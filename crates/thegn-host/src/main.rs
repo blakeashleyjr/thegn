@@ -30,7 +30,6 @@ mod caret;
 mod caret_ratchet_tests;
 mod center;
 mod channel_state;
-mod chime;
 mod chrome;
 mod ci_refresh;
 mod cli_help;
@@ -134,6 +133,7 @@ mod mq_assets;
 mod naming;
 mod nav;
 mod nixcache;
+mod notification_sound;
 mod notify;
 mod onboarding;
 mod owl;
@@ -201,6 +201,7 @@ mod sidebar;
 mod sidebar_help;
 mod sidebar_keytable;
 mod sidebar_legend;
+mod sidebar_mq;
 mod sidebar_order;
 mod sidebar_pipeline;
 mod sidebar_view;
@@ -1076,6 +1077,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         .config
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
+    let repo_context = std::env::current_dir().ok();
     match command {
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action),
@@ -1118,7 +1120,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             revoke,
         } => cmd::repos::trust(&cfg, path, approve, revoke),
         Command::Recent { count, json } => cmd::repos::recent(count, json),
-        Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::Config { action } => {
+            cmd::config::run(&cfg, action, config_path, repo_context.clone())
+        }
         Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
         Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Env { action } => cmd::env::run(&cfg, action),
@@ -1136,8 +1140,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),
         Command::Doctor { json, action } => match action {
-            Some(DoctorAction::Bundle { args }) => cmd::bundle::run(&cfg, args),
-            None => cmd::doctor::run(&cfg, json),
+            Some(DoctorAction::Bundle { args }) => {
+                cmd::bundle::run(&cfg, args, config_path, repo_context.clone())
+            }
+            None => cmd::doctor::run(&cfg, json, config_path, repo_context),
         },
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.

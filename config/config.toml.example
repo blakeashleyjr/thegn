@@ -280,7 +280,8 @@ process_io = false         # also read per-process disk IO (one extra /proc read
 # for the focused zone), "pr" (forge + PR number, state-colored), "tests"
 # (✓pass ✗fail rollup of the last test run; green all-pass, red on failure;
 # hidden until a run), "loc" (tokei line count), "disk" (the active worktree's
-# size, incl. target/), "status" (transient messages).
+# size, incl. target/), "status" (transient messages), and "mq" (the scoped
+# merge-queue summary; opt-in because it is absent from the default list).
 [bars]
 top_left = ["brand"]
 # Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
@@ -1906,23 +1907,49 @@ active_mode = ""
 # windows = ["22:00-08:00", "sat,sun 00:00-24:00"]
 # allow_priority = "alert"
 
-# Sound / chime (item 429). `mode`: "chime" (default — a bundled chime played
-# through an auto-detected system player: paplay/pw-play/afplay/PowerShell/…,
-# falling back to the terminal BEL), "bell" (terminal BEL), "command" (run a
-# command line off-thread), or "off". Fires at/above `min_priority` EXCEPT for
-# the `always_kinds` list, which chimes regardless (so a background agent that
-# finishes or needs you is audible out of the box). `suppress_focused` silences
-# the cue for the worktree you're currently viewing (the inbox record + desktop
-# toast still fire). `chime_file` points `mode = "chime"` at your own .wav.
+# Sound effects (item 429). The zero-config default is the terminal BEL. Sound
+# is opt-in per custom event: add a key under `per_kind` to select a file or
+# pack entry for that notification kind. All sound paths and packs are trusted
+# user configuration; an untrusted repository overlay cannot supply them.
+#
+# `mute = true` disables sound globally. `mode` accepts "bell" (terminal BEL),
+# "chime" (legacy generic file mode), "command" (the legacy configured command
+# mode), or "off". `min_priority` accepts "info", "notice", or "alert";
+# events below it are silent unless listed in `always_kinds`. The default
+# always-kinds are agent_done, agent_attention, and agent_failed. They bypass
+# only this priority floor: mute, DND, rule routing, and focused-worktree
+# suppression still apply. `suppress_focused` silences a cue for the worktree
+# currently in view while retaining its inbox/other-channel delivery.
+#
+# `pack` is an absolute or `~`-expanded trusted directory. `per_kind` values
+# use one restricted reference vocabulary: "off"/"none", "bell"/"terminal"
+# (or "builtin:bell"), "pack:<name>", or an absolute/`~`-expanded file path.
+# Bare pack names, relative paths, and shell commands are rejected. Pack names
+# are looked up from the immutable startup/reload snapshot; the provider checks
+# the file extension. Missing/unreadable files, packs, providers, and unsupported
+# formats fall back to the terminal BEL. `volume` is a finite 0.0..=1.0 hint;
+# providers without volume support play at their default volume.
+#
+# `chime_file` is the legacy generic file used only by `mode = "chime"` and
+# accepts an absolute or `~` path. `command` and `per_priority` retain their
+# legacy command-mode compatibility behavior; commands are trusted user config
+# and run off the event loop. No command language is accepted by `per_kind`.
 # [notifications.sound]
-# mode = "chime"
-# min_priority = "alert"
+# mute = false
+# mode = "bell"                 # bell | chime | command | off
+# min_priority = "alert"        # info | notice | alert
 # always_kinds = ["agent_done", "agent_attention", "agent_failed"]
 # suppress_focused = true
-# chime_file = "~/sounds/ding.wav"     # optional custom chime (default: bundled)
-# command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"  # mode = "command"
-# [notifications.sound.per_priority]   # optional per-priority command overrides
-# alert = "paplay /usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
+# pack = ""                     # trusted absolute or ~-expanded directory
+# volume = 1.0                   # provider hint, clamped/validated to 0.0..=1.0
+# chime_file = ""               # legacy mode = "chime" file
+# command = ""                  # legacy mode = "command" shell command
+# per_priority = {}              # legacy command-mode priority overrides
+# [notifications.sound.per_kind]
+# agent_attention = "pack:attention"
+# agent_done = "~/sounds/finished.wav"
+# queue_landed = "pack:merged"
+# log_error = "pack:error"
 
 # Routing modes (item 427): named presets you switch between at runtime with
 # Ctrl+Alt+m. A rule's `modes` selector limits it to the listed modes;
