@@ -619,6 +619,29 @@ mod tests {
     }
 
     #[test]
+    fn resolves_existing_target_without_rerooting_or_credentials() {
+        let base = std::env::temp_dir().join(format!("thegn-move-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(base.join("profiles/work/state")).unwrap();
+        let target = resolve_existing_target(&base, "default", " Work ").unwrap();
+        assert_eq!(target.name, "work");
+        assert_eq!(target.root, base.join("profiles/work"));
+        assert!(resolve_existing_target(&base, "default", "missing").is_err());
+        assert!(resolve_existing_target(&base, "default", "default").is_err());
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn base_for_named_profile_is_parent_of_profiles_directory() {
+        let base = PathBuf::from("/tmp/thegn-profile-base");
+        let named = ProfilePaths {
+            name: "work".into(),
+            root: base.join("profiles/work"),
+        };
+        assert_eq!(base_for(&named), base);
+    }
+
+    #[test]
     fn credential_env_pins_config_dirs_and_drops_tokens() {
         let root = std::path::Path::new("/home/x/.thegn/profiles/work");
         let env = credential_env(root);
