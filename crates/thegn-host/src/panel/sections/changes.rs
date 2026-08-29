@@ -34,13 +34,20 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(g2(), "PR review"),
             seg(
                 g(),
-                format!(" · {unresolved} unresolved · open Diff and press Tab"),
+                format!(
+                    " {} {unresolved} unresolved {} open Diff and press Tab",
+                    crate::caps::active_glyphs().middot,
+                    crate::caps::active_glyphs().middot
+                ),
             ),
         ])));
     } else if let Some(status) = &data.review_snapshot_status {
         rows.push(PanelRow::plain(Line::segs(vec![
             seg(g2(), "PR review"),
-            seg(hue(Hue::Amber), format!(" · {status}")),
+            seg(
+                hue(Hue::Amber),
+                format!(" {} {status}", crate::caps::active_glyphs().middot),
+            ),
         ])));
     }
     if data.changes.is_empty() {

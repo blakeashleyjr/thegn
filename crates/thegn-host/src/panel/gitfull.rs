@@ -263,13 +263,22 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow
             .iter()
             .filter(|thread| !thread.resolved)
             .count();
-        l.push(seg(g2(), " · "));
+        l.push(seg(
+            g2(),
+            format!(" {} ", crate::caps::active_glyphs().middot),
+        ));
         l.push(seg(
             ac(),
-            format!("PR review: {unresolved} unresolved · Tab in Diff"),
+            format!(
+                "PR review: {unresolved} unresolved {} Tab in Diff",
+                crate::caps::active_glyphs().middot
+            ),
         ));
     } else if let Some(status) = &data.review_snapshot_status {
-        l.push(seg(g2(), " · "));
+        l.push(seg(
+            g2(),
+            format!(" {} ", crate::caps::active_glyphs().middot),
+        ));
         l.push(seg(hue(Hue::Amber), format!("PR review: {status}")));
     }
     vec![PanelRow::plain(Line::split(l, right))]

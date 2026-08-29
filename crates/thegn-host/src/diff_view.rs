@@ -133,7 +133,14 @@ impl DiffView {
         review: Option<thegn_core::review::PrReviewSnapshot>,
         status: Option<String>,
     ) -> bool {
-        let changed = self.review != review || self.review_status != status;
+        let source_changed = review.is_none() && self.source == DiffSource::PrReview;
+        let changed = self.review != review || self.review_status != status || source_changed;
+        if source_changed {
+            self.source = DiffSource::Worktree;
+            self.open_file = None;
+            self.sel = 0;
+            self.scroll.set(0);
+        }
         self.review = review;
         self.review_status = status;
         changed
@@ -400,18 +407,44 @@ impl DiffView {
     fn footer(&self) -> Line {
         // Offer the toggle only when a structural render actually loaded.
         let toggle = matches!(self.structural, Some(Ok(_)));
+        let glyphs = crate::caps::active_glyphs();
+        let movement = format!("{}{}", glyphs.arrow_up, glyphs.arrow_down);
+        let separator = format!(" {} ", glyphs.middot);
         let hint = if self.structural_active() {
             if toggle {
-                "↑↓ scroll · t internal · q/esc close"
+                [
+                    format!("{movement} scroll"),
+                    "t internal".into(),
+                    "q/esc close".into(),
+                ]
+                .join(&separator)
             } else {
-                "↑↓ scroll · q/esc close"
+                [format!("{movement} scroll"), "q/esc close".into()].join(&separator)
             }
         } else if self.open_file.is_some() {
-            "↑↓ move · ← back · q/esc close"
+            [
+                format!("{movement} move"),
+                "Left back".into(),
+                "q/esc close".into(),
+            ]
+            .join(&separator)
         } else if toggle {
-            "↑↓ move · Enter open · Tab source · t structural · q/esc close"
+            [
+                format!("{movement} move"),
+                "Enter open".into(),
+                "Tab source".into(),
+                "t structural".into(),
+                "q/esc close".into(),
+            ]
+            .join(&separator)
         } else {
-            "↑↓ move · Enter open file · Tab source · q/esc close"
+            [
+                format!("{movement} move"),
+                "Enter open file".into(),
+                "Tab source".into(),
+                "q/esc close".into(),
+            ]
+            .join(&separator)
         };
         let source = match self.source {
             DiffSource::Worktree => "Worktree",
@@ -420,7 +453,7 @@ impl DiffView {
         let stale = self.review_status.as_deref().unwrap_or("");
         Line::segs(vec![seg(
             Tok::Slot(S::Dim),
-            format!("{source} · {hint} {stale}"),
+            format!("{source}{separator}{hint} {stale}"),
         )])
     }
 
@@ -757,6 +790,28 @@ mod tests {
             2,
             "the PR diff arrived without losing the view"
         );
+    }
+
+    #[test]
+    fn stale_review_delivery_clears_the_pr_source_and_keeps_worktree_diff() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: sample(),
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.source, DiffSource::PrReview);
+
+        assert!(v.set_review(None, Some("stale PR review snapshot".into())));
+        assert_eq!(v.source, DiffSource::Worktree);
+        assert_eq!(v.row_count(), 2, "the local diff remains available");
+        assert!(format!("{:?}", v.footer()).contains("stale PR review snapshot"));
     }
 
     #[test]
