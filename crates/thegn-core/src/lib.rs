@@ -47,6 +47,7 @@ pub mod config_loc;
 pub mod config_media;
 pub mod config_model_proxy;
 pub mod config_network;
+pub mod config_notifications;
 pub mod config_observe;
 pub mod config_pipeline;
 pub mod config_placement;
@@ -165,6 +166,7 @@ pub mod msg;
 pub mod notification;
 pub mod notification_route;
 pub mod notification_scope;
+pub mod notification_sound;
 pub mod notify_debounce;
 pub mod push_inbox;
 // `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
