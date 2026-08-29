@@ -930,6 +930,9 @@ impl Db {
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
+        if ver < SCHEMA_VERSION {
+            crate::db_migrate::verify_v61_schema(&conn)?;
+        }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;

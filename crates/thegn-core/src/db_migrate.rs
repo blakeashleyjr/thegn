@@ -640,6 +640,40 @@ fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
     rows.flatten().any(|name| name == col)
 }
 
+/// The legacy additive ladder is intentionally best-effort for cache-only
+/// tables, but v61 adds the storage contract used by the report/note commands.
+/// Verify that contract before `Db::init` stamps the schema version; otherwise
+/// a disk/lock/schema error swallowed by the historical ladder would make a
+/// broken upgrade look complete on the next open.
+pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
+    // Preparing the projection catches a missing `report` column without
+    // reading any user payload.
+    conn.prepare("SELECT report FROM agent_dispatches LIMIT 0")?;
+
+    let notes_table: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='agent_dispatch_notes'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if notes_table.as_deref() != Some("table") {
+        anyhow::bail!("schema v61 migration did not create agent_dispatch_notes");
+    }
+
+    let notes_index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_dispatch_notes_dispatch'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if notes_index.is_none() {
+        anyhow::bail!("schema v61 migration did not create the dispatch notes index");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
@@ -652,6 +686,15 @@ mod tests {
         assert_eq!(super::detect_newer_schema(5, 10), None);
         assert_eq!(super::detect_newer_schema(10, 10), None);
         assert_eq!(super::detect_newer_schema(12, 10), Some(12));
+    }
+
+    #[test]
+    fn v61_schema_verifier_rejects_an_incomplete_upgrade() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, report TEXT);")
+            .unwrap();
+        let err = super::verify_v61_schema(&conn).unwrap_err();
+        assert!(err.to_string().contains("agent_dispatch_notes"), "{err}");
     }
 
     #[test]
