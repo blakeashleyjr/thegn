@@ -2978,7 +2978,7 @@ impl Default for StatsConfig {
 /// `brand` (thegn + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
 /// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
 /// (free %), `battery`, `weather` (needs `[weather] enabled = true`), `date`,
-/// `clock` (top bar) and `keyhints`
+/// `clock` (top bar), `mq` (opt-in merge-queue summary) and `keyhints`
 /// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
 /// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
