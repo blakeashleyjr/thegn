@@ -45,6 +45,11 @@ merge_driver.rs
 # Windows has no unprivileged equivalent for. Nothing here to move behind a
 # `platform::` function — the production path already is one.
 metrics.rs
+# TEST-ONLY cfg, not production platform code: the notification routing tests
+# need a Unix PTY solely to obtain a real TerminalWaker and exercise bell
+# latching; moving this harness behind the sound provider would obscure the
+# NotifyState behavior under test.
+notify.rs
 panes.rs
 perf.rs
 probe.rs
