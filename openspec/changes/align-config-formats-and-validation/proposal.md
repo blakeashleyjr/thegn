@@ -26,17 +26,21 @@ undocumented section/key, the example must parse as a `Config`, and
 `example_config_validates_clean` strict-validates it. Downstream, the in-app
 config-reference help page is _generated from the example at runtime_
 (`help/config_ref.rs`), and `hm_module_drift` checks the home-manager module
-against the same schema. Autogeneration would trade curated prose for
-mechanical dumps and gain nothing the gates don't already guarantee. The
-answer to THE-38's second question is "no, and by design" — recorded here, no
-delta needed.
+against the same schema. The gates cover every documented key, but the
+example's illustrative values are not mechanically proven to equal
+`Config::default()`; the reference must describe them as example values.
+Autogeneration would trade curated prose for mechanical dumps and gain
+nothing the gates don't already guarantee. The answer to THE-38's second
+question is "no, and by design" — strengthen drift coverage, do not replace
+the curated example.
 
 **Drift and blind spots found by the audit** (the actual work):
 
 1. The config spec's layer requirement omits the profile overlay from the
    fixed order, and claims the repo overlay carries "`[sandbox]` only" — the
    real `RepoConfigFile` carries `[sandbox]` (trust-clamped), `[keybinds]`,
-   `[notifications]`, `[issues]`, and the `env` selector.
+   `[notifications]`, `[issues]`, the `env` selector, and a metrics
+   detection/refusal table.
    `docs/help/configuration.md` contradicts _itself_: one paragraph lists
    sandbox/keybinds/env, another says "`[sandbox]` only".
 2. The spec and the help page both reference `thegn config validate --strict`.
@@ -70,6 +74,11 @@ delta needed.
 - **`thegn doctor` gains a config-health line**: the config path plus its
   strict-validation problem count (and the same for a repo overlay when run
   inside one), pointing at `thegn config validate` for the detail.
+- **Validation diagnostics and reference drift are tightened**: type errors
+  name the dotted key, `config get/set` failures include the effective config
+  path, and the generated config-reference is checked against the schema key
+  set rather than only a handful of tables. The example remains curated and
+  no exact-default comparison is added.
 - **Fix the drift**: the spec's layer requirement gains the profile overlay
   and the repo overlay's real table set; `--strict` disappears from spec and
   help-page prose (validation is strict, full stop);
@@ -105,14 +114,18 @@ delta needed.
   "Unknown keys are reported by strict validation"), 2 ADDED ("One
   configuration format per trust tier", "Doctor reports configuration
   health").
-- Code: `thegn-core` `config_validate.rs` (overlay validation walk — pure,
-  unit-tested under the 95% line gate), `config.rs` (`load_repo_overlay`
-  shadow warning); `thegn-host` `cmd/config.rs` (multi-layer validate),
-  `cmd/doctor.rs` (config-health line); `docs/help/configuration.md`.
+- Code: `thegn-core` `config_repo.rs` (new format/candidate seam),
+  `config_validate.rs` (overlay validation walk — pure, unit-tested under the
+  95% line gate), and `config.rs` delegation; `help/config_ref.rs` (generated
+  reference gate); `thegn-host` `cmd/config.rs` plus `cmd/config_health.rs`
+  (multi-layer validate), `cmd/doctor.rs` (config-health line), and the
+  completion catalog's structural `--repo` slot; `docs/help/configuration.md`.
 - In-flight reconciliation: `add-config-trust-resolution` (its `sandbox` and
   `state-db` deltas are untouched; the layer-requirement rewrite here
   describes the repo `[sandbox]` table as trust-clamped, consistent with it).
   No overlap with `add-workspace-zones` (reserved trust slot unaffected).
-- No new capability-catalog row: `config validate`/`doctor` are local CLI
-  verbs that never drive a running instance; the catalog's surfaces are
-  unaffected.
+- No new control capability or control-schema row: `config validate`/`doctor`
+  are local CLI verbs that never drive a running instance. The value-taking
+  `config validate --repo` argument is still recorded in the single completion
+  catalog as a structural path slot, so the completion ratchet remains
+  satisfied.

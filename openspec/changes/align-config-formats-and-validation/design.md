@@ -7,9 +7,10 @@ schema (`schemars`), strict validation walks the raw TOML in lockstep with that
 schema (`config_validate::validate_str` — unknown keys with nearest-key hints,
 `config_enum!` values, template placeholders, tz names), the example file is
 coverage-gated in both directions, and the help page is generated from the
-example. The audit therefore adds no new machinery — it extends the existing
-walk to the two layers it never reached, and fixes prose that claims flags and
-table sets that don't exist.
+example. The branch already has tri-format repo parsing, profile loading,
+home-manager drift checks, and generated-page registration. The audit adds
+only the missing shared overlay walk, layer aggregation, shadow warning,
+diagnostic context, and generated-reference key assertion.
 
 ## Format decision (THE-38's first question)
 
@@ -29,19 +30,19 @@ changes — all to serve a file the user writes once. Rejected.
 
 ## Validation across layers
 
-`validate_str` stays as-is for `Config`-shaped documents. Added, in
-`thegn-core` (pure, unit-testable):
+`validate_str` stays as-is for `Config`-shaped documents. Added in a new
+`thegn-core` sibling module plus the shared validator (pure, unit-testable):
 
 - `validate_repo_overlay_str(body: &str, format: OverlayFormat) -> Vec<String>`
   — parses the body in its format to a format-neutral value
-  (`serde_json::Value` via `serde_yaml`/`serde_json`, TOML via the existing
-  `toml::Value` path), then runs the same schema walk against
-  `schema_for!(RepoConfigFile)`. `RepoConfigFile` already derives
-  `JsonSchema`; it (or a validation entry point over it) becomes `pub` so the
-  host can call it. The walk is shared: it takes the schema root as a
-  parameter instead of hard-coding the `Config` schema.
-- The nearest-key hint and map-valued-table tolerance behave identically —
-  they are properties of the walk, not of the `Config` schema.
+  (`serde_json::Value` via the format adapters), then runs the same schema walk
+  against `schema_for!(RepoConfigFile)`. `RepoConfigFile` already derives
+  `JsonSchema`; expose a validation entry point rather than its internal
+  fields. The walk takes the schema root as a parameter instead of hard-coding
+  the `Config` schema.
+- The nearest-key hint, dotted type diagnostics, and map-valued-table tolerance
+  behave identically — they are properties of the walk, not of the `Config`
+  schema.
 
 Host side, `cmd/config.rs::validate` becomes a loop over located layers:
 
@@ -50,15 +51,17 @@ Host side, `cmd/config.rs::validate` becomes a loop over located layers:
    (validated as a `Config`-shaped overlay — it is a full `Config` overlay),
 3. the repo overlay found from cwd (or `--repo <path>`), when present.
 
-Each problem line is prefixed `<path>: ` so three files' reports don't blur.
-Exit is non-zero when any layer has problems; a missing layer is skipped
-silently (absence is normal, not a warning).
+Each problem line is prefixed `<path>: ` so three files' reports don't blur;
+type failures include the dotted key. Exit is non-zero when any layer has
+problems; a missing layer is skipped silently (absence is normal, not a
+warning). `config get/set` add the effective config path as context without
+inventing key provenance.
 
 ## Shadowed-overlay warning
 
 `load_repo_overlay` / `repo_overlay_parse_error` currently `return` on the
-first existing extension. The loop instead records which candidates exist;
-when >1, `config_warn` names the winner and the ignored files once per load.
+first existing extension. The new candidate seam records which candidates
+exist; when >1, `config_warn` names the winner and ignored files once per load.
 Warning text contains only file _paths_ (never file contents — the files are
 untrusted). The precedence order itself does not change.
 
@@ -67,8 +70,10 @@ untrusted). The precedence order itself does not change.
 `cmd/doctor.rs` adds to the text report and the JSON document:
 
 ```
-"config_health": { "path": "...", "problems": <n>,
-                   "repo_overlay": {"path": "...", "problems": <n>} | null }
+"config_health": { "config": {"path": "...", "problems": <n>},
+                   "profile": {"path": "...", "problems": <n>} | null,
+                   "repo_overlay": {"path": "...", "problems": <n>} | null,
+                   "validate": "thegn config validate" }
 ```
 
 Doctor reuses the same core validation functions; no second policy. It reads
@@ -78,11 +83,12 @@ command, off the compositor entirely). Render damage channels: none touched.
 ## Docs
 
 `docs/help/configuration.md`: reconcile the two layer paragraphs (real table
-set: sandbox — clamped —, keybinds, notifications, issues, `env` selector),
-drop `--strict` from all three mentions, add one line on multi-format
-precedence + the shadow warning. The config-reference page is generated and
-needs nothing. Help ratchet: no new action ids, no new pages — the existing
-`configuration` page keeps its claims; prose-ratchet unaffected.
+set: sandbox — clamped —, keybinds, notifications, issues, `env` selector,
+and metrics detection/refusal), drop `--strict` from all mentions, add
+multi-format precedence plus the shadow warning, and describe example values
+instead of code-default parity. The config-reference page remains generated;
+its key-coverage test is strengthened. Help ratchet: no new action ids, no
+new pages — the existing `configuration` page keeps its registration.
 
 ## Alternatives considered
 
@@ -120,5 +126,5 @@ needs nothing. Help ratchet: no new action ids, no new pages — the existing
   worth a heuristic pass (only lines whose value parses as the field's type
   and differs from the schema default)? Deferred — noise risk until measured.
 - Should `config validate` also name layers it _skipped_ (no profile overlay,
-  no repo overlay) for discoverability? Leaning no (quiet success is the Unix
-  contract); decide at implementation with the one-line cost in view.
+  no repo overlay) for discoverability? No: quiet absence is the Unix contract;
+  doctor reports only layers that exist.

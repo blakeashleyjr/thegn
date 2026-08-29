@@ -1,43 +1,47 @@
 # Tasks
 
-## 1. Core: overlay validation + shadow warning (thegn-core)
+## 1. Core: overlay validation, shadow warning, and reference drift (thegn-core)
 
-- [ ] 1.1 Generalize the strict-validation walk in `config_validate.rs` to take
-      a schema root parameter; keep `validate_str` byte-compatible for the
-      `Config` path — **unit tests** (existing suite must pass unchanged).
-- [ ] 1.2 `validate_repo_overlay_str(body, format) -> Vec<String>` over
-      `schema_for!(RepoConfigFile)`, parsing TOML/YAML/JSON to the shared
-      value shape; expose a `pub` entry point — **unit tests**: typo'd
-      `[sandbox]` key with hint, unknown top-level table, all three formats,
-      syntax-error message per format (95% line gate applies).
-- [ ] 1.3 `load_repo_overlay` / `repo_overlay_parse_error`: detect multiple
-      `.thegn.*` candidates and `config_warn` naming the winner + ignored
-      paths (paths only, never contents) — **unit test** with two files in a
-      temp dir.
+- [ ] 1.1 Extract the repo candidate/parser seam to `config_repo.rs`; retain
+      TOML > YAML > YML > JSON precedence, trust clamps, metrics refusal, and
+      tolerant loading. Add a path-only shadow warning, deduplicated for one
+      load — **unit tests** for precedence and two candidates.
+- [ ] 1.2 Generalize the strict-validation walk to a schema root/value shape;
+      keep `validate_str` for `Config`, and expose
+      `validate_repo_overlay_str(body, format)` over `RepoConfigFile` —
+      **unit tests** for valid TOML/YAML/JSON, syntax errors, unknown keys with
+      hints, dotted type errors, and dynamic maps (95% line gate applies).
+- [ ] 1.3 Add generated config-reference coverage derived from the schema and
+      shipped example; change wording from exact code defaults to example
+      values. Do not add a default-value heuristic or a config key.
 
-## 2. Host: multi-layer `config validate` + doctor line (thegn-host)
+## 2. Host: multi-layer validation, context, and doctor health (thegn-host)
 
-- [ ] 2.1 `cmd/config.rs::validate`: iterate main file → active profile
-      overlay (`Config::profile_overlay_path`) → repo overlay (cwd or
-      `--repo`); prefix every problem with its file path; non-zero exit on
-      any problem; silent skip for absent layers. Add `--repo <path>` to
-      `Action::Validate`.
-- [ ] 2.2 `cmd/doctor.rs`: `config_health` in the JSON document + one text
-      line (path, problem count, repo overlay when present), reusing the core
-      validators.
+- [ ] 2.1 Add `--repo <path>` and a host `config_health` collector. Iterate
+      main TOML → active profile TOML → selected repo overlay; prefix every
+      finding with its path, return non-zero for any finding, and silently skip
+      absent optional layers.
+- [ ] 2.2 Make `config get/set` include effective config-path context without
+      changing typed JSON or atomic rollback. Make `doctor` consume the same
+      collector in text and JSON, including profile/repo counts and the
+      `thegn config validate` follow-up. Preserve bundle JSON behavior.
+- [ ] 2.3 Register `config validate --repo` in the single completion catalog
+      as structural path completion. Do not change the completion ratchet,
+      env-overlay ratchet, control schema, help ratchets, or config enum count.
 
 ## 3. Docs + spec text
 
-- [ ] 3.1 `docs/help/configuration.md`: reconcile the two contradictory
-      repo-overlay paragraphs to the real table set; delete all three
-      `--strict` mentions; document tri-format precedence + the shadow
-      warning. (Generated pages need nothing; no new action ids, so the help
-      ratchets are unaffected. If any e2e snapshot renders this page,
-      re-record with `just e2e-update` and review the diff.)
-- [ ] 3.2 Confirm `config/config.toml.example` needs no change (no new keys
-      are added by this change).
+- [ ] 3.1 Update §7 of `docs/ARCHITECTURE.md` and
+      `docs/help/configuration.md`: trusted TOML-only contract, active profile,
+      actual repo tables/formats, tolerant load, strict validation, and
+      example-value wording; remove every nonexistent `--strict` claim.
+- [ ] 3.2 Synchronize this proposal, design, tasks, and config spec. Confirm
+      `config/config.toml.example` needs no change because this change adds no
+      key and deliberately does not auto-generate the curated example.
 
 ## 4. Validation
 
-- [ ] 4.1 Run `just ci` once, when the implementation is complete (includes
-      `openspec validate --all --strict`).
+- [ ] 4.1 Per chunk, run the scoped `just quick <crate>` and
+      `cargo nextest run -p <crate> <filter>` commands in its chunk spec;
+      run `just openspec-validate` for the synchronized draft. Do not run
+      full-workspace CI or e2e as part of this change.
