@@ -159,6 +159,11 @@ pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
         .open(path)
 }
 
+/// Windows ACLs are inherited from the per-profile state directory.
+pub fn restrict_dir_owner_only_checked(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// No-op on Windows (no unix mode bits to tighten).
 pub fn restrict_dir_owner_only(_path: &std::path::Path) {}
 

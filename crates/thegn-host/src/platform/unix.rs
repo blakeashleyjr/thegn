@@ -176,17 +176,23 @@ pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
         .mode(0o600)
         .open(path)?;
     // Tighten logs created by older versions too.
-    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
+}
+
+/// Restrict a directory to owner-only access and preserve any chmod failure for
+/// callers that need to report an incomplete security boundary.
+pub fn restrict_dir_owner_only_checked(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Restrict a directory to owner-only access (mode `0700`). Best-effort — a
 /// failure hardens less but must not stop recording.
 pub fn restrict_dir_owner_only(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
     // best-effort: 0700 is defence-in-depth; the dir is already under the
     // per-profile state root.
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)); // best-effort: hardening: a failed chmod must never block the caller
+    let _ = restrict_dir_owner_only_checked(path); // best-effort: hardening: a failed chmod must never block the caller
 }
 
 /// A spawned child's process group — what [`GroupHandle::terminate`] reaps

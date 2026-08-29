@@ -310,6 +310,8 @@ pub fn run_event_with_db(
         if !result.succeeded() {
             thegn_core::msg::warn(&format!("{}: {}", event.as_str(), result.summary()));
             report_failure(&context, result);
+        } else if result.log_error.is_some() {
+            report_log_failure(&context, result);
         }
     }
     if !policy.pending.is_empty() {
@@ -429,6 +431,8 @@ pub fn spawn_event(
                     if !result.succeeded() {
                         thegn_core::msg::warn(&format!("{}: {}", event.as_str(), result.summary()));
                         report_failure(&context, result);
+                    } else if result.log_error.is_some() {
+                        report_log_failure(&context, result);
                     }
                 }
             }
@@ -1011,6 +1015,25 @@ fn report_failure(context: &HookContext, result: &crate::hook_run::HookRunResult
         &db,
         state,
         "hook_failed",
+        context.event.as_str(),
+        &message,
+        &context.worktree,
+    );
+    state.emit_sound(&decision);
+}
+
+fn report_log_failure(context: &HookContext, result: &crate::hook_run::HookRunResult) {
+    let Some(state) = NOTIFY_STATE.get() else {
+        return;
+    };
+    let Ok(db) = Db::open() else {
+        return;
+    };
+    let message = format!("{}: {}", context.event.as_str(), result.summary());
+    let (decision, _) = crate::notify::record(
+        &db,
+        state,
+        "hook_log_failed",
         context.event.as_str(),
         &message,
         &context.worktree,
