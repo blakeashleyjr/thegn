@@ -39,8 +39,9 @@ A test over every workspace member's manifest SHALL assert that `tokio`, `termwi
 The repository SHALL gate its dependency tree with `just deps-audit`
 (`cargo deny check` followed by `cargo machete`, as defined at
 `justfile:455-462`; included by `just ci` and the dedicated CI job). Its policy
-is `deny.toml`: RustSec advisories fail unless an exception has a documented
-reason and exit condition; licenses outside the allowlist fail; wildcard
+is `deny.toml`: vulnerability advisories fail unless ignored with a documented
+reason and exit condition; unmaintained, unsound, and notice advisories retain
+their configured severity; licenses outside the allowlist fail; wildcard
 requirements and unknown registry or git sources are denied; duplicate major
 versions warn under the documented known-splits policy. `cargo machete` SHALL
 fail the gate on an unused direct dependency.
@@ -64,9 +65,9 @@ re-asked.
 - **THEN** `just deps-audit` fails via cargo-machete until the declaration is
   removed
 
-#### Scenario: A new advisory forces an upgrade or exception
+#### Scenario: A new vulnerability advisory forces an upgrade or exception
 
-- **WHEN** a RustSec advisory affects a crate in the lock
+- **WHEN** a RustSec vulnerability advisory affects a crate in the lock
 - **THEN** `just deps-audit` fails until the dependency is upgraded or a
   documented exception with an exit condition is added
 
