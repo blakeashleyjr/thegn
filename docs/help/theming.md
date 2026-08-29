@@ -43,10 +43,11 @@ thegn theme import ~/Downloads/theme.yml --name my-theme
 ```
 
 `theme set` accepts a built-in or valid local name and writes the existing
-`[theme].preset` key. A local selection also writes its existing
-`[theme.colors]` and `[theme.hues]` overrides, so it remains effective after a
-reload. `theme import` reads only a bounded local file, validates the Gogh
-scheme, and saves a versioned TOML user theme. It performs no network access.
+`[theme].preset` key; the runtime resolver loads the selected local file and
+applies any existing `[theme.colors]` and `[theme.hues]` overrides on top.
+`theme import` reads only a bounded local file, validates the Gogh scheme, and
+saves a versioned TOML user theme. It reports any contrast warnings and
+performs no network access.
 
 User themes live under `$XDG_CONFIG_HOME/thegn/themes` (normally
 `~/.config/thegn/themes`). Files with invalid content are ignored by the

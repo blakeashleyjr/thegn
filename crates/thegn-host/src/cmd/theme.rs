@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use thegn_core::config::Config;
 use thegn_core::theme::{self, PRESETS};
+use thegn_core::theme_contrast::{self, Bar};
 use thegn_core::theme_user::UserTheme;
 use thegn_core::{msg, outln, util};
 
@@ -90,8 +91,21 @@ fn import(path: &Path, name: Option<&str>) -> Result<()> {
     theme.validate()?;
     let dir = util::xdg_config_home().join("thegn/themes");
     write_user_theme(&dir, &theme)?;
+    report_contrast_warnings(&theme);
     msg::info(&format!("theme imported as `{}`", theme.meta.name));
     Ok(())
+}
+
+fn report_contrast_warnings(theme: &UserTheme) {
+    let Ok(palette) = theme.palette() else {
+        return;
+    };
+    for finding in theme_contrast::audit(&palette, Bar::Preset) {
+        msg::warn(&format!(
+            "contrast warning: {} on {} {:.2} < {:.1}",
+            finding.fg, finding.bg, finding.ratio, finding.min
+        ));
+    }
 }
 
 fn read_user_themes() -> Vec<UserTheme> {
