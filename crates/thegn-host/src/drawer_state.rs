@@ -1,7 +1,7 @@
-//! Everything drawer: the per-worktree open-flag cache, the keep-alive
-//! file-manager pane pool, and the async cold-spawn pipeline. The manager the
-//! drawer runs is resolved through the `thegn_core::file_manager` seam, so this
-//! module is manager-agnostic — it names no vendor.
+//! Everything drawer: the per-scope occupant cache, the keep-alive pane pool,
+//! and the async cold-spawn pipeline. The built-in manager is resolved through
+//! the `thegn_core::file_manager` seam, so this module is manager-agnostic — it
+//! names no vendor.
 //!
 //! Three rules keep the drawer off the event loop's critical path:
 //!
@@ -28,15 +28,20 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::compositor::Rect;
 use crate::panes::Panes;
+use thegn_core::config::{DrawerScope, expand_env_ref};
+use thegn_core::config_drawer::{
+    DrawerOccupant, DrawerPolicy, FILES_OCCUPANT_ID, GLOBAL_SCOPE_KEY, drawer_scope_key,
+    resolve_drawer_cwd,
+};
 
 // ── open-flag cache ──────────────────────────────────────────────────────────
 
-/// Pure flag cache keyed by worktree slug. The global wrappers below bind it
-/// to the on-disk store; kept separate so the semantics are unit-testable
-/// against an explicit directory (no process-env mutation in tests).
+/// Memory-first drawer state keyed by scope. Values are stable occupant IDs;
+/// `None` is persisted closed, while the legacy strings `true` and `false`
+/// decode as `files` and closed respectively.
 #[derive(Default)]
 pub(crate) struct FlagCache {
-    map: HashMap<String, bool>,
+    map: HashMap<String, Option<String>>,
 }
 
 impl FlagCache {
@@ -50,20 +55,28 @@ impl FlagCache {
         if let Ok(rd) = std::fs::read_dir(store) {
             for e in rd.flatten() {
                 if let Ok(s) = std::fs::read_to_string(e.path()) {
-                    map.insert(
-                        e.file_name().to_string_lossy().into_owned(),
-                        s.trim() == "true",
-                    );
+                    let value = match s.trim() {
+                        "true" => Some(FILES_OCCUPANT_ID.to_string()),
+                        "false" | "" => None,
+                        id => Some(id.to_string()),
+                    };
+                    map.insert(e.file_name().to_string_lossy().into_owned(), value);
                 }
             }
         }
         FlagCache { map }
     }
     pub(crate) fn get(&self, dir: &Path) -> bool {
-        self.map.get(&Self::key(dir)).copied().unwrap_or(false)
+        self.occupant_for_key(&Self::key(dir)).is_some()
     }
     pub(crate) fn set(&mut self, dir: &Path, open: bool) {
-        self.map.insert(Self::key(dir), open);
+        self.set_key(&Self::key(dir), open.then(|| FILES_OCCUPANT_ID.to_string()));
+    }
+    pub(crate) fn occupant_for_key(&self, key: &str) -> Option<String> {
+        self.map.get(key).cloned().flatten()
+    }
+    pub(crate) fn set_key(&mut self, key: &str, occupant: Option<String>) {
+        self.map.insert(key.to_string(), occupant);
     }
 }
 
@@ -112,12 +125,82 @@ pub(crate) fn set_flag(dir: &Path, open: bool) {
     }
 }
 
+/// Return the desired occupant for a scope from the memory cache. This is safe
+/// on the event loop: startup performs the only state-directory read.
+pub(crate) fn desired_occupant(scope: DrawerScope, dir: &Path) -> Option<String> {
+    flags()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.occupant_for_key(&drawer_scope_key(scope, dir)))
+}
+
+/// Persist a desired occupant after updating the in-memory cache. The write is
+/// deliberately off-loop and uses the same best-effort cache semantics as the
+/// legacy files-drawer flag.
+pub(crate) fn set_desired_occupant(scope: DrawerScope, dir: &Path, occupant: Option<&str>) {
+    let key = drawer_scope_key(scope, dir);
+    set_desired_key(&key, occupant);
+}
+
+fn set_desired_key(key: &str, occupant: Option<&str>) {
+    if let Ok(mut cache) = flags().lock() {
+        cache.set_key(key, occupant.map(str::to_string));
+    }
+    let path = store_dir().join(key);
+    let value = occupant.unwrap_or("false").to_string();
+    let write = move || {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent); // best-effort: cache directory setup
+        }
+        let _ = std::fs::write(&path, value); // best-effort: drawer state is recoverable UI cache
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(write);
+    } else {
+        write();
+    }
+}
+
+fn clear_desired_if(key: &str, occupant_id: &str) {
+    let matches = flags()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.occupant_for_key(key))
+        .is_some_and(|current| current == occupant_id);
+    if matches {
+        set_desired_key(key, None);
+    }
+}
+
 // ── keep-alive pane pool ─────────────────────────────────────────────────────
 
-/// Keep-alive file-manager drawers, one per worktree dir: hiding STASHES the
+/// The key for a pooled drawer pane. A global occupant uses the fixed global
+/// scope key, while worktree occupants use the existing slugged absolute path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DrawerPoolKey {
+    pub scope_key: String,
+    pub occupant_id: String,
+}
+
+impl DrawerPoolKey {
+    pub(crate) fn worktree(dir: &Path, occupant_id: impl Into<String>) -> Self {
+        Self {
+            scope_key: drawer_scope_key(DrawerScope::Worktree, dir),
+            occupant_id: occupant_id.into(),
+        }
+    }
+
+    pub(crate) fn global(occupant_id: impl Into<String>) -> Self {
+        Self {
+            scope_key: GLOBAL_SCOPE_KEY.to_string(),
+            occupant_id: occupant_id.into(),
+        }
+    }
+}
+
+/// Keep-alive drawer panes, one per `(scope, occupant)` key: hiding STASHES the
 /// pane (cursor position and manager state survive), showing takes it back
-/// instantly, and the worktree-change detector pre-warms the pool so the
-/// first toggle never waits on the manager's startup.
+/// instantly, and the worktree-change detector can pre-warm the pool.
 ///
 /// The pool is bounded by `[drawer].pool_limit`: hidden drawers are held in
 /// insertion order and the oldest is evicted (its pane torn down) once the
@@ -125,23 +208,33 @@ pub(crate) fn set_flag(dir: &Path, open: bool) {
 /// limit. `pool_limit = 0` disables pooling entirely (hiding kills the pane).
 #[derive(Default)]
 pub(crate) struct DrawerPool {
-    /// `(dir-key, pane-id)` in insertion order; front is the oldest (next to evict).
-    hidden: VecDeque<(String, u32)>,
+    /// `(scope/occupant key, pane-id)` in insertion order; front is oldest.
+    hidden: VecDeque<(DrawerPoolKey, u32)>,
 }
 
 impl DrawerPool {
-    fn key(dir: &Path) -> String {
-        FlagCache::key(dir)
+    fn legacy_key(dir: &Path) -> DrawerPoolKey {
+        DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID)
     }
     /// Stash `id` for `dir`, enforcing `limit`. A `limit` of 0 tears the pane
     /// down immediately (no pool); otherwise the oldest entries beyond the
     /// limit are evicted and their panes dropped from the table.
     pub(crate) fn stash(&mut self, dir: &Path, id: u32, limit: usize, panes: &mut Panes) {
+        self.stash_key(Self::legacy_key(dir), id, limit, panes);
+    }
+
+    /// Stash a pane under its complete scope/occupant key.
+    pub(crate) fn stash_key(
+        &mut self,
+        key: DrawerPoolKey,
+        id: u32,
+        limit: usize,
+        panes: &mut Panes,
+    ) {
         if limit == 0 {
             panes.table.remove(&id);
             return;
         }
-        let key = Self::key(dir);
         self.remove_key(&key, panes);
         self.hidden.push_back((key, id));
         while self.hidden.len() > limit {
@@ -151,13 +244,23 @@ impl DrawerPool {
         }
     }
     pub(crate) fn take(&mut self, dir: &Path) -> Option<u32> {
-        let key = Self::key(dir);
-        let idx = self.hidden.iter().position(|(k, _)| k == &key)?;
+        self.take_key(&Self::legacy_key(dir))
+    }
+
+    pub(crate) fn take_key(&mut self, key: &DrawerPoolKey) -> Option<u32> {
+        let idx = self.hidden.iter().position(|(k, _)| k == key)?;
         self.hidden.remove(idx).map(|(_, id)| id)
     }
     pub(crate) fn contains(&self, dir: &Path) -> bool {
-        let key = Self::key(dir);
-        self.hidden.iter().any(|(k, _)| k == &key)
+        self.contains_key(&Self::legacy_key(dir))
+    }
+    pub(crate) fn contains_key(&self, key: &DrawerPoolKey) -> bool {
+        self.hidden.iter().any(|(k, _)| k == key)
+    }
+    pub(crate) fn key_for_id(&self, id: u32) -> Option<DrawerPoolKey> {
+        self.hidden
+            .iter()
+            .find_map(|(key, pane)| (*pane == id).then(|| key.clone()))
     }
     /// Drop a pooled entry by pane id (e.g. its manager exited on its own).
     pub(crate) fn remove_id(&mut self, id: u32) -> bool {
@@ -168,7 +271,7 @@ impl DrawerPool {
         true
     }
     /// Drop the pooled entry for `key`, tearing down its pane.
-    fn remove_key(&mut self, key: &str, panes: &mut Panes) {
+    fn remove_key(&mut self, key: &DrawerPoolKey, panes: &mut Panes) {
         if let Some(idx) = self.hidden.iter().position(|(k, _)| k == key)
             && let Some((_, id)) = self.hidden.remove(idx)
         {
@@ -189,6 +292,13 @@ pub(crate) enum DrawerLaunch {
         cwd: Option<PathBuf>,
         env: Vec<(String, String)>,
     },
+    /// A configured `[[tools]]` drawer occupant. Unlike a file manager this
+    /// always uses the command catalog and the local ephemeral PTY seam.
+    Tool {
+        argv: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    },
     /// No runnable manager (binary missing, or an empty custom command): fall
     /// back to a worktree shell pane. Rare, config-degraded; resolved
     /// synchronously at the drain (as before).
@@ -197,6 +307,18 @@ pub(crate) enum DrawerLaunch {
 
 /// What rides the drawer channel: the worktree the spec is for + the result.
 pub(crate) type DrawerSpecMsg = (PathBuf, Result<DrawerLaunch, String>);
+
+/// A scope-aware cold-spawn request. Both fields are required to reject a
+/// result for a different occupant that raced with a picker/cycle change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrawerRequest {
+    pub scope: DrawerScope,
+    pub scope_key: String,
+    pub occupant_id: String,
+    pub worktree: PathBuf,
+}
+
+pub(crate) type DrawerRegistryMsg = (DrawerRequest, Result<DrawerLaunch, String>);
 
 struct Spawner {
     tx: tokio_mpsc::UnboundedSender<DrawerSpecMsg>,
@@ -305,6 +427,120 @@ fn manager_available(program: &str) -> bool {
     }
 }
 
+struct RegistrySpawner {
+    tx: tokio_mpsc::UnboundedSender<DrawerRegistryMsg>,
+    waker: TerminalWaker,
+    pending: Mutex<HashSet<(String, String)>>,
+}
+
+static REGISTRY_SPAWNER: OnceLock<RegistrySpawner> = OnceLock::new();
+
+/// Install the scope-aware registry channel. Kept separate from the legacy
+/// files-only channel so chunk 3 can migrate the loop in one integration edit.
+pub(crate) fn install_registry_spawner(
+    tx: tokio_mpsc::UnboundedSender<DrawerRegistryMsg>,
+    waker: TerminalWaker,
+) {
+    let _ = REGISTRY_SPAWNER.set(RegistrySpawner {
+        tx,
+        waker,
+        pending: Mutex::new(HashSet::new()),
+    });
+}
+
+/// Request a configured occupant's launch spec. Config/policy expansion and
+/// all PATH/filesystem checks happen in the blocking task, never on the loop.
+pub(crate) fn request_occupant_spawn(
+    cfg: &thegn_core::config::Config,
+    scope: DrawerScope,
+    occupant_id: &str,
+    dir: &Path,
+) {
+    let Some(spawner) = REGISTRY_SPAWNER.get() else {
+        return;
+    };
+    let scope_key = drawer_scope_key(scope, dir);
+    let pending_key = (scope_key.clone(), occupant_id.to_string());
+    {
+        let Ok(mut pending) = spawner.pending.lock() else {
+            return;
+        };
+        if !pending.insert(pending_key) {
+            return;
+        }
+    }
+    let request = DrawerRequest {
+        scope,
+        scope_key,
+        occupant_id: occupant_id.to_string(),
+        worktree: dir.to_path_buf(),
+    };
+    let tx = spawner.tx.clone();
+    let waker = spawner.waker.clone();
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = resolve_registry_launch(&cfg, &request);
+        if tx.send((request, result)).is_ok() {
+            let _ = waker.wake(); // best-effort: wake a waiting loop to drain the result
+        }
+    });
+}
+
+pub(crate) fn request_done_occupant(request: &DrawerRequest) {
+    if let Some(spawner) = REGISTRY_SPAWNER.get()
+        && let Ok(mut pending) = spawner.pending.lock()
+    {
+        pending.remove(&(request.scope_key.clone(), request.occupant_id.clone()));
+    }
+}
+
+fn resolve_registry_launch(
+    cfg: &thegn_core::config::Config,
+    request: &DrawerRequest,
+) -> Result<DrawerLaunch, String> {
+    let policy = DrawerPolicy::from_config(cfg);
+    let occupant = policy
+        .occupant(&request.occupant_id)
+        .ok_or_else(|| format!("unknown drawer occupant {:?}", request.occupant_id))?;
+    if !occupant.available_in(request.scope) {
+        return Err(format!(
+            "{} is not available in {:?} scope",
+            occupant.name, request.scope
+        ));
+    }
+    if request.occupant_id == FILES_OCCUPANT_ID {
+        return resolve_launch(cfg, &request.worktree);
+    }
+    resolve_tool_launch(occupant, request.scope, &request.worktree, cfg)
+}
+
+fn resolve_tool_launch(
+    occupant: &DrawerOccupant,
+    scope: DrawerScope,
+    worktree: &Path,
+    cfg: &thegn_core::config::Config,
+) -> Result<DrawerLaunch, String> {
+    let home = thegn_core::util::home();
+    let cwd = resolve_drawer_cwd(scope, occupant.drawer_cwd.as_deref(), worktree, &home)?;
+    if !cwd.is_dir() {
+        return Err(format!("drawer cwd {} is not a directory", cwd.display()));
+    }
+    let argv = crate::panes::tool_drawer_argv(&occupant.command);
+    if argv.is_empty() {
+        return Err(format!("{} has an empty drawer command", occupant.name));
+    }
+    let env = occupant
+        .env
+        .iter()
+        .filter_map(|(key, value)| expand_env_ref(value).map(|value| (key.clone(), value)))
+        .collect();
+    Ok(DrawerLaunch::Tool {
+        argv: contain_drawer_argv(cfg, argv, thegn_core::util::have("systemd-run")),
+        cwd,
+        env,
+    })
+}
+
 /// The loop half: openpty+exec a resolved launch — cheap and sanctioned on the
 /// loop (mirrors `materialize_with_specs`' split).
 pub(crate) fn open_resolved(
@@ -319,6 +555,9 @@ pub(crate) fn open_resolved(
         // spawn_argv_env_local).
         DrawerLaunch::Manager { argv, cwd, env } => panes
             .spawn_argv_env_local(&argv, cwd.as_deref().or(Some(dir)), &env, rect)
+            .ok(),
+        DrawerLaunch::Tool { argv, cwd, env } => panes
+            .spawn_argv_env_local(&argv, Some(&cwd), &env, rect)
             .ok(),
         DrawerLaunch::ShellFallback => {
             crate::run::spawn_worktree_shell_pane(panes, cfg, Some(dir), rect).ok()
@@ -441,6 +680,273 @@ pub(crate) fn sync_drawer_persistence(
     }
 }
 
+/// The currently visible drawer occupant. The pool key is authoritative for
+/// reuse; `home` is retained for the legacy file-manager compatibility path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisibleDrawer {
+    pub key: DrawerPoolKey,
+    pub scope: DrawerScope,
+    pub worktree: PathBuf,
+    pub pane_id: u32,
+}
+
+/// Scope-aware drawer lifecycle shared by keyboard actions and the loop drain.
+/// It contains only in-memory state and delegates cold work to the channel
+/// spawner above.
+#[derive(Default)]
+pub(crate) struct DrawerRuntime {
+    pub visible: Option<VisibleDrawer>,
+    pub pool: DrawerPool,
+    last: HashMap<String, String>,
+}
+
+impl DrawerRuntime {
+    fn target(dir: &Path) -> Option<(DrawerScope, DrawerPoolKey, String)> {
+        if let Some(id) = desired_occupant(DrawerScope::Worktree, dir) {
+            return Some((DrawerScope::Worktree, DrawerPoolKey::worktree(dir, &id), id));
+        }
+        desired_occupant(DrawerScope::Global, dir)
+            .map(|id| (DrawerScope::Global, DrawerPoolKey::global(&id), id))
+    }
+
+    fn stash_visible(&mut self, cfg: &thegn_core::config::Config, panes: &mut Panes) {
+        if let Some(visible) = self.visible.take() {
+            self.pool
+                .stash_key(visible.key, visible.pane_id, cfg.drawer.pool_limit, panes);
+        }
+    }
+
+    fn show_target(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        scope: DrawerScope,
+        key: DrawerPoolKey,
+        occupant_id: String,
+        dir: &Path,
+    ) {
+        if let Some(pane_id) = self.pool.take_key(&key) {
+            self.visible = Some(VisibleDrawer {
+                key,
+                scope,
+                worktree: dir.to_path_buf(),
+                pane_id,
+            });
+        } else {
+            request_occupant_spawn(cfg, scope, &occupant_id, dir);
+        }
+    }
+
+    /// Reconcile visibility after a worktree switch. An open worktree slot
+    /// wins over an open global slot; the outgoing process is stashed by its
+    /// complete scope/occupant key.
+    pub(crate) fn reconcile(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        dir: &Path,
+        panes: &mut Panes,
+        _rect: Rect,
+    ) {
+        let wanted = Self::target(dir);
+        if let Some((scope, key, id)) = wanted {
+            if self
+                .visible
+                .as_ref()
+                .is_some_and(|visible| visible.key == key)
+            {
+                return;
+            }
+            if self.visible.is_some() {
+                self.stash_visible(cfg, panes);
+            }
+            self.show_target(cfg, scope, key, id, dir);
+        } else if self.visible.is_some() {
+            self.stash_visible(cfg, panes);
+        }
+    }
+
+    /// Select an occupant for a scope. Global selection of the built-in files
+    /// occupant is normalized to the active worktree files slot because the
+    /// global state slot is reserved for configured global tools.
+    pub(crate) fn select(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        scope: DrawerScope,
+        occupant_id: &str,
+        dir: &Path,
+        panes: &mut Panes,
+        rect: Rect,
+    ) -> bool {
+        let policy = DrawerPolicy::from_config(cfg);
+        let Some(occupant) = policy.occupant(occupant_id) else {
+            return false;
+        };
+        if !occupant.available_in(scope) {
+            return false;
+        }
+        let (state_scope, id) = if scope == DrawerScope::Global && occupant_id == FILES_OCCUPANT_ID
+        {
+            (DrawerScope::Worktree, FILES_OCCUPANT_ID)
+        } else {
+            (scope, occupant_id)
+        };
+        self.last
+            .insert(drawer_scope_key(state_scope, dir), id.to_string());
+        set_desired_occupant(state_scope, dir, Some(id));
+        self.reconcile(cfg, dir, panes, rect);
+        true
+    }
+
+    /// Close the active scope's desired occupant. The live pane is reconciled
+    /// immediately, while any pooled pane remains available only until its
+    /// persisted slot is selected again.
+    pub(crate) fn close(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        scope: DrawerScope,
+        dir: &Path,
+        panes: &mut Panes,
+        rect: Rect,
+    ) {
+        set_desired_occupant(scope, dir, None);
+        self.reconcile(cfg, dir, panes, rect);
+    }
+
+    /// Toggle the last occupant in a scope. Closing remembers the occupant so
+    /// reopening the compact files action restores the same tool; a fresh
+    /// scope falls back to the built-in files occupant.
+    pub(crate) fn toggle(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        scope: DrawerScope,
+        dir: &Path,
+        panes: &mut Panes,
+        rect: Rect,
+    ) {
+        if desired_occupant(scope, dir).is_some() {
+            self.close(cfg, scope, dir, panes, rect);
+            return;
+        }
+        let key = drawer_scope_key(scope, dir);
+        let id = self
+            .last
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| FILES_OCCUPANT_ID.into());
+        if scope == DrawerScope::Global && id == FILES_OCCUPANT_ID {
+            return;
+        }
+        let _ = self.select(cfg, scope, &id, dir, panes, rect);
+    }
+
+    /// Cycle through the effective registry in config order. The files row is
+    /// always first and remains the fallback when no configured occupant is
+    /// available for the requested scope.
+    pub(crate) fn cycle(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        scope: DrawerScope,
+        dir: &Path,
+        panes: &mut Panes,
+        rect: Rect,
+    ) -> Option<String> {
+        let policy = DrawerPolicy::from_config(cfg);
+        let occupants = policy.occupants_for(scope);
+        if occupants.is_empty() {
+            return None;
+        }
+        let current = desired_occupant(scope, dir).unwrap_or_else(|| FILES_OCCUPANT_ID.into());
+        let index = occupants
+            .iter()
+            .position(|occupant| occupant.id == current)
+            .unwrap_or(0);
+        let next = occupants[(index + 1) % occupants.len()].id.clone();
+        if scope == DrawerScope::Global && next == FILES_OCCUPANT_ID {
+            self.close(cfg, scope, dir, panes, rect);
+        } else {
+            self.select(cfg, scope, &next, dir, panes, rect);
+        }
+        Some(next)
+    }
+
+    /// Apply one cold result. A result is opened only when both scope key and
+    /// occupant still match the desired state; otherwise it is discarded.
+    pub(crate) fn apply_result(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        request: DrawerRequest,
+        result: Result<DrawerLaunch, String>,
+        dir: &Path,
+        panes: &mut Panes,
+        rect: Rect,
+    ) {
+        request_done_occupant(&request);
+        let desired = desired_occupant(request.scope, &request.worktree);
+        if desired.as_deref() != Some(request.occupant_id.as_str()) {
+            return;
+        }
+        let key = DrawerPoolKey {
+            scope_key: request.scope_key.clone(),
+            occupant_id: request.occupant_id.clone(),
+        };
+        let launch = match result {
+            Ok(launch) => launch,
+            Err(error) => {
+                thegn_core::msg::warn(&format!("drawer {}: {error}", request.occupant_id));
+                set_desired_key(&request.scope_key, None);
+                if self
+                    .visible
+                    .as_ref()
+                    .is_some_and(|visible| visible.key == key)
+                {
+                    self.visible = None;
+                }
+                return;
+            }
+        };
+        let active = Self::target(dir).is_some_and(|(_, active_key, _)| active_key == key);
+        if active && self.visible.is_none() {
+            if let Some(pane_id) = open_resolved(panes, launch, cfg, &request.worktree, rect) {
+                self.visible = Some(VisibleDrawer {
+                    key,
+                    scope: request.scope,
+                    worktree: request.worktree,
+                    pane_id,
+                });
+            } else {
+                thegn_core::msg::warn(&format!("drawer {} failed to spawn", request.occupant_id));
+                set_desired_key(&request.scope_key, None);
+            }
+        } else if cfg.drawer.pool_limit > 0
+            && !self.pool.contains_key(&key)
+            && let Some(pane_id) = open_resolved(panes, launch, cfg, &request.worktree, rect)
+        {
+            self.pool
+                .stash_key(key, pane_id, cfg.drawer.pool_limit, panes);
+        }
+    }
+
+    /// Remove a drawer pane from the visible slot or pool and clear its
+    /// persisted desired occupant. This is called when the PTY exits on its
+    /// own, so a dead process cannot be resurrected on the next switch.
+    pub(crate) fn on_exit(&mut self, pane_id: u32, panes: &mut Panes) {
+        if let Some(key) = self.pool.key_for_id(pane_id) {
+            self.pool.remove_id(pane_id);
+            clear_desired_if(&key.scope_key, &key.occupant_id);
+            panes.table.remove(&pane_id);
+        }
+        if self
+            .visible
+            .as_ref()
+            .is_some_and(|visible| visible.pane_id == pane_id)
+        {
+            if let Some(visible) = self.visible.take() {
+                clear_desired_if(&visible.key.scope_key, &visible.key.occupant_id);
+            }
+            panes.table.remove(&pane_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +982,41 @@ mod tests {
         let empty = FlagCache::load_from(&store.join("nope"));
         assert!(!empty.get(open), "missing store dir = all closed");
         let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn state_cache_decodes_legacy_flags_and_occupant_ids() {
+        let store =
+            std::env::temp_dir().join(format!("tg-drawer-occupants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store); // best-effort: test scratch cleanup
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("legacy-open"), "true").unwrap();
+        std::fs::write(store.join("legacy-closed"), "false").unwrap();
+        std::fs::write(store.join("tool"), "tool:db\n").unwrap();
+
+        let cache = FlagCache::load_from(&store);
+        assert_eq!(cache.occupant_for_key("legacy-open"), Some("files".into()));
+        assert_eq!(cache.occupant_for_key("legacy-closed"), None);
+        assert_eq!(cache.occupant_for_key("tool"), Some("tool:db".into()));
+        let _ = std::fs::remove_dir_all(&store); // best-effort: test scratch cleanup
+    }
+
+    #[test]
+    fn pool_keys_isolate_occupants_and_global_scope() {
+        let worktree = Path::new("/tmp/wt");
+        let files = DrawerPoolKey::worktree(worktree, FILES_OCCUPANT_ID);
+        let tool = DrawerPoolKey::worktree(worktree, "tool:db");
+        let global = DrawerPoolKey::global("tool:db");
+        assert_ne!(files, tool);
+        assert_ne!(tool, global);
+
+        let (tx, _rx) = tokio_mpsc::channel(crate::panes::PANE_EVENT_CHANNEL_CAPACITY);
+        let mut panes = Panes::new(tx);
+        let mut pool = DrawerPool::default();
+        pool.stash_key(tool.clone(), 7, 3, &mut panes);
+        assert!(pool.contains_key(&tool));
+        assert!(!pool.contains_key(&global));
+        assert_eq!(pool.take_key(&tool), Some(7));
     }
 
     #[test]
