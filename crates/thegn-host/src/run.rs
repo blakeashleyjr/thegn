@@ -825,6 +825,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
     let config_path = thegn_core::config::Config::path();
+    let theme_config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(thegn_core::config::Config::path);
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
@@ -1040,12 +1044,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         );
     }
 
-    let theme_store = crate::theme_store::ThemeStore::spawn(
-        waker.clone(),
-        cli.config
-            .clone()
-            .unwrap_or_else(thegn_core::config::Config::path),
-    );
+    let theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), theme_config_path);
     let result = event_loop(
         &mut buf,
         session,
@@ -6318,7 +6317,8 @@ async fn event_loop<T: Terminal>(
     // The toast deadline a one-shot wake is already armed for (see the prune
     // block), so repeated frames don't spawn duplicate sleepers.
     let mut toast_wake_armed: Option<std::time::Instant> = None;
-    // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
+    // Live theme-cycle position within the merged built-in/user catalog
+    // (Ctrl+Alt+t).
     let mut theme_idx: usize = thegn_core::theme::PRESETS
         .iter()
         .position(|p| *p == keymap.config().theme.preset)
@@ -12700,6 +12700,7 @@ async fn event_loop<T: Terminal>(
                         my,
                         Rect::full(cols, rows),
                         current_config.ui.dismiss_overlay_on_click_outside,
+                        &mut mouse_left_down,
                     );
                     if !keep {
                         theme_builder = None;
@@ -20428,17 +20429,16 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::CycleTheme => {
-                                // Live theme cycle: presets resolve through
-                                // the config so [theme.colors] customizations
-                                // ride along. Set `[theme] preset` to persist.
-                                let presets = thegn_core::theme::PRESETS;
-                                theme_idx = (theme_idx + 1) % presets.len();
-                                let name = presets[theme_idx];
-                                crate::chrome::set_palette(
-                                    current_config.palette_with_preset(name),
+                                let themes = crate::theme_builder::cycle_catalog(
+                                    &current_config,
+                                    &theme_users,
                                 );
-                                model.status =
-                                    format!("Theme: {name} (set [theme] preset to keep)");
+                                if !themes.is_empty() {
+                                    theme_idx = (theme_idx + 1) % themes.len();
+                                    let (name, palette) = &themes[theme_idx];
+                                    crate::chrome::set_palette(palette.clone());
+                                    model.status = format!("Theme: {name}");
+                                }
                             }
                             Action::ThemeBuilderOpen => {
                                 let builder = crate::handlers::theme_builder::open(

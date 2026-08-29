@@ -18,12 +18,16 @@ enum Request {
     Scan,
     Import(PathBuf),
     Save(UserTheme),
-    Apply { preset: String, theme: UserTheme },
+    Apply {
+        preset: String,
+        theme: UserTheme,
+        persist_theme: bool,
+    },
 }
 
 #[derive(Debug)]
 enum Work {
-    Request(Request),
+    Request(Box<Request>),
     Changed,
 }
 
@@ -52,6 +56,7 @@ impl ThemeStore {
         std::thread::Builder::new()
             .name("theme-store".into())
             .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 worker(
                     request_rx,
                     result_tx,
@@ -66,21 +71,27 @@ impl ThemeStore {
     }
 
     pub(crate) fn scan(&self) {
-        let _ = self.request.send(Work::Request(Request::Scan));
+        let _ = self.request.send(Work::Request(Box::new(Request::Scan)));
     }
 
     pub(crate) fn import(&self, path: PathBuf) {
-        let _ = self.request.send(Work::Request(Request::Import(path)));
+        let _ = self
+            .request
+            .send(Work::Request(Box::new(Request::Import(path))));
     }
 
     pub(crate) fn save(&self, theme: UserTheme) {
-        let _ = self.request.send(Work::Request(Request::Save(theme)));
-    }
-
-    pub(crate) fn apply(&self, preset: String, theme: UserTheme) {
         let _ = self
             .request
-            .send(Work::Request(Request::Apply { preset, theme }));
+            .send(Work::Request(Box::new(Request::Save(theme))));
+    }
+
+    pub(crate) fn apply(&self, preset: String, theme: UserTheme, persist_theme: bool) {
+        let _ = self.request.send(Work::Request(Box::new(Request::Apply {
+            preset,
+            theme,
+            persist_theme,
+        })));
     }
 
     pub(crate) fn try_recv(&mut self) -> Option<ThemeStoreResult> {
@@ -96,6 +107,9 @@ fn worker(
     config_path: PathBuf,
     watcher_tx: mpsc::Sender<Work>,
 ) {
+    if let Err(error) = std::fs::create_dir_all(&themes_dir) {
+        tracing::warn!(target: "thegn::theme", error = %error, "theme directory unavailable");
+    }
     let mut watcher = recommended_watcher(move |result: notify::Result<Event>| {
         if result.is_ok_and(|event| {
             matches!(
@@ -118,23 +132,33 @@ fn worker(
                 while request_rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
                 publish_catalog(&themes_dir, &result_tx, &waker);
             }
-            Work::Request(Request::Scan) => publish_catalog(&themes_dir, &result_tx, &waker),
-            Work::Request(Request::Import(path)) => {
-                let result = read_bounded(&path).and_then(|bytes| {
-                    thegn_core::theme_import::import_gogh(&bytes).map_err(|e| e.to_string())
-                });
-                publish(&result_tx, &waker, ThemeStoreResult::Imported(result));
-            }
-            Work::Request(Request::Save(theme)) => {
-                let result = write_theme(&themes_dir, &theme).map(|_| theme);
-                publish(&result_tx, &waker, ThemeStoreResult::Saved(result));
-            }
-            Work::Request(Request::Apply { preset, theme }) => {
-                let result = write_theme(&themes_dir, &theme)
-                    .and_then(|_| write_config(&config_path, &preset, &theme))
+            Work::Request(request) => match *request {
+                Request::Scan => publish_catalog(&themes_dir, &result_tx, &waker),
+                Request::Import(path) => {
+                    let result = read_bounded(&path).and_then(|bytes| {
+                        thegn_core::theme_import::import_gogh(&bytes).map_err(|e| e.to_string())
+                    });
+                    publish(&result_tx, &waker, ThemeStoreResult::Imported(result));
+                }
+                Request::Save(theme) => {
+                    let result = write_theme(&themes_dir, &theme).map(|_| theme);
+                    publish(&result_tx, &waker, ThemeStoreResult::Saved(result));
+                }
+                Request::Apply {
+                    preset,
+                    theme,
+                    persist_theme,
+                } => {
+                    let result = (|| {
+                        if persist_theme {
+                            write_theme(&themes_dir, &theme)?;
+                        }
+                        write_config(&config_path, &preset, &theme)
+                    })()
                     .map(|_| theme);
-                publish(&result_tx, &waker, ThemeStoreResult::Applied(result));
-            }
+                    publish(&result_tx, &waker, ThemeStoreResult::Applied(result));
+                }
+            },
         }
     }
 }

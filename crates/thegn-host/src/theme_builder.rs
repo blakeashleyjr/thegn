@@ -6,6 +6,7 @@ use termwiz::input::{KeyCode, Modifiers, MouseButtons, MouseEvent};
 use termwiz::surface::Surface;
 
 use thegn_core::theme::{Hue, Palette};
+use thegn_core::theme_contrast::{self, Bar};
 use thegn_core::theme_user::UserTheme;
 
 use crate::chrome::S;
@@ -77,7 +78,11 @@ pub(crate) enum BuilderEvent {
     Close,
     Import(PathBuf),
     Save(UserTheme),
-    Apply { preset: String, theme: UserTheme },
+    Apply {
+        preset: String,
+        theme: UserTheme,
+        persist_theme: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +117,11 @@ impl ThemeBuilder {
             .get(selected)
             .map(|item| item.theme.clone())
             .unwrap_or_else(|| UserTheme::from_palette(&cfg.theme.preset, &cfg.palette()));
-        let candidate = draft.palette().unwrap_or_else(|_| cfg.palette());
+        let candidate = user_themes
+            .iter()
+            .find(|theme| theme.meta.name == cfg.theme.preset)
+            .and_then(|theme| theme.palette().ok())
+            .unwrap_or_else(|| cfg.palette());
         Self {
             snapshot: cfg.palette(),
             candidate,
@@ -132,11 +141,7 @@ impl ThemeBuilder {
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
-        self.candidate != &self.snapshot
-    }
-
-    pub(crate) fn active(&self) -> bool {
-        true
+        self.candidate != self.snapshot
     }
 
     pub(crate) fn set_catalog(&mut self, cfg: &thegn_core::config::Config, users: &[UserTheme]) {
@@ -171,13 +176,15 @@ impl ThemeBuilder {
         my: usize,
         screen: Rect,
         dismiss_outside: bool,
+        mouse_left_down: &mut bool,
     ) -> BuilderEvent {
         let spec = layer_spec();
         let Some(outer) = box_rect(&spec, screen) else {
             return BuilderEvent::None;
         };
         let left = event.mouse_buttons.contains(MouseButtons::LEFT);
-        let press = left && !event.mouse_buttons.contains(MouseButtons::MOTION);
+        let press = left && !*mouse_left_down;
+        *mouse_left_down = left;
         if !outer.contains(mx, my) {
             if press && dismiss_outside && !self.is_dirty() && self.input.is_none() {
                 return BuilderEvent::Close;
@@ -247,10 +254,8 @@ impl ThemeBuilder {
                         }
                     }
                 }
-                KeyCode::Char(c) => {
-                    if !c.is_control() {
-                        value.push(*c);
-                    }
+                KeyCode::Char(c) if !c.is_control() => {
+                    value.push(*c);
                 }
                 _ => {}
             }
@@ -360,6 +365,10 @@ impl ThemeBuilder {
                 .map(|item| item.name.clone())
                 .unwrap_or_else(|| self.draft.meta.name.clone()),
             theme: self.draft.clone(),
+            persist_theme: self
+                .catalog
+                .get(self.selected)
+                .is_some_and(|item| !item.builtin),
         }
     }
 
@@ -407,6 +416,33 @@ impl ThemeBuilder {
         }
     }
 
+    pub(crate) fn saved(&mut self, result: Result<UserTheme, String>) {
+        match result {
+            Ok(theme) => {
+                self.store_completed(Ok(theme.clone()));
+                if let Some(index) = self
+                    .catalog
+                    .iter()
+                    .position(|item| item.name == theme.meta.name)
+                {
+                    if !self.catalog[index].builtin {
+                        self.catalog[index].theme = theme;
+                        self.selected = index;
+                    }
+                } else {
+                    self.catalog.push(CatalogItem {
+                        name: theme.meta.name.clone(),
+                        theme,
+                        builtin: false,
+                    });
+                    self.selected = self.catalog.len() - 1;
+                }
+                self.status = Some("Theme saved".into());
+            }
+            Err(error) => self.store_completed(Err(error)),
+        }
+    }
+
     pub(crate) fn cancel_palette(&self) -> Palette {
         self.snapshot.clone()
     }
@@ -418,10 +454,6 @@ impl ThemeBuilder {
     pub(crate) fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
-
-    pub(crate) fn input_value(&self) -> Option<&str> {
-        self.input.as_ref().map(|(_, value)| value.as_str())
-    }
 }
 
 fn catalog(cfg: &thegn_core::config::Config, users: &[UserTheme]) -> Vec<CatalogItem> {
@@ -429,7 +461,7 @@ fn catalog(cfg: &thegn_core::config::Config, users: &[UserTheme]) -> Vec<Catalog
         .iter()
         .map(|name| CatalogItem {
             name: (*name).into(),
-            theme: UserTheme::from_palette(name, &cfg.palette_with_preset(name)),
+            theme: UserTheme::from_palette(*name, &cfg.palette_with_preset(name)),
             builtin: true,
         })
         .collect::<Vec<_>>();
@@ -443,6 +475,21 @@ fn catalog(cfg: &thegn_core::config::Config, users: &[UserTheme]) -> Vec<Catalog
         }
     }
     out
+}
+
+pub(crate) fn cycle_catalog(
+    cfg: &thegn_core::config::Config,
+    users: &[UserTheme],
+) -> Vec<(String, Palette)> {
+    catalog(cfg, users)
+        .into_iter()
+        .filter_map(|item| {
+            item.theme
+                .palette()
+                .ok()
+                .map(|palette| (item.name, palette))
+        })
+        .collect()
 }
 
 fn role_value(theme: &UserTheme, role: ColorRole) -> String {
@@ -548,6 +595,24 @@ impl ThemeBuilder {
             return;
         };
         let panel = Tok::Slot(S::Panel);
+        let bar = if self
+            .catalog
+            .get(self.selected)
+            .is_some_and(|item| item.name == thegn_core::theme::PRESETS[0])
+        {
+            Bar::Default
+        } else {
+            Bar::Preset
+        };
+        let findings = theme_contrast::audit(&self.candidate, bar);
+        let contrast = if findings.is_empty() {
+            seg(Tok::Slot(S::ActivityDone), "contrast ok")
+        } else {
+            seg(
+                Tok::Hue(Hue::Amber),
+                format!("contrast warning ({})", findings.len()),
+            )
+        };
         seg::draw_line(
             surface,
             inner.x,
@@ -557,6 +622,8 @@ impl ThemeBuilder {
                 seg(Tok::Slot(S::Accent), "catalog").bold(),
                 sp(2),
                 seg(Tok::Slot(S::Dim), "editable palette + live preview"),
+                sp(2),
+                contrast,
             ]),
             panel,
         );
@@ -608,7 +675,11 @@ impl ThemeBuilder {
             } else {
                 role_token(*role)
             };
-            let prefix = if focused { "› " } else { "  " };
+            let prefix = if focused {
+                format!("{} ", crate::caps::glyph(crate::caps::Glyph::ArrowRight))
+            } else {
+                "  ".to_string()
+            };
             seg::draw_line(
                 surface,
                 inner.x + CATALOG_COLS + 2,
@@ -634,7 +705,7 @@ impl ThemeBuilder {
                 action_y,
                 inner.cols.saturating_sub(CATALOG_COLS + 2),
                 &Line::segs(vec![
-                    Seg::key(" Apply ".into()),
+                    Seg::key(" Apply "),
                     sp(1),
                     seg(Tok::Slot(S::Text), "Enter"),
                     sp(2),
@@ -698,7 +769,7 @@ fn render_preview(surface: &mut Surface, inner: Rect, panel: Tok) {
             sp(1),
             seg(Tok::Slot(S::Focus), "focused tab"),
             sp(1),
-            seg(Tok::Hue(Hue::Purple), "●"),
+            seg(Tok::Hue(Hue::Purple), dot),
         ]),
         Line::segs(vec![
             seg(Tok::Slot(S::ActivityActive), " status "),
@@ -721,7 +792,7 @@ fn render_preview(surface: &mut Surface, inner: Rect, panel: Tok) {
             sp(1),
             seg(Tok::Slot(S::Text), "structural text"),
             sp(1),
-            seg(Tok::Slot(S::Ghost3), "···"),
+            seg(Tok::Slot(S::Ghost3), format!("{dot}{dot}{dot}")),
         ]),
         Line::segs(vec![
             seg(Tok::SelAccent, " selected row "),
@@ -736,5 +807,69 @@ fn render_preview(surface: &mut Surface, inner: Rect, panel: Tok) {
             break;
         }
         seg::draw_line(surface, x, y + row, inner.cols.min(48), line, panel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder() -> ThemeBuilder {
+        ThemeBuilder::open(&thegn_core::config::Config::default(), &[])
+    }
+
+    #[test]
+    fn catalog_keeps_builtins_ahead_of_users_and_builtin_names_win() {
+        let cfg = thegn_core::config::Config::default();
+        let user = UserTheme::from_palette(
+            thegn_core::theme::PRESETS[0],
+            &cfg.palette_with_preset(thegn_core::theme::PRESETS[0]),
+        );
+        let items = catalog(&cfg, &[user]);
+        assert_eq!(items.len(), thegn_core::theme::PRESETS.len());
+        assert!(items[0].builtin);
+    }
+
+    #[test]
+    fn color_edit_cancel_restores_the_snapshot() {
+        let mut b = builder();
+        let original = role_value(&b.draft, ColorRole::Bg0);
+        b.editing = Some((ColorRole::Bg0, original.clone(), original.len()));
+        set_role(&mut b.draft, ColorRole::Bg0, "#ffffff".into());
+        b.refresh_candidate();
+        assert!(b.is_dirty());
+        assert_eq!(
+            b.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            BuilderEvent::None
+        );
+        assert_eq!(b.cancel_palette(), b.snapshot);
+        assert_eq!(role_value(&b.draft, ColorRole::Bg0), original);
+    }
+
+    #[test]
+    fn pasted_path_is_data_and_control_characters_are_removed() {
+        let mut b = builder();
+        b.input = Some((InputMode::ImportPath, String::new()));
+        assert!(b.handle_paste(" /tmp/theme.yml\n"));
+        assert_eq!(b.input_value_for_test(), Some("/tmp/theme.yml"));
+    }
+
+    #[test]
+    fn small_render_is_safe_and_apply_is_an_explicit_action() {
+        let b = builder();
+        let mut surface = Surface::new(80, 24);
+        b.render(&mut surface, Rect::full(80, 24));
+        let mut b = builder();
+        b.focus = ACTION_ROW;
+        assert!(matches!(
+            b.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            BuilderEvent::Apply { .. }
+        ));
+    }
+
+    impl ThemeBuilder {
+        fn input_value_for_test(&self) -> Option<&str> {
+            self.input.as_ref().map(|(_, value)| value.as_str())
+        }
     }
 }
