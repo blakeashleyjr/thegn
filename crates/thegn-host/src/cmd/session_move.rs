@@ -19,6 +19,8 @@ use thegn_svc::control::client::ControlClient;
 
 use super::session::SessionAction;
 
+const OPAQUE_PAYLOAD_WARNING: &str = "opaque pane commands, scrollback, dispatch reports, and notes are carried unchanged and are not included in this audit";
+
 /// The stable, payload-free audit emitted by a move. Opaque commands,
 /// scrollback, reports, notes, and credentials are deliberately absent.
 #[derive(Debug, Serialize)]
@@ -36,6 +38,7 @@ struct MigrationAudit {
     target_confirmed: bool,
     source_deleted: bool,
     resumed: bool,
+    opaque_payload_warning: String,
     notification: NotificationAudit,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -64,6 +67,7 @@ impl MigrationAudit {
             target_confirmed: false,
             source_deleted: false,
             resumed: false,
+            opaque_payload_warning: OPAQUE_PAYLOAD_WARNING.to_string(),
             notification: NotificationAudit {
                 status: "not_attempted".to_string(),
                 warning: None,
@@ -425,21 +429,28 @@ fn report(audit: &MigrationAudit, json: bool) -> Result<()> {
     if json {
         return super::emit_json(audit);
     }
-    outln!(
+    outln!("{}", human_report(audit));
+    Ok(())
+}
+
+fn human_report(audit: &MigrationAudit) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
         "session migration{}",
         if audit.dry_run { " (dry-run)" } else { "" }
-    );
-    outln!("  source profile: {}", audit.source_profile);
-    outln!("  target profile: {}", audit.target_profile);
-    outln!(
+    ));
+    lines.push(format!("  source profile: {}", audit.source_profile));
+    lines.push(format!("  target profile: {}", audit.target_profile));
+    lines.push(format!("  worktree: {}", audit.worktree));
+    lines.push(format!(
         "  groups: {}",
         if audit.groups.is_empty() {
             "(none)".to_string()
         } else {
             audit.groups.join(", ")
         }
-    );
-    outln!(
+    ));
+    lines.push(format!(
         "  rows: worktrees={} tab_groups={} group_tabs={} ui_state={} dispatches={} notes={}",
         audit.counts.worktrees,
         audit.counts.tab_groups,
@@ -447,21 +458,25 @@ fn report(audit: &MigrationAudit, json: bool) -> Result<()> {
         audit.counts.ui_state,
         audit.counts.dispatches,
         audit.counts.dispatch_notes
-    );
-    outln!("  live IDs: {}", display_ids(&audit.live_ids));
-    outln!("  killed IDs: {}", display_ids(&audit.killed_ids));
-    outln!("  target committed: {}", audit.target_committed);
-    outln!("  target confirmed: {}", audit.target_confirmed);
-    outln!("  source deleted: {}", audit.source_deleted);
-    outln!("  resumed: {}", audit.resumed);
-    outln!("  notification: {}", audit.notification.status);
+    ));
+    lines.push(format!("  live IDs: {}", display_ids(&audit.live_ids)));
+    lines.push(format!("  killed IDs: {}", display_ids(&audit.killed_ids)));
+    lines.push(format!("  target committed: {}", audit.target_committed));
+    lines.push(format!("  target confirmed: {}", audit.target_confirmed));
+    lines.push(format!("  source deleted: {}", audit.source_deleted));
+    lines.push(format!("  resumed: {}", audit.resumed));
+    lines.push(format!(
+        "  opaque payload warning: {}",
+        audit.opaque_payload_warning
+    ));
+    lines.push(format!("  notification: {}", audit.notification.status));
     if let Some(warning) = &audit.notification.warning {
-        outln!("  warning: {warning}");
+        lines.push(format!("  warning: {warning}"));
     }
     if let Some(error) = &audit.error {
-        outln!("  error: {error}");
+        lines.push(format!("  error: {error}"));
     }
-    Ok(())
+    lines.join("\n")
 }
 
 fn display_ids(ids: &[String]) -> String {
@@ -602,5 +617,24 @@ mod tests {
         ] {
             assert!(!encoded.contains(secret), "audit leaked {secret}");
         }
+    }
+
+    #[test]
+    fn dry_run_reports_opaque_payload_warning_in_human_and_json_modes() {
+        let audit = MigrationAudit::new("source", "target", "/worktree", true);
+        let human = human_report(&audit);
+        assert!(human.contains(OPAQUE_PAYLOAD_WARNING));
+
+        let json = serde_json::to_value(&audit).unwrap();
+        assert_eq!(
+            json["opaque_payload_warning"].as_str(),
+            Some(OPAQUE_PAYLOAD_WARNING)
+        );
+        assert!(
+            json["opaque_payload_warning"]
+                .as_str()
+                .unwrap()
+                .contains("carried unchanged")
+        );
     }
 }
