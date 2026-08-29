@@ -235,8 +235,10 @@ mod tests {
         let mut base = Palette::default();
         extend_palette(&mut base);
         let user = UserTheme::from_palette("local-paper", &base);
-        let mut colors = ThemeColors::default();
-        colors.bg0 = Some("#123456".into());
+        let colors = ThemeColors {
+            bg0: Some("#123456".into()),
+            ..ThemeColors::default()
+        };
         let hues = ThemeHues::default();
 
         let first = palette_with_catalog(
