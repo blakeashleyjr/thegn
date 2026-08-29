@@ -78,6 +78,8 @@ pub(crate) fn spawn_scan(
         let mut counted = 0u32;
         for path_s in &due {
             let path = std::path::Path::new(path_s);
+            // loc_scan owns the repository boundary rule: a gitlink's checked
+            // out source is not part of the superproject's LOC total.
             let Some(report) = crate::loc_scan::scan(path) else {
                 // Unreadable or empty: drop any previous count rather than let
                 // the chip keep showing a number for a tree that is gone.

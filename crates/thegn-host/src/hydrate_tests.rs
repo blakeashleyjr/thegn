@@ -2,6 +2,29 @@ use super::*;
 use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
+fn glyph_row(
+    dirty: bool,
+    ahead: usize,
+    behind: usize,
+    branch: Option<&str>,
+    repo_root: &str,
+    add: u32,
+    del: u32,
+    branch_diff: Option<(u32, u32)>,
+) -> GlyphRow {
+    GlyphRow {
+        dirty,
+        ahead,
+        behind,
+        branch: branch.map(str::to_string),
+        repo_root: repo_root.into(),
+        add,
+        del,
+        branch_diff,
+        submodule_dirty: false,
+    }
+}
+
 #[test]
 fn pr_clean_decision_only_acts_on_definitive_states() {
     // Both policies enabled: cleaning is still gated on a DEFINITIVE state.
@@ -210,19 +233,11 @@ fn glyph_scan_clean_read_updates() {
         "/repo".into(),
         Ok((42, 7)),
         Ok(Some((310, 84))),
+        Ok(false),
     );
     assert_eq!(
         row,
-        (
-            true,
-            4,
-            1,
-            Some("feat".into()),
-            "/repo".into(),
-            42,
-            7,
-            Some((310, 84))
-        )
+        glyph_row(true, 4, 1, Some("feat"), "/repo", 42, 7, Some((310, 84)))
     );
     assert!(clean);
 }
@@ -232,16 +247,7 @@ fn glyph_scan_no_upstream_is_zero_not_error() {
     // `Ok(None)` from ahead_behind is the genuine "no upstream" state: zero
     // arrows, and still a clean read. `Ok(None)` from branch_diff is the genuine
     // "no base" state.
-    let prior: GlyphRow = (
-        true,
-        4,
-        1,
-        Some("feat".into()),
-        "/repo".into(),
-        1,
-        1,
-        Some((2, 2)),
-    );
+    let prior = glyph_row(true, 4, 1, Some("feat"), "/repo", 1, 1, Some((2, 2)));
     let (row, clean) = merge_glyph_scan(
         Some(&prior),
         Ok(false),
@@ -250,10 +256,11 @@ fn glyph_scan_no_upstream_is_zero_not_error() {
         "/repo".into(),
         Ok((0, 0)),
         Ok(None),
+        Ok(false),
     );
     assert_eq!(
         row,
-        (false, 0, 0, Some("feat".into()), "/repo".into(), 0, 0, None)
+        glyph_row(false, 0, 0, Some("feat"), "/repo", 0, 0, None)
     );
     assert!(clean);
 }
@@ -262,22 +269,14 @@ fn glyph_scan_no_upstream_is_zero_not_error() {
 fn glyph_scan_transient_error_reuses_prior() {
     // A transient gix error on every read must reuse the prior row, not
     // collapse to zero/clean, and the row is NOT clean (cache untouched).
-    let prior: GlyphRow = (
-        true,
-        4,
-        1,
-        Some("feat".into()),
-        "/repo".into(),
-        42,
-        7,
-        Some((310, 84)),
-    );
+    let prior = glyph_row(true, 4, 1, Some("feat"), "/repo", 42, 7, Some((310, 84)));
     let (row, clean) = merge_glyph_scan(
         Some(&prior),
         Err(()),
         Err(()),
         Err(()),
         "/repo".into(),
+        Err(()),
         Err(()),
         Err(()),
     );
@@ -288,16 +287,7 @@ fn glyph_scan_transient_error_reuses_prior() {
 #[test]
 fn glyph_scan_partial_error_keeps_only_failed_field() {
     // ahead_behind errors (reuse prior counts) while dirty succeeds (fresh).
-    let prior: GlyphRow = (
-        true,
-        4,
-        1,
-        Some("feat".into()),
-        "/repo".into(),
-        42,
-        7,
-        Some((310, 84)),
-    );
+    let prior = glyph_row(true, 4, 1, Some("feat"), "/repo", 42, 7, Some((310, 84)));
     let (row, clean) = merge_glyph_scan(
         Some(&prior),
         Ok(false),
@@ -306,19 +296,11 @@ fn glyph_scan_partial_error_keeps_only_failed_field() {
         "/repo".into(),
         Ok((5, 2)),
         Err(()),
+        Err(()),
     );
     assert_eq!(
         row,
-        (
-            false,
-            4,
-            1,
-            Some("feat".into()),
-            "/repo".into(),
-            5,
-            2,
-            Some((310, 84))
-        )
+        glyph_row(false, 4, 1, Some("feat"), "/repo", 5, 2, Some((310, 84)))
     );
     assert!(!clean);
 }
@@ -335,8 +317,9 @@ fn glyph_scan_error_without_prior_falls_back_to_defaults() {
         "/repo".into(),
         Err(()),
         Err(()),
+        Err(()),
     );
-    assert_eq!(row, (false, 0, 0, None, "/repo".into(), 0, 0, None));
+    assert_eq!(row, glyph_row(false, 0, 0, None, "/repo", 0, 0, None));
     assert!(!clean);
 }
 
@@ -636,16 +619,7 @@ fn bootstrap_workspace_survives_switch_in_workspace_list() {
 fn glyph_persist_entry_serializes_only_the_row() {
     // The DB write moved out of the glyph_cache mutex; this helper is what the
     // loop-off write path serializes. It must round-trip the row verbatim.
-    let row: GlyphRow = (
-        true,
-        3,
-        1,
-        Some("feature".into()),
-        "/repo".into(),
-        12,
-        3,
-        Some((99, 4)),
-    );
+    let row = glyph_row(true, 3, 1, Some("feature"), "/repo", 12, 3, Some((99, 4)));
     let (path, json) = glyph_persist_entry("/repo/wt", &row);
     assert_eq!(path, "/repo/wt");
     let back: GlyphRow = serde_json::from_str(&json).unwrap();

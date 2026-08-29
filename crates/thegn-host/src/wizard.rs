@@ -773,6 +773,7 @@ impl NewWorktreeWizard {
 pub enum CreateStep {
     ResolveBase,
     CreateWorktree,
+    InitSubmodules,
     FinalizeName,
     SandboxPrep,
     Register,
@@ -780,9 +781,10 @@ pub enum CreateStep {
 }
 
 impl CreateStep {
-    const ALL: [CreateStep; 6] = [
+    const ALL: [CreateStep; 7] = [
         CreateStep::ResolveBase,
         CreateStep::CreateWorktree,
+        CreateStep::InitSubmodules,
         CreateStep::FinalizeName,
         CreateStep::SandboxPrep,
         CreateStep::Register,
@@ -793,6 +795,7 @@ impl CreateStep {
         match self {
             CreateStep::ResolveBase => "resolve base",
             CreateStep::CreateWorktree => "create worktree",
+            CreateStep::InitSubmodules => "initialize submodules",
             CreateStep::FinalizeName => "finalize name",
             CreateStep::SandboxPrep => "sandbox",
             CreateStep::Register => "register",
@@ -1063,10 +1066,16 @@ pub fn run_worker(
     // overlaps the checkout with the user's wizard time).
     step(CreateStep::CreateWorktree, StepState::Running, None);
     let mut path = worktree::worktree_path(root, &branch, cfg);
-    if let Err(e) = worktree::add_checked(root, &branch, &base, &path, cfg) {
-        worktree::remove(root, &path, &branch, true);
+    if let Err(e) = crate::git_worktree::add_checked(root, &branch, &base, &path, cfg) {
+        crate::git_worktree::remove(root, &path, true);
         fail(CreateStep::CreateWorktree, e);
         return;
+    }
+    step(CreateStep::InitSubmodules, StepState::Running, None);
+    match crate::git_worktree::initialize(cfg, root, &path, None) {
+        Ok(true) => step(CreateStep::InitSubmodules, StepState::Done, None),
+        Ok(false) => step(CreateStep::InitSubmodules, StepState::Skipped, None),
+        Err(e) => step(CreateStep::InitSubmodules, StepState::Done, Some(e)),
     }
     // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
     // for agents in this worktree (best-effort, gated on [merge_queue] enabled).
@@ -1105,7 +1114,7 @@ pub fn run_worker(
             // the worktree in place — resurrect picks it up next session.
             Err(_) => return,
             Ok(WizardCmd::Cancel) => {
-                worktree::remove(root, &path, &branch, true);
+                crate::git_worktree::remove(root, &path, true);
                 tracing::info!(
                     target: "thegn::worktree_create",
                     since_ms = started.elapsed().as_millis() as u64,
@@ -1184,7 +1193,7 @@ pub fn run_worker(
                                     *outcome = redo;
                                 }
                                 Err(e) => {
-                                    worktree::remove(root, &path, &branch, true);
+                                    crate::git_worktree::remove(root, &path, true);
                                     fail(CreateStep::SandboxPrep, e.to_string());
                                     return;
                                 }
@@ -1274,7 +1283,7 @@ pub fn run_worker(
                     halted(halt);
                     return;
                 }
-                worktree::remove(root, &path, &branch, true);
+                crate::git_worktree::remove(root, &path, true);
                 if let Ok(db) = open_db() {
                     let _ = db.del_worktree(&path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }

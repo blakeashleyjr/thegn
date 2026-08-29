@@ -114,13 +114,14 @@ fn local_git(worktree: &str, args: &[&str]) -> Option<String> {
 pub(crate) fn retarget_if_remote_oci(
     spec: &mut thegn_core::sandbox::SandboxSpec,
     worktree: &str,
+    recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) {
     if !spec.backend.is_oci() || spec.placement.is_local() {
         return;
     }
     let runner = OciRunner::new(spec.placement.clone());
-    match sync_worktree(&runner, worktree, &spec.name) {
+    match sync_worktree(&runner, worktree, &spec.name, recursive_submodules) {
         Ok(remote_path) => {
             thegn_core::host::mount_remote_worktree(spec, &remote_path, REMOTE_WORKTREE_DEST)
         }
@@ -139,9 +140,10 @@ pub(crate) fn retarget_if_remote_oci(
 pub(crate) fn finalize_spec_before_ensure(
     spec: &mut thegn_core::sandbox::SandboxSpec,
     worktree: &str,
+    recursive_submodules: bool,
     warnings: &mut Vec<String>,
 ) {
-    retarget_if_remote_oci(spec, worktree, warnings);
+    retarget_if_remote_oci(spec, worktree, recursive_submodules, warnings);
     if let Some(w) = degrade_oci_runtime(spec) {
         thegn_core::msg::warn(&format!("{w} for {worktree}"));
         warnings.push(w);
@@ -181,6 +183,7 @@ pub(crate) fn sync_worktree(
     runner: &OciRunner,
     worktree: &str,
     slug: &str,
+    recursive_submodules: bool,
 ) -> Result<String, String> {
     if let Some(p) = SYNCED
         .lock()
@@ -237,7 +240,18 @@ pub(crate) fn sync_worktree(
             b = q(&branch)
         )
     };
-    let _ = runner.host_exec(&format!("{restore}rm -f {d}.bundle", d = q(&dir)), secs(60)); // best-effort: cleanup: a leftover bundle on the host is harmless
+    let init = if recursive_submodules {
+        format!(
+            "git -C {d} submodule update --init --recursive; ",
+            d = q(&dir)
+        )
+    } else {
+        String::new()
+    };
+    let _ = runner.host_exec(
+        &format!("{restore}{init}rm -f {d}.bundle", d = q(&dir)),
+        secs(600),
+    ); // best-effort: cleanup: a leftover bundle on the host is harmless
 
     // 3. Apply working state (best-effort): tracked diff, then untracked files.
     let _ = runner.pipe_local_to_host(

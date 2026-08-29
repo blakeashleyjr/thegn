@@ -562,7 +562,14 @@ pub fn prepare_sandbox_env(
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);
             // Final pre-create spec fixups: remote-OCI worktree sync + runtime degrade.
-            crate::remote_sync::finalize_spec_before_ensure(&mut spec, worktree, &mut warnings);
+            let recursive_submodules =
+                crate::git_worktree::recursive_submodules_allowed(cfg, Path::new(worktree));
+            crate::remote_sync::finalize_spec_before_ensure(
+                &mut spec,
+                worktree,
+                recursive_submodules,
+                &mut warnings,
+            );
             // Isolation floor: compare the HONEST class of what this launch would
             // enter (after the runtime degrade `finalize_*` just applied) against
             // the demanded floor. A fail-closed miss must abort BEFORE anything
@@ -2646,7 +2653,7 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
 // CLI). NOTE: some direct pane-spawn helpers still call launch_spec on the
 // loop — see the sweep report; the fix belongs at those callers.
 #[expect(clippy::disallowed_methods)]
-fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>) {
+fn provision_provider_repo(cfg: &Config, repo_root: &Path, loc: &GitLoc, branch: Option<&str>) {
     let Some(origin) = local_origin(repo_root) else {
         return;
     };
@@ -2655,7 +2662,10 @@ fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>)
     // else fall back to the per-op CLI control prefix.
     if let Some(b) = thegn_svc::bridge::for_loc(loc) {
         match b.exec(&["/bin/sh", "-lc", &script], Some(&loc.path()), &[]) {
-            Ok(r) if r.exit == 0 => return,
+            Ok(r) if r.exit == 0 => {
+                initialize_provider_submodules(cfg, repo_root, loc);
+                return;
+            }
             Ok(r) => {
                 thegn_core::msg::warn(&format!(
                     "provider repo provision failed (exit {}): {}",
@@ -2669,13 +2679,21 @@ fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>)
         }
     }
     match loc.sh_command(&script).output() {
-        Ok(o) if o.status.success() => {}
+        Ok(o) if o.status.success() => initialize_provider_submodules(cfg, repo_root, loc),
         Ok(o) => thegn_core::msg::warn(&format!(
             "provider repo provision failed ({}): {}",
             o.status,
             crate::provision_recover::stderr_gist(&String::from_utf8_lossy(&o.stderr))
         )),
         Err(e) => thegn_core::msg::warn(&format!("provider repo provision spawn failed: {e}")),
+    }
+}
+
+fn initialize_provider_submodules(cfg: &Config, repo_root: &Path, loc: &GitLoc) {
+    if let Err(error) =
+        crate::git_worktree::initialize(cfg, repo_root, Path::new(&loc.path()), Some(loc))
+    {
+        thegn_core::msg::warn(&format!("provider submodules not initialized: {error}"));
     }
 }
 
@@ -3137,7 +3155,7 @@ pub fn launch_spec_full(
     if let Some(blob) = outcome.location.as_deref() {
         let fresh = crate::provision_gate::rebind_resolved_location(db.as_ref(), worktree, blob);
         if fresh.is_remote() {
-            provision_provider_repo(&repo_root, &fresh, branch);
+            provision_provider_repo(cfg, &repo_root, &fresh, branch);
         }
     } else if let Some(db) = db.as_ref()
         && should_heal_degraded_location(

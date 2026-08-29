@@ -1234,6 +1234,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/x.rs".into(),
                 old_path: Some("src/x.rs".into()),
+                is_submodule: false,
                 hunks: vec![thegn_core::forge::model::DiffHunk {
                     header: "@@ -1,2 +1,3 @@".into(),
                     lines: vec![

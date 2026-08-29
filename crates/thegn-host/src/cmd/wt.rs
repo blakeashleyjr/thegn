@@ -11,7 +11,7 @@ use anyhow::Result;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::store::WorkspaceStore;
-use thegn_core::{outln, util, worktree};
+use thegn_core::{msg, outln, util, worktree};
 
 /// Args shared by `diff` and `wt diff`.
 #[derive(clap::Args, Clone)]
@@ -258,11 +258,14 @@ fn create_and_register(
     db: &Db,
 ) -> Result<String> {
     let path = worktree::worktree_path(root, branch, cfg);
-    worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
+    crate::git_worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
-        worktree::remove(root, &path, branch, true);
+        crate::git_worktree::remove(root, &path, true);
         anyhow::anyhow!(e)
     })?;
+    if let Err(e) = crate::git_worktree::initialize(cfg, root, &path, None) {
+        msg::warn(&e);
+    }
     // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
     // so agents launched in this worktree discover them (best-effort, gated on
     // [merge_queue] enabled).
@@ -275,7 +278,7 @@ fn create_and_register(
     let path_s = path.to_string_lossy().into_owned();
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(root), branch);
     if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, branch, None, None) {
-        worktree::remove(root, &path, branch, true);
+        crate::git_worktree::remove(root, &path, true);
         return Err(anyhow::anyhow!("db: {e}"));
     }
     // Pin the env only when it differs from the ambient default this worktree
@@ -603,12 +606,7 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     // git removal (worktree::remove has the --force fallback), then make sure
     // the directory is actually gone — a lingering dir is re-adopted at next
     // launch and looks like a failed delete.
-    worktree::remove(
-        &root,
-        std::path::Path::new(&path),
-        if delete_branch { &branch } else { "" },
-        delete_branch,
-    );
+    crate::git_worktree::remove(&root, std::path::Path::new(&path), delete_branch);
     let _ = std::fs::remove_dir_all(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     if std::path::Path::new(&path).exists() {
         anyhow::bail!("could not remove {path}");
