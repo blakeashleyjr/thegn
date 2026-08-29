@@ -14228,7 +14228,7 @@ async fn event_loop<T: Terminal>(
                 // The full-screen PR view is a top-priority modal (like the
                 // detail overlay): it owns every key while open. Actions run off
                 // the loop and the view stays open (only Close dismisses it).
-                if pr_view.is_some() {
+                if pr_view.is_some() && active_menu.is_none() {
                     crate::actions::dispatch_pr_view_key(
                         &mut pr_view,
                         &k.key,
@@ -14240,6 +14240,7 @@ async fn event_loop<T: Terminal>(
                         &refresh_tx,
                         &waker,
                         &mut model,
+                        &mut active_menu,
                     );
                     dirty = true;
                     continue;
@@ -15039,6 +15040,9 @@ async fn event_loop<T: Terminal>(
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
                             active_menu = None;
+                            if let Some(v) = pr_view.as_mut() {
+                                v.pending_handoff = None;
+                            }
                             pending_confirm_op = None;
                             pending_undo = None;
                             pending_delete_workspace = None;
@@ -15049,6 +15053,31 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
+                            if matches!(
+                                &choice,
+                                menu::MenuChoice::Confirm {
+                                    tag: "pr-review-handoff",
+                                    ..
+                                }
+                            ) {
+                                if let Some(selection) =
+                                    pr_view.as_mut().and_then(|v| v.pending_handoff.take())
+                                {
+                                    crate::actions::dispatch_pr_handoff(
+                                        &mut pr_view,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut focus,
+                                        keymap.config(),
+                                        &mut model,
+                                        &refresh_tx,
+                                        &waker,
+                                        selection,
+                                    );
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -15075,6 +15104,11 @@ async fn event_loop<T: Terminal>(
                                 && let Some(g) = session.worktrees.get(session.active)
                             {
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
+                            }
+                            if matches!(&choice, menu::MenuChoice::Dismiss)
+                                && let Some(v) = pr_view.as_mut()
+                            {
+                                v.pending_handoff = None;
                             }
                             if let menu::MenuChoice::ConfirmCloseWorktrees = choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
