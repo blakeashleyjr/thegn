@@ -273,6 +273,8 @@ mod tests {
             model: Some("claude-sonnet-5".into()),
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         c.pipeline
             .stages
