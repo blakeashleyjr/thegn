@@ -133,7 +133,10 @@ use std::path::PathBuf;
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-pub const SCHEMA_VERSION: i64 = 61;
+///
+/// v62: adds `session_forks`, a credential-free lineage cache. Live fork
+/// recipes remain daemon memory only; the cache cannot resurrect a process.
+pub const SCHEMA_VERSION: i64 = 62;
 
 pub struct Db {
     conn: Connection,
@@ -943,6 +946,10 @@ impl Db {
         crate::db_control::migrate_v40(&conn)?;
         crate::db_calendar::migrate_v52(&conn)?;
         crate::db_model_proxy::migrate_v54(&conn)?;
+        crate::db_migrate::migrate_v62(&conn)?;
+        if ver < SCHEMA_VERSION {
+            crate::db_migrate::verify_v62_schema(&conn)?;
+        }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
         // relay-lost `None` exits) were mis-classified as failures — see

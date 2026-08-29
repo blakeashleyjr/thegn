@@ -62,6 +62,9 @@ impl HarnessCaps {
     /// native session ids for every harness — so the relaunched agent picks
     /// up its own latest session in the worktree.
     pub const CONTINUE: HarnessCaps = HarnessCaps(32);
+    /// Can fork a native session into a new native session
+    /// ([`Harness::fork_command`]).
+    pub const FORK: HarnessCaps = HarnessCaps(64);
 
     pub const NONE: HarnessCaps = HarnessCaps(0);
 
@@ -90,6 +93,7 @@ impl HarnessCaps {
             (HarnessCaps::TOKENS, "tokens"),
             (HarnessCaps::TEAMMATES, "teammates"),
             (HarnessCaps::CONTINUE, "continue"),
+            (HarnessCaps::FORK, "fork"),
         ] {
             if self.contains(bit) {
                 out.push(name);
@@ -267,6 +271,13 @@ pub trait Harness: Send + Sync {
     fn continue_command(&self) -> Option<String> {
         None
     }
+    /// The command that creates a new native session from `native_session_id`
+    /// (`FORK`). Callers MUST validate the id shape ([`session_id_ok`]) first.
+    /// The command is vendor-owned and may use a native fork or resume form;
+    /// generic code must never guess one.
+    fn fork_command(&self, _native_session_id: &str) -> Option<String> {
+        None
+    }
     /// Fold one transcript's token counters into a host-wide rollup (`TOKENS`).
     fn fold_transcript(
         &self,
@@ -344,6 +355,7 @@ impl Harness for Codex {
             HarnessCaps::SESSIONS,
             HarnessCaps::RESUME,
             HarnessCaps::USAGE,
+            HarnessCaps::FORK,
         ])
     }
     fn session_layout(&self) -> Option<SessionLayout> {
@@ -358,6 +370,9 @@ impl Harness for Codex {
     }
     fn resume_command(&self, session_id: &str) -> Option<String> {
         Some(format!("codex resume {}", util::sh_quote(session_id)))
+    }
+    fn fork_command(&self, native_session_id: &str) -> Option<String> {
+        Some(format!("codex fork {}", util::sh_quote(native_session_id)))
     }
     fn parse_usage(&self, bytes: &[u8], now: i64) -> Option<AccountUsage> {
         crate::usage::parse_codex_rollup(bytes, now)
@@ -402,6 +417,7 @@ impl Harness for Claude {
             HarnessCaps::USAGE,
             HarnessCaps::TOKENS,
             HarnessCaps::CONTINUE,
+            HarnessCaps::FORK,
         ])
     }
     fn session_layout(&self) -> Option<SessionLayout> {
@@ -416,6 +432,12 @@ impl Harness for Claude {
     }
     fn resume_command(&self, session_id: &str) -> Option<String> {
         Some(format!("claude --resume {}", util::sh_quote(session_id)))
+    }
+    fn fork_command(&self, native_session_id: &str) -> Option<String> {
+        Some(format!(
+            "claude --resume {} --fork-session",
+            util::sh_quote(native_session_id)
+        ))
     }
     fn continue_command(&self) -> Option<String> {
         // thegn does not hold claude's native session id (`--resume <id>` needs
@@ -743,6 +765,12 @@ mod tests {
                 "{}: CONTINUE bit vs continue_command()",
                 h.id()
             );
+            assert_eq!(
+                h.fork_command("abc").is_some(),
+                caps.contains(HarnessCaps::FORK),
+                "{}: FORK bit vs fork_command()",
+                h.id()
+            );
             // USAGE: a non-USAGE harness never parses usage; a USAGE one is
             // exercised with a real body in its own unit test below.
             if !caps.contains(HarnessCaps::USAGE) {
@@ -772,6 +800,30 @@ mod tests {
                 "{}: unquoted: {nasty}",
                 h.id()
             );
+        }
+    }
+
+    /// Every FORK impl yields a vendor command containing its id, shell-quoted,
+    /// and unsupported harnesses leave the operation reserved.
+    #[test]
+    fn every_fork_impl_quotes_its_id() {
+        for h in HARNESSES
+            .iter()
+            .filter(|h| h.caps().contains(HarnessCaps::FORK))
+        {
+            let cmd = h.fork_command("sess-123").expect("fork cmd");
+            assert!(cmd.contains("sess-123"), "{}: {cmd}", h.id());
+            let nasty = h.fork_command("a b; rm -rf /").expect("fork cmd");
+            assert!(
+                !nasty.contains("; rm -rf / "),
+                "{}: unquoted: {nasty}",
+                h.id()
+            );
+        }
+        for id in ["aider", "antigravity", "pi"] {
+            let h = harness(id).unwrap();
+            assert!(!h.caps().contains(HarnessCaps::FORK));
+            assert!(h.fork_command("sess-123").is_none());
         }
     }
 
