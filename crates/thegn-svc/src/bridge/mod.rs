@@ -579,7 +579,8 @@ fn reader_loop(
                         .and_then(|p| serde_json::from_value::<FsEventNote>(p).ok())
                         && let Some(tx) = subs.lock().unwrap().get(&note.watch_id)
                     {
-                        let _ = tx.send(FsEvent { // best-effort: subscriber may be gone
+                        let _ = tx.send(FsEvent {
+                            // best-effort: subscriber may be gone
                             paths: note.paths,
                             kind: note.kind,
                         });
@@ -598,7 +599,8 @@ fn reader_loop(
                         match B64.decode(&note.data) {
                             Ok(data) => {
                                 if let Some(tx) = procs.lock().unwrap().get(&note.chan) {
-                                    let _ = tx.send(ProcEvent::Out { // best-effort: subscriber may be gone
+                                    let _ = tx.send(ProcEvent::Out {
+                                        // best-effort: subscriber may be gone
                                         stream: note.stream,
                                         data,
                                     });
@@ -729,7 +731,10 @@ pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
                     {
                         // Primary path: a failed spawn would leave the host
                         // waiting on a response that never comes — answer now.
-                        write_frame(&writer, &resp_err(req_id, format!("spawn exec worker: {e}")));
+                        write_frame(
+                            &writer,
+                            &resp_err(req_id, format!("spawn exec worker: {e}")),
+                        );
                     }
                 }
                 // Stateful / fast: stay inline (they borrow `watchers`/`procs`).
