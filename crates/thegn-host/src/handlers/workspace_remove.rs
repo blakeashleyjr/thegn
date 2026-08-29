@@ -69,6 +69,7 @@ pub(crate) fn spawn_delete_workspace_dirs(
 ///
 /// The destructive disk-removal is dispatched to a background thread (see
 /// [`spawn_delete_workspace_dirs`]) so the compositor never blocks on git/ssh/fs.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn remove_workspace(
     session: &mut crate::session::Session,
     panes: &mut Panes,
