@@ -6,23 +6,23 @@
 
 The repository's AI-harness configuration SHALL register a `PreToolUse`
 command guard (`test/heavy-guard.sh`, wired in `.claude/settings.json`) that
-refuses full-workspace gate invocations issued from an agent session — the
-heavy `just` recipes (`test`, `test-doc`, `ci`, `ci-local`, `coverage`,
-`coverage-html`, `lint`, `bench`, `bench-micro`, `e2e`, `doc-check`),
-`cargo llvm-cov`, and `--workspace`-wide cargo build/check/clippy/test runs,
-including when reached through `nix develop --command`, `exec`/`time`/`nice`,
-or a shell's `-c` string — replying with the scoped equivalents
+refuses the full-workspace invocations it recognizes: the direct heavy `just`
+recipes (`test`, `test-doc`, `ci`, `ci-local`, `coverage`, `coverage-html`,
+`lint`, `bench`, `bench-micro`, `e2e`, `doc-check`), `cargo llvm-cov`, and
+workspace-wide cargo build/check/clippy/test/nextest runs. The guard also
+recognizes these forms after the command boundaries implemented by the script,
+including `--command`, `exec`, `time`, `nice`, and the supported shell `-c`
+runner forms. A refusal SHALL name the scoped alternatives
 (`just quick <crate>`, `cargo nextest run -p <crate> <substring>`,
 `cargo check -p <crate>`). This is a harness gate, not a `just lint`/`just
-test` gate: it steers iteration; the git pre-push hook remains the
-correctness gate and runs outside it.
+test` gate: it steers iteration; the git pre-push hook remains the correctness
+gate and runs outside it.
 
 The guard MUST pass a command through unchanged when `THEGN_ALLOW_HEAVY=1`
-appears on it (the deliberate pre-push/pre-PR run), MUST fail open when it
-cannot parse its input or its dependencies are missing (a broken guard never
-blocks work), and MUST NOT fire on gate names that appear only inside quoted
-strings or heredoc bodies (a `grep "just test"` or a commit message naming a
-gate is not a gate run).
+appears on it, MUST fail open when it cannot parse its input or its
+dependencies are missing, and MUST NOT fire on gate names that appear only
+inside quoted strings or heredoc bodies. Actual supported shell `-c` runner
+invocations remain recognized even though their command text is quoted.
 
 #### Scenario: An iterating agent is redirected
 
