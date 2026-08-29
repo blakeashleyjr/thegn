@@ -20464,51 +20464,86 @@ async fn event_loop<T: Terminal>(
                                     .map(|t| t.name.clone())
                                     .filter(|n| !n.is_empty())
                                     .collect();
-                                // Resolve the repo root the same way NewWorktree does:
-                                // the sidebar-selected workspace, else the active group.
-                                let src_wt = focus
-                                    .sidebar()
-                                    .then(|| sb.selected_row(&model))
-                                    .flatten()
-                                    .map(|r| r.workspace_slug.clone())
-                                    .and_then(|slug| {
-                                        model
-                                            .sidebar_workspaces
-                                            .iter()
-                                            .find(|(s, _, _, _)| *s == slug)
-                                            .map(|(_, _, _, p)| p.clone())
-                                    })
-                                    .filter(|p| !p.is_empty())
-                                    .unwrap_or_else(|| {
-                                        session
+                                // Single resolution via the sidebar_keys helper (never silently
+                                // crosses workspaces — same shape as Action::NewWorktree /
+                                // composite NewWorktree).
+                                // The template action intentionally has NO current_dir fallback:
+                                // the template picker is an explicit gesture against the active
+                                // workspace, not a CD-relative convenience.
+                                match sb.new_worktree_target(&model, focus.sidebar()) {
+                                    NewWorktreeTarget::Root(root) => {
+                                        let repo_root =
+                                            thegn_core::repo::main_worktree(Path::new(&root))
+                                                .map(|p| p.to_string_lossy().into_owned());
+                                        match (names.is_empty(), repo_root) {
+                                            (true, _) => {
+                                                model.status =
+                                                    "No [[worktree_templates]] configured".into();
+                                            }
+                                            (false, None) => {
+                                                model.status =
+                                                    "New worktree: not inside a git repository"
+                                                        .into();
+                                            }
+                                            (false, Some(root)) => {
+                                                host_input = Some((
+                                                    menu::InputOverlay::new(
+                                                        "worktree template (name)",
+                                                        "",
+                                                    ),
+                                                    HostInputKind::NewWorktreeFromTemplate {
+                                                        repo_root: root,
+                                                    },
+                                                ));
+                                                model.status = format!(
+                                                    "New worktree from template — {}",
+                                                    names.join(", ")
+                                                );
+                                            }
+                                        }
+                                    }
+                                    NewWorktreeTarget::Refuse(msg) => {
+                                        model.status = msg.into();
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    NewWorktreeTarget::ActiveFallback => {
+                                        let src_wt = session
                                             .active_group()
                                             .map(|g| g.path.clone())
-                                            .unwrap_or_default()
-                                    });
-                                let repo_root = (!src_wt.is_empty())
-                                    .then(|| thegn_core::repo::main_worktree(Path::new(&src_wt)))
-                                    .flatten()
-                                    .map(|p| p.to_string_lossy().into_owned());
-                                match (names.is_empty(), repo_root) {
-                                    (true, _) => {
-                                        model.status =
-                                            "No [[worktree_templates]] configured".into();
-                                    }
-                                    (false, None) => {
-                                        model.status =
-                                            "New worktree: not inside a git repository".into();
-                                    }
-                                    (false, Some(root)) => {
-                                        host_input = Some((
-                                            menu::InputOverlay::new("worktree template (name)", ""),
-                                            HostInputKind::NewWorktreeFromTemplate {
-                                                repo_root: root,
-                                            },
-                                        ));
-                                        model.status = format!(
-                                            "New worktree from template — {}",
-                                            names.join(", ")
-                                        );
+                                            .unwrap_or_default();
+                                        let repo_root = (!src_wt.is_empty())
+                                            .then(|| {
+                                                thegn_core::repo::main_worktree(Path::new(&src_wt))
+                                            })
+                                            .flatten()
+                                            .map(|p| p.to_string_lossy().into_owned());
+                                        match (names.is_empty(), repo_root) {
+                                            (true, _) => {
+                                                model.status =
+                                                    "No [[worktree_templates]] configured".into();
+                                            }
+                                            (false, None) => {
+                                                model.status =
+                                                    "New worktree: not inside a git repository"
+                                                        .into();
+                                            }
+                                            (false, Some(root)) => {
+                                                host_input = Some((
+                                                    menu::InputOverlay::new(
+                                                        "worktree template (name)",
+                                                        "",
+                                                    ),
+                                                    HostInputKind::NewWorktreeFromTemplate {
+                                                        repo_root: root,
+                                                    },
+                                                ));
+                                                model.status = format!(
+                                                    "New worktree from template — {}",
+                                                    names.join(", ")
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
