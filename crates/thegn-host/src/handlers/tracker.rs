@@ -284,14 +284,14 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 return;
             }
 
-            if let Err(e) = wt::add_checked(&root, &branch, &base, &path, &cfg2) {
-                let message = crate::worktree_lifecycle::create_failure_with_rollback(
-                    format!("agent dispatch: {e}"),
-                    &cfg2,
-                    &root,
-                    &path,
-                    &branch,
-                );
+            if let Err(e) = crate::worktree_lifecycle::add_checked_with_rollback(
+                || wt::add_checked(&root, &branch, &base, &path, &cfg2),
+                &cfg2,
+                &root,
+                &path,
+                &branch,
+            ) {
+                let message = format!("agent dispatch: {e}");
                 thegn_core::msg::warn(&message);
                 return;
             }
