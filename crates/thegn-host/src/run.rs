@@ -1846,6 +1846,7 @@ pub(crate) fn delete_groups(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
+            crate::worktree_lifecycle::session_end_once(&del_cfg, Path::new(&path), waker.clone());
             // Tear down the per-worktree provider sandbox (sprite/…) if this env
             // has one. Resolve the env name from the DB NOW (before
             // `forget_worktree_group` below removes the worktree's rows), then
@@ -1888,8 +1889,34 @@ pub(crate) fn delete_groups(
             }
             if let Some(waker) = waker.clone() {
                 let path_clone = path.clone();
+                let hook_cfg = del_cfg.clone();
                 std::thread::spawn(move || {
                     if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path_clone)) {
+                        let branch = thegn_core::util::git_out(
+                            Path::new(&path_clone),
+                            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                        )
+                        .unwrap_or_default();
+                        let workspace = thegn_core::repo::repo_slug(&root);
+                        let pre = crate::worktree_lifecycle::run_event(
+                            &hook_cfg,
+                            &root,
+                            Path::new(&path_clone),
+                            &branch,
+                            &workspace,
+                            thegn_core::hooks::HookEvent::PreDestroy,
+                            // The existing delete confirmation is the explicit
+                            // delete-anyway authorization for this background job.
+                            thegn_core::hooks::HookExecutionMode::Force,
+                        );
+                        if !pre.results.is_empty()
+                            && pre.results.iter().any(|result| !result.succeeded())
+                        {
+                            thegn_core::msg::warn(&format!(
+                                "worktree cleanup {path_clone}: {}",
+                                pre.message()
+                            ));
+                        }
                         // Remove from git, keeping files if requested.
                         // git worktree remove does both.
                         if keep_files {
@@ -1903,13 +1930,32 @@ pub(crate) fn delete_groups(
                         } else {
                             thegn_core::worktree::remove(&root, Path::new(&path_clone), "", false);
                         }
-                    }
-                    if !keep_files {
-                        // git is the source of truth, but `git worktree remove` leaves the
-                        // dir behind if it ever fails (locked, detached, prune races); a
-                        // lingering dir is re-adopted on the next launch and looks like a
-                        // failed delete. Purge it — locally AND on the remote box.
-                        thegn_core::worktree::purge_worktree_files(Path::new(&path_clone));
+                        if !keep_files {
+                            // git is the source of truth, but `git worktree remove` leaves the
+                            // dir behind if it ever fails (locked, detached, prune races); a
+                            // lingering dir is re-adopted on the next launch and looks like a
+                            // failed delete. Purge it — locally AND on the remote box.
+                            thegn_core::worktree::purge_worktree_files(Path::new(&path_clone));
+                            if !Path::new(&path_clone).exists() {
+                                let post = crate::worktree_lifecycle::run_event(
+                                    &hook_cfg,
+                                    &root,
+                                    Path::new(&path_clone),
+                                    &branch,
+                                    &workspace,
+                                    thegn_core::hooks::HookEvent::PostDestroy,
+                                    thegn_core::hooks::HookExecutionMode::Force,
+                                );
+                                if !post.results.is_empty()
+                                    && post.results.iter().any(|result| !result.succeeded())
+                                {
+                                    thegn_core::msg::warn(&format!(
+                                        "worktree cleanup {path_clone}: {}",
+                                        post.message()
+                                    ));
+                                }
+                            }
+                        }
                     }
                     let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 });
@@ -5069,6 +5115,7 @@ pub(crate) fn spawn_worktree_shell_pane(
     if let Some(dir) = dir
         && dir.is_dir()
     {
+        crate::worktree_lifecycle::session_start_once(cfg, dir, None);
         let wt = dir.to_string_lossy().into_owned();
         // Failover off + a non-local env that's known-down (token unset / native
         // exec in failure cooldown): refuse to open a host-degraded pane. The
@@ -6678,6 +6725,7 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
+    crate::worktree_lifecycle::install_notify_state(notify_state.clone());
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());

@@ -46,11 +46,24 @@ impl HookRunResult {
 
 /// Run one hook. Callers must invoke this from a worker, never from the
 /// compositor loop: the CPU wrapper probes the host and the child wait blocks.
-#[allow(dead_code)]
 #[expect(clippy::disallowed_methods)]
 pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
     let log_path = log_path(&context.worktree);
-    let mut child = spawn(spec, context, cwd);
+    let mut child = match spawn(spec, context, cwd) {
+        Ok(child) => child,
+        Err(error) => {
+            let stderr = format!("failed to start hook: {error}");
+            append_log(&log_path, context, spec, HookRunState::Failed, "", &stderr);
+            return HookRunResult {
+                command: spec.command.clone(),
+                state: HookRunState::Failed,
+                code: None,
+                stdout: String::new(),
+                stderr,
+                log_path,
+            };
+        }
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let out_thread = stdout.map(read_pipe);
@@ -93,7 +106,7 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
     }
 }
 
-fn spawn(spec: &HookSpec, context: &HookContext, cwd: &Path) -> Child {
+fn spawn(spec: &HookSpec, context: &HookContext, cwd: &Path) -> std::io::Result<Child> {
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
         "sh".into(),
         "-lc".into(),
@@ -110,9 +123,7 @@ fn spawn(spec: &HookSpec, context: &HookContext, cwd: &Path) -> Child {
         .envs(thegn_core::util::filter_host_env(std::env::vars(), &[]))
         .envs(context.environment());
     prepare_process_group(&mut command);
-    command
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to start lifecycle hook: {error}"))
+    command.spawn()
 }
 
 fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
@@ -223,30 +234,6 @@ pub fn run_all(
     results
 }
 
-/// Spawn a hook list on a named utility worker and wake the compositor after
-/// completion. The returned handle is useful to CLI/headless callers that must
-/// keep the process alive; UI callers can detach it.
-#[expect(clippy::disallowed_methods)]
-pub fn spawn_all(
-    specs: Vec<HookSpec>,
-    context: HookContext,
-    cwd: PathBuf,
-    mode: thegn_core::hooks::HookExecutionMode,
-    waker: Option<termwiz::terminal::TerminalWaker>,
-) -> std::thread::JoinHandle<Vec<HookRunResult>> {
-    std::thread::Builder::new()
-        .name(format!("thegn-hook-{}", context.event.as_str()))
-        .spawn(move || {
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let results = run_all(&specs, &context, &cwd, mode);
-            if let Some(waker) = waker {
-                let _ = waker.wake();
-            }
-            results
-        })
-        .expect("failed to spawn lifecycle hook worker")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +276,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = run(&spec("sleep 2", 1), &context(), dir.path());
         assert_eq!(result.state, HookRunState::TimedOut);
+    }
+
+    #[test]
+    fn blocking_failure_stops_the_remaining_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = spec("exit 7", 2);
+        first.on_failure = HookFailure::Block;
+        let results = run_all(
+            &[first, spec("printf unreachable", 2)],
+            &context(),
+            dir.path(),
+            thegn_core::hooks::HookExecutionMode::User,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].state, HookRunState::Failed);
     }
 }

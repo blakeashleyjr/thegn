@@ -76,7 +76,6 @@ mod graphics;
 mod handlers;
 mod help;
 mod hibernator;
-#[allow(dead_code)]
 mod hook_run;
 mod host_flow;
 mod host_provision;
@@ -233,7 +232,6 @@ mod wizard;
 mod workspace_create;
 mod workspace_picker;
 mod workspace_pool;
-#[allow(dead_code)]
 mod worktree_lifecycle;
 
 use clap::{Parser, Subcommand};
