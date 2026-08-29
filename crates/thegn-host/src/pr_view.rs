@@ -279,6 +279,7 @@ impl PrView {
         if let Some(status) = data.review_status {
             self.status = Some(status);
         }
+        self.clamp_selection();
     }
 
     /// Whether the diff + conversation are still loading.
@@ -358,6 +359,23 @@ impl PrView {
         self.status = None;
     }
 
+    /// Keep cursor/open-file state valid when a refresh or the resolved toggle
+    /// changes the current projection beneath the view.
+    fn clamp_selection(&mut self) {
+        if self.open_file.is_some_and(|file| {
+            self.diff
+                .as_ref()
+                .is_some_and(|diff| file >= diff.files.len())
+        }) {
+            self.open_file = None;
+            self.scroll.set(0);
+        }
+        let rows = self.row_count();
+        if self.sel >= rows {
+            self.sel = rows.saturating_sub(1);
+        }
+    }
+
     // --- input -------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> PrViewOutcome {
@@ -430,6 +448,7 @@ impl PrView {
             KeyCode::Char('v') => {
                 self.include_resolved = !self.include_resolved;
                 self.thread_sel = 0;
+                self.clamp_selection();
                 self.status = Some(
                     if self.include_resolved {
                         "showing resolved review threads"
@@ -1174,61 +1193,64 @@ impl PrView {
                 Line::segs(vec![seg(Tok::Slot(S::Dim), "No file changes.")]),
                 false,
             ));
-            return out;
-        }
-        match self.open_file {
-            None => {
-                let review = self.anchored_review();
-                for (i, f) in diff.files.iter().enumerate() {
-                    let selected = i == self.sel;
-                    let (adds, dels) = file_stat(f);
-                    out.push((
-                        Line::split(
-                            vec![
-                                seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                                seg(Tok::Slot(S::Text), f.path.clone()),
-                            ],
-                            {
-                                let unresolved = review
-                                    .as_ref()
-                                    .and_then(|r| r.files.get(i))
-                                    .map(|r| {
-                                        r.threads.iter().filter(|t| !t.thread.resolved).count()
-                                            + r.outdated.iter().filter(|t| !t.resolved).count()
-                                    })
-                                    .unwrap_or(0);
-                                let mut stats = vec![
-                                    seg(
-                                        Tok::Hue(thegn_core::theme::Hue::Green),
-                                        format!("+{adds} "),
-                                    ),
-                                    seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
-                                ];
-                                if unresolved > 0 {
-                                    stats.push(seg(
-                                        Tok::Slot(S::Accent),
-                                        format!(
-                                            " {} {unresolved} unresolved",
-                                            crate::caps::active_glyphs().middot
+        } else {
+            match self.open_file {
+                None => {
+                    let review = self.anchored_review();
+                    for (i, f) in diff.files.iter().enumerate() {
+                        let selected = i == self.sel;
+                        let (adds, dels) = file_stat(f);
+                        out.push((
+                            Line::split(
+                                vec![
+                                    seg(Tok::Slot(S::Faint), sel_marker(selected)),
+                                    seg(Tok::Slot(S::Text), f.path.clone()),
+                                ],
+                                {
+                                    let unresolved = review
+                                        .as_ref()
+                                        .and_then(|r| r.files.get(i))
+                                        .map(|r| {
+                                            r.threads.iter().filter(|t| !t.thread.resolved).count()
+                                                + r.outdated.iter().filter(|t| !t.resolved).count()
+                                        })
+                                        .unwrap_or(0);
+                                    let mut stats = vec![
+                                        seg(
+                                            Tok::Hue(thegn_core::theme::Hue::Green),
+                                            format!("+{adds} "),
                                         ),
-                                    ));
-                                }
-                                stats
-                            },
-                        ),
-                        selected,
-                    ));
+                                        seg(
+                                            Tok::Hue(thegn_core::theme::Hue::Red),
+                                            format!("-{dels}"),
+                                        ),
+                                    ];
+                                    if unresolved > 0 {
+                                        stats.push(seg(
+                                            Tok::Slot(S::Accent),
+                                            format!(
+                                                " {} {unresolved} unresolved",
+                                                crate::caps::active_glyphs().middot
+                                            ),
+                                        ));
+                                    }
+                                    stats
+                                },
+                            ),
+                            selected,
+                        ));
+                    }
                 }
-            }
-            Some(fi) => {
-                if let Some(f) = diff.files.get(fi) {
-                    out.push((
-                        Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
-                        false,
-                    ));
-                    for (ri, row) in self.open_file_rows(fi).into_iter().enumerate() {
-                        let selected = ri == self.sel;
-                        out.extend(render_review_row(&row, selected, cols));
+                Some(fi) => {
+                    if let Some(f) = diff.files.get(fi) {
+                        out.push((
+                            Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
+                            false,
+                        ));
+                        for (ri, row) in self.open_file_rows(fi).into_iter().enumerate() {
+                            let selected = ri == self.sel;
+                            out.extend(render_review_row(&row, selected, cols));
+                        }
                     }
                 }
             }
@@ -1815,6 +1837,86 @@ mod tests {
         let rendered = format!("{:?}", v.files_body(80));
         assert!(rendered.contains("first body"));
         assert!(rendered.contains("second body"));
+    }
+
+    #[test]
+    fn empty_pr_diff_still_renders_general_feedback() {
+        let mut v = sample();
+        v.diff = Some(PrDiff::default());
+        v.review = Some(PrReviewSnapshot {
+            diff: PrDiff::default(),
+            conversation: PrConversation {
+                threads: vec![ReviewThread {
+                    id: "general".into(),
+                    comments: vec![PrComment {
+                        author: "reviewer".into(),
+                        body: "general body".into(),
+                        ..PrComment::default()
+                    }],
+                    ..ReviewThread::default()
+                }],
+                ..PrConversation::default()
+            },
+            ..PrReviewSnapshot::default()
+        });
+        v.switch_tab(PrTab::Files);
+
+        assert_eq!(v.row_count(), 1);
+        assert!(format!("{:?}", v.files_body(80)).contains("general body"));
+    }
+
+    #[test]
+    fn hiding_resolved_threads_clamps_an_expanded_file_cursor() {
+        let threads = vec![
+            ReviewThread {
+                id: "open".into(),
+                path: "src/lib.rs".into(),
+                line: Some(1),
+                ..ReviewThread::default()
+            },
+            ReviewThread {
+                id: "resolved".into(),
+                path: "src/lib.rs".into(),
+                line: Some(1),
+                resolved: true,
+                ..ReviewThread::default()
+            },
+        ];
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                hunks: vec![thegn_core::forge::model::DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Add,
+                        text: "new".into(),
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                    }],
+                }],
+            }],
+        };
+        let mut v = sample();
+        v.diff = Some(diff.clone());
+        v.review = Some(PrReviewSnapshot {
+            diff,
+            conversation: PrConversation {
+                threads,
+                ..PrConversation::default()
+            },
+            ..PrReviewSnapshot::default()
+        });
+        v.switch_tab(PrTab::Files);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        v.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+        v.handle_key(&KeyCode::Char('G'), Modifiers::NONE);
+        assert_eq!(v.sel, v.row_count() - 1);
+
+        v.handle_key(&KeyCode::Char('v'), Modifiers::NONE);
+
+        assert_eq!(v.sel, v.row_count() - 1);
+        assert!(v.files_body(80).iter().any(|(_, selected)| *selected));
     }
 
     #[test]

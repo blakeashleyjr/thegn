@@ -487,49 +487,73 @@ impl DiffView {
                 )]),
                 false,
             ));
-            return out;
-        }
-        match self.open_file {
-            None => {
-                for (i, f) in diff.files.iter().enumerate() {
-                    let selected = i == self.sel;
-                    let (adds, dels) = file_stat(f);
-                    out.push((
-                        Line::split(
-                            vec![
-                                seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                                seg(Tok::Slot(S::Text), f.path.clone()),
-                            ],
-                            vec![
-                                seg(Tok::Hue(thegn_core::theme::Hue::Green), format!("+{adds} ")),
-                                seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
-                            ],
-                        ),
-                        selected,
-                    ));
-                }
+            if self.source == DiffSource::Worktree {
+                return out;
             }
-            Some(fi) => {
-                if let Some(f) = diff.files.get(fi) {
-                    out.push((
-                        Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
-                        false,
-                    ));
-                    let review = self.anchored_review();
-                    let rows: Vec<ReviewRow> = if self.source == DiffSource::PrReview {
-                        expanded_file_rows(f, review.as_ref(), false)
-                    } else {
-                        f.hunks
-                            .iter()
-                            .flat_map(|h| {
-                                std::iter::once(ReviewRow::Hunk(h.header.clone()))
-                                    .chain(h.lines.iter().cloned().map(ReviewRow::Diff))
-                            })
-                            .collect()
-                    };
-                    for (ri, row) in rows.into_iter().enumerate() {
-                        let selected = ri == self.sel;
-                        out.extend(crate::review_rows::render_review_row(&row, selected, cols));
+        } else {
+            match self.open_file {
+                None => {
+                    for (i, f) in diff.files.iter().enumerate() {
+                        let selected = i == self.sel;
+                        let (adds, dels) = file_stat(f);
+                        out.push((
+                            Line::split(
+                                vec![
+                                    seg(Tok::Slot(S::Faint), sel_marker(selected)),
+                                    seg(Tok::Slot(S::Text), f.path.clone()),
+                                ],
+                                vec![
+                                    seg(
+                                        Tok::Hue(thegn_core::theme::Hue::Green),
+                                        format!("+{adds} "),
+                                    ),
+                                    seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
+                                ],
+                            ),
+                            selected,
+                        ));
+                    }
+                }
+                Some(fi) => {
+                    if let Some(f) = diff.files.get(fi) {
+                        out.push((
+                            Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
+                            false,
+                        ));
+                        if self.source == DiffSource::PrReview {
+                            let review = self.anchored_review();
+                            for (ri, row) in expanded_file_rows(f, review.as_ref(), false)
+                                .into_iter()
+                                .enumerate()
+                            {
+                                let selected = ri == self.sel;
+                                out.extend(crate::review_rows::render_review_row(
+                                    &row, selected, cols,
+                                ));
+                            }
+                        } else {
+                            // Preserve the original Worktree selection model:
+                            // hunk headers render, but only diff lines consume
+                            // cursor indices. PR review rows use their separate
+                            // shared selectable projection above.
+                            let mut line_index = 0usize;
+                            for hunk in &f.hunks {
+                                out.extend(crate::review_rows::render_review_row(
+                                    &ReviewRow::Hunk(hunk.header.clone()),
+                                    false,
+                                    cols,
+                                ));
+                                for line in &hunk.lines {
+                                    let selected = line_index == self.sel;
+                                    out.extend(crate::review_rows::render_review_row(
+                                        &ReviewRow::Diff(line.clone()),
+                                        selected,
+                                        cols,
+                                    ));
+                                    line_index += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -857,6 +881,77 @@ mod tests {
         assert_eq!(v.row_count(), 4, "expanded PR rows match their renderer");
         let expanded_body = format!("{:?}", v.body_lines(80));
         assert!(expanded_body.contains("general body"));
+    }
+
+    #[test]
+    fn worktree_hunk_headers_do_not_shift_the_diff_line_selection() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+
+        let first = format!(
+            "{:?}",
+            v.body_lines(80)
+                .into_iter()
+                .find(|(_, selected)| *selected)
+                .map(|(line, _)| line)
+        );
+        assert!(first.contains("ctx"));
+        assert!(!first.contains("@@"));
+
+        v.handle_key(&KeyCode::Char('G'), Modifiers::NONE);
+        let last = format!(
+            "{:?}",
+            v.body_lines(80)
+                .into_iter()
+                .find(|(_, selected)| *selected)
+                .map(|(line, _)| line)
+        );
+        assert!(last.contains("new"));
+    }
+
+    #[test]
+    fn empty_pr_diff_still_renders_top_level_and_general_feedback() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: PrDiff::default(),
+                conversation: PrConversation {
+                    comments: vec![PrComment {
+                        author: "commenter".into(),
+                        body: "top-level body".into(),
+                        ..PrComment::default()
+                    }],
+                    threads: vec![ReviewThread {
+                        id: "general".into(),
+                        comments: vec![PrComment {
+                            author: "reviewer".into(),
+                            body: "general body".into(),
+                            ..PrComment::default()
+                        }],
+                        ..ReviewThread::default()
+                    }],
+                    ..PrConversation::default()
+                },
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+
+        assert_eq!(v.row_count(), 1);
+        let body = format!("{:?}", v.body_lines(80));
+        assert!(body.contains("top-level body"));
+        assert!(body.contains("general body"));
     }
 
     #[test]

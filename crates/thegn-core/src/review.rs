@@ -139,6 +139,12 @@ pub fn visible_threads(review: &AnchoredReview, include_resolved: bool) -> Vec<R
             visible.push(thread.clone());
         }
     }
+    if include_resolved {
+        // `sort_by_key` is stable, so this keeps diff/source order within
+        // each group while ensuring thread navigation visits every unresolved
+        // item before the resolved history exposed by the view-local toggle.
+        visible.sort_by_key(|thread| thread.resolved);
+    }
     visible
 }
 
@@ -382,6 +388,33 @@ mod tests {
             ["open"]
         );
         assert_eq!(visible_threads(&review, true).len(), 2);
+    }
+
+    #[test]
+    fn visible_threads_puts_unresolved_before_resolved_without_losing_diff_order() {
+        let review = anchor_threads(
+            &diff(
+                "src/lib.rs",
+                &[
+                    (DiffLineKind::Add, Some(10)),
+                    (DiffLineKind::Add, Some(11)),
+                    (DiffLineKind::Add, Some(12)),
+                ],
+            ),
+            &[
+                thread("done-first", "src/lib.rs", Some(10), true),
+                thread("open-first", "src/lib.rs", Some(11), false),
+                thread("open-second", "src/lib.rs", Some(12), false),
+            ],
+        );
+
+        assert_eq!(
+            visible_threads(&review, true)
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["open-first", "open-second", "done-first"]
+        );
     }
 
     #[test]
