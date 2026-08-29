@@ -43,8 +43,8 @@ pub fn validate_str(body: &str) -> Vec<String> {
     // deserialize into `Config`, the entire file is discarded for defaults.
     // This catches shape/type errors; the schema walk below catches the
     // warn-and-default enum values `Deserialize` never rejects.
-    match toml::from_str::<Config>(body) {
-        Err(e) => errs.push(format!("config would be rejected on load: {e}")),
+    let load_error = match toml::from_str::<Config>(body) {
+        Err(e) => Some(e),
         // Templates are strings as far as the schema is concerned, so their
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
@@ -89,11 +89,29 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());
+            None
         }
-    }
+    };
     let val = serde_json::to_value(val).expect("TOML values are JSON-compatible");
     let root = config_schema();
-    walk_object(&root.schema, root, &val, "", &mut errs, false);
+    let before_schema = errs.len();
+    walk_object(&root.schema, root, &val, "", &mut errs, true);
+    if let Some(error) = load_error {
+        let type_errors: Vec<String> = errs[before_schema..]
+            .iter()
+            .filter(|message| message.contains(": expected "))
+            .cloned()
+            .collect();
+        errs.truncate(before_schema);
+        if type_errors.is_empty() {
+            errs.push(format!("config would be rejected on load: {error}"));
+        } else {
+            errs.push(format!(
+                "config would be rejected on load: {error}; {}",
+                type_errors.join("; ")
+            ));
+        }
+    }
     errs
 }
 
@@ -333,7 +351,13 @@ fn walk_object(
             walk_schema(s, root, value, path, errs, check_types);
         }
     }
+    // `sandbox.failover` and `env.<name>.failover` retain a legacy boolean
+    // spelling through their custom deserializers, although schemars exposes
+    // the enum's canonical string shape. Preserve that compatibility while
+    // still type-checking every other schema node.
+    let legacy_failover_bool = value.is_boolean() && path.rsplit('.').next() == Some("failover");
     if check_types
+        && !legacy_failover_bool
         && let Some(expected) = expected_type(obj, value)
         && !value_matches_type(value, &expected)
     {
