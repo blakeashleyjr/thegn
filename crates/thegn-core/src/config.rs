@@ -4593,6 +4593,12 @@ impl NotificationsConfig {
     /// entry is both surprising and needlessly expensive to compare.
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
+        if self.agent_error_signatures.len() > crate::agent_error::MAX_AGENT_ERROR_SIGNATURES {
+            errors.push(format!(
+                "notifications.agent_error_signatures: more than {} entries",
+                crate::agent_error::MAX_AGENT_ERROR_SIGNATURES
+            ));
+        }
         for (index, signature) in self.agent_error_signatures.iter().enumerate() {
             let key = format!("notifications.agent_error_signatures[{index}]");
             if signature.trim().is_empty() {
@@ -7075,6 +7081,16 @@ mod agent_error_signatures_tests {
                 && error.contains("empty")),
             "{strict_errors:?}"
         );
+    }
+
+    #[test]
+    fn validation_rejects_an_excessive_signature_count() {
+        let mut cfg = NotificationsConfig::default();
+        cfg.agent_error_signatures = (0..=crate::agent_error::MAX_AGENT_ERROR_SIGNATURES)
+            .map(|i| format!("signature-{i}"))
+            .collect();
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|error| error.contains("more than 64")));
     }
 }
 

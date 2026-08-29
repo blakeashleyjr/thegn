@@ -104,26 +104,34 @@ pub fn set(session: &str, worktree: Option<String>, error_active: bool) {
 /// Update one session for a particular bridge/daemon generation.
 pub fn set_for(owner: &str, session: &str, worktree: Option<String>, error_active: bool) {
     let changed = if let Ok(mut g) = cell().lock() {
-        // Skip the lock-and-store when the value is unchanged: a chatty
-        // agent that keeps emitting the same error banner can otherwise
-        // produce a cache write per chunk. Same-key + same-value is a
-        // no-op for the reader.
-        if let Some(existing) = g.get(session)
-            && existing.owner == owner
-            && existing.worktree == worktree
-            && existing.error_active == error_active
+        // A stream from an older daemon generation can still have buffered
+        // Activity frames when a replacement connection has installed its
+        // snapshot. Never let that late frame reclaim the newer entry.
+        if g.get(session)
+            .is_some_and(|existing| existing.owner != owner)
         {
             false
         } else {
-            g.insert(
-                session.to_string(),
-                AgentErrorEntry {
-                    owner: owner.to_string(),
-                    worktree,
-                    error_active,
-                },
-            );
-            true
+            // Skip the lock-and-store when the value is unchanged: a chatty
+            // agent that keeps emitting the same error banner can otherwise
+            // produce a cache write per chunk. Same-key + same-value is a
+            // no-op for the reader.
+            if let Some(existing) = g.get(session)
+                && existing.worktree == worktree
+                && existing.error_active == error_active
+            {
+                false
+            } else {
+                g.insert(
+                    session.to_string(),
+                    AgentErrorEntry {
+                        owner: owner.to_string(),
+                        worktree,
+                        error_active,
+                    },
+                );
+                true
+            }
         }
     } else {
         false
@@ -206,13 +214,7 @@ pub fn clear_owner(owner: &str) {
 /// Legacy/local teardown helper. Bridge teardown uses [`clear_for`] so a late
 /// event cannot remove a newer daemon's entry for the same session id.
 pub fn clear(session: &str) {
-    let changed = cell()
-        .lock()
-        .map(|mut g| g.remove(session).is_some())
-        .unwrap_or(false);
-    if changed {
-        pulse_refresh();
-    }
+    clear_for("local", session);
 }
 
 /// True iff any session whose `worktree` equals `wt_path` has
@@ -324,11 +326,21 @@ mod tests {
         let _serial = test_lock();
         clear_all();
         set_for("old", "s1", Some("/wt/a".into()), true);
-        set_for("new", "s1", Some("/wt/a".into()), true);
+        replace_owner("new", [("s1".into(), Some("/wt/a".into()), true)]);
         clear_owner("old");
         assert!(worktree_has_error("/wt/a"));
         clear_owner("new");
         assert!(!worktree_has_error("/wt/a"));
+    }
+
+    #[test]
+    fn late_old_generation_cannot_overwrite_newer_entry() {
+        let _serial = test_lock();
+        clear_all();
+        set_for("new", "s1", Some("/wt/a".into()), false);
+        set_for("old", "s1", Some("/wt/a".into()), true);
+        assert!(!worktree_has_error("/wt/a"));
+        clear_all();
     }
 
     #[test]

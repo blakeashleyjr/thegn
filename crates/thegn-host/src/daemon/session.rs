@@ -519,7 +519,7 @@ impl SessionActor {
         // wins: a banner followed by normal output in one PTY read is already
         // resumed and must not leave the error bit raised.
         let pushed = self.history.total_pushed() - pushed_before;
-        if pushed > 0 && !self.error_signatures.is_empty() {
+        if self.has_agent && pushed > 0 && !self.error_signatures.is_empty() {
             classify_error_history(
                 &mut self.error_state,
                 &self.error_signatures,
@@ -1790,7 +1790,7 @@ mod tests {
                 continue;
             };
             let event: SessionActivityEvent =
-                serde_json::from_str(&json).expect("activity event decodes");
+                serde_json::from_str(json).expect("activity event decodes");
             if event.error_active {
                 raised = true;
             } else if raised {
@@ -1800,6 +1800,32 @@ mod tests {
         }
         assert!(raised, "the harness banner must raise error_active");
         assert!(cleared, "normal output must clear error_active");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_agent_session_does_not_classify_harness_banner() {
+        let mut harness = spawn_actor_as(
+            "printf 'Weekly limit reached\\n'; sleep 0.2; cat",
+            None,
+            "sh",
+        );
+        let feed = &mut harness.feed;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), feed.recv()).await
+            else {
+                continue;
+            };
+            if let EventFrame::Activity { json } = frame.as_ref() {
+                let event: SessionActivityEvent =
+                    serde_json::from_str(json).expect("activity event decodes");
+                assert!(
+                    !event.error_active,
+                    "shell output must not raise agent error"
+                );
+            }
+        }
     }
 
     #[test]
