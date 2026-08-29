@@ -221,6 +221,7 @@ pub(crate) fn init_new_project(leaf: &std::path::Path) -> Result<()> {
 pub(crate) fn spawn_workspace_clone(
     url: String,
     dest: std::path::PathBuf,
+    cfg: thegn_core::config::Config,
     tx: tokio::sync::mpsc::UnboundedSender<CloneEvent>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
@@ -236,6 +237,15 @@ pub(crate) fn spawn_workspace_clone(
             });
             let _ = progress_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
+        if result.is_ok()
+            && let Err(error) = crate::git_worktree::initialize(&cfg, &dest, &dest, None)
+        {
+            let _ = progress_tx.send(CloneEvent::Progress {
+                url: progress_url,
+                line: error,
+            });
+            let _ = progress_waker.wake();
+        }
         // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(CloneEvent::Done(WorkspaceCloneOutcome {
             url,
@@ -509,7 +519,7 @@ pub(crate) fn handle_picker_outcome(
                 if let Some(p) = picker.as_mut() {
                     p.begin_clone(url.clone());
                 }
-                spawn_workspace_clone(url, dest, clone_tx.clone(), waker.clone());
+                spawn_workspace_clone(url, dest, cfg.clone(), clone_tx.clone(), waker.clone());
                 false
             }
             SubmitPlan::Local(input) => create(

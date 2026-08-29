@@ -270,9 +270,12 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let branch = wt::dedupe(&raw_branch, &taken);
             let path = wt::worktree_path(&root, &branch, &cfg2);
 
-            if let Err(e) = wt::add_checked(&root, &branch, &base, &path, &cfg2) {
+            if let Err(e) = crate::git_worktree::add_checked(&root, &branch, &base, &path, &cfg2) {
                 thegn_core::msg::warn(&format!("agent dispatch: {e}"));
                 return;
+            }
+            if let Err(e) = crate::git_worktree::initialize(&cfg2, &root, &path, None) {
+                thegn_core::msg::warn(&e);
             }
 
             let wt_str = path.to_string_lossy().into_owned();

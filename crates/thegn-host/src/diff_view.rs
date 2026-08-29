@@ -475,6 +475,7 @@ mod tests {
                 DiffFile {
                     path: "a.rs".into(),
                     old_path: None,
+                    is_submodule: false,
                     hunks: vec![DiffHunk {
                         header: "@@ -1 +1 @@".into(),
                         lines: vec![
@@ -486,6 +487,7 @@ mod tests {
                 DiffFile {
                     path: "b.rs".into(),
                     old_path: None,
+                    is_submodule: false,
                     hunks: vec![],
                 },
             ],

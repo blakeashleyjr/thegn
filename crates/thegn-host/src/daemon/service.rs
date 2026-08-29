@@ -1361,8 +1361,11 @@ impl ControlApi for DaemonService {
                 let taken = wt::BranchSet::load(&root);
                 let branch = wt::dedupe(&seed, &taken);
                 let path = wt::worktree_path(&root, &branch, &cfg);
-                wt::add_checked(&root, &branch, &base, &path, &cfg)
+                crate::git_worktree::add_checked(&root, &branch, &base, &path, &cfg)
                     .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
+                if let Err(e) = crate::git_worktree::initialize(&cfg, &root, &path, None) {
+                    tracing::warn!(target: "thegn::worktree_create", error = %e, "submodule initialization failed");
+                }
 
                 let wt_str = path.to_string_lossy().into_owned();
                 let slug = repo::repo_slug(&root);
