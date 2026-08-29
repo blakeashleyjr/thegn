@@ -468,9 +468,13 @@ pub(crate) fn apply_step(
 /// Route a settled queue transition to the notification machinery: rules/DND
 /// decide desktop + sound; the inbox record is written off-loop.
 fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, message: String) {
-    let dec = ctx
-        .notify_state
-        .decide(kind.as_str(), worktree, &message, worktree);
+    let dec = crate::notify::route(
+        ctx.notify_state,
+        kind.as_str(),
+        worktree,
+        &message,
+        worktree,
+    );
     if dec.desktop {
         let n = thegn_core::notification::Notification {
             id: 0,
@@ -485,9 +489,6 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
             &thegn_core::event_bus::Event::NotificationReceived { notification: n },
         );
     }
-    ctx.notify_state.emit_sound(&dec);
-    ctx.notify_state
-        .emit_push(&dec, kind.as_str(), &message, "", worktree);
     if dec.record {
         let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
         tokio::task::spawn_blocking(move || {
