@@ -89,6 +89,13 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // Sound references and kind selectors use a free-form map, so the
             // schema walker cannot validate their keys or values.
             errs.extend(cfg.notifications.validate_sound());
+            for (profile, profile_cfg) in &cfg.profiles {
+                errs.extend(
+                    profile_cfg
+                        .notifications
+                        .validate_sound(&format!("profiles.{profile}.notifications.sound")),
+                );
+            }
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());

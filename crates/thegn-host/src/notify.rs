@@ -245,7 +245,12 @@ impl NotifyState {
 
     /// Consume the latched bell (called once per render flush by the loop).
     pub fn take_bell(&self) -> bool {
-        self.pending_bell.swap(false, Ordering::Relaxed) || self.sound_runtime.take_fallback_bell()
+        // Read both latches before combining them. Short-circuiting here would
+        // leave a fallback latch set whenever a normal BEL was also pending,
+        // replaying that fallback on the following frame.
+        let pending = self.pending_bell.swap(false, Ordering::Relaxed);
+        let fallback = self.sound_runtime.take_fallback_bell();
+        pending || fallback
     }
 
     /// Toggle the manual DND override; returns the new resolved DND state.
@@ -559,5 +564,16 @@ mod tests {
         assert!(inserted);
         assert_eq!(decision.sound, None);
         assert!(!focused_state.take_bell());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_bell_consumes_normal_and_fallback_latches_together() {
+        let (state, _master, _terminal) = test_state(NotificationsConfig::default());
+        state.ring_bell();
+        state.sound_runtime.latch_fallback_bell_for_test();
+
+        assert!(state.take_bell());
+        assert!(!state.take_bell());
     }
 }
