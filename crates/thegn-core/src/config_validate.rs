@@ -622,9 +622,10 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
+        // 90 → 91 (THE-60): `[toolchain.mise] inject` (MiseInject).
         assert_eq!(
             defs.len(),
-            90,
+            91,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -662,6 +663,7 @@ mod tests {
         has("lifecycle.eager", "EagerScope");
         has("sandbox.failover", "FailoverMode");
         has("toolchain.mode", "ToolchainMode");
+        has("toolchain.mise.inject", "MiseInject");
         has("issues.provider", "IssueProviderKind");
         has("ui.sidebar_focus_detail", "FocusDetail");
         // Maps via additionalProperties.

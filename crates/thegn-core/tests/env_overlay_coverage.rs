@@ -9,9 +9,9 @@
 //! a reason (most section-scoped keys legitimately aren't env-settable — the
 //! file says which).
 //!
-//! Only depth ≤ 1 (`key`, `section.key`) is in scope: deeper tables
-//! (`[sandbox.remote]`, `[notifications.priority]`) are structured config,
-//! not knobs.
+//! Depth ≤ 1 (`key`, `section.key`) is in scope automatically. Deeper tables
+//! (`[sandbox.remote]`, `[notifications.priority]`) are structured config and
+//! stay out of scope unless a specific nested key is deliberately pinned.
 
 mod common;
 
@@ -70,15 +70,20 @@ fn every_shallow_key_has_an_env_knob_or_is_pinned() {
     let required = common::required();
     let mut in_scope: BTreeSet<String> = BTreeSet::new();
     for (section, key) in &required.keys {
-        // depth ≤ 1 and no wildcard segment
-        if section.contains('.') || section.contains('*') {
+        // Depth ≤ 1 is automatic. A nested, non-map key may opt in through an
+        // explicit ratchet entry (e.g. security policy that must never become
+        // an ambient override).
+        if section.contains('*') {
             continue;
         }
-        in_scope.insert(if section.is_empty() {
+        let path = if section.is_empty() {
             key.clone()
         } else {
             format!("{section}.{key}")
-        });
+        };
+        if !section.contains('.') || allow.contains(&path) {
+            in_scope.insert(path);
+        }
     }
     let covered = |path: &str| {
         let (section, key) = path.split_once('.').unwrap_or(("", path));

@@ -5244,8 +5244,8 @@ pub struct Config {
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
-    /// `[toolchain]` — the batteries-included toolchain for languages-only
-    /// repos (synthesized Nix devShell; mode + per-language package overrides).
+    /// `[toolchain]` — languages-only provisioning plus activation policy for
+    /// detected repo toolchain declarations.
     pub toolchain: crate::toolchain::ToolchainConfig,
     pub limits: LimitsConfig,
     /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
