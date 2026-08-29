@@ -54,6 +54,7 @@ pub mod config_pr_queue;
 pub mod config_presets;
 pub mod config_push;
 pub mod config_remote;
+pub mod config_repo;
 pub mod config_resolve;
 pub mod config_sandbox;
 pub mod config_theme;
