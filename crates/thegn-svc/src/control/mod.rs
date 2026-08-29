@@ -64,6 +64,11 @@ pub struct SessionInfo {
     pub cols: u16,
     pub created_at_ms: i64,
     pub attached_clients: u32,
+    /// Whether the live session currently has a harness-level error banner.
+    /// This is included in session listings so a new event subscriber can
+    /// bootstrap its cache before consuming activity deltas.
+    #[serde(default)]
+    pub error_active: bool,
     /// Set while a relay lease is keeping this detached session warm.
     pub lease_expires_at: Option<i64>,
     /// The PTY child's pid on the daemon's host. A same-host compositor uses

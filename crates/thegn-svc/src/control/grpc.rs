@@ -226,6 +226,7 @@ fn info_to_proto(i: &super::SessionInfo) -> proto::SessionInfo {
         created_at_ms: i.created_at_ms,
         attached_clients: i.attached_clients,
         lease_expires_at: i.lease_expires_at,
+        error_active: i.error_active,
     }
 }
 
