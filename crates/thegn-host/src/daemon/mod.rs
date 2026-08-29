@@ -13,6 +13,7 @@
 //! loop, not this process, and nothing here ever ticks a UI client (clients
 //! only receive frames via their own mpsc + waker path).
 
+pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
 pub(crate) mod client;
 pub(crate) mod inbox;

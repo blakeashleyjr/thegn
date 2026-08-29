@@ -1825,6 +1825,9 @@ github_mentions = true
 # every other notification. On, you get one CURRENT row per session (not one per
 # turn) as an audit trail. Env: THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX.
 agent_attention_inbox = false
+# Case-insensitive substrings in completed agent-output lines that identify a
+# harness failure. Set to [] to disable text-based agent error detection.
+# agent_error_signatures = ["weekly limit", "rate limit", "usage limit", "limit reached", "quota exceeded", "out of credits", "insufficient credits", "credit balance", "billing", "payment required", "connection error.", "connection refused", "connection timed out", "network error", "network request failed", "authentication failed", "permission denied"]
 # Startup routing mode ("" = default). Named modes are defined below in
 # [notifications.modes.<name>]; switch at runtime with Ctrl+Alt+m.
 active_mode = ""

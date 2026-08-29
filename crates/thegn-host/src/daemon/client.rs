@@ -45,6 +45,7 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     if let Some(addr) = discovered {
         let client = ControlClient::new(addr);
         if client.health().await.is_ok() {
+            start_error_state_bridge(&client);
             return Some(client);
         }
     }
@@ -54,6 +55,7 @@ pub(crate) async fn connect_daemon(dcfg: &DaemonConfig) -> Option<ControlClient>
     let sock = super::socket_path(dcfg);
     let client = ControlClient::new(ControlAddr::Unix(sock));
     if client.health().await.is_ok() {
+        start_error_state_bridge(&client);
         return Some(client);
     }
     None
@@ -80,6 +82,7 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if client.health().await.is_ok() {
+            start_error_state_bridge(&client);
             return Ok(client);
         }
     }
@@ -87,6 +90,69 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
         "pane daemon did not come up on {} within 3s",
         sock.display()
     ))
+}
+
+/// Keep the compositor's attention cache synchronized with the daemon's
+/// process-wide activity feed. The pane attach stream carries activity frames
+/// only for the attached pane; this subscription also covers daemon sessions
+/// that are currently detached from a pane.
+fn start_error_state_bridge(client: &ControlClient) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn started() -> &'static Mutex<HashSet<String>> {
+        static STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        STARTED.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    let key = match client.addr() {
+        ControlAddr::Unix(path) => format!("unix:{}", path.display()),
+        ControlAddr::Tcp { addr, .. } => format!("tcp:{addr}"),
+    };
+    let inserted = started()
+        .lock()
+        .map(|mut keys| keys.insert(key.clone()))
+        .unwrap_or(false);
+    if !inserted {
+        return;
+    }
+
+    let client = client.clone();
+    tokio::spawn(async move {
+        // best-effort: the bridge is an ambient cache feed; a daemon disconnect
+        // must not affect the compositor or its pane relay.
+        let _ = async {
+            let stream = client.subscribe_events().await?;
+            let mut frames = stream.frames;
+            // Keep the sender alive for the lifetime of the websocket pump.
+            let _control = stream.control;
+            while let Some(frame) = frames.recv().await {
+                match frame {
+                    EventFrame::Activity { json } => {
+                        if let Ok(event) =
+                            serde_json::from_str::<thegn_svc::control::SessionActivityEvent>(&json)
+                        {
+                            super::agent_error_cache::set(
+                                &event.session,
+                                event.worktree,
+                                event.error_active,
+                            );
+                        }
+                    }
+                    EventFrame::SessionExit { session, .. } => {
+                        super::agent_error_cache::clear(&session);
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Ok(mut keys) = started().lock() {
+            keys.remove(&key);
+        }
+    });
 }
 
 /// A daemon-backed exec source for one worktree's panes. `sandbox_id` on the
