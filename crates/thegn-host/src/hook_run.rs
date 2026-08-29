@@ -89,13 +89,18 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
     let stderr = child.stderr.take();
     let out_thread = stdout.map(read_pipe);
     let err_thread = stderr.map(read_pipe);
-    let deadline = Instant::now() + Duration::from_secs(spec.timeout_secs);
+    // Do not construct an absolute Instant from untrusted config: a valid
+    // `u64` timeout can exceed the representable range of `Instant` and panic
+    // here. Elapsed-time comparison keeps the timeout bounded without an
+    // overflow edge.
+    let started = Instant::now();
+    let timeout = Duration::from_secs(spec.timeout_secs);
     let mut timed_out = false;
 
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => {
+            Ok(None) if started.elapsed() >= timeout => {
                 timed_out = true;
                 group.kill();
                 // Reap the direct child after the group termination request.
@@ -450,6 +455,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = run(&spec("sleep 2", 1), &context(), dir.path());
         assert_eq!(result.state, HookRunState::TimedOut);
+    }
+
+    #[test]
+    fn maximum_timeout_value_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(&spec("true", u64::MAX), &context(), dir.path());
+        assert_eq!(result.state, HookRunState::Succeeded);
     }
 
     #[test]
