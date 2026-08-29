@@ -19,7 +19,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
-use super::{OpenSpec, RecordStatus, SessionInfo};
+use super::{ForkSpec, OpenSpec, RecordStatus, SessionInfo};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
@@ -173,6 +173,17 @@ impl ControlClient {
     pub async fn open(&self, spec: &OpenSpec) -> Result<SessionInfo> {
         let v = self
             .request("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    pub async fn fork(&self, spec: &ForkSpec) -> Result<SessionInfo> {
+        let v = self
+            .request(
+                "POST",
+                "/v1/sessions/fork",
+                Some(serde_json::to_value(spec)?),
+            )
             .await?;
         Ok(serde_json::from_value(v)?)
     }
