@@ -862,26 +862,62 @@ fn wait(cfg: &Config, row: Option<i64>, timeout: Option<i64>, json: bool) -> Res
 }
 
 /// Read `(report, artifact_path)` for a roster row by id — the wake-time
-/// fact fetch (THE-88). Both are `None` when the row has been reaped between
-/// the daemon's exit and our DB read: a missing row is the wake's own answer
-/// (the tombstone fired), the caller still gets a clean wake. Split out
-/// from `wait_wake` so the DB lookup is unit-testable against a tempdir DB.
-fn row_report_artifact(id: i64) -> (Option<String>, Option<String>) {
-    match Db::open() {
-        Ok(db) => row_report_artifact_db(&db, id),
-        // No DB at all (pathological) — treat as missing row.
-        Err(_) => (None, None),
-    }
+/// fact fetch (THE-88). Both are `None` only when the row has been reaped
+/// between the daemon's exit and our DB read: a missing row is the wake's own
+/// answer (the tombstone fired), the caller still gets a clean wake. Database
+/// open/query failures remain errors so they cannot look like a worker with no
+/// report.
+fn row_report_artifact(id: i64) -> Result<(Option<String>, Option<String>)> {
+    let db = Db::open()?;
+    row_report_artifact_db(&db, id)
 }
 
 /// THE-88 — the DB-bound half of `row_report_artifact`. The unit tests
 /// exercise this directly against a tempdir DB.
-pub(crate) fn row_report_artifact_db(db: &Db, id: i64) -> (Option<String>, Option<String>) {
-    match db.get_dispatch(id) {
-        Ok(Some(row)) => (row.report, row.artifact_path),
-        // A missing row (reaped mid-wake) returns nulls — never an error.
-        _ => (None, None),
+pub(crate) fn row_report_artifact_db(db: &Db, id: i64) -> Result<(Option<String>, Option<String>)> {
+    row_report_artifact_from(db.get_dispatch(id))
+}
+
+fn row_report_artifact_from(
+    row: Result<Option<AgentDispatch>>,
+) -> Result<(Option<String>, Option<String>)> {
+    match row {
+        Ok(Some(row)) => Ok((row.report, row.artifact_path)),
+        Ok(None) => Ok((None, None)),
+        Err(e) => Err(e),
     }
+}
+
+/// The daemon's wait endpoint reports a reaped session as HTTP 404. Every
+/// other control error is infrastructure or protocol failure and must remain
+/// retryable rather than becoming a false worker completion.
+fn classify_wait_outcome(
+    outcome: anyhow::Result<serde_json::Value>,
+) -> Result<(bool, Option<i64>, bool)> {
+    match outcome {
+        Ok(v) => {
+            let matched = v
+                .get("matched")
+                .and_then(|m| m.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("malformed wait response: {v}"))?;
+            let exit_code = match v.get("exit_code") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(code) => Some(
+                    code.as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("malformed wait response: {v}"))?,
+                ),
+            };
+            Ok((matched, exit_code, false))
+        }
+        Err(e) if is_reaped_wait_error(&e) => Ok((true, None, true)),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_reaped_wait_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<thegn_svc::control::client::ControlRequestError>()
+        .is_some_and(|e| e.status() == 404)
 }
 
 async fn wait_wake(
@@ -921,25 +957,19 @@ async fn wait_wake(
     // one target timing out a beat before another exits still wakes us.
     while let Some(joined) = set.join_next().await {
         let (t, outcome) = joined.map_err(|e| anyhow::anyhow!("wait task failed: {e}"))?;
-        // A daemon error for one target (its session aged past the tombstone
-        // TTL and was reaped) is a wake with `"gone": true` — never a failure
-        // of the whole call: one reaped session must not make `--any` unusable.
-        let (matched, exit_code, gone) = match outcome {
-            Ok(v) => (
-                v.get("matched").and_then(|m| m.as_bool()).unwrap_or(false),
-                v.get("exit_code").and_then(|c| c.as_i64()),
-                false,
-            ),
-            Err(_) => (true, None, true),
-        };
+        // Only a daemon HTTP 404 means the selected session was reaped after
+        // selection. Preserve all other control/protocol errors and mark them
+        // retryable so the monitor cannot advance on a false wake.
+        let (matched, exit_code, gone) = classify_wait_outcome(outcome)
+            .map_err(|e| anyhow::Error::new(crate::cmd::Retryable(e)))?;
         if !matched {
             continue;
         }
         // THE-88: read the row's report/artifact AT WAKE TIME (not at candidate
-        // selection — the worker files the report seconds before exit). The
-        // DB read is best-effort: a row reaped mid-wake reads as missing
-        // fields, the wake itself is still the answer.
-        let (report, artifact) = row_report_artifact(t.id);
+        // selection — the worker files the report seconds before exit). Only a
+        // missing row is an empty fact; DB open/query failures are retryable.
+        let (report, artifact) =
+            row_report_artifact(t.id).map_err(|e| anyhow::Error::new(crate::cmd::Retryable(e)))?;
         if json {
             let mut v = serde_json::json!({
                 "row": t.id,
@@ -1496,19 +1526,61 @@ mod tests {
         .unwrap();
         // Initial: report absent, artifact path present from the put.
         assert_eq!(
-            row_report_artifact_db(&db, row.id),
+            row_report_artifact_db(&db, row.id).unwrap(),
             (None, Some(".thegn/pipeline/A/1.md".to_string()))
         );
         // Worker files a report: both fields populated.
         write_report(&db, row.id, "verdict: done", false).unwrap();
         assert_eq!(
-            row_report_artifact_db(&db, row.id),
+            row_report_artifact_db(&db, row.id).unwrap(),
             (
                 Some("verdict: done".to_string()),
                 Some(".thegn/pipeline/A/1.md".to_string())
             )
         );
         // Missing row: reaped mid-wake, both nulls, no error.
-        assert_eq!(row_report_artifact_db(&db, 9_999_999), (None, None));
+        assert_eq!(
+            row_report_artifact_db(&db, 9_999_999).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn wait_only_treats_a_control_404_as_a_gone_wake() {
+        let not_found = anyhow::Error::new(thegn_svc::control::client::ControlRequestError::new(
+            404,
+            "not found: session s1",
+        ));
+        assert_eq!(
+            classify_wait_outcome(Err(not_found)).unwrap(),
+            (true, None, true)
+        );
+
+        let transport = anyhow::anyhow!("connect control endpoint: connection reset");
+        let err = classify_wait_outcome(Err(transport)).unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
+
+        let forbidden = anyhow::Error::new(thegn_svc::control::client::ControlRequestError::new(
+            403,
+            "missing required scope",
+        ));
+        assert!(classify_wait_outcome(Err(forbidden)).is_err());
+    }
+
+    #[test]
+    fn wake_response_and_db_read_errors_are_not_timeouts_or_missing_rows() {
+        let err = classify_wait_outcome(Ok(serde_json::json!({"exit_code": 0}))).unwrap_err();
+        assert!(err.to_string().contains("malformed wait response"), "{err}");
+        assert!(
+            classify_wait_outcome(Ok(serde_json::json!({
+                "matched": true,
+                "exit_code": "0"
+            })))
+            .is_err()
+        );
+
+        let err =
+            row_report_artifact_from(Err(anyhow::anyhow!("database is corrupt"))).unwrap_err();
+        assert!(err.to_string().contains("database is corrupt"), "{err}");
     }
 }

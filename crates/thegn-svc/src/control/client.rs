@@ -61,6 +61,13 @@ pub struct ControlRequestError {
 }
 
 impl ControlRequestError {
+    pub fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
     pub fn status(&self) -> u16 {
         self.status
     }
@@ -128,10 +135,7 @@ impl ControlClient {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("control request failed");
-            Err(anyhow::Error::new(ControlRequestError {
-                status,
-                message: msg.to_string(),
-            }))
+            Err(anyhow::Error::new(ControlRequestError::new(status, msg)))
         }
     }
 
