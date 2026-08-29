@@ -7,6 +7,16 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — merge queue lives in scoped surfaces
+
+- The default bottom bar no longer emits a merge-queue badge. Add `"mq"` to
+  `[bars] bottom_right` to opt into its compact scoped summary; activating it
+  opens the existing unified merge-queue detail.
+- Full-mode workspace headers now show the highest active queue tier and count
+  before the warm-pool token, with the right-panel Work ▸ Merge queue section
+  as the activation destination. Empty and landed-only queues stay quiet.
+- E2E baselines were not re-recorded for this change.
+
 ### Changed — the sidebar reads in tiers, and repos no longer run together
 
 - **A workspace header now looks like a workspace header.** Every structural
