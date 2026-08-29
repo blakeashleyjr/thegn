@@ -274,7 +274,7 @@ fn create_and_register(
     }
     worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
-        worktree::remove(root, &path, branch, true);
+        crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch);
         anyhow::anyhow!(e)
     })?;
     // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
@@ -289,7 +289,7 @@ fn create_and_register(
     let path_s = path.to_string_lossy().into_owned();
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(root), branch);
     if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, branch, None, None) {
-        worktree::remove(root, &path, branch, true);
+        crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch);
         return Err(anyhow::anyhow!("db: {e}"));
     }
     // Pin the env only when it differs from the ambient default this worktree
