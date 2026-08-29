@@ -3072,10 +3072,10 @@ fn fast_reopen_round_trips_and_reports_no_mismatch() {
 }
 
 #[test]
-fn newer_db_takes_the_fast_path_and_still_serves_reads_writes() {
+fn newer_db_takes_the_tolerant_read_only_path() {
     // A newer-schema DB (a different-branch build sharing the file) must:
-    // - still take the fast path (no migration run)
-    // - serve reads/writes identically
+    // - take the tolerant fast path (no migration or open-time write)
+    // - serve reads while refusing writes from this older build
     // - report `schema_mismatch() == Some(on_disk_version)` on every open
     let dir = std::env::temp_dir().join(format!("thegn-newerdb-{}", std::process::id()));
     // best-effort: test cleanup: scratch removal must never fail the test
@@ -3096,7 +3096,7 @@ fn newer_db_takes_the_fast_path_and_still_serves_reads_writes() {
             .unwrap();
     }
 
-    // Reopen: must take the fast path and serve reads/writes.
+    // Reopen: must take the tolerant fast path and serve reads without writes.
     {
         let db = Db::open_at(&path).unwrap();
         assert_eq!(
@@ -3109,15 +3109,14 @@ fn newer_db_takes_the_fast_path_and_still_serves_reads_writes() {
             Some("v"),
             "reads work on newer-db fast path"
         );
-        db.set_ui_state("test", "k2", "v2").unwrap();
-        assert_eq!(
-            db.get_ui_state("test", "k2").unwrap().as_deref(),
-            Some("v2"),
-            "writes work on newer-db fast path"
+        assert!(
+            db.set_ui_state("test", "k2", "v2").is_err(),
+            "an older build must not write a newer-schema DB"
         );
     }
 
-    // Second reopen: mismatch stays reported.
+    // Second reopen: mismatch stays reported and the rejected write did not
+    // leave a row behind.
     {
         let db = Db::open_at(&path).unwrap();
         assert_eq!(
@@ -3125,6 +3124,12 @@ fn newer_db_takes_the_fast_path_and_still_serves_reads_writes() {
             Some(SCHEMA_VERSION + 1),
             "schema_mismatch reported on SECOND newer-db open"
         );
+        assert_eq!(db.get_ui_state("test", "k2").unwrap(), None);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION + 1);
     }
 
     // best-effort: test cleanup: scratch removal must never fail the test
@@ -3461,9 +3466,8 @@ fn v58_leaves_a_value_at_the_ms_epoch_floor_alone() {
 #[test]
 fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
     // A DB written by a newer build (shared state file across branches) must
-    // NOT fast-path: the full path records `schema_mismatch` so callers can
-    // warn, and tolerates the unknown tables. Exactly the pre-fast-path
-    // behavior.
+    // take the tolerant path, preserve the higher version, and not migrate
+    // downward.
     let dir = std::env::temp_dir().join(format!("thegn-fastdown-{}", std::process::id()));
     // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
