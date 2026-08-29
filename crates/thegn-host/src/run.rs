@@ -1237,6 +1237,7 @@ pub(crate) use crate::handlers::switch::refresh_tab_model;
 // `handlers/sidebar_keys.rs` (both extracted from this ratchet-pinned file);
 // re-exported so call sites read unchanged. Loop-coupled methods
 // (`rebuild`/`sync`/`effective_cols`) stay in the impl block below.
+pub(crate) use crate::handlers::sidebar_keys::NewWorktreeTarget;
 pub(crate) use crate::handlers::sidebar_keys::SidebarOutcome;
 pub(crate) use crate::handlers::sidebar_persist::{SIDEBAR_SCOPE, SidebarState};
 
@@ -18954,58 +18955,78 @@ async fn event_loop<T: Terminal>(
                                             agent,
                                             base,
                                         } => {
-                                            // Same repo-root resolution as Action::NewWorktree:
-                                            // sidebar-selected workspace, else active group, else cwd.
-                                            let sidebar_repo = focus
-                                                .sidebar()
-                                                .then(|| sb.selected_row(&model))
-                                                .flatten()
-                                                .map(|r| r.workspace_slug.clone())
-                                                .and_then(|slug| {
-                                                    model
-                                                        .sidebar_workspaces
-                                                        .iter()
-                                                        .find(|(s, _, _, _)| *s == slug)
-                                                        .map(|(_, _, _, p)| p.clone())
-                                                })
-                                                .filter(|p| !p.is_empty());
-                                            let src_wt = sidebar_repo.unwrap_or_else(|| {
-                                                session
-                                                    .active_group()
-                                                    .map(|g| g.path.clone())
-                                                    .unwrap_or_default()
-                                            });
-                                            let repo_root = (!src_wt.is_empty())
-                                                .then(|| {
-                                                    thegn_core::repo::main_worktree(Path::new(
-                                                        &src_wt,
-                                                    ))
-                                                })
-                                                .flatten()
-                                                .or_else(|| {
-                                                    std::env::current_dir().ok().and_then(|c| {
-                                                        thegn_core::repo::main_worktree(&c)
-                                                    })
-                                                });
-                                            if let Some(root) = repo_root {
-                                                begin_worktree_preset(
-                                                    root,
-                                                    name,
-                                                    sandbox,
-                                                    agent,
-                                                    base,
-                                                    keymap.config(),
-                                                    &mut create_gen,
-                                                    &create_tx,
-                                                    &waker,
-                                                    &mut inflight,
-                                                    &mut wizard_ui,
-                                                    &mut model,
-                                                );
-                                            } else {
-                                                thegn_core::msg::warn(
-                                                    "new-worktree: not inside a git repository",
-                                                );
+                                            // Single resolution via sidebar_keys helper
+                                            // (never silently crosses workspaces).
+                                            match sb.new_worktree_target(&model, focus.sidebar()) {
+                                                NewWorktreeTarget::Root(root) => {
+                                                    if let Some(root) = thegn_core::repo::main_worktree(
+                                                        Path::new(&root),
+                                                    ) {
+                                                        begin_worktree_preset(
+                                                            root,
+                                                            name,
+                                                            sandbox,
+                                                            agent,
+                                                            base,
+                                                            keymap.config(),
+                                                            &mut create_gen,
+                                                            &create_tx,
+                                                            &waker,
+                                                            &mut inflight,
+                                                            &mut wizard_ui,
+                                                            &mut model,
+                                                        );
+                                                    } else {
+                                                        thegn_core::msg::warn(
+                                                            "new-worktree: not inside a git repository",
+                                                        );
+                                                    }
+                                                }
+                                                NewWorktreeTarget::Refuse(msg) => {
+                                                    model.status = msg.into();
+                                                    dirty = true;
+                                                    continue;
+                                                }
+                                                NewWorktreeTarget::ActiveFallback => {
+                                                    let src_wt = session
+                                                        .active_group()
+                                                        .map(|g| g.path.clone())
+                                                        .unwrap_or_default();
+                                                    let repo_root = (!src_wt.is_empty())
+                                                        .then(|| {
+                                                            thegn_core::repo::main_worktree(
+                                                                Path::new(&src_wt),
+                                                            )
+                                                        })
+                                                        .flatten()
+                                                        .or_else(|| {
+                                                            std::env::current_dir()
+                                                                .ok()
+                                                                .and_then(|c| {
+                                                                    thegn_core::repo::main_worktree(&c)
+                                                                })
+                                                        });
+                                                    if let Some(root) = repo_root {
+                                                        begin_worktree_preset(
+                                                            root,
+                                                            name,
+                                                            sandbox,
+                                                            agent,
+                                                            base,
+                                                            keymap.config(),
+                                                            &mut create_gen,
+                                                            &create_tx,
+                                                            &waker,
+                                                            &mut inflight,
+                                                            &mut wizard_ui,
+                                                            &mut model,
+                                                        );
+                                                    } else {
+                                                        thegn_core::msg::warn(
+                                                            "new-worktree: not inside a git repository",
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                         crate::keymap::CompositeAction::NewPane {
@@ -20990,57 +21011,75 @@ async fn event_loop<T: Terminal>(
                                     Some(open_terminal_wizard(keymap.config(), &session));
                             }
                             Action::NewWorktree => {
-                                // Create a real git worktree off the active group's repo,
-                                // add a `{slug}/{branch}` group for it, then open the agent
-                                // picker — its selection launches into the new worktree.
-                                // From the sidebar, Alt+w applies to the
-                                // SELECTED workspace (e.g. WASHU), not
-                                // whichever worktree happens to be active.
-                                let sidebar_repo = focus
-                                    .sidebar()
-                                    .then(|| sb.selected_row(&model))
-                                    .flatten()
-                                    .map(|r| r.workspace_slug.clone())
-                                    .and_then(|slug| {
-                                        model
-                                            .sidebar_workspaces
-                                            .iter()
-                                            .find(|(s, _, _, _)| *s == slug)
-                                            .map(|(_, _, _, p)| p.clone())
-                                    })
-                                    .filter(|p| !p.is_empty());
-                                let src_wt = sidebar_repo.unwrap_or_else(|| {
-                                    session
-                                        .active_group()
-                                        .map(|g| g.path.clone())
-                                        .unwrap_or_default()
-                                });
-                                let repo_root = (!src_wt.is_empty())
-                                    .then(|| thegn_core::repo::main_worktree(Path::new(&src_wt)))
-                                    .flatten()
-                                    .or_else(|| {
-                                        std::env::current_dir()
-                                            .ok()
-                                            .and_then(|c| thegn_core::repo::main_worktree(&c))
-                                    });
-                                if let Some(root) = repo_root {
-                                    begin_worktree_wizard(
-                                        root,
-                                        None,
-                                        None,
-                                        keymap.config(),
-                                        &mut create_gen,
-                                        &create_tx,
-                                        &waker,
-                                        &mut inflight,
-                                        &mut wizard_cmd_tx,
-                                        &mut wizard_ui,
-                                        &mut model,
-                                    );
-                                } else {
-                                    thegn_core::msg::warn(
-                                        "new-worktree: not inside a git repository",
-                                    );
+                                // Create a real git worktree. From the sidebar,
+                                // Alt+w applies to the SELECTED workspace row;
+                                // otherwise it falls back to the active tab.
+                                // Refuse unresolvable sidebar rows — NEVER
+                                // silently cross workspaces.
+                                match sb.new_worktree_target(&model, focus.sidebar()) {
+                                    NewWorktreeTarget::Root(root) => {
+                                        if let Some(root) =
+                                            thegn_core::repo::main_worktree(Path::new(&root))
+                                        {
+                                            begin_worktree_wizard(
+                                                root,
+                                                None,
+                                                None,
+                                                keymap.config(),
+                                                &mut create_gen,
+                                                &create_tx,
+                                                &waker,
+                                                &mut inflight,
+                                                &mut wizard_cmd_tx,
+                                                &mut wizard_ui,
+                                                &mut model,
+                                            );
+                                        } else {
+                                            thegn_core::msg::warn(
+                                                "new-worktree: not inside a git repository",
+                                            );
+                                        }
+                                    }
+                                    NewWorktreeTarget::Refuse(msg) => {
+                                        model.status = msg.into();
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    NewWorktreeTarget::ActiveFallback => {
+                                        let src_wt = session
+                                            .active_group()
+                                            .map(|g| g.path.clone())
+                                            .unwrap_or_default();
+                                        let repo_root = (!src_wt.is_empty())
+                                            .then(|| {
+                                                thegn_core::repo::main_worktree(Path::new(&src_wt))
+                                            })
+                                            .flatten()
+                                            .or_else(|| {
+                                                std::env::current_dir().ok().and_then(|c| {
+                                                    thegn_core::repo::main_worktree(&c)
+                                                })
+                                            });
+                                        if let Some(root) = repo_root {
+                                            begin_worktree_wizard(
+                                                root,
+                                                None,
+                                                None,
+                                                keymap.config(),
+                                                &mut create_gen,
+                                                &create_tx,
+                                                &waker,
+                                                &mut inflight,
+                                                &mut wizard_cmd_tx,
+                                                &mut wizard_ui,
+                                                &mut model,
+                                            );
+                                        } else {
+                                            thegn_core::msg::warn(
+                                                "new-worktree: not inside a git repository",
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Action::NewTab => {
