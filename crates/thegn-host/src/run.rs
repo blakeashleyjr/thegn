@@ -20470,6 +20470,14 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&new);
                                 }
                             }
+                            Action::ForkSession => {
+                                model.status = crate::handlers::session_fork::request(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                    &waker,
+                                );
+                            }
                             Action::CycleTheme => {
                                 let themes = crate::theme_builder::cycle_catalog(
                                     &current_config,
