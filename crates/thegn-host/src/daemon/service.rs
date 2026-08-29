@@ -19,7 +19,7 @@ use thegn_core::db::Db;
 use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
-    AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult,
+    AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult, ForkSpec,
     GitFileStatus, OpenSpec, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
     WaitCondition, WaitOutcome,
 };
@@ -33,6 +33,9 @@ pub(crate) struct SessionEntry {
     pub msg_tx: mpsc::Sender<SessionMsg>,
     pub meta: SessionMeta,
     pub live: Arc<Mutex<LiveMeta>>,
+    /// The resolved source recipe used to create this live session. It is
+    /// deliberately absent only on test/legacy stubs and is never persisted.
+    pub recipe: Option<thegn_core::session_fork::DaemonRecipe>,
 }
 
 /// What a session id resolves to.
@@ -423,6 +426,19 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
+            // Keep only a memory-resident recipe for a later live fork. Raw
+            // argv/env never enter a response, tombstone, or cache row.
+            let recipe = match &spec.agent {
+                Some(launch) => super::fork::agent_recipe(&self.config, launch, &spec),
+                None => Some(thegn_core::session_fork::DaemonRecipe::Raw(
+                    thegn_core::session_fork::RawLaunchRecipe {
+                        argv: spec.argv.clone(),
+                        cwd: spec.cwd.clone(),
+                        env: spec.env.clone(),
+                        worktree: spec.worktree.clone(),
+                    },
+                )),
+            };
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
@@ -526,6 +542,7 @@ impl ControlApi for DaemonService {
                 cwd: cwd_s.clone(),
                 created_at_ms: now_ms(),
                 pid: pty.pid,
+                forked_from: None,
             };
             let live = Arc::new(Mutex::new(LiveMeta {
                 rows,
@@ -546,6 +563,7 @@ impl ControlApi for DaemonService {
                 self.tombs.clone(),
                 self.db.clone(),
                 self.config.clone(),
+                None,
             );
             let info = {
                 let live = live.lock().expect("live meta lock");
@@ -558,10 +576,15 @@ impl ControlApi for DaemonService {
             // a PHANTOM entry for a dead actor: listed forever, `kill` no-ops, and
             // idle-exit (busy = sessions non-empty) never fires. Inserting first
             // guarantees the teardown removal always observes the entry.
-            self.sessions
-                .lock()
-                .await
-                .insert(id.clone(), SessionEntry { msg_tx, meta, live });
+            self.sessions.lock().await.insert(
+                id.clone(),
+                SessionEntry {
+                    msg_tx,
+                    meta,
+                    live,
+                    recipe,
+                },
+            );
             tokio::spawn(actor.run(pane_rx, msg_rx));
             self.emit(EventFrame::Sessions);
 
@@ -574,6 +597,7 @@ impl ControlApi for DaemonService {
                     session: id.clone(),
                     worktree,
                     focus: false,
+                    tab: false,
                 };
                 if let Err(e) = self
                     .with_db(move |db| {
@@ -585,6 +609,270 @@ impl ControlApi for DaemonService {
                     tracing::warn!(target: "thegn::daemon", "adopt intent for {id} failed: {e}");
                 }
             }
+            Ok(info)
+        })
+    }
+
+    fn fork(&self, spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async move {
+            let (source, source_tx) = if let Some(harness) = spec.harness.clone() {
+                (
+                    thegn_core::session_fork::ForkSource::HarnessSession {
+                        harness,
+                        id: spec.session.clone(),
+                        agent: spec.agent.clone(),
+                        worktree: spec.worktree.clone(),
+                    },
+                    None,
+                )
+            } else {
+                match self.lookup(&spec.session).await {
+                    Lookup::Live(tx) => {
+                        let sessions = self.sessions.lock().await;
+                        let entry = sessions
+                            .get(&spec.session)
+                            .ok_or_else(|| Self::not_found(&spec.session))?;
+                        let source = super::fork::source(entry).ok_or_else(|| {
+                            ControlError::Conflict(format!(
+                                "session {} has no retained fork recipe",
+                                spec.session
+                            ))
+                        })?;
+                        (source, Some(tx))
+                    }
+                    Lookup::Dead(_) => {
+                        return Err(ControlError::Conflict(format!(
+                            "session {} has exited; use sessions.open for a cold start",
+                            spec.session
+                        )));
+                    }
+                    Lookup::Unknown => return Err(Self::not_found(&spec.session)),
+                }
+            };
+            let options = thegn_core::session_fork::ForkOptions {
+                cwd: spec.cwd.clone(),
+                worktree: spec.worktree.clone(),
+                scrollback: spec.scrollback,
+                adopt: spec.adopt,
+                placement: if spec.tab {
+                    thegn_core::session_fork::ForkPlacement::NewTab
+                } else {
+                    thegn_core::session_fork::ForkPlacement::Sibling
+                },
+            };
+            let plan = thegn_core::session_fork::ForkRequest { source, options }
+                .plan()
+                .map_err(|error| ControlError::Conflict(error.to_string()))?;
+            let history = if spec.scrollback {
+                if let Some(tx) = source_tx {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    tx.send(SessionMsg::HistoryTail { reply: reply_tx })
+                        .await
+                        .map_err(|_| Self::not_found(&spec.session))?;
+                    Some(reply_rx.await.map_err(|_| Self::not_found(&spec.session))?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let child_id = fresh_id();
+            let handoff = match history.as_deref().filter(|text| !text.is_empty()) {
+                Some(text) => Some(
+                    super::fork::write_handoff(&child_id, text).map_err(ControlError::Internal)?,
+                ),
+                None => None,
+            };
+            let handoff_s = handoff
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            let (argv, cwd_s, env, worktree, program, child_recipe) = match &plan {
+                thegn_core::session_fork::ForkPlan::Raw {
+                    argv,
+                    cwd,
+                    env,
+                    worktree,
+                    ..
+                } => (
+                    thegn_core::sandbox_cpucap::wrap_control_argv(argv.clone(), false),
+                    cwd.clone(),
+                    thegn_core::session_fork::compose_identity_env(
+                        env,
+                        &child_id,
+                        &self.endpoint,
+                        plan.lineage(),
+                        handoff_s.as_deref(),
+                    ),
+                    worktree.clone(),
+                    crate::pane::program_name(argv),
+                    thegn_core::session_fork::DaemonRecipe::Raw(
+                        thegn_core::session_fork::RawLaunchRecipe {
+                            argv: argv.clone(),
+                            cwd: cwd.clone(),
+                            env: env.clone(),
+                            worktree: worktree.clone(),
+                        },
+                    ),
+                ),
+                thegn_core::session_fork::ForkPlan::Harness {
+                    harness,
+                    native_session_id,
+                    agent,
+                    cwd,
+                    worktree,
+                    ..
+                } => {
+                    let agent = agent.clone().unwrap_or_else(|| harness.clone());
+                    let open = OpenSpec {
+                        argv: Vec::new(),
+                        cwd: cwd.clone(),
+                        env: Vec::new(),
+                        rows: 24,
+                        cols: 80,
+                        worktree: worktree.clone(),
+                        agent: Some(thegn_svc::control::AgentLaunch {
+                            agent: agent.clone(),
+                            prompt: String::new(),
+                            headless: Some(false),
+                            bind_worktree: false,
+                            resume: None,
+                            continue_last: false,
+                            stage: None,
+                            fork: true,
+                            native_session_id: Some(native_session_id.clone()),
+                        }),
+                        adopt: false,
+                        already_capped: false,
+                    };
+                    let snapshot = self.config.clone();
+                    let launch = open.agent.as_ref().expect("fork agent").clone();
+                    let resolved = self
+                        .with_db(move |db| {
+                            let fresh = crate::config_source::fresh();
+                            let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                            super::agent_open::resolve(cfg, db, &open, &launch)
+                        })
+                        .await
+                        .map_err(|error| ControlError::Conflict(error.to_string()))?;
+                    let cwd_s = resolved
+                        .cwd
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
+                    let env = thegn_core::session_fork::compose_identity_env(
+                        &resolved.env,
+                        &child_id,
+                        &self.endpoint,
+                        plan.lineage(),
+                        handoff_s.as_deref(),
+                    );
+                    (
+                        resolved.argv,
+                        cwd_s,
+                        env,
+                        worktree.clone(),
+                        agent.clone(),
+                        thegn_core::session_fork::DaemonRecipe::Agent {
+                            harness: harness.clone(),
+                            native_session_id: None,
+                            agent: Some(agent),
+                            cwd: cwd.clone(),
+                            worktree: worktree.clone(),
+                        },
+                    )
+                }
+            };
+            if argv.is_empty() {
+                super::fork::cleanup_handoff(handoff.as_deref());
+                return Err(ControlError::Conflict("fork produced empty argv".into()));
+            }
+            let rows = 24;
+            let cols = 80;
+            let (pane_tx, pane_rx) = mpsc::channel(256);
+            let cwd = cwd_s.as_ref().map(std::path::PathBuf::from);
+            let pty = crate::pane_pty::open_pty(
+                0,
+                &argv,
+                cwd.as_deref(),
+                &env,
+                rows,
+                cols,
+                pane_tx,
+                None,
+                None,
+            )
+            .map_err(|error| {
+                super::fork::cleanup_handoff(handoff.as_deref());
+                ControlError::Internal(error)
+            })?;
+            let meta = SessionMeta {
+                id: child_id.clone(),
+                worktree: worktree.clone(),
+                program,
+                cwd: cwd_s.clone(),
+                created_at_ms: now_ms(),
+                pid: pty.pid,
+                forked_from: Some(plan.lineage().to_string()),
+            };
+            let live = Arc::new(Mutex::new(LiveMeta {
+                rows,
+                cols,
+                ..Default::default()
+            }));
+            let (msg_tx, msg_rx) = mpsc::channel(64);
+            let actor = SessionActor::new(
+                meta.clone(),
+                live.clone(),
+                pty,
+                rows,
+                cols,
+                self.events.clone(),
+                self.idle_tx.clone(),
+                self.sessions.clone(),
+                self.tombs.clone(),
+                self.db.clone(),
+                self.config.clone(),
+                handoff,
+            );
+            let info = {
+                let live = live.lock().expect("live meta lock");
+                meta.info(&live, None)
+            };
+            self.sessions.lock().await.insert(
+                child_id.clone(),
+                SessionEntry {
+                    msg_tx,
+                    meta,
+                    live,
+                    recipe: Some(child_recipe),
+                },
+            );
+            tokio::spawn(actor.run(pane_rx, msg_rx));
+            self.emit(EventFrame::Sessions);
+            if spec.adopt {
+                let payload = thegn_core::models::AdoptIntent {
+                    session: child_id.clone(),
+                    worktree,
+                    focus: false,
+                    tab: spec.tab,
+                };
+                if let Err(error) = self
+                    .with_db(move |db| {
+                        db.put_intent("adopt_session", &serde_json::to_string(&payload)?)?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    tracing::warn!(target: "thegn::daemon", "adopt intent for {child_id} failed: {error}");
+                }
+            }
+            let record =
+                thegn_core::session_fork::ForkRecord::from_plan(&child_id, &plan, now_ms() / 1000);
+            let _ = self
+                .with_db(move |db| {
+                    use thegn_core::store::SessionForkStore;
+                    db.put_session_fork(&record)
+                })
+                .await;
             Ok(info)
         })
     }
@@ -1542,6 +1830,7 @@ mod tests {
                     cwd: None,
                     created_at_ms: 0,
                     pid: None,
+                    forked_from: None,
                 },
                 live: Arc::new(Mutex::new(LiveMeta {
                     rows: 24,
@@ -1549,6 +1838,7 @@ mod tests {
                     attached: 0,
                     ..Default::default()
                 })),
+                recipe: None,
             },
         );
 
@@ -1995,6 +2285,7 @@ mod tests {
             cwd: None,
             created_at_ms: 0,
             pid: None,
+            forked_from: None,
         };
         let live = Arc::new(Mutex::new(LiveMeta {
             rows: 24,
@@ -2002,10 +2293,15 @@ mod tests {
             attached: 0,
             ..Default::default()
         }));
-        svc.sessions
-            .lock()
-            .await
-            .insert(id.to_string(), SessionEntry { msg_tx, meta, live });
+        svc.sessions.lock().await.insert(
+            id.to_string(),
+            SessionEntry {
+                msg_tx,
+                meta,
+                live,
+                recipe: None,
+            },
+        );
         tokio::spawn(async move {
             while let Some(msg) = msg_rx.recv().await {
                 if let SessionMsg::Attach { reply, .. } = msg {

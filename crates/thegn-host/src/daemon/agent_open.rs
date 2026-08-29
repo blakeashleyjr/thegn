@@ -67,15 +67,24 @@ pub(crate) fn resolve(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let cmd = command_for(
-        cfg,
-        agent,
-        &launch.prompt,
-        headless,
-        launch.resume.as_deref().filter(|s| !s.is_empty()),
-        launch.continue_last,
-        stage,
-    )?;
+    let cmd = if launch.fork {
+        let native_id = launch
+            .native_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .context("a fork launch needs a native session id")?;
+        fork_command_for(cfg, agent, native_id)?
+    } else {
+        command_for(
+            cfg,
+            agent,
+            &launch.prompt,
+            headless,
+            launch.resume.as_deref().filter(|s| !s.is_empty()),
+            launch.continue_last,
+            stage,
+        )?
+    };
 
     // The branch is the worktree's registered one; a worktree thegn does not
     // know about still launches, just without the branch in its environment.
@@ -224,6 +233,24 @@ pub(crate) fn harness_for_agent(
         return thegn_core::harness::harness(&id);
     }
     thegn_core::harness::harness(agent)
+}
+
+/// Resolve the vendor-owned native fork command. The generic daemon never
+/// interprets provider syntax; it only asks the harness seam for the operation.
+pub(crate) fn fork_command_for(
+    cfg: &Config,
+    agent: &str,
+    native_session_id: &str,
+) -> Result<String> {
+    if !thegn_core::harness::session_id_ok(native_session_id) {
+        bail!("invalid fork session id {native_session_id}");
+    }
+    let harness = harness_for_agent(cfg, agent)
+        .with_context(|| format!("unknown agent {agent} — cannot fork"))?;
+    harness
+        .fork_command(native_session_id)
+        .filter(|command| !command.is_empty())
+        .with_context(|| format!("agent {agent} does not support native session fork"))
 }
 
 #[cfg(test)]
@@ -459,6 +486,8 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            fork: false,
+            native_session_id: None,
         };
         let db = Db::open_memory().expect("in-memory db");
         let err = resolve(&cfg(), &db, &spec, &launch).expect_err("should refuse");
