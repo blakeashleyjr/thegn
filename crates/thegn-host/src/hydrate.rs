@@ -3710,9 +3710,21 @@ pub(crate) fn spawn_pr_cache_refresh(
                 let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Ok(mentions) = forge.mentions(&loc, &repo) {
                     for (source_ref, msg) in mentions {
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ =
-                            db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
+                        if !crate::notify::record_global_once(
+                            &db,
+                            "mentioned",
+                            &source_ref,
+                            &msg,
+                            &repo_root,
+                        ) {
+                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            let _ = db.put_notification_once(
+                                "mentioned",
+                                &source_ref,
+                                &msg,
+                                &repo_root,
+                            );
+                        }
                     }
                 }
             }

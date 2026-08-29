@@ -347,7 +347,47 @@ pub fn record(
     } else {
         None
     };
-    state.emit_sound(&decision);
+    emit_channels(state, &decision, kind, message, worktree);
+    (decision, id)
+}
+
+/// Decide + emit-once persist a re-derived notification. Transient channels
+/// are emitted only after the atomic store operation inserts a new row, so a
+/// hydration refresh cannot replay a sound for an already-observed fact.
+pub(crate) fn record_once(
+    db: &thegn_core::db::Db,
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> (RouteDecision, bool) {
+    let decision = state.decide(kind, source_ref, message, worktree);
+    let inserted = if decision.record {
+        match db.put_notification_once(kind, source_ref, message, worktree) {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                tracing::debug!(target: "thegn::notify", %error, "emit-once notification cache write failed");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if inserted {
+        emit_channels(state, &decision, kind, message, worktree);
+    }
+    (decision, inserted)
+}
+
+fn emit_channels(
+    state: &NotifyState,
+    decision: &RouteDecision,
+    kind: &str,
+    message: &str,
+    worktree: &str,
+) {
+    state.emit_sound(decision);
     // The transient in-app toast is the one funnel for routed events: it fires
     // iff the routing decision authorizes it (`toast`), governed by the same
     // rules/DND as every other channel — never a hand-rolled toast that dodges
@@ -358,7 +398,6 @@ pub fn record(
     // Push-to-phone rides the same decision. The publisher worker exists only
     // when `[notifications.push]` is configured; otherwise this is a no-op.
     state.emit_push(&decision, kind, message, "", worktree);
-    (decision, id)
 }
 
 /// Route a hydration/worker notification through the live host state when it
@@ -373,6 +412,21 @@ pub(crate) fn record_global(
 ) -> bool {
     let Some(state) = global() else { return false };
     let _ = record(db, &state, kind, source_ref, message, worktree);
+    true
+}
+
+/// Route a re-derived hydration notification through the live host state. The
+/// caller keeps its durable-only `put_notification_once` fallback when this
+/// returns `false` because startup has not installed a live route yet.
+pub(crate) fn record_global_once(
+    db: &thegn_core::db::Db,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> bool {
+    let Some(state) = global() else { return false };
+    let (_decision, _inserted) = record_once(db, &state, kind, source_ref, message, worktree);
     true
 }
 
