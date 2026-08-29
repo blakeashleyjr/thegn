@@ -54,6 +54,17 @@ across in-process worktree switches. Global panes SHALL not be daemon-owned or
 restored after restart. Legacy `true` state SHALL decode as `files`, and
 `false` SHALL decode as closed.
 
+#### Scenario: Global pane follows an in-process worktree switch
+
+- **WHEN** a global occupant is open and the user switches worktrees
+- **THEN** the same local pane is reused, while a destination worktree
+  occupant takes precedence when its state is open
+
+#### Scenario: Legacy drawer state remains readable
+
+- **WHEN** a persisted worktree drawer file contains `true`
+- **THEN** the runtime treats it as the built-in `files` occupant
+
 ### Requirement: Occupants are contained and resolved off-loop
 
 Every occupant SHALL use the existing drawer argv conversion, containment,
@@ -61,9 +72,22 @@ and local-spawn seams. Cold resolution, environment expansion, and PATH or
 filesystem checks SHALL happen off the event loop through a channel and waker,
 deduplicated by `(scope-key, occupant-id)`; stale results SHALL be dropped.
 
+#### Scenario: Rapid selection deduplicates a cold spawn
+
+- **WHEN** the user selects the same cold occupant repeatedly before its
+  result arrives
+- **THEN** one `(scope-key, occupant-id)` request is in flight and stale
+  results cannot open a different selection
+
 ### Requirement: The drawer indicator is discoverable and removable
 
 The `drawer` bars widget SHALL be present in the default `bottom_left` order,
 use existing glyph/theme chokepoints, show closed/open occupant state and the
 configured occupant count, and toggle the same files-drawer action when
 clicked. Removing it from `[bars]` SHALL remove both its paint and hit target.
+
+#### Scenario: The indicator reflects the active occupant
+
+- **WHEN** the drawer is closed or a configured occupant is open
+- **THEN** the widget shows the dim closed state or the accented occupant
+  label and configured count, and clicking it invokes files-drawer
