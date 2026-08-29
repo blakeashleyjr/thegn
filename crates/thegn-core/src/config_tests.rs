@@ -2695,6 +2695,11 @@ fn validate_str_catches_wholesale_type_error() {
         !errs.is_empty(),
         "type mismatch that breaks load must be reported: {errs:?}"
     );
+    assert!(
+        errs.iter()
+            .any(|error| error.contains("sandbox.enabled: expected boolean, got string")),
+        "type mismatch should identify its dotted key and types: {errs:?}"
+    );
 
     // A clean config still validates.
     assert!(validate_str("picker = \"fzf\"\n").is_empty());
