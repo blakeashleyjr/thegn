@@ -133,7 +133,11 @@ use std::path::PathBuf;
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-pub const SCHEMA_VERSION: i64 = 61;
+/// v62: adds `pr_review_cache`, one complete PR review snapshot per canonical
+/// worktree key. It is a best-effort cache; the branch, PR number, and head OID
+/// are retained beside the JSON so stale feedback cannot silently attach to a
+/// different PR.
+pub const SCHEMA_VERSION: i64 = 62;
 
 pub struct Db {
     conn: Connection,
@@ -475,6 +479,17 @@ impl Db {
               branch     TEXT,
               json       TEXT,
               fetched_at INTEGER
+            );
+            -- v62: complete PR review conversation + PR-head diff snapshot.
+            -- Identity columns make stale cache validation possible without
+            -- parsing the payload and the JSON is replaced atomically.
+            CREATE TABLE IF NOT EXISTS pr_review_cache (
+              worktree   TEXT PRIMARY KEY,
+              branch     TEXT NOT NULL,
+              pr_number  INTEGER NOT NULL,
+              head_oid   TEXT NOT NULL,
+              json       TEXT NOT NULL,
+              fetched_at INTEGER NOT NULL
             );
             -- CI run-history cache per worktree (TTL'd JSON `Vec<ci::CiRun>`),
             -- so the CI panel/view paint instantly from cache then hydrate live
@@ -931,7 +946,7 @@ impl Db {
         )?;
         crate::db_migrate::additive_schema(&conn);
         if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v61_schema(&conn)?;
+            crate::db_migrate::verify_v62_schema(&conn)?;
         }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);

@@ -175,7 +175,9 @@ pub fn format_review_feedback(
             push_remote_comment(&mut out, comment);
         }
         for review in &snapshot.conversation.reviews {
-            push_remote_review(&mut out, review);
+            if !review.body.trim().is_empty() {
+                push_remote_review(&mut out, review);
+            }
         }
     }
     for thread in threads {
@@ -250,14 +252,23 @@ fn clean_bounded(text: &str, max_chars: usize) -> String {
 }
 
 fn is_terminal_control(ch: char) -> bool {
-    matches!(ch as u32, 0x00..=0x08 | 0x0a..=0x1f | 0x7f..=0x9f)
+    matches!(ch as u32, 0x00..=0x08 | 0x0b..=0x1f | 0x7f..=0x9f)
 }
 
 fn push_line(out: &mut String, line: &str) {
-    if out.len() < MAX_REVIEW_FEEDBACK_CHARS {
-        out.push_str(line);
-        out.push('\n');
+    let remaining = MAX_REVIEW_FEEDBACK_CHARS.saturating_sub(out.len());
+    if remaining <= 1 {
+        return;
     }
+    let mut room = remaining - 1;
+    for ch in line.chars() {
+        if ch.len_utf8() > room {
+            break;
+        }
+        out.push(ch);
+        room -= ch.len_utf8();
+    }
+    out.push('\n');
 }
 
 fn truncate_feedback(out: &mut String) {
@@ -277,7 +288,7 @@ fn truncate_feedback(out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::model::{DiffFile, DiffHunk, DiffLineKind};
+    use crate::forge::model::{DiffFile, DiffHunk, DiffLine, DiffLineKind};
 
     fn diff(path: &str, lines: &[(DiffLineKind, Option<u64>)]) -> PrDiff {
         PrDiff {
