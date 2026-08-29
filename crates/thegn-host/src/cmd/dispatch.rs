@@ -241,8 +241,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => set_status(id, &status, force, json),
         Action::Verify { id, json } => verify(id, json),
         Action::Wait {
-            row, timeout, json, ..
-        } => wait(cfg, row, timeout, json),
+            row,
+            any,
+            timeout,
+            json,
+        } => wait(cfg, row, any, timeout, json),
         Action::Report { id, text, json } => report(id, &text, json),
         Action::Note { id, text, json } => note(id, &text, json),
         Action::Status {
@@ -865,12 +868,27 @@ fn yes_no(b: bool) -> &'static str {
 /// read and the candidate selection stay synchronous and BEFORE the connect:
 /// a selection error (unknown row, nothing active) is answerable from the
 /// local roster alone and must not require a running daemon.
-fn wait(cfg: &Config, row: Option<i64>, timeout: Option<i64>, json: bool) -> Result<()> {
+fn wait(cfg: &Config, row: Option<i64>, any: bool, timeout: Option<i64>, json: bool) -> Result<()> {
+    validate_wait_timeout(row, any, timeout)?;
     let db = Db::open()?;
     let rows = db.list_dispatches()?;
     let targets = pipeline_run::wait_candidates(&rows, row).map_err(|e| anyhow::anyhow!("{e}"))?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(wait_wake(cfg, targets, timeout, json))
+}
+
+fn validate_wait_timeout(row: Option<i64>, any: bool, timeout: Option<i64>) -> Result<()> {
+    if timeout.is_some_and(|ms| ms <= 0) {
+        anyhow::bail!("dispatch wait --timeout must be greater than zero milliseconds");
+    }
+    // A row-less wait is the --any form, including the documented default when
+    // neither --row nor --any is supplied. It is used by background monitors,
+    // so an omitted timeout must never create an unbounded supervisor wait.
+    if row.is_none() && timeout.is_none() {
+        let form = if any { "--any" } else { "without --row" };
+        anyhow::bail!("dispatch wait {form} requires --timeout");
+    }
+    Ok(())
 }
 
 /// Read `(report, artifact_path)` for a roster row by id — the wake-time
@@ -953,13 +971,28 @@ async fn wait_wake(
     for t in targets {
         let client = client.clone();
         set.spawn(async move {
-            let out = client
-                .wait(
-                    &t.session_id,
-                    serde_json::json!({ "kind": "exited" }),
-                    timeout,
+            let out = match timeout {
+                Some(ms) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(ms as u64),
+                    client.wait(
+                        &t.session_id,
+                        serde_json::json!({ "kind": "exited" }),
+                        Some(ms),
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(out) => out,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "dispatch wait timed out after {ms} milliseconds"
+                    )),
+                },
+                None => {
+                    client
+                        .wait(&t.session_id, serde_json::json!({ "kind": "exited" }), None)
+                        .await
+                }
+            };
             (t, out)
         });
     }
@@ -1065,6 +1098,19 @@ mod tests {
         assert_eq!(shown.first().map(|n| n.id), Some(1));
         assert_eq!(shown.last().map(|n| n.id), Some(20));
         assert_eq!(notes.len(), 21);
+    }
+
+    #[test]
+    fn rowless_wait_requires_a_positive_hard_timeout() {
+        assert!(
+            validate_wait_timeout(None, true, None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --timeout")
+        );
+        assert!(validate_wait_timeout(None, false, Some(0)).is_err());
+        assert!(validate_wait_timeout(Some(7), false, None).is_ok());
+        assert!(validate_wait_timeout(None, true, Some(600_000)).is_ok());
     }
 
     #[test]
@@ -1458,10 +1504,10 @@ mod tests {
     fn dispatch_note_appends_and_assigns_ids_in_order() {
         let (_d, db) = db("note-append");
         let row = put(&db, NewDispatch::new("linear:A-1", "/wt/a", "claude")).unwrap();
-        let n1 = write_note(&db, row.id, "first", false).unwrap();
+        write_note(&db, row.id, "first", false).unwrap();
         // Second append: ids are monotonic and the second text is what we wrote.
         // `write_note` validates through the same core policy as the report.
-        let _ = write_note(&db, row.id, "second", false).unwrap();
+        write_note(&db, row.id, "second", false).unwrap();
         let all = db.dispatch_notes(row.id, None, 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].text, "first");
@@ -1474,7 +1520,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not be empty"), "{err}");
-        let _ = n1; // silence unused
     }
 
     /// THE-88: `dispatch status` filters active by default, returns the row
