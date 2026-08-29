@@ -970,7 +970,7 @@ fn csi_reply<'a>(s: &'a str, prefix: &str, final_byte: char) -> Option<&'a str> 
 /// [`KEYBOARD_QUERIES`] the buffer also holds a kitty reply (`ESC [ ? … u`),
 /// which shares the `ESC [ ?` prefix, and an XTVERSION name is arbitrary text
 /// that routinely contains a `c` (`Alacritty`, `contour` — both in
-/// [`MODERN_TERMS`]). A loose "a `?` somewhere, then any `c`" rule therefore
+/// `MODERN_TERMS`). A loose "a `?` somewhere, then any `c`" rule therefore
 /// ends the read on the *version* reply and leaves the DA bytes in the tty for
 /// the input reader to decode as stray keystrokes. See THE-70.
 pub fn has_primary_da(bytes: &[u8]) -> bool {

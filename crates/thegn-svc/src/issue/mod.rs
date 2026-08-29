@@ -287,7 +287,7 @@ impl IssueRouter {
     /// `wt new --from-issue`) falls back to the sole configured backend when
     /// there is exactly one. Two or more stay strict: guessing which tracker a
     /// bare key belongs to would fetch the wrong issue, which is worse than the
-    /// error [`id_miss`] then produces.
+    /// error `id_miss` then produces.
     fn backend_for_id(&self, id: &str) -> Option<&dyn IssueBackend> {
         let prefix = id.split_once(':').map(|(p, _)| p).unwrap_or(id);
         if let Some(b) = self.inner.iter().find(|b| b.inner.provider_id() == prefix) {

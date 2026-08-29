@@ -109,7 +109,7 @@ use std::path::PathBuf;
 /// `parent_id`, `session_id`, `artifact_path` — so one roster row can say which
 /// pipeline stage it is, which row it was chunked out of, which daemon session
 /// runs it, and where its handoff artifact lives. Purely additive idempotent
-/// `ALTER`s in [`crate::db_migrate::additive_schema`]; every pre-v56 row reads
+/// `ALTER`s in `db_migrate::additive_schema`; every pre-v56 row reads
 /// back `NULL` (⇒ `None`), which is exactly the pre-change behaviour. The
 /// roster gains columns, never transitions: no thegn code path advances a
 /// `stage`.
