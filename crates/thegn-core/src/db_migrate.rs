@@ -16,20 +16,11 @@ impl crate::db::Db {
 
 /// Classify the on-disk `user_version` against `current` (this build's
 /// [`crate::db::SCHEMA_VERSION`]): `Some(on_disk)` when the DB was written by a
-/// newer-schema build (a different branch sharing the file), else `None`. We
-/// warn and keep opening — the multi-branch-one-DB dev workflow is intentional
-/// and the additive schema is forward-compatible — but record it so the host
-/// can surface the mismatch once at startup.
+/// newer-schema build (a different branch sharing the file), else `None`.
+/// Pure classifier — the caller (e.g. [`crate::db::Db::init`]) is responsible
+/// for emitting the once-per-process warning.
 pub(crate) fn detect_newer_schema(on_disk: i64, current: i64) -> Option<i64> {
-    let newer = (on_disk > current).then_some(on_disk)?;
-    tracing::warn!(
-        target: "thegn::db",
-        on_disk = newer,
-        build = current,
-        "database schema v{newer} is newer than this build (v{current}); \
-         data written by the newer build may be invisible"
-    );
-    Some(newer)
+    (on_disk > current).then_some(on_disk)
 }
 
 /// Split a legacy v4/v5 tab name into its worktree-group base and page number:
