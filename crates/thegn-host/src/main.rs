@@ -46,6 +46,7 @@ mod daemon;
 mod db_task;
 mod desktop_notify;
 mod detail;
+mod devcontainer_provider;
 mod diag;
 mod diff_view;
 mod direnv_warm;
