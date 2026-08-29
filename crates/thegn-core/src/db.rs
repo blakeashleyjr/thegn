@@ -318,6 +318,31 @@ impl Db {
         Self::init(Self::open_connection(path)?)
     }
 
+    /// Open an existing state DB without creating, migrating, pruning, or
+    /// changing its journal mode. This is the only safe opener for commands
+    /// whose dry-run contract is strictly read-only. An absent file is
+    /// represented as `None` so callers can inspect an empty, not-yet-created
+    /// target without manufacturing a database.
+    pub fn open_read_only_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Read-only counterpart to [`Db::open`] for dry-run command paths.
+    pub fn open_read_only() -> Result<Option<Db>> {
+        Self::open_read_only_at(&db_path())
+    }
+
     /// Open a state DB read-only when it was written by a newer build. The
     /// initial connection is only used to read `user_version`; reopening with
     /// read-only flags prevents callers from mutating columns this build does
