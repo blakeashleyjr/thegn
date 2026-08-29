@@ -234,9 +234,9 @@ const fn slot(command_path: &'static str, arg_id: &'static str, source: SourceKi
 /// The catalog. Rows are grouped by source kind, and within a kind sorted by
 /// command path, so a new verb lands next to its neighbours.
 ///
-/// Not every implemented kind has a slot yet — `theme`, `tool`, `plugin` and
-/// `action` are served (and tested) but nothing in today's CLI grammar takes
-/// one, so they wait for a verb rather than being bound to an approximation.
+/// Not every implemented kind has a slot yet — `tool`, `plugin` and `action`
+/// are served (and tested) but nothing in today's CLI grammar takes one, so
+/// they wait for a verb rather than being bound to an approximation.
 /// Everything a slot could take and this does not classify is pinned in
 /// `test/completion-slot-ratchet.txt`, which only shrinks.
 pub const CATALOG: &[Slot] = &[
