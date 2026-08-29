@@ -117,6 +117,13 @@ Thereafter, a new session or changed `since` SHALL route one synthetic
 `agent_attention` cue through `NotifyState`; cleared or removed sessions SHALL
 be forgotten. This observer SHALL NOT insert a duplicate durable inbox row.
 
+#### Scenario: Baseline and changed hand
+
+- **WHEN** hydration sees an existing session hand for the first time and later
+  sees the same session with a changed `since` value
+- **THEN** the baseline emits no cue and the changed hand routes exactly one
+  transient `agent_attention` cue without inserting an inbox row
+
 ### Requirement: Sound diagnostics and boundaries
 
 `thegn doctor` SHALL report the host sound provider id and availability,
@@ -125,3 +132,10 @@ and fallback reason in its existing text and JSON provider surfaces. Missing
 optional players, packs, and files SHALL be diagnostics rather than doctor
 failures. THE-35 SHALL add no CLI action, control snapshot field, MCP tool,
 completion slot, capability-catalog row, or SQLite state.
+
+#### Scenario: Optional sound remains diagnostic
+
+- **WHEN** no supported player or configured pack is available
+- **THEN** doctor reports the unavailable provider or pack fallback while the
+  command remains successful and no control, capability, or database surface is
+  added

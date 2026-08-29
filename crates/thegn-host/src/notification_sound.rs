@@ -83,6 +83,7 @@ impl SoundRuntime {
                 let snapshot = Arc::new(build_snapshot(&cfg));
                 *runtime.snapshot.lock().unwrap() = snapshot;
             })
+            // best-effort: a failed config worker leaves the last snapshot in place
             .ok();
     }
 
@@ -273,7 +274,7 @@ fn run_command(command: &str) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status(); // best-effort: a configured command is an advisory sound
 }
 
 pub(crate) fn emit(runtime: &Arc<SoundRuntime>, emit: &SoundEmit) {
