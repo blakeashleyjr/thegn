@@ -1773,6 +1773,8 @@ fn agent_command() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1794,6 +1796,8 @@ fn default_agent_name_skips_the_shell_fallback() {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         }],
         ..Default::default()
     };
@@ -1810,6 +1814,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
@@ -1822,6 +1828,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
@@ -1840,6 +1848,8 @@ fn tool_command() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);
