@@ -6138,6 +6138,21 @@ impl Config {
                 s.per_priority.clear();
                 s.chime_file.clear();
             }
+            // Rule sound overrides retain a legacy shell-command escape hatch.
+            // Keep only the non-executable aliases from an untrusted repo
+            // overlay; arbitrary values must not reach `sh -c`.
+            if let Some(rules) = overlay.notifications.rules.as_mut() {
+                for rule in rules.iter_mut() {
+                    if let Some(sound) = rule.sound.as_deref()
+                        && !matches!(
+                            sound.trim().to_ascii_lowercase().as_str(),
+                            "" | "off" | "none" | "silent" | "bell" | "beep" | "terminal"
+                        )
+                    {
+                        rule.sound = None;
+                    }
+                }
+            }
             overlay.notifications.apply(&mut n);
         }
         n

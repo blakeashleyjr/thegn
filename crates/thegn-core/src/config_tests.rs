@@ -2614,6 +2614,29 @@ per_kind = { agent_done = "/tmp/untrusted-kind.wav" }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn repo_notification_overlay_cannot_supply_rule_sound_commands() {
+    let dir = tmpdir("notification-rule-sound-trust");
+    std::fs::write(
+        dir.join(".thegn.toml"),
+        r#"[[notifications.rules]]
+kind = "agent_done"
+sound = "touch /tmp/pwned"
+
+[[notifications.rules]]
+kind = "agent_failed"
+sound = "off"
+"#,
+    )
+    .unwrap();
+
+    let effective = Config::default().effective_notifications(Some(&dir));
+    assert_eq!(effective.rules.len(), 2);
+    assert!(effective.rules[0].sound.is_none());
+    assert_eq!(effective.rules[1].sound.as_deref(), Some("off"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// THE-68: an OSC raised hand is live state, so it is NOT recorded in the inbox
 /// unless the user opts in — the default that stops one row per agent turn.
 #[test]
