@@ -10,6 +10,41 @@ fn db() -> Db {
 }
 
 #[test]
+fn read_only_open_does_not_create_or_migrate_state_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent.db");
+    assert!(Db::open_read_only_at(&absent).unwrap().is_none());
+    assert!(!absent.exists());
+
+    let stale = dir.path().join("stale.db");
+    {
+        let conn = Connection::open(&stale).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 5;
+             CREATE TABLE marker(value TEXT NOT NULL);",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&stale).unwrap();
+    let db = Db::open_read_only_at(&stale).unwrap().unwrap();
+    assert!(
+        db.conn
+            .execute("CREATE TABLE should_not_exist(value TEXT)", [])
+            .is_err(),
+        "the dry-run connection must reject writes"
+    );
+    drop(db);
+
+    assert_eq!(std::fs::read(&stale).unwrap(), before);
+    for suffix in ["-wal", "-journal", "-shm"] {
+        assert!(
+            !dir.path().join(format!("stale.db{suffix}")).exists(),
+            "read-only open created stale.db{suffix}"
+        );
+    }
+}
+
+#[test]
 fn pool_spare_lifecycle_claim_and_target() {
     let db = db();
     assert!(db.pool_spares_for("/repo", "sprites").unwrap().is_empty());
