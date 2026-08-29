@@ -282,6 +282,7 @@ pub fn resolve_drawer_cwd(
     worktree: &Path,
     home: &Path,
 ) -> Result<PathBuf, String> {
+    let cwd = cwd.map(str::trim);
     if let Some(cwd) = cwd {
         validate_drawer_cwd(scope, cwd)?;
     }
@@ -466,5 +467,28 @@ drawer_scope = "not-a-scope"
         let errors = validate_drawer_config(&cfg);
         assert!(errors.iter().any(|e| e.contains("[[agents]]")));
         assert!(errors.iter().any(|e| e.contains("global drawer_cwd")));
+    }
+
+    #[test]
+    fn strict_toml_validation_reports_invalid_scope_and_agent_metadata() {
+        let invalid = crate::config_validate::validate_str(
+            "[[tools]]\nname = 'bad'\ncommand = 'bad'\ndrawer_scope = 'nowhere'\n",
+        );
+        assert!(
+            invalid
+                .iter()
+                .any(|error| error.contains("tools[0].drawer_scope")),
+            "{invalid:?}"
+        );
+
+        let agent = crate::config_validate::validate_str(
+            "[[agents]]\nname = 'agent'\ncommand = 'agent'\ndrawer_scope = 'global'\n",
+        );
+        assert!(
+            agent
+                .iter()
+                .any(|error| error.contains("drawer metadata is only valid on [[tools]]")),
+            "{agent:?}"
+        );
     }
 }
