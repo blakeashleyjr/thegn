@@ -291,7 +291,7 @@ top_left = ["brand"]
 top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"]
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
-bottom_left = ["help", "keyhints"]
+bottom_left = ["help", "drawer", "keyhints"]
 bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets. Validated at load — an
 # invalid specifier warns and falls back to the default rather than panicking
