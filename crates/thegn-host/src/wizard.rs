@@ -1385,7 +1385,7 @@ pub fn run_worker(
     // after the existing built-in provisioning and before the first pane is
     // allowed to consume this worker's Done event.
     let lifecycle_db = open_db().ok();
-    crate::worktree_lifecycle::schedule_post_create(
+    if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
         cfg,
         root,
         &path,
@@ -1393,7 +1393,18 @@ pub fn run_worker(
         &slug,
         lifecycle_db.as_ref(),
         None,
-    );
+    ) {
+        let primary = format!("post_create: {}", report.message());
+        let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
+            Ok(()) => primary,
+            Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
+        };
+        if let Ok(db) = open_db() {
+            let _ = db.del_worktree(&path_s);
+        }
+        fail(CreateStep::Register, error);
+        return;
+    }
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     let loc = GitLoc::from_db(&path_s, None);

@@ -314,7 +314,7 @@ fn create_and_register(
     // A CLI has no compositor to keep alive, so it waits for post-create
     // completion before printing success and exiting. Warn-only failures are
     // reported by the lifecycle runner but do not roll back a real worktree.
-    crate::worktree_lifecycle::run_event_with_db(
+    let post = crate::worktree_lifecycle::run_event_with_db(
         cfg,
         root,
         &path,
@@ -324,6 +324,17 @@ fn create_and_register(
         thegn_core::hooks::HookExecutionMode::User,
         Some(db),
     );
+    if post.blocked() {
+        let message = crate::worktree_lifecycle::create_failure_with_rollback(
+            format!("post_create: {}", post.message()),
+            cfg,
+            root,
+            &path,
+            branch,
+        );
+        let _ = db.del_worktree(&path_s);
+        return Err(anyhow::anyhow!(message));
+    }
     Ok(path_s)
 }
 

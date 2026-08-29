@@ -340,14 +340,14 @@ pub fn schedule_post_create(
     workspace: &str,
     db: Option<&Db>,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
+) -> Result<(), LifecycleReport> {
     let policy = resolve(cfg, repo_root, db);
     let waits_for_pane = policy
         .entries(HookEvent::PostCreate)
         .iter()
         .any(|spec| spec.wait);
     if waits_for_pane {
-        let _ = run_event_with_db(
+        let report = run_event_with_db(
             cfg,
             repo_root,
             worktree,
@@ -357,6 +357,11 @@ pub fn schedule_post_create(
             HookExecutionMode::User,
             db,
         );
+        if report.blocked() {
+            Err(report)
+        } else {
+            Ok(())
+        }
     } else {
         spawn_event(
             cfg.clone(),
@@ -368,6 +373,7 @@ pub fn schedule_post_create(
             HookExecutionMode::User,
             waker,
         );
+        Ok(())
     }
 }
 
@@ -1104,6 +1110,40 @@ mod tests {
         release_session_start(&worktree);
         assert!(session_start_once(&Config::default(), &worktree, None));
         release_session_start(&worktree);
+    }
+
+    #[test]
+    fn waiting_post_create_failure_blocks_create_pipeline() {
+        let state_home = std::env::temp_dir().join(format!(
+            "tg-lifecycle-post-wait-state-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let _env =
+            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.hooks.post_create = vec![thegn_core::hooks::HookEntry::Spec(
+            thegn_core::hooks::HookEntrySpec {
+                command: "exit 9".into(),
+                wait: Some(true),
+                timeout_secs: Some(2),
+                on_failure: Some(thegn_core::hooks::HookFailure::Block),
+            },
+        )];
+
+        let report = schedule_post_create(
+            &cfg,
+            dir.path(),
+            dir.path(),
+            "feature",
+            "workspace",
+            None,
+            None,
+        )
+        .expect_err("a blocking wait hook must stop creation");
+        assert!(report.blocked());
+        assert!(report.message().contains("hook failed"));
     }
 
     #[test]

@@ -1393,16 +1393,25 @@ impl ControlApi for DaemonService {
                 if let Some(id) = &issue {
                     let _ = db.link_issue(&wt_str, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
-                crate::worktree_lifecycle::spawn_event(
-                    (*cfg).clone(),
-                    root.clone(),
-                    path.clone(),
-                    branch.clone(),
-                    slug,
-                    thegn_core::hooks::HookEvent::PostCreate,
-                    thegn_core::hooks::HookExecutionMode::User,
+                if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
+                    &cfg,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    Some(db),
                     None,
-                );
+                ) {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("post_create: {}", report.message()),
+                        &cfg,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    let _ = db.del_worktree(&wt_str);
+                    anyhow::bail!("worktrees.create: {message}");
+                }
                 Ok(thegn_svc::control::WorktreeInfo {
                     path: wt_str,
                     branch,
