@@ -158,12 +158,14 @@ impl DrawerPolicy {
         &self.occupants
     }
 
-    /// The files occupant plus tools available in `scope`, in registry order.
-    pub fn occupants_for(&self, scope: DrawerScope) -> Vec<&DrawerOccupant> {
-        self.occupants
-            .iter()
-            .filter(|occupant| occupant.available_in(scope))
-            .collect()
+    /// The effective picker/cycle registry for the active worktree.
+    ///
+    /// Both scope kinds are reachable from the same chrome controls.  The
+    /// selected occupant's own scope determines which state slot and pane key
+    /// it uses; filtering global entries here would make them impossible to
+    /// select while the active scope is a worktree.
+    pub fn occupants_for(&self, _scope: DrawerScope) -> Vec<&DrawerOccupant> {
+        self.occupants.iter().collect()
     }
 
     pub fn occupant(&self, id: &str) -> Option<&DrawerOccupant> {
@@ -179,7 +181,10 @@ impl DrawerPolicy {
     }
 
     pub fn configured_count_for(&self, scope: DrawerScope) -> usize {
-        self.occupants_for(scope).len().saturating_sub(1)
+        self.occupants
+            .iter()
+            .filter(|occupant| occupant.scope == Some(scope))
+            .count()
     }
 }
 

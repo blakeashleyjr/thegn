@@ -701,6 +701,16 @@ pub(crate) struct DrawerRuntime {
 }
 
 impl DrawerRuntime {
+    fn selection_scope(
+        policy: &DrawerPolicy,
+        requested: DrawerScope,
+        occupant_id: &str,
+    ) -> Option<DrawerScope> {
+        policy
+            .occupant(occupant_id)
+            .map(|occupant| occupant.scope.unwrap_or(requested))
+    }
+
     fn target(dir: &Path) -> Option<(DrawerScope, DrawerPoolKey, String)> {
         if let Some(id) = desired_occupant(DrawerScope::Worktree, dir) {
             return Some((DrawerScope::Worktree, DrawerPoolKey::worktree(dir, &id), id));
@@ -764,9 +774,9 @@ impl DrawerRuntime {
         }
     }
 
-    /// Select an occupant for a scope. Global selection of the built-in files
-    /// occupant is normalized to the active worktree files slot because the
-    /// global state slot is reserved for configured global tools.
+    /// Select an occupant from the active-worktree registry. Configured
+    /// occupants persist under their declared scope, even though the picker
+    /// itself is opened from worktree chrome.
     pub(crate) fn select(
         &mut self,
         cfg: &thegn_core::config::Config,
@@ -780,15 +790,8 @@ impl DrawerRuntime {
         let Some(occupant) = policy.occupant(occupant_id) else {
             return false;
         };
-        if !occupant.available_in(scope) {
-            return false;
-        }
-        let (state_scope, id) = if scope == DrawerScope::Global && occupant_id == FILES_OCCUPANT_ID
-        {
-            (DrawerScope::Worktree, FILES_OCCUPANT_ID)
-        } else {
-            (scope, occupant_id)
-        };
+        let state_scope = Self::selection_scope(&policy, scope, occupant_id)?;
+        let id = occupant_id;
         self.last
             .insert(drawer_scope_key(state_scope, dir), id.to_string());
         set_desired_occupant(state_scope, dir, Some(id));
@@ -854,17 +857,19 @@ impl DrawerRuntime {
         if occupants.is_empty() {
             return None;
         }
-        let current = desired_occupant(scope, dir).unwrap_or_else(|| FILES_OCCUPANT_ID.into());
+        let current = self
+            .visible
+            .as_ref()
+            .map(|visible| visible.key.occupant_id.clone())
+            .or_else(|| desired_occupant(DrawerScope::Worktree, dir))
+            .or_else(|| desired_occupant(DrawerScope::Global, dir))
+            .unwrap_or_else(|| FILES_OCCUPANT_ID.into());
         let index = occupants
             .iter()
             .position(|occupant| occupant.id == current)
             .unwrap_or(0);
         let next = occupants[(index + 1) % occupants.len()].id.clone();
-        if scope == DrawerScope::Global && next == FILES_OCCUPANT_ID {
-            self.close(cfg, scope, dir, panes, rect);
-        } else {
-            self.select(cfg, scope, &next, dir, panes, rect);
-        }
+        self.select(cfg, scope, &next, dir, panes, rect);
         Some(next)
     }
 
@@ -1019,6 +1024,34 @@ mod tests {
         assert!(pool.contains_key(&tool));
         assert!(!pool.contains_key(&global));
         assert_eq!(pool.take_key(&tool), Some(7));
+    }
+
+    #[test]
+    fn active_worktree_selection_uses_configured_global_scope() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.tools.push(thegn_core::config::NamedCommand {
+            name: "db".into(),
+            command: "psql".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: Some(DrawerScope::Global),
+            drawer_cwd: None,
+        });
+        let policy = DrawerPolicy::from_config(&cfg);
+        assert_eq!(
+            DrawerRuntime::selection_scope(&policy, DrawerScope::Worktree, "tool:db"),
+            Some(DrawerScope::Global)
+        );
+        assert_eq!(
+            DrawerRuntime::selection_scope(&policy, DrawerScope::Worktree, FILES_OCCUPANT_ID),
+            Some(DrawerScope::Worktree)
+        );
     }
 
     #[test]
