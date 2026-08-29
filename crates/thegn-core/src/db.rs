@@ -136,7 +136,73 @@ use std::path::PathBuf;
 ///
 /// v62: adds `session_forks`, a credential-free lineage cache. Live fork
 /// recipes remain daemon memory only; the cache cannot resurrect a process.
-pub const SCHEMA_VERSION: i64 = 62;
+///
+/// v63: adds `agent_dispatches.exit_code` / `.exited_at_ms` — the worker
+/// process's recorded exit, so a row that is still `running` because nobody
+/// closed it is distinguishable from one whose worker is genuinely alive. A
+/// supervisor that could not tell the two apart counted exited rows as free
+/// slots and re-dispatched them (2026-08-29). Purely additive; a pre-v63 row
+/// reads back `None`, which is the pre-change behaviour.
+pub const SCHEMA_VERSION: i64 = 63;
+
+/// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
+/// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
+/// the tolerant open is a debugging affordance now, not a default.
+pub const ALLOW_OLD_BUILD_ENV: &str = "THEGN_ALLOW_SCHEMA_DOWNGRADE";
+
+/// Whether this build must refuse to operate a database at `on_disk`.
+///
+/// # Why refusing beats tolerating
+///
+/// The schema is additive, so an older build's *named-column* reads still
+/// work — which is what made tolerance look safe. What it cannot do is see
+/// columns and tables the newer build writes, and the pipeline roster is
+/// exactly that kind of state: on 2026-08-29 a v57 daemon drove a v62 roster
+/// for hours, could not see the `report` column the newer build gated
+/// completion on, and re-dispatched work it believed unfinished — while
+/// emitting 326,912 identical mismatch warnings. A build that cannot see the
+/// state it is deciding on must not decide.
+///
+/// Pure, so the policy is unit-testable without a database or an environment.
+pub fn schema_refusal(on_disk: i64, build: i64, allow_override: bool) -> Option<String> {
+    if on_disk <= build || allow_override {
+        return None;
+    }
+    Some(format!(
+        "database schema v{on_disk} was written by a newer thegn than this build (v{build}).\n\
+         Refusing to run: this build cannot see the columns the newer one writes, so it would \
+         mis-read live state (a pipeline roster, a merge queue) and act on the gap.\n\
+         Fix: rebuild or reinstall thegn so the binary matches the database \
+         (`just build` in a checkout, `nix profile upgrade` for an installed copy), and make \
+         sure the daemon is restarted from the same build as the CLI \
+         (`thegn doctor` prints both).\n\
+         Override (read-only, for debugging only): {ALLOW_OLD_BUILD_ENV}=1"
+    ))
+}
+
+/// The state DB's on-disk `user_version`, read through a read-only connection.
+///
+/// Deliberately independent of [`Db::open`]: when the schema is NEWER than this
+/// build, `open` refuses — and that is exactly the moment `thegn doctor` most
+/// needs to print the two numbers. `None` when there is no database yet or it
+/// cannot be read at all.
+pub fn on_disk_schema_version() -> Option<i64> {
+    let path = db_path();
+    if !path.exists() {
+        return None;
+    }
+    let conn =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()
+}
+
+/// Read the [`ALLOW_OLD_BUILD_ENV`] escape hatch.
+fn schema_downgrade_allowed() -> bool {
+    matches!(
+        std::env::var(ALLOW_OLD_BUILD_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
 
 pub struct Db {
     conn: Connection,
@@ -342,6 +408,21 @@ impl Db {
 
     /// Apply pragmas, migration, and schema to a fresh connection.
     fn init(conn: Connection) -> Result<Db> {
+        Self::init_with(conn, schema_downgrade_allowed())
+    }
+
+    /// Open at an explicit path, tolerating a newer on-disk schema (read-only)
+    /// instead of refusing it — the programmatic form of the
+    /// [`ALLOW_OLD_BUILD_ENV`] escape hatch, so the tolerant branch is
+    /// reachable (and testable) without mutating process-global environment.
+    pub fn open_at_allowing_older_build(path: &std::path::Path) -> Result<Db> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        Self::init_with(Self::open_connection(path)?, true)
+    }
+
+    fn init_with(conn: Connection, allow_downgrade: bool) -> Result<Db> {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -351,14 +432,23 @@ impl Db {
         // journal mode or run the startup prune: those are writes even though
         // the schema/migration ladder is being skipped.
         if ver > SCHEMA_VERSION {
+            // One actionable error, not a warning repeated per open. The old
+            // behaviour (warn + carry on read-only) is what let a v57 runtime
+            // drive a v62 roster; it survives only behind the explicit
+            // `ALLOW_OLD_BUILD_ENV` override, which still warns exactly once.
+            if let Some(msg) = schema_refusal(ver, SCHEMA_VERSION, allow_downgrade) {
+                anyhow::bail!(msg);
+            }
             static MISMATCH_WARNED: std::sync::Once = std::sync::Once::new();
             MISMATCH_WARNED.call_once(|| {
                 tracing::warn!(
                     target: "thegn::db",
                     on_disk = ver,
                     build = SCHEMA_VERSION,
+                    override_env = ALLOW_OLD_BUILD_ENV,
                     "database schema v{ver} is newer than this build (v{SCHEMA_VERSION}); \
-                     data written by the newer build may be invisible"
+                     running anyway because {ALLOW_OLD_BUILD_ENV} is set — data written by \
+                     the newer build is invisible to this one"
                 );
             });
             return Ok(Db {
@@ -947,8 +1037,10 @@ impl Db {
         crate::db_calendar::migrate_v52(&conn)?;
         crate::db_model_proxy::migrate_v54(&conn)?;
         crate::db_migrate::migrate_v62(&conn)?;
+        crate::db_migrate::migrate_v63_leases(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
+            crate::db_migrate::verify_v63_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

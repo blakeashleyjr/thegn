@@ -181,6 +181,7 @@ pub mod paste_drop;
 pub mod patch;
 pub mod picker;
 pub mod pipeline_chunk;
+pub mod pipeline_claim;
 pub mod pipeline_exit;
 pub mod pipeline_report;
 pub mod pipeline_resume;

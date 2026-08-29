@@ -25,6 +25,186 @@ impl Db {
         Ok(())
     }
 
+    /// Take (or renew) the named pipeline lease for `owner`, for `ttl_secs`.
+    ///
+    /// Returns `Ok(())` when this owner now holds it, or `Err(current_owner)`
+    /// when someone else does and their claim has not expired. Renewal by the
+    /// same owner always succeeds, so a live monitor keeps its own lease by
+    /// heartbeating.
+    ///
+    /// One `INSERT … ON CONFLICT DO UPDATE … WHERE` statement, so acquisition is
+    /// atomic: the `WHERE` decides, inside the write lock, whether the existing
+    /// row may be taken over. Two monitors racing therefore cannot both win.
+    pub fn acquire_pipeline_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl_secs: i64,
+    ) -> Result<std::result::Result<(), String>> {
+        let now = util::now_ms();
+        let expires = now.saturating_add(ttl_secs.saturating_mul(1000));
+        let changed = self.conn().execute(
+            "INSERT INTO pipeline_leases (name, owner, acquired_at_ms, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+               owner=excluded.owner,
+               acquired_at_ms=excluded.acquired_at_ms,
+               expires_at_ms=excluded.expires_at_ms
+             WHERE pipeline_leases.owner = excluded.owner
+                OR pipeline_leases.expires_at_ms <= ?3",
+            rusqlite::params![name, owner, now, expires],
+        )?;
+        if changed > 0 {
+            return Ok(Ok(()));
+        }
+        // The upsert was refused, so someone else holds a live lease.
+        let holder: String = self
+            .conn()
+            .query_row(
+                "SELECT owner FROM pipeline_leases WHERE name=?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "<unknown>".into());
+        Ok(Err(holder))
+    }
+
+    /// Release a lease this owner holds. A no-op when someone else holds it —
+    /// releasing another process's lease is never correct.
+    pub fn release_pipeline_lease(&self, name: &str, owner: &str) -> Result<bool> {
+        let n = self.conn().execute(
+            "DELETE FROM pipeline_leases WHERE name=?1 AND owner=?2",
+            rusqlite::params![name, owner],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The current holder of a lease and its remaining life in ms, if it is
+    /// live. An expired lease reads as `None` — it is nobody's.
+    pub fn pipeline_lease_holder(&self, name: &str) -> Result<Option<(String, i64)>> {
+        let now = util::now_ms();
+        // `.optional()` (not `.ok()`): "no such lease" is a legitimate answer,
+        // but a genuine query failure must propagate rather than read as free.
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT owner, expires_at_ms FROM pipeline_leases WHERE name=?1",
+                rusqlite::params![name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .filter(|(_, exp)| *exp > now)
+            .map(|(o, exp)| (o, exp - now)))
+    }
+
+    /// Atomically claim a slot and create the row, or refuse with the reason.
+    ///
+    /// # Why this is one call
+    ///
+    /// A supervisor doing `dispatch list` → decide → `dispatch put` has a
+    /// read-modify-write race: two monitors (or one monitor and its own restart)
+    /// both read a free stage and both insert. Running
+    /// [`crate::pipeline_claim::decide`] *inside* the write transaction closes
+    /// it — SQLite's write lock serializes the check with the insert, so the
+    /// second caller re-reads the first caller's row and is refused.
+    ///
+    /// `allow_duplicate` is the auditable override: it skips the policy and
+    /// records the operator's reason as the row's first note, so a deliberate
+    /// duplicate is always distinguishable from a runaway one.
+    pub fn claim_dispatch(
+        &self,
+        new: crate::issue::NewDispatch<'_>,
+        limit: u32,
+        allow_duplicate: Option<&str>,
+    ) -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
+        use crate::pipeline_claim::{ClaimRequest, decide};
+        let req = ClaimRequest {
+            issue_id: new.issue_id.to_string(),
+            stage: new.stage.unwrap_or_default().to_string(),
+            worktree_path: new.worktree_path.to_string(),
+            artifact_path: new.artifact_path.map(str::to_string),
+            chunk_path: new.chunk_path.map(str::to_string),
+        };
+        // IMMEDIATE: take the write lock up front so the read below cannot be
+        // interleaved with another claimant's insert.
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result =
+            (|| -> Result<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>> {
+                if allow_duplicate.is_none() {
+                    let rows = self.list_dispatches()?;
+                    let d = decide(&rows, &req, limit);
+                    if !d.granted() {
+                        return Ok(Err(d));
+                    }
+                }
+                let id = self.put_agent_dispatch(new)?;
+                // The override's audit trail is written INSIDE the transaction,
+                // so an authorized duplicate and the record of who authorized it
+                // commit together. A duplicate row with no note would be
+                // indistinguishable from a runaway one — exactly the ambiguity
+                // this whole change exists to remove — so it must not be
+                // best-effort.
+                if let Some(why) = allow_duplicate {
+                    self.append_dispatch_note(
+                        id,
+                        &format!("duplicate dispatch explicitly authorized: {why}"),
+                    )?;
+                }
+                Ok(Ok(id))
+            })();
+        match &result {
+            Ok(Ok(_)) => conn.execute_batch("COMMIT")?,
+            // Nothing was written on a refusal, but the transaction still has to
+            // be released or the next writer blocks on it.
+            _ => conn.execute_batch("ROLLBACK")?,
+        }
+        result
+    }
+
+    /// Stamp a row's worker exit (v63): the exit code, if it was reaped, and
+    /// when. Idempotent-by-overwrite (last exit wins, which is what a relaunched
+    /// worker should record).
+    ///
+    /// This is the write that makes `running` mean something again: without it
+    /// a supervisor cannot tell a live worker from one that exited into a row
+    /// nobody closed, and counts the latter as free capacity.
+    pub fn stamp_dispatch_exit(&self, id: i64, exit_code: Option<i64>) -> Result<()> {
+        if self.get_dispatch(id)?.is_none() {
+            anyhow::bail!("roster row {id} does not exist");
+        }
+        self.conn().execute(
+            "UPDATE agent_dispatches SET exit_code=?1, exited_at_ms=?2 WHERE id=?3",
+            rusqlite::params![exit_code, util::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Worktrees carrying at least one dispatch row that still occupies a slot.
+    ///
+    /// The disk reclaimer's unverified-work guard: such a worktree has work no
+    /// supervisor has closed, so its `target/` must survive even though nothing
+    /// is running in it. Liveness is decided by the typed status
+    /// ([`crate::issue::AgentDispatchStatus::is_active`]) rather than a SQL
+    /// string list, so the closed set keeps exactly one definition.
+    pub fn worktrees_with_active_dispatch(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT worktree_path, status FROM agent_dispatches")?;
+        let mut rows = stmt.query([])?;
+        let mut out: Vec<String> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let path: String = r.get(0)?;
+            let status = crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(1)?);
+            if status.is_active() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
     /// Append a progress note to a row's queue — INSERT into
     /// `agent_dispatch_notes`. Returns the new note's id. Errors when the row
     /// does not exist.

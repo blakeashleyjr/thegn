@@ -50,6 +50,13 @@ pub struct Candidate {
     pub building: bool,
     /// `git status --porcelain` is non-empty. Exempt from the idle rule only.
     pub dirty: bool,
+    /// This worktree still carries an unclosed pipeline dispatch row — work a
+    /// supervisor has not yet verified. Never reclaimed, at any pressure: the
+    /// artifact may be committed but the reviewing stage has still to build.
+    pub awaiting_verification: bool,
+    /// Seconds since thegn last reclaimed this worktree's `target/`, or `None`
+    /// if it never has. Drives the [`RECLAIM_COOLDOWN_SECS`] hysteresis.
+    pub reclaimed_secs_ago: Option<u64>,
 }
 
 /// The configured reclaim rules. Mirrors the `[disk]` keys plus the two
@@ -119,6 +126,28 @@ pub const MIN_RECLAIM_BYTES: u64 = 256 * 1024 * 1024;
 /// this policy exists not to impose.
 pub const LOW_DISK_MIN_IDLE_SECS: u64 = 60 * 60;
 
+/// Hysteresis, half one: a worktree reclaimed inside this window is not
+/// reclaimed again.
+///
+/// Without it the pressure rule and a build loop form an oscillator. Reclaiming
+/// `target/` makes a worktree look *maximally* idle-and-large the moment its
+/// next build repopulates it, so on a disk that stays near the critical line the
+/// same worktree is chosen round after round: delete 20 GiB, rebuild 20 GiB,
+/// delete it again — pure I/O with no net space gained, which is precisely the
+/// thrash observed on 2026-08-29. Six hours is longer than any single warm
+/// rebuild, so a worktree gets to finish being useful before it is a candidate
+/// again.
+pub const RECLAIM_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+
+/// Hysteresis, half two: evict past the warn line by this many points rather
+/// than stopping exactly on it.
+///
+/// Stopping at `free_warn_pct` leaves the filesystem one build away from
+/// critical, so the next round trips the rule again. Overshooting buys a margin
+/// that a normal build cycle cannot immediately erase, which turns a
+/// permanently-firing rule into one that fires, fixes, and goes quiet.
+pub const LOW_DISK_OVERSHOOT_PCT: u8 = 5;
+
 /// Seconds a worktree must be untouched before the idle rule may fire, or
 /// `None` when the rule is off. Exposed so a caller can defer the (relatively
 /// expensive) `git status` dirtiness probe to the few candidates that could
@@ -138,8 +167,19 @@ pub fn need_bytes(pressure: &Pressure, warn_pct: u8) -> u64 {
 }
 
 /// Whether a candidate may ever be reclaimed automatically, under any rule.
+///
+/// The two additions beyond "not in use and worth the rebuild" are hysteresis
+/// ([`RECLAIM_COOLDOWN_SECS`]) and the unverified-work exemption: a worktree
+/// whose pipeline row nobody has closed is still live work, even though no
+/// process is running in it — reclaiming it imposes a cold rebuild on the very
+/// next stage.
 fn eligible(c: &Candidate) -> bool {
-    !c.active && !c.building && c.target_bytes >= MIN_RECLAIM_BYTES
+    !c.active
+        && !c.building
+        && !c.awaiting_verification
+        && c.target_bytes >= MIN_RECLAIM_BYTES
+        && c.reclaimed_secs_ago
+            .is_none_or(|s| s >= RECLAIM_COOLDOWN_SECS)
 }
 
 /// Decide which `target/` dirs to reclaim.
@@ -174,9 +214,13 @@ pub fn plan(candidates: &[Candidate], policy: &Policy, pressure: Option<Pressure
         return out;
     }
 
-    // How much more is needed once the idle matches above are counted.
+    // How much more is needed once the idle matches above are counted. The
+    // target is the warn line PLUS the overshoot, so the rule buys a margin
+    // instead of parking the disk one build below critical (see
+    // `LOW_DISK_OVERSHOOT_PCT`).
     let already: u64 = out.iter().map(|r| r.bytes).sum();
-    let mut need = need_bytes(&p, policy.free_warn_pct).saturating_sub(already);
+    let target_pct = policy.free_warn_pct.saturating_add(LOW_DISK_OVERSHOOT_PCT);
+    let mut need = need_bytes(&p, target_pct).saturating_sub(already);
     if need == 0 {
         return out;
     }
@@ -222,6 +266,8 @@ mod tests {
             active: false,
             building: false,
             dirty: false,
+            awaiting_verification: false,
+            reclaimed_secs_ago: None,
         }
     }
 
@@ -242,6 +288,55 @@ mod tests {
             total_bytes: total,
             free_bytes: total * u64::from(free_pct) / 100,
         }
+    }
+
+    #[test]
+    fn a_worktree_awaiting_verification_is_never_reclaimed() {
+        // The 2026-08-29 shape: the coder committed and exited, so nothing is
+        // running and nothing is dirty — but the row is unclosed and the next
+        // stage still has to build here. Reclaiming would impose a cold rebuild
+        // on work that is mid-pipeline.
+        let mut c = cand("/wt/a", 30, 40);
+        c.awaiting_verification = true;
+        // Neither rule may touch it: not the idle rule...
+        assert!(plan(&[c.clone()], &policy(), None).is_empty());
+        // ...nor eviction at genuinely critical pressure.
+        assert!(plan(&[c], &policy(), Some(pressure(2))).is_empty());
+    }
+
+    #[test]
+    fn a_just_reclaimed_worktree_is_not_reclaimed_again() {
+        // Hysteresis: without the cooldown, a rebuild repopulates `target/` and
+        // the very next round picks the same worktree — delete, rebuild,
+        // delete, forever, with no net space gained.
+        let mut c = cand("/wt/a", 30, 40);
+        c.reclaimed_secs_ago = Some(RECLAIM_COOLDOWN_SECS - 1);
+        assert!(
+            plan(&[c.clone()], &policy(), Some(pressure(2))).is_empty(),
+            "inside the cooldown the worktree must be left alone"
+        );
+        // Once the cooldown has elapsed it is a candidate again.
+        c.reclaimed_secs_ago = Some(RECLAIM_COOLDOWN_SECS);
+        assert_eq!(plan(&[c], &policy(), Some(pressure(2))).len(), 1);
+    }
+
+    #[test]
+    fn eviction_overshoots_the_warn_line_so_the_rule_stops_firing() {
+        // At 9% free on a 1 TiB disk, stopping exactly at warn (15%) frees
+        // ~61 GiB and leaves the disk one build from critical. The overshoot
+        // target (15 + 5 = 20%) asks for ~113 GiB instead, so the round buys a
+        // margin. Two 64 GiB candidates make the difference observable: the
+        // warn-only target is satisfied by one, the overshoot target needs both.
+        let cands = [cand("/wt/a", 64, 30), cand("/wt/b", 64, 20)];
+        let mut p = policy();
+        p.idle_days = 0; // isolate the pressure rule
+        let picked = plan(&cands, &p, Some(pressure(9)));
+        assert_eq!(
+            picked.len(),
+            2,
+            "overshoot must keep evicting past the warn line: {picked:?}"
+        );
+        assert!(need_bytes(&pressure(9), 15) < need_bytes(&pressure(9), 20));
     }
 
     #[test]
@@ -332,17 +427,20 @@ mod tests {
 
     #[test]
     fn low_disk_eviction_takes_lru_targets_until_the_gap_is_covered() {
-        // 1 TiB at 8% free, warn 15% ⇒ needs ~72 GiB back.
+        // 1 TiB at 8% free, warn 15% + 5% overshoot ⇒ target 20%, so ~123 GiB
+        // back rather than the ~72 GiB the bare warn line would ask for. Three
+        // 40 GiB targets are needed to clear it; eviction is still LRU-ordered
+        // and still stops as soon as the gap is covered.
         let cands = vec![
             cand("/wt/oldest", 40, 5),
             cand("/wt/older", 40, 4),
             cand("/wt/newer", 40, 3),
         ];
         let got = plan(&cands, &policy(), Some(pressure(8)));
-        // Two 40 GiB targets cover the 71.7 GiB gap; the third is spared.
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 3, "{got:?}");
         assert_eq!(got[0].path, "/wt/oldest");
         assert_eq!(got[1].path, "/wt/older");
+        assert_eq!(got[2].path, "/wt/newer");
         assert!(matches!(got[0].reason, Reason::LowDisk { free_pct: 8 }));
     }
 
@@ -374,10 +472,12 @@ mod tests {
 
     #[test]
     fn an_idle_match_counts_against_the_pressure_gap_and_is_never_listed_twice() {
-        // 1 TiB at 8% free ⇒ ~72 GiB needed; one 80 GiB idle target covers it.
-        let cands = vec![cand("/wt/stale", 80, 30), cand("/wt/warm", 80, 2)];
+        // 1 TiB at 8% free ⇒ ~123 GiB needed to reach the 20% overshoot target.
+        // The 128 GiB idle match covers it on its own, so the pressure pass adds
+        // nothing — and critically does not list `/wt/stale` a second time.
+        let cands = vec![cand("/wt/stale", 128, 30), cand("/wt/warm", 80, 2)];
         let got = plan(&cands, &policy(), Some(pressure(8)));
-        assert_eq!(got.len(), 1);
+        assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].path, "/wt/stale");
         assert!(matches!(got[0].reason, Reason::Idle { .. }));
     }

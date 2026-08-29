@@ -271,6 +271,77 @@ fn index_of(stages: &[PipelineStage], name: &str) -> Option<usize> {
     stages.iter().position(|s| s.name.trim() == name)
 }
 
+/// The substring a stage prompt must contain to be teaching its worker the
+/// report half of the handoff. Matched literally (not as a placeholder) because
+/// what matters is that the prompt *names the command* — a worker that is never
+/// told to run it never files one.
+const REPORT_VERB: &str = "dispatch report";
+
+/// Why a stage prompt cannot produce a closable row.
+///
+/// # The failure this exists to prevent
+///
+/// `pipeline_run::verify` — the gate behind `dispatch set-status … done` —
+/// requires BOTH a git-tracked artifact and a worker report. A stage whose
+/// prompt never tells the worker its row id, or never tells it to run
+/// `thegn dispatch report`, therefore produces rows that **can never close
+/// without `--force`**: the worker does the work, commits the artifact, exits
+/// 0, and the row stays `running` forever. A supervisor that reads liveness
+/// from sessions rather than rows then sees a free slot and dispatches again,
+/// and the roster grows without bound.
+///
+/// That is not hypothetical: it is exactly how a 121-row backlog accumulated
+/// on 2026-08-29 after the report requirement landed (THE-88) while the
+/// deployed `[[pipeline.stages]]` prompts were left on their pre-THE-88 text.
+/// The config was individually valid at every other check — which is why this
+/// one exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractGap {
+    /// The prompt never references `{row}`, so the worker cannot name itself to
+    /// `dispatch report` even if it wanted to.
+    NoRowPlaceholder,
+    /// The prompt never mentions `thegn dispatch report`, so the worker is
+    /// never asked for the report the done-gate requires.
+    NoReportInstruction,
+}
+
+impl ContractGap {
+    /// The operator-facing remedy — one actionable sentence, not a diagnosis.
+    pub fn remedy(self) -> &'static str {
+        match self {
+            Self::NoRowPlaceholder => {
+                "the prompt never references {row}, so the worker cannot know which roster row \
+                 it is filing against — add `You are dispatch row {row}.` and have it run \
+                 `thegn dispatch report {row} --text '…'`"
+            }
+            Self::NoReportInstruction => {
+                "the prompt never tells the worker to run `thegn dispatch report`, but the \
+                 done-gate requires a report — such a row can only ever be closed with \
+                 `--force`; add the report step to the prompt"
+            }
+        }
+    }
+}
+
+/// Which halves of the handoff contract a stage prompt is missing.
+///
+/// Pure and placeholder-aware: `{row}` is detected through the same parser the
+/// renderer uses ([`crate::agent_task::template_vars`]), so `{ row }` counts and
+/// an escaped `{{row}}` correctly does not.
+pub fn stage_contract_gaps(stage: &PipelineStage) -> Vec<ContractGap> {
+    let mut out = Vec::new();
+    let refs_row = crate::agent_task::template_vars(&stage.prompt)
+        .map(|vs| vs.iter().any(|v| v == "row"))
+        .unwrap_or(false);
+    if !refs_row {
+        out.push(ContractGap::NoRowPlaceholder);
+    }
+    if !stage.prompt.contains(REPORT_VERB) {
+        out.push(ContractGap::NoReportInstruction);
+    }
+    out
+}
+
 /// Strict validation for `thegn config validate` (errors only — these fail the
 /// command): a stage must be nameable, uniquely, runnable by a resolvable
 /// agent, with a concurrency budget above zero and a `next` edge that names a
@@ -345,6 +416,24 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
     }
     out.extend(cycle_errors(stages));
     out.extend(validate_transport_retry(&cfg.pipeline.transport_retry));
+    out
+}
+
+/// The handoff-contract pass: every configured stage must teach its worker the
+/// two halves the done-gate checks. Separate from [`validate_pipeline`] so the
+/// message can name the gate it is protecting, and so a caller that only wants
+/// the structural checks (the display path) need not pay for it.
+///
+/// Errors, not warnings: a stage that fails this cannot produce a closable row,
+/// and the failure is invisible until a backlog has already built up.
+pub fn validate_stage_contracts(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, s) in cfg.pipeline.stages.iter().enumerate() {
+        let label = label(i, s);
+        for gap in stage_contract_gaps(s) {
+            out.push(format!("{label}.prompt: {}", gap.remedy()));
+        }
+    }
     out
 }
 
@@ -438,6 +527,15 @@ pub fn pipeline_warnings(cfg: &Config) -> Vec<String> {
             ));
         }
     }
+    // Surface the handoff-contract gaps at load too, not only under
+    // `config validate`: the operator who most needs this is the one whose
+    // pipeline is already running against prompts that cannot close a row.
+    for (i, s) in stages.iter().enumerate() {
+        let label = label(i, s);
+        for gap in stage_contract_gaps(s) {
+            out.push(format!("{label}.prompt: {}", gap.remedy()));
+        }
+    }
     out
 }
 
@@ -469,14 +567,23 @@ mod tests {
         cfg
     }
 
+    /// A stage whose prompt satisfies the handoff contract, so tests about the
+    /// org chart (names, edges, cycles) are not also asserting on
+    /// [`stage_contract_gaps`]. The contract itself is tested directly below.
     fn stage(name: &str, next: Option<&str>) -> PipelineStage {
         PipelineStage {
             name: name.into(),
             agent: "worker".into(),
             next: next.map(str::to_string),
+            prompt: COMPLIANT_PROMPT.into(),
             ..Default::default()
         }
     }
+
+    /// The minimum a stage prompt must say: which row the worker is, and that
+    /// it must file the report the done-gate requires.
+    const COMPLIANT_PROMPT: &str = "You are dispatch row {row}. Do the work, commit {artifact}, then run \
+         `thegn dispatch report {row} --text '…'`.";
 
     #[test]
     fn defaults_are_one_worker_and_an_hour_parked() {
@@ -683,6 +790,78 @@ permissions = ["Read", "Edit", "Bash(git:*)"]
         assert!(!stage_agent_resolves("nosuchagent", &agents, &tools));
         // `shell` classifies as the login shell, not a named entry.
         assert!(!stage_agent_resolves("shell", &agents, &tools));
+    }
+
+    #[test]
+    fn contract_gaps_flag_a_prompt_that_cannot_close_its_row() {
+        // The exact shape of the 2026-08-29 incident: a perfectly valid org
+        // chart whose prompts predate the report requirement. Every other
+        // check passes, and every row it dispatches is unclosable.
+        let mut s = stage("code", None);
+        s.prompt = "Implement the chunk at {parent_artifact}; write {artifact}.".into();
+        assert_eq!(
+            stage_contract_gaps(&s),
+            vec![
+                ContractGap::NoRowPlaceholder,
+                ContractGap::NoReportInstruction
+            ]
+        );
+        let cfg = cfg_with(vec![s]);
+        // The org-chart pass is silent — which is precisely why the contract
+        // pass has to exist as its own channel.
+        assert!(validate_pipeline(&cfg).is_empty());
+        let errs = validate_stage_contracts(&cfg);
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("{row}")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("dispatch report")),
+            "{errs:?}"
+        );
+        // And it reaches the operator at load, not only under `config validate`.
+        assert!(
+            pipeline_warnings(&cfg)
+                .iter()
+                .any(|w| w.contains("dispatch report"))
+        );
+    }
+
+    #[test]
+    fn contract_gaps_are_placeholder_aware_not_substring_matching() {
+        // `{ row }` renders, so it counts...
+        let mut spaced = stage("code", None);
+        spaced.prompt = "row { row }: run `thegn dispatch report`".into();
+        assert!(stage_contract_gaps(&spaced).is_empty());
+        // ...but an escaped `{{row}}` is a literal brace pair the renderer
+        // never substitutes, so it must NOT count as naming the row.
+        let mut escaped = stage("code", None);
+        escaped.prompt = "literally {{row}} — run `thegn dispatch report`".into();
+        assert_eq!(
+            stage_contract_gaps(&escaped),
+            vec![ContractGap::NoRowPlaceholder]
+        );
+    }
+
+    #[test]
+    fn contract_gap_reports_only_the_half_that_is_missing() {
+        let mut no_report = stage("code", None);
+        no_report.prompt = "You are row {row}. Commit {artifact}.".into();
+        assert_eq!(
+            stage_contract_gaps(&no_report),
+            vec![ContractGap::NoReportInstruction]
+        );
+        let mut no_row = stage("code", None);
+        no_row.prompt = "Commit it, then run `thegn dispatch report <id>`.".into();
+        assert_eq!(
+            stage_contract_gaps(&no_row),
+            vec![ContractGap::NoRowPlaceholder]
+        );
+    }
+
+    #[test]
+    fn a_compliant_prompt_has_no_contract_gaps() {
+        let cfg = cfg_with(vec![stage("architect", None)]);
+        assert!(validate_stage_contracts(&cfg).is_empty());
+        assert!(stage_contract_gaps(&cfg.pipeline.stages[0]).is_empty());
     }
 
     #[test]

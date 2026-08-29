@@ -1123,7 +1123,7 @@ cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
 [[pipeline.stages]]
 name = "smoke"
 agent = "claude"
-prompt = "task {issue_number} on {branch} in {worktree}, artifact {artifact}"
+prompt = "row {row}: task {issue_number} on {branch} in {worktree}, artifact {artifact}; then run \`thegn dispatch report {row} --text '…'\`"
 EOF
 # `dispatch put` is the roster's writer, and the v56 pipeline columns
 # (stage/parent/session/artifact) ride it — there is no second verb. A parent id
