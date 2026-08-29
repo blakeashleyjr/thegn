@@ -21,6 +21,7 @@ mod plumbing;
 mod rebase;
 mod stage;
 mod stash;
+mod submodule;
 mod undo;
 
 pub use bisect::BisectOps;
@@ -257,6 +258,45 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// one `exec.batch` over a bridged connection.
     fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
         local_glyph_reads(self, loc)
+    }
+    /// Recursive gitlink state plus targeted dirty/untracked evidence. The
+    /// default is the bounded CLI provider; native backends may override it
+    /// without changing callers.
+    fn submodule_states(&self, loc: &GitLoc) -> Result<Vec<thegn_core::submodule::SubmoduleState>> {
+        submodule::states(loc)
+    }
+    /// Raw mode-160000 transitions. This intentionally does not use numstat:
+    /// a gitlink is an atomic pointer, not a text file.
+    fn submodule_diffs(
+        &self,
+        loc: &GitLoc,
+        base: &str,
+    ) -> Result<Vec<thegn_core::submodule::SubmoduleDiff>> {
+        submodule::diffs(loc, base)
+    }
+    /// Bounded local-object summary for a pointer transition. No fetch is
+    /// allowed on this read path.
+    fn submodule_summary(
+        &self,
+        loc: &GitLoc,
+        _path: &str,
+        old: &str,
+        new: &str,
+        limit: usize,
+    ) -> Result<thegn_core::submodule::SubmoduleSummary> {
+        submodule::summary(loc, old, new, limit)
+    }
+    /// Initialize checked-out submodules after creation/clone.
+    fn init_submodules(&self, loc: &GitLoc, recursive: bool) -> Result<()> {
+        submodule::init(loc, recursive)
+    }
+    /// Resolve mode-160000 ours/theirs metadata for already-reported paths.
+    fn submodule_conflicts(
+        &self,
+        loc: &GitLoc,
+        paths: &[String],
+    ) -> Result<Vec<thegn_core::submodule::SubmoduleConflict>> {
+        submodule::conflicts(loc, paths)
     }
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>>;
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
@@ -913,6 +953,8 @@ fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
         if let Some(range) = &branch_range {
             specs.push(vec!["diff", "--numstat", range.as_str()]);
         }
+        let submodule_status_idx = specs.len();
+        specs.push(vec!["submodule", "status", "--recursive"]);
         let want = specs.len();
         let cmds: Vec<Vec<String>> = specs
             .iter()
@@ -947,15 +989,27 @@ fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
                     Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
                 };
                 // Absent when no base resolved (the 5th command wasn't sent).
-                let branch_diff = Ok(r
-                    .get(4)
-                    .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))));
+                let branch_diff = if branch_range.is_some() {
+                    Ok(r.get(submodule_status_idx.saturating_sub(1))
+                        .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))))
+                } else {
+                    Ok(None)
+                };
+                let submodule_dirty = r
+                    .get(submodule_status_idx)
+                    .filter(|res| res.exit == 0)
+                    .map(|res| {
+                        submodule::dirty_from_outputs(&res.stdout, &r[0].stdout)
+                            .map_err(|e| anyhow::anyhow!(e))
+                    })
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("git submodule status failed")));
                 return Some(GlyphReads {
                     dirty,
                     ahead_behind,
                     branch,
                     uncommitted,
                     branch_diff,
+                    submodule_dirty,
                 });
             }
             _ => {
@@ -966,6 +1020,7 @@ fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
                     branch: Err(err()),
                     uncommitted: Err(err()),
                     branch_diff: Err(err()),
+                    submodule_dirty: Err(err()),
                 });
             }
         }
@@ -990,6 +1045,9 @@ fn local_glyph_reads(git: &(impl GitBackend + ?Sized), loc: &GitLoc) -> GlyphRea
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
+        submodule_dirty: git
+            .submodule_states(loc)
+            .map(|states| submodule::dirty_from_states(&states)),
     }
 }
 
@@ -1023,6 +1081,9 @@ fn gix_glyph_reads(git: &GixGit, loc: &GitLoc) -> GlyphReads {
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
+        submodule_dirty: git
+            .submodule_states(loc)
+            .map(|states| submodule::dirty_from_states(&states)),
     }
 }
 
@@ -1040,6 +1101,9 @@ pub struct GlyphReads {
     /// unpushed trunk doesn't leak its backlog into every row). `None` when no
     /// base is resolvable.
     pub branch_diff: Result<Option<(u32, u32)>>,
+    /// Whether any gitlink is moved, dirty, untracked, diverged, conflicted,
+    /// unavailable, or uninitialized. This is independent of ordinary files.
+    pub submodule_dirty: Result<bool>,
 }
 
 /// The write-op runner: like [`run`] but with extra env, a null stdin, and
