@@ -515,28 +515,17 @@ impl SessionActor {
         self.seq += 1;
 
         // THE-89: classify the just-completed lines against the configured
-        // harness-failure signature list. One match per chunk is enough —
-        // the rest are at best redundant (we already raised) and at worst
-        // turn the cache write into per-line work. A chunk with `pushed > 0`
-        // and zero matches clears the state: the agent resumed.
+        // harness-failure signature list in order. The final completed line
+        // wins: a banner followed by normal output in one PTY read is already
+        // resumed and must not leave the error bit raised.
         let pushed = self.history.total_pushed() - pushed_before;
         if pushed > 0 && !self.error_signatures.is_empty() {
-            let len = self.history.len();
-            let start = len.saturating_sub(pushed as usize);
-            let mut hit: Option<&str> = None;
-            for i in start..len {
-                if let Some(line) = self.history.get(i)
-                    && thegn_core::agent_error::classify_error_line(line, &self.error_signatures)
-                        .is_some()
-                {
-                    hit = Some(line);
-                    break;
-                }
-            }
-            match hit {
-                Some(line) => self.error_state.note_error(line),
-                None => self.error_state.clear_on_resume(),
-            }
+            classify_error_history(
+                &mut self.error_state,
+                &self.error_signatures,
+                &self.history,
+                pushed_before,
+            );
             // Mirror the new state into the host-side cache. Cheap in-process
             // write; the cross-process path is a subscription bridge that
             // decodes the same state from the broadcast `Activity` frame.
@@ -1161,6 +1150,29 @@ fn unix_now_secs() -> f64 {
 
 fn now_ms() -> i64 {
     (unix_now_secs() * 1000.0) as i64
+}
+
+/// Apply the live-error state machine to the newly completed history lines.
+/// Lines are processed in order because one PTY read can contain both a
+/// harness banner and the normal output that resumes the agent.
+fn classify_error_history(
+    state: &mut AgentErrorState,
+    signatures: &AgentErrorSignatures,
+    history: &HistoryBuffer,
+    pushed_before: u64,
+) {
+    let pushed = history.total_pushed().saturating_sub(pushed_before);
+    let len = history.len();
+    let start = len.saturating_sub(pushed as usize);
+    for i in start..len {
+        if let Some(line) = history.get(i) {
+            if thegn_core::agent_error::classify_error_line(line, signatures).is_some() {
+                state.note_error(line);
+            } else {
+                state.clear_on_resume();
+            }
+        }
+    }
 }
 
 /// Whether a session's launched program can be an agent, by the same rules the
@@ -1788,6 +1800,47 @@ mod tests {
         }
         assert!(raised, "the harness banner must raise error_active");
         assert!(cleared, "normal output must clear error_active");
+    }
+
+    #[test]
+    fn error_state_uses_the_last_completed_line_in_a_chunk() {
+        let signatures = AgentErrorSignatures::defaults();
+        let mut state = AgentErrorState::default();
+        let mut history = HistoryBuffer::new(100);
+        let mut partial = Vec::new();
+        let mut stripper = AnsiStripper::default();
+
+        feed_bytes_to_history(
+            b"Weekly limit reached\nnormal output\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        classify_error_history(&mut state, &signatures, &history, 0);
+        assert!(
+            !state.error_active,
+            "normal output after a banner in one PTY chunk resumes the agent"
+        );
+
+        let pushed_before = history.total_pushed();
+        feed_bytes_to_history(
+            b"Weekly limit reached\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        classify_error_history(&mut state, &signatures, &history, pushed_before);
+        assert!(state.error_active);
+
+        let pushed_before = history.total_pushed();
+        feed_bytes_to_history(
+            b"normal output\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        classify_error_history(&mut state, &signatures, &history, pushed_before);
+        assert!(!state.error_active);
     }
 
     /// `wait --until idle` must not be answered instantly by an agent that has
