@@ -100,7 +100,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // index will shift as groups below it are removed.
     let active_group_name = cx.session.active_group().map(|g| g.name.clone());
 
-    // Capture the worktree paths being closed BEFORE the loop shifts indices, so
+    // Capture the groups and worktree paths being closed BEFORE the loop shifts indices, so
     // we can optimistically drop their merge-queue rows from the in-memory model
     // (the authoritative DB delete happens in `forget_worktree_group`; this keeps
     // the MQ badge correct on the same frame instead of next hydration tick).
@@ -110,19 +110,24 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         .filter(|p| !p.is_empty())
         .collect();
 
+    let removed_groups: Vec<crate::session::WorktreeGroup> = targets
+        .iter()
+        .filter_map(|&gi| cx.session.worktrees.get(gi).cloned())
+        .collect();
+    let session_id = cx.session.id.clone();
+
+    // Cache pruning is a worker operation. Close from the highest index down so
+    // earlier in-memory indices stay valid without opening SQLite on the loop.
+    crate::db_task::persist(move |db| {
+        for group in &removed_groups {
+            crate::run::forget_worktree_group(db, &session_id, group, true);
+        }
+    });
+
     // Close from the highest index down so earlier indices stay valid.
-    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: deletion proceeds on disk/git; a failed open just leaves stale rows
     targets.sort_unstable_by(|a, b| b.cmp(a));
     for gi in targets {
         if gi < cx.session.worktrees.len() {
-            if let Some(db) = &db {
-                crate::run::forget_worktree_group(
-                    db,
-                    &cx.session.id,
-                    &cx.session.worktrees[gi],
-                    true,
-                );
-            }
             for tab in &cx.session.worktrees[gi].tabs {
                 for id in tab.center.pane_ids() {
                     cx.panes.table.remove(&id);
@@ -153,7 +158,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     if skipped_home > 0 {
         cx.model.status = "The home worktree can't be closed".into();
     }
-    crate::run::persist_session_layout(cx.session, cx.panes);
+    crate::run::persist_session_layout_cached(cx.session);
     cx.sb.marked.clear();
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
     cx.sb.focus_active_row(cx.model);

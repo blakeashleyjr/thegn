@@ -6,7 +6,7 @@
 //! persistence goes through `persist_session_layout` (the DB cache, best-effort;
 //! git is the source of truth).
 
-use crate::run::{SidebarState, persist_session_layout, refresh_tab_model};
+use crate::run::{SidebarState, persist_session_layout_cached, refresh_tab_model};
 
 /// The loop-scope state the close helpers touch, borrowed for the call.
 pub(crate) struct CloseCtx<'a> {
@@ -47,7 +47,7 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
                 tab.focused_pane = first;
             }
             *cx.need_relayout = true;
-            persist_session_layout(cx.session, cx.panes);
+            persist_session_layout_cached(cx.session);
         }
     }
     refresh_tab_model(cx.model, cx.session, cx.sb);
@@ -108,7 +108,13 @@ pub(crate) fn close_tab(
             }
             if let Some((name, path, gi, ti)) = target {
                 tab_state.on_tab_closed(&name, gi, ti);
-                if !path.is_empty() {
+                if !path.is_empty()
+                    && cx
+                        .session
+                        .worktrees
+                        .get(gi)
+                        .is_some_and(|group| group.tabs.is_empty())
+                {
                     crate::worktree_lifecycle::session_end_once(
                         cx.lifecycle_cfg,
                         std::path::Path::new(&path),
@@ -119,7 +125,7 @@ pub(crate) fn close_tab(
         }
         crate::session::CloseResult::Nothing => {}
     }
-    persist_session_layout(cx.session, cx.panes);
+    persist_session_layout_cached(cx.session);
     // Close always lands the user on the center terminal of whichever tab is
     // now active.
     cx.focus.zone = crate::focus::Zone::Center;

@@ -798,6 +798,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         crate::worktree_lifecycle::session_end_after_pane_exit(
             ctx.current_config,
             ctx.session,
+            ctx.panes,
             id,
             Some(ctx.waker.clone()),
         );
