@@ -180,6 +180,8 @@ mod render_plan;
 mod replay;
 mod replay_overlay;
 mod repo_index;
+mod review_handoff;
+mod review_rows;
 mod revtunnel;
 mod run;
 mod sandbox_events;
