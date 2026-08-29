@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub use crate::hooks::HooksConfig;
+
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
 pub fn config_warn(msg: &str) {
@@ -2263,6 +2265,9 @@ pub struct WorkspaceConfig {
     /// global active account. See [`crate::account`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// Lifecycle hooks for worktrees in this workspace. Entries accumulate
+    /// after global hooks and before a repo overlay's hooks.
+    pub hooks: HooksConfig,
     /// Extra sandbox bind mounts for this workspace, same format as
     /// `[sandbox] mounts` (`"host"`, `"host:dest"`, `"host:dest:ro|rw|cache"`;
     /// `~` is expanded). These **extend** the global `[sandbox] mounts` (plus
@@ -4368,6 +4373,8 @@ impl RemoteOverlay {
 #[serde(default)]
 pub(crate) struct RepoConfigFile {
     pub(crate) sandbox: SandboxOverlay,
+    /// Repo-authored lifecycle hooks. These are trust-gated before execution.
+    pub(crate) hooks: HooksConfig,
     keybinds: KeybindConfig,
     /// Per-repo notification routing overlay, applied on top of global +
     /// profile (see [`Config::effective_notifications`]).
@@ -5244,6 +5251,9 @@ pub struct Config {
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
+    /// `[hooks]` lifecycle commands. Workspace and trusted repo layers add to
+    /// these lists; repo entries are trust-gated before execution.
+    pub hooks: HooksConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
     pub toolchain: crate::toolchain::ToolchainConfig,
@@ -5468,6 +5478,7 @@ impl Default for Config {
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
+            hooks: HooksConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
@@ -6611,6 +6622,17 @@ impl Config {
         approvals: &crate::config_resolve::Approvals,
     ) -> crate::config_resolve::ResolvedRepoSandbox {
         crate::config_resolve::resolve_repo_sandbox(self, repo_root, approvals)
+    }
+
+    /// Resolve lifecycle hooks for a repo, including workspace and legacy
+    /// `sandbox.prepare` layers. Repo-authored entries remain pending until
+    /// their canonical trust request is approved.
+    pub fn repo_hooks_resolved(
+        &self,
+        repo_root: &std::path::Path,
+        approvals: &crate::config_resolve::Approvals,
+    ) -> crate::hooks::ResolvedHooks {
+        crate::hooks::resolve_for_repo(self, repo_root, approvals)
     }
 
     /// The effective `[merge_queue]` for a repo: the global table with the

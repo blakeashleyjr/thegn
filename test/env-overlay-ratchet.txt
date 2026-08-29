@@ -117,6 +117,12 @@ git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+hooks.pre_create
+hooks.post_create
+hooks.pre_destroy
+hooks.post_destroy
+hooks.session_start
+hooks.session_end
 host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
