@@ -499,7 +499,7 @@ impl NotificationStore for Db {
 /// apart when the roster gains a column (v56 added four at once; v59 added
 /// `note`; v60 added `chunk_path`).
 const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
-     stage, parent_id, session_id, artifact_path, note, chunk_path";
+     stage, parent_id, session_id, artifact_path, note, chunk_path, report";
 
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
@@ -523,5 +523,6 @@ fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDi
         artifact_path: r.get(9)?,
         note: r.get(10)?,
         chunk_path: r.get(11)?,
+        report: r.get(12)?,
     })
 }

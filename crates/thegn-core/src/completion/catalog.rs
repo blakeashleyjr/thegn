@@ -414,6 +414,33 @@ pub const CATALOG: &[Slot] = &[
         "timeout",
         SourceKind::Reserved(Reserved::Freeform),
     ),
+    // --- pipeline report/note/status (THE-88) -----------------------------
+    // `dispatch report` takes an id (roster row) and free-form text.
+    slot(
+        "dispatch report",
+        "id",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot("dispatch report", "text", SourceKind::Structural),
+    // `dispatch note` takes an id (roster row) and free-form text.
+    slot(
+        "dispatch note",
+        "id",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot("dispatch note", "text", SourceKind::Structural),
+    // `dispatch status` takes an optional row id (roster row) and an epoch-ms
+    // since timestamp.
+    slot(
+        "dispatch status",
+        "row",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot(
+        "dispatch status",
+        "since",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     // A path under the parent row's worktree; the engine's filesystem
     // completion is the intended behavior (same shape as `--config`).
     slot("session open", "parent_artifact", SourceKind::Structural),
