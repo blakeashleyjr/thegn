@@ -47,7 +47,10 @@ use super::tombstone::{TOMBSTONE_HISTORY_LINES, Tombstone};
 const SUB_CHANNEL_CAP: usize = 256;
 
 /// History lines folded into a warm-attach snapshot (scrollback context).
-const SNAPSHOT_HISTORY_LINES: usize = 2_000;
+/// Shared bound for live snapshots and fork handoff context. Tombstones keep
+/// their smaller forensic tail, but a fork must receive the same context a
+/// fresh warm attach would see.
+pub(crate) const SNAPSHOT_HISTORY_LINES: usize = 2_000;
 
 /// The actor's control mailbox.
 pub(crate) enum SessionMsg {
@@ -419,7 +422,7 @@ impl SessionActor {
                     Some(SessionMsg::WatchOutput { re, reply }) => self.on_watch(*re, reply),
                     Some(SessionMsg::HistoryTail { reply }) => {
                         let len = self.history.len();
-                        let start = len.saturating_sub(TOMBSTONE_HISTORY_LINES);
+                        let start = len.saturating_sub(SNAPSHOT_HISTORY_LINES);
                         let tail = (start..len)
                             .filter_map(|i| self.history.get(i))
                             .collect::<Vec<_>>()
