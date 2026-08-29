@@ -7,11 +7,12 @@
 //!
 //! 1. **Flags are memory-first.** Whether a worktree's drawer is open persists
 //!    as a tiny scope-keyed file under `~/.thegn/drawer/` so it survives
-//!    restarts, but the loop only ever reads the in-process cache
-//!    ([`desired_occupant`]); writes are write-through
-//!    ([`set_desired_occupant`]: cache now, file off-loop). Before
-//!    this cache every tab/worktree switch paid a synchronous `read_to_string`
-//!    on the loop.
+//!    restarts. The global drawer slot is process-local because its PTY is
+//!    local to this process and cannot be restored after restart. The loop only
+//!    ever reads the in-process cache ([`desired_occupant`]); worktree writes
+//!    are write-through ([`set_desired_occupant`]: cache now, file off-loop).
+//!    Before this cache every tab/worktree switch paid a synchronous
+//!    `read_to_string` on the loop.
 //! 2. **Cold spawns resolve off-loop.** Materializing a drawer pane means
 //!    resolving the manager's spawn spec + private config — so a cold
 //!    runtime transition only *requests* a spec ([`request_occupant_spawn`]); a
@@ -38,27 +39,33 @@ use thegn_core::config_drawer::{
 // ── open-flag cache ──────────────────────────────────────────────────────────
 
 /// Memory-first drawer state keyed by scope. Values are stable occupant IDs;
-/// `None` is persisted closed, while the legacy strings `true` and `false`
-/// decode as `files` and closed respectively.
+/// worktree `None` is persisted closed, while the legacy strings `true` and
+/// `false` decode as `files` and closed respectively. The reserved global key
+/// is deliberately memory-only and is never loaded from disk.
 #[derive(Default)]
 pub(crate) struct FlagCache {
     map: HashMap<String, Option<String>>,
 }
 
 impl FlagCache {
-    /// Load every persisted flag from `store` — one readdir + tiny reads, only
-    /// for worktrees that ever toggled a drawer.
+    /// Load persisted worktree flags from `store` — one readdir + tiny reads,
+    /// only for worktrees that ever toggled a drawer. The global slot is
+    /// process-local and any stale on-disk value is ignored.
     pub(crate) fn load_from(store: &Path) -> Self {
         let mut map = HashMap::new();
         if let Ok(rd) = std::fs::read_dir(store) {
             for e in rd.flatten() {
+                let key = e.file_name().to_string_lossy().into_owned();
+                if key == GLOBAL_SCOPE_KEY {
+                    continue;
+                }
                 if let Ok(s) = std::fs::read_to_string(e.path()) {
                     let value = match s.trim() {
                         "true" => Some(FILES_OCCUPANT_ID.to_string()),
                         "false" | "" => None,
                         id => Some(id.to_string()),
                     };
-                    map.insert(e.file_name().to_string_lossy().into_owned(), value);
+                    map.insert(key, value);
                 }
             }
         }
@@ -98,9 +105,9 @@ pub(crate) fn desired_occupant(scope: DrawerScope, dir: &Path) -> Option<String>
         .and_then(|cache| cache.occupant_for_key(&drawer_scope_key(scope, dir)))
 }
 
-/// Persist a desired occupant after updating the in-memory cache. The write is
-/// deliberately off-loop and uses the same best-effort cache semantics as the
-/// legacy files-drawer flag.
+/// Update a desired occupant in the memory cache. Worktree state is persisted
+/// through the same best-effort, off-loop path as the legacy files-drawer flag;
+/// the global slot remains process-local and is never written.
 pub(crate) fn set_desired_occupant(scope: DrawerScope, dir: &Path, occupant: Option<&str>) {
     let key = drawer_scope_key(scope, dir);
     set_desired_key(&key, occupant);
@@ -109,6 +116,9 @@ pub(crate) fn set_desired_occupant(scope: DrawerScope, dir: &Path, occupant: Opt
 fn set_desired_key(key: &str, occupant: Option<&str>) {
     if let Ok(mut cache) = flags().lock() {
         cache.set_key(key, occupant.map(str::to_string));
+    }
+    if key == GLOBAL_SCOPE_KEY {
+        return;
     }
     let path = store_dir().join(key);
     let value = occupant.unwrap_or("false").to_string();
@@ -524,12 +534,23 @@ impl DrawerRuntime {
             .map(|occupant| occupant.scope.unwrap_or(requested))
     }
 
-    fn target(dir: &Path) -> Option<(DrawerScope, DrawerPoolKey, String)> {
-        if let Some(id) = desired_occupant(DrawerScope::Worktree, dir) {
+    fn target_from_cache(
+        cache: &FlagCache,
+        dir: &Path,
+    ) -> Option<(DrawerScope, DrawerPoolKey, String)> {
+        if let Some(id) = cache.occupant_for_key(&drawer_scope_key(DrawerScope::Worktree, dir)) {
             return Some((DrawerScope::Worktree, DrawerPoolKey::worktree(dir, &id), id));
         }
-        desired_occupant(DrawerScope::Global, dir)
+        cache
+            .occupant_for_key(GLOBAL_SCOPE_KEY)
             .map(|id| (DrawerScope::Global, DrawerPoolKey::global(&id), id))
+    }
+
+    fn target(dir: &Path) -> Option<(DrawerScope, DrawerPoolKey, String)> {
+        flags()
+            .lock()
+            .ok()
+            .and_then(|cache| Self::target_from_cache(&cache, dir))
     }
 
     fn stash_visible(&mut self, cfg: &thegn_core::config::Config, panes: &mut Panes) {
@@ -854,6 +875,7 @@ mod tests {
             "false",
         )
         .unwrap();
+        std::fs::write(store.join(GLOBAL_SCOPE_KEY), "tool:db").unwrap();
 
         let c = FlagCache::load_from(&store);
         assert_eq!(
@@ -881,6 +903,60 @@ mod tests {
             "missing store dir = all closed"
         );
         let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn global_selection_reuses_in_process_but_not_after_restart() {
+        let store =
+            std::env::temp_dir().join(format!("tg-drawer-global-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store); // best-effort: test scratch cleanup
+        std::fs::create_dir_all(&store).unwrap();
+
+        let source = Path::new("/tmp/drawer-global-source");
+        let destination = Path::new("/tmp/drawer-global-destination");
+        let destination_key = drawer_scope_key(DrawerScope::Worktree, destination);
+        std::fs::write(&store.join(GLOBAL_SCOPE_KEY), "tool:db").unwrap();
+        std::fs::write(&store.join(&destination_key), "tool:local").unwrap();
+
+        // A newly started process ignores the stale global slot but retains
+        // the persisted worktree selection.
+        let mut process = FlagCache::load_from(&store);
+        assert_eq!(process.occupant_for_key(GLOBAL_SCOPE_KEY), None);
+        assert_eq!(
+            process.occupant_for_key(&destination_key),
+            Some("tool:local".into())
+        );
+
+        // Selecting a global occupant updates the process-local slot. It is
+        // available while switching worktrees, and an open destination
+        // worktree occupant still takes precedence.
+        process.set_key(GLOBAL_SCOPE_KEY, Some("tool:db".into()));
+        assert_eq!(
+            DrawerRuntime::target_from_cache(&process, source),
+            Some((
+                DrawerScope::Global,
+                DrawerPoolKey::global("tool:db"),
+                "tool:db".into()
+            ))
+        );
+        assert_eq!(
+            DrawerRuntime::target_from_cache(&process, destination),
+            Some((
+                DrawerScope::Worktree,
+                DrawerPoolKey::worktree(destination, "tool:local"),
+                "tool:local".into()
+            ))
+        );
+
+        // A fresh cache is the next process boundary: global state is not
+        // restored, while worktree persistence remains intact.
+        let fresh = FlagCache::load_from(&store);
+        assert_eq!(fresh.occupant_for_key(GLOBAL_SCOPE_KEY), None);
+        assert_eq!(
+            fresh.occupant_for_key(&destination_key),
+            Some("tool:local".into())
+        );
+        let _ = std::fs::remove_dir_all(&store); // best-effort: test scratch cleanup
     }
 
     #[test]
