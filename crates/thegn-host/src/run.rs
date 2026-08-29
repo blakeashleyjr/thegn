@@ -65,7 +65,7 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Mirror the scope-aware drawer runtime into the legacy geometry locals. The
+/// Mirror the scope-aware drawer runtime into the geometry locals. The
 /// layout/compositor still deals in a pane id; ownership, pooling, and stale
 /// result handling remain in [`DrawerRuntime`].
 fn sync_drawer_runtime_mirror(
@@ -86,7 +86,7 @@ fn sync_drawer_runtime_mirror(
 
 /// Reconcile the one drawer runtime after any active-directory mutation. The
 /// pane-id locals are only a layout mirror; they never own drawer lifecycle.
-pub(crate) fn sync_drawer_persistence(
+pub(crate) fn reconcile_drawer_runtime(
     session: &crate::session::Session,
     panes: &mut Panes,
     drawer: &mut Option<u32>,
@@ -13470,7 +13470,7 @@ async fn event_loop<T: Terminal>(
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
-                            sync_drawer_persistence(
+                            reconcile_drawer_runtime(
                                 &session,
                                 &mut panes,
                                 &mut drawer,
@@ -15340,7 +15340,7 @@ async fn event_loop<T: Terminal>(
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
                                 need_relayout = true;
-                                sync_drawer_persistence(
+                                reconcile_drawer_runtime(
                                     &session,
                                     &mut panes,
                                     &mut drawer,
@@ -16375,7 +16375,7 @@ async fn event_loop<T: Terminal>(
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
                                         need_relayout = true;
-                                        sync_drawer_persistence(
+                                        reconcile_drawer_runtime(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
@@ -16406,7 +16406,7 @@ async fn event_loop<T: Terminal>(
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
                                         need_relayout = true;
-                                        sync_drawer_persistence(
+                                        reconcile_drawer_runtime(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
@@ -16427,7 +16427,7 @@ async fn event_loop<T: Terminal>(
                                     session.switch_to(i);
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
@@ -20129,7 +20129,7 @@ async fn event_loop<T: Terminal>(
                                                 // workspace/folder was collapsed.
                                                 sb.reveal_active_worktree(&mut model, &session);
                                                 need_relayout = true;
-                                                sync_drawer_persistence(
+                                                reconcile_drawer_runtime(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
@@ -20165,7 +20165,7 @@ async fn event_loop<T: Terminal>(
                                                 sb.reveal_active_worktree(&mut model, &session);
                                                 kick_model_hydration!();
                                                 need_relayout = true;
-                                                sync_drawer_persistence(
+                                                reconcile_drawer_runtime(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
@@ -20240,7 +20240,7 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
@@ -20322,7 +20322,7 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
@@ -20350,7 +20350,7 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
@@ -20936,7 +20936,7 @@ async fn event_loop<T: Terminal>(
                                         session.switch_to(i);
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
-                                        sync_drawer_persistence(
+                                        reconcile_drawer_runtime(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
@@ -20970,7 +20970,7 @@ async fn event_loop<T: Terminal>(
                                             refresh_tab_model(&mut model, &session, &mut sb);
                                             kick_model_hydration!();
                                             need_relayout = true;
-                                            sync_drawer_persistence(
+                                            reconcile_drawer_runtime(
                                                 &session,
                                                 &mut panes,
                                                 &mut drawer,
@@ -21087,7 +21087,7 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
