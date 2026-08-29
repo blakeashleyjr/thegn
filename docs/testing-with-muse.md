@@ -7,7 +7,8 @@ web-first checks, and snapshots frames. thegn uses it two ways:
 
 1. **The gate** — `just e2e` runs `test/muse/specs/*.yaml` against the built
    binary and diffs snapshots against `test/muse/snapshots/` (`just ci-local`;
-   opt-in in CI with `[ci-e2e]` until the baselines are re-recorded).
+   opt-in in CI with the extras workflow input until the baselines are
+   re-recorded).
 2. **The loop** — `muse session` keeps a thegn alive between commands so a
    developer or an agent can look, act, and look again while iterating.
 
@@ -22,8 +23,11 @@ Contents: [Quick start](#quick-start-the-loop) · [Environment](#the-environment
 
 ## Quick start (the loop)
 
+Build only the host crate when the interactive binary needs refreshing, then
+keep the isolated session open while you look, act, and look again:
+
 ```bash
-just build                                   # target/debug/thegn (+ fake_lsp)
+cargo build -p thegn-host                     # refresh target/debug/thegn when needed
 T=$(mktemp -d); mkdir -p "$T/home" "$T/cfg/thegn" "$T/state" "$T/run" "$T/bin"
 printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$T/cfg/thegn/config.toml"
 printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$T/bin/e2esh"
@@ -42,7 +46,7 @@ muse session send tg --key ctrl+alt+p                      # a host chord
 muse session send tg --text "echo hi" --key enter          # pane input
 muse session wait tg --visible "hi" --timeout-ms 5000
 muse session snap tg --kind pixel --out "$T/shot.png"      # a PNG (open it)
-muse session close tg                                      # always
+muse session close tg                                      # close when the iteration is done
 ```
 
 `wait` exits 0 when the condition holds, 1 when it doesn't (with the reason),
@@ -228,7 +232,10 @@ snapshots get `#styled` in the directory name). `just e2e` runs with `--ci`:
 a missing baseline is a **failure**, never an auto-create. After an
 intentional UI change run `just e2e-update`, then review the diff under
 `test/muse/snapshots/` like code — it is the rendered consequence of your
-change. `just e2e` must then pass twice.
+change. Treat the full `just e2e` suite as final UI validation: run it after the
+change is settled, not after every small edit. `just e2e-update` is likewise an
+intentional baseline update followed by review; run `just e2e` again afterward
+to verify the reviewed baselines.
 
 Masks and normalizers in a spec's `snapshot_defaults` apply to every
 snapshot in it; per-step `masks:`/`normalize:` add to them. A `content` mask
