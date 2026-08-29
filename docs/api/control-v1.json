@@ -18,11 +18,23 @@
           "description": "Continue the harness's own most recent session in the worktree — the id-free relaunch form the transport-retry observer uses (THE-86). Resolved through [`thegn_core::harness::Harness::continue_command`]; a harness without a continue form refuses, exactly like an unsupported `resume`. Wire-additive with a `false` default: older clients are unaffected.",
           "type": "boolean"
         },
+        "fork": {
+          "default": false,
+          "description": "Ask the selected harness to create a native child session rather than resume the source in place. The daemon validates and resolves this operation through the harness seam.",
+          "type": "boolean"
+        },
         "headless": {
           "default": null,
           "description": "Run headlessly (`claude -p …`) rather than as an interactive TUI. Defaults to headless exactly when a prompt is given.",
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "native_session_id": {
+          "description": "Native session id passed to the harness fork operation. It is kept separate from `resume` so a fork cannot silently become an in-place resume when the two launch forms are composed.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -158,6 +170,62 @@
         "agent_name",
         "issue_id",
         "worktree_path"
+      ],
+      "type": "object"
+    },
+    "ForkSpec": {
+      "description": "Intent for creating a new session from a live daemon or recorded harness session. `harness` discriminates the source: absent means `session` is a live daemon id; present means it is a native id discovered from `agent.sessions`. No process recipe, environment, prompt, or transcript data crosses the control boundary.",
+      "properties": {
+        "adopt": {
+          "default": false,
+          "description": "Ask a connected compositor to adopt the child.",
+          "type": "boolean"
+        },
+        "agent": {
+          "description": "Configured agent name used to resolve the child launch context.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Optional child working-directory override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harness": {
+          "description": "Harness id for a recorded native session source.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scrollback": {
+          "default": false,
+          "description": "Request a bounded plain-text scrollback handoff file.",
+          "type": "boolean"
+        },
+        "session": {
+          "description": "Live daemon id, or native harness id when `harness` is set.",
+          "type": "string"
+        },
+        "tab": {
+          "default": false,
+          "description": "Adopt the child in a new tab instead of beside the source.",
+          "type": "boolean"
+        },
+        "worktree": {
+          "description": "Optional child worktree override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
       ],
       "type": "object"
     },
@@ -479,6 +547,13 @@
             "null"
           ]
         },
+        "forked_from": {
+          "description": "Stable display form of the source session when this session was forked. This is lineage metadata only; no launch recipe is included.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -780,6 +855,11 @@
       "path": "/v1/sessions"
     },
     {
+      "cap": "sessions.fork",
+      "method": "POST",
+      "path": "/v1/sessions/fork"
+    },
+    {
       "cap": "sessions.snapshot",
       "method": "GET",
       "path": "/v1/sessions/{s}/snapshot"
@@ -997,6 +1077,9 @@
     },
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"
+    },
+    "ForkSpec": {
+      "$ref": "#/definitions/ForkSpec"
     },
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"
