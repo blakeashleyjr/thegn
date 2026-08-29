@@ -420,6 +420,12 @@ pub fn spawn_event(
                     }
                 }
             }
+            // Hook completion is a model change even when no lifecycle
+            // transaction completion is queued. Keep the compositor's
+            // existing refresh funnel in sync with the completion pulse.
+            if let Some(tx) = REFRESH_TX.get() {
+                let _ = tx.send(crate::hydrate::RefreshKind::Model);
+            }
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }

@@ -7,7 +7,7 @@
 //! remote-dir removal, and a recursive `remove_dir_all` (a Rust worktree with a
 //! `target/` is easily multi-GB → tens of seconds). That work MUST NOT run on
 //! the event loop, so it is handed to a spawned thread that pulses the
-//! `TerminalWaker` when done — mirroring [`crate::run::delete_groups`]. Only the
+//! `TerminalWaker` when done — mirroring [`crate::run::delete_groups_with_mode`]. Only the
 //! in-memory session prune + DB-row pruning (cheap, cache writes) stays on the
 //! loop, and the status line reports "removing N worktrees…" until the thread
 //! finishes.
