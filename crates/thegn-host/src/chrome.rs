@@ -1222,6 +1222,9 @@ pub enum BarBadge {
     /// Needs-you rollup: worktrees whose attention tier is T0–T2.
     Attention,
     Ci,
+    /// Legacy queue badge id retained for detail/compatibility. The default
+    /// statusbar now emits the configured `Widget("mq")` instead.
+    #[allow(dead_code)]
     MergeQueue,
     /// PR queue: pull requests being shepherded on a forge.
     PrQueue,
@@ -1607,8 +1610,14 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     use crate::seg::{Seg, Tok, seg};
     let mut items: Vec<(BarItemId, Vec<Seg>)> = Vec::new();
 
-    // Config widgets (PR / tests / LOC / disk / transient status).
+    // Config widgets (PR / tests / LOC / disk / transient status). `mq` is a
+    // compact, data-backed widget and is rendered by the badge module rather
+    // than by the text-only widget resolver below.
     for id in &model.bars.bottom_right {
+        if id == "mq" {
+            crate::statusbar_badges::push_mq_widget(model, &mut items);
+            continue;
+        }
         if let Some(p) = bottombar_widget(id, model) {
             items.push((
                 BarItemId::Widget(id.clone()),
@@ -1646,12 +1655,11 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     // The attention chip (`✋ N` / quiet `✉ N`) is the ONE inbox/needs-you
     // signal — see `statusbar_badges::push_attention_badge`. (A separate `⚑`
     // alert-count chip used to sit here and double-counted the same events.)
-    // Needs-you / CI rollup / merge-queue chips live in `statusbar_badges.rs`
+    // Needs-you / CI rollup chips live in `statusbar_badges.rs`
     // (extracted from this ratchet-pinned file).
     crate::statusbar_badges::push_attention_badge(model, &mut items);
     crate::statusbar_badges::push_network_chip(model, &mut items);
     crate::statusbar_badges::push_ci_badge(model, &mut items);
-    crate::statusbar_badges::push_mq_badge(model, &mut items);
     crate::statusbar_badges::push_prq_badge(model, &mut items);
     crate::statusbar_badges::push_usage_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below

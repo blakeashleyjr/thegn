@@ -20,6 +20,13 @@ the sidebar row menu, or `thegn merge add` in the pane. The queue is
 persisted; entries survive restarts. The section shows the active
 workspace's queue by default; `g` widens it to every workspace.
 
+The workspace header in the full sidebar also shows a compact queue token when
+that workspace has active entries. It summarizes the highest-priority tier —
+blocked, working, or populated — and is a shortcut to this existing Work ▸
+Merge queue section. The token is omitted for empty or landed-only queues and
+is not shown in rail mode. The bottom-bar summary is opt-in: set
+`[bars] bottom_right = ["mq"]` if you want it alongside the other widgets.
+
 ## Landing
 
 - **Integrate** (palette, or the section's key) drains the queue once:
@@ -224,5 +231,6 @@ changes elsewhere.
 
 ## Watching
 
-The status bar shows queue depth ([[bars]]); the _merge_ section lists
-entries with their gate state. Failures surface as notifications.
+The full sidebar token and optional `mq` widget show queue depth; the _merge_
+section lists entries with their gate state. Failures surface as
+notifications. E2E baselines are not re-recorded for this behavior change.
