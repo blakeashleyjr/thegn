@@ -861,6 +861,7 @@ mod tests {
         ];
         let write = [
             OpenSession,
+            ForkSession,
             Attach,
             Detach,
             SendInput,
