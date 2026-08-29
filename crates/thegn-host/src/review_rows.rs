@@ -104,6 +104,22 @@ pub(crate) fn row_thread(row: &ReviewRow) -> Option<&ReviewThread> {
     }
 }
 
+pub(crate) fn render_review_row(row: &ReviewRow, selected: bool, cols: usize) -> Vec<(Line, bool)> {
+    match row {
+        ReviewRow::Hunk(header) => vec![(
+            Line::segs(vec![seg(
+                Tok::Hue(thegn_core::theme::Hue::Teal),
+                trunc(header, cols),
+            )]),
+            false,
+        )],
+        ReviewRow::Diff(line) => vec![(diff_line(line, selected, cols), selected)],
+        ReviewRow::Thread(thread) => review_thread_lines(thread, selected, cols),
+        ReviewRow::Outdated(thread) => review_feedback_lines(thread, "OUTDATED", selected, cols),
+        ReviewRow::General(thread) => review_feedback_lines(thread, "GENERAL", selected, cols),
+    }
+}
+
 pub(crate) fn sel_marker(selected: bool) -> &'static str {
     if selected { "❯ " } else { "  " }
 }
@@ -311,7 +327,7 @@ pub(crate) fn top_level_feedback_lines(
     out
 }
 
-fn review_state_marker(state: &str) -> (&'static str, Tok) {
+pub(crate) fn review_state_marker(state: &str) -> (&'static str, Tok) {
     match state.to_uppercase().as_str() {
         "APPROVED" => (
             crate::caps::active_glyphs().check,
