@@ -899,13 +899,7 @@ pub(crate) fn dispatch_pr_view_key(
                 crate::review_handoff::PaneTarget::Headless { .. }
             ) {
                 v.pending_handoff = Some(selection);
-                *active_menu = Some(crate::menu::confirm_menu(
-                    "send review to headless agent?",
-                    "Remote review text will be sent to the configured agent.",
-                    "pr-review-handoff",
-                    String::new(),
-                    true,
-                ));
+                *active_menu = Some(headless_handoff_confirm_menu());
                 model.status = "confirm headless review handoff".into();
             } else {
                 dispatch_pr_handoff(
@@ -917,7 +911,18 @@ pub(crate) fn dispatch_pr_view_key(
     }
 }
 
+fn headless_handoff_confirm_menu() -> crate::menu::MenuOverlay {
+    crate::menu::confirm_menu(
+        "send review to headless agent?",
+        "Remote review text will be sent to the configured agent.",
+        "pr-review-handoff",
+        String::new(),
+        true,
+    )
+}
+
 /// Dispatch a handoff that has already passed any required confirmation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_pr_handoff(
     view: &mut Option<PrView>,
     session: &mut Session,
@@ -1467,5 +1472,24 @@ mod tests {
         );
         // A non-mutation action has no transient status.
         assert_eq!(status_for(&DetailAction::CiRefresh), "");
+    }
+
+    #[test]
+    fn headless_handoff_menu_requires_an_explicit_confirmation() {
+        let mut menu = headless_handoff_confirm_menu();
+        assert_eq!(menu.tag, crate::menu::MenuKindTag::Confirm);
+        assert!(matches!(
+            menu.handle_key(&KeyCode::Char('y'), Modifiers::NONE),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Confirm {
+                tag: "pr-review-handoff",
+                ..
+            })
+        ));
+
+        let mut cancelled = headless_handoff_confirm_menu();
+        assert_eq!(
+            cancelled.handle_key(&KeyCode::Char('n'), Modifiers::NONE),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Dismiss)
+        );
     }
 }
