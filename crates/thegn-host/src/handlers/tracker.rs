@@ -309,7 +309,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let rendered_prompt =
                 render_prompt(default_prompt(TaskKind::Issue), &vars).unwrap_or_default();
 
-            let Ok(mut spec) = crate::direnv_warm::launch_spec_synced_with(
+            let mut spec = match crate::direnv_warm::launch_spec_synced_with(
                 &cfg2,
                 &wt_str,
                 Some(&branch),
@@ -322,8 +322,20 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     suppress_agent_record: false,
                     stage: None,
                 },
-            ) else {
-                return;
+            ) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    let cleanup =
+                        crate::worktree_lifecycle::rollback_remove(&cfg2, &root, &path, &branch);
+                    let message = match cleanup {
+                        Ok(()) => format!("agent dispatch launch spec failed: {error}"),
+                        Err(cleanup) => format!(
+                            "agent dispatch launch spec failed: {error}; rollback failed: {cleanup}"
+                        ),
+                    };
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
             };
 
             // Inject issue context for the agent.
@@ -335,11 +347,39 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
 
             let slug = repo::repo_slug(&root);
             let tab = repo::branch_tab(&slug, &branch);
+            let root_s = root.to_string_lossy();
 
-            // Register the dispatch in the DB.
-            if let Ok(db) = thegn_core::db::Db::open() {
-                let root_s = root.to_string_lossy();
-                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            // Register the dispatch in the DB. A missing/failed primary row
+            // leaves no usable create result, so force-clean the speculative
+            // checkout while preserving the original error in the warning.
+            let db = match thegn_core::db::Db::open() {
+                Ok(db) => db,
+                Err(error) => {
+                    let cleanup =
+                        crate::worktree_lifecycle::rollback_remove(&cfg2, &root, &path, &branch);
+                    let message = match cleanup {
+                        Ok(()) => format!("agent dispatch database open failed: {error}"),
+                        Err(cleanup) => format!(
+                            "agent dispatch database open failed: {error}; rollback failed: {cleanup}"
+                        ),
+                    };
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
+            };
+            if let Err(error) = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None) {
+                let cleanup =
+                    crate::worktree_lifecycle::rollback_remove(&cfg2, &root, &path, &branch);
+                let message = match cleanup {
+                    Ok(()) => format!("agent dispatch registration failed: {error}"),
+                    Err(cleanup) => format!(
+                        "agent dispatch registration failed: {error}; rollback failed: {cleanup}"
+                    ),
+                };
+                thegn_core::msg::warn(&message);
+                return;
+            }
+            {
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
                     &issue_id,
