@@ -317,10 +317,7 @@ fn from_fields(fields: BTreeMap<String, Option<String>>) -> Result<GoghScheme, T
             .ok_or_else(|| ThemeImportError::MissingField(name.into()))
     };
     let name = required("name")?.to_owned();
-    if name
-        .chars()
-        .any(|character| character.is_control() || character.is_ascii_control())
-    {
+    if !crate::theme_user::safe_theme_name(&name) {
         return Err(ThemeImportError::UnsafeName);
     }
     let variant = fields

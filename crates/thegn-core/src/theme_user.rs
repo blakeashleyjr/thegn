@@ -63,6 +63,22 @@ pub struct UserTheme {
     pub hues: UserThemeHues,
 }
 
+pub(crate) fn safe_theme_name(name: &str) -> bool {
+    !name.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{00ad}'
+                    | '\u{061c}'
+                    | '\u{180e}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{feff}'
+            )
+    })
+}
+
 /// Errors returned while decoding or validating a user-theme TOML file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserThemeError {
@@ -152,12 +168,7 @@ impl UserTheme {
         if self.meta.name.trim().is_empty() {
             return Err(UserThemeError::EmptyName);
         }
-        if self
-            .meta
-            .name
-            .chars()
-            .any(|character| character.is_control() || character.is_ascii_control())
-        {
+        if !safe_theme_name(&self.meta.name) {
             return Err(UserThemeError::UnsafeName);
         }
         let fields = [
