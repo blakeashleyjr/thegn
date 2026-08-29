@@ -952,10 +952,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
-    #[cfg(unix)]
     #[test]
     fn flag_cache_ignores_symlinked_state_entries() {
-        use std::os::unix::fs::symlink;
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
 
         let store =
             std::env::temp_dir().join(format!("tg-drawer-symlink-state-{}", std::process::id()));
@@ -964,7 +965,7 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(&outside, "true").unwrap();
-        symlink(&outside, store.join("linked")).unwrap();
+        crate::platform::test_symlink(&outside, &store.join("linked")).unwrap();
 
         let cache = FlagCache::load_from(&store);
         assert_eq!(cache.occupant_for_key("linked"), None);
@@ -973,10 +974,11 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
     }
 
-    #[cfg(unix)]
     #[test]
     fn state_cache_write_replaces_symlink_without_touching_target() {
-        use std::os::unix::fs::symlink;
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
 
         let store =
             std::env::temp_dir().join(format!("tg-drawer-symlink-write-{}", std::process::id()));
@@ -986,7 +988,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(&outside, "keep-me").unwrap();
         let state = store.join("state");
-        symlink(&outside, &state).unwrap();
+        crate::platform::test_symlink(&outside, &state).unwrap();
 
         crate::platform::write_state_file(&state, "tool:db");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep-me");
@@ -996,10 +998,11 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
     }
 
-    #[cfg(unix)]
     #[test]
     fn state_cache_write_rejects_symlinked_parent() {
-        use std::os::unix::fs::symlink;
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
 
         let root =
             std::env::temp_dir().join(format!("tg-drawer-symlink-parent-{}", std::process::id()));
@@ -1008,7 +1011,7 @@ mod tests {
         let _ = std::fs::remove_file(&root);
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, &root).unwrap();
+        crate::platform::test_symlink(&outside, &root).unwrap();
 
         crate::platform::write_state_file(&root.join("state"), "must-not-escape");
         assert!(!outside.join("state").exists());
@@ -1017,10 +1020,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    #[cfg(unix)]
     #[test]
     fn flag_cache_ignores_symlinked_store_directory() {
-        use std::os::unix::fs::symlink;
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
 
         let store =
             std::env::temp_dir().join(format!("tg-drawer-symlink-store-{}", std::process::id()));
@@ -1030,7 +1034,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("linked"), "true").unwrap();
-        symlink(&outside, &store).unwrap();
+        crate::platform::test_symlink(&outside, &store).unwrap();
 
         let cache = FlagCache::load_from(&store);
         assert_eq!(cache.occupant_for_key("linked"), None);
