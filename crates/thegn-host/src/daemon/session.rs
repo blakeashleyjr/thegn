@@ -831,6 +831,10 @@ impl SessionActor {
             body = %sig.body,
             "attention signal",
         );
+        // A raised hand supersedes a harness banner. Keep the live attention
+        // reason singular: once the session is blocked, the user should see
+        // the input request rather than a stale failure bit (THE-89).
+        self.clear_error_state();
         let message = match &sig.title {
             Some(t) if !t.is_empty() => format!("{t} — {}", sig.body),
             _ => sig.body.clone(),
@@ -941,13 +945,33 @@ impl SessionActor {
     /// the user answering a raised hand.
     fn on_input(&mut self) {
         self.activity.note_input(unix_now_secs());
-        if self.attention.take().is_some() {
+        let had_attention = self.attention.take().is_some();
+        let had_error = self.clear_error_state();
+        if had_attention || had_error {
             self.publish_state();
+        }
+        if had_attention {
             // The user answered — lower the hand in the shared table too, or
             // the worktree stays Blocked forever (the old notification row did
             // exactly that, against this capability's own spec).
             self.clear_attention_row();
         }
+    }
+
+    /// Clear the transient harness-error bit and mirror the transition to the
+    /// host-side cache. Returns whether a live error was actually cleared so
+    /// callers can publish an otherwise activity-neutral state transition.
+    fn clear_error_state(&mut self) -> bool {
+        if !self.error_state.error_active {
+            return false;
+        }
+        self.error_state.clear_on_resume();
+        super::agent_error_cache::set(
+            &self.meta.id,
+            self.meta.worktree.clone(),
+            self.error_state.error_active,
+        );
+        true
     }
 
     /// Register an output matcher, firing at once if the pattern is already in
