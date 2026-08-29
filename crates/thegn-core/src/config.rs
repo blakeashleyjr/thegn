@@ -4487,6 +4487,10 @@ impl Default for DrawerConfig {
     }
 }
 
+fn default_agent_error_signatures() -> Vec<String> {
+    crate::agent_error::AgentErrorSignatures::defaults().signatures
+}
+
 /// `[notifications]` — the aggregated event bus and desktop notification
 /// delivery (items 420/421/430). Events from git/agents/tests/logs are
 /// surfaced as sidebar badges and (optionally) OS desktop notifications.
@@ -4521,6 +4525,12 @@ pub struct NotificationsConfig {
     /// and buried everything else (THE-68). When on, the write is one CURRENT
     /// row per session (delete-then-insert), never one per turn.
     pub agent_attention_inbox: bool,
+    /// Substrings that classify a live agent output line as a harness
+    /// failure banner. Each entry is matched case-insensitively against
+    /// individual output lines. Defaults to thegn's known harness banners;
+    /// add your harness's own to catch e.g. "your claude subscription…".
+    #[serde(default = "default_agent_error_signatures")]
+    pub agent_error_signatures: Vec<String>,
     /// Per-kind attention priority overrides: maps a notification kind
     /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
     /// Unset kinds use their built-in `NotificationKind::default_priority`;
@@ -4565,6 +4575,7 @@ impl Default for NotificationsConfig {
             surface_self_log_errors: false,
             github_mentions: true,
             agent_attention_inbox: false,
+            agent_error_signatures: default_agent_error_signatures(),
             priority: std::collections::BTreeMap::new(),
             rules: Vec::new(),
             dnd: DndConfig::default(),
@@ -4577,6 +4588,23 @@ impl Default for NotificationsConfig {
 }
 
 impl NotificationsConfig {
+    /// Validate the live agent-output signature list for strict config
+    /// validation. Empty entries would match every line, and an unbounded
+    /// entry is both surprising and needlessly expensive to compare.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (index, signature) in self.agent_error_signatures.iter().enumerate() {
+            let key = format!("notifications.agent_error_signatures[{index}]");
+            if signature.trim().is_empty() {
+                errors.push(format!("{key}: empty (a signature must name something)"));
+            }
+            if signature.chars().count() > 256 {
+                errors.push(format!("{key}: over 256 characters"));
+            }
+        }
+        errors
+    }
+
     /// Effective priority of a kind: a valid config override wins, else the kind's
     /// built-in default. Garbage override values fall through to the default.
     pub fn priority_of(

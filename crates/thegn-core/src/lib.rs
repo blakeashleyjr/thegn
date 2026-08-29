@@ -16,6 +16,7 @@ pub mod activity;
 // pane daemon's session-keyed `session_activity` — one decision function, so the
 // two can never drift into disagreeing about what "quiet" means.
 pub mod activity_step;
+pub mod agent_error;
 pub mod agent_task;
 pub mod aggregate;
 pub mod ansi_cells;
