@@ -4,30 +4,6 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-pub fn prepare_hook_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `setpgid(0, 0)` only changes the child process group before exec;
-    // it does not access Rust memory or share state with the parent.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-}
-
-pub fn kill_hook_process_group(child: &mut Child) {
-    // SAFETY: the pid is owned by this child and its process group was created
-    // immediately before exec; SIGKILL is the timeout cleanup contract.
-    unsafe {
-        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.kill();
-}
-
 /// Restores the original stderr fd on drop (see [`super::redirect_stderr_to_logfile`]).
 ///
 /// Holds an `OwnedFd` rather than a `RawFd`: nix 0.31 moved the fd API to
@@ -219,6 +195,16 @@ impl GroupHandle {
         nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(self.pgid),
             nix::sys::signal::Signal::SIGTERM,
+        )
+        .ok();
+    }
+
+    /// Forcefully terminate the whole process group.
+    pub fn kill(&self) {
+        // best-effort: signal: the process may already be gone
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(self.pgid),
+            nix::sys::signal::Signal::SIGKILL,
         )
         .ok();
     }

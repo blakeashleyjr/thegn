@@ -57,7 +57,7 @@ impl HookRunResult {
 #[expect(clippy::disallowed_methods)]
 pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
     let log_path = log_path(&context.worktree, context.event);
-    let mut child = match spawn(spec, context, cwd) {
+    let (mut child, group) = match spawn(spec, context, cwd) {
         Ok(child) => child,
         Err(error) => {
             let stderr = format!("failed to start hook: {error}");
@@ -84,7 +84,8 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() >= deadline => {
                 timed_out = true;
-                kill_process_group(&mut child);
+                group.kill();
+                // Reap the direct child after the group termination request.
                 break child.wait().ok();
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
@@ -114,7 +115,11 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
     }
 }
 
-fn spawn(spec: &HookSpec, context: &HookContext, cwd: &Path) -> std::io::Result<Child> {
+fn spawn(
+    spec: &HookSpec,
+    context: &HookContext,
+    cwd: &Path,
+) -> std::io::Result<(Child, crate::platform::GroupHandle)> {
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
         "sh".into(),
         "-lc".into(),
@@ -130,8 +135,10 @@ fn spawn(spec: &HookSpec, context: &HookContext, cwd: &Path) -> std::io::Result<
         .env_clear()
         .envs(thegn_core::util::filter_host_env(std::env::vars(), &[]))
         .envs(context.environment());
-    crate::platform::prepare_hook_process_group(&mut command);
-    command.spawn()
+    // The platform seam creates a real process group on Unix and assigns the
+    // child to a kill-on-close Job Object on Windows. Keeping the handle alive
+    // through wait is what makes timeout cleanup cover grandchildren too.
+    crate::platform::spawn_grouped(&mut command)
 }
 
 fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
@@ -145,10 +152,6 @@ fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<S
 fn join_pipe(pipe: Option<std::thread::JoinHandle<String>>) -> String {
     pipe.and_then(|thread| thread.join().ok())
         .unwrap_or_default()
-}
-
-fn kill_process_group(child: &mut Child) {
-    crate::platform::kill_hook_process_group(child);
 }
 
 static LOG_INDICES: OnceLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
