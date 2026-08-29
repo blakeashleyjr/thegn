@@ -133,12 +133,41 @@ fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear()
-        .envs(thegn_core::util::filter_host_env(std::env::vars(), &[]))
+        .envs(hook_base_env(std::env::vars()))
         .envs(context.environment());
     // The platform seam creates a real process group on Unix and assigns the
     // child to a kill-on-close Job Object on Windows. Keeping the handle alive
     // through wait is what makes timeout cleanup cover grandchildren too.
     crate::platform::spawn_grouped(&mut command)
+}
+
+/// Build the non-context portion of a hook environment. The general pane
+/// allowlist admits `THEGN_*` for internal pane markers, but repository hooks
+/// are an untrusted boundary: inherited values must not shadow the five
+/// context variables installed below or carry a credential-shaped name.
+fn hook_base_env<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    thegn_core::util::filter_host_env(vars, &[])
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with("THEGN_") && !credential_shaped(key))
+        .collect()
+}
+
+fn credential_shaped(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "_TOKEN",
+        "_SECRET",
+        "_PASSWORD",
+        "_PRIVATE_KEY",
+        "_CREDENTIAL",
+        "_SOCK",
+        "_AGENT",
+    ]
+    .iter()
+    .any(|suffix| upper.ends_with(suffix))
 }
 
 fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
@@ -318,6 +347,19 @@ mod tests {
         );
         assert_eq!(result.state, HookRunState::Succeeded);
         assert_eq!(result.stdout, "post_create:feature:");
+    }
+
+    #[test]
+    fn hook_base_env_excludes_inherited_context_and_credentials() {
+        let env = hook_base_env([
+            ("PATH".into(), "/bin".into()),
+            ("THEGN_INBOX_SECRET".into(), "secret".into()),
+            ("THEGN_API_KEY".into(), "secret".into()),
+            ("GH_TOKEN".into(), "secret".into()),
+            ("SSH_AUTH_SOCK".into(), "/tmp/agent.sock".into()),
+            ("THEGN_SAFE_MARKER".into(), "must-not-inherit".into()),
+        ]);
+        assert_eq!(env, vec![("PATH".to_string(), "/bin".to_string())]);
     }
 
     #[test]
