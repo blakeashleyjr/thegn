@@ -1,4 +1,4 @@
-//! Per-session agent error state, shared between the daemon's [`SessionActor`]
+//! Per-session agent error state, shared between the daemon's `SessionActor`
 //! (which classifies each output chunk) and the host's `collect_attention` (which
 //! projects the state into the worktree's `AttentionInputs`). The cache is
 //! **host-side**: the compositor's `collect_attention` reads it directly, and a
