@@ -114,7 +114,7 @@ pub(crate) fn drain(
                 store.scan();
             }
             ThemeStoreResult::Applied(result) => {
-                builder.store_completed(result);
+                builder.apply_completed(result);
                 if builder.status().is_none() {
                     outcome.close = true;
                 }

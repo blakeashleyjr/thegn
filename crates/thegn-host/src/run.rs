@@ -824,11 +824,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (config_tx, config_rx) =
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
-    let config_path = thegn_core::config::Config::path();
-    let theme_config_path = cli
+    let config_path = cli
         .config
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
+    let theme_config_path = config_path.clone();
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {

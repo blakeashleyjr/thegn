@@ -317,6 +317,9 @@ fn from_fields(fields: BTreeMap<String, Option<String>>) -> Result<GoghScheme, T
             .ok_or_else(|| ThemeImportError::MissingField(name.into()))
     };
     let name = required("name")?.to_owned();
+    if name.trim().is_empty() {
+        return Err(ThemeImportError::MissingField("name".into()));
+    }
     if !crate::theme_user::safe_theme_name(&name) {
         return Err(ThemeImportError::UnsafeName);
     }
@@ -479,6 +482,15 @@ mod tests {
         assert!(matches!(
             theme.validate(),
             Err(crate::theme_user::UserThemeError::UnsafeName)
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_name_is_rejected_before_conversion() {
+        let input = yaml().replacen("name: \"Test Gogh\"", "name: '   '", 1);
+        assert!(matches!(
+            import_gogh(input.as_bytes()),
+            Err(ThemeImportError::MissingField(field)) if field == "name"
         ));
     }
 
