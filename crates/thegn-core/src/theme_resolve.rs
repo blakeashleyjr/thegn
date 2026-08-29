@@ -15,7 +15,28 @@ pub fn palette_with_config(
     accent: &str,
     focus: &str,
 ) -> Palette {
-    let mut palette = preset(preset_name).unwrap_or_default();
+    palette_with_catalog(preset_name, &[], colors, hues, accent, focus)
+}
+
+/// Resolve a named palette from the built-in and loaded user-theme catalogs.
+/// Built-ins deliberately win name collisions, and config-shaped overrides are
+/// applied after either base palette so user themes behave exactly like presets.
+pub fn palette_with_catalog(
+    preset_name: &str,
+    user_themes: &[UserTheme],
+    colors: &ThemeColors,
+    hues: &ThemeHues,
+    accent: &str,
+    focus: &str,
+) -> Palette {
+    let mut palette = preset(preset_name)
+        .or_else(|| {
+            user_themes
+                .iter()
+                .find(|theme| theme.meta.name == preset_name)
+                .and_then(|theme| palette_from_user_theme(theme).ok())
+        })
+        .unwrap_or_default();
     apply_config_overrides(&mut palette, colors, hues, accent, focus);
     extend_palette(&mut palette);
     palette
@@ -207,6 +228,47 @@ mod tests {
             assert!(!palette.ghost2.is_empty(), "{name}");
             assert!(!palette.heat[4].is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn user_theme_resolution_survives_reload_and_layers_config_overrides() {
+        let mut base = Palette::default();
+        extend_palette(&mut base);
+        let user = UserTheme::from_palette("local-paper", &base);
+        let mut colors = ThemeColors::default();
+        colors.bg0 = Some("#123456".into());
+        let hues = ThemeHues::default();
+
+        let first = palette_with_catalog(
+            "local-paper",
+            std::slice::from_ref(&user),
+            &colors,
+            &hues,
+            "#6ee7d8",
+            "#6ee7d8",
+        );
+        let after_reload = palette_with_catalog(
+            "local-paper",
+            std::slice::from_ref(&user),
+            &colors,
+            &hues,
+            "#6ee7d8",
+            "#6ee7d8",
+        );
+        assert_eq!(first, after_reload);
+        assert_eq!(first.bg0, "18;52;86");
+        assert_eq!(
+            palette_with_catalog(
+                "prism",
+                std::slice::from_ref(&user),
+                &colors,
+                &hues,
+                "#6ee7d8",
+                "#6ee7d8",
+            )
+            .bg0,
+            "18;52;86"
+        );
     }
 
     #[test]

@@ -72,6 +72,7 @@ pub enum ThemeImportError {
     MissingField(String),
     NonStringField(String),
     InvalidVariant(String),
+    UnsafeName,
     InvalidHex { field: String, value: String },
 }
 
@@ -92,6 +93,9 @@ impl std::fmt::Display for ThemeImportError {
             Self::MissingField(field) => write!(f, "missing Gogh field: {field}"),
             Self::NonStringField(field) => write!(f, "Gogh field must be a scalar string: {field}"),
             Self::InvalidVariant(value) => write!(f, "unsupported Gogh variant: {value}"),
+            Self::UnsafeName => {
+                f.write_str("Gogh theme name contains control or non-printing data")
+            }
             Self::InvalidHex { field, value } => {
                 write!(f, "invalid hex color for {field}: {value}")
             }
@@ -313,6 +317,12 @@ fn from_fields(fields: BTreeMap<String, Option<String>>) -> Result<GoghScheme, T
             .ok_or_else(|| ThemeImportError::MissingField(name.into()))
     };
     let name = required("name")?.to_owned();
+    if name
+        .chars()
+        .any(|character| character.is_control() || character.is_ascii_control())
+    {
+        return Err(ThemeImportError::UnsafeName);
+    }
     let variant = fields
         .get("variant")
         .and_then(|value| value.as_deref())
@@ -457,6 +467,21 @@ mod tests {
         assert!(matches!(
             parse_gogh(b"name: x\nnope: y\n"),
             Err(ThemeImportError::UnknownField(_))
+        ));
+    }
+
+    #[test]
+    fn hostile_metadata_name_is_rejected_before_import() {
+        let input = yaml().replacen("name: \"Test Gogh\"", "name: bad\u{1b}name", 1);
+        assert!(matches!(
+            parse_gogh(input.as_bytes()),
+            Err(ThemeImportError::UnsafeName)
+        ));
+        let mut theme = convert_gogh(&parse_gogh(yaml().as_bytes()).unwrap());
+        theme.meta.name = "bad\u{1b}name".into();
+        assert!(matches!(
+            theme.validate(),
+            Err(crate::theme_user::UserThemeError::UnsafeName)
         ));
     }
 

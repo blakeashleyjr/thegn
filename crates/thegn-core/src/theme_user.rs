@@ -70,6 +70,7 @@ pub enum UserThemeError {
     UnsupportedVersion(u16),
     InvalidHex { field: String, value: String },
     EmptyName,
+    UnsafeName,
 }
 
 impl std::fmt::Display for UserThemeError {
@@ -83,6 +84,9 @@ impl std::fmt::Display for UserThemeError {
                 write!(f, "invalid hex color for {field}: {value}")
             }
             Self::EmptyName => f.write_str("user theme name must not be empty"),
+            Self::UnsafeName => {
+                f.write_str("user theme name contains control or non-printing data")
+            }
         }
     }
 }
@@ -147,6 +151,14 @@ impl UserTheme {
         }
         if self.meta.name.trim().is_empty() {
             return Err(UserThemeError::EmptyName);
+        }
+        if self
+            .meta
+            .name
+            .chars()
+            .any(|character| character.is_control() || character.is_ascii_control())
+        {
+            return Err(UserThemeError::UnsafeName);
         }
         let fields = [
             ("colors.bg0", &self.colors.bg0),
