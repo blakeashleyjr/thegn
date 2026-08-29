@@ -654,12 +654,13 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .table
         .get(&id)
         .is_some_and(|p| is_daemon_agent_exit(p.is_daemon_backed(), p.program()));
-    let was_drawer = ctx
+    let visible_drawer = ctx
         .drawer_runtime
         .visible
         .as_ref()
-        .is_some_and(|visible| visible.pane_id == id)
-        || ctx.drawer_runtime.pool.key_for_id(id).is_some();
+        .is_some_and(|visible| visible.pane_id == id);
+    let pooled_drawer = ctx.drawer_runtime.pool.key_for_id(id).is_some();
+    let was_drawer = visible_drawer || pooled_drawer;
     ctx.panes.table.remove(&id);
     // Set only in the sole-pane leave-for-materialize branch below.
     let mut left_for_materialize = false;
@@ -667,8 +668,14 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
     // drawer closed, hand focus back to the center, and relayout to reclaim
     // the bottom slice.
     if was_drawer {
-        *ctx.drawer = None;
         ctx.drawer_runtime.on_exit(id, ctx.panes);
+        // A prewarmed occupant can exit while another occupant remains
+        // visible. Removing that hidden pane must not steal focus or reclaim
+        // the visible drawer's geometry.
+        if !visible_drawer {
+            return false;
+        }
+        *ctx.drawer = None;
         // A clean exit is the normal `q`-quit path — stay quiet. Only an
         // abnormal exit (e.g. the contained scope hit the drawer memory
         // limit) gets a hint.

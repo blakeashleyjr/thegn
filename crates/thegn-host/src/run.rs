@@ -15840,7 +15840,6 @@ async fn event_loop<T: Terminal>(
                                 if let Some(id) = selected
                                     && let Some(dir) = active_cwd(&session)
                                 {
-                                    let was_visible = drawer_runtime.visible.is_some();
                                     if !crate::handlers::drawer::select(
                                         &mut drawer_runtime,
                                         keymap.config(),
@@ -15862,9 +15861,10 @@ async fn event_loop<T: Terminal>(
                                     }
                                     if drawer.is_some() {
                                         focus.zone = crate::focus::Zone::Drawer;
-                                    } else if !was_visible {
-                                        // The cold result will focus the
-                                        // drawer when it is opened.
+                                    } else {
+                                        // A cold result needs to focus the
+                                        // drawer when it is opened, including
+                                        // when it replaces a visible drawer.
                                         drawer_focus_pending = true;
                                     }
                                 }
@@ -19387,7 +19387,6 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::DrawerCycle => {
                                 if let Some(dir) = active_cwd(&session) {
-                                    let was_visible = drawer_runtime.visible.is_some();
                                     let next = crate::handlers::drawer::cycle(
                                         &mut drawer_runtime,
                                         keymap.config(),
@@ -19409,7 +19408,7 @@ async fn event_loop<T: Terminal>(
                                         if drawer.is_some() {
                                             focus.zone = crate::focus::Zone::Drawer;
                                             drawer_focus_pending = false;
-                                        } else if !was_visible {
+                                        } else {
                                             drawer_focus_pending = true;
                                         }
                                     }
