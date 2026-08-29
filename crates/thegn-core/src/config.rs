@@ -6624,17 +6624,6 @@ impl Config {
         crate::config_resolve::resolve_repo_sandbox(self, repo_root, approvals)
     }
 
-    /// Resolve lifecycle hooks for a repo, including workspace and legacy
-    /// `sandbox.prepare` layers. Repo-authored entries remain pending until
-    /// their canonical trust request is approved.
-    pub fn repo_hooks_resolved(
-        &self,
-        repo_root: &std::path::Path,
-        approvals: &crate::config_resolve::Approvals,
-    ) -> crate::hooks::ResolvedHooks {
-        crate::hooks::resolve_for_repo(self, repo_root, approvals)
-    }
-
     /// The effective `[merge_queue]` for a repo: the global table with the
     /// `[workspace.<slug>] merge_queue` overlay applied on top.
     ///
@@ -6968,6 +6957,14 @@ pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfi
         };
     }
     None
+}
+
+/// Load only the lifecycle-hook portion of a repo overlay for the host
+/// orchestration boundary. The policy resolver in `hooks.rs` remains pure: it
+/// receives these typed values rather than discovering files itself.
+pub fn load_repo_hooks(repo_root: &std::path::Path) -> Option<(HooksConfig, Vec<String>)> {
+    load_repo_overlay(repo_root)
+        .map(|overlay| (overlay.hooks, overlay.sandbox.prepare.unwrap_or_default()))
 }
 
 /// A repo-root `.thegn.*` overlay that EXISTS but failed to parse. Returned by

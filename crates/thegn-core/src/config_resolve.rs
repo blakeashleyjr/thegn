@@ -753,7 +753,7 @@ pub fn classify_repo_overlay(
     );
     // `sandbox.prepare` is the legacy spelling for the head of the new
     // `post_create` hook event. It is deliberately not classified as a
-    // sandbox field here: `crate::hooks::resolve_for_repo` emits one canonical
+    // sandbox field here: the host's config boundary emits one canonical
     // `hooks.post_create` trust request containing both forms together.
     gated_scalar_string(
         &mut out.image,
