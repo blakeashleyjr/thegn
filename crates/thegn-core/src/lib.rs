@@ -208,6 +208,7 @@ pub mod repo_map;
 pub mod repo_trust;
 pub mod resource_alert;
 pub mod retry;
+pub mod review;
 pub mod revtunnel;
 pub mod sandbox;
 pub mod sandbox_backend;
