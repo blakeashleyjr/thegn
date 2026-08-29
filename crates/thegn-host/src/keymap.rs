@@ -68,6 +68,8 @@ pub enum Action {
     NewWorktreeFromTemplate,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
+    /// Open the boxed theme builder with live previews.
+    ThemeBuilderOpen,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
     SwitchFont,
     /// Close the active tab within the worktree. The final tab is kept; use
@@ -499,6 +501,7 @@ impl Action {
             Action::ImportLayout => "import-layout",
             Action::NewWorktreeFromTemplate => "new-worktree-from-template",
             Action::CycleTheme => "cycle-theme",
+            Action::ThemeBuilderOpen => "theme-builder-open",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
@@ -645,6 +648,7 @@ impl Action {
             "import-layout" => Action::ImportLayout,
             "new-worktree-from-template" | "worktree-template" => Action::NewWorktreeFromTemplate,
             "cycle-theme" | "theme" => Action::CycleTheme,
+            "theme-builder-open" | "theme-builder" => Action::ThemeBuilderOpen,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
@@ -1306,6 +1310,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
+    map.insert_all("Ctrl Alt Shift t", Action::ThemeBuilderOpen)
+        .unwrap();
     // Bind every `ACTION_SPECS` default chord for real: these six were
     // DECLARED (so the palette + `thegn keys list` advertised them) but never
     // registered here — pressing the shown chord did nothing.

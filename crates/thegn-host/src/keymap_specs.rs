@@ -500,6 +500,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "theme-builder-open",
+        label: "Open theme builder",
+        hint: "theme builder",
+        default_chords: &["Ctrl Alt Shift t"],
+        palette: true,
+        keywords: &[
+            "theme",
+            "builder",
+            "appearance",
+            "colors",
+            "palette",
+            "preview",
+            "customize",
+        ],
+    },
+    ActionSpec {
         id: "switch-font",
         // Single chord `Alt f`; the old redundant `Alt F` alias was dropped so
         // Shift keeps its "up-a-level" meaning everywhere in the Alt layer.
