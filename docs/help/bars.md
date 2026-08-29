@@ -80,8 +80,9 @@ always counted. Clicking the widget performs the same files-drawer toggle as
   `disk`, and `status` — the transient status message, which clears itself
   after a few seconds), then the badge cluster: the do-not-disturb / routing
   mode chip, the attention `✋` chip (or the quiet `✉` inbox count),
-  `offline`, CI, merge-queue (`⚑ N MQ`), PR-queue, disk-warn, share `⇅`,
-  media `▶`, zoom / max / `LOCKED` / `SYNC`.
+  `offline`, CI, PR-queue, disk-warn, share `⇅`, media `▶`, zoom / max /
+  `LOCKED` / `SYNC`. The merge queue is not in the default bar; add `"mq"`
+  to `bottom_right` for a compact scoped summary.
 - **Far right:** the always-on **daemon/status indicator** — a single glyph,
   no label. It is the one badge that is never silent, since it is a persistent
   affordance rather than an alert.
@@ -173,8 +174,8 @@ the sidebar dot and the `✋` chip and clears the moment you answer. It reaches
 the notification list only if you turn on
 `[notifications] agent_attention_inbox`.
 
-The `✋`/`✉` chip and the merge- and PR-queue chips all open the **one
-unified surface** — a single grouped list of _Needs you · Alerts · Merge
+The `✋`/`✉` chip, the opt-in `mq` widget, and the PR-queue chip all open the
+**one unified surface** — a single grouped list of _Needs you · Alerts · Merge
 queue · Notifications · Other repos · Logs_, sized to the terminal and
 showing **only unread** rows (read history lives in the panel's System ▸
 Notifications section behind its show-read toggle). Moving the cursor never
