@@ -2558,6 +2558,19 @@ fn sound_config_validation_rejects_bad_bounds_and_kind_names() {
             .any(|e| e.contains("per_kind.test_fialed") && e.contains("unsupported")),
         "{errors:?}"
     );
+    let strict_errors = crate::config_validate::validate_str(
+        "[notifications.sound]\nvolume = 1.5\nper_kind = { agent_dnoe = \"bell\" }\n",
+    );
+    assert!(
+        strict_errors.iter().any(|e| e.contains("volume")),
+        "{strict_errors:?}"
+    );
+    assert!(
+        strict_errors
+            .iter()
+            .any(|e| e.contains("agent_done") && e.contains("did you mean")),
+        "{strict_errors:?}"
+    );
     sound.volume = f32::NAN;
     assert_eq!(sound.clamped_volume(), 1.0);
 }
