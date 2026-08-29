@@ -14,7 +14,7 @@ provider uses WSS for native exec and a TCP-over-WebSocket proxy
 (`crates/thegn-svc/src/provider.rs:1311-1405`). The axum control server supplies
 the WebSocket routes alongside SSE (`crates/thegn-svc/src/control/http.rs:1406-1468,1554-1570`).
 The lock shows axum and the direct client on one `tokio-tungstenite 0.29`
-cohort (`Cargo.lock:428-451,8675-8688,9060-9073`).
+cohort (`Cargo.lock:428-451,8439-8476,8675-8688,9060-9073`).
 
 The workspace pin disables defaults and selects `connect`, `handshake`, and
 `rustls-tls-webpki-roots` (`Cargo.toml:153-160`) to stay with the existing
@@ -27,8 +27,10 @@ Adopt / keep. Tungstenite is required for the existing async client and keeps
 the server adapter compatible with axum. Replacing it with another WebSocket
 stack would add an adapter and risk a second implementation. Binary size and
 MSRV 1.89 are already paid costs; the main maintenance risk is version skew.
-The musl bridge and mingw workspace must retain the current static-rustls and
-target behavior.
+The Linux service and musl bridge, macOS service builds, and mingw/Windows
+workspace must retain the current static-rustls and target behavior. No new
+platform-specific binary cost is justified by changing an already shared
+service dependency.
 
 ## Reopen condition
 

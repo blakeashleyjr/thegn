@@ -26,6 +26,12 @@ unsafe block, or improve a current wire format. Adding it would increase
 derive/proc-macro maintenance and direct-dependency review without a binary
 or runtime benefit. Thegn-core remains independent of substrate codecs.
 
+Linux and musl keep the current JSON, event-frame, and `prost` service edges;
+macOS keeps its libc/libproc FFI; and mingw/Windows keeps the existing
+`windows-sys` out-parameter seam. None of those target paths gains a fixed
+Rust-owned layout from this candidate, so a direct dependency would add build
+cost without reducing the current unsafe or codec surface.
+
 ## Reopen condition
 
 If a measured hot fixed-layout wire or storage format is introduced, evaluate a

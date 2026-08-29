@@ -31,6 +31,14 @@ replacement.
 This is a replacement candidate, not an additional dependency. No source or
 manifest change is part of this decision.
 
+On Linux, including the musl bridge, the existing `nix`/`libc` calls remain
+the maintained Unix vocabulary. On macOS, the libproc, Mach, and dynamic
+symbol paths still require their existing FFI seams; on mingw/Windows the
+candidate has no ownership because those paths use the Windows platform seam.
+Adding a direct crate would therefore add build and review work to the Unix
+graphs without reducing the cross-target graph or changing the shipped
+binary meaningfully.
+
 ## Reopen condition
 
 For a new Unix syscall that `nix` cannot provide, evaluate `rustix` behind the
