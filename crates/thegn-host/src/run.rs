@@ -8019,81 +8019,52 @@ async fn event_loop<T: Terminal>(
                     g.kind == crate::session::GroupKind::Terminal,
                 )
             };
-            // A worktree whose dir vanished (deleted externally) must never
-            // crash the loop: prune it from the session + registry, land on
-            // home, and tell the user. The stat is cheap (`active_tab_path`
-            // precedent); the DB remote-exemption check runs only on a miss.
-            let dir_missing = !path.is_empty() && !Path::new(&path).is_dir();
-            let remote = dir_missing
-                && thegn_core::db::Db::open()
-                    .and_then(|db| db.worktrees())
-                    .map(|rows| {
-                        rows.iter()
-                            .any(|w| w.worktree == path && !w.location.is_empty())
-                    })
-                    .unwrap_or(false);
-            if dir_missing && !remote && session.worktrees.len() > 1 {
-                let gi = session.active;
-                let ids = prune_vanished_group(&mut session, gi);
-                for id in ids {
-                    panes.table.remove(&id);
-                }
-                if let Ok(db) = thegn_core::db::Db::open() {
-                    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                    let _ = session.persist(&db, &session.id, now_secs());
-                }
-                model.status = format!("Worktree dir gone: {path} — removed from session");
-                refresh_tab_model(&mut model, &session, &mut sb);
-                need_relayout = true;
-                dirty = true;
-                // The landing group materializes on the next loop turn.
+            // Two-phase materialize: request launch specs off-thread (the
+            // sandbox ensure inside `launch_spec` can block on podman for
+            // seconds to minutes), spawn when they land. Extracted to
+            // `handlers::materialize` (which also streams the core's
+            // sandbox bring-up phases into the splash). Out-of-band vanished
+            // worktrees are reconciled by the worker-backed refresh path below.
+            let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
+            let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
+            // Seed the splash for THIS worktree's effective backend, not the
+            // global default: `path`/`name` are the active group, so
+            // `model.active_sandbox_backend` (hydrated for it) is the saved
+            // per-worktree `sandbox_backend` — no DB read on the loop. A
+            // session "run on host" pin overrides both.
+            let sandbox_override = if crate::agent::force_host_requested(&path) {
+                Some("none")
+            } else if !model.active_sandbox_backend.is_empty() {
+                Some(model.active_sandbox_backend.as_str())
             } else {
-                // Two-phase materialize: request launch specs off-thread (the
-                // sandbox ensure inside `launch_spec` can block on podman for
-                // seconds to minutes), spawn when they land. Extracted to
-                // `handlers::materialize` (which also streams the core's
-                // sandbox bring-up phases into the splash).
-                let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
-                let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
-                // Seed the splash for THIS worktree's effective backend, not the
-                // global default: `path`/`name` are the active group, so
-                // `model.active_sandbox_backend` (hydrated for it) is the saved
-                // per-worktree `sandbox_backend` — no DB read on the loop. A
-                // session "run on host" pin overrides both.
-                let sandbox_override = if crate::agent::force_host_requested(&path) {
-                    Some("none")
-                } else if !model.active_sandbox_backend.is_empty() {
-                    Some(model.active_sandbox_backend.as_str())
-                } else {
-                    None
-                };
-                crate::handlers::materialize::maybe_materialize(
-                    &mut crate::handlers::materialize::MaterializeCtx {
-                        materialize_inflight: &mut materialize_inflight,
-                        materialize_failed: &materialize_failed,
-                        creating_tabs: &creating_tabs,
-                        loading_retired: &mut loading_retired,
-                        loading_remote: &mut loading_remote,
-                        loading_state: &mut loading_state,
-                        dirty: &mut dirty,
-                    },
-                    keymap.config(),
-                    &crate::handlers::materialize::MaterializeTx {
-                        spec_tx: spec_tx.clone(),
-                        provision_tx: provision_tx.clone(),
-                        waker: waker.clone(),
-                        host_ui: host_ui.clone(),
-                        rt: tokio::runtime::Handle::current(),
-                    },
-                    missing,
-                    &name,
-                    &path,
-                    ti,
-                    is_terminal,
-                    quiet,
-                    sandbox_override,
-                );
-            }
+                None
+            };
+            crate::handlers::materialize::maybe_materialize(
+                &mut crate::handlers::materialize::MaterializeCtx {
+                    materialize_inflight: &mut materialize_inflight,
+                    materialize_failed: &materialize_failed,
+                    creating_tabs: &creating_tabs,
+                    loading_retired: &mut loading_retired,
+                    loading_remote: &mut loading_remote,
+                    loading_state: &mut loading_state,
+                    dirty: &mut dirty,
+                },
+                keymap.config(),
+                &crate::handlers::materialize::MaterializeTx {
+                    spec_tx: spec_tx.clone(),
+                    provision_tx: provision_tx.clone(),
+                    waker: waker.clone(),
+                    host_ui: host_ui.clone(),
+                    rt: tokio::runtime::Handle::current(),
+                },
+                missing,
+                &name,
+                &path,
+                ti,
+                is_terminal,
+                quiet,
+                sandbox_override,
+            );
         }
         // The accordion's width (Normal → Half → Full) drives the chrome
         // geometry. Keep this before the relayout gate so the resized center
@@ -10663,6 +10634,10 @@ async fn event_loop<T: Terminal>(
                         &mut panes,
                         &result.paths,
                     ) {
+                        model.status = format!(
+                            "Worktree dir gone: {} — removed from session",
+                            result.paths.join(", ")
+                        );
                         refresh_tab_model(&mut model, &session, &mut sb);
                         need_relayout = true;
                         dirty = true;
