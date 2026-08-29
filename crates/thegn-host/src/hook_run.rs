@@ -122,7 +122,7 @@ fn spawn(spec: &HookSpec, context: &HookContext, cwd: &Path) -> std::io::Result<
         .env_clear()
         .envs(thegn_core::util::filter_host_env(std::env::vars(), &[]))
         .envs(context.environment());
-    prepare_process_group(&mut command);
+    crate::platform::prepare_hook_process_group(&mut command);
     command.spawn()
 }
 
@@ -139,38 +139,8 @@ fn join_pipe(pipe: Option<std::thread::JoinHandle<String>>) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
-fn prepare_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `setpgid(0, 0)` only changes the child process group before exec;
-    // it does not access Rust memory or share state with the parent.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn prepare_process_group(_command: &mut Command) {}
-
-#[cfg(unix)]
 fn kill_process_group(child: &mut Child) {
-    // SAFETY: the pid is owned by this child and its process group was created
-    // immediately before exec; SIGKILL is the timeout cleanup contract.
-    unsafe {
-        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut Child) {
-    let _ = child.kill();
+    crate::platform::kill_hook_process_group(child);
 }
 
 fn log_path(worktree: &str) -> PathBuf {
@@ -178,10 +148,8 @@ fn log_path(worktree: &str) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(worktree.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    let root = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join("thegn")
+    thegn_core::util::xdg_state_home()
+        .join("thegn")
         .join("hooks")
         .join(format!("{digest}.log"))
 }
