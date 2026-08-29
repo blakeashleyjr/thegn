@@ -85,6 +85,34 @@ layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
 over the agent — see [[configuration]]. The daemon composes the same
 sandbox, credentials, model flag and env overlay an interactive pane gets.
 
+To move a persisted session presentation between profiles, use the
+admin-only, two-store operation:
+
+```sh
+thegn --profile <source> session move <worktree> --to-profile <target>
+```
+
+`--profile` (or `THEGN_PROFILE`) selects the source; `<target>` must already
+exist. The exact stored worktree path is selected. The move carries its
+worktree registration, all matching current groups and tabs, sidebar
+collapse/pin state, and dispatch ledger (including notes and artifact/chunk
+paths). Pane commands, scrollback, reports, and notes are opaque text and are
+carried unchanged, but never printed by the audit. Named global layouts,
+global caches, transports, git files/objects, branches, and worktree disk
+locations are not moved. Neither profile configuration nor credentials,
+tokens, identities, accounts, pairings, or secrets are read or copied.
+
+The target transaction commits first and is read back using a sanitized
+fingerprint. Only after confirmation are the selected source rows deleted;
+dispatch IDs are remapped and source daemon/pane IDs are cleared. A retry
+adopts an identical target import and completes pending source cleanup. A
+target-confirmed but source-pending result is retryable (exit 2). The command
+is cold-safe. Live source daemon sessions refuse the operation unless
+`--kill` is explicit; `--kill` terminates and re-lists them before import.
+`--dry-run` prints the complete redacted plan and never kills or writes, and
+`--json` emits the audit object for scripts. A target daemon notification is
+best effort and a warning cannot undo a confirmed move.
+
 ## Landing work
 
 - `thegn merge add` queues the current worktree's branch.

@@ -23,6 +23,25 @@ use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SessionAction {
+    /// Move one persisted worktree presentation and dispatch ledger to an
+    /// existing profile. This is deliberately a host operation: it crosses
+    /// two profile databases and is not a daemon control verb.
+    Move {
+        /// Exact stored worktree path to migrate.
+        worktree: String,
+        /// Existing target profile name.
+        #[arg(long)]
+        to_profile: String,
+        /// Kill live source daemon sessions after listing them, before import.
+        #[arg(long)]
+        kill: bool,
+        /// Print the complete migration plan without killing or writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit one redacted audit JSON document instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the daemon's sessions — including recently exited ones (the
     /// daemon's tombstones), each marked with a liveness token.
     List {
@@ -327,7 +346,8 @@ pub fn run(cfg: &Config, action: SessionAction) -> Result<()> {
 async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     let json_mode = matches!(
         &action,
-        SessionAction::List { json: true, .. }
+        SessionAction::Move { json: true, .. }
+            | SessionAction::List { json: true, .. }
             | SessionAction::Open { json: true, .. }
             | SessionAction::Close { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
@@ -341,6 +361,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     // offline row checks (unknown row, non-pipeline row, unknown stage) in
     // `resume_preflight`, the same pre-`connect` slot.
     match &action {
+        SessionAction::Move { .. } => {
+            // Migration is dispatched before `connect`: a cold source daemon
+            // is a supported case, and the target is never loaded in-process.
+            return crate::cmd::session_move::run(cfg, action).await;
+        }
         SessionAction::Open {
             stage,
             issue,
@@ -370,6 +395,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
     };
     match action {
+        SessionAction::Move { .. } => unreachable!("session move was dispatched before connect"),
         SessionAction::List { json, live } => {
             let mut sessions = client.sessions().await?;
             if live {
