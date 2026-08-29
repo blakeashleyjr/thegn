@@ -117,7 +117,7 @@ impl DiffView {
             self.structural = Some(structural);
         }
         if let Some(review) = data.review {
-            self.review = Some(review);
+            self.set_review(Some(review), data.review_status.clone());
         }
         self.review_status = data.review_status;
         let n = self.row_count();
@@ -130,9 +130,11 @@ impl DiffView {
         &mut self,
         review: Option<thegn_core::review::PrReviewSnapshot>,
         status: Option<String>,
-    ) {
+    ) -> bool {
+        let changed = self.review != review || self.review_status != status;
         self.review = review;
         self.review_status = status;
+        changed
     }
 
     /// Whether the structural pane is currently the active render.
@@ -747,6 +749,36 @@ mod tests {
         assert_eq!(v.source, DiffSource::PrReview);
         assert!(!v.structural_active());
         assert!(format!("{:?}", v.footer()).contains("PR review"));
+    }
+
+    #[test]
+    fn late_review_delivery_can_switch_an_already_open_view() {
+        let review_diff = sample();
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        assert_eq!(v.row_count(), 2, "the worktree diff is available first");
+
+        assert!(v.set_review(
+            Some(thegn_core::review::PrReviewSnapshot {
+                diff: review_diff,
+                ..Default::default()
+            }),
+            None,
+        ));
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+
+        assert_eq!(v.source, DiffSource::PrReview);
+        assert_eq!(
+            v.row_count(),
+            2,
+            "the PR diff arrived without losing the view"
+        );
     }
 
     #[test]

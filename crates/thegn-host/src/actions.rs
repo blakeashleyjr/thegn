@@ -1028,15 +1028,27 @@ pub(crate) fn open_diff_view(
     let want_structural = structural.is_some();
     spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker, structural);
     let mut view = DiffView::with_structural(title, *gen_ctr, want_structural);
-    let review = model.panel.review_snapshot.clone().filter(|snapshot| {
-        model.panel.pr.as_ref().is_some_and(|pr| {
-            snapshot.branch == model.panel.branch
-                && snapshot.pr_number == pr.number
-                && snapshot.head_oid == model.panel.pr_head_oid
-        })
-    });
+    let review = model
+        .panel
+        .review_snapshot
+        .clone()
+        .filter(|snapshot| review_snapshot_matches_panel(&model.panel, snapshot));
     view.set_review(review, model.panel.review_snapshot_status.clone());
     view
+}
+
+/// Check that a cached deep review belongs to the panel's current PR identity.
+/// The worktree's checked-out branch is the canonical cache branch identity;
+/// the PR's remote head ref is provider metadata and may differ for forks.
+pub(crate) fn review_snapshot_matches_panel(
+    panel: &crate::panel::PanelData,
+    snapshot: &thegn_core::review::PrReviewSnapshot,
+) -> bool {
+    panel.pr.as_ref().is_some_and(|pr| {
+        snapshot.branch == panel.branch
+            && snapshot.pr_number == pr.number
+            && snapshot.head_oid == panel.pr_head_oid
+    })
 }
 
 /// Route a key to the open diff viewer: close it, or consume it (read-only).
