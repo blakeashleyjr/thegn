@@ -235,20 +235,26 @@ fn db_path() -> PathBuf {
 }
 
 /// How [`Db::init`] treats a connection, decided from the on-disk
-/// `user_version`. `Fast` (exact match with [`SCHEMA_VERSION`]) skips the
-/// schema batch, migrations, and startup prunes entirely — safe because the
-/// version is stamped only after a full init completes. Anything else —
-/// `0` (fresh), older (migrate), newer (downgrade tolerance) — is `Full`.
+/// `user_version`. `Fast` (on-disk >= [`SCHEMA_VERSION`]) skips the
+/// schema batch, migrations, and startup prunes entirely — safe because
+/// the version is stamped only after a full init completes *and* the
+/// schema is purely additive (`IF NOT EXISTS` DDL + idempotent ALTER
+/// probes), so an older binary's named-column reads/writes are unaffected
+/// by columns it doesn't know. Only `on_disk < current` (fresh or genuinely
+/// stale) takes `Full` — a migration is due only then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenMode {
     Fast,
     Full,
 }
 
-/// Pure decision for the open fast path (unit-tested exhaustively; the
-/// correctness of skipping init rides entirely on this being exact-match).
+/// Pure decision for the open fast path (unit-tested exhaustively).
+/// `on_disk >= current` is Fast: the schema is additive by construction, so
+/// an older binary's named-column reads/writes are unaffected by columns it
+/// doesn't know. Only `on_disk < current` (fresh or genuinely stale) takes
+/// Full — a migration is due then.
 pub(crate) fn open_mode(on_disk: i64, current: i64) -> OpenMode {
-    if on_disk == current {
+    if on_disk >= current {
         OpenMode::Fast
     } else {
         OpenMode::Full
@@ -326,18 +332,32 @@ impl Db {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
 
-        // Fast path: `user_version` is stamped at the very END of a full init
-        // (see below), so an exact match PROVES the whole schema batch + every
-        // migration completed on some prior open — the ALTER probes, the
-        // 45-statement DDL transaction, the migrate_vNN passes, and the prunes
-        // are all no-ops that would still take the WAL write lock (and, under
-        // a busy background writer, stall up to the 5s busy_timeout). Skip
-        // them. Every other case — older (migrate), newer (tolerate + warn) —
-        // takes the full path exactly as before.
+        // Fast path: `user_version` is stamped at the END of a full init
+        // (see below), so `on_disk >= current` PROVES the whole schema batch +
+        // every migration completed — the ALTER probes, the DDL transaction,
+        // the migrate_vNN passes, and the prunes are all no-ops that would
+        // still take the WAL write lock. Skip them. A newer-schema DB
+        // (different branch sharing this file) is tolerated: the schema is
+        // purely additive, so reads/writes on named columns are unaffected.
+        // Only `on_disk < current` (fresh or genuinely stale) takes the full
+        // path with its migrations.
         if open_mode(ver, SCHEMA_VERSION) == OpenMode::Fast {
+            let schema_mismatch = crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION);
+            if schema_mismatch.is_some() {
+                static MISMATCH_WARNED: std::sync::Once = std::sync::Once::new();
+                MISMATCH_WARNED.call_once(|| {
+                    tracing::warn!(
+                        target: "thegn::db",
+                        on_disk = ver,
+                        build = SCHEMA_VERSION,
+                        "database schema v{ver} is newer than this build (v{SCHEMA_VERSION}); \
+                         data written by the newer build may be invisible"
+                    );
+                });
+            }
             return Ok(Db {
                 conn,
-                schema_mismatch: None,
+                schema_mismatch,
             });
         }
         // The v2→v3 remap has no faithful transform — drop & recreate. Guard it
