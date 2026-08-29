@@ -1039,6 +1039,7 @@ mod tests {
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "test"]);
         git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
         std::fs::write(root.join("file"), "base\n").unwrap();
         git(&root, &["add", "file"]);
         git(&root, &["commit", "-q", "-m", "base"]);
@@ -1067,6 +1068,7 @@ mod tests {
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "test"]);
         git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
         std::fs::write(root.join("file"), "base\n").unwrap();
         git(&root, &["add", "file"]);
         git(&root, &["commit", "-q", "-m", "base"]);
