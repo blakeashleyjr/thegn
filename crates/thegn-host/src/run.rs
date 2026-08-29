@@ -7050,6 +7050,58 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                SidebarOutcome::OpenMergeQueue { repo_path } => {
+                    // The token/menu carries the workspace repo path, so use
+                    // the existing workspace activation seam before opening
+                    // the queue. This keeps dormant workspaces and their
+                    // scoped queue rows on the same path as Enter/click.
+                    switch_at = Some((
+                        std::time::Instant::now(),
+                        if repo_path == session.id {
+                            crate::perf::SwitchKind::Worktree
+                        } else {
+                            crate::perf::SwitchKind::Workspace
+                        },
+                    ));
+                    let activated = activate_row!(crate::sidebar::RowTarget::Workspace {
+                        repo_path: repo_path.clone(),
+                        group: None,
+                    });
+                    if !activated {
+                        // Activation reports a user-visible status on DB/path
+                        // failure. Do not replace that diagnostic with a
+                        // queue panel for the previous workspace.
+                        dirty = true;
+                        continue;
+                    }
+                    kick_model_hydration!();
+
+                    panel_auto_revealed = None;
+                    if chrome.panel.is_none() {
+                        want_panel = true;
+                        panel_forced = cols < layout::PANEL_MIN_COLS;
+                        chrome = recompute_chrome!();
+                        need_relayout = true;
+                    }
+                    panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                    open_panel_section(
+                        crate::panel::Section::MergeQueue,
+                        &mut panel_ui,
+                        &mut hydration_gen,
+                        &model_tx,
+                        &session,
+                        &waker,
+                        PanelDocsWiring {
+                            generation: docs_gen,
+                            tx: &docs_tx,
+                        },
+                    );
+                    focus.zone = crate::focus::Zone::Panel;
+                    sidebar_dirty = true;
+                    bars_dirty = true;
+                    dirty = true;
+                    continue;
+                }
                 SidebarOutcome::DeleteGroups(targets) => {
                     crate::handlers::worktree_delete::request_group_delete(
                         crate::handlers::worktree_delete::DeleteCtx {
