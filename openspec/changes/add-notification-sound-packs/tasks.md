@@ -43,7 +43,11 @@
 ## 4. Scoped verification
 
 - [x] 4.1 Run the targeted core/host/svc tests and quick checks required by the
-      implementation loop, plus the relevant ratchet checks.
-- [ ] 4.2 Full-workspace CI, coverage, and e2e remain deferred to the normal
+      implementation loop, plus the help, completion, platform, and schema
+      ratchet checks.
+- [ ] 4.2 The ignored-result ratchet still reports the sibling-owned
+      `crates/thegn-host/src/notification_sound.rs`; this chunk does not alter
+      that implementation or add a new ratchet entry.
+- [ ] 4.3 Full-workspace CI, coverage, and e2e remain deferred to the normal
       pre-PR gate; they are explicitly outside this issue's implementation
       loop.
