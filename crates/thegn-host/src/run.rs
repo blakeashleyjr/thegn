@@ -9174,6 +9174,12 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            // A review snapshot may be fetched after the Changes modal opens.
+            // Deliver the accepted model's compatible snapshot directly to
+            // that view; its worktree diff must remain intact while only the
+            // review source is updated.
+            let review_for_diff_view = next_model.panel.review_snapshot.clone();
+            let review_status_for_diff_view = next_model.panel.review_snapshot_status.clone();
             // `thegn open` intents ride the hydration result (claimed from
             // the DB mailbox off-loop); take them out before the model swap —
             // last one wins, applied after the drain below.
@@ -9379,6 +9385,13 @@ async fn event_loop<T: Terminal>(
             model.status = prev_status;
             model.masthead_sel = prev_masthead_sel;
             model.statusbar_sel = prev_statusbar_sel;
+            if let Some(review) = review_for_diff_view
+                && crate::actions::review_snapshot_matches_panel(&model.panel, &review)
+                && let Some(view) = diff_view.as_mut()
+                && view.set_review(Some(review), review_status_for_diff_view)
+            {
+                dirty = true;
+            }
             // Seed the stale-while-revalidate cache with this worktree's fresh
             // slice (pre LSP-merge: LSP diags live in their own per-root store
             // and are re-merged on every paint) so a later switch back paints
