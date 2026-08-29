@@ -41,13 +41,18 @@ pub(crate) fn key(
             store.save(theme);
             true
         }
-        BuilderEvent::Apply { preset, theme } => {
-            store.apply(preset, theme);
+        BuilderEvent::Apply {
+            preset,
+            theme,
+            persist_theme,
+        } => {
+            store.apply(preset, theme, persist_theme);
             true
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mouse(
     builder: &mut ThemeBuilder,
     store: &ThemeStore,
@@ -56,8 +61,9 @@ pub(crate) fn mouse(
     my: usize,
     screen: Rect,
     dismiss_outside: bool,
+    mouse_left_down: &mut bool,
 ) -> bool {
-    match builder.handle_mouse(event, mx, my, screen, dismiss_outside) {
+    match builder.handle_mouse(event, mx, my, screen, dismiss_outside, mouse_left_down) {
         BuilderEvent::None => true,
         BuilderEvent::Close => {
             crate::chrome::set_palette(builder.cancel_palette());
@@ -71,8 +77,12 @@ pub(crate) fn mouse(
             store.save(theme);
             true
         }
-        BuilderEvent::Apply { preset, theme } => {
-            store.apply(preset, theme);
+        BuilderEvent::Apply {
+            preset,
+            theme,
+            persist_theme,
+        } => {
+            store.apply(preset, theme, persist_theme);
             true
         }
     }
@@ -100,7 +110,7 @@ pub(crate) fn drain(
             }
             ThemeStoreResult::Imported(result) => builder.import_completed(result),
             ThemeStoreResult::Saved(result) => {
-                builder.store_completed(result);
+                builder.saved(result);
                 store.scan();
             }
             ThemeStoreResult::Applied(result) => {
