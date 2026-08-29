@@ -22,11 +22,14 @@ session alive while iterating so each look → act → look cycle reuses it:
 cargo build -p thegn-host
 T=$(mktemp -d); mkdir -p "$T/home" "$T/cfg/thegn" "$T/state" "$T/run" "$T/bin"
 printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$T/cfg/thegn/config.toml"
+printf '[user]\nname = muse\nemail = muse@example.invalid\n' > "$T/gitconfig"
 printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$T/bin/e2esh"; chmod +x "$T/bin/e2esh"
 export MUSE_SOCKET="$T/muse.sock"
 muse session open --name tg --size 120x40 --cwd "$PWD" \
   --env HOME="$T/home" --env XDG_CONFIG_HOME="$T/cfg" --env XDG_STATE_HOME="$T/state" \
   --env XDG_RUNTIME_DIR="$T/run" --env SHELL="$T/bin/e2esh" \
+  --env GIT_CONFIG_GLOBAL="$T/gitconfig" --env GIT_CONFIG_SYSTEM=/dev/null \
+  --env DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus" \
   --env THEGN_E2E=1 --env MUSE_READY=1 --env THEGN_NO_DAEMON=1 --env THEGN_SKIP_ONBOARDING=1 \
   --env THEGN_LOG=debug --env TERM=xterm-256color -- "$PWD/target/debug/thegn"
 muse session wait tg --visible NORMAL --timeout-ms 20000
