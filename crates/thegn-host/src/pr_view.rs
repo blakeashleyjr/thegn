@@ -499,15 +499,31 @@ impl PrView {
         }
     }
 
-    fn handoff_selected(&self) -> PrViewOutcome {
-        self.visible_threads()
-            .get(self.thread_sel)
-            .map(|thread| {
-                PrViewOutcome::Act(PrViewAction::Handoff(ReviewSelection::Selected(
-                    thread.id.clone(),
-                )))
-            })
-            .unwrap_or(PrViewOutcome::Pending)
+    fn handoff_selected(&mut self) -> PrViewOutcome {
+        let thread_id = match self.tab {
+            PrTab::Conversation => match self.conv_rows().get(self.sel) {
+                Some(ConvRow::Thread(i)) => self
+                    .conversation
+                    .as_ref()
+                    .and_then(|c| c.threads.get(*i))
+                    .map(|thread| thread.id.clone()),
+                _ => None,
+            },
+            PrTab::Files => self.open_file.and_then(|i| {
+                self.open_file_rows(i)
+                    .get(self.sel)
+                    .and_then(|row| match row {
+                        ReviewRow::Thread(thread) => Some(thread.id.clone()),
+                        _ => None,
+                    })
+            }),
+            _ => None,
+        };
+        let Some(thread_id) = thread_id else {
+            self.status = Some("select a review thread row first".into());
+            return PrViewOutcome::Pending;
+        };
+        PrViewOutcome::Act(PrViewAction::Handoff(ReviewSelection::Selected(thread_id)))
     }
 
     fn checks_key(&mut self, key: &KeyCode) -> PrViewOutcome {
@@ -1323,6 +1339,8 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::forge::model::{PrComment, ReviewThread};
+    use thegn_core::review::PrReviewSnapshot;
 
     fn sample() -> PrView {
         let pr = PrSummary {
@@ -1499,6 +1517,103 @@ mod tests {
         assert_eq!(
             v.handle_key(&KeyCode::Escape, Modifiers::NONE),
             PrViewOutcome::Close
+        );
+    }
+
+    #[test]
+    fn handoff_uses_the_cursor_thread_not_the_thread_navigation_cursor() {
+        let mut v = sample();
+        let threads = vec![
+            ReviewThread {
+                id: "first".into(),
+                path: "src/lib.rs".into(),
+                line: Some(1),
+                comments: vec![PrComment {
+                    author: "alice".into(),
+                    body: "first".into(),
+                    ..PrComment::default()
+                }],
+                ..ReviewThread::default()
+            },
+            ReviewThread {
+                id: "second".into(),
+                path: "src/lib.rs".into(),
+                line: Some(2),
+                comments: vec![PrComment {
+                    author: "bob".into(),
+                    body: "second".into(),
+                    ..PrComment::default()
+                }],
+                ..ReviewThread::default()
+            },
+        ];
+        v.apply_data(PrViewData {
+            generation: 0,
+            conversation: None,
+            diff: None,
+            review: Some(PrReviewSnapshot {
+                conversation: PrConversation {
+                    threads,
+                    ..PrConversation::default()
+                },
+                diff: PrDiff {
+                    files: vec![DiffFile {
+                        path: "src/lib.rs".into(),
+                        old_path: None,
+                        hunks: vec![thegn_core::forge::model::DiffHunk {
+                            header: "@@ -1,2 +1,2 @@".into(),
+                            lines: vec![
+                                DiffLine {
+                                    kind: DiffLineKind::Context,
+                                    text: "one".into(),
+                                    old_lineno: Some(1),
+                                    new_lineno: Some(1),
+                                },
+                                DiffLine {
+                                    kind: DiffLineKind::Context,
+                                    text: "two".into(),
+                                    old_lineno: Some(2),
+                                    new_lineno: Some(2),
+                                },
+                            ],
+                        }],
+                    }],
+                },
+                ..PrReviewSnapshot::default()
+            }),
+            review_status: None,
+        });
+        v.switch_tab(PrTab::Conversation);
+        v.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('p'), Modifiers::NONE),
+            PrViewOutcome::Act(PrViewAction::Handoff(ReviewSelection::Selected(
+                "second".into(),
+            )))
+        );
+    }
+
+    #[test]
+    fn handoff_rejects_a_non_thread_row() {
+        let mut v = sample();
+        v.conversation = Some(PrConversation {
+            comments: vec![PrComment {
+                author: "alice".into(),
+                body: "top-level".into(),
+                ..PrComment::default()
+            }],
+            ..PrConversation::default()
+        });
+        v.switch_tab(PrTab::Conversation);
+
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('p'), Modifiers::NONE),
+            PrViewOutcome::Pending
+        );
+        assert_eq!(
+            v.status.as_deref(),
+            Some("select a review thread row first")
         );
     }
 
