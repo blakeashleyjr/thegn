@@ -1603,6 +1603,9 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "model_proxy.start",
         "model_proxy.stop",
     ]);
+    // Cross-profile migration is a local, admin-scoped CLI operation rather
+    // than a control route, but it is still a catalog-owned CLI surface.
+    v.push("sessions.migrate");
     // Pipeline run-completion verbs (THE-76/THE-88): local `thegn dispatch
     // verify|wait|report|note|status`
     // — the first reads the worktree + roster directly, the second composes the
