@@ -558,4 +558,64 @@ mod tests {
         );
         validate_fork_harness(&c, "worker", "codex").expect("matching native harness");
     }
+
+    #[test]
+    fn matching_native_fork_preserves_source_command_and_fresh_launch_context() {
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let state = tempfile::tempdir().expect("isolated state dir");
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            state.path().to_str().expect("state path"),
+        )]);
+        let mut c = cfg();
+        c.sandbox.enabled = false;
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("THEGN_TEST_FORK_AGENT_ENV".into(), "fresh-context".into());
+        c.agents.push(thegn_core::config::NamedCommand {
+            name: "worker".into(),
+            command: "codex".into(),
+            hints: Vec::new(),
+            provider: Some("codex".into()),
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env,
+            permissions: Vec::new(),
+        });
+        let db = Db::open_memory().expect("in-memory db");
+        let spec = OpenSpec {
+            cwd: Some(worktree.path().to_string_lossy().into_owned()),
+            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let launch = AgentLaunch {
+            agent: "worker".into(),
+            prompt: String::new(),
+            headless: Some(false),
+            bind_worktree: false,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            fork: true,
+            native_session_id: Some("native-codex".into()),
+        };
+        let source_command = "source-harness-command --native native-codex";
+        let resolved = resolve_fork(&c, &db, &spec, &launch, "codex", source_command)
+            .expect("matching provider resolves");
+
+        assert!(
+            resolved.argv.iter().any(|arg| arg.contains(source_command)),
+            "the source harness command must survive launch composition: {:?}",
+            resolved.argv
+        );
+        assert!(
+            resolved
+                .env
+                .iter()
+                .any(|(key, value)| key == "THEGN_TEST_FORK_AGENT_ENV" && value == "fresh-context"),
+            "configured launch context must still be composed: {:?}",
+            resolved.env
+        );
+    }
 }
