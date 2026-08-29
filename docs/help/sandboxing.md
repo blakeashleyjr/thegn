@@ -62,6 +62,93 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 
 `thegn doctor` reports which backends this machine actually has.
 
+## Devcontainers
+
+With the default `auto` mode, thegn discovers a repo's
+`.devcontainer/devcontainer.json` or `.devcontainer.json`, parses JSONC, and
+maps its supported subset onto the existing sandbox. To opt out globally or in
+a trusted overlay:
+
+```toml
+[sandbox]
+devcontainer = "off" # "auto" (default) | "off"
+```
+
+If neither primary file exists, thegn also discovers
+`.devcontainer/<name>/devcontainer.json`. One variant is unambiguous; multiple
+variants need a top-level selector in the repo's `.thegn.toml`:
+
+```toml
+devcontainer = "gpu"
+
+[sandbox]
+devcontainer = "auto"
+```
+
+The selector only picks a file. It does not approve anything in that file.
+Review pending category requests and their ids with `thegn repo trust .`, then
+approve one explicitly with `thegn repo trust . --approve <id>`.
+
+### Security boundary
+
+A repo JSON file is untrusted, just like any other cloned executable content.
+thegn records trust-on-first-use approval separately for its image, build,
+compose, mounts, ports, lifecycle, and features categories. An unapproved
+category stays pending and is not applied; the worktree still opens. Editing a
+request changes its canonical form and requires approval again.
+
+Literal `containerEnv` and `remoteEnv` values do not prompt, but host-variable
+substitution is clamped: `${localEnv:NAME}` is available only when `NAME` is in
+the effective `[sandbox] env_passthrough` list. A blocked name becomes empty
+and is reported without exposing its value.
+
+Some repo requests are never eligible for approval. `privileged`, `capAdd`,
+`securityOpt`, `runArgs`, and `init` could weaken the trusted sandbox, so thegn
+always refuses them and names the reason. Recognized fields that thegn does not
+apply — such as `hostRequirements`, port attributes, `waitFor`,
+`workspaceMount`, `overrideCommand`, `secrets`, remote-user/UID settings, and
+compose overrides — are reported as reserved. Unknown top-level keys are also
+reported and not applied; editor-only `customizations` is ignored silently.
+This is the supported subset for this thegn version, not a promise to mirror
+every current or future containers.dev field.
+
+Supported native OCI behavior includes image, Dockerfile build, compose
+service, mounts, forwarded ports, container/process environment, lifecycle
+hooks, and in-container feature installs. `overrideFeatureInstallOrder` is
+honored; fetched `installsAfter`/`dependsOn` metadata ordering, generated
+Dockerfile feature layers, and `devcontainer.metadata` image-label merging are
+reserved.
+
+### Lifecycle and provider fallback
+
+After lifecycle approval, `initializeCommand` uses the host-side one-time
+prepare hook. `onCreateCommand`, `updateContentCommand`, and
+`postCreateCommand` are ordered one-time provisioning steps. In particular,
+postCreate is not rerun for every pane. `postStartCommand` and
+`postAttachCommand` use the existing per-pane init script and run before each
+pane shell — thegn has no distinct attach event, so per-pane is its explicit
+per-start/attach analogue.
+
+For a local, fully approved config containing only safely applied fields, an
+installed `devcontainer` CLI may be **CLI-ready**. If that bounded provider
+probe is unavailable/degraded, the config is not safe to pass through raw, or
+`devcontainer up` fails, thegn uses its existing native OCI path for the
+supported approved subset. A non-OCI backend cannot honor an
+image/build/compose source; doctor reports that degradation instead of
+silently claiming the container shape was used.
+
+`thegn doctor` shows the `Devcontainer support` block: mode, repo, candidates,
+selected file or selection error, provider, status, trust counts, and backend
+honorability. It reads config and approvals and may run bounded
+`devcontainer --version`; it never pulls, builds, starts, runs lifecycle code,
+or makes a network probe just to report health.
+
+The sidebar and active tab bar use `dc:<selected-path> [<state>]` (or
+`dc:[<state>]` before selection). The transient states are `off`, `ambiguous`,
+`invalid`, `pending`, `ready`, and `degraded`. `ready` means CLI-ready;
+`degraded` can still mean the supported subset is running through the native
+OCI fallback. Re-run doctor for the detailed reason.
+
 ## Enforcement matrix
 
 `thegn doctor` renders one **enforcement matrix** for this host: per backend,
