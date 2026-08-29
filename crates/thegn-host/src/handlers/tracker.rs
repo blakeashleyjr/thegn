@@ -270,6 +270,20 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let branch = wt::dedupe(&raw_branch, &taken);
             let path = wt::worktree_path(&root, &branch, &cfg2);
 
+            let pre = crate::worktree_lifecycle::run_event(
+                &cfg2,
+                &root,
+                &path,
+                &branch,
+                &repo::repo_slug(&root),
+                thegn_core::hooks::HookEvent::PreCreate,
+                thegn_core::hooks::HookExecutionMode::User,
+            );
+            if pre.blocked() {
+                thegn_core::msg::warn(&format!("agent dispatch: {}", pre.message()));
+                return;
+            }
+
             if let Err(e) = wt::add_checked(&root, &branch, &base, &path, &cfg2) {
                 thegn_core::msg::warn(&format!("agent dispatch: {e}"));
                 return;
@@ -333,6 +347,15 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     &agent_name,
                 ));
                 let _ = db.link_issue(&wt_str, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                crate::worktree_lifecycle::schedule_post_create(
+                    &cfg2,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    Some(&db),
+                    None,
+                );
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
             let env = crate::wizard::ambient_env_name_live(&cfg2, &root);

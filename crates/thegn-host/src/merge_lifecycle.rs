@@ -172,6 +172,22 @@ pub(crate) fn remove_landed(
         let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
         return;
     }
+    // Automatic reclaim is unattended: the hook still runs before the git
+    // removal, but a repository-authored failure can never wedge the queue.
+    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let workspace = thegn_core::repo::repo_slug(repo_root);
+    let pre = crate::worktree_lifecycle::run_event(
+        &cfg,
+        repo_root,
+        Path::new(worktree),
+        branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PreDestroy,
+        thegn_core::hooks::HookExecutionMode::Unattended,
+    );
+    if !pre.results.is_empty() && pre.results.iter().any(|r| !r.succeeded()) {
+        thegn_core::msg::warn(&format!("merge cleanup: {}", pre.message()));
+    }
     let removed =
         thegn_core::worktree::remove(repo_root, Path::new(worktree), branch, delete_branch);
     // The branch landed, so it's no longer a queue entry regardless.
@@ -182,6 +198,18 @@ pub(crate) fn remove_landed(
     // folder instead of orphaning it ungrouped under the repo root ("home").
     // git is the source of truth; the row self-corrects once the dir is gone.
     if removed {
+        let post = crate::worktree_lifecycle::run_event(
+            &cfg,
+            repo_root,
+            Path::new(worktree),
+            branch,
+            &workspace,
+            thegn_core::hooks::HookEvent::PostDestroy,
+            thegn_core::hooks::HookExecutionMode::Unattended,
+        );
+        if !post.results.is_empty() && post.results.iter().any(|r| !r.succeeded()) {
+            thegn_core::msg::warn(&format!("merge cleanup: {}", post.message()));
+        }
         let _ = db.del_worktree(worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }

@@ -1063,8 +1063,22 @@ pub fn run_worker(
     // overlaps the checkout with the user's wizard time).
     step(CreateStep::CreateWorktree, StepState::Running, None);
     let mut path = worktree::worktree_path(root, &branch, cfg);
+    let slug = repo::repo_slug(root);
+    let pre = crate::worktree_lifecycle::run_event(
+        cfg,
+        root,
+        &path,
+        &branch,
+        &slug,
+        thegn_core::hooks::HookEvent::PreCreate,
+        thegn_core::hooks::HookExecutionMode::User,
+    );
+    if pre.blocked() {
+        fail(CreateStep::CreateWorktree, pre.message());
+        return;
+    }
     if let Err(e) = worktree::add_checked(root, &branch, &base, &path, cfg) {
-        worktree::remove(root, &path, &branch, true);
+        crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch);
         fail(CreateStep::CreateWorktree, e);
         return;
     }
@@ -1074,7 +1088,6 @@ pub fn run_worker(
     step(CreateStep::CreateWorktree, StepState::Done, None);
 
     // --- command loop: the wizard drives the rest.
-    let slug = repo::repo_slug(root);
     // Keyed on (env, backend): both the host env and the sandbox backend feed
     // the placement/isolation bring-up, so a change to either invalidates a
     // prior prep.
@@ -1105,7 +1118,7 @@ pub fn run_worker(
             // the worktree in place — resurrect picks it up next session.
             Err(_) => return,
             Ok(WizardCmd::Cancel) => {
-                worktree::remove(root, &path, &branch, true);
+                crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch);
                 tracing::info!(
                     target: "thegn::worktree_create",
                     since_ms = started.elapsed().as_millis() as u64,
@@ -1184,7 +1197,9 @@ pub fn run_worker(
                                     *outcome = redo;
                                 }
                                 Err(e) => {
-                                    worktree::remove(root, &path, &branch, true);
+                                    crate::worktree_lifecycle::rollback_remove(
+                                        cfg, root, &path, &branch,
+                                    );
                                     fail(CreateStep::SandboxPrep, e.to_string());
                                     return;
                                 }
@@ -1274,7 +1289,7 @@ pub fn run_worker(
                     halted(halt);
                     return;
                 }
-                worktree::remove(root, &path, &branch, true);
+                crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch);
                 if let Ok(db) = open_db() {
                     let _ = db.del_worktree(&path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
@@ -1325,8 +1340,12 @@ pub fn run_worker(
     // (devShell already realized ⇒ warm is a fast store-hit) opens on a warm cache
     // and replays instantly; a genuinely cold build that overruns the timeout falls
     // through to the in-pane eval, which the ~/.cache/nix carve now makes succeed.
-    thegn_core::sandbox::run_prepare(&path, &cfg.sandbox.prepare);
     crate::direnv_warm::warm_direnv_now(cfg, &path);
+
+    // Lifecycle post-create owns the legacy sandbox.prepare alias too. It runs
+    // after the existing built-in provisioning and before the first pane is
+    // allowed to consume this worker's Done event.
+    crate::worktree_lifecycle::schedule_post_create(cfg, root, &path, &branch, &slug, None, None);
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     let loc = GitLoc::from_db(&path_s, None);

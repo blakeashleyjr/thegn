@@ -258,6 +258,20 @@ fn create_and_register(
     db: &Db,
 ) -> Result<String> {
     let path = worktree::worktree_path(root, branch, cfg);
+    let workspace = thegn_core::repo::repo_slug(root);
+    let pre = crate::worktree_lifecycle::run_event_with_db(
+        cfg,
+        root,
+        &path,
+        branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PreCreate,
+        thegn_core::hooks::HookExecutionMode::User,
+        Some(db),
+    );
+    if pre.blocked() {
+        return Err(anyhow::anyhow!(pre.message()));
+    }
     worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
         worktree::remove(root, &path, branch, true);
@@ -287,6 +301,19 @@ fn create_and_register(
         // best-effort: the worktree exists; a missed pin re-resolves ambient.
         let _ = db.set_worktree_env(&path_s, e);
     }
+    // A CLI has no compositor to keep alive, so it waits for post-create
+    // completion before printing success and exiting. Warn-only failures are
+    // reported by the lifecycle runner but do not roll back a real worktree.
+    crate::worktree_lifecycle::run_event_with_db(
+        cfg,
+        root,
+        &path,
+        branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PostCreate,
+        thegn_core::hooks::HookExecutionMode::User,
+        Some(db),
+    );
     Ok(path_s)
 }
 
@@ -578,6 +605,21 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
         }
     }
 
+    let workspace = thegn_core::repo::repo_slug(&root);
+    let pre = crate::worktree_lifecycle::run_event_with_db(
+        cfg,
+        &root,
+        std::path::Path::new(&path),
+        &branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PreDestroy,
+        crate::worktree_lifecycle::mode_for_user(force, false),
+        Some(&db),
+    );
+    if pre.blocked() && !force {
+        anyhow::bail!("{}; retry with --force", pre.message());
+    }
+
     // Provider/sandbox teardown, synchronous (unlike the TUI's fire-and-forget
     // thread — a CLI exiting would orphan it). Same env-precedence resolution
     // as `delete_groups`: DB selection → repo `.thegn.*` → global default,
@@ -613,6 +655,17 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     if std::path::Path::new(&path).exists() {
         anyhow::bail!("could not remove {path}");
     }
+
+    crate::worktree_lifecycle::run_event_with_db(
+        cfg,
+        &root,
+        std::path::Path::new(&path),
+        &branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PostDestroy,
+        crate::worktree_lifecycle::mode_for_user(force, false),
+        Some(&db),
+    );
 
     // DB cleanup (best-effort: the DB is a cache; git above was the truth).
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);

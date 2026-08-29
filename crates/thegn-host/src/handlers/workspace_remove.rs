@@ -54,12 +54,46 @@ pub(crate) fn spawn_delete_workspace_dirs(
     let root = repo_path.to_string();
     std::thread::spawn(move || {
         let root = Path::new(&root);
+        let cfg =
+            thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+        let workspace = thegn_core::repo::repo_slug(root);
         for path in &dirs {
+            let branch = thegn_core::util::git_out(
+                Path::new(path),
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            )
+            .unwrap_or_default();
+            let pre = crate::worktree_lifecycle::run_event(
+                &cfg,
+                root,
+                Path::new(path),
+                &branch,
+                &workspace,
+                thegn_core::hooks::HookEvent::PreDestroy,
+                thegn_core::hooks::HookExecutionMode::Force,
+            );
+            if !pre.results.is_empty() && pre.results.iter().any(|r| !r.succeeded()) {
+                thegn_core::msg::warn(&format!("workspace cleanup {path}: {}", pre.message()));
+            }
             // git is the source of truth; both calls are idempotent and
             // best-effort — a failure only leaves a dir that re-adopts on the
             // next launch, never corrupts state.
             thegn_core::worktree::remove(root, Path::new(path), "", false);
             thegn_core::worktree::purge_worktree_files(Path::new(path));
+            if !Path::new(path).exists() {
+                let post = crate::worktree_lifecycle::run_event(
+                    &cfg,
+                    root,
+                    Path::new(path),
+                    &branch,
+                    &workspace,
+                    thegn_core::hooks::HookEvent::PostDestroy,
+                    thegn_core::hooks::HookExecutionMode::Force,
+                );
+                if !post.results.is_empty() && post.results.iter().any(|r| !r.succeeded()) {
+                    thegn_core::msg::warn(&format!("workspace cleanup {path}: {}", post.message()));
+                }
+            }
         }
         if let Some(waker) = waker {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
