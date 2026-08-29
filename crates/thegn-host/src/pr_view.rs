@@ -19,8 +19,8 @@ use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::panel::{CheckLine, CheckState, PrSummary};
 use crate::review_handoff::ReviewSelection;
 use crate::review_rows::{
-    ReviewRow, diff_line, expanded_file_rows, feedback_rows, file_stat, push_wrapped_body_lines,
-    review_feedback_lines, review_thread_lines, row_thread, sel_marker, trunc, wrap,
+    ReviewRow, expanded_file_rows, feedback_rows, file_stat, push_wrapped_body_lines,
+    render_review_row, review_state_marker, row_thread, sel_marker, trunc, wrap,
 };
 use crate::seg::{Line, Seg, Tok, seg, sp};
 use thegn_core::forge::model::{
@@ -1072,11 +1072,11 @@ impl PrView {
                 }
                 ConvRow::Review(i) => {
                     let r = &conv.reviews[*i];
-                    let tone = review_tone(&r.state);
+                    let (glyph, tone) = review_state_marker(&r.state);
                     out.push((
                         Line::segs(vec![
                             seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                            seg(tone, format!("{} ", review_glyph(&r.state))),
+                            seg(tone, format!("{} ", glyph)),
                             seg(Tok::Slot(S::Text), r.author.clone()).bold(),
                             seg(tone, format!("  {}", r.state)),
                         ]),
@@ -1200,31 +1200,7 @@ impl PrView {
                     ));
                     for (ri, row) in self.open_file_rows(fi).into_iter().enumerate() {
                         let selected = ri == self.sel;
-                        match row {
-                            ReviewRow::Hunk(header) => out.push((
-                                Line::segs(vec![seg(
-                                    Tok::Hue(thegn_core::theme::Hue::Teal),
-                                    trunc(&header, cols),
-                                )]),
-                                false,
-                            )),
-                            ReviewRow::Diff(dl) => {
-                                out.push((diff_line(&dl, selected, cols), selected))
-                            }
-                            ReviewRow::Thread(thread) => {
-                                out.extend(review_thread_lines(&thread, selected, cols));
-                            }
-                            ReviewRow::Outdated(thread) => {
-                                out.extend(review_feedback_lines(
-                                    &thread, "OUTDATED", selected, cols,
-                                ));
-                            }
-                            ReviewRow::General(thread) => {
-                                out.extend(review_feedback_lines(
-                                    &thread, "GENERAL", selected, cols,
-                                ));
-                            }
-                        }
+                        out.extend(render_review_row(&row, selected, cols));
                     }
                 }
             }
@@ -1235,15 +1211,7 @@ impl PrView {
                     .diff
                     .as_ref()
                     .is_some_and(|diff| diff.files.len() + i == self.sel);
-                match row {
-                    ReviewRow::Outdated(thread) => {
-                        out.extend(review_feedback_lines(&thread, "OUTDATED", selected, cols));
-                    }
-                    ReviewRow::General(thread) => {
-                        out.extend(review_feedback_lines(&thread, "GENERAL", selected, cols));
-                    }
-                    _ => {}
-                }
+                out.extend(render_review_row(&row, selected, cols));
             }
         }
         out
@@ -1291,23 +1259,6 @@ impl PrView {
 }
 
 // --- free helpers ----------------------------------------------------------
-
-fn review_glyph(state: &str) -> &'static str {
-    match state.to_uppercase().as_str() {
-        "APPROVED" => "✓",
-        "CHANGES_REQUESTED" => "✗",
-        "DISMISSED" => "⊘",
-        _ => "💬",
-    }
-}
-
-fn review_tone(state: &str) -> Tok {
-    match state.to_uppercase().as_str() {
-        "APPROVED" => Tok::Hue(thegn_core::theme::Hue::Green),
-        "CHANGES_REQUESTED" => Tok::Hue(thegn_core::theme::Hue::Red),
-        _ => Tok::Slot(S::Dim),
-    }
-}
 
 #[cfg(test)]
 mod tests {

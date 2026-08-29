@@ -19,8 +19,8 @@ use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::review_rows::{
-    ReviewRow, diff_line, expanded_file_rows, feedback_rows, file_stat, review_feedback_lines,
-    review_thread_lines, sel_marker, top_level_feedback_lines, trunc,
+    ReviewRow, expanded_file_rows, feedback_rows, file_stat, render_review_row, sel_marker,
+    top_level_feedback_lines,
 };
 use crate::seg::{Line, Tok, Under, seg};
 use thegn_core::ansi_cells::StyledLine;
@@ -496,31 +496,7 @@ impl DiffView {
                     };
                     for (ri, row) in rows.into_iter().enumerate() {
                         let selected = ri == self.sel;
-                        match row {
-                            ReviewRow::Hunk(header) => out.push((
-                                Line::segs(vec![seg(
-                                    Tok::Hue(thegn_core::theme::Hue::Teal),
-                                    trunc(&header, cols),
-                                )]),
-                                false,
-                            )),
-                            ReviewRow::Diff(dl) => {
-                                out.push((diff_line(&dl, selected, cols), selected))
-                            }
-                            ReviewRow::Thread(thread) => {
-                                out.extend(review_thread_lines(&thread, selected, cols));
-                            }
-                            ReviewRow::Outdated(thread) => {
-                                out.extend(review_feedback_lines(
-                                    &thread, "OUTDATED", selected, cols,
-                                ));
-                            }
-                            ReviewRow::General(thread) => {
-                                out.extend(review_feedback_lines(
-                                    &thread, "GENERAL", selected, cols,
-                                ));
-                            }
-                        }
+                        out.extend(crate::review_rows::render_review_row(&row, selected, cols));
                     }
                 }
             }
@@ -540,15 +516,7 @@ impl DiffView {
                     let selected = self
                         .active_diff()
                         .is_some_and(|diff| diff.files.len() + i == self.sel);
-                    match row {
-                        ReviewRow::Outdated(thread) => {
-                            out.extend(review_feedback_lines(&thread, "OUTDATED", selected, cols));
-                        }
-                        ReviewRow::General(thread) => {
-                            out.extend(review_feedback_lines(&thread, "GENERAL", selected, cols));
-                        }
-                        _ => {}
-                    }
+                    out.extend(render_review_row(&row, selected, cols));
                 }
             }
         }
