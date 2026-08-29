@@ -4,10 +4,10 @@
 //! to [`crate::hook_run`]. Physical git/provider operations remain at their
 //! existing call sites; this seam owns hook ordering and failure semantics.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use thegn_core::config::Config;
 use thegn_core::config_resolve::Approvals;
 use thegn_core::db::Db;
@@ -222,6 +222,7 @@ pub struct LifecycleReport {
     #[allow(dead_code)]
     pub pending: Vec<thegn_core::config_resolve::GatedRequest>,
     blocked_failure: bool,
+    dispatch_error: Option<String>,
 }
 
 impl LifecycleReport {
@@ -230,11 +231,13 @@ impl LifecycleReport {
     }
 
     pub fn message(&self) -> String {
-        self.results
-            .iter()
-            .find(|result| !result.succeeded())
-            .map(crate::hook_run::HookRunResult::summary)
-            .unwrap_or_else(|| format!("{} hooks completed", self.event.as_str()))
+        self.dispatch_error.clone().unwrap_or_else(|| {
+            self.results
+                .iter()
+                .find(|result| !result.succeeded())
+                .map(crate::hook_run::HookRunResult::summary)
+                .unwrap_or_else(|| format!("{} hooks completed", self.event.as_str()))
+        })
     }
 }
 
@@ -325,6 +328,20 @@ pub fn run_event_with_db(
         results,
         pending: policy.pending,
         blocked_failure,
+        dispatch_error: None,
+    }
+}
+
+fn spawn_failure_report(event: HookEvent, error: std::io::Error) -> LifecycleReport {
+    LifecycleReport {
+        event,
+        results: Vec::new(),
+        pending: Vec::new(),
+        blocked_failure: true,
+        dispatch_error: Some(format!(
+            "failed to schedule {} lifecycle worker: {error}",
+            event.as_str()
+        )),
     }
 }
 
@@ -372,8 +389,8 @@ pub fn schedule_post_create(
             HookEvent::PostCreate,
             HookExecutionMode::User,
             waker,
-        );
-        Ok(())
+        )
+        .map_err(|error| spawn_failure_report(HookEvent::PostCreate, error))
     }
 }
 
@@ -389,10 +406,31 @@ pub fn spawn_event(
     event: HookEvent,
     mode: HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
-    let handle = std::thread::Builder::new()
+) -> std::io::Result<()> {
+    spawn_event_with_completion(
+        cfg, repo_root, worktree, branch, workspace, event, mode, waker, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_event_with_completion(
+    cfg: Config,
+    repo_root: PathBuf,
+    worktree: PathBuf,
+    branch: String,
+    workspace: String,
+    event: HookEvent,
+    mode: HookExecutionMode,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+    completion: Option<SessionEndGuard>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
         .name(format!("thegn-resolve-hook-{}", event.as_str()))
         .spawn(move || {
+            // Holding this guard for the entire worker makes destructive
+            // teardown wait for all hook/report/waker work. It also releases
+            // the in-flight claim if the worker unwinds.
+            let _completion = completion;
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let resolved_root = if matches!(event, HookEvent::SessionStart | HookEvent::SessionEnd)
             {
@@ -451,12 +489,10 @@ pub fn spawn_event(
             if let Some(waker) = waker {
                 let _ = waker.wake();
             }
-        });
-    if let Ok(handle) = handle {
-        // Detached UI/daemon work reports failures from inside the worker and
-        // pulses the compositor after completion.
-        std::mem::forget(handle);
-    }
+        })
+        // Dropping a JoinHandle detaches the worker. Errors remain owned by the
+        // caller instead of being mistaken for a successfully scheduled event.
+        .map(drop)
 }
 
 /// Run one user/unattended destroy transaction off-loop and report its result.
@@ -469,55 +505,59 @@ pub fn spawn_worktree_destroy(
     keep_files: bool,
     mode: HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
-    std::thread::spawn(move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-        let db = Db::open().ok();
-        let (success, message) = thegn_core::repo::main_worktree(&worktree)
-            .map(|repo_root| {
-                let branch = thegn_core::util::git_out(
-                    &worktree,
-                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                )
-                .unwrap_or_default();
-                let workspace = thegn_core::repo::repo_slug(&repo_root);
-                destroy_one(
-                    &cfg,
-                    &repo_root,
-                    &worktree,
-                    &branch,
-                    &workspace,
-                    keep_files,
-                    false,
-                    mode,
-                    db.as_ref(),
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    false,
-                    format!("could not resolve repository for {}", worktree.display()),
-                )
-            });
-        if success && let Some(db) = db.as_ref() {
-            crate::handlers::workspace_remove::forget_worktree_path_in_db(
-                db,
-                &session_id,
-                &worktree.to_string_lossy(),
+) -> std::io::Result<()> {
+    let claimed_path = worktree.clone();
+    let spawned = std::thread::Builder::new()
+        .name("thegn-worktree-destroy".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+            let db = Db::open().ok();
+            let (success, message) = thegn_core::repo::main_worktree(&worktree)
+                .map(|repo_root| {
+                    let branch = thegn_core::util::git_out(
+                        &worktree,
+                        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                    )
+                    .unwrap_or_default();
+                    let workspace = thegn_core::repo::repo_slug(&repo_root);
+                    destroy_one(
+                        &cfg,
+                        &repo_root,
+                        &worktree,
+                        &branch,
+                        &workspace,
+                        keep_files,
+                        false,
+                        mode,
+                        db.as_ref(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        false,
+                        format!("could not resolve repository for {}", worktree.display()),
+                    )
+                });
+            if success && let Some(db) = db.as_ref() {
+                crate::handlers::workspace_remove::forget_worktree_path_in_db(
+                    db,
+                    &session_id,
+                    &worktree.to_string_lossy(),
+                );
+            }
+            release_destroy_path(&worktree);
+            complete(
+                LifecycleCompletion::WorktreeDelete {
+                    group_name,
+                    path: worktree.to_string_lossy().into_owned(),
+                    success,
+                    message,
+                },
+                waker,
             );
-        }
-        release_destroy_path(&worktree);
-        complete(
-            LifecycleCompletion::WorktreeDelete {
-                group_name,
-                path: worktree.to_string_lossy().into_owned(),
-                success,
-                message,
-            },
-            waker,
-        );
-    });
+        });
+    release_destroy_claim_on_spawn_failure(&claimed_path, spawned.map(drop))
 }
 
 /// Run each workspace path as an independent transaction. A failed path is
@@ -529,93 +569,106 @@ pub fn spawn_workspace_destroy(
     session_id: String,
     paths: Vec<String>,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
-    std::thread::spawn(move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let db = Db::open().ok();
-        let mut candidates = paths;
-        if let Some(db) = db.as_ref() {
-            candidates.extend(crate::handlers::workspace_remove::workspace_worktree_dirs(
-                db,
-                &repo_root.to_string_lossy(),
-            ));
-        }
-        candidates.sort();
-        candidates.dedup();
-        let had_candidates = !candidates.is_empty();
-        let paths: Vec<String> = candidates
-            .into_iter()
-            .filter(|path| try_claim_destroy_path(Path::new(path)))
-            .collect();
-        if had_candidates && paths.is_empty() {
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("thegn-workspace-destroy".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            let db = Db::open().ok();
+            let mut candidates = paths;
+            if let Some(db) = db.as_ref() {
+                candidates.extend(crate::handlers::workspace_remove::workspace_worktree_dirs(
+                    db,
+                    &repo_root.to_string_lossy(),
+                ));
+            }
+            candidates.sort();
+            candidates.dedup();
+            let had_candidates = !candidates.is_empty();
+            let paths: Vec<String> = candidates
+                .into_iter()
+                .filter(|path| try_claim_destroy_path(Path::new(path)))
+                .collect();
+            if had_candidates && paths.is_empty() {
+                complete(
+                    LifecycleCompletion::WorkspaceDeleteFinished {
+                        repo_path: repo_root.to_string_lossy().into_owned(),
+                        slug,
+                        failed_paths: vec!["all worktrees are already being deleted".into()],
+                    },
+                    waker,
+                );
+                return;
+            }
+            let mut failed_paths = Vec::new();
+            for path in paths {
+                let branch = thegn_core::util::git_out(
+                    Path::new(&path),
+                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                )
+                .unwrap_or_default();
+                let (success, message) = destroy_one(
+                    &cfg,
+                    &repo_root,
+                    Path::new(&path),
+                    &branch,
+                    &slug,
+                    false,
+                    false,
+                    HookExecutionMode::Force,
+                    db.as_ref(),
+                );
+                if !success {
+                    failed_paths.push(format!("{path}: {message}"));
+                } else if let Some(db) = db.as_ref() {
+                    crate::handlers::workspace_remove::forget_worktree_path_in_db(
+                        db,
+                        &session_id,
+                        &path,
+                    );
+                }
+                release_destroy_path(Path::new(&path));
+                complete(
+                    LifecycleCompletion::WorkspaceDelete {
+                        repo_path: repo_root.to_string_lossy().into_owned(),
+                        slug: slug.clone(),
+                        path,
+                        success,
+                        message,
+                    },
+                    waker.clone(),
+                );
+            }
+            if failed_paths.is_empty()
+                && let Some(db) = db.as_ref()
+            {
+                crate::handlers::workspace_remove::forget_workspace_in_db(
+                    db,
+                    &session_id,
+                    &repo_root.to_string_lossy(),
+                    &slug,
+                );
+            }
             complete(
                 LifecycleCompletion::WorkspaceDeleteFinished {
                     repo_path: repo_root.to_string_lossy().into_owned(),
                     slug,
-                    failed_paths: vec!["all worktrees are already being deleted".into()],
+                    failed_paths,
                 },
                 waker,
             );
-            return;
-        }
-        let mut failed_paths = Vec::new();
-        for path in paths {
-            let branch = thegn_core::util::git_out(
-                Path::new(&path),
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            )
-            .unwrap_or_default();
-            let (success, message) = destroy_one(
-                &cfg,
-                &repo_root,
-                Path::new(&path),
-                &branch,
-                &slug,
-                false,
-                false,
-                HookExecutionMode::Force,
-                db.as_ref(),
-            );
-            if !success {
-                failed_paths.push(format!("{path}: {message}"));
-            } else if let Some(db) = db.as_ref() {
-                crate::handlers::workspace_remove::forget_worktree_path_in_db(
-                    db,
-                    &session_id,
-                    &path,
-                );
-            }
-            release_destroy_path(Path::new(&path));
-            complete(
-                LifecycleCompletion::WorkspaceDelete {
-                    repo_path: repo_root.to_string_lossy().into_owned(),
-                    slug: slug.clone(),
-                    path,
-                    success,
-                    message,
-                },
-                waker.clone(),
-            );
-        }
-        if failed_paths.is_empty()
-            && let Some(db) = db.as_ref()
-        {
-            crate::handlers::workspace_remove::forget_workspace_in_db(
-                db,
-                &session_id,
-                &repo_root.to_string_lossy(),
-                &slug,
-            );
-        }
-        complete(
-            LifecycleCompletion::WorkspaceDeleteFinished {
-                repo_path: repo_root.to_string_lossy().into_owned(),
-                slug,
-                failed_paths,
-            },
-            waker,
-        );
-    });
+        })
+        .map(drop)
+}
+
+fn release_destroy_claim_on_spawn_failure(
+    path: &Path,
+    spawned: std::io::Result<()>,
+) -> std::io::Result<()> {
+    if spawned.is_err() {
+        release_destroy_path(path);
+    }
+    spawned
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -888,11 +941,65 @@ pub fn create_failure_with_add_state(
     }
 }
 
-static SESSION_LATCHES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+type SessionKey = (String, String);
+
+#[derive(Default)]
+struct SessionRuntime {
+    latches: HashSet<SessionKey>,
+    ending: HashMap<SessionKey, Vec<Arc<SessionEndInFlight>>>,
+}
+
+#[derive(Default)]
+struct SessionEndInFlight {
+    done: Mutex<bool>,
+    completed: Condvar,
+}
+
+impl SessionEndInFlight {
+    fn finish(&self) {
+        *self.done.lock().expect("session end mutex poisoned") = true;
+        self.completed.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut done = self.done.lock().expect("session end mutex poisoned");
+        while !*done {
+            done = self
+                .completed
+                .wait(done)
+                .expect("session end mutex poisoned");
+        }
+    }
+}
+
+struct SessionEndGuard {
+    key: SessionKey,
+    in_flight: Arc<SessionEndInFlight>,
+}
+
+impl Drop for SessionEndGuard {
+    fn drop(&mut self) {
+        // Publish completion before removing the discoverable token. A destroy
+        // that observed the token can always wait safely; a later destroy knows
+        // all work in this event is already finished.
+        self.in_flight.finish();
+        let mut runtime = session_runtime()
+            .lock()
+            .expect("session runtime mutex poisoned");
+        if let Some(events) = runtime.ending.get_mut(&self.key) {
+            events.retain(|event| !Arc::ptr_eq(event, &self.in_flight));
+            if events.is_empty() {
+                runtime.ending.remove(&self.key);
+            }
+        }
+    }
+}
+
+static SESSION_RUNTIME: OnceLock<Mutex<SessionRuntime>> = OnceLock::new();
 static DESTROY_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
-fn session_latches() -> &'static Mutex<HashSet<(String, String)>> {
-    SESSION_LATCHES.get_or_init(|| Mutex::new(HashSet::new()))
+fn session_runtime() -> &'static Mutex<SessionRuntime> {
+    SESSION_RUNTIME.get_or_init(|| Mutex::new(SessionRuntime::default()))
 }
 
 fn destroy_claims() -> &'static Mutex<HashSet<PathBuf>> {
@@ -922,34 +1029,55 @@ pub fn session_start_once(
     cfg: &Config,
     worktree: &Path,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) -> bool {
+) -> std::io::Result<bool> {
     if worktree.as_os_str().is_empty() {
-        return false;
+        return Ok(false);
     }
-    let key = (
-        worktree.to_string_lossy().into_owned(),
-        std::process::id().to_string(),
-    );
-    if !session_latches().lock().unwrap().insert(key) {
-        return false;
+    let key = session_key(worktree);
+    if !session_runtime()
+        .lock()
+        .expect("session runtime mutex poisoned")
+        .latches
+        .insert(key.clone())
+    {
+        return Ok(false);
     }
-    spawn_session_event(
+    let spawned = spawn_session_event(
         cfg.clone(),
         worktree.to_path_buf(),
         HookEvent::SessionStart,
         waker,
+        None,
     );
-    true
+    finish_session_start_spawn(&key, spawned)
+}
+
+fn finish_session_start_spawn(
+    key: &SessionKey,
+    spawned: std::io::Result<()>,
+) -> std::io::Result<bool> {
+    match spawned {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            session_runtime()
+                .lock()
+                .expect("session runtime mutex poisoned")
+                .latches
+                .remove(key);
+            Err(error)
+        }
+    }
 }
 
 /// Release a claimed `session_start` when the pane it was preparing could not
 /// be spawned. The next retry must be allowed to run the hook again.
 pub fn release_session_start(worktree: &Path) {
-    let key = (
-        worktree.to_string_lossy().into_owned(),
-        std::process::id().to_string(),
-    );
-    session_latches().lock().unwrap().remove(&key);
+    let key = session_key(worktree);
+    session_runtime()
+        .lock()
+        .expect("session runtime mutex poisoned")
+        .latches
+        .remove(&key);
 }
 
 /// Schedule `session_end` once for the current host session and worktree.
@@ -957,24 +1085,45 @@ pub fn session_end_once(
     cfg: &Config,
     worktree: &Path,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
-    let key = (
-        worktree.to_string_lossy().into_owned(),
-        std::process::id().to_string(),
-    );
-    if !claim_session_end(&key) {
-        return;
-    }
+) -> std::io::Result<bool> {
+    let key = session_key(worktree);
+    let Some(guard) = claim_session_end(&key) else {
+        return Ok(false);
+    };
     spawn_session_event(
         cfg.clone(),
         worktree.to_path_buf(),
         HookEvent::SessionEnd,
         waker,
-    );
+        Some(guard),
+    )?;
+    Ok(true)
 }
 
-fn claim_session_end(key: &(String, String)) -> bool {
-    session_latches().lock().unwrap().remove(key)
+fn session_key(worktree: &Path) -> SessionKey {
+    (
+        worktree.to_string_lossy().into_owned(),
+        std::process::id().to_string(),
+    )
+}
+
+fn claim_session_end(key: &SessionKey) -> Option<SessionEndGuard> {
+    let mut runtime = session_runtime()
+        .lock()
+        .expect("session runtime mutex poisoned");
+    if !runtime.latches.remove(key) {
+        return None;
+    }
+    let in_flight = Arc::new(SessionEndInFlight::default());
+    runtime
+        .ending
+        .entry(key.clone())
+        .or_default()
+        .push(Arc::clone(&in_flight));
+    Some(SessionEndGuard {
+        key: key.clone(),
+        in_flight,
+    })
 }
 
 fn end_session_before_destroy(
@@ -985,11 +1134,21 @@ fn end_session_before_destroy(
     workspace: &str,
     db: Option<&Db>,
 ) {
-    let key = (
-        worktree.to_string_lossy().into_owned(),
-        std::process::id().to_string(),
-    );
-    if !claim_session_end(&key) {
+    let key = session_key(worktree);
+    let (claimed, in_flight) = {
+        let mut runtime = session_runtime()
+            .lock()
+            .expect("session runtime mutex poisoned");
+        let claimed = runtime.latches.remove(&key);
+        let in_flight = runtime.ending.get(&key).cloned().unwrap_or_default();
+        (claimed, in_flight)
+    };
+    // Destruction already runs on a lifecycle worker. Waiting here serializes
+    // cwd ownership without ever blocking the compositor loop.
+    for event in in_flight {
+        event.wait();
+    }
+    if !claimed {
         return;
     }
     let report = run_event_with_db(
@@ -1032,8 +1191,11 @@ pub fn session_end_after_pane_exit(
                     .into_iter()
                     .any(|id| id != exited_pane && panes.table.contains_key(&id))
             });
-            if !other_live {
-                session_end_once(cfg, Path::new(&group.path), waker);
+            if !other_live && let Err(error) = session_end_once(cfg, Path::new(&group.path), waker)
+            {
+                thegn_core::msg::warn(&format!(
+                    "session_end lifecycle worker could not start: {error}"
+                ));
             }
             return;
         }
@@ -1045,10 +1207,11 @@ fn spawn_session_event(
     worktree: PathBuf,
     event: HookEvent,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
+    completion: Option<SessionEndGuard>,
+) -> std::io::Result<()> {
     // `spawn_event` performs trust/config resolution on its worker and derives
     // the real repo root from this worktree path.
-    spawn_event(
+    spawn_event_with_completion(
         cfg,
         worktree.clone(),
         worktree,
@@ -1057,7 +1220,8 @@ fn spawn_session_event(
         event,
         HookExecutionMode::Unattended,
         waker,
-    );
+        completion,
+    )
 }
 
 fn report_failure(context: &HookContext, result: &crate::hook_run::HookRunResult) {
@@ -1170,9 +1334,9 @@ mod tests {
             std::process::id(),
             thegn_core::util::now()
         ));
-        assert!(session_start_once(&Config::default(), &worktree, None));
+        assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
         release_session_start(&worktree);
-        assert!(session_start_once(&Config::default(), &worktree, None));
+        assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
         release_session_start(&worktree);
     }
 
@@ -1183,10 +1347,158 @@ mod tests {
             std::process::id(),
             thegn_core::util::now()
         ));
-        assert!(session_start_once(&Config::default(), &worktree, None));
-        session_end_once(&Config::default(), &worktree, None);
-        assert!(session_start_once(&Config::default(), &worktree, None));
+        assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
+        assert!(session_end_once(&Config::default(), &worktree, None).unwrap());
+        assert!(session_start_once(&Config::default(), &worktree, None).unwrap());
         release_session_start(&worktree);
+    }
+
+    #[test]
+    fn lifecycle_worker_spawn_failures_release_claims_and_surface_errors() {
+        let worktree = std::env::temp_dir().join(format!(
+            "tg-lifecycle-spawn-failure-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let key = session_key(&worktree);
+        session_runtime()
+            .lock()
+            .expect("session runtime mutex poisoned")
+            .latches
+            .insert(key.clone());
+        let error =
+            finish_session_start_spawn(&key, Err(std::io::Error::other("injected thread failure")))
+                .expect_err("the session-start scheduling failure must propagate");
+        assert!(error.to_string().contains("injected thread failure"));
+        assert!(
+            !session_runtime()
+                .lock()
+                .expect("session runtime mutex poisoned")
+                .latches
+                .contains(&key)
+        );
+
+        assert!(try_claim_destroy_path(&worktree));
+        let error = release_destroy_claim_on_spawn_failure(
+            &worktree,
+            Err(std::io::Error::other("injected destroy failure")),
+        )
+        .expect_err("the destroy scheduling failure must propagate");
+        assert!(error.to_string().contains("injected destroy failure"));
+        assert!(try_claim_destroy_path(&worktree));
+        release_destroy_path(&worktree);
+
+        session_runtime()
+            .lock()
+            .expect("session runtime mutex poisoned")
+            .latches
+            .insert(key.clone());
+        let guard = claim_session_end(&key).expect("session end should be claimed");
+        drop(guard); // Builder::spawn drops its closure and guard on failure.
+        assert!(
+            !session_runtime()
+                .lock()
+                .expect("session runtime mutex poisoned")
+                .ending
+                .contains_key(&key)
+        );
+
+        let report = spawn_failure_report(
+            HookEvent::PostCreate,
+            std::io::Error::other("injected post-create failure"),
+        );
+        assert!(report.blocked());
+        assert!(report.message().contains("injected post-create failure"));
+    }
+
+    #[test]
+    fn destroy_waits_for_detached_session_end_before_removing_worktree() {
+        let base = tempfile::tempdir().unwrap();
+        let state_home = base.path().join("state");
+        let _env =
+            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+        let root = base.path().join("repo");
+        let worktree = base.path().join("feature");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "test"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("file"), "base\n").unwrap();
+        git(&root, &["add", "file"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let started = base.path().join("session-end-started");
+        let release = base.path().join("release-session-end");
+        let mut cfg = Config::default();
+        cfg.hooks.session_end = vec![thegn_core::hooks::HookEntry::Spec(
+            thegn_core::hooks::HookEntrySpec {
+                command: format!(
+                    "printf started > {}; while [ ! -e {} ]; do sleep 0.01; done",
+                    started.display(),
+                    release.display()
+                ),
+                wait: Some(false),
+                timeout_secs: Some(5),
+                on_failure: Some(thegn_core::hooks::HookFailure::Warn),
+            },
+        )];
+        let key = session_key(&worktree);
+        session_runtime()
+            .lock()
+            .expect("session runtime mutex poisoned")
+            .latches
+            .insert(key);
+        assert!(session_end_once(&cfg, &worktree, None).unwrap());
+
+        let hook_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.exists() && std::time::Instant::now() < hook_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started.exists(), "session_end hook did not start");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let destroy_cfg = cfg.clone();
+        let destroy_root = root.clone();
+        let destroy_worktree = worktree.clone();
+        std::thread::spawn(move || {
+            let result = destroy_one(
+                &destroy_cfg,
+                &destroy_root,
+                &destroy_worktree,
+                "feature",
+                "repo",
+                false,
+                false,
+                HookExecutionMode::Force,
+                None,
+            );
+            tx.send(result).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "destroy completed while session_end still owned the cwd"
+        );
+        assert!(worktree.exists());
+
+        std::fs::write(&release, "release\n").unwrap();
+        let (success, message) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("destroy should resume after session_end completion");
+        assert!(success, "destroy failed: {message}");
+        assert!(!worktree.exists());
     }
 
     #[test]

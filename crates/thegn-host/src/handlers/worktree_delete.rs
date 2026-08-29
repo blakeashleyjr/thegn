@@ -120,13 +120,16 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // the session boundary. Release any live session latch before removing
     // the group; otherwise reopening it in this process suppresses the next
     // session_start and session_end never runs for an explicit close.
+    let mut session_end_errors = Vec::new();
     for group in &removed_groups {
-        if !group.path.is_empty() {
-            crate::worktree_lifecycle::session_end_once(
+        if !group.path.is_empty()
+            && let Err(error) = crate::worktree_lifecycle::session_end_once(
                 cx.cfg,
                 std::path::Path::new(&group.path),
                 Some(cx.waker.clone()),
-            );
+            )
+        {
+            session_end_errors.push(format!("{}: {error}", group.path));
         }
     }
 
@@ -175,6 +178,12 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     crate::run::persist_session_layout_cached(cx.session);
     cx.sb.marked.clear();
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
+    if !session_end_errors.is_empty() {
+        cx.model.status = format!(
+            "Closed worktree; session_end failed to start: {}",
+            session_end_errors.join("; ")
+        );
+    }
     cx.sb.focus_active_row(cx.model);
     *cx.need_relayout = true;
     crate::run::sync_drawer_persistence(

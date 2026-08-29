@@ -73,7 +73,7 @@ pub(crate) fn spawn_delete_workspace_dirs(
     slug: &str,
     session_id: &str,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
+) -> std::io::Result<()> {
     let root = Path::new(repo_path).to_path_buf();
     crate::worktree_lifecycle::spawn_workspace_destroy(
         cfg,
@@ -82,7 +82,7 @@ pub(crate) fn spawn_delete_workspace_dirs(
         session_id.to_string(),
         dirs,
         waker,
-    );
+    )
 }
 
 /// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
@@ -118,23 +118,30 @@ pub(crate) fn remove_workspace(
     // Destructive: delete each worktree dir from disk off-loop. The DB/session
     // rows stay visible until each worker reports a successful transaction.
     if !keep_files {
-        spawn_delete_workspace_dirs(
+        if let Err(error) = spawn_delete_workspace_dirs(
             repo_path,
             live_dirs.clone(),
             cfg.clone(),
             slug,
             &session.id,
             waker,
-        );
+        ) {
+            return format!("Workspace '{display}' removal failed to start: {error}");
+        }
         return workspace_removed_status(display, false, live_dirs.len());
     }
 
     // Keep-files is a pure in-memory reconciliation on the loop. Its cache
     // cleanup runs on the DB writer and, by contract, does not run destroy
     // hooks or touch the checkout.
-    for path in &live_dirs {
-        crate::worktree_lifecycle::session_end_once(cfg, Path::new(path), waker.clone());
-    }
+    let session_end_errors: Vec<String> = live_dirs
+        .iter()
+        .filter_map(|path| {
+            crate::worktree_lifecycle::session_end_once(cfg, Path::new(path), waker.clone())
+                .err()
+                .map(|error| format!("{path}: {error}"))
+        })
+        .collect();
     remove_workspace_in_memory(session, panes, slug);
     let session_id = session.id.clone();
     let repo_path_owned = repo_path.to_string();
@@ -149,7 +156,14 @@ pub(crate) fn remove_workspace(
         land_after_workspace_removed(session, None);
     }
 
-    workspace_removed_status(display, keep_files, live_dirs.len())
+    let mut status = workspace_removed_status(display, keep_files, live_dirs.len());
+    if !session_end_errors.is_empty() {
+        status.push_str(&format!(
+            "; session_end failed to start: {}",
+            session_end_errors.join("; ")
+        ));
+    }
+    status
 }
 
 /// After removing the *active* workspace, land on the first remaining workspace,
