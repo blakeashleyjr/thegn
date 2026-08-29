@@ -1845,6 +1845,7 @@ pub(crate) fn delete_groups_with_mode(
             crate::worktree_lifecycle::spawn_worktree_destroy(
                 PathBuf::from(&path),
                 group_name,
+                session.id.clone(),
                 keep_files,
                 mode,
                 waker.clone(),

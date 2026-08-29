@@ -48,13 +48,21 @@ pub(crate) fn spawn_delete_workspace_dirs(
     dirs: Vec<String>,
     cfg: thegn_core::config::Config,
     slug: &str,
+    session_id: &str,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) {
     if dirs.is_empty() {
         return;
     }
     let root = Path::new(repo_path).to_path_buf();
-    crate::worktree_lifecycle::spawn_workspace_destroy(cfg, root, slug.to_string(), dirs, waker);
+    crate::worktree_lifecycle::spawn_workspace_destroy(
+        cfg,
+        root,
+        slug.to_string(),
+        session_id.to_string(),
+        dirs,
+        waker,
+    );
 }
 
 /// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
@@ -102,7 +110,14 @@ pub(crate) fn remove_workspace(
             }
             return workspace_removed_status(display, false, 0);
         }
-        spawn_delete_workspace_dirs(repo_path, worktree_dirs.clone(), cfg.clone(), slug, waker);
+        spawn_delete_workspace_dirs(
+            repo_path,
+            worktree_dirs.clone(),
+            cfg.clone(),
+            slug,
+            &session.id,
+            waker,
+        );
         return workspace_removed_status(display, false, worktree_dirs.len());
     }
 
@@ -173,34 +188,22 @@ pub(crate) fn remove_workspace_with_db(
     repo_path: &str,
     slug: &str,
 ) {
-    // Close (forget, never delete from disk) the workspace's live groups,
-    // highest index first so earlier indices stay valid as groups are removed.
-    let mut targets: Vec<usize> = session
+    let groups: Vec<crate::session::WorktreeGroup> = session
         .worktrees
         .iter()
-        .enumerate()
-        .filter_map(|(gi, g)| {
+        .filter(|g| {
             crate::sidebar::split_tab(&g.name)
                 .filter(|(repo, _)| repo == slug)
-                .map(|_| gi)
+                .is_some()
         })
+        .cloned()
         .collect();
-    targets.sort_unstable_by(|a, b| b.cmp(a));
-    for gi in targets {
-        if gi >= session.worktrees.len() {
-            continue;
+    if let Some(db) = db {
+        for group in &groups {
+            forget_worktree_group(db, &session.id, group, true);
         }
-        if let Some(db) = db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi], true);
-        }
-        for tab in &session.worktrees[gi].tabs {
-            for id in tab.center.pane_ids() {
-                panes.table.remove(&id);
-            }
-        }
-        session.switch_to(gi);
-        session.close_active_group();
     }
+    remove_workspace_in_memory(session, panes, slug);
 
     if let Some(db) = db {
         // Prune every DB trace so the workspace doesn't re-render or resurrect.
@@ -228,6 +231,73 @@ pub(crate) fn remove_workspace_with_db(
         // resurrect the closed groups on the next launch (see `delete_groups`).
         let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the trimmed layout feed; git/disk removal already reported
     }
+}
+
+/// Close the live groups belonging to a workspace without touching disk or
+/// the DB. Lifecycle completion handling uses this after its worker has
+/// already completed the cache transaction.
+pub(crate) fn remove_workspace_in_memory(
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    slug: &str,
+) {
+    let mut targets: Vec<usize> = session
+        .worktrees
+        .iter()
+        .enumerate()
+        .filter_map(|(gi, g)| {
+            crate::sidebar::split_tab(&g.name)
+                .filter(|(repo, _)| repo == slug)
+                .map(|_| gi)
+        })
+        .collect();
+    targets.sort_unstable_by(|a, b| b.cmp(a));
+    for gi in targets {
+        if gi >= session.worktrees.len() {
+            continue;
+        }
+        for tab in &session.worktrees[gi].tabs {
+            for id in tab.center.pane_ids() {
+                panes.table.remove(&id);
+            }
+        }
+        session.switch_to(gi);
+        session.close_active_group();
+    }
+}
+
+/// Remove a successfully destroyed worktree from the cache on a worker. The
+/// loop later reconciles the corresponding live group separately.
+pub(crate) fn forget_worktree_path_in_db(db: &thegn_core::db::Db, session_id: &str, path: &str) {
+    let _ = db.del_worktree(path); // best-effort: cache write: git is the source of truth
+    let _ = db.delete_tab_groups_for_worktree(session_id, path); // best-effort: cache write: layout is resurrection state
+}
+
+/// Remove a successfully destroyed workspace from the cache on a worker. The
+/// current session's tab groups are removed by slug so an in-flight deletion
+/// cannot leave the home group or a stale layout resurrected.
+pub(crate) fn forget_workspace_in_db(
+    db: &thegn_core::db::Db,
+    session_id: &str,
+    repo_path: &str,
+    slug: &str,
+) {
+    if let Ok(groups) = db.groups_for_session(session_id) {
+        for group in groups.into_iter().filter(|group| {
+            crate::sidebar::split_tab(&group.name).is_some_and(|(group_slug, _)| group_slug == slug)
+        }) {
+            let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: layout is resurrection state
+        }
+    }
+    let _ = db.del_worktrees_for_repo(repo_path); // best-effort: cache write: git is the source of truth
+    let _ = db.del_workspace(repo_path); // best-effort: cache write: git is the source of truth
+    let _ = db.del_repo_slug(repo_path); // best-effort: cache write: git is the source of truth
+    let _ = db.tombstone_workspace(repo_path); // best-effort: cache write: removal tombstone
+    if db.active_workspace().ok().flatten().as_deref() == Some(repo_path) {
+        let _ = db.del_ui_state("", "active_workspace"); // best-effort: cache write: active-workspace pointer
+    }
+    del_ui_state_segment(db, SIDEBAR_SCOPE, "collapse", slug);
+    del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", slug);
 }
 
 /// Segment-anchored delete of a `{prefix}:{name}` ui_state key family: removes

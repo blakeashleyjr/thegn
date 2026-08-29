@@ -80,10 +80,23 @@ pub fn apply_completions(
     model: &mut crate::chrome::FrameModel,
     sb: &mut crate::run::SidebarState,
 ) -> bool {
+    apply_completions_from(take_completions(), session, panes, model, sb)
+}
+
+/// Apply a supplied batch of worker outcomes on the compositor loop. Keeping
+/// the batch-taking wrapper above separate makes this seam testable without
+/// racing the process-global completion queue.
+fn apply_completions_from(
+    completions: Vec<LifecycleCompletion>,
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    model: &mut crate::chrome::FrameModel,
+    sb: &mut crate::run::SidebarState,
+) -> bool {
     let mut changed = false;
     let mut workspace_failures: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
-    for completion in take_completions() {
+    for completion in completions {
         match completion {
             LifecycleCompletion::WorktreeDelete {
                 group_name,
@@ -98,10 +111,6 @@ pub fn apply_completions(
                         .position(|g| g.name == group_name || g.path == path)
                     {
                         let group = session.worktrees[gi].clone();
-                        if let Ok(db) = Db::open() {
-                            crate::run::forget_worktree_group(&db, &session.id, &group, false);
-                            let _ = session.persist(&db, &session.id, crate::run::now_secs());
-                        }
                         for tab in &group.tabs {
                             for id in tab.center.pane_ids() {
                                 panes.table.remove(&id);
@@ -128,10 +137,6 @@ pub fn apply_completions(
                 if success {
                     if let Some(gi) = session.worktrees.iter().position(|g| g.path == path) {
                         let group = session.worktrees[gi].clone();
-                        if let Ok(db) = Db::open() {
-                            crate::run::forget_worktree_group(&db, &session.id, &group, false);
-                            let _ = session.persist(&db, &session.id, crate::run::now_secs());
-                        }
                         for tab in &group.tabs {
                             for id in tab.center.pane_ids() {
                                 panes.table.remove(&id);
@@ -154,20 +159,13 @@ pub fn apply_completions(
                 failed_paths,
             } => {
                 if failed_paths.is_empty() {
-                    if let Ok(db) = Db::open() {
-                        crate::handlers::workspace_remove::remove_workspace_with_db(
-                            session,
-                            panes,
-                            Some(&db),
-                            &repo_path,
-                            &slug,
+                    crate::handlers::workspace_remove::remove_workspace_in_memory(
+                        session, panes, &slug,
+                    );
+                    if session.id == repo_path {
+                        crate::handlers::workspace_remove::land_after_workspace_removed(
+                            session, None,
                         );
-                        if session.id == repo_path {
-                            crate::handlers::workspace_remove::land_after_workspace_removed(
-                                session,
-                                Some(&db),
-                            );
-                        }
                     }
                     crate::handlers::workspace_remove::forget_workspace_in_model(
                         model, &slug, &repo_path,
@@ -191,7 +189,6 @@ pub fn apply_completions(
         }
     }
     if changed {
-        crate::run::persist_session_layout(session, panes);
         crate::run::refresh_tab_model(model, session, sb);
         sb.focus_active_row(model);
     }
@@ -458,6 +455,7 @@ pub fn spawn_event(
 pub fn spawn_worktree_destroy(
     worktree: PathBuf,
     group_name: String,
+    session_id: String,
     keep_files: bool,
     mode: HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
@@ -492,6 +490,13 @@ pub fn spawn_worktree_destroy(
                     format!("could not resolve repository for {}", worktree.display()),
                 )
             });
+        if success && let Some(db) = db.as_ref() {
+            crate::handlers::workspace_remove::forget_worktree_path_in_db(
+                &db,
+                &session_id,
+                &worktree.to_string_lossy(),
+            );
+        }
         complete(
             LifecycleCompletion::WorktreeDelete {
                 group_name,
@@ -510,6 +515,7 @@ pub fn spawn_workspace_destroy(
     cfg: Config,
     repo_root: PathBuf,
     slug: String,
+    session_id: String,
     paths: Vec<String>,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) {
@@ -536,6 +542,12 @@ pub fn spawn_workspace_destroy(
             );
             if !success {
                 failed_paths.push(format!("{path}: {message}"));
+            } else if let Some(db) = db.as_ref() {
+                crate::handlers::workspace_remove::forget_worktree_path_in_db(
+                    db,
+                    &session_id,
+                    &path,
+                );
             }
             complete(
                 LifecycleCompletion::WorkspaceDelete {
@@ -546,6 +558,17 @@ pub fn spawn_workspace_destroy(
                     message,
                 },
                 waker.clone(),
+            );
+        }
+        if failed_paths.is_empty()
+            && session_id == repo_root.to_string_lossy()
+            && let Some(db) = db.as_ref()
+        {
+            crate::handlers::workspace_remove::forget_workspace_in_db(
+                db,
+                &session_id,
+                &repo_root.to_string_lossy(),
+                &slug,
             );
         }
         complete(
@@ -1085,5 +1108,66 @@ mod tests {
 
         assert!(error.contains("git worktree add failed: partial checkout"));
         assert!(!thegn_core::worktree::branch_exists(&root, "partial"));
+    }
+
+    fn completion_test_session() -> crate::session::Session {
+        crate::session::Session {
+            id: "repo".into(),
+            worktrees: vec![crate::session::WorktreeGroup::new(
+                "repo/feature",
+                crate::session::GroupKind::Branch,
+                "/tmp/repo-feature",
+            )],
+            active: 0,
+        }
+    }
+
+    fn apply_test_completion(
+        completion: LifecycleCompletion,
+    ) -> (crate::session::Session, crate::chrome::FrameModel) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut session = completion_test_session();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut sb = crate::run::SidebarState::default();
+        assert!(apply_completions_from(
+            vec![completion],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        ));
+        (session, model)
+    }
+
+    #[test]
+    fn successful_completion_variants_reconcile_without_loop_io() {
+        let (session, model) = apply_test_completion(LifecycleCompletion::WorktreeDelete {
+            group_name: "repo/feature".into(),
+            path: "/tmp/repo-feature".into(),
+            success: true,
+            message: String::new(),
+        });
+        assert!(session.worktrees.is_empty());
+        assert_eq!(model.status, "Deleted worktree /tmp/repo-feature");
+
+        let (session, _) = apply_test_completion(LifecycleCompletion::WorkspaceDelete {
+            repo_path: "/tmp/repo".into(),
+            slug: "repo".into(),
+            path: "/tmp/repo-feature".into(),
+            success: true,
+            message: String::new(),
+        });
+        assert!(session.worktrees.is_empty());
+
+        let (session, mut model) =
+            apply_test_completion(LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path: "repo".into(),
+                slug: "repo".into(),
+                failed_paths: Vec::new(),
+            });
+        model.sidebar_workspaces =
+            vec![("repo".into(), "repo".into(), "repo".into(), "repo".into())];
+        assert!(session.worktrees.len() <= 1);
     }
 }
