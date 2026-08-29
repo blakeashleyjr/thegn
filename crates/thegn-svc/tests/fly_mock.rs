@@ -98,7 +98,8 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
     } else if method == "DELETE" && path.starts_with("/v1/apps/") {
         r#"{"ok":true}"#.to_string()
     } else {
-        let _ = writer.write_all( // best-effort: client may have disconnected
+        let _ = writer.write_all(
+            // best-effort: client may have disconnected
             b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
         );
         return;
