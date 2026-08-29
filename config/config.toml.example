@@ -1082,6 +1082,18 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # [workspace.my-repo.keybinds]
 # new-worktree = "Alt w"
 
+# Per-worktree lifecycle commands for this workspace. These lists accumulate
+# after the global [hooks] table and before a repo-root .thegn.* [hooks] table.
+# Repo-authored entries are trust-gated and can never block an operation.
+# [workspace.my-repo.hooks]
+# pre_create = ["./.thegn/pre-create.sh"]
+# post_create = [{ command = "pnpm install --frozen-lockfile", wait = true,
+#                  timeout_secs = 120, on_failure = "warn" }]
+# pre_destroy = ["docker compose down"]
+# post_destroy = []
+# session_start = []
+# session_end = []
+
 # Per-program host-action overlays, keyed by the focused pane's program name.
 # These intercept *before* the active mode — useful for binding a host action
 # while a TUI like lazygit is focused.
@@ -2193,6 +2205,28 @@ max_results = 1000
 # go = ["go"]
 # ruby = ["ruby"]
 # extra = []      # nixpkgs packages appended for every language mix
+
+# ── Worktree lifecycle hooks ────────────────────────────────────────────────
+# Host-side commands run at worktree/session boundaries. Lists retain their
+# declaration order and accumulate global → [workspace.<slug>] → repo overlay.
+# A string is shorthand for an object with wait = false, timeout_secs = 120,
+# and the event default for on_failure (pre_create/pre_destroy = "block";
+# every other event = "warn"). `wait` is valid only for post_create.
+#
+# The repo .thegn.* [hooks] table is untrusted until approved through the
+# existing repo trust flow; its entries are omitted while pending and are
+# always warn-only after approval. The legacy [sandbox] prepare list is also
+# run as the head of global post_create (and repo sandbox.prepare as the head
+# of repo post_create), with warn/no-wait semantics.
+[hooks]
+pre_create = ["./.thegn/pre-create.sh"]
+post_create = [
+  { command = "pnpm install --frozen-lockfile", wait = false, timeout_secs = 120, on_failure = "warn" },
+]
+pre_destroy = ["docker compose down"]
+post_destroy = []
+session_start = []
+session_end = []
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
