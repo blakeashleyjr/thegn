@@ -1262,9 +1262,7 @@ impl PrView {
 mod tests {
     use super::*;
     use crate::review_rows::wrap;
-    use thegn_core::forge::model::{
-        DiffFile, DiffHunk, DiffLine, DiffLineKind, PrComment, ReviewThread,
-    };
+    use thegn_core::forge::model::{DiffFile, DiffLine, DiffLineKind, PrComment, ReviewThread};
     use thegn_core::review::PrReviewSnapshot;
 
     fn sample() -> PrView {
