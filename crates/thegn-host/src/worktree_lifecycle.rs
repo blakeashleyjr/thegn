@@ -747,6 +747,19 @@ pub fn rollback_remove(
     worktree: &Path,
     branch: &str,
 ) -> Result<(), String> {
+    rollback_remove_with_branch_created(cfg, repo_root, worktree, branch, true)
+}
+
+/// Roll back a failed `git worktree add` without deleting a branch that was
+/// already present before that add attempt. `branch_created` comes from the
+/// core add operation while its git mutation lock was held.
+pub fn rollback_remove_with_branch_created(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    branch_created: bool,
+) -> Result<(), String> {
     let workspace = thegn_core::repo::repo_slug(repo_root);
     let db = Db::open().ok();
     let (success, message) = if worktree.exists() {
@@ -757,7 +770,7 @@ pub fn rollback_remove(
             branch,
             &workspace,
             false,
-            true,
+            branch_created,
             HookExecutionMode::Force,
             db.as_ref(),
         )
@@ -770,7 +783,8 @@ pub fn rollback_remove(
         if !thegn_core::util::git_ok(repo_root, &["worktree", "prune"]) {
             failures.push("could not prune failed worktree metadata".to_string());
         }
-        if !branch.is_empty()
+        if branch_created
+            && !branch.is_empty()
             && thegn_core::worktree::branch_exists(repo_root, branch)
             && !thegn_core::util::git_ok(repo_root, &["branch", "-D", branch])
         {
@@ -822,17 +836,19 @@ pub fn create_failure_with_rollback(
     }
 }
 
-/// Run a worktree add and route every failure through the shared force-cleanup
-/// transaction. The closure keeps the git seam injectable for callers/tests,
-/// while the returned error always preserves the original add diagnostic.
-pub fn add_checked_with_rollback(
-    add: impl FnOnce() -> Result<(), String>,
+pub fn create_failure_with_add_state(
+    primary: impl Into<String>,
     cfg: &Config,
     repo_root: &Path,
     worktree: &Path,
     branch: &str,
-) -> Result<(), String> {
-    add().map_err(|error| create_failure_with_rollback(error, cfg, repo_root, worktree, branch))
+    branch_created: bool,
+) -> String {
+    let primary = primary.into();
+    match rollback_remove_with_branch_created(cfg, repo_root, worktree, branch, branch_created) {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
+    }
 }
 
 static SESSION_LATCHES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
@@ -1096,17 +1112,28 @@ mod tests {
         git(&root, &["commit", "-q", "-m", "base"]);
         git(&root, &["branch", "partial", "main"]);
 
-        let error = add_checked_with_rollback(
-            || Err("git worktree add failed: partial checkout".into()),
+        let error = create_failure_with_add_state(
+            "git worktree add failed: partial checkout",
             &Config::default(),
             &root,
             &root.join("missing"),
             "partial",
-        )
-        .expect_err("injected add failure");
+            true,
+        );
 
         assert!(error.contains("git worktree add failed: partial checkout"));
         assert!(!thegn_core::worktree::branch_exists(&root, "partial"));
+
+        git(&root, &["branch", "preexisting", "main"]);
+        let result = rollback_remove_with_branch_created(
+            &Config::default(),
+            &root,
+            &root.join("missing-preexisting"),
+            "preexisting",
+            false,
+        );
+        assert!(result.is_ok(), "rollback failed: {result:?}");
+        assert!(thegn_core::worktree::branch_exists(&root, "preexisting"));
     }
 
     fn completion_test_session() -> crate::session::Session {

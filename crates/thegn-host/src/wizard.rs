@@ -1077,12 +1077,15 @@ pub fn run_worker(
         fail(CreateStep::CreateWorktree, pre.message());
         return;
     }
-    if let Err(e) = worktree::add_checked(root, &branch, &base, &path, cfg) {
-        let primary = e.to_string();
-        let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
-            Ok(()) => primary,
-            Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
-        };
+    if let Err(e) = worktree::add_checked_with_state(root, &branch, &base, &path, cfg) {
+        let error = crate::worktree_lifecycle::create_failure_with_add_state(
+            e.message,
+            cfg,
+            root,
+            &path,
+            &branch,
+            e.branch_created,
+        );
         fail(CreateStep::CreateWorktree, error);
         return;
     }
