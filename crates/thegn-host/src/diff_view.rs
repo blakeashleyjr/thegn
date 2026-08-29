@@ -18,7 +18,7 @@ use termwiz::surface::Surface;
 use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
-use crate::pr_view::{diff_line, file_stat, sel_marker, trunc};
+use crate::pr_view::{diff_line, file_stat, review_thread_lines, sel_marker, trunc};
 use crate::review_rows::{ReviewRow, file_rows, outdated_rows};
 use crate::seg::{Line, Tok, Under, seg};
 use thegn_core::ansi_cells::StyledLine;
@@ -211,7 +211,10 @@ impl DiffView {
             self.show_structural = !self.show_structural;
             return DiffViewOutcome::Pending;
         }
-        if matches!(key, KeyCode::Tab) && self.review.is_some() {
+        // Structural output is a complete rendered view of the worktree. Do
+        // not let the source label switch underneath it; return to the
+        // internal view first, then Tab can select the PR projection.
+        if matches!(key, KeyCode::Tab) && self.review.is_some() && !self.structural_active() {
             self.source = match self.source {
                 DiffSource::Worktree => DiffSource::PrReview,
                 DiffSource::PrReview => DiffSource::Worktree,
@@ -494,31 +497,7 @@ impl DiffView {
                                 out.push((diff_line(&dl, selected, cols), selected))
                             }
                             ReviewRow::Thread(thread) => {
-                                let comment = thread.comments.first();
-                                let mark = if thread.resolved {
-                                    crate::caps::active_glyphs().check
-                                } else {
-                                    crate::caps::active_glyphs().warn
-                                };
-                                out.push((
-                                    Line::segs(vec![
-                                        seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                                        seg(Tok::Slot(S::Accent), mark),
-                                        seg(
-                                            Tok::Slot(S::Text),
-                                            format!(
-                                                "{} · {}",
-                                                comment
-                                                    .map(|c| c.author.as_str())
-                                                    .unwrap_or("reviewer"),
-                                                comment
-                                                    .map(|c| c.body.as_str())
-                                                    .unwrap_or("(no comment)")
-                                            ),
-                                        ),
-                                    ]),
-                                    selected,
-                                ));
+                                out.extend(review_thread_lines(&thread, selected, cols));
                             }
                         }
                     }
@@ -550,18 +529,15 @@ impl DiffView {
                         seg(
                             Tok::Slot(S::Dim),
                             format!(
-                                "{} · {}",
+                                "{}:{}",
                                 thread.path,
-                                thread
-                                    .comments
-                                    .first()
-                                    .map(|c| c.body.as_str())
-                                    .unwrap_or("(no comment)")
+                                thread.line.map(|line| line.to_string()).unwrap_or_default()
                             ),
                         ),
                     ]),
                     false,
                 ));
+                out.extend(review_thread_lines(&thread, false, cols));
             }
         }
         out
@@ -606,7 +582,9 @@ fn structural_line(styled: &StyledLine) -> Line {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::forge::model::{DiffFile, DiffHunk, DiffLineKind};
+    use thegn_core::forge::model::{
+        DiffFile, DiffHunk, DiffLineKind, PrComment, PrConversation, ReviewThread,
+    };
 
     fn line(kind: DiffLineKind, text: &str) -> DiffLine {
         DiffLine {
@@ -742,5 +720,85 @@ mod tests {
         // The toggle is inert (no structural render to switch to).
         v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
         assert!(!v.structural_active());
+    }
+
+    #[test]
+    fn structural_mode_keeps_the_worktree_source_label_pair() {
+        let mut v = DiffView::with_structural("t".into(), 1, true);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: Some(Ok(vec![styled("fn add")])),
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: sample(),
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+
+        assert!(v.structural_active());
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.source, DiffSource::Worktree);
+        assert!(v.structural_active());
+        assert!(format!("{:?}", v.footer()).contains("Worktree"));
+
+        v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.source, DiffSource::PrReview);
+        assert!(!v.structural_active());
+        assert!(format!("{:?}", v.footer()).contains("PR review"));
+    }
+
+    #[test]
+    fn pr_review_projection_renders_every_comment_in_a_thread() {
+        let thread = ReviewThread {
+            id: "thread".into(),
+            path: "a.rs".into(),
+            line: Some(1),
+            comments: vec![
+                PrComment {
+                    author: "alice".into(),
+                    body: "first body".into(),
+                    ..PrComment::default()
+                },
+                PrComment {
+                    author: "bob".into(),
+                    body: "second body".into(),
+                    ..PrComment::default()
+                },
+            ],
+            ..ReviewThread::default()
+        };
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "a.rs".into(),
+                old_path: None,
+                hunks: vec![DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![line(DiffLineKind::Add, "new")],
+                }],
+            }],
+        };
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: None,
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff,
+                conversation: PrConversation {
+                    threads: vec![thread],
+                    ..PrConversation::default()
+                },
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+
+        let rendered = format!("{:?}", v.body_lines(80));
+        assert!(rendered.contains("first body"));
+        assert!(rendered.contains("second body"));
     }
 }

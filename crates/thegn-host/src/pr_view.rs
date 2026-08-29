@@ -21,7 +21,7 @@ use crate::review_handoff::ReviewSelection;
 use crate::review_rows::{ReviewRow, file_rows, outdated_rows};
 use crate::seg::{Line, Seg, Tok, seg, sp};
 use thegn_core::forge::model::{
-    DiffFile, DiffLine, DiffLineKind, PrConversation, PrDiff, ReviewState,
+    DiffFile, DiffLine, DiffLineKind, PrConversation, PrDiff, ReviewState, ReviewThread,
 };
 
 /// The four workflow tabs.
@@ -1058,18 +1058,7 @@ impl PrView {
 
     /// Wrap + push a comment body as dim indented lines.
     fn push_body_lines(&self, out: &mut Vec<(Line, bool)>, body: &str, cols: usize) {
-        let width = cols.saturating_sub(4).max(8);
-        for raw in body.lines() {
-            if raw.trim().is_empty() {
-                continue;
-            }
-            for chunk in wrap(raw, width) {
-                out.push((
-                    Line::segs(vec![sp(4), seg(Tok::Slot(S::Dim), chunk)]),
-                    false,
-                ));
-            }
-        }
+        push_wrapped_body_lines(out, body, cols);
     }
 
     fn files_body(&self, cols: usize) -> Vec<(Line, bool)> {
@@ -1149,31 +1138,7 @@ impl PrView {
                                 out.push((diff_line(&dl, selected, cols), selected))
                             }
                             ReviewRow::Thread(thread) => {
-                                let mark = if thread.resolved {
-                                    crate::caps::active_glyphs().check
-                                } else {
-                                    crate::caps::active_glyphs().warn
-                                };
-                                let comment = thread.comments.first();
-                                out.push((
-                                    Line::segs(vec![
-                                        seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                                        seg(Tok::Slot(S::Accent), mark),
-                                        seg(
-                                            Tok::Slot(S::Text),
-                                            format!(
-                                                "{} · {}",
-                                                comment
-                                                    .map(|c| c.author.as_str())
-                                                    .unwrap_or("reviewer"),
-                                                comment
-                                                    .map(|c| c.body.as_str())
-                                                    .unwrap_or("(no comment)")
-                                            ),
-                                        ),
-                                    ]),
-                                    selected,
-                                ));
+                                out.extend(review_thread_lines(&thread, selected, cols));
                             }
                         }
                     }
@@ -1182,21 +1147,30 @@ impl PrView {
         }
         if let Some(review) = self.anchored_review() {
             for thread in outdated_rows(&review, self.include_resolved) {
-                let comment = thread.comments.first();
                 out.push((
                     Line::segs(vec![
                         seg(Tok::Slot(S::Accent), "OUTDATED · "),
                         seg(
                             Tok::Slot(S::Dim),
                             format!(
-                                "{} · {}",
+                                "{}:{}",
                                 thread.path,
-                                comment.map(|c| c.body.as_str()).unwrap_or("(no comment)")
+                                thread.line.map(|line| line.to_string()).unwrap_or_default()
                             ),
                         ),
                     ]),
                     false,
                 ));
+                for comment in &thread.comments {
+                    self.push_comment_block(
+                        &mut out,
+                        &comment.author,
+                        &comment.body,
+                        "  ↳",
+                        false,
+                        cols,
+                    );
+                }
             }
         }
         out
@@ -1335,6 +1309,70 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
     }
     if out.is_empty() {
         out.push(String::new());
+    }
+    out
+}
+
+fn push_wrapped_body_lines(out: &mut Vec<(Line, bool)>, body: &str, cols: usize) {
+    let width = cols.saturating_sub(4).max(8);
+    for raw in body.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        for chunk in wrap(raw, width) {
+            out.push((
+                Line::segs(vec![sp(4), seg(Tok::Slot(S::Dim), chunk)]),
+                false,
+            ));
+        }
+    }
+}
+
+/// Render one inline review thread. Only the header is selectable; every
+/// comment remains visible below it using the Conversation tab's wrapping.
+pub(crate) fn review_thread_lines(
+    thread: &ReviewThread,
+    selected: bool,
+    cols: usize,
+) -> Vec<(Line, bool)> {
+    let mark = if thread.resolved {
+        crate::caps::active_glyphs().check
+    } else {
+        crate::caps::active_glyphs().warn
+    };
+    let location = format!(
+        "{}:{}{}",
+        thread.path,
+        thread.line.map(|line| line.to_string()).unwrap_or_default(),
+        if thread.resolved { " (resolved)" } else { "" }
+    );
+    let author = thread
+        .comments
+        .first()
+        .map(|comment| comment.author.as_str())
+        .unwrap_or("reviewer");
+    let mut out = vec![(
+        Line::segs(vec![
+            seg(Tok::Slot(S::Faint), sel_marker(selected)),
+            seg(Tok::Slot(S::Accent), mark),
+            seg(Tok::Slot(S::Text), format!("{author} · {location}")),
+        ]),
+        selected,
+    )];
+    if thread.comments.is_empty() {
+        push_wrapped_body_lines(&mut out, "(no comment)", cols);
+    } else {
+        for comment in &thread.comments {
+            out.push((
+                Line::segs(vec![
+                    seg(Tok::Slot(S::Faint), sel_marker(false)),
+                    seg(Tok::Slot(S::Accent), "  ↳ "),
+                    seg(Tok::Slot(S::Text), comment.author.clone()).bold(),
+                ]),
+                false,
+            ));
+            push_wrapped_body_lines(&mut out, &comment.body, cols);
+        }
     }
     out
 }
@@ -1618,6 +1656,59 @@ mod tests {
             v.status.as_deref(),
             Some("select a review thread row first")
         );
+    }
+
+    #[test]
+    fn files_projection_renders_every_comment_in_a_thread() {
+        let thread = ReviewThread {
+            id: "thread".into(),
+            path: "src/lib.rs".into(),
+            line: Some(1),
+            comments: vec![
+                PrComment {
+                    author: "alice".into(),
+                    body: "first body".into(),
+                    ..PrComment::default()
+                },
+                PrComment {
+                    author: "bob".into(),
+                    body: "second body".into(),
+                    ..PrComment::default()
+                },
+            ],
+            ..ReviewThread::default()
+        };
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                hunks: vec![thegn_core::forge::model::DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Add,
+                        text: "new".into(),
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                    }],
+                }],
+            }],
+        };
+        let mut v = sample();
+        v.diff = Some(diff.clone());
+        v.review = Some(PrReviewSnapshot {
+            diff,
+            conversation: PrConversation {
+                threads: vec![thread],
+                ..PrConversation::default()
+            },
+            ..PrReviewSnapshot::default()
+        });
+        v.switch_tab(PrTab::Files);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+
+        let rendered = format!("{:?}", v.files_body(80));
+        assert!(rendered.contains("first body"));
+        assert!(rendered.contains("second body"));
     }
 
     #[test]
