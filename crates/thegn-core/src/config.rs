@@ -5709,6 +5709,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             }
         }
     };
+    /// One env-provided enum override: warn on an invalid value instead of
+    /// silently keeping the default (parity with `parse_float`/`parse_bool`).
+    fn parse_enum_env<T>(raw: &str, key: &str, parse: fn(&str) -> Result<T, String>) -> Option<T> {
+        match parse(raw) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                config_warn(&format!("{key}: {e}; ignoring"));
+                None
+            }
+        }
+    }
     let parse_list = |raw: String| -> Vec<String> {
         raw.split(',')
             .map(str::trim)
@@ -5722,23 +5733,43 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.base_branch = env.get("THEGN_BASE_BRANCH");
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
     if let Some(v) = env.get("THEGN_PICKER") {
-        o.picker = Picker::from_str_validated(v.trim()).ok();
+        o.picker = parse_enum_env(v.trim(), "THEGN_PICKER", Picker::from_str_validated);
     }
     if let Some(v) = env.get("THEGN_GIT_BACKEND") {
-        o.git_backend = GitBackendKind::from_str_validated(v.trim()).ok();
+        o.git_backend = parse_enum_env(
+            v.trim(),
+            "THEGN_GIT_BACKEND",
+            GitBackendKind::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_GIT_STRUCTURAL_DIFF") {
-        o.git_structural_diff = StructuralDiff::from_str_validated(v.trim()).ok();
+        o.git_structural_diff = parse_enum_env(
+            v.trim(),
+            "THEGN_GIT_STRUCTURAL_DIFF",
+            StructuralDiff::from_str_validated,
+        );
     }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");
     if let Some(v) = env.get("THEGN_EDITOR_OPEN_IN") {
-        o.editor_open_in = EditorOpenIn::from_str_validated(v.trim()).ok();
+        o.editor_open_in = parse_enum_env(
+            v.trim(),
+            "THEGN_EDITOR_OPEN_IN",
+            EditorOpenIn::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_WORKTREE_MODE") {
-        o.worktree_mode = WorktreeMode::from_str_validated(v.trim()).ok();
+        o.worktree_mode = parse_enum_env(
+            v.trim(),
+            "THEGN_WORKTREE_MODE",
+            WorktreeMode::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_NAME_SCHEME") {
-        o.name_scheme = NameScheme::from_str_validated(v.trim()).ok();
+        o.name_scheme = parse_enum_env(
+            v.trim(),
+            "THEGN_NAME_SCHEME",
+            NameScheme::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_AUTO_REMOVE_WORKTREE") {
         o.auto_remove_worktree = parse_bool(&v, "THEGN_AUTO_REMOVE_WORKTREE");
@@ -5751,13 +5782,22 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.focus_border = env.get("THEGN_THEME_FOCUS_BORDER");
     o.frame_border = env.get("THEGN_THEME_BORDER");
     if let Some(v) = env.get("THEGN_THEME_COLOR") {
-        o.theme_color = ColorMode::from_str_validated(v.trim()).ok();
+        o.theme_color =
+            parse_enum_env(v.trim(), "THEGN_THEME_COLOR", ColorMode::from_str_validated);
     }
     if let Some(v) = env.get("THEGN_THEME_GLYPHS") {
-        o.theme_glyphs = GlyphMode::from_str_validated(v.trim()).ok();
+        o.theme_glyphs = parse_enum_env(
+            v.trim(),
+            "THEGN_THEME_GLYPHS",
+            GlyphMode::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_THEME_AGENT_GLYPHS") {
-        o.theme_agent_glyphs = AgentGlyphs::from_str_validated(v.trim()).ok();
+        o.theme_agent_glyphs = parse_enum_env(
+            v.trim(),
+            "THEGN_THEME_AGENT_GLYPHS",
+            AgentGlyphs::from_str_validated,
+        );
     }
 
     // [pr] — THEGN_PR_TTL, with deprecated TG_PR_TTL fallback.
@@ -5790,7 +5830,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
 
     // [log]
     if let Some(v) = env.get("THEGN_LOG_LEVEL") {
-        o.log_level = LogLevel::from_str_validated(v.trim()).ok();
+        o.log_level = parse_enum_env(v.trim(), "THEGN_LOG_LEVEL", LogLevel::from_str_validated);
     }
     if let Some(v) = env.get("THEGN_LOG_FILE") {
         o.log_file = parse_bool(&v, "THEGN_LOG_FILE");
@@ -5803,7 +5843,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.log_max_files = parse_num(v, "THEGN_LOG_MAX_FILES").map(|n| n as usize);
     }
     if let Some(v) = env.get("THEGN_LOG_FORMAT") {
-        o.log_format = LogFormat::from_str_validated(v.trim()).ok();
+        o.log_format = parse_enum_env(v.trim(), "THEGN_LOG_FORMAT", LogFormat::from_str_validated);
     }
     if let Some(v) = env.get("THEGN_LOG_STDERR_CAP_MB") {
         o.log_stderr_cap_mb = parse_num(v, "THEGN_LOG_STDERR_CAP_MB");
@@ -5889,20 +5929,40 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
 
     // [sandbox]
     if let Some(v) = env.get("THEGN_SANDBOX_BACKEND") {
-        o.sandbox.backend = SandboxBackend::from_str_validated(v.trim()).ok();
+        o.sandbox.backend = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_BACKEND",
+            SandboxBackend::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_SANDBOX_NETWORK") {
-        o.sandbox.network = Network::from_str_validated(v.trim()).ok();
+        o.sandbox.network = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_NETWORK",
+            Network::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_SANDBOX_PROFILE") {
-        o.sandbox.profile = SandboxProfile::from_str_validated(v.trim()).ok();
+        o.sandbox.profile = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_PROFILE",
+            SandboxProfile::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_SANDBOX_ON_DORMANT") {
-        o.sandbox.on_dormant = OnDormant::from_str_validated(v.trim()).ok();
+        o.sandbox.on_dormant = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_ON_DORMANT",
+            OnDormant::from_str_validated,
+        );
     }
     o.sandbox.image = env.get("THEGN_SANDBOX_IMAGE");
     if let Some(v) = env.get("THEGN_SANDBOX_ON_MISSING") {
-        o.sandbox.on_missing = OnMissing::from_str_validated(v.trim()).ok();
+        o.sandbox.on_missing = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_ON_MISSING",
+            OnMissing::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_SANDBOX_ENABLED") {
         o.sandbox.enabled = parse_bool(&v, "THEGN_SANDBOX_ENABLED");
@@ -5914,7 +5974,11 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.sandbox.nix_daemon = parse_bool(&v, "THEGN_SANDBOX_NIX_DAEMON");
     }
     if let Some(v) = env.get("THEGN_SANDBOX_WARM_DIRENV") {
-        o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
+        o.sandbox.warm_direnv = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_WARM_DIRENV",
+            WarmDirenv::from_str_validated,
+        );
     }
     // The floor pair is env-settable for the same reason `on_missing` /
     // `on_dormant` are: a CI job or a launcher script needs to raise (or relax)
@@ -5922,10 +5986,18 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     // trusted, so unlike a repo overlay it may move the floor in either
     // direction (see `config_resolve::classify_repo_overlay`).
     if let Some(v) = env.get("THEGN_SANDBOX_ISOLATION_FLOOR") {
-        o.sandbox.isolation_floor = IsolationFloor::from_str_validated(v.trim()).ok();
+        o.sandbox.isolation_floor = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_ISOLATION_FLOOR",
+            IsolationFloor::from_str_validated,
+        );
     }
     if let Some(v) = env.get("THEGN_SANDBOX_ON_FLOOR_MISS") {
-        o.sandbox.on_floor_miss = OnFloorMiss::from_str_validated(v.trim()).ok();
+        o.sandbox.on_floor_miss = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_ON_FLOOR_MISS",
+            OnFloorMiss::from_str_validated,
+        );
     }
     if let Some(host) = env.get("THEGN_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
