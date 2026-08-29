@@ -928,4 +928,18 @@ mod tests {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");
         }
     }
+
+    #[test]
+    fn session_info_lineage_is_additive_on_the_grpc_wire() {
+        let info = crate::control::SessionInfo {
+            id: "child".into(),
+            forked_from: Some("parent".into()),
+            ..Default::default()
+        };
+        let wire = super::info_to_proto(&info);
+        assert_eq!(wire.forked_from.as_deref(), Some("parent"));
+
+        let legacy = crate::control::SessionInfo::default();
+        assert_eq!(super::info_to_proto(&legacy).forked_from, None);
+    }
 }
