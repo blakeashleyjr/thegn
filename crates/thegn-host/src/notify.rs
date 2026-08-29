@@ -12,8 +12,8 @@
 //! engine; this module only supplies the clock + runtime state and performs the
 //! I/O the decision authorizes.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::NotificationsConfig;
@@ -40,9 +40,9 @@ pub struct NotifyState {
     /// routing context so `[notifications.sound] suppress_focused` can silence a
     /// cue for the worktree the user is already looking at.
     focused_worktree: Mutex<String>,
-    /// The configured chime file (`[notifications.sound] chime_file`), empty ⇒
-    /// the bundled chime. Read on every `Chime` emit.
-    chime_file: Mutex<String>,
+    /// Off-loop provider/pack runtime. Its snapshot is swapped after config
+    /// reload, while producers only perform a bounded queue send.
+    sound_runtime: Arc<crate::notification_sound::SoundRuntime>,
     /// Sender for the transient in-app toast projection, installed once at loop
     /// startup ([`Self::set_toast_tx`]). `None` before wiring (or in headless tests),
     /// so an emit is a silent no-op rather than a panic.
@@ -60,6 +60,18 @@ pub struct NotifyState {
     waker: TerminalWaker,
 }
 
+fn global_slot() -> &'static Mutex<Weak<NotifyState>> {
+    static SLOT: OnceLock<Mutex<Weak<NotifyState>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+/// The hydration worker has no loop-owned argument, but still belongs to the
+/// single UI notification route. This weak handle avoids keeping a compositor
+/// alive after shutdown.
+pub(crate) fn global() -> Option<Arc<NotifyState>> {
+    global_slot().lock().unwrap().upgrade()
+}
+
 impl NotifyState {
     /// Build a handle from the effective notification config. `active_profile`
     /// is the resolved profile name (may be empty).
@@ -69,8 +81,9 @@ impl NotifyState {
         waker: TerminalWaker,
     ) -> std::sync::Arc<Self> {
         let active_mode = cfg.active_mode.clone();
-        let chime_file = cfg.sound.chime_file.clone();
-        std::sync::Arc::new(NotifyState {
+        let sound_cfg = cfg.sound.clone();
+        let sound_runtime = crate::notification_sound::SoundRuntime::new(waker.clone());
+        let state = Arc::new(NotifyState {
             cfg: Mutex::new(cfg),
             debounce: Mutex::new(thegn_core::notify_debounce::NotifyDebounce::default()),
             dnd_forced: Mutex::new(None),
@@ -78,12 +91,15 @@ impl NotifyState {
             active_profile,
             pending_bell: AtomicBool::new(false),
             focused_worktree: Mutex::new(String::new()),
-            chime_file: Mutex::new(chime_file),
+            sound_runtime: Arc::clone(&sound_runtime),
             toast_tx: Mutex::new(None),
             push_tx: Mutex::new(None),
             push_dropped: std::sync::atomic::AtomicU64::new(0),
             waker,
-        })
+        });
+        *global_slot().lock().unwrap() = Arc::downgrade(&state);
+        sound_runtime.reload(sound_cfg);
+        state
     }
 
     /// Install the bounded sender to the push publisher worker (wired at startup
@@ -161,7 +177,7 @@ impl NotifyState {
 
     /// Replace the effective config after a live reload.
     pub fn update_cfg(&self, cfg: NotificationsConfig) {
-        *self.chime_file.lock().unwrap() = cfg.sound.chime_file.clone();
+        self.sound_runtime.reload(cfg.sound.clone());
         // Keep the runtime mode if it is still a valid mode (or empty); else
         // reset to the new config's default.
         {
@@ -209,20 +225,14 @@ impl NotifyState {
         decide(kind, source_ref, message, worktree, &cfg, &self.route_ctx())
     }
 
-    /// Ring the resolved sound: latch the terminal bell (painted by the render
-    /// loop) or spawn the configured command off-thread. Best-effort.
+    /// Queue the resolved sound or latch the terminal bell. Best-effort and
+    /// non-blocking for every producer.
     pub fn emit_sound(&self, decision: &RouteDecision) {
         match &decision.sound {
-            Some(SoundEmit::Chime) => {
-                let file = self.chime_file.lock().unwrap().clone();
-                // No system player/file ⇒ fall back to the terminal bell so a
-                // chime is never a silent no-op.
-                if !crate::chime::play(&file) {
-                    self.ring_bell();
-                }
+            Some(sound @ (SoundEmit::File { .. } | SoundEmit::Command(_))) => {
+                crate::notification_sound::emit(&self.sound_runtime, sound);
             }
             Some(SoundEmit::Bell) => self.ring_bell(),
-            Some(SoundEmit::Command(cmd)) => spawn_sound_command(cmd),
             None => {}
         }
     }
@@ -235,7 +245,7 @@ impl NotifyState {
 
     /// Consume the latched bell (called once per render flush by the loop).
     pub fn take_bell(&self) -> bool {
-        self.pending_bell.swap(false, Ordering::Relaxed)
+        self.pending_bell.swap(false, Ordering::Relaxed) || self.sound_runtime.take_fallback_bell()
     }
 
     /// Toggle the manual DND override; returns the new resolved DND state.
@@ -281,6 +291,25 @@ impl NotifyState {
     }
 }
 
+/// Decide and emit all transient channels for producers that have no DB handle.
+/// DB-backed producers use [`record`], which records before calling the same
+/// emission steps.
+pub(crate) fn route(
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> RouteDecision {
+    let decision = state.decide(kind, source_ref, message, worktree);
+    state.emit_sound(&decision);
+    if decision.toast {
+        state.emit_toast(message, decision.effective_priority);
+    }
+    state.emit_push(&decision, kind, message, "", worktree);
+    decision
+}
+
 /// Decide + conditionally persist a notification. Returns the decision and the
 /// new inbox row id (`None` when a rule dropped it). The dispatch sites use the
 /// returned decision to gate the desktop toast + sound.
@@ -318,6 +347,7 @@ pub fn record(
     } else {
         None
     };
+    state.emit_sound(&decision);
     // The transient in-app toast is the one funnel for routed events: it fires
     // iff the routing decision authorizes it (`toast`), governed by the same
     // rules/DND as every other channel — never a hand-rolled toast that dodges
@@ -331,32 +361,23 @@ pub fn record(
     (decision, id)
 }
 
-fn parse_kind(s: &str) -> Option<NotificationKind> {
-    NotificationKind::ALL.into_iter().find(|k| k.as_str() == s)
+/// Route a hydration/worker notification through the live host state when it
+/// exists. Returns false before startup, allowing the caller to retain its
+/// durable-only fallback without inventing a second notification path.
+pub(crate) fn record_global(
+    db: &thegn_core::db::Db,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> bool {
+    let Some(state) = global() else { return false };
+    let _ = record(db, &state, kind, source_ref, message, worktree);
+    true
 }
 
-/// Run a sound command line off-thread via `sh -c`, fully detached. Best-effort:
-/// a missing shell or a failing command is swallowed — a sound must never
-/// disrupt the session.
-// off-loop: the wait happens on the detached "notify-sound" std::thread below.
-#[expect(clippy::disallowed_methods)]
-pub(crate) fn spawn_sound_command(cmd: &str) {
-    let cmd = cmd.to_string();
-    std::thread::Builder::new()
-        .name("notify-sound".into())
-        .spawn(move || {
-            // Utility: an audible cue paired with a toast — the user hears the result.
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let _ = std::process::Command::new("sh") // best-effort: sound playback is advisory: a missing player just skips it
-                .arg("-c")
-                .arg(&cmd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            // best-effort: sound thread: a failed spawn just skips the sound
-        })
-        .ok();
+fn parse_kind(s: &str) -> Option<NotificationKind> {
+    NotificationKind::ALL.into_iter().find(|k| k.as_str() == s)
 }
 
 #[cfg(test)]
