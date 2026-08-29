@@ -1182,7 +1182,7 @@ impl PrView {
                                 if unresolved > 0 {
                                     stats.push(seg(
                                         Tok::Slot(S::Accent),
-                                        format!(" · ⊘{unresolved}"),
+                                        format!(" · {unresolved} unresolved"),
                                     ));
                                 }
                                 stats
@@ -1439,7 +1439,7 @@ pub(crate) fn review_thread_lines(
             out.push((
                 Line::segs(vec![
                     seg(Tok::Slot(S::Faint), sel_marker(false)),
-                    seg(Tok::Slot(S::Accent), "  ↳ "),
+                    seg(Tok::Slot(S::Accent), "  -> "),
                     seg(Tok::Slot(S::Text), comment.author.clone()).bold(),
                 ]),
                 false,
@@ -1474,7 +1474,7 @@ pub(crate) fn review_feedback_lines(
         out.push((
             Line::segs(vec![
                 seg(Tok::Slot(S::Faint), sel_marker(false)),
-                seg(Tok::Slot(S::Accent), "  ↳ "),
+                seg(Tok::Slot(S::Accent), "  -> "),
                 seg(Tok::Slot(S::Text), comment.author.clone()).bold(),
             ]),
             false,
