@@ -134,65 +134,52 @@ pub(crate) fn push_ci_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
     }
 }
 
-/// Merge-queue (fold-actor) badge: a red ⚑ chip when branches are blocked
-/// (deferred / gate-failed / needs-human), an amber chip while the queue is
-/// working (folding / agent running), and a quiet dim chip whenever anything
-/// is merely queued or held at ready — so an idle-but-populated queue is
-/// visible. Silent only when the queue is empty (clean is quiet). Activating
-/// it opens the queue overlay (`detail.rs`).
-pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
-    // Repo-scoped like every other nag surface (the ✋ badge, "Needs you",
-    // the inbox): `merge_queue` rows are global in the DB, but a sibling
-    // repo's queued branches must not raise a red ⚑ in the repo you're
-    // working in. `repo_scope == None` fails open (count everything), per
-    // the contract on `SidebarStatus::repo_scope`.
+/// Return the active workspace's merge-queue rollup. Queue rows are global in
+/// the cache, so retain the existing repo scope before applying core policy.
+fn mq_rollup(model: &FrameModel) -> Option<thegn_core::merge_queue_view::MqRollup> {
     let scope = model.sidebar_status.repo_scope.as_ref();
-    let q = model
-        .panel
-        .merge_queue
-        .iter()
-        .filter(|r| scope.is_none_or(|s| s.contains(&r.worktree)));
-    let blocked = q
-        .clone()
-        .filter(|r| {
-            // Same set the Merge-queue section paints as blocked — keep in
-            // sync with `panel::sections::merge_queue` (`gate_error` = the
-            // gate could not run; amber there, but still "needs a human").
-            matches!(
-                r.status.as_str(),
-                "deferred" | "gate_failed" | "gate_error" | "needs_human"
-            )
-        })
-        .count();
-    let working = q
-        .clone()
-        .filter(|r| matches!(r.status.as_str(), "folding" | "verifying" | "agent_running"))
-        .count();
-    let idle = q
-        .filter(|r| matches!(r.status.as_str(), "queued" | "ready"))
-        .count();
-    if blocked > 0 {
-        items.push((
-            BarItemId::Badge(BarBadge::MergeQueue),
-            vec![Seg::chip(
-                Tok::Hue(Hue::Red),
-                format!(" {} {blocked} MQ ", crate::caps::active_glyphs().flag),
-            )],
-        ));
-    } else if working > 0 {
-        items.push((
-            BarItemId::Badge(BarBadge::MergeQueue),
-            vec![Seg::chip(Tok::Hue(Hue::Amber), format!(" ⧉ {working} MQ "))],
-        ));
-    } else if idle > 0 {
-        items.push((
-            BarItemId::Badge(BarBadge::MergeQueue),
-            vec![Seg::chip(
-                Tok::Slot(crate::chrome::S::Dim),
-                format!(" ⧉ {idle} MQ "),
-            )],
-        ));
-    }
+    thegn_core::merge_queue_view::rollup(model.panel.merge_queue.iter().filter_map(|r| {
+        if scope.is_none_or(|s| s.contains(&r.worktree)) {
+            thegn_core::attention::MqStatus::parse(&r.status)
+        } else {
+            None
+        }
+    }))
+}
+
+/// Render the compact queue indicator used by the ordinary `mq` widget.
+/// Counts precede the tier marker, and marker glyphs use the existing queue
+/// status/capability vocabulary.
+pub(crate) fn push_mq_widget(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    let Some(rollup) = mq_rollup(model) else {
+        return;
+    };
+    let glyphs = crate::caps::active_glyphs();
+    let (marker, tone) = match rollup.tier {
+        thegn_core::merge_queue_view::MqTier::Blocked => (
+            thegn_core::attention::MqStatus::Deferred.glyph(glyphs).0,
+            Tok::Hue(Hue::Red),
+        ),
+        thegn_core::merge_queue_view::MqTier::Working => (
+            thegn_core::attention::MqStatus::Folding.glyph(glyphs).0,
+            Tok::Hue(Hue::Amber),
+        ),
+        thegn_core::merge_queue_view::MqTier::Populated => (
+            thegn_core::attention::MqStatus::Queued.glyph(glyphs).0,
+            Tok::Slot(crate::chrome::S::Dim),
+        ),
+    };
+    items.push((
+        BarItemId::Widget("mq".into()),
+        vec![Seg::chip(tone, format!(" {} {marker} MQ ", rollup.count))],
+    ));
+}
+
+/// Compatibility helper for the old unit-test call site. The default bar
+/// never emits the legacy badge; configured `mq` uses [`push_mq_widget`].
+#[cfg(test)]
+fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    push_mq_widget(model, items);
 }
 
 /// PR-queue badge, with the same grammar as the merge queue's so the two read
@@ -727,9 +714,9 @@ mod tests {
         let (text, seg) = mq_chip_for(&["queued", "agent_running"]).unwrap();
         assert!(text.contains("1 MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Amber))); // chips carry the tone as bg
-        // Anything blocked (needs_human included) wins over all: red ⚑.
+        // Anything blocked (needs_human included) wins over all: red marker.
         let (text, seg) = mq_chip_for(&["queued", "folding", "needs_human"]).unwrap();
-        assert!(text.contains("⚑ 1 MQ"), "{text}");
+        assert!(text.contains("1 ⚑ MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red))); // chips carry the tone as bg
         // A gate that could not run is blocked too (the section shows it in
         // amber as "gate could not run"); the chip used to go silent on it.
@@ -738,5 +725,32 @@ mod tests {
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red)));
         // Only landed rows: nothing left to signal.
         assert!(mq_chip_for(&["landed"]).is_none());
+    }
+
+    #[test]
+    fn merge_queue_is_only_emitted_when_configured_as_a_widget() {
+        let mut model = FrameModel::default();
+        model.panel.merge_queue = vec![mq_row("ready")];
+
+        let default_ids: Vec<_> = crate::chrome::statusbar_items(&model)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!default_ids.contains(&BarItemId::Badge(BarBadge::MergeQueue)));
+        assert!(!default_ids.contains(&BarItemId::Widget("mq".into())));
+
+        model.bars.bottom_right = vec!["mq".into()];
+        let configured = crate::chrome::statusbar_items(&model);
+        let item = configured
+            .iter()
+            .find(|(id, _)| *id == BarItemId::Widget("mq".into()))
+            .expect("configured mq widget");
+        assert!(item.1[0].text.contains("1"));
+        assert_eq!(item.1[0].bg, Some(Tok::Slot(crate::chrome::S::Dim)));
+        assert!(
+            !configured
+                .iter()
+                .any(|(id, _)| *id == BarItemId::Badge(BarBadge::MergeQueue))
+        );
     }
 }
