@@ -1,8 +1,32 @@
 //! Unix impls of the platform seam: real fds, signals, and process groups.
 
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+pub fn prepare_hook_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setpgid(0, 0)` only changes the child process group before exec;
+    // it does not access Rust memory or share state with the parent.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+pub fn kill_hook_process_group(child: &mut Child) {
+    // SAFETY: the pid is owned by this child and its process group was created
+    // immediately before exec; SIGKILL is the timeout cleanup contract.
+    unsafe {
+        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
 
 /// Restores the original stderr fd on drop (see [`super::redirect_stderr_to_logfile`]).
 ///
