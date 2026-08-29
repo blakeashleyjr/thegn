@@ -792,10 +792,12 @@ mod tests {
     #[test]
     fn strict_conflicts_and_identical_resume() {
         let source = bundle();
-        let mut target = MigrationTarget::default();
-        target.groups = source.groups.clone();
-        target.ui_state = source.ui_state.clone();
-        target.pin_state = source.pin_state.clone();
+        let mut target = MigrationTarget {
+            groups: source.groups.clone(),
+            ui_state: source.ui_state.clone(),
+            pin_state: source.pin_state.clone(),
+            ..Default::default()
+        };
         let plan = plan_migration(source.clone(), target.clone()).unwrap();
         assert!(plan.resumed);
 
@@ -809,8 +811,10 @@ mod tests {
     #[test]
     fn differing_prior_dispatch_import_is_rejected() {
         let source = bundle();
-        let mut target = MigrationTarget::default();
-        target.groups = source.groups.clone();
+        let mut target = MigrationTarget {
+            groups: source.groups.clone(),
+            ..Default::default()
+        };
         target.dispatches.push(MigrationDispatch {
             source_id: 50,
             issue_id: "different".into(),
