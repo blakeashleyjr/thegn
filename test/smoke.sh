@@ -63,6 +63,17 @@ mode = "tabs"
 [git]
 override_gpg = true
 
+# Lifecycle hooks (THE-19): exercise successful setup and make one teardown
+# intentionally veto until --force is supplied. These markers stay in the
+# throwaway repo/worktrees and never touch the checkout that runs smoke.
+[hooks]
+pre_create = ["printf '%s\\n' \"\$THEGN_BRANCH\" > \"\$THEGN_REPO_ROOT/.thegn-smoke-pre-create\""]
+post_create = ["printf '%s\\n' \"\$THEGN_EVENT\" > \"\$THEGN_WORKTREE/.thegn-smoke-post-create\""]
+pre_destroy = ["test \"\$THEGN_BRANCH\" = smoke-fail-hook && exit 23 || true"]
+post_destroy = ["printf '%s\\n' \"\$THEGN_EVENT\" >> \"\$THEGN_REPO_ROOT/.thegn-smoke-post-destroy\""]
+session_start = []
+session_end = []
+
 [[git_commands]]
 key = "p"
 context = "branches"
@@ -432,6 +443,8 @@ check "repo recent matches legacy recent" \
 # git + DB; removal cleans the checkout + DB rows and honors --delete-branch.
 NP="$("$SZ" wt new smoke-cli --repo "$R")"
 check "wt new prints an existing worktree path" "[[ -d '$NP' ]]"
+check "wt new runs the pre-create hook" "grep -qx 'smoke-cli' '$R/.thegn-smoke-pre-create'"
+check "wt new runs the post-create hook" "grep -qx 'post_create' '$NP/.thegn-smoke-post-create'"
 check "wt new registered the branch in git" \
   "git -C '$R' worktree list --porcelain | grep -q 'smoke-cli'"
 check "wt new appears in wt list" "'$SZ' wt list | grep -q 'smoke-cli'"
@@ -448,6 +461,20 @@ check "wt rm --delete-branch drops the branch" \
    [[ -z \$(git -C '$R' branch --list '*smoke-json*') ]]"
 check "wt rm unknown target exits 3" \
   "'$SZ' wt rm no-such-thing --force >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+
+# A blocking pre-destroy failure is visible, while the existing --force
+# override lets cleanup continue and still runs post-destroy.
+NF="$("$SZ" wt new smoke-fail-hook --repo "$R")"
+fail_rm_rc=0
+fail_rm_out="$("$SZ" wt rm "$NF" --force 2>&1)" || fail_rm_rc=$?
+if [[ $fail_rm_rc -eq 0 && ! -d $NF ]] &&
+  grep -q 'pre_destroy: hook failed' <<<"$fail_rm_out"; then
+  ok "forced teardown reports failed pre-destroy hook"
+else
+  bad "forced teardown reports failed pre-destroy hook"
+fi
+check "wt rm runs post-destroy after forced cleanup" \
+  "grep -qx 'post_destroy' '$R/.thegn-smoke-post-destroy'"
 if command -v sqlite3 >/dev/null 2>&1; then
   DBS="$XDG_STATE_HOME/thegn/thegn.db"
   check "wt rm cleaned the DB worktree rows" \

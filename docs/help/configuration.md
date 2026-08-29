@@ -40,6 +40,9 @@ The file is watched: edits apply live, no restart.
   agent, prompt, concurrency, `next`), with per-stage `model` / `env` /
   `permissions` overrides. Structure only: thegn validates and displays it,
   the Lead executes it. See [[system-monitor]] for the board.
+- `[hooks]` — host-side commands at worktree and session boundaries. Entries
+  accumulate across global, workspace, and trusted repo-local configuration;
+  see **Worktree lifecycle hooks** below.
 - `[editor]` — how "open in editor" opens files: `command` is a template
   (`{path}`, `{line}`, `{col}`); unset, thegn uses `[[tools]] editor`, then
   `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
@@ -54,6 +57,69 @@ The file is watched: edits apply live, no restart.
   language-server command is untrusted) — declare them in your user config.
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
+
+## Worktree lifecycle hooks
+
+`[hooks]` contains host-side commands for the six lifecycle events:
+`pre_create`, `post_create`, `pre_destroy`, `post_destroy`, `session_start`,
+and `session_end`. The same table is valid in your global config, in
+`[workspace.<slug>]`, and in a repo-root `.thegn.{toml,yaml,yml,json}`.
+Entries accumulate in that order; they do not replace entries from a lower
+layer, and declaration order within each event is preserved.
+
+Each event is an array. A string is shorthand for an object with the defaults
+for that event:
+
+```toml
+[hooks]
+pre_create = ["./.thegn/pre-create.sh"]
+post_create = [
+  { command = "pnpm install --frozen-lockfile", wait = false,
+    timeout_secs = 120, on_failure = "warn" },
+]
+pre_destroy = ["docker compose down"]
+post_destroy = []
+session_start = []
+session_end = []
+```
+
+The object form accepts `command`, `wait`, `timeout_secs`, and `on_failure`.
+Commands with an empty value are ignored. `timeout_secs` must be greater than
+zero and defaults to 120. `wait` defaults to `false` and is valid only for
+`post_create`; setting it holds the first pane behind the host-side
+post-create completion gate. It never blocks the compositor event loop.
+
+Failure defaults are `block` for `pre_create` and `pre_destroy`, and `warn`
+for the other four events. A blocking `pre_create` prevents the git checkout
+and registration. A failed `pre_destroy` leaves a user-requested worktree in
+place; `wt rm --force` reuses the existing force confirmation to skip that
+veto. Unattended merge cleanup and rollback use warn-and-continue semantics.
+Repo hooks remain warn-only even after trust approval, so a cloned repository
+cannot veto a local operation.
+
+Hook working directories are event-specific: `pre_create` and `post_destroy`
+run from the repository root; `post_create`, `pre_destroy`, `session_start`,
+and `session_end` run from the worktree. The runner clears the inherited
+environment and supplies the curated host baseline plus exactly these context
+values: `THEGN_EVENT`, `THEGN_REPO_ROOT`, `THEGN_WORKTREE`, `THEGN_BRANCH`,
+and `THEGN_WORKSPACE`. Hook entries do not inherit `env_passthrough`,
+`host_env_allow_extra`, credentials, or agent sockets. Output is captured in a
+per-worktree state log and failures are surfaced through notifications.
+
+Repo-local hook tables are trust-on-first-use gated. Until the existing repo
+trust request for `hooks.<event>` is approved, those entries are omitted and
+the pending request is reported; approval does not change their warn-only
+failure policy. The legacy `[sandbox].prepare` list is still accepted as the
+first global `post_create` entries (and repo `sandbox.prepare` as the first
+repo `post_create` entries), using the same timeout, logging, notifications,
+and failure rules. It is no longer a separate fire-and-forget mechanism.
+
+`session_start` is scheduled once when the first pane for a worktree session is
+about to spawn, and `session_end` once when its last pane exits or the tab
+closes. Neither delays pane creation or tab close, and these latches are
+process-local rather than stored in SQLite. `[sandbox].init_script` is
+different: it remains a per-pane script executed inside the sandbox, not a
+lifecycle hook.
 
 ## Agents, models and accounts
 
@@ -146,9 +212,10 @@ name, and `thegn doctor` lists it as unavailable with the reason.
 
 Settings resolve in a fixed order: built-in defaults → your `config.toml` →
 `THEGN_<SECTION>_<KEY>` environment variables → `--set key=value` on the
-command line. A repo's `.thegn.toml` can overlay `[sandbox]` only. Every
-layer is tolerant: a malformed value warns and the layer below stands, so a
-typo never blocks a launch.
+command line. A repo's `.thegn.toml` can provide the documented repo-local
+overlays, including clamped `[sandbox]` settings and trust-gated `[hooks]`.
+Every layer is tolerant: a malformed value warns and the layer below stands,
+so a typo never blocks a launch.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,
