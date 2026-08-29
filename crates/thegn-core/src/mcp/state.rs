@@ -252,7 +252,11 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
     },
     StateToolSpec {
         cap: "sessions.fork",
-        description: "Fork a live daemon or recorded harness session into a new process. +                      The source is never paused or cloned; a recorded source uses only +                      the harness's native fork operation. Write-scoped +                      (`--scopes write`). No argv, environment, prompt, transcript, or +                      vendor file data is accepted. Requires a running daemon.",
+        description: "Fork a live daemon or recorded harness session into a new process. \
+                      The source is never paused or cloned; a recorded source uses only \
+                      the harness's native fork operation. Write-scoped \
+                      (`--scopes write`). No argv, environment, prompt, transcript, or \
+                      vendor file data is accepted. Requires a running daemon.",
         args: &[
             ArgSpec {
                 name: "session",
