@@ -121,7 +121,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                     per_file.push((thread.path.clone(), 1));
                 }
             }
-            if !data.threads.is_empty() || pr.review_decision.is_some() {
+            if !data.threads.is_empty() || pr.review_decision.is_some() || top_level > 0 {
                 let decision = pr
                     .review_decision
                     .as_deref()
@@ -133,7 +133,10 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                     seg(g(), format!("  {decision}")),
                 ];
                 if unresolved > 0 {
-                    l.push(seg(g(), " · "));
+                    l.push(seg(
+                        g(),
+                        format!(" {} ", crate::caps::active_glyphs().middot),
+                    ));
                     l.push(seg(hue(Hue::Amber), format!("⊘{unresolved} unresolved")));
                 }
                 if top_level > 0 {
@@ -149,9 +152,9 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                             per_file
                                 .iter()
                                 .take(6)
-                                .map(|(path, count)| format!("{path} ×{count}"))
+                                .map(|(path, count)| format!("{path} x{count}"))
                                 .collect::<Vec<_>>()
-                                .join(" · "),
+                                .join(&format!(" {} ", crate::caps::active_glyphs().middot)),
                         ),
                     ])));
                 }

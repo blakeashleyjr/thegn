@@ -120,8 +120,12 @@ pub(crate) fn render_review_row(row: &ReviewRow, selected: bool, cols: usize) ->
     }
 }
 
-pub(crate) fn sel_marker(selected: bool) -> &'static str {
-    if selected { "❯ " } else { "  " }
+pub(crate) fn sel_marker(selected: bool) -> String {
+    if selected {
+        format!("{} ", crate::caps::active_glyphs().chevron)
+    } else {
+        "  ".into()
+    }
 }
 
 pub(crate) fn file_stat(f: &DiffFile) -> (usize, usize) {
@@ -161,7 +165,16 @@ pub(crate) fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+        let ellipsis = crate::caps::active_glyphs().ellipsis;
+        let ellipsis_len = ellipsis.chars().count();
+        if max <= ellipsis_len {
+            ellipsis.chars().take(max).collect()
+        } else {
+            s.chars()
+                .take(max - ellipsis_len)
+                .chain(ellipsis.chars())
+                .collect()
+        }
     }
 }
 
@@ -236,7 +249,13 @@ pub(crate) fn review_thread_lines(
         Line::segs(vec![
             seg(Tok::Slot(S::Faint), sel_marker(selected)),
             seg(Tok::Slot(S::Accent), mark),
-            seg(Tok::Slot(S::Text), format!("{author} · {location}")),
+            seg(
+                Tok::Slot(S::Text),
+                format!(
+                    "{author} {} {location}",
+                    crate::caps::active_glyphs().middot
+                ),
+            ),
         ]),
         selected,
     )];
@@ -273,7 +292,10 @@ pub(crate) fn review_feedback_lines(
     let mut out = vec![(
         Line::segs(vec![
             seg(Tok::Slot(S::Faint), sel_marker(selected)),
-            seg(Tok::Slot(S::Accent), format!("{label} · ")),
+            seg(
+                Tok::Slot(S::Accent),
+                format!("{label} {} ", crate::caps::active_glyphs().middot),
+            ),
             seg(Tok::Slot(S::Dim), location),
         ]),
         selected,
@@ -302,7 +324,10 @@ pub(crate) fn top_level_feedback_lines(
     for comment in &conversation.comments {
         out.push((
             Line::segs(vec![
-                seg(Tok::Slot(S::Accent), "TOP-LEVEL · "),
+                seg(
+                    Tok::Slot(S::Accent),
+                    format!("TOP-LEVEL {} ", crate::caps::active_glyphs().middot),
+                ),
                 seg(Tok::Slot(S::Text), comment.author.clone()).bold(),
             ]),
             false,

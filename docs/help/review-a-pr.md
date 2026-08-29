@@ -37,10 +37,10 @@ or previous thread (unresolved first), and `Enter` jumps to an exact
 report that they have no diff anchor. `v` toggles the view-local resolved
 threads display. `p` passes the selected thread and `P` passes all unresolved
 threads to the configured agent. A live agent pane in this worktree receives
-a non-submitting bracketed paste with no trailing newline; otherwise the
-configured headless PR-review template runs off-loop. If neither exists, the
-handoff reports why and does nothing. Pasting never auto-submits, resolves,
-approves, merges, or closes a PR.
+a non-submitting bracketed paste with no trailing newline; otherwise an
+explicit confirmation is required before the configured headless PR-review
+template runs off-loop. If neither exists, the handoff reports why and does
+nothing. Pasting never auto-submits, resolves, approves, merges, or closes a PR.
 
 ## Raising one
 

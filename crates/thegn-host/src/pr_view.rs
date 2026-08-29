@@ -600,9 +600,9 @@ impl PrView {
                     self.status = Some("no diff anchor".into());
                     return PrViewOutcome::Pending;
                 }
-                let Some(row) = self.open_file_rows(fi).iter().position(|row| {
-                    row_thread(row).is_some_and(|candidate| candidate.id == thread.id)
-                }) else {
+                let Some(row) = self.open_file_rows(fi).iter().position(
+                    |row| matches!(row, ReviewRow::Thread(candidate) if candidate.id == thread.id),
+                ) else {
                     self.status = Some("no diff anchor".into());
                     return PrViewOutcome::Pending;
                 };
@@ -913,20 +913,47 @@ impl PrView {
         if let Some(s) = &self.status {
             return Line::segs(vec![seg(Tok::Slot(S::Accent), s.clone())]);
         }
-        let hint = match self.tab {
-            PrTab::Overview => {
-                "M merge · A approve · R request-changes · C review · c comment · o browser"
-            }
-            PrTab::Checks => "↑↓ move · Enter open · r re-run failed · c comment",
-            PrTab::Conversation => {
-                "↑↓ move · n/N thread · Enter jump · r reply · p/P pass · v resolved"
-            }
-            PrTab::Files => {
-                "↑↓ move · n/N thread · Enter jump · p/P pass · v resolved · c comment line"
-            }
+        let glyphs = crate::caps::active_glyphs();
+        let movement = format!("{}{} move", glyphs.arrow_up, glyphs.arrow_down);
+        let actions: &[&str] = match self.tab {
+            PrTab::Overview => &[
+                "M merge",
+                "A approve",
+                "R request-changes",
+                "C review",
+                "c comment",
+                "o browser",
+            ],
+            PrTab::Checks => &["Enter open", "r re-run failed", "c comment"],
+            PrTab::Conversation => &[
+                "n/N thread",
+                "Enter jump",
+                "r reply",
+                "p/P pass",
+                "v resolved",
+            ],
+            PrTab::Files => &[
+                "n/N thread",
+                "Enter jump",
+                "p/P pass",
+                "v resolved",
+                "c comment line",
+            ],
+        };
+        let separator = format!(" {} ", glyphs.middot);
+        let hint = if self.tab == PrTab::Overview {
+            actions.join(&separator)
+        } else {
+            std::iter::once(movement.as_str())
+                .chain(actions.iter().copied())
+                .collect::<Vec<_>>()
+                .join(&separator)
         };
         Line::segs(vec![
-            seg(Tok::Slot(S::Faint), "Tab switch · "),
+            seg(
+                Tok::Slot(S::Faint),
+                format!("Tab switch {} ", glyphs.middot),
+            ),
             seg(Tok::Slot(S::Dim), hint),
         ])
     }
@@ -1180,7 +1207,10 @@ impl PrView {
                                 if unresolved > 0 {
                                     stats.push(seg(
                                         Tok::Slot(S::Accent),
-                                        format!(" · {unresolved} unresolved"),
+                                        format!(
+                                            " {} {unresolved} unresolved",
+                                            crate::caps::active_glyphs().middot
+                                        ),
                                     ));
                                 }
                                 stats
@@ -1493,6 +1523,49 @@ mod tests {
             v.composer.as_ref().map(|composer| &composer.target),
             Some(ComposerTarget::ThreadReply { thread_id, .. }) if thread_id == "outdated"
         ));
+    }
+
+    #[test]
+    fn conversation_enter_rejects_an_outdated_thread_in_the_same_file() {
+        let thread = ReviewThread {
+            id: "outdated".into(),
+            path: "src/current.rs".into(),
+            line: Some(99),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "please revisit".into(),
+                ..PrComment::default()
+            }],
+            ..ReviewThread::default()
+        };
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "src/current.rs".into(),
+                old_path: None,
+                hunks: vec![],
+            }],
+        };
+        let conversation = PrConversation {
+            threads: vec![thread],
+            ..PrConversation::default()
+        };
+        let mut v = sample();
+        v.diff = Some(diff.clone());
+        v.conversation = Some(conversation.clone());
+        v.review = Some(PrReviewSnapshot {
+            diff,
+            conversation,
+            ..PrReviewSnapshot::default()
+        });
+        v.switch_tab(PrTab::Conversation);
+
+        assert_eq!(
+            v.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            PrViewOutcome::Pending
+        );
+        assert_eq!(v.tab, PrTab::Conversation);
+        assert_eq!(v.open_file, None);
+        assert_eq!(v.status.as_deref(), Some("no diff anchor"));
     }
 
     #[test]

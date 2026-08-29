@@ -9385,12 +9385,13 @@ async fn event_loop<T: Terminal>(
             model.status = prev_status;
             model.masthead_sel = prev_masthead_sel;
             model.statusbar_sel = prev_statusbar_sel;
-            if let Some(review) = review_for_diff_view
-                && crate::actions::review_snapshot_matches_panel(&model.panel, &review)
-                && let Some(view) = diff_view.as_mut()
-                && view.set_review(Some(review), review_status_for_diff_view)
-            {
-                dirty = true;
+            if let Some(view) = diff_view.as_mut() {
+                let review = review_for_diff_view.filter(|review| {
+                    crate::actions::review_snapshot_matches_panel(&model.panel, review)
+                });
+                if view.set_review(review, review_status_for_diff_view) {
+                    dirty = true;
+                }
             }
             // Seed the stale-while-revalidate cache with this worktree's fresh
             // slice (pre LSP-merge: LSP diags live in their own per-root store
