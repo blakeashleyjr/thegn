@@ -1329,6 +1329,26 @@ fn db_wt(slug: &str, repo_path: &str) -> crate::sidebar::DbWorktree {
     }
 }
 
+fn db_wt_at(slug: &str, branch: &str, repo_path: &str, path: &str) -> crate::sidebar::DbWorktree {
+    let mut row = db_wt(slug, repo_path);
+    row.branch = branch.into();
+    row.tab_name = format!("{slug}/{branch}");
+    row.path = path.into();
+    row
+}
+
+fn live_session(slug: &str, branch: &str, path: &str) -> Session {
+    Session {
+        id: "s1".into(),
+        worktrees: vec![WorktreeGroup::new(
+            format!("{slug}/{branch}"),
+            GroupKind::Branch,
+            path,
+        )],
+        active: 0,
+    }
+}
+
 #[test]
 fn heal_fills_a_lost_repo_path_from_the_registry() {
     let mut workspaces = vec![(
@@ -1338,7 +1358,8 @@ fn heal_fills_a_lost_repo_path_from_the_registry() {
         String::new(),
     )];
     let db_worktrees = vec![db_wt("app", "/r/app")];
-    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    let session = live_session("app", "main", "/tmp/app/main");
+    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees, &session);
     assert_eq!(healed, 1);
     assert_eq!(workspaces[0].3, "/r/app");
 }
@@ -1352,7 +1373,8 @@ fn heal_leaves_db_backed_entries_alone() {
         "/r/app".to_string(),
     )];
     let db_worktrees = vec![db_wt("app", "/r/other")];
-    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    let session = live_session("app", "main", "/tmp/app/main");
+    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees, &session);
     assert_eq!(healed, 0);
     assert_eq!(
         workspaces[0].3, "/r/app",
@@ -1369,9 +1391,10 @@ fn heal_is_idempotent() {
         String::new(),
     )];
     let db_worktrees = vec![db_wt("app", "/r/app")];
-    let first = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    let session = live_session("app", "main", "/tmp/app/main");
+    let first = heal_workspace_paths(&mut workspaces, &db_worktrees, &session);
     assert_eq!(first, 1);
-    let second = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    let second = heal_workspace_paths(&mut workspaces, &db_worktrees, &session);
     assert_eq!(second, 0);
     assert_eq!(workspaces[0].3, "/r/app");
 }
@@ -1385,9 +1408,55 @@ fn heal_does_nothing_when_the_registry_is_empty() {
         String::new(),
     )];
     let db_worktrees: Vec<crate::sidebar::DbWorktree> = vec![];
-    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    let session = live_session("app", "main", "/tmp/app/main");
+    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees, &session);
     assert_eq!(healed, 0);
     assert!(workspaces[0].3.is_empty());
+}
+
+#[test]
+fn heal_requires_live_identity_and_keeps_same_basename_repos_separate() {
+    let mut workspaces = vec![
+        ("app".into(), "app".into(), "repo".into(), String::new()),
+        ("app-2".into(), "app-2".into(), "repo".into(), String::new()),
+    ];
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![
+            WorktreeGroup::new("app/feat", GroupKind::Branch, "/tmp/app/feat"),
+            WorktreeGroup::new("app-2/feat", GroupKind::Branch, "/tmp/app-2/feat"),
+        ],
+        active: 0,
+    };
+    let db_worktrees = vec![
+        // An empty row cannot heal anything.
+        db_wt_at("app", "feat", "", "/tmp/app/feat"),
+        // A foreign row with the same slug but a different live path cannot
+        // poison the recovery.
+        db_wt_at("app", "feat", "/repos/foreign-app", "/tmp/foreign/feat"),
+        db_wt_at("app", "feat", "/repos/app", "/tmp/app/feat"),
+        // Distinct stable slug for the second repo with the same basename.
+        db_wt_at("app-2", "feat", "/repos/app-2", "/tmp/app-2/feat"),
+    ];
+    assert_eq!(
+        heal_workspace_paths(&mut workspaces, &db_worktrees, &session),
+        2
+    );
+    assert_eq!(workspaces[0].3, "/repos/app");
+    assert_eq!(workspaces[1].3, "/repos/app-2");
+
+    let mut uncorroborated = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+    let foreign_only = vec![db_wt_at(
+        "app",
+        "feat",
+        "/repos/foreign-app",
+        "/tmp/foreign/feat",
+    )];
+    assert_eq!(
+        heal_workspace_paths(&mut uncorroborated, &foreign_only, &session),
+        0
+    );
+    assert!(uncorroborated[0].3.is_empty());
 }
 
 #[test]
@@ -1402,13 +1471,27 @@ fn healed_live_fallback_renders_its_registered_worktrees() {
         String::new(),
     )];
     let mut healed = unhealed.clone();
-    let db_worktrees = vec![db_wt("app", "/r/app"), db_wt("app", "/r/app")];
-    heal_workspace_paths(&mut healed, &db_worktrees);
+    let mut first = db_wt("app", "/r/app");
+    first.tab_name = "app/one".into();
+    first.path = "/tmp/app/one".into();
+    let mut second = db_wt("app", "/r/app");
+    second.tab_name = "app/two".into();
+    second.path = "/tmp/app/two".into();
+    let mut third = db_wt("app", "/r/app");
+    third.tab_name = "app/three".into();
+    third.path = "/tmp/app/three".into();
+    let db_worktrees = vec![first, second, third];
+    let session = live_session("app", "one", "/tmp/app/one");
+    heal_workspace_paths(&mut healed, &db_worktrees, &session);
     assert_eq!(healed[0].3, "/r/app");
 
     let session = Session {
         id: "s1".into(),
-        worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/r/app")],
+        worktrees: vec![WorktreeGroup::new(
+            "app/one",
+            GroupKind::Branch,
+            "/tmp/app/one",
+        )],
         active: 0,
     };
 
@@ -1431,7 +1514,7 @@ fn healed_live_fallback_renders_its_registered_worktrees() {
     );
     let unhealed_wt_count = unhealed_rows
         .iter()
-        .filter(|r| matches!(r.kind, crate::sidebar::RowKind::Worktree { .. }))
+        .filter(|r| matches!(r.kind, crate::sidebar::RowKind::Worktree))
         .count();
     // Live session group still renders.
     assert!(
@@ -1451,10 +1534,10 @@ fn healed_live_fallback_renders_its_registered_worktrees() {
     );
     let healed_wt_count = healed_rows
         .iter()
-        .filter(|r| matches!(r.kind, crate::sidebar::RowKind::Worktree { .. }))
+        .filter(|r| matches!(r.kind, crate::sidebar::RowKind::Worktree))
         .count();
     assert!(
-        healed_wt_count >= 1 + 2,
+        healed_wt_count > 2,
         "healed: live group + ≥2 registry rows, got {healed_wt_count}"
     );
     assert!(

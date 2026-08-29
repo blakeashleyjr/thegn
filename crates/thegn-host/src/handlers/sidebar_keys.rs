@@ -1379,15 +1379,17 @@ mod tests {
     #[test]
     fn cursor_repo_root_is_none_for_a_live_fallback_workspace_row() {
         use crate::sidebar::{RowKind, SidebarRow};
-        let mut model = FrameModel::default();
+        let mut model = FrameModel {
+            sidebar_workspaces: vec![(
+                "live-fb".to_string(),
+                "live-fb".to_string(),
+                "git".to_string(),
+                "".to_string(),
+            )],
+            ..Default::default()
+        };
         // Empty repo_path (4th tuple element) simulates a live fallback whose
         // registry heal also failed.
-        model.sidebar_workspaces = vec![(
-            "live-fb".to_string(),
-            "live-fb".to_string(),
-            "git".to_string(),
-            "".to_string(),
-        )];
         let row = SidebarRow::base(RowKind::Workspace, 1, "live-fb", "live-fb");
         model.sidebar_rows = vec![row];
 
@@ -1406,13 +1408,15 @@ mod tests {
     #[test]
     fn new_worktree_key_refuses_a_live_fallback_workspace_row() {
         use crate::sidebar::{RowKind, SidebarRow};
-        let mut model = FrameModel::default();
-        model.sidebar_workspaces = vec![(
-            "live-fb".to_string(),
-            "live-fb".to_string(),
-            "git".to_string(),
-            "".to_string(),
-        )];
+        let mut model = FrameModel {
+            sidebar_workspaces: vec![(
+                "live-fb".to_string(),
+                "live-fb".to_string(),
+                "git".to_string(),
+                "".to_string(),
+            )],
+            ..Default::default()
+        };
         let row = SidebarRow::base(RowKind::Workspace, 1, "live-fb", "live-fb");
         model.sidebar_rows = vec![row];
 
@@ -1436,13 +1440,15 @@ mod tests {
         use crate::sidebar::{RowKind, SidebarRow};
 
         // Resolvable workspace row => Root
-        let mut model = FrameModel::default();
-        model.sidebar_workspaces = vec![(
-            "ok".to_string(),
-            "ok".to_string(),
-            "git".to_string(),
-            "/repo".to_string(),
-        )];
+        let mut model = FrameModel {
+            sidebar_workspaces: vec![(
+                "ok".to_string(),
+                "ok".to_string(),
+                "git".to_string(),
+                "/repo".to_string(),
+            )],
+            ..Default::default()
+        };
         let mut row = SidebarRow::base(RowKind::Workspace, 0, "ok", "ok");
         row.worktree_path = Some("/repo".to_string());
         model.sidebar_rows = vec![row];
@@ -1455,19 +1461,21 @@ mod tests {
         }
 
         // Unresolvable workspace row => Refuse
-        let mut model2 = FrameModel::default();
-        model2.sidebar_workspaces = vec![(
-            "live-fb".to_string(),
-            "live-fb".to_string(),
-            "git".to_string(),
-            "".to_string(),
-        )];
-        model2.sidebar_rows = vec![SidebarRow::base(
-            RowKind::Workspace,
-            1,
-            "live-fb",
-            "live-fb",
-        )];
+        let model2 = FrameModel {
+            sidebar_workspaces: vec![(
+                "live-fb".to_string(),
+                "live-fb".to_string(),
+                "git".to_string(),
+                "".to_string(),
+            )],
+            sidebar_rows: vec![SidebarRow::base(
+                RowKind::Workspace,
+                1,
+                "live-fb",
+                "live-fb",
+            )],
+            ..Default::default()
+        };
         match sb.new_worktree_target(&model2, true) {
             crate::handlers::sidebar_keys::NewWorktreeTarget::Refuse(msg) => {
                 assert!(!msg.is_empty());
@@ -1482,13 +1490,15 @@ mod tests {
         }
 
         // Terminals row => ActiveFallback (defensive)
-        let mut model_terms = FrameModel::default();
-        model_terms.sidebar_rows = vec![SidebarRow::base(
-            RowKind::SectionHeading,
-            0,
-            "TERMINALS",
-            "terminals",
-        )];
+        let model_terms = FrameModel {
+            sidebar_rows: vec![SidebarRow::base(
+                RowKind::SectionHeading,
+                0,
+                "TERMINALS",
+                "terminals",
+            )],
+            ..Default::default()
+        };
         match sb.new_worktree_target(&model_terms, true) {
             crate::handlers::sidebar_keys::NewWorktreeTarget::ActiveFallback => {}
             other => panic!("expected ActiveFallback for terminals row, got {other:?}"),

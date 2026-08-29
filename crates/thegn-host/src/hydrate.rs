@@ -1375,24 +1375,44 @@ pub(crate) fn merge_workspace_lists(
 }
 
 /// Recover a live-fallback workspace's lost repo root from the worktree
-/// registry: every [`DbWorktree`](crate::sidebar::DbWorktree) of the slug
-/// carries its repo's root, so the first non-empty match repairs the entry.
-/// Pure, no I/O — hydration and the loop-side switch rebuild both run it.
-/// Idempotent; never touches entries that already carry a path.
+/// registry: a matching live tab/path corroborates the slug before its repo
+/// root is copied. This prevents a stale row from a different checkout from
+/// poisoning recovery merely by retaining a colliding slug. Pure, no I/O —
+/// hydration and the loop-side switch rebuild both run it. Idempotent; never
+/// touches entries that already carry a path.
 pub(crate) fn heal_workspace_paths(
     workspaces: &mut [(String, String, String, String)],
     db_worktrees: &[crate::sidebar::DbWorktree],
+    session: &crate::session::Session,
 ) -> usize {
     let mut healed = 0usize;
     for ws in workspaces.iter_mut() {
         if !ws.3.is_empty() {
             continue;
         }
-        if let Some(row) = db_worktrees
-            .iter()
-            .find(|r| r.slug == ws.0 && !r.repo_path.is_empty())
+        let mut roots = db_worktrees.iter().filter_map(|r| {
+            (r.slug == ws.0
+                && !r.repo_path.is_empty()
+                // The slug is the namespace, but the live tab/path pair
+                // is the corroborating identity. A stale row from a
+                // different checkout must not donate its repo root just
+                // because it retained a colliding slug.
+                && session
+                    .worktrees
+                    .iter()
+                    .any(|g| g.name == r.tab_name && g.path == r.path && !g.path.is_empty()))
+            .then_some(r.repo_path.as_str())
+        });
+        let Some(root) = roots.next() else {
+            continue;
+        };
+        // Conflicting rows with the same live identity are ambiguous. Refuse
+        // to heal rather than let DB row order choose a workspace.
+        if roots.any(|candidate| candidate != root) {
+            continue;
+        }
         {
-            ws.3 = row.repo_path.clone();
+            ws.3 = root.to_string();
             healed += 1;
             tracing::debug!(
                 target: "thegn::hydrate",
@@ -2453,6 +2473,10 @@ pub(crate) fn build_model(
     let counted_kinds = app_cfg.notifications.counted_unread_kind_names();
 
     let mut sidebar_workspaces = workspace_list(session, Some(db));
+    let sidebar_db_worktrees = db_worktree_list(db, &app_cfg);
+    // Recover lost repo paths before querying folders: folder rows are keyed by
+    // the same repo root and otherwise remain hidden for this pass.
+    heal_workspace_paths(&mut sidebar_workspaces, &sidebar_db_worktrees, session);
     // Folders for every workspace shown in the sidebar (not just the active
     // tab's): the sidebar filters this list per-workspace by `repo_path`, so a
     // worktree filed into a folder stays visible whichever tab is active.
@@ -2461,11 +2485,6 @@ pub(crate) fn build_model(
         .filter(|(_, _, _, repo)| !repo.is_empty())
         .flat_map(|(_, _, _, repo)| db.folders_for_workspace(repo).unwrap_or_default())
         .collect();
-    let sidebar_db_worktrees = db_worktree_list(db, &app_cfg);
-    // Recover lost repo paths from the worktree registry: a live-fallback
-    // workspace (empty repo_path) that has registered worktrees picks up its
-    // real root so those rows render in the sidebar.
-    heal_workspace_paths(&mut sidebar_workspaces, &sidebar_db_worktrees);
     let sidebar_db_terminals = crate::hydrate_terminal::sidebar_terminals(db);
     // One-shot at process start: collapse any stale running/active activity dot
     // (a session killed mid-run) to a settled state before the sidebar first

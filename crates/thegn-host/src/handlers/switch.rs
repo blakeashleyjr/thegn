@@ -98,7 +98,7 @@ pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &
     // a live-fallback workspace that has registered worktrees picks up its
     // real root so those rows render in the sidebar.
     let registry = std::mem::take(&mut model.sidebar_db_worktrees);
-    crate::hydrate::heal_workspace_paths(&mut model.sidebar_workspaces, &registry);
+    crate::hydrate::heal_workspace_paths(&mut model.sidebar_workspaces, &registry, session);
     model.sidebar_db_worktrees = registry;
     // Overlay last-known-good git glyphs from the persistent cache so
     // dirty-dots / ahead-behind arrows persist instantly across a switch
