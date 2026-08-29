@@ -41,17 +41,18 @@ to 95% first.
 
 ## Tiers
 
-| Stage          | What runs                                                                      | Where            |
-| -------------- | ------------------------------------------------------------------------------ | ---------------- |
-| **inner loop** | `just quick [crate]` — clippy on lib/bin only (no tests/coverage)              | on demand (fast) |
-| **pre-commit** | treefmt, shellcheck, yamllint                                                  | git-hook (fast)  |
-| **pre-push**   | clippy, `cargo test`, smoke                                                    | git-hook         |
-| **CI**         | `just ci` (fmt + lint + build + test + **coverage** + smoke + e2e + nix-build) | authoritative    |
+| Stage          | What runs                                                                               | Where            |
+| -------------- | --------------------------------------------------------------------------------------- | ---------------- |
+| **inner loop** | `just quick [crate]` — clippy on lib/bin only (no tests/coverage)                       | on demand (fast) |
+| **pre-commit** | treefmt, shellcheck, yamllint                                                           | git-hook (fast)  |
+| **pre-push**   | clippy, `cargo test`, smoke                                                             | git-hook         |
+| **CI**         | `just ci` (fmt + lint + build + test + **coverage** + smoke + nix-build; no `just e2e`) | authoritative    |
 
 Coverage (`cargo llvm-cov`) is a **CI-only** gate — it is an instrumented full
 recompile (the heaviest phase) and CI re-runs it regardless, so it is no longer
-on pre-push. Run `just coverage` locally on demand before opening a PR. The e2e
-suite sandboxes `HOME`, the XDG dirs, git config and the daemon runtime dir
+on pre-push. Run `just coverage` locally only once at the final/pre-PR boundary,
+if needed; do not pay for it after every edit. The e2e suite is part of
+`just ci-local`, not `just ci`, and sandboxes `HOME`, the XDG dirs, git config and the daemon runtime dir
 into a throwaway directory, so it never leaks into the daily session or DB.
 
 ## End-to-end (`just e2e`)
