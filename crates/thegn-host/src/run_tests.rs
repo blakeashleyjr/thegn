@@ -25,6 +25,7 @@ impl Drop for XdgGuard {
     }
 }
 use crate::center::CenterTree;
+use crate::drawer_state::DrawerPool;
 use crate::hydrate::build_model;
 use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};

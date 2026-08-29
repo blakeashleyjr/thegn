@@ -781,7 +781,7 @@ pub(crate) fn build_drawer_palette(
 ) -> Vec<crate::palette::PaletteItem> {
     thegn_core::config_drawer::drawer_policy(cfg)
         .occupants()
-        .into_iter()
+        .iter()
         .map(|occupant| {
             let label = if occupant.id == thegn_core::config_drawer::FILES_OCCUPANT_ID {
                 "files (built-in)".to_string()

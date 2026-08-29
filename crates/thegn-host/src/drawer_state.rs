@@ -6,9 +6,10 @@
 //! Three rules keep the drawer off the event loop's critical path:
 //!
 //! 1. **Flags are memory-first.** Whether a worktree's drawer is open persists
-//!    as a tiny per-worktree file under `~/.thegn/drawer/` so it survives
-//!    restarts, but the loop only ever reads the in-process cache ([`flag`]);
-//!    writes are write-through ([`set_flag`]: cache now, file off-loop). Before
+//!    as a tiny scope-keyed file under `~/.thegn/drawer/` so it survives
+//!    restarts, but the loop only ever reads the in-process cache
+//!    ([`desired_occupant`]); writes are write-through
+//!    ([`set_desired_occupant`]: cache now, file off-loop). Before
 //!    this cache every tab/worktree switch paid a synchronous `read_to_string`
 //!    on the loop.
 //! 2. **Cold spawns resolve off-loop.** Materializing a drawer pane means
@@ -321,8 +322,7 @@ struct RegistrySpawner {
 
 static REGISTRY_SPAWNER: OnceLock<RegistrySpawner> = OnceLock::new();
 
-/// Install the scope-aware registry channel. Kept separate from the legacy
-/// files-only channel so chunk 3 can migrate the loop in one integration edit.
+/// Install the scope-aware registry channel used by the single drawer runtime.
 pub(crate) fn install_registry_spawner(
     tx: tokio_mpsc::UnboundedSender<DrawerRegistryMsg>,
     waker: TerminalWaker,
@@ -493,7 +493,7 @@ fn contain_drawer_argv(
 }
 
 /// The currently visible drawer occupant. The pool key is authoritative for
-/// reuse; `home` is retained for the legacy file-manager compatibility path.
+/// reuse; `worktree` records the destination used when the pane was opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisibleDrawer {
     pub key: DrawerPoolKey,
@@ -510,6 +510,7 @@ pub(crate) struct DrawerRuntime {
     pub visible: Option<VisibleDrawer>,
     pub pool: DrawerPool,
     last: HashMap<String, String>,
+    prewarming: HashSet<DrawerPoolKey>,
 }
 
 impl DrawerRuntime {
@@ -599,6 +600,7 @@ impl DrawerRuntime {
     ) {
         let key = DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID);
         if self.visible.is_none() && !self.pool.contains_key(&key) && cfg.drawer.pool_limit > 0 {
+            self.prewarming.insert(key);
             request_occupant_spawn(cfg, DrawerScope::Worktree, FILES_OCCUPANT_ID, dir);
         }
     }
@@ -625,6 +627,12 @@ impl DrawerRuntime {
         let id = occupant_id;
         self.last
             .insert(drawer_scope_key(state_scope, dir), id.to_string());
+        if state_scope == DrawerScope::Global {
+            // An explicit global picker/cycle choice must become visible even
+            // when the active worktree has an older remembered occupant. The
+            // worktree slot remains independent on later switches.
+            set_desired_occupant(DrawerScope::Worktree, dir, None);
+        }
         set_desired_occupant(state_scope, dir, Some(id));
         self.reconcile(cfg, dir, panes, rect);
         true
@@ -674,8 +682,12 @@ impl DrawerRuntime {
         panes: &mut Panes,
         rect: Rect,
     ) {
-        if desired_occupant(scope, dir).is_some() {
-            self.close(cfg, scope, dir, panes, rect);
+        if let Some(visible) = self.visible.as_ref() {
+            self.close(cfg, visible.scope, dir, panes, rect);
+            return;
+        }
+        if let Some((target_scope, _, _)) = Self::target(dir) {
+            self.close(cfg, target_scope, dir, panes, rect);
             return;
         }
         let key = drawer_scope_key(scope, dir);
@@ -683,10 +695,8 @@ impl DrawerRuntime {
             .last
             .get(&key)
             .cloned()
+            .or_else(|| self.last.get(GLOBAL_SCOPE_KEY).cloned())
             .unwrap_or_else(|| FILES_OCCUPANT_ID.into());
-        if scope == DrawerScope::Global && id == FILES_OCCUPANT_ID {
-            return;
-        }
         let _ = self.select(cfg, scope, &id, dir, panes, rect);
     }
 
@@ -734,14 +744,15 @@ impl DrawerRuntime {
         rect: Rect,
     ) {
         request_done_occupant(&request);
-        let desired = desired_occupant(request.scope, &request.worktree);
-        if desired.as_deref() != Some(request.occupant_id.as_str()) {
-            return;
-        }
         let key = DrawerPoolKey {
             scope_key: request.scope_key.clone(),
             occupant_id: request.occupant_id.clone(),
         };
+        let prewarming = self.prewarming.remove(&key);
+        let desired = desired_occupant(request.scope, &request.worktree);
+        if desired.as_deref() != Some(request.occupant_id.as_str()) && !prewarming {
+            return;
+        }
         let launch = match result {
             Ok(launch) => launch,
             Err(error) => {
@@ -933,6 +944,31 @@ mod tests {
             DrawerRuntime::selection_scope(&policy, DrawerScope::Worktree, FILES_OCCUPANT_ID),
             Some(DrawerScope::Worktree)
         );
+    }
+
+    #[test]
+    fn files_prewarm_is_tracked_by_the_runtime_pool() {
+        let (tx, _rx) = tokio_mpsc::channel(TEST_PANE_EVENT_CHANNEL_CAPACITY);
+        let mut panes = Panes::new(tx);
+        let mut runtime = DrawerRuntime::default();
+        let dir = Path::new("/tmp/drawer-prewarm");
+        runtime.prewarm_files(
+            &thegn_core::config::Config::default(),
+            dir,
+            &mut panes,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 10,
+            },
+        );
+        assert!(
+            runtime
+                .prewarming
+                .contains(&DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID))
+        );
+        assert!(runtime.pool.hidden.is_empty());
     }
 
     #[test]
