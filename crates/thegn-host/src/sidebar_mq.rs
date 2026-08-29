@@ -22,7 +22,7 @@ pub(crate) struct MqToken {
 /// The count is dropped before the marker, and the marker is dropped last.
 pub(crate) fn token(rollup: MqRollup, available: usize) -> Option<MqToken> {
     let marker = tier_marker(rollup.tier);
-    let full = format!("{}{marker}", rollup.count);
+    let full = format!("{} {marker}", rollup.count);
     let marker_only = marker.to_string();
     let fg = tier_tone(rollup.tier);
     let full_width = seg_width(&[seg(fg, full.clone())]);
@@ -81,11 +81,11 @@ mod tests {
 
     #[test]
     fn token_uses_full_then_marker_then_hidden() {
-        let full = token(rollup(MqTier::Working, 2), 2).unwrap();
-        assert_eq!(full.width, 2);
+        let full = token(rollup(MqTier::Working, 2), 3).unwrap();
+        assert_eq!(full.width, 3);
         assert_eq!(
             full.segments[0].text,
-            format!("2{}", crate::caps::active_glyphs().dot_filled)
+            format!("2 {}", crate::caps::active_glyphs().dot_filled)
         );
 
         let marker = token(rollup(MqTier::Working, 12), 1).unwrap();

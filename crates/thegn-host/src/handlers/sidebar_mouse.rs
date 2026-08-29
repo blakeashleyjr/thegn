@@ -235,6 +235,23 @@ pub(crate) fn on_left_press(
         return PressOut::Consumed;
     }
 
+    // The workspace token is a scoped door to the existing queue section. It
+    // is checked after caret/Ctrl-click guards so those established gestures
+    // keep their precedence, and before ordinary workspace activation.
+    if hit.kind == RowKind::Workspace
+        && hit
+            .mq_span
+            .is_some_and(|(start, end)| mx >= start && mx < end)
+        && let Some(repo_path) = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .nth(hit.visible_index)
+            .and_then(|row| row.worktree_path.clone())
+    {
+        return PressOut::Outcome(SidebarOutcome::OpenMergeQueue { repo_path });
+    }
+
     // Double-click: second press on the same row within the window.
     let double = ui.last_click.as_ref().is_some_and(|(k, at)| {
         *k == hit.pin_key && now.duration_since(*at).as_millis() <= DOUBLE_CLICK_MS
@@ -1997,6 +2014,41 @@ mod tests {
         let mut model2 = model.clone();
         model2.sidebar_rows[3].folder_id = Some(-1);
         assert!(drag_src_for(&sb, &model2, &session, hit).is_none());
+    }
+
+    #[test]
+    fn workspace_token_click_returns_the_existing_merge_queue_outcome() {
+        use thegn_core::merge_queue_view::{MqRollup, MqTier};
+
+        let (mut model, rect) = fixture();
+        model.sidebar_rows[0].mq_rollup = Some(MqRollup {
+            tier: MqTier::Blocked,
+            count: 1,
+        });
+        let hit = hit_rows(&model, rect)
+            .into_iter()
+            .find(|hit| hit.pin_key == "app")
+            .expect("workspace token row");
+        let (start, end) = hit.mq_span.expect("workspace token span");
+        let mut sb = SidebarState::default();
+        let mut ui = MouseUi::default();
+        let out = on_left_press(
+            &mut ui,
+            &mut sb,
+            &mut model,
+            &crate::session::Session::default(),
+            rect,
+            start,
+            hit.y + hit.lead_gap,
+            false,
+            Instant::now(),
+        );
+        assert!(matches!(
+            out,
+            PressOut::Outcome(SidebarOutcome::OpenMergeQueue { ref repo_path })
+                if repo_path == "/repos/app"
+        ));
+        assert!(end > start);
     }
 
     #[test]
