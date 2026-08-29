@@ -497,7 +497,7 @@ impl NotificationStore for Db {
 /// The explicit column list every `AgentDispatch` read selects, paired with
 /// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
 /// apart when the roster gains a column (v56 added four at once; v59 added
-/// `note`; v60 added `chunk_path`).
+/// `note`; v60 added `chunk_path`; v61 added `report`).
 const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
      stage, parent_id, session_id, artifact_path, note, chunk_path, report";
 

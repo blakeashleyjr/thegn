@@ -615,7 +615,9 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // exactly the pre-change behaviour. Idempotent (`ALTER` fails harmlessly
     // once the column exists) so parallel-branch DBs sharing the file tolerate
     // it.
-    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN report TEXT", []);
+    if !has_column(conn, "agent_dispatches", "report") {
+        let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN report TEXT", []);
+    }
     // v61 companion: per-row progress queue — a worker or monitor appends short
     // notes (≤4 KiB), read newest-last by `dispatch status`. Kept separate from
     // `agent_dispatches.note` (the daemon's transport-retry observer ledger):
