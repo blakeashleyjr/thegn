@@ -31,7 +31,7 @@ impl Db {
         if self.get_dispatch(id)?.is_none() {
             anyhow::bail!("roster row {id} does not exist");
         }
-        let now = util::now();
+        let now = util::now_ms();
         self.conn().execute(
             "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, now, text],
@@ -150,16 +150,13 @@ mod tests {
         let _n1 = db.append_dispatch_note(id, "early").unwrap();
         // Read the timestamp of the first note so we can filter strictly after it.
         let n1_ts = db.dispatch_notes(id, None, 0).unwrap()[0].created_at_ms;
-        // `append_dispatch_note` uses the roster's existing epoch-seconds
-        // stamp convention, so wait for the next second before the second
-        // insert to make the strict `since` filter observable.
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Wait for a distinct millisecond so the strict `since` filter is
+        // observable without imposing a human-scale delay on the test.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let _n2 = db.append_dispatch_note(id, "late").unwrap();
 
         // Filter by since: only "late" should return (created_at_ms > n1_ts)
         let filtered = db.dispatch_notes(id, Some(n1_ts), 0).unwrap();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].text, "late");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].text, "late");
 
