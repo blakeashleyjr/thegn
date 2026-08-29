@@ -1453,6 +1453,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_PICKER", "fzf"),
         ("THEGN_GIT_BACKEND", "cli"),
         ("THEGN_GIT_STRUCTURAL_DIFF", "difft"),
+        ("THEGN_GIT_SUBMODULES", "off"),
         ("THEGN_EDITOR_COMMAND", "hx {path}"),
         ("THEGN_EDITOR_OPEN_IN", "external"),
         ("THEGN_WORKTREE_MODE", "in_repo"),
@@ -1523,6 +1524,7 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.branch_prefix, "x/");
     assert_eq!(c.git.backend, GitBackendKind::Cli);
     assert_eq!(c.git.structural_diff, StructuralDiff::Difft);
+    assert_eq!(c.git.submodules, SubmoduleMode::Off);
     assert_eq!(c.editor.command, "hx {path}");
     assert_eq!(c.editor.open_in, EditorOpenIn::External);
     assert_eq!(c.picker, Picker::Fzf);

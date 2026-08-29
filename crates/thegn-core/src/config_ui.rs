@@ -92,6 +92,8 @@ pub struct UiConfig {
     /// Show the jujutsu-colocation marker (`ĵ`) in a worktree row's right cluster
     /// when the repo has a `.jj/` beside `.git/`.
     pub sidebar_show_jj: bool,
+    /// Show a separate indicator when a submodule pointer or checkout is dirty.
+    pub sidebar_show_submodules: bool,
     /// Which rows expand to a detail line while the sidebar is focused (see
     /// [`FocusDetail`]).
     pub sidebar_focus_detail: FocusDetail,
@@ -137,6 +139,7 @@ impl Default for UiConfig {
             sidebar_show_ahead_behind: true,
             sidebar_show_pr_chip: true,
             sidebar_show_jj: true,
+            sidebar_show_submodules: true,
             sidebar_focus_detail: FocusDetail::default(),
             sidebar_detail_branch: true,
             sidebar_detail_branch_stat: true,
@@ -266,6 +269,7 @@ mod tests {
         assert!(cfg.sidebar_show_ahead_behind);
         assert!(cfg.sidebar_show_pr_chip);
         assert!(cfg.sidebar_show_jj);
+        assert!(cfg.sidebar_show_submodules);
         assert!(cfg.sidebar_detail_branch);
         assert!(cfg.sidebar_icon_ahead.is_empty());
         // Defaults survive an empty table.
