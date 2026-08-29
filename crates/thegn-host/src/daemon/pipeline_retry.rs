@@ -385,6 +385,7 @@ async fn cold_stage_prompt(svc: &DaemonService, row: &AgentDispatch) -> anyhow::
         &stage_name,
         &artifact,
         &parent_artifact,
+        row.id,
     );
     crate::stage_prompt::render_stage(&stage_name, &stage.prompt, &vars)
 }

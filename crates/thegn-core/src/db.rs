@@ -127,7 +127,13 @@ use std::path::PathBuf;
 /// old. The write side was fixed; those rows never were. This bump multiplies
 /// them by 1000. See [`crate::issue::normalize_dispatch_ms`], the read-side
 /// guard for values that never pass through this migration.
-pub const SCHEMA_VERSION: i64 = 60;
+///
+/// v61: adds `agent_dispatches.report` (the worker's structured handoff
+/// summary, ≤16 KiB) and the `agent_dispatch_notes` table (per-row progress
+/// queue; kept separate from `agent_dispatches.note` which is the daemon's
+/// transport-retry observer ledger). Purely additive — a pre-v61 row reads
+/// back `report = None`, which is exactly the pre-change behaviour.
+pub const SCHEMA_VERSION: i64 = 61;
 
 pub struct Db {
     conn: Connection,
@@ -717,8 +723,22 @@ impl Db {
               worktree_path    TEXT    NOT NULL,
               agent_name       TEXT    NOT NULL,
               dispatched_at_ms INTEGER NOT NULL,
-              status           TEXT    NOT NULL DEFAULT 'queued'
+              status           TEXT    NOT NULL DEFAULT 'queued',
+              report           TEXT
             );
+            -- v61: per-row progress queue — a worker or monitor appends short
+            -- notes (≤4 KiB), read newest-last by dispatch status.
+            -- Kept separate from `agent_dispatches.note` (the daemon's
+            -- transport-retry observer ledger): conflating them would make
+            -- every progress read re-parse for transport artifacts.
+            CREATE TABLE IF NOT EXISTS agent_dispatch_notes (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              dispatch_id    INTEGER NOT NULL,
+              created_at_ms  INTEGER NOT NULL,
+              text           TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
+              ON agent_dispatch_notes (dispatch_id, created_at_ms);
             -- v13: sandbox audit trail.  Exec events (commands run inside
             -- containers), network events (outbound connections), and GC events
             -- (orphan teardown) from the sandbox subsystem.
@@ -910,6 +930,9 @@ impl Db {
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
+        if ver < SCHEMA_VERSION {
+            crate::db_migrate::verify_v61_schema(&conn)?;
+        }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;

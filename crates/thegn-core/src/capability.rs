@@ -612,6 +612,24 @@ pub const CATALOG: &[HostCapability] = &[
         "Block until an active roster row's session exits (the supervisor wake primitive)",
     ),
     cap(
+        "dispatches.report",
+        Verb::DispatchesReport,
+        SurfaceSet::of(&[Surface::Cli]),
+        "File a worker's structured handoff summary on a roster row",
+    ),
+    cap(
+        "dispatches.note",
+        Verb::DispatchesNote,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Append a progress note to a roster row's queue",
+    ),
+    cap(
+        "dispatches.status",
+        Verb::DispatchesStatus,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Read one or all rows' status digest with reports and notes",
+    ),
+    cap(
         "worktrees.create",
         Verb::WorktreeCreate,
         SurfaceSet::ALL,
