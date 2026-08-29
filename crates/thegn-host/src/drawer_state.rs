@@ -22,8 +22,6 @@
 //!    survives); showing takes it back instantly ([`DrawerPool`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(unix)]
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -55,6 +53,12 @@ impl FlagCache {
     /// process-local and any stale on-disk value is ignored.
     pub(crate) fn load_from(store: &Path) -> Self {
         let mut map = HashMap::new();
+        let Ok(store_metadata) = std::fs::symlink_metadata(store) else {
+            return FlagCache { map };
+        };
+        if !store_metadata.file_type().is_dir() {
+            return FlagCache { map };
+        }
         if let Ok(rd) = std::fs::read_dir(store) {
             for e in rd.flatten() {
                 let path = e.path();
@@ -135,63 +139,11 @@ fn set_desired_key(key: &str, occupant: Option<&str>) {
     }
     let path = store_dir().join(key);
     let value = occupant.unwrap_or("false").to_string();
-    let write = move || write_state_file(&path, &value);
+    let write = move || crate::platform::write_state_file(&path, &value);
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::spawn_blocking(write);
     } else {
         write();
-    }
-}
-
-/// Persist a recoverable UI-cache value without following an attacker-created
-/// state-file symlink. Unix publishes a same-directory temp file atomically,
-/// which also avoids exposing a partially-written occupant ID to another
-/// thegn process. Non-Unix platforms retain the direct-write fallback only
-/// after rejecting existing non-regular targets.
-fn write_state_file(path: &Path, value: &str) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed("drawer-state"));
-        let tmp = parent.join(format!(
-            ".{name}.tmp-{}-{}",
-            std::process::id(),
-            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&tmp) else {
-            return;
-        };
-        if file.write_all(value.as_bytes()).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-        drop(file);
-        if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if !metadata.file_type().is_file() => return,
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return,
-            _ => {}
-        }
-        let _ = std::fs::write(path, value);
     }
 }
 
@@ -1036,12 +988,55 @@ mod tests {
         let state = store.join("state");
         symlink(&outside, &state).unwrap();
 
-        write_state_file(&state, "tool:db");
+        crate::platform::write_state_file(&state, "tool:db");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep-me");
         assert_eq!(std::fs::read_to_string(&state).unwrap(), "tool:db");
 
         let _ = std::fs::remove_dir_all(&store); // best-effort: test scratch cleanup
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_cache_write_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("tg-drawer-symlink-parent-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &root).unwrap();
+
+        crate::platform::write_state_file(&root.join("state"), "must-not-escape");
+        assert!(!outside.join("state").exists());
+
+        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flag_cache_ignores_symlinked_store_directory() {
+        use std::os::unix::fs::symlink;
+
+        let store =
+            std::env::temp_dir().join(format!("tg-drawer-symlink-store-{}", std::process::id()));
+        let outside = store.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("linked"), "true").unwrap();
+        symlink(&outside, &store).unwrap();
+
+        let cache = FlagCache::load_from(&store);
+        assert_eq!(cache.occupant_for_key("linked"), None);
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
