@@ -461,6 +461,15 @@
       # CARGO_BUILD_JOBS headroom, pinned yazi, OpenSpec seeding). Used by BOTH the
       # full `default` shell and the trimmed `sprite-full` shell so they never drift.
       devShellHook = ''
+        # NOTE: this puts the DEBUG build on PATH, while `just live` runs the
+        # RELEASE build. The two age independently and both print the same
+        # `thegn --version` (the crate version rarely moves), so "I rebuilt it"
+        # can be true of one and false of the other — that is how a v57 runtime
+        # came to drive a v62 database for hours on 2026-08-29.
+        # `thegn doctor` now prints the schema pair and BOTH binaries' paths;
+        # check it before trusting a rebuild, and note that a database newer
+        # than the binary is refused outright (THEGN_ALLOW_SCHEMA_DOWNGRADE=1
+        # restores the old tolerant read-only behaviour).
         export PATH="$PWD/target/debug:$PATH"
         # Point pkg-config at the nix zlib/openssl .pc files. Without this,
         # PKG_CONFIG_PATH is empty and pkg-config falls back to its host
