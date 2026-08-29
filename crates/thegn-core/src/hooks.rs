@@ -243,7 +243,8 @@ impl ResolvedHooks {
     }
 }
 
-fn default_failure(event: HookEvent) -> HookFailure {
+/// Default failure policy for a hook before execution-mode overrides.
+pub const fn default_failure(event: HookEvent) -> HookFailure {
     match event {
         HookEvent::PreCreate | HookEvent::PreDestroy => HookFailure::Block,
         HookEvent::PostCreate
