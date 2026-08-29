@@ -61,6 +61,10 @@ The file is watched: edits apply live, no restart.
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 
+Live daemon sessions can be forked with `thegn session fork` or the
+`fork-session` pane action. Forking uses the daemon's retained launch recipe
+and current harness capabilities; it has no additional TOML setting.
+
 ## Agents, models and accounts
 
 An `[[agents]]` entry is _what runs_; four optional keys say _how_:
