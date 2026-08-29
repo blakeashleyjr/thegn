@@ -196,7 +196,7 @@ pub(crate) fn parse_repo_config(
 /// Validate a repo overlay against the actual `RepoConfigFile` schema.
 ///
 /// Loading remains tolerant: callers that only need effective values may keep
-/// using [`load_repo_overlay`], while validation callers get all syntax,
+/// using the tolerant repo-overlay loader, while validation callers get all syntax,
 /// unknown-key, enum, and type diagnostics without format-specific branches.
 pub fn validate_repo_overlay(body: &str, format: OverlayFormat) -> Vec<RepoOverlayDiagnostic> {
     let value = match parse_overlay_value(body, format) {
