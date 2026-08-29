@@ -150,6 +150,15 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
     std::fs::File::create(path)
 }
 
+/// The state directory is under the user's profile; Windows ACLs are inherited
+/// from that directory, so use the same append semantics as the Unix seam.
+pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// No-op on Windows (no unix mode bits to tighten).
 pub fn restrict_dir_owner_only(_path: &std::path::Path) {}
 
