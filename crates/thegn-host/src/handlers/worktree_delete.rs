@@ -116,6 +116,20 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         .collect();
     let session_id = cx.session.id.clone();
 
+    // Closing a group keeps its checkout, so the destroy worker cannot own
+    // the session boundary. Release any live session latch before removing
+    // the group; otherwise reopening it in this process suppresses the next
+    // session_start and session_end never runs for an explicit close.
+    for group in &removed_groups {
+        if !group.path.is_empty() {
+            crate::worktree_lifecycle::session_end_once(
+                cx.cfg,
+                std::path::Path::new(&group.path),
+                Some(cx.waker.clone()),
+            );
+        }
+    }
+
     // Cache pruning is a worker operation. Close from the highest index down so
     // earlier in-memory indices stay valid without opening SQLite on the loop.
     crate::db_task::persist(move |db| {

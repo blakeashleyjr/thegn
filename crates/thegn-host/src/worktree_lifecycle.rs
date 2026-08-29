@@ -1177,6 +1177,19 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_worktree_releases_the_session_latch_for_reopen() {
+        let worktree = std::env::temp_dir().join(format!(
+            "tg-lifecycle-session-close-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        assert!(session_start_once(&Config::default(), &worktree, None));
+        session_end_once(&Config::default(), &worktree, None);
+        assert!(session_start_once(&Config::default(), &worktree, None));
+        release_session_start(&worktree);
+    }
+
+    #[test]
     fn waiting_post_create_failure_blocks_create_pipeline() {
         let state_home = std::env::temp_dir().join(format!(
             "tg-lifecycle-post-wait-state-{}-{}",
