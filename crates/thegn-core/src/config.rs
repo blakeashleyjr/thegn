@@ -2663,13 +2663,6 @@ impl Default for ThemeConfig {
     }
 }
 
-/// Accent/focus values treated as "not customized" when deciding whether the
-/// user's `[theme]` should clobber a preset's own accent: the current default
-/// plus the pre-prism defaults (a config that pinned the old default keeps
-/// preset-cycling behavior).
-const DEFAULTISH_ACCENTS: &[&str] = &["#6ee7d8", "#76eede"];
-const DEFAULTISH_FOCUS: &[&str] = &["#6ee7d8", "#9bd1ff"];
-
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
 /// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
@@ -6728,15 +6721,13 @@ impl Config {
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
-        parse_hex_rgb(&self.theme.accent).unwrap_or_else(|| crate::theme::HUE_TEAL.to_string())
+        crate::theme_resolve::parse_hex_rgb(&self.theme.accent)
+            .unwrap_or_else(|| crate::theme::HUE_TEAL.to_string())
     }
 
     /// The accent as "#rrggbb" (validated; falls back to the default teal).
     pub fn accent_hex(&self) -> String {
-        match parse_hex_rgb(&self.theme.accent) {
-            Some(_) => self.theme.accent.to_ascii_lowercase(),
-            None => "#6ee7d8".into(),
-        }
+        crate::theme_resolve::normalize_hex(&self.theme.accent).unwrap_or_else(|| "#6ee7d8".into())
     }
 
     /// Resolve the full chrome palette: built-in defaults overlaid with any
@@ -6750,51 +6741,13 @@ impl Config {
     /// uses this. Extension tokens a legacy preset leaves empty are derived
     /// last, so derivations follow any user-overridden base colors.
     pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
-        let mut p = crate::theme::preset(preset).unwrap_or_default();
-        let set = |slot: &mut String, hex: &Option<String>| {
-            if let Some(rgb) = hex.as_deref().and_then(parse_hex_rgb) {
-                *slot = rgb;
-            }
-        };
-        let c = &self.theme.colors;
-        set(&mut p.bg0, &c.bg0);
-        set(&mut p.bg1, &c.bg1);
-        set(&mut p.panel, &c.panel);
-        set(&mut p.panel2, &c.panel2);
-        set(&mut p.raise, &c.raise);
-        set(&mut p.border, &c.border);
-        set(&mut p.text, &c.text);
-        set(&mut p.dim, &c.dim);
-        set(&mut p.faint, &c.faint);
-        set(&mut p.ghost, &c.ghost);
-        set(&mut p.ghost2, &c.ghost2);
-        set(&mut p.ghost3, &c.ghost3);
-        set(&mut p.shadow_bg, &c.shadow_bg);
-        set(&mut p.shadow_fg, &c.shadow_fg);
-        set(&mut p.chip_fg, &c.chip_fg);
-        set(&mut p.activity_active, &c.activity_active);
-        set(&mut p.activity_waiting, &c.activity_waiting);
-        set(&mut p.activity_done, &c.activity_done);
-        let h = &self.theme.hues;
-        set(&mut p.hues.teal, &h.teal);
-        set(&mut p.hues.magenta, &h.magenta);
-        set(&mut p.hues.purple, &h.purple);
-        set(&mut p.hues.green, &h.green);
-        set(&mut p.hues.amber, &h.amber);
-        set(&mut p.hues.red, &h.red);
-        set(&mut p.hues.blue, &h.blue);
-        set(&mut p.hues.orange, &h.orange);
-        // Only override the preset's focus/accent when the user actually
-        // customized them (a default — current or pre-prism — would clobber
-        // presets).
-        if !DEFAULTISH_FOCUS.contains(&self.theme.focus_border.as_str()) {
-            set(&mut p.focus, &Some(self.theme.focus_border.clone()));
-        }
-        if !DEFAULTISH_ACCENTS.contains(&self.theme.accent.as_str()) {
-            p.accent = self.accent_rgb();
-        }
-        crate::theme::extend_palette(&mut p);
-        p
+        crate::theme_resolve::palette_with_config(
+            preset,
+            &self.theme.colors,
+            &self.theme.hues,
+            &self.theme.accent,
+            &self.theme.focus_border,
+        )
     }
 
     /// Look up a dotted config key as a bare string (for `config get` and the
@@ -7018,23 +6971,6 @@ fn lenient_env_selector(text: &str) -> String {
         }
     }
     String::new()
-}
-
-/// "#rrggbb" / "#rgb" -> "R;G;B".
-fn parse_hex_rgb(hex: &str) -> Option<String> {
-    let h = hex.trim().strip_prefix('#')?;
-    let h = match h.len() {
-        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
-        6 => h.to_string(),
-        _ => return None,
-    };
-    let n = u32::from_str_radix(&h, 16).ok()?;
-    Some(format!(
-        "{};{};{}",
-        (n >> 16) & 255,
-        (n >> 8) & 255,
-        n & 255
-    ))
 }
 
 #[cfg(test)]
