@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::caps::Capabilities;
@@ -1815,8 +1815,26 @@ fn connect_worktree_bridge(
 pub(crate) fn delete_groups(
     session: &mut crate::session::Session,
     panes: &mut Panes,
+    targets: Vec<usize>,
+    keep_files: bool,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) -> String {
+    delete_groups_with_mode(
+        session,
+        panes,
+        targets,
+        keep_files,
+        thegn_core::hooks::HookExecutionMode::User,
+        waker,
+    )
+}
+
+pub(crate) fn delete_groups_with_mode(
+    session: &mut crate::session::Session,
+    _panes: &mut Panes,
     mut targets: Vec<usize>,
     keep_files: bool,
+    mode: thegn_core::hooks::HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
@@ -1846,156 +1864,36 @@ pub(crate) fn delete_groups(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
-            crate::worktree_lifecycle::session_end_once(&del_cfg, Path::new(&path), waker.clone());
-            // Tear down the per-worktree provider sandbox (sprite/…) if this env
-            // has one. Resolve the env name from the DB NOW (before
-            // `forget_worktree_group` below removes the worktree's rows), then
-            // destroy off-thread (a network DELETE; idempotent on 404). No-op for
-            // local/ssh/k8s envs or an unconfigured/tokenless provider.
-            if let Some(db) = &db {
-                // repo_root by the same fallback launch uses (DB → climb from path).
-                let repo_root = db
-                    .repo_root_for(&path)
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        thegn_core::repo::main_worktree(Path::new(&path))
-                            .map(|p| p.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_else(|| path.clone());
-                // Resolve the env NOW (path still on disk; the git-remove thread runs
-                // below) by full precedence, so a repo-selected provider env is found.
-                let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(&path));
-                let selected = db.effective_env(&path, &repo_root);
-                let env = del_cfg.resolve_env(
-                    Path::new(&repo_root),
-                    &loc,
-                    Path::new(&path),
-                    selected.as_deref(),
-                );
-                // Only provider placements have a sandbox to destroy (no-op for
-                // local/ssh/k8s — destroy_provider_sandbox also guards internally).
-                if !env.placement.is_local() {
-                    let (p, env_name) = (path.clone(), env.name.clone());
-                    std::thread::spawn(move || {
-                        crate::agent::destroy_provider_sandbox(&p, &env_name);
-                    });
-                }
-                // A deleted worktree frees its placement-engine slot (own
-                // thread: keep DB writes off the loop).
-                let freed = path.clone();
-                std::thread::spawn(move || crate::placement_flow::release(&freed));
-            }
-            if let Some(waker) = waker.clone() {
-                let path_clone = path.clone();
-                let hook_cfg = del_cfg.clone();
-                std::thread::spawn(move || {
-                    if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path_clone)) {
-                        let branch = thegn_core::util::git_out(
-                            Path::new(&path_clone),
-                            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                        )
-                        .unwrap_or_default();
-                        let workspace = thegn_core::repo::repo_slug(&root);
-                        let pre = crate::worktree_lifecycle::run_event(
-                            &hook_cfg,
-                            &root,
-                            Path::new(&path_clone),
-                            &branch,
-                            &workspace,
-                            thegn_core::hooks::HookEvent::PreDestroy,
-                            // The existing delete confirmation is the explicit
-                            // delete-anyway authorization for this background job.
-                            thegn_core::hooks::HookExecutionMode::Force,
-                        );
-                        if !pre.results.is_empty()
-                            && pre.results.iter().any(|result| !result.succeeded())
-                        {
-                            thegn_core::msg::warn(&format!(
-                                "worktree cleanup {path_clone}: {}",
-                                pre.message()
-                            ));
-                        }
-                        // Remove from git, keeping files if requested.
-                        // git worktree remove does both.
-                        if keep_files {
-                            // git does not have a "keep files" flag for `worktree remove`.
-                            // We must delete the files ourselves if we don't want them, but if we DO want them,
-                            // we cannot run `git worktree remove` as it destroys the files.
-                            // Instead, we just delete the .git file so it becomes a plain directory.
-                            // We will need to run `git worktree prune` in the main repo to clean up the metadata.
-                            let _ = std::fs::remove_file(Path::new(&path_clone).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                            thegn_core::util::git_ok(&root, &["worktree", "prune"]);
-                        } else {
-                            thegn_core::worktree::remove(&root, Path::new(&path_clone), "", false);
-                        }
-                        if !keep_files {
-                            // git is the source of truth, but `git worktree remove` leaves the
-                            // dir behind if it ever fails (locked, detached, prune races); a
-                            // lingering dir is re-adopted on the next launch and looks like a
-                            // failed delete. Purge it — locally AND on the remote box.
-                            thegn_core::worktree::purge_worktree_files(Path::new(&path_clone));
-                            if !Path::new(&path_clone).exists() {
-                                let post = crate::worktree_lifecycle::run_event(
-                                    &hook_cfg,
-                                    &root,
-                                    Path::new(&path_clone),
-                                    &branch,
-                                    &workspace,
-                                    thegn_core::hooks::HookEvent::PostDestroy,
-                                    thegn_core::hooks::HookExecutionMode::Force,
-                                );
-                                if !post.results.is_empty()
-                                    && post.results.iter().any(|result| !result.succeeded())
-                                {
-                                    thegn_core::msg::warn(&format!(
-                                        "worktree cleanup {path_clone}: {}",
-                                        post.message()
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                });
-            } else {
-                if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path)) {
-                    // Remove from git, keeping files if requested.
-                    // git worktree remove does both.
-                    if keep_files {
-                        let _ = std::fs::remove_file(Path::new(&path).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                        thegn_core::util::git_ok(&root, &["worktree", "prune"]);
-                    } else {
-                        thegn_core::worktree::remove(&root, Path::new(&path), "", false);
-                    }
-                }
-                if !keep_files {
-                    thegn_core::worktree::purge_worktree_files(Path::new(&path));
-                }
-            }
+            let group_name = session.worktrees[gi].name.clone();
+            let root = db
+                .as_ref()
+                .and_then(|db| db.repo_root_for(&path).ok().flatten())
+                .map(PathBuf::from)
+                .or_else(|| thegn_core::repo::main_worktree(Path::new(&path)))
+                .unwrap_or_else(|| PathBuf::from(&path));
+            let branch = thegn_core::util::git_out(
+                Path::new(&path),
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            )
+            .unwrap_or_default();
+            let workspace = thegn_core::repo::repo_slug(&root);
+            crate::worktree_lifecycle::spawn_worktree_destroy(
+                del_cfg.clone(),
+                root,
+                PathBuf::from(&path),
+                branch,
+                workspace,
+                group_name,
+                keep_files,
+                mode,
+                waker.clone(),
+            );
         }
-        if let Some(db) = &db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
-        }
-        for tab in &session.worktrees[gi].tabs {
-            for id in tab.center.pane_ids() {
-                panes.table.remove(&id);
-            }
-        }
-        session.switch_to(gi);
-        session.close_active_group();
+        // The group and its cache rows remain available until the worker reports
+        // that pre_destroy and the requested disk operation both succeeded.
         deleted += 1;
     }
-    // Persist the trimmed layout: without this the closed groups survive in the
-    // `tab_groups` table and `Session::resurrect` brings the "deleted" worktrees
-    // back on the next launch.
-    if deleted > 0
-        && let Some(db) = &db
-    {
-        let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the DB is a cache; the session rows are resurrection state
-    }
-    let mut status = format!("Deleted {deleted} worktree(s) from disk");
+    let mut status = format!("Deleting {deleted} worktree(s) from disk…");
     if skipped > 0 {
         status.push_str(" (home checkout skipped)");
     }
@@ -5794,6 +5692,7 @@ async fn event_loop<T: Terminal>(
     // each provider worktree's reverse tunnel forwards to it.
     host_cache_port: Option<u16>,
 ) -> Result<()> {
+    crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
     let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -8361,6 +8260,7 @@ async fn event_loop<T: Terminal>(
                 event_bus: &event_bus,
                 notify_state: &notify_state,
                 writer: &writer,
+                waker: &waker,
             };
             crate::pty_drain::drain(
                 &mut dctx,
@@ -10664,6 +10564,14 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
+        dirty |= crate::worktree_lifecycle::apply_completions(
+            &current_config,
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+            &waker,
+        );
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             // While offline, skip the network-backed refresh backstops (the
@@ -21199,6 +21107,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                 );
                             }
@@ -21211,6 +21121,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                     &mut crate::handlers::tab_keys::TabScopedState {
                                         loading_state: &mut loading_state,
@@ -21242,6 +21154,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                     &mut crate::handlers::tab_keys::TabScopedState {
                                         loading_state: &mut loading_state,

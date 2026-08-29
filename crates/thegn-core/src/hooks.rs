@@ -5,7 +5,6 @@
 //! owns those concerns. Repo hooks are represented as one trust request per
 //! event and are omitted until that request is approved.
 
-use crate::config::HooksConfig;
 use crate::config_resolve::{self, Approvals, GatedRequest};
 use serde::{Deserialize, Serialize};
 

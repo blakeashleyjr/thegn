@@ -15,6 +15,190 @@ use thegn_core::hooks::{HookContext, HookEvent, HookExecutionMode, ResolvedHooks
 use thegn_core::store::RepoTrustStore;
 
 static NOTIFY_STATE: OnceLock<Arc<crate::notify::NotifyState>> = OnceLock::new();
+static REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>> =
+    OnceLock::new();
+static COMPLETIONS: OnceLock<Mutex<Vec<LifecycleCompletion>>> = OnceLock::new();
+
+/// Completion delivered by an off-loop lifecycle worker. The loop owns all
+/// session/model/DB reconciliation; workers only perform hooks and disk work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleCompletion {
+    WorktreeDelete {
+        group_name: String,
+        path: String,
+        success: bool,
+        message: String,
+    },
+    WorkspaceDelete {
+        repo_path: String,
+        slug: String,
+        path: String,
+        success: bool,
+        message: String,
+    },
+    WorkspaceDeleteFinished {
+        repo_path: String,
+        slug: String,
+        failed_paths: Vec<String>,
+    },
+}
+
+fn completions() -> &'static Mutex<Vec<LifecycleCompletion>> {
+    COMPLETIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Install the event loop's existing refresh channel for lifecycle workers.
+pub fn install_refresh(tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>) {
+    let _ = REFRESH_TX.set(tx);
+}
+
+pub fn take_completions() -> Vec<LifecycleCompletion> {
+    std::mem::take(&mut *completions().lock().expect("lifecycle mutex poisoned"))
+}
+
+/// Apply worker outcomes on the compositor loop. No hook, git, or filesystem
+/// work occurs here; this only reconciles the in-memory session and cache after
+/// a worker has proven that its requested removal completed.
+pub fn apply_completions(
+    cfg: &Config,
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    model: &mut crate::chrome::FrameModel,
+    sb: &mut crate::run::SidebarState,
+    waker: &termwiz::terminal::TerminalWaker,
+) -> bool {
+    let mut changed = false;
+    let mut workspace_failures: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for completion in take_completions() {
+        match completion {
+            LifecycleCompletion::WorktreeDelete {
+                group_name,
+                path,
+                success,
+                message,
+            } => {
+                if success {
+                    if let Some(gi) = session
+                        .worktrees
+                        .iter()
+                        .position(|g| g.name == group_name || g.path == path)
+                    {
+                        let group = session.worktrees[gi].clone();
+                        if let Ok(db) = Db::open() {
+                            crate::run::forget_worktree_group(&db, &session.id, &group);
+                            let _ = session.persist(&db, &session.id, crate::run::now_secs());
+                        }
+                        for tab in &group.tabs {
+                            for id in tab.center.pane_ids() {
+                                panes.table.remove(&id);
+                            }
+                        }
+                        session.switch_to(gi);
+                        session.close_active_group();
+                        session_end_once(cfg, Path::new(&path), Some(waker.clone()));
+                        model.status = format!("Deleted worktree {path}");
+                        changed = true;
+                    }
+                } else {
+                    model.status = format!("Worktree delete failed for {path}: {message}");
+                    changed = true;
+                }
+            }
+            LifecycleCompletion::WorkspaceDelete {
+                repo_path,
+                slug,
+                path,
+                success,
+                message,
+            } => {
+                let key = (repo_path.clone(), slug.clone());
+                if success {
+                    if let Some(gi) = session.worktrees.iter().position(|g| g.path == path) {
+                        let group = session.worktrees[gi].clone();
+                        if let Ok(db) = Db::open() {
+                            crate::run::forget_worktree_group(&db, &session.id, &group);
+                            let _ = session.persist(&db, &session.id, crate::run::now_secs());
+                        }
+                        for tab in &group.tabs {
+                            for id in tab.center.pane_ids() {
+                                panes.table.remove(&id);
+                            }
+                        }
+                        session.switch_to(gi);
+                        session.close_active_group();
+                        session_end_once(cfg, Path::new(&path), Some(waker.clone()));
+                    }
+                } else {
+                    workspace_failures
+                        .entry(key)
+                        .or_default()
+                        .push(format!("{path}: {message}"));
+                }
+                changed = true;
+            }
+            LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path,
+                slug,
+                failed_paths,
+            } => {
+                if failed_paths.is_empty() {
+                    if let Ok(db) = Db::open() {
+                        crate::handlers::workspace_remove::remove_workspace_with_db(
+                            session,
+                            panes,
+                            Some(&db),
+                            &repo_path,
+                            &slug,
+                        );
+                        if session.id == repo_path {
+                            crate::handlers::workspace_remove::land_after_workspace_removed(
+                                session,
+                                Some(&db),
+                            );
+                        }
+                    }
+                    crate::handlers::workspace_remove::forget_workspace_in_model(
+                        model, &slug, &repo_path,
+                    );
+                    model.status = format!("Removed workspace '{slug}'");
+                } else {
+                    let details = workspace_failures
+                        .remove(&(repo_path.clone(), slug.clone()))
+                        .unwrap_or_default();
+                    model.status = format!(
+                        "Workspace '{slug}' kept; failed worktrees: {}",
+                        if details.is_empty() {
+                            failed_paths.join(", ")
+                        } else {
+                            details.join("; ")
+                        }
+                    );
+                }
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        crate::run::persist_session_layout(session, panes);
+        crate::run::refresh_tab_model(model, session, sb);
+        sb.focus_active_row(model);
+    }
+    changed
+}
+
+fn complete(completion: LifecycleCompletion, waker: Option<termwiz::terminal::TerminalWaker>) {
+    completions()
+        .lock()
+        .expect("lifecycle mutex poisoned")
+        .push(completion);
+    if let Some(tx) = REFRESH_TX.get() {
+        let _ = tx.send(crate::hydrate::RefreshKind::Model);
+    }
+    if let Some(waker) = waker {
+        let _ = waker.wake();
+    }
+}
 
 /// Install the compositor's durable notification funnel for background hook
 /// completions. Headless callers still receive `thegn_core::msg` output.
@@ -251,6 +435,147 @@ pub fn spawn_event(
     }
 }
 
+/// Run one user/unattended destroy transaction off-loop and report its result.
+/// The caller does not prune the live group until the completion says the disk
+/// operation really succeeded.
+pub fn spawn_worktree_destroy(
+    cfg: Config,
+    repo_root: PathBuf,
+    worktree: PathBuf,
+    branch: String,
+    workspace: String,
+    group_name: String,
+    keep_files: bool,
+    mode: HookExecutionMode,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) {
+    std::thread::spawn(move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let (success, message) = destroy_one(
+            &cfg, &repo_root, &worktree, &branch, &workspace, keep_files, mode,
+        );
+        complete(
+            LifecycleCompletion::WorktreeDelete {
+                group_name,
+                path: worktree.to_string_lossy().into_owned(),
+                success,
+                message,
+            },
+            waker,
+        );
+    });
+}
+
+/// Run each workspace path as an independent transaction. A failed path is
+/// reported without preventing its siblings from completing.
+pub fn spawn_workspace_destroy(
+    cfg: Config,
+    repo_root: PathBuf,
+    slug: String,
+    paths: Vec<(String, String)>,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) {
+    std::thread::spawn(move || {
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let mut failed_paths = Vec::new();
+        for (path, branch) in paths {
+            let (success, message) = destroy_one(
+                &cfg,
+                &repo_root,
+                Path::new(&path),
+                &branch,
+                &slug,
+                false,
+                HookExecutionMode::Force,
+            );
+            if !success {
+                failed_paths.push(format!("{path}: {message}"));
+            }
+            complete(
+                LifecycleCompletion::WorkspaceDelete {
+                    repo_path: repo_root.to_string_lossy().into_owned(),
+                    slug: slug.clone(),
+                    path,
+                    success,
+                    message,
+                },
+                waker.clone(),
+            );
+        }
+        complete(
+            LifecycleCompletion::WorkspaceDeleteFinished {
+                repo_path: repo_root.to_string_lossy().into_owned(),
+                slug,
+                failed_paths,
+            },
+            waker,
+        );
+    });
+}
+
+fn destroy_one(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    keep_files: bool,
+    mode: HookExecutionMode,
+) -> (bool, String) {
+    let pre = run_event(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        HookEvent::PreDestroy,
+        mode,
+    );
+    if pre.blocked() {
+        return (false, pre.message());
+    }
+
+    let removed = if keep_files {
+        let marker = worktree.join(".git");
+        match std::fs::remove_file(&marker) {
+            Ok(()) => thegn_core::util::git_ok(repo_root, &["worktree", "prune"]),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                thegn_core::util::git_ok(repo_root, &["worktree", "prune"])
+            }
+            Err(error) => {
+                thegn_core::msg::warn(&format!("could not detach kept worktree: {error}"));
+                false
+            }
+        }
+    } else if thegn_core::worktree::remove(repo_root, worktree, "", false) {
+        thegn_core::worktree::purge_worktree_files(worktree);
+        !worktree.exists()
+    } else {
+        false
+    };
+    if !removed {
+        return (
+            false,
+            format!("could not remove worktree at {}", worktree.display()),
+        );
+    }
+
+    let post = run_event(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        HookEvent::PostDestroy,
+        mode,
+    );
+    if post.results.iter().any(|result| !result.succeeded()) {
+        // Post-destroy is warn-only, so physical success remains success.
+        return (true, post.message());
+    }
+    (true, "removed".into())
+}
+
 fn context(
     event: HookEvent,
     repo_root: &Path,
@@ -373,6 +698,38 @@ pub fn session_end_once(
         HookEvent::SessionEnd,
         waker,
     );
+}
+
+/// End a worktree session when the pane that just exited was its last live
+/// process. The exited pane is still present in the session tree until the
+/// drain reconciles it, so callers pass its id explicitly.
+pub fn session_end_after_pane_exit(
+    cfg: &Config,
+    session: &crate::session::Session,
+    exited_pane: u32,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) {
+    for group in &session.worktrees {
+        if group.path.is_empty() {
+            continue;
+        }
+        let has_exited = group
+            .tabs
+            .iter()
+            .any(|tab| tab.center.pane_ids().contains(&exited_pane));
+        if has_exited {
+            let other_live = group.tabs.iter().any(|tab| {
+                tab.center
+                    .pane_ids()
+                    .into_iter()
+                    .any(|id| id != exited_pane)
+            });
+            if !other_live {
+                session_end_once(cfg, Path::new(&group.path), waker);
+            }
+            return;
+        }
+    }
 }
 
 fn spawn_session_event(

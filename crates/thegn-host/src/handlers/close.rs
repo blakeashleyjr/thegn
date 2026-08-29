@@ -16,6 +16,8 @@ pub(crate) struct CloseCtx<'a> {
     pub sb: &'a mut SidebarState,
     pub focus: &'a mut crate::focus::FocusState,
     pub need_relayout: &'a mut bool,
+    pub lifecycle_cfg: &'a thegn_core::config::Config,
+    pub waker: &'a termwiz::terminal::TerminalWaker,
 }
 
 /// Close the currently focused split pane. If it's the only pane in the tab, do
@@ -98,14 +100,21 @@ pub(crate) fn close_tab(
         .session
         .worktrees
         .get(gi)
-        .map(|g| (g.name.clone(), gi, g.active_tab));
+        .map(|g| (g.name.clone(), g.path.clone(), gi, g.active_tab));
     match cx.session.close_active_tab() {
         crate::session::CloseResult::Tab(tab) => {
             for id in tab.center.pane_ids() {
                 cx.panes.table.remove(&id);
             }
-            if let Some((name, gi, ti)) = target {
+            if let Some((name, path, gi, ti)) = target {
                 tab_state.on_tab_closed(&name, gi, ti);
+                if !path.is_empty() && !cx.session.worktrees.iter().any(|g| g.name == name) {
+                    crate::worktree_lifecycle::session_end_once(
+                        cx.lifecycle_cfg,
+                        std::path::Path::new(&path),
+                        Some(cx.waker.clone()),
+                    );
+                }
             }
         }
         crate::session::CloseResult::Nothing => {}
