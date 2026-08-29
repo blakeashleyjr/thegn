@@ -66,15 +66,13 @@ fn print_preview(name: &str, pal: &theme::Palette) {
 
 fn set(name: &str, config_path: &Path) -> Result<()> {
     if PRESETS.contains(&name) {
-        write_preset(config_path, name)?;
-    } else if let Some(user) = read_user_themes()
+        write_selection(config_path, name)?;
+    } else if read_user_themes()
         .into_iter()
         .find(|theme| theme.meta.name == name)
+        .is_some()
     {
-        // Config resolution knows the existing preset key and override tables;
-        // materialize a user theme's roles there so selecting its name remains
-        // a normal `[theme].preset`, not a second config key.
-        write_theme_config(config_path, name, &user)?;
+        write_selection(config_path, name)?;
     } else {
         anyhow::bail!("unknown theme `{name}`; run `thegn theme list`");
     }
@@ -103,8 +101,10 @@ fn read_user_themes() -> Vec<UserTheme> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
     let mut themes = Vec::new();
-    for entry in entries.flatten().take(MAX_THEME_FILES) {
+    for entry in entries.into_iter().take(MAX_THEME_FILES) {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
             || !entry.file_type().is_ok_and(|kind| kind.is_file())
@@ -118,6 +118,13 @@ fn read_user_themes() -> Vec<UserTheme> {
             continue;
         };
         if let Ok(theme) = UserTheme::from_toml(text) {
+            if PRESETS.contains(&theme.meta.name.as_str()) {
+                msg::warn(&format!(
+                    "{}: user theme `{}` is shadowed by built-in preset",
+                    path.display(),
+                    theme.meta.name
+                ));
+            }
             themes.push(theme);
         }
     }
@@ -159,83 +166,6 @@ fn write_user_theme(dir: &Path, theme: &UserTheme) -> Result<()> {
     Ok(())
 }
 
-fn write_preset(path: &Path, preset: &str) -> Result<()> {
-    let mut doc = read_document(path)?;
-    let theme = doc
-        .entry("theme")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[theme] is not a table"))?;
-    theme.insert("preset", toml_edit::value(preset));
-    write_document(path, &doc)
-}
-
-fn write_theme_config(path: &Path, preset: &str, user: &UserTheme) -> Result<()> {
-    let mut doc = read_document(path)?;
-    let root = doc.as_table_mut();
-    let theme = root
-        .entry("theme")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[theme] is not a table"))?;
-    theme.insert("preset", toml_edit::value(preset));
-    theme.insert("accent", toml_edit::value(&user.colors.accent));
-    theme.insert("focus_border", toml_edit::value(&user.colors.focus));
-    let colors = theme
-        .entry("colors")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[theme.colors] is not a table"))?;
-    for (key, value) in [
-        ("bg0", &user.colors.bg0),
-        ("bg1", &user.colors.bg1),
-        ("panel", &user.colors.panel),
-        ("panel2", &user.colors.panel2),
-        ("raise", &user.colors.raise),
-        ("border", &user.colors.border),
-        ("text", &user.colors.text),
-        ("dim", &user.colors.dim),
-        ("faint", &user.colors.faint),
-        ("ghost", &user.colors.ghost),
-    ] {
-        colors.insert(key, toml_edit::value(value));
-    }
-    let hues = theme
-        .entry("hues")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[theme.hues] is not a table"))?;
-    for (key, value) in [
-        ("teal", &user.hues.teal),
-        ("magenta", &user.hues.magenta),
-        ("purple", &user.hues.purple),
-        ("green", &user.hues.green),
-        ("amber", &user.hues.amber),
-        ("red", &user.hues.red),
-        ("blue", &user.hues.blue),
-        ("orange", &user.hues.orange),
-    ] {
-        hues.insert(key, toml_edit::value(value));
-    }
-    write_document(path, &doc)
-}
-
-fn read_document(path: &Path) -> Result<toml_edit::DocumentMut> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    text.parse::<toml_edit::DocumentMut>()
-        .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))
-}
-
-fn write_document(path: &Path, doc: &toml_edit::DocumentMut) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("toml.tmp");
-    std::fs::write(&temporary, doc.to_string())?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
+fn write_selection(path: &Path, preset: &str) -> Result<()> {
+    crate::theme_store::write_theme_selection(path, preset, None).map_err(anyhow::Error::msg)
 }

@@ -44,9 +44,9 @@ pub(crate) fn key(
         BuilderEvent::Apply {
             preset,
             theme,
-            persist_theme,
+            overrides,
         } => {
-            store.apply(preset, theme, persist_theme);
+            store.apply(preset, theme, overrides);
             true
         }
     }
@@ -80,9 +80,9 @@ pub(crate) fn mouse(
         BuilderEvent::Apply {
             preset,
             theme,
-            persist_theme,
+            overrides,
         } => {
-            store.apply(preset, theme, persist_theme);
+            store.apply(preset, theme, overrides);
             true
         }
     }
@@ -128,12 +128,18 @@ pub(crate) fn drain(
 pub(crate) fn drain_catalog(
     store: &mut ThemeStore,
     users: &mut Vec<thegn_core::theme_user::UserTheme>,
-) {
+) -> bool {
+    let mut changed = false;
     while let Some(result) = store.try_recv() {
-        if let ThemeStoreResult::Catalog { themes, .. } = result {
+        if let ThemeStoreResult::Catalog { themes, warnings } = result {
             *users = themes;
+            for warning in warnings {
+                tracing::warn!(target: "thegn::theme", "{warning}");
+            }
+            changed = true;
         }
     }
+    changed
 }
 
 pub(crate) fn render(builder: &ThemeBuilder, surface: &mut Surface, screen: Rect) {

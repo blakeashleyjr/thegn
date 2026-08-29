@@ -7555,7 +7555,13 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         } else {
-            crate::handlers::theme_builder::drain_catalog(&mut theme_store, &mut theme_users);
+            if crate::handlers::theme_builder::drain_catalog(&mut theme_store, &mut theme_users) {
+                crate::chrome::set_palette(
+                    current_config
+                        .palette_with_user_themes(&current_config.theme.preset, &theme_users),
+                );
+                dirty = true;
+            }
         }
         // Writer-thread health: a transient write failure means the terminal's
         // actual content is unknown — resync with a full repaint (the async
@@ -10513,7 +10519,9 @@ async fn event_loop<T: Terminal>(
                     model.status = keybind_conflict_summary(&new_cfg)
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
-                    crate::chrome::set_palette(new_cfg.palette());
+                    crate::chrome::set_palette(
+                        new_cfg.palette_with_user_themes(&new_cfg.theme.preset, &theme_users),
+                    );
                     if let Some(builder) = theme_builder.as_mut() {
                         builder.config_reloaded(&new_cfg);
                         crate::chrome::set_palette(builder.candidate().clone());
