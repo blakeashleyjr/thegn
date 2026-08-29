@@ -55,7 +55,7 @@ pub struct RepoOverlayCandidate {
     pub body: String,
 }
 
-/// All readable candidates and the selected winner.  TOML wins, followed by
+/// All readable candidates and the selected winner. TOML wins, followed by
 /// YAML/YML, then JSON; shadowed files are intentionally reported without
 /// inspecting or printing their contents.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -149,17 +149,17 @@ pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Ve
         .collect()
 }
 
-/// Discover every readable candidate without parsing it.  The first candidate
+/// Discover every readable candidate without parsing it. The first candidate
 /// is the winner; all later candidates are shadowed and remain visible to
 /// validation/health callers.
 pub fn discover_repo_overlay(repo_root: &Path) -> RepoOverlayDiscovery {
     let mut candidates = Vec::new();
     for extension in ["toml", "yaml", "yml", "json"] {
         let path = repo_root.join(format!(".thegn.{extension}"));
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(format) = OverlayFormat::from_extension(extension) else {
             continue;
         };
-        let Some(format) = OverlayFormat::from_extension(extension) else {
+        let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
         candidates.push(RepoOverlayCandidate { path, format, body });
@@ -191,6 +191,21 @@ pub(crate) fn parse_repo_config(
         OverlayFormat::Yaml => serde_yaml::from_str(body).map_err(|e| e.to_string()),
         OverlayFormat::Json => serde_json::from_str(body).map_err(|e| e.to_string()),
     }
+}
+
+/// Return the command-collector refusals for an already-discovered candidate.
+///
+/// The host health collector already owns the candidate body and format, so it
+/// can apply the same trust rule without starting a second discovery/read
+/// path. Syntax and schema problems are reported by [`validate_repo_overlay`];
+/// an unparseable body therefore produces no additional refusal warning here.
+pub fn repo_command_collector_warnings_for_overlay(
+    body: &str,
+    format: OverlayFormat,
+) -> Vec<String> {
+    parse_repo_config(body, format)
+        .map(|overlay| reject_overlay_command_collectors(&overlay.metrics.targets))
+        .unwrap_or_default()
 }
 
 /// Validate a repo overlay against the actual `RepoConfigFile` schema.
@@ -411,5 +426,20 @@ mod tests {
         assert!(warning.contains(&dir.path().join(".thegn.toml").display().to_string()));
         assert!(warning.contains(&dir.path().join(".thegn.yaml").display().to_string()));
         assert!(!warning.contains("enabled = true"));
+    }
+
+    #[test]
+    fn command_collector_refusal_uses_an_already_read_overlay_body() {
+        let warnings = repo_command_collector_warnings_for_overlay(
+            r#"
+                [[metrics.targets]]
+                name = "repo-command"
+                kind = "command"
+                command = ["should-not-run"]
+            "#,
+            OverlayFormat::Toml,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("repo-command"));
     }
 }

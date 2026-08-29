@@ -163,6 +163,12 @@ fn collect_repo(health: &mut ConfigHealth, discovery: &RepoOverlayDiscovery) {
         let message = diagnostic.to_string();
         add_problem(health, Layer::Repo, &candidate.path, message);
     }
+    for warning in thegn_core::config_repo::repo_command_collector_warnings_for_overlay(
+        &candidate.body,
+        candidate.format,
+    ) {
+        add_warning(health, &candidate.path, warning);
+    }
 }
 
 fn active_profile_path() -> Option<PathBuf> {
@@ -241,5 +247,45 @@ mod tests {
         let health = collect(&main, Some(dir.path()));
         assert_eq!(health.problems(), 0);
         assert!(health.repo_path.is_none());
+    }
+
+    #[test]
+    fn selected_repo_command_collectors_are_warned_without_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("collector-ran");
+        std::fs::write(
+            dir.path().join(".thegn.toml"),
+            format!(
+                "[[metrics.targets]]\nname = \"repo-command\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"touch '{}'\"]\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        let discovery = thegn_core::config_repo::discover_repo_overlay(dir.path());
+        let mut health = ConfigHealth {
+            main_path: dir.path().join("config.toml"),
+            profile_path: None,
+            repo_path: None,
+            main_present: false,
+            findings: Vec::new(),
+            main_problems: 0,
+            profile_problems: 0,
+            repo_problems: 0,
+            warnings: 0,
+        };
+        collect_repo(&mut health, &discovery);
+
+        assert_eq!(health.problems(), 0);
+        assert_eq!(health.warnings, 1);
+        assert!(health.findings().any(|finding| {
+            finding.warning
+                && finding.message.contains("repo-command")
+                && finding.message.contains("global config only")
+        }));
+        assert!(
+            !marker.exists(),
+            "config health must not execute collectors"
+        );
     }
 }
