@@ -428,32 +428,31 @@ impl DiffView {
                 "q/esc close".into(),
             ]
             .join(&separator)
-        } else if toggle {
-            [
-                format!("{movement} move"),
-                "Enter open".into(),
-                "Tab source".into(),
-                "t structural".into(),
-                "q/esc close".into(),
-            ]
-            .join(&separator)
         } else {
-            [
-                format!("{movement} move"),
-                "Enter open file".into(),
-                "Tab source".into(),
-                "q/esc close".into(),
-            ]
-            .join(&separator)
+            let mut actions = vec![format!("{movement} move"), "Enter open file".into()];
+            if self.review.is_some() {
+                actions.push("Tab source".into());
+            }
+            if toggle {
+                actions.push("t structural".into());
+            }
+            actions.push("q/esc close".into());
+            actions.join(&separator)
         };
         let source = match self.source {
             DiffSource::Worktree => "Worktree",
             DiffSource::PrReview => "PR review",
         };
-        let stale = self.review_status.as_deref().unwrap_or("");
+        let availability = self.review_status.as_deref().unwrap_or_else(|| {
+            if self.review.is_none() {
+                "PR review loading or unavailable"
+            } else {
+                ""
+            }
+        });
         Line::segs(vec![seg(
             Tok::Slot(S::Dim),
-            format!("{source}{separator}{hint} {stale}"),
+            format!("{source}{separator}{hint} {availability}"),
         )])
     }
 
@@ -798,6 +797,9 @@ mod tests {
             review_status: None,
         });
         assert_eq!(v.row_count(), 2, "the worktree diff is available first");
+        let unavailable = format!("{:?}", v.footer());
+        assert!(unavailable.contains("PR review loading or unavailable"));
+        assert!(!unavailable.contains("Tab source"));
 
         assert!(v.set_review(
             Some(thegn_core::review::PrReviewSnapshot {
@@ -806,6 +808,7 @@ mod tests {
             }),
             None,
         ));
+        assert!(format!("{:?}", v.footer()).contains("Tab source"));
         v.handle_key(&KeyCode::Tab, Modifiers::NONE);
 
         assert_eq!(v.source, DiffSource::PrReview);
