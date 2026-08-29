@@ -101,11 +101,11 @@ impl SessionMigrationStore for Db {
                     .collect(),
             })
             .collect();
-        let selected_names = all_groups
-            .iter()
-            .filter(|group| group.worktree == worktree_path)
-            .map(|group| group.name.as_str());
-        let ui_state = select_sidebar_state(&sidebar_rows(self)?, selected_names);
+        // Keep every sidebar row in the target snapshot. The pure planner
+        // filters this to the source bundle's exact keys, and it must also see
+        // orphaned/stale keys that no longer have a matching target group so a
+        // conflicting value is rejected before the import transaction starts.
+        let ui_state = sidebar_rows(self)?;
         let dispatches = dispatches_for_worktree(self, worktree_path)?;
         let ids: Vec<i64> = dispatches.iter().map(|row| row.source_id).collect();
         let notes = notes_for_dispatches(self, &ids)?;
@@ -479,7 +479,7 @@ fn session_pin(db: &Db, session: &str) -> Result<(Option<String>, Option<i64>)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_migration::plan_migration;
+    use crate::session_migration::{MigrationConflict, plan_migration};
     use crate::store::SessionMigrationStore;
 
     #[test]
@@ -654,6 +654,44 @@ mod tests {
                 .unwrap()
                 .worktree
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn orphan_target_sidebar_key_conflicts_during_preflight() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','stale','worktree','/w',0,0)",
+                [],
+            )
+            .unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO ui_state(scope,key,value) VALUES('sidebar','pin:stale','source')",
+                [],
+            )
+            .unwrap();
+        target
+            .conn()
+            .execute(
+                "INSERT INTO ui_state(scope,key,value) VALUES('sidebar','pin:stale','target')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/w")
+            .unwrap();
+        let target_state = target.migration_target_snapshot("default", "/w").unwrap();
+
+        assert_eq!(
+            plan_migration(bundle, target_state),
+            Err(MigrationConflict::UiState("pin:stale".into()))
         );
     }
 }

@@ -42,6 +42,33 @@ fn read_only_open_does_not_create_or_migrate_state_files() {
             "read-only open created stale.db{suffix}"
         );
     }
+
+    let wal = dir.path().join("wal.db");
+    {
+        let conn = Connection::open(&wal).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE marker(value TEXT NOT NULL);
+             INSERT INTO marker(value) VALUES ('kept');
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&wal).unwrap();
+    let db = Db::open_read_only_at(&wal).unwrap().unwrap();
+    let value: String = db
+        .conn
+        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "kept");
+    drop(db);
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    for suffix in ["-wal", "-journal", "-shm"] {
+        assert!(
+            !dir.path().join(format!("wal.db{suffix}")).exists(),
+            "immutable read-only open created wal.db{suffix}"
+        );
+    }
 }
 
 #[test]
