@@ -234,10 +234,11 @@ records lane.
 Every future adoption or version alignment must be reviewed through the
 existing gate, not by a lockfile diff alone:
 
-- `deny.toml:8-39` fails RustSec advisories unless ignored with a documented
-  reason and exit condition; `:41-63` limits licenses; `:70-78` warns on
-  duplicate versions and permits only the documented workspace path wildcard;
-  `:94-97` denies unknown registry/git sources.
+- `deny.toml:8-39` fails vulnerability advisories unless ignored with a
+  documented reason and exit condition; unmaintained, unsound, and notice
+  advisories retain their configured severity. `:41-63` limits licenses;
+  `:70-78` warns on duplicate versions and permits only the documented
+  workspace path wildcard; `:94-97` denies unknown registry/git sources.
 - `justfile:455-462` defines `just deps-audit` as `cargo deny check` followed
   by `cargo machete`. The `deps-audit` CI job runs that recipe at
   `.github/workflows/ci.yml:121-138`; `just ci` includes it at `justfile:394-397`.
