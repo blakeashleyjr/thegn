@@ -18,24 +18,6 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
-#[cfg(unix)]
-pub fn prepare_hook_process_group(command: &mut std::process::Command) {
-    unix::prepare_hook_process_group(command);
-}
-
-#[cfg(not(unix))]
-pub fn prepare_hook_process_group(_command: &mut std::process::Command) {}
-
-#[cfg(unix)]
-pub fn kill_hook_process_group(child: &mut std::process::Child) {
-    unix::kill_hook_process_group(child);
-}
-
-#[cfg(not(unix))]
-pub fn kill_hook_process_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
 /// A signal the monitor's Processes tab can deliver to a selected pid.
 ///
 /// Two rungs only — a graceful ask, then a hard stop — matching the tab's

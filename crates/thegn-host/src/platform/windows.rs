@@ -203,6 +203,11 @@ impl GroupHandle {
             None => terminate_pid(self.pid),
         }
     }
+
+    /// Forcefully terminate the whole Job Object.
+    pub fn kill(&self) {
+        self.terminate();
+    }
 }
 
 /// Spawn `cmd` and assign it to a fresh kill-on-close Job Object. Best-effort:
