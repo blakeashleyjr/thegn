@@ -108,6 +108,7 @@ pub(crate) struct ThemeBuilder {
     input: Option<(InputMode, String)>,
     status: Option<String>,
     pending: bool,
+    requires_save: bool,
     edited: Vec<ColorRole>,
 }
 
@@ -134,6 +135,7 @@ impl ThemeBuilder {
             input: None,
             status: None,
             pending: false,
+            requires_save: false,
             edited: Vec::new(),
         }
     }
@@ -191,6 +193,10 @@ impl ThemeBuilder {
         let left = event.mouse_buttons.contains(MouseButtons::LEFT);
         let press = left && !*mouse_left_down;
         *mouse_left_down = left;
+        if self.pending {
+            self.status = Some("Waiting for theme store…".into());
+            return BuilderEvent::None;
+        }
         if !outer.contains(mx, my) {
             if press && dismiss_outside && !self.is_dirty() && self.input.is_none() {
                 return BuilderEvent::Close;
@@ -208,7 +214,8 @@ impl ThemeBuilder {
         };
         let layout = layout_for(inner);
         if layout.catalog.contains(mx, my) {
-            let index = my.saturating_sub(inner.y);
+            let index = catalog_start(self.selected, layout.catalog.rows)
+                .saturating_add(my.saturating_sub(inner.y));
             if index < self.catalog.len() {
                 self.select(index);
             }
@@ -225,6 +232,10 @@ impl ThemeBuilder {
     }
 
     pub(crate) fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> BuilderEvent {
+        if self.pending {
+            self.status = Some("Waiting for theme store…".into());
+            return BuilderEvent::None;
+        }
         if let Some((mode, value)) = &mut self.input {
             match key {
                 KeyCode::Escape => {
@@ -370,6 +381,10 @@ impl ThemeBuilder {
             self.status = Some("Waiting for theme store…".into());
             return BuilderEvent::None;
         }
+        if self.requires_save {
+            self.status = Some("Save the imported theme before applying it".into());
+            return BuilderEvent::None;
+        }
         if let Err(error) = self.draft.validate() {
             self.status = Some(error.to_string());
             return BuilderEvent::None;
@@ -392,6 +407,7 @@ impl ThemeBuilder {
             .config
             .palette_with_user_themes(&self.active_name, &self.users);
         self.draft = UserTheme::from_palette(&self.active_name, &palette);
+        self.requires_save = false;
         self.edited.clear();
         self.refresh_candidate();
         self.status = None;
@@ -499,10 +515,23 @@ impl ThemeBuilder {
             Ok(theme) => {
                 self.draft = theme;
                 self.active_name = self.draft.meta.name.clone();
+                self.requires_save = false;
                 self.edited.clear();
                 self.refresh_candidate();
                 self.status = None;
             }
+            Err(error) => self.status = Some(error),
+        }
+    }
+
+    pub(crate) fn apply_completed(&mut self, result: Result<UserTheme, String>) {
+        self.pending = false;
+        match result {
+            // Keep the palette that was actually confirmed live until the
+            // config watcher reconciles the in-memory Config. Re-resolving
+            // here would use the stale pre-write overrides and visibly undo a
+            // successful token edit just as the popup closes.
+            Ok(_) => self.status = None,
             Err(error) => self.status = Some(error),
         }
     }
@@ -513,6 +542,7 @@ impl ThemeBuilder {
             Ok(theme) => {
                 self.draft = theme;
                 self.active_name = self.draft.meta.name.clone();
+                self.requires_save = true;
                 self.edited.clear();
                 self.refresh_candidate();
                 self.status = Some("Imported preview — Ctrl+S to save it".into());
@@ -736,9 +766,17 @@ fn layout_for(inner: Rect) -> BuilderLayout {
         apply: Rect {
             x: right_x,
             y: inner.y + ACTION_ROW,
-            cols: editor_cols,
+            cols: right_cols,
             rows: inner.rows.saturating_sub(ACTION_ROW).min(1),
         },
+    }
+}
+
+fn catalog_start(selected: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        0
+    } else {
+        selected.saturating_add(1).saturating_sub(visible_rows)
     }
 }
 
@@ -764,12 +802,16 @@ impl ThemeBuilder {
             format!("contrast warning ({})", findings.len())
         };
         let layout = layout_for(inner);
-        for (row, item) in self.catalog.iter().enumerate() {
+        let catalog_start = catalog_start(self.selected, layout.catalog.rows);
+        for (row, item) in self
+            .catalog
+            .iter()
+            .skip(catalog_start)
+            .take(layout.catalog.rows)
+            .enumerate()
+        {
             let y = layout.catalog.y + row;
-            if y >= layout.catalog.y + layout.catalog.rows {
-                break;
-            }
-            let selected = row == self.selected;
+            let selected = catalog_start + row == self.selected;
             let bg = if selected { Tok::SelAccent } else { panel };
             let fg = if selected {
                 Tok::Slot(S::Text)
@@ -845,8 +887,6 @@ impl ThemeBuilder {
                     sp(1),
                     seg(Tok::Slot(S::Text), "Enter"),
                     sp(2),
-                    seg(Tok::Slot(S::Dim), "Ctrl+S save as · i import"),
-                    sp(2),
                     seg(
                         if findings.is_empty() {
                             Tok::Slot(S::ActivityDone)
@@ -855,6 +895,8 @@ impl ThemeBuilder {
                         },
                         contrast,
                     ),
+                    sp(2),
+                    seg(Tok::Slot(S::Dim), "Ctrl+S save as · i import"),
                 ]),
                 bg,
             );
@@ -1031,7 +1073,7 @@ mod tests {
                 layout.preview.x + layout.preview.cols.saturating_sub(1),
                 layout.preview.y + 5,
             ));
-            assert!(layout.apply.x + layout.apply.cols <= layout.preview.x);
+            assert!(layout.preview.y + layout.preview.rows <= layout.apply.y);
 
             let mut b = builder();
             let event = MouseEvent {
@@ -1053,6 +1095,59 @@ mod tests {
                 BuilderEvent::Apply { .. }
             ));
         }
+    }
+
+    #[test]
+    fn render_keeps_contrast_feedback_visible_at_eighty_columns() {
+        let b = builder();
+        let mut surface = Surface::new(80, 24);
+        b.render(&mut surface, Rect::full(80, 24));
+        assert!(surface.screen_chars_to_string().contains("contrast"));
+    }
+
+    #[test]
+    fn catalog_scrolls_to_keep_the_selected_user_theme_visible() {
+        let mut cfg = thegn_core::config::Config::default();
+        let users = (0..30)
+            .map(|index| UserTheme::from_palette(format!("user-{index:02}"), &cfg.palette()))
+            .collect::<Vec<_>>();
+        cfg.theme.preset = "user-29".into();
+        let b = ThemeBuilder::open(&cfg, &users);
+        let mut surface = Surface::new(80, 24);
+        b.render(&mut surface, Rect::full(80, 24));
+        assert!(surface.screen_chars_to_string().contains("user-29"));
+    }
+
+    #[test]
+    fn pending_apply_cannot_be_dismissed_and_keeps_confirmed_palette() {
+        let mut b = builder();
+        b.set_role_for_test(ColorRole::Bg0, "#abcdef");
+        remember_edit(&mut b.edited, ColorRole::Bg0);
+        b.refresh_candidate();
+        let confirmed = b.candidate.clone();
+        let applied_theme = b.draft.clone();
+        assert!(matches!(b.apply_event(), BuilderEvent::Apply { .. }));
+        assert_eq!(
+            b.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            BuilderEvent::None
+        );
+        b.apply_completed(Ok(applied_theme));
+        assert_eq!(b.candidate, confirmed);
+        assert!(b.status().is_none());
+    }
+
+    #[test]
+    fn imported_preview_must_be_saved_before_it_can_be_applied() {
+        let mut b = builder();
+        let imported = UserTheme::from_palette("imported", b.candidate());
+        b.import_completed(Ok(imported.clone()));
+        assert_eq!(b.apply_event(), BuilderEvent::None);
+        assert_eq!(
+            b.status(),
+            Some("Save the imported theme before applying it")
+        );
+        b.saved(Ok(imported));
+        assert!(matches!(b.apply_event(), BuilderEvent::Apply { .. }));
     }
 
     #[test]
