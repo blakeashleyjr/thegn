@@ -1,90 +1,77 @@
-# Configurable sound effects — per-event mapping, packs, volume
+# Configurable notification sound effects
 
 Linear: THE-35
 
 ## Why
 
-THE-35 asks for "configurable sound effects", pointing at Agent of Empires'
-sound system (per-session-transition sounds, a directory of files referenced
-by name, platform players). thegn's notification sound channel already covers
-more than half of that (roadmap AI 429, `openspec/specs/notifications`):
-`[notifications.sound]` with `bell` / `chime` (a bundled, build-time
-**synthesized** WAV — no binary asset shipped — or a custom `chime_file`) /
-`command` / `off` modes, `min_priority`, `always_kinds`, `suppress_focused`,
-per-priority command overrides, per-rule `sound` overrides, and DND/quiet
-windows. Playback already shells out to the first available system player
-(`paplay`/`aplay`/`afplay`/…) on a detached thread, best-effort, with a
-terminal-bell fallback — never an in-process audio stack.
+thegn already has one notification route and a sound channel, but the old
+configuration described a synthesized chime and the host implementation had
+no safe way to select different user-provided effects for different events.
+Users need to distinguish events such as `agent_attention`, `agent_done`,
+`queue_landed`, and `test_failed` without adding another notification bus or
+making audio a compositor dependency.
 
-What "configurable sound effects" still means on top of that: **different
-events sounding different.** Today every kind that qualifies plays the same
-chime; there is no event→sound mapping, no sound-pack convention, and no
-volume control. The accessibility case is real: a user who is heads-down in a
-pane (or away from the screen) can learn to distinguish "agent needs you"
-from "queue landed" from "tests failed" by ear — that is information the
-single chime cannot carry.
+## What changed
 
-## What Changes
+The existing `[notifications.sound]` configuration now has a bell default and
+an opt-in `[notifications.sound.per_kind]` map. The pure core accepts one
+restricted `SoundRef` vocabulary:
 
-All strictly additive to the existing channel — an unconfigured setup behaves
-byte-identically, and no audio system is ever initialized in-process (zero
-default overhead; playback remains a short-lived subprocess).
+- `off`/`none` disables a sound;
+- `bell`/`terminal` and `builtin:bell` select the terminal bell;
+- `pack:<name>` selects a named entry from the trusted pack directory; and
+- an absolute or `~`-expanded path selects a user-provided file.
 
-- **Per-kind mapping: `[notifications.sound.per_kind]`.** Maps a
-  `NotificationKind` name to a sound spec — `"bell"` | `"off"` | a file path
-  | a bare pack-sound name (see packs). Unknown kind names warn at
-  validation with a did-you-mean. Resolution order becomes (first match
-  wins): rule `sound` action → `per_kind` → `per_priority` → the mode
-  default; all existing gates (`min_priority`, `always_kinds`,
-  `suppress_focused`, DND) apply unchanged after resolution.
-- **Sound packs: `[notifications.sound] pack = "<dir>"`.** A directory of
-  `.wav`/`.ogg` files where a file named `<kind>.<ext>` (e.g.
-  `agent_attention.ogg`) is that kind's sound and `default.<ext>` covers the
-  rest — the Agent-of-Empires convention, so existing CC0 packs drop in.
-  `per_kind` entries override pack files; a missing pack file falls through
-  to the bundled chime. The bundled fallback grows into a small synthesized
-  family — distinct tones per priority tier (alert / notice), still
-  generated at first use, still no binary asset in the repo.
-- **Volume: `[notifications.sound] volume = 0.0..=1.0`** (default 1.0),
-  passed to players that support it (`paplay --volume`, `pw-play --volume`,
-  `afplay -v`, the PowerShell player); players without a volume flag play
-  at their default — documented best-effort. The terminal bell is unaffected.
-- **Quiet hours: nothing new.** `[notifications.dnd]` windows already
-  silence the sound channel below `allow_priority`; the spec states
-  explicitly that sound effects compose with DND rather than growing a
-  second schedule.
-- **Doctor:** the existing chime probe extends to report the resolved
-  player, whether it supports volume, and the pack directory resolution
-  (found / missing / empty).
+Bare pack names, relative paths, and commands are rejected for `per_kind`.
+Legacy rule `sound`, `command`, and `per_priority` command-mode behavior stays
+available as a compatibility boundary. Resolution applies the existing mute,
+route, DND, focus, and priority gates before selecting a rule override,
+per-kind reference, legacy priority command, or generic mode.
 
-## Non-goals
+The host owns pack/file inspection and the platform provider. It builds an
+immutable pack/file snapshot at startup and reload, resolves references
+without per-event filesystem access, and sends file or command jobs through a
+bounded `notify-sound` utility worker. Providers use fixed argv vectors and
+report their supported formats and volume capability. Missing references,
+packs, providers, unsupported formats, and playback failures degrade to a
+terminal-bell latch with best-effort diagnostics.
 
-- **An in-process audio stack (rodio/cpal).** Argued and rejected in
-  design.md — dependency weight and device-lifetime cost for zero functional
-  gain over the existing subprocess players.
-- **Shipping recorded sound assets.** The bundled sounds stay synthesized;
-  users who want real foley point `pack` at any directory of files.
-- **Per-worktree or per-profile sound schemes.** `[[notifications.rules]]`
-  (worktree glob → `sound`) and profile overlays already compose to this;
-  no new mechanism.
-- **Sounds for non-notification events** (keypress clicks, UI whooshes).
-  The sound channel rides the notification bus only.
+The live `session_attention` state is observed at hydration edges: the first
+snapshot establishes a baseline, and only new or changed sessions route an
+`agent_attention` cue. This does not insert another inbox row.
+
+`thegn doctor` reports the sound provider, availability, formats, volume
+support, selected pack, entry count, and fallback reason in its existing
+provider report. No new command, control field, MCP tool, completion slot,
+capability-catalog row, database table, or bundled audio file is added.
+
+## Pruned draft claims
+
+The initial draft proposed bare pack names, filename-convention `default.*`
+fallbacks, a synthesized family of built-in tones, filesystem validation in
+the core, and a widened command vocabulary for per-kind entries. Those claims
+were removed: pack-vs-path syntax is explicit, core remains substrate-free,
+the only built-in sound is the terminal bell, and per-kind values cannot run
+commands. The host provider is platform-owned and fixed-argv; it does not
+shell-quote or execute pack paths.
+
+The draft also proposed a second event-bus sink, new SQLite state, a sound CLI
+action, and control/capability surface. Those are not part of THE-35: the
+existing `NotifyState` route remains the single emission funnel, SQLite stays
+a best-effort notification cache, and existing live attention state supplies
+the edge trigger.
 
 ## Impact
 
-- Roadmap: extends **AI 429** (sound/bell config — landed); the audit phase
-  wires THE-35 in beside it.
-- Specs: `notifications` — MODIFIED `Sound and bell channel` (chime mode —
-  shipped but never specced — plus volume and the resolution order), ADDED
-  `Per-event sound mapping` and `Sound packs`.
-- Code (indicative): `thegn-core/src/notification_route.rs` (resolution
-  order — pure, coverage-gated), `config_notifications.rs` (`per_kind`,
-  `pack`, `volume` + validation), `thegn-host/src/chime.rs` (pack
-  resolution, volume flags, synthesized family), `cmd/doctor.rs` (probe).
-- Capability catalog: no new rows (no externally invokable operation). No
-  SQLite change. No new dependencies. No e2e impact (sound is invisible;
-  nothing under `THEGN_E2E` changes).
-- Help: the page claiming the notification actions gains the per-kind/pack/
-  volume prose (help-prose ratchet identifies the page).
-- In-flight overlap: `add-osc-attention-signaling` emits attention via OSC —
-  orthogonal channel, same bus; no shared config keys. None other.
+- Roadmap: THE-35 extends the existing notification sound configuration.
+- Core: `SoundRef` parsing, config validation, and route precedence remain
+  pure and use `NotificationKind::ALL` as the only event catalog.
+- Host: platform provider, bounded queue, immutable snapshots, bell fallback,
+  live-attention edge observation, and doctor presentation.
+- Docs: the configuration example, notifications help, and this openspec
+  change describe the same accepted values and trust boundary.
+- No schema, database, command, completion, capability, or e2e surface change.
+
+The notification route, priority/DND/focus gates, command worker boundary,
+terminal-bell latch, and live attention state were already present or are now
+implemented on this branch; this document records their final contract.

@@ -329,6 +329,48 @@ fn providers_report(cfg: &Config) {
             outln!("  {:<9} {:<24}   {n}", "", "");
         }
     }
+    let sound = crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound);
+    let provider = &sound["provider"];
+    let availability = provider["availability"]["state"]
+        .as_str()
+        .unwrap_or("unknown");
+    outln!(
+        "  {:<9} {:<24} {availability}{}",
+        "sound",
+        provider["id"].as_str().unwrap_or("none"),
+        provider["availability"]["reason"]
+            .as_str()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default(),
+    );
+    outln!(
+        "  {:<9} {:<24} formats: {}; volume: {}",
+        "",
+        "",
+        provider["caps"]["formats"]
+            .as_array()
+            .map(|formats| {
+                formats
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        provider["caps"]["volume"].as_bool().map_or("unknown", |v| {
+            if v { "supported" } else { "unsupported" }
+        }),
+    );
+    outln!(
+        "  {:<9} {:<24} pack: {}; entries: {}",
+        "",
+        "",
+        sound["pack"].as_str().unwrap_or("(none)"),
+        sound["pack_entries"].as_u64().unwrap_or(0),
+    );
+    if let Some(reason) = sound["fallback"].as_str() {
+        outln!("  {:<9} {:<24} fallback: {reason}", "", "");
+    }
 }
 
 /// The `Secrets` section: one probe row per backend kind (keyring/file/env,
@@ -1127,6 +1169,7 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
         "providers": providers_json(cfg),
+        "sound": crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound),
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
@@ -2061,7 +2104,6 @@ fn macos_report(env: &thegn_core::termcaps::TermEnv) {
     outln!("  integrations");
     for (bin, what) in [
         ("osascript", "desktop notifications"),
-        ("afplay", "chime"),
         ("pbcopy", "clipboard copy"),
         ("pbpaste", "clipboard paste"),
         (
