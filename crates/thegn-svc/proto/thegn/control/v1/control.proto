@@ -12,6 +12,7 @@ service Control {
   rpc Attach(AttachRequest) returns (stream Event);
   rpc Detach(DetachRequest) returns (Empty);
   rpc OpenSession(OpenSessionRequest) returns (SessionInfo);
+  rpc ForkSession(ForkSessionRequest) returns (SessionInfo);
   rpc SendInput(SendInputRequest) returns (Empty);
   rpc Resize(ResizeRequest) returns (Empty);
   rpc Snapshot(SnapshotRequest) returns (Event);
@@ -64,6 +65,7 @@ message SessionInfo {
   uint32 attached_clients = 8;
   optional int64 lease_expires_at = 9;
   bool error_active = 10;
+  optional string forked_from = 11; // stable source lineage, empty = none
 }
 
 message AttachRequest {
@@ -86,6 +88,17 @@ message OpenSessionRequest {
   uint32 rows = 4;
   uint32 cols = 5;
   string worktree = 6;        // empty = none
+}
+
+message ForkSessionRequest {
+  string session = 1;       // daemon id, or native id when harness is set
+  string harness = 2;       // empty = live daemon source
+  string agent = 3;         // optional configured launch context
+  string cwd = 4;           // empty = inherit source
+  string worktree = 5;      // empty = inherit source
+  bool scrollback = 6;
+  bool adopt = 7;
+  bool tab = 8;
 }
 
 message EnvVar {
