@@ -915,8 +915,8 @@ mod tests {
         let source = Path::new("/tmp/drawer-global-source");
         let destination = Path::new("/tmp/drawer-global-destination");
         let destination_key = drawer_scope_key(DrawerScope::Worktree, destination);
-        std::fs::write(&store.join(GLOBAL_SCOPE_KEY), "tool:db").unwrap();
-        std::fs::write(&store.join(&destination_key), "tool:local").unwrap();
+        std::fs::write(store.join(GLOBAL_SCOPE_KEY), "tool:db").unwrap();
+        std::fs::write(store.join(&destination_key), "tool:local").unwrap();
 
         // A newly started process ignores the stale global slot but retains
         // the persisted worktree selection.
