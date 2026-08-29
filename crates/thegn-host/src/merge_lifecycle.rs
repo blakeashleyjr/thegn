@@ -199,6 +199,9 @@ pub(crate) fn remove_landed(
         Some(db),
     );
     if !removed {
+        // Landing completes the queue transition even when physical cleanup
+        // fails; retain the worktree row so the sidebar can report/retry it.
+        let _ = db.remove_merge_entry(worktree); // best-effort: cache write
         thegn_core::msg::warn(&format!("merge cleanup: {message}"));
         return;
     }
