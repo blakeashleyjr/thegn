@@ -3,6 +3,7 @@
 //! reroots the process, loads target configuration, or becomes a daemon API.
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -20,6 +21,33 @@ use thegn_svc::control::client::ControlClient;
 use super::session::SessionAction;
 
 const OPAQUE_PAYLOAD_WARNING: &str = "opaque pane commands, scrollback, dispatch reports, and notes are carried unchanged and are not included in this audit";
+
+trait MigrationControl {
+    fn health(&self) -> BoxFuture<'_, Result<()>>;
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionInfo>>>;
+    fn kill(&self, session: &str) -> BoxFuture<'_, Result<()>>;
+    fn notify_push(&self, note: &thegn_svc::control::PushedNote) -> BoxFuture<'_, Result<i64>>;
+}
+
+impl MigrationControl for ControlClient {
+    fn health(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { ControlClient::health(self).await })
+    }
+
+    fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionInfo>>> {
+        Box::pin(async move { ControlClient::sessions(self).await })
+    }
+
+    fn kill(&self, session: &str) -> BoxFuture<'_, Result<()>> {
+        let session = session.to_string();
+        Box::pin(async move { ControlClient::kill(self, &session).await })
+    }
+
+    fn notify_push(&self, note: &thegn_svc::control::PushedNote) -> BoxFuture<'_, Result<i64>> {
+        let note = note.clone();
+        Box::pin(async move { ControlClient::notify_push(self, &note).await })
+    }
+}
 
 /// The stable, payload-free audit emitted by a move. Opaque commands,
 /// scrollback, reports, notes, and credentials are deliberately absent.
@@ -161,16 +189,11 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         return report(&audit, json);
     }
 
+    if let Some(message) = live_move_refusal(&live_ids, kill) {
+        return fail(&mut audit, json, message, false);
+    }
     if !live_ids.is_empty() {
-        if !kill {
-            return fail(
-                &mut audit,
-                json,
-                "live source sessions found; rerun with --kill",
-                false,
-            );
-        }
-        let Some(client) = source_client.as_ref() else {
+        let Some(client) = source_client.as_deref() else {
             return fail(
                 &mut audit,
                 json,
@@ -178,75 +201,22 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
                 false,
             );
         };
-        for id in &live_ids {
-            client
-                .kill(id)
-                .await
-                .with_context(|| format!("kill source daemon session {id}"))?;
-            audit.killed_ids.push(id.clone());
-        }
-        let after = client
-            .sessions()
-            .await
-            .context("confirm source daemon sessions were killed")?;
-        let survivors = live_session_ids(&after, &refs, &worktree);
-        if !survivors.is_empty() {
-            return fail(
-                &mut audit,
-                json,
-                &format!(
-                    "source daemon sessions survived --kill: {}",
-                    survivors.into_iter().collect::<Vec<_>>().join(", ")
-                ),
-                false,
-            );
+        if let Err(error) = kill_and_relist(client, &live_ids, &refs, &worktree, &mut audit).await {
+            return fail(&mut audit, json, &error.to_string(), false);
         }
     }
 
     let target_db = target_db
         .as_ref()
         .expect("real migration always opens a writable target database");
-    let imported = target_db
-        .import_migration(&plan)
-        .map_err(|e| anyhow!("target profile import failed before commit: {e}"))?;
-    audit.target_committed = true;
-    audit.target_dispatch_ids = if imported.dispatch_id_map.is_empty() {
-        plan.target
-            .dispatches
-            .iter()
-            .map(|dispatch| dispatch.source_id)
-            .collect()
-    } else {
-        imported.dispatch_id_map.values().copied().collect()
-    };
-    audit.target_dispatch_ids.sort_unstable();
-
-    if !target_db.confirm_migration(&plan)? {
-        return fail(
-            &mut audit,
-            json,
-            "target import read-back did not match its sanitized fingerprint",
-            true,
-        );
+    if let Err(error) = commit_target_then_cleanup(&source_db, target_db, &plan, &mut audit) {
+        let retryable = audit.target_committed;
+        return fail(&mut audit, json, &error.to_string(), retryable);
     }
-    audit.target_confirmed = true;
-
-    let cleanup = match source_db.cleanup_migration(&plan.bundle) {
-        Ok(cleanup) => cleanup,
-        Err(error) => {
-            return fail(
-                &mut audit,
-                json,
-                &format!("source cleanup is pending after target confirmation: {error}"),
-                true,
-            );
-        }
-    };
-    audit.source_deleted = cleanup.source_deleted;
 
     audit.notification = notify_target(
         &target_db_path,
-        &target_db,
+        target_db,
         &source.name,
         &target.name,
         &worktree,
@@ -270,6 +240,39 @@ fn fill_bundle_audit(audit: &mut MigrationAudit, bundle: &MigrationBundle) {
         dispatch_notes: bundle.notes.len(),
         attention: 0,
     };
+}
+
+fn commit_target_then_cleanup(
+    source_db: &dyn SessionMigrationStore,
+    target_db: &dyn SessionMigrationStore,
+    plan: &thegn_core::session_migration::MigrationPlan,
+    audit: &mut MigrationAudit,
+) -> Result<()> {
+    let imported = target_db
+        .import_migration(plan)
+        .map_err(|error| anyhow!("target profile import failed before commit: {error}"))?;
+    audit.target_committed = true;
+    audit.target_dispatch_ids = if imported.dispatch_id_map.is_empty() {
+        plan.target
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.source_id)
+            .collect()
+    } else {
+        imported.dispatch_id_map.values().copied().collect()
+    };
+    audit.target_dispatch_ids.sort_unstable();
+
+    if !target_db.confirm_migration(plan)? {
+        bail!("target import read-back did not match its sanitized fingerprint");
+    }
+    audit.target_confirmed = true;
+
+    let cleanup = source_db
+        .cleanup_migration(&plan.bundle)
+        .map_err(|error| anyhow!("source cleanup is pending after target confirmation: {error}"))?;
+    audit.source_deleted = cleanup.source_deleted;
+    Ok(())
 }
 
 fn referenced_session_ids(bundle: &MigrationBundle) -> BTreeSet<String> {
@@ -327,13 +330,46 @@ fn live_session_ids(
         .collect()
 }
 
+fn live_move_refusal(live_ids: &BTreeSet<String>, kill: bool) -> Option<&'static str> {
+    (!live_ids.is_empty() && !kill).then_some("live source sessions found; rerun with --kill")
+}
+
+async fn kill_and_relist(
+    control: &dyn MigrationControl,
+    live_ids: &BTreeSet<String>,
+    references: &BTreeSet<String>,
+    worktree: &str,
+    audit: &mut MigrationAudit,
+) -> Result<()> {
+    for id in live_ids {
+        control
+            .kill(id)
+            .await
+            .with_context(|| format!("kill source daemon session {id}"))?;
+        audit.killed_ids.push(id.clone());
+    }
+    let after = control
+        .sessions()
+        .await
+        .context("confirm source daemon sessions were killed")?;
+    let survivors = live_session_ids(&after, references, worktree);
+    if survivors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "source daemon sessions survived --kill: {}",
+            survivors.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 /// List a source daemon only when its active DB registry says one is live.
 /// A live registry row that cannot be reached is a fail-closed condition: the
 /// migration cannot safely prove that a referenced session has stopped.
 async fn source_daemon(
     db: &Db,
     referenced: &BTreeSet<String>,
-) -> Result<(Option<ControlClient>, Vec<SessionInfo>)> {
+) -> Result<(Option<Box<dyn MigrationControl>>, Vec<SessionInfo>)> {
     let scope = crate::daemon::scope_key();
     let now = now_ms();
     let registered = db
@@ -350,16 +386,12 @@ async fn source_daemon(
         if !referenced.is_empty()
             && let Some(daemon) = registered.iter().max_by_key(|daemon| daemon.heartbeat_at)
         {
-            let client = ControlClient::new(thegn_svc::control::client::ControlAddr::Unix(
-                daemon.endpoint.clone().into(),
+            let client = Box::new(ControlClient::new(
+                thegn_svc::control::client::ControlAddr::Unix(daemon.endpoint.clone().into()),
             ));
-            if client.health().await.is_err() {
-                bail!("source daemon is registered but unreachable while referenced sessions exist")
-            }
-            let sessions = client
-                .sessions()
-                .await
-                .context("list source daemon sessions")?;
+            let sessions = checked_sessions(client.as_ref()).await.with_context(
+                || "source daemon is registered but unreachable while referenced sessions exist",
+            )?;
             return Ok((Some(client), sessions));
         }
         return Ok((None, Vec::new()));
@@ -367,20 +399,24 @@ async fn source_daemon(
 
     let addr = thegn_svc::control::client::discover(db, &scope, now)
         .ok_or_else(|| anyhow!("source daemon is registered but not discoverable"))?;
-    let client = ControlClient::new(addr);
-    if client.health().await.is_err() {
-        bail!("source daemon is registered but unreachable; refusing migration")
-    }
-    let sessions = client
-        .sessions()
+    let client = Box::new(ControlClient::new(addr));
+    let sessions = checked_sessions(client.as_ref())
         .await
-        .context("list source daemon sessions")?;
+        .context("source daemon is registered but unreachable; refusing migration")?;
     // Keep this assertion explicit: if a future registry implementation can
     // return a live row without `discover` seeing it, do not silently proceed.
     if registered.is_empty() {
         bail!("source daemon registry changed during migration preflight")
     }
     Ok((Some(client), sessions))
+}
+
+async fn checked_sessions(control: &dyn MigrationControl) -> Result<Vec<SessionInfo>> {
+    control.health().await?;
+    control
+        .sessions()
+        .await
+        .context("list source daemon sessions")
 }
 
 async fn notify_target(
@@ -400,20 +436,27 @@ async fn notify_target(
             warning: Some("target daemon is not registered".to_string()),
         };
     };
-    let client = ControlClient::new(addr);
-    if let Err(error) = client.health().await {
-        return NotificationAudit {
-            status: "unavailable".to_string(),
-            warning: Some(format!("target daemon is unreachable: {error}")),
-        };
-    }
+    let client = Box::new(ControlClient::new(addr));
     let note = thegn_svc::control::PushedNote {
         title: "Session migrated".to_string(),
         body: format!("{worktree}: {source_profile} → {target_profile}"),
         urgency: None,
         source: Some("session_migration".to_string()),
     };
-    match client.notify_push(&note).await {
+    notify_with_control(client.as_ref(), note).await
+}
+
+async fn notify_with_control(
+    control: &dyn MigrationControl,
+    note: thegn_svc::control::PushedNote,
+) -> NotificationAudit {
+    if let Err(error) = control.health().await {
+        return NotificationAudit {
+            status: "unavailable".to_string(),
+            warning: Some(format!("target daemon is unreachable: {error}")),
+        };
+    }
+    match control.notify_push(&note).await {
         Ok(_) => NotificationAudit {
             status: "sent".to_string(),
             warning: None,
@@ -521,7 +564,269 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::session_migration::{MigrationDispatch, MigrationGroup, MigrationTab};
+    use std::sync::{Arc, Mutex};
+    use thegn_core::session_migration::{
+        MigrationCleanupResult, MigrationDispatch, MigrationGroup, MigrationImportResult,
+        MigrationNote, MigrationPlan, MigrationTab, MigrationTarget, make_bundle,
+    };
+
+    #[derive(Clone, Default)]
+    struct FakeControl {
+        health_error: Option<String>,
+        listings: Arc<Mutex<Vec<Vec<SessionInfo>>>>,
+        killed: Arc<Mutex<Vec<String>>>,
+        notifications: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MigrationControl for FakeControl {
+        fn health(&self) -> BoxFuture<'_, Result<()>> {
+            let error = self.health_error.clone();
+            Box::pin(async move {
+                match error {
+                    Some(error) => bail!(error),
+                    None => Ok(()),
+                }
+            })
+        }
+
+        fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionInfo>>> {
+            let listings = Arc::clone(&self.listings);
+            Box::pin(async move { Ok(listings.lock().unwrap().pop().unwrap_or_default()) })
+        }
+
+        fn kill(&self, session: &str) -> BoxFuture<'_, Result<()>> {
+            let killed = Arc::clone(&self.killed);
+            let session = session.to_string();
+            Box::pin(async move {
+                killed.lock().unwrap().push(session);
+                Ok(())
+            })
+        }
+
+        fn notify_push(&self, note: &thegn_svc::control::PushedNote) -> BoxFuture<'_, Result<i64>> {
+            let notifications = Arc::clone(&self.notifications);
+            let body = note.body.clone();
+            Box::pin(async move {
+                notifications.lock().unwrap().push(body);
+                Ok(1)
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeStore {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        import_error: Option<String>,
+        confirm: bool,
+        cleanup_error: Option<String>,
+    }
+
+    impl FakeStore {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                import_error: None,
+                confirm: true,
+                cleanup_error: None,
+            }
+        }
+
+        fn record(&self, event: &'static str) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl SessionMigrationStore for FakeStore {
+        fn migration_snapshot(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<MigrationBundle> {
+            bail!("unused fake snapshot")
+        }
+
+        fn migration_target_snapshot(&self, _: &str, _: &str) -> Result<MigrationTarget> {
+            bail!("unused fake target snapshot")
+        }
+
+        fn import_migration(&self, _: &MigrationPlan) -> Result<MigrationImportResult> {
+            self.record("target_import");
+            if let Some(error) = &self.import_error {
+                bail!(error.clone())
+            }
+            Ok(MigrationImportResult {
+                counts: MigrationCounts::default(),
+                dispatch_id_map: Default::default(),
+                fingerprint: "fingerprint".into(),
+            })
+        }
+
+        fn confirm_migration(&self, _: &MigrationPlan) -> Result<bool> {
+            self.record("target_confirm");
+            Ok(self.confirm)
+        }
+
+        fn cleanup_migration(&self, _: &MigrationBundle) -> Result<MigrationCleanupResult> {
+            self.record("source_cleanup");
+            if let Some(error) = &self.cleanup_error {
+                bail!(error.clone())
+            }
+            Ok(MigrationCleanupResult {
+                source_deleted: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn empty_plan() -> MigrationPlan {
+        let bundle = make_bundle(
+            "source",
+            "target",
+            "default",
+            "/worktree",
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::<MigrationNote>::new(),
+            None,
+            None,
+        );
+        MigrationPlan {
+            fingerprint: bundle.fingerprint(),
+            bundle,
+            target: MigrationTarget::default(),
+            resumed: false,
+        }
+    }
+
+    fn live_session(id: &str, worktree: &str) -> SessionInfo {
+        SessionInfo {
+            id: id.into(),
+            worktree: Some(worktree.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn live_sessions_refuse_without_kill() {
+        let live = BTreeSet::from(["daemon-1".to_string()]);
+        assert_eq!(
+            live_move_refusal(&live, false),
+            Some("live source sessions found; rerun with --kill")
+        );
+        assert_eq!(live_move_refusal(&live, true), None);
+    }
+
+    #[test]
+    fn control_seam_kills_and_relists_before_import() {
+        let control = FakeControl {
+            listings: Arc::new(Mutex::new(vec![
+                vec![live_session("daemon-1", "/worktree")],
+                Vec::new(),
+            ])),
+            ..Default::default()
+        };
+        let refs = BTreeSet::from(["daemon-1".to_string()]);
+        let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
+
+        futures::executor::block_on(kill_and_relist(
+            &control,
+            &BTreeSet::from(["daemon-1".to_string()]),
+            &refs,
+            "/worktree",
+            &mut audit,
+        ))
+        .unwrap();
+        assert_eq!(*control.killed.lock().unwrap(), vec!["daemon-1"]);
+        assert_eq!(audit.killed_ids, vec!["daemon-1"]);
+    }
+
+    #[test]
+    fn unreachable_control_fails_closed() {
+        let control = FakeControl {
+            health_error: Some("socket unavailable".into()),
+            ..Default::default()
+        };
+        let error = futures::executor::block_on(checked_sessions(&control)).unwrap_err();
+        assert!(error.to_string().contains("socket unavailable"));
+    }
+
+    #[test]
+    fn target_commit_precedes_source_cleanup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeStore::new(Arc::clone(&events));
+        let target = FakeStore::new(Arc::clone(&events));
+        let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
+
+        commit_target_then_cleanup(&source, &target, &empty_plan(), &mut audit).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["target_import", "target_confirm", "source_cleanup"]
+        );
+        assert!(audit.target_committed);
+        assert!(audit.target_confirmed);
+        assert!(audit.source_deleted);
+    }
+
+    #[test]
+    fn readback_failure_is_reported_before_source_cleanup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeStore::new(Arc::clone(&events));
+        let target = FakeStore {
+            confirm: false,
+            ..FakeStore::new(Arc::clone(&events))
+        };
+        let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
+
+        let error =
+            commit_target_then_cleanup(&source, &target, &empty_plan(), &mut audit).unwrap_err();
+        assert!(error.to_string().contains("read-back"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["target_import", "target_confirm"]
+        );
+        assert!(audit.target_committed);
+        assert!(!audit.target_confirmed);
+        assert!(!audit.source_deleted);
+    }
+
+    #[test]
+    fn cleanup_failure_leaves_retryable_target_confirmation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let source = FakeStore {
+            cleanup_error: Some("database busy".into()),
+            ..FakeStore::new(Arc::clone(&events))
+        };
+        let target = FakeStore::new(Arc::clone(&events));
+        let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
+
+        let error =
+            commit_target_then_cleanup(&source, &target, &empty_plan(), &mut audit).unwrap_err();
+        assert!(error.to_string().contains("database busy"));
+        assert!(audit.target_confirmed);
+        assert!(!audit.source_deleted);
+    }
+
+    #[test]
+    fn notification_failure_is_a_warning_after_confirmed_move() {
+        let control = FakeControl {
+            health_error: Some("target daemon unavailable".into()),
+            ..Default::default()
+        };
+        let note = thegn_svc::control::PushedNote {
+            title: "Session migrated".into(),
+            body: "body".into(),
+            urgency: None,
+            source: Some("session_migration".into()),
+        };
+
+        let notification = futures::executor::block_on(notify_with_control(&control, note));
+        assert_eq!(notification.status, "unavailable");
+        assert!(notification.warning.unwrap().contains("unavailable"));
+    }
 
     #[test]
     fn default_target_db_uses_the_pre_rerooted_state_home() {
