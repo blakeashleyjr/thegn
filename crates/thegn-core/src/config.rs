@@ -7065,8 +7065,10 @@ mod agent_error_signatures_tests {
 
     #[test]
     fn validation_rejects_empty_and_overlong_entries() {
-        let mut cfg = NotificationsConfig::default();
-        cfg.agent_error_signatures = vec![String::new(), "x".repeat(257)];
+        let cfg = NotificationsConfig {
+            agent_error_signatures: vec![String::new(), "x".repeat(257)],
+            ..NotificationsConfig::default()
+        };
         let errors = cfg.validate();
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].contains("agent_error_signatures[0]") && errors[0].contains("empty"));
@@ -7085,10 +7087,12 @@ mod agent_error_signatures_tests {
 
     #[test]
     fn validation_rejects_an_excessive_signature_count() {
-        let mut cfg = NotificationsConfig::default();
-        cfg.agent_error_signatures = (0..=crate::agent_error::MAX_AGENT_ERROR_SIGNATURES)
-            .map(|i| format!("signature-{i}"))
-            .collect();
+        let cfg = NotificationsConfig {
+            agent_error_signatures: (0..=crate::agent_error::MAX_AGENT_ERROR_SIGNATURES)
+                .map(|i| format!("signature-{i}"))
+                .collect(),
+            ..NotificationsConfig::default()
+        };
         let errors = cfg.validate();
         assert!(errors.iter().any(|error| error.contains("more than 64")));
     }

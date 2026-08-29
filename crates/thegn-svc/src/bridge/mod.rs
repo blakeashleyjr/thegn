@@ -1389,7 +1389,17 @@ mod tests {
                 break;
             }
         }
-        drop(saw_end); // non-Result discard: the receiver ending (sender dropped) is also acceptance
+        // The receiver ending (sender dropped) is also acceptance; a bare
+        // timeout with a live sender is not.
+        if !saw_end {
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                ),
+                "no Exit event and the sender is still alive"
+            );
+        }
     }
 
     #[test]
