@@ -114,7 +114,11 @@ pub(crate) fn spawn_issue_cache_refresh(
             for (source_ref, msg) in
                 overdue_notifications(&issues, &linked, thegn_core::util::now())
             {
-                let _ = db.put_notification_once("overdue", &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if !crate::notify::record_global_once(&db, "overdue", &source_ref, &msg, &repo_key)
+                {
+                    // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    let _ = db.put_notification_once("overdue", &source_ref, &msg, &repo_key);
+                }
             }
             let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             changed = true;

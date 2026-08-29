@@ -446,4 +446,118 @@ mod tests {
         );
         assert_eq!(parse_kind("bogus"), None);
     }
+
+    #[cfg(unix)]
+    fn test_state(
+        cfg: NotificationsConfig,
+    ) -> (
+        Arc<NotifyState>,
+        std::fs::File,
+        termwiz::terminal::UnixTerminal,
+    ) {
+        use std::os::fd::FromRawFd;
+        use termwiz::terminal::{Terminal, UnixTerminal};
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        let state = NotifyState::new(cfg, String::new(), terminal.waker());
+        (state, master, terminal)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hydration_emit_once_sounds_mentions_and_overdue_only_on_insert() {
+        use std::collections::BTreeMap;
+        use thegn_core::config::{NotificationRule, NotificationsConfig};
+        use thegn_core::notification_route::SoundEmit;
+
+        let mut cfg = NotificationsConfig::default();
+        cfg.sound.min_priority = "info".into();
+        cfg.sound.per_kind = BTreeMap::from([
+            ("mentioned".into(), "bell".into()),
+            ("overdue".into(), "bell".into()),
+        ]);
+        let (state, _master, _terminal) = test_state(cfg.clone());
+        let db = thegn_core::db::Db::open_memory().unwrap();
+
+        for (kind, source_ref, message) in [
+            ("mentioned", "ghn:42:1", "mentioned in issue: fix it"),
+            ("overdue", "linear:A-1", "A-1 overdue (was due 2026-08-01)"),
+        ] {
+            let (decision, inserted) =
+                record_once(&db, &state, kind, source_ref, message, "/wt/app");
+            assert!(inserted, "first {kind} observation must insert");
+            assert_eq!(decision.sound, Some(SoundEmit::Bell));
+            assert!(state.take_bell(), "first {kind} observation must sound");
+
+            let (decision, inserted) =
+                record_once(&db, &state, kind, source_ref, message, "/wt/app");
+            assert!(!inserted, "second {kind} observation must dedupe");
+            assert_eq!(decision.sound, Some(SoundEmit::Bell));
+            assert!(!state.take_bell(), "duplicate {kind} must not sound");
+        }
+
+        let mut drop_cfg = cfg.clone();
+        drop_cfg.rules.push(NotificationRule {
+            kind: Some("mentioned".into()),
+            drop: true,
+            ..Default::default()
+        });
+        let (drop_state, _master, _terminal) = test_state(drop_cfg);
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (decision, inserted) = record_once(
+            &db,
+            &drop_state,
+            "mentioned",
+            "ghn:drop",
+            "dropped",
+            "/wt/app",
+        );
+        assert!(!inserted);
+        assert!(!decision.record);
+        assert_eq!(decision.sound, None);
+        assert!(!drop_state.take_bell());
+
+        let (dnd_state, _master, _terminal) = test_state(cfg.clone());
+        assert!(dnd_state.toggle_dnd());
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (decision, inserted) =
+            record_once(&db, &dnd_state, "overdue", "linear:dnd", "dnd", "/wt/app");
+        assert!(inserted);
+        assert_eq!(decision.sound, None);
+        assert!(!dnd_state.take_bell());
+
+        let (focused_state, _master, _terminal) = test_state(cfg);
+        focused_state.set_focused_worktree("/wt/app".into());
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (decision, inserted) = record_once(
+            &db,
+            &focused_state,
+            "mentioned",
+            "ghn:focused",
+            "focused",
+            "/wt/app",
+        );
+        assert!(inserted);
+        assert_eq!(decision.sound, None);
+        assert!(!focused_state.take_bell());
+    }
 }
