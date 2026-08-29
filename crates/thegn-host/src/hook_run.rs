@@ -38,9 +38,12 @@ impl HookRunResult {
 
     pub fn summary(&self) -> String {
         match self.state {
-            HookRunState::Succeeded => format!("hook succeeded: {}", self.command),
-            HookRunState::Failed => format!("hook failed (exit {:?}): {}", self.code, self.command),
-            HookRunState::TimedOut => format!("hook timed out: {}", self.command),
+            // Do not echo the shell command: it is user/repository supplied
+            // data and may contain a literal secret. The detailed result keeps
+            // it for internal callers, while notifications stay safe.
+            HookRunState::Succeeded => "hook succeeded".to_string(),
+            HookRunState::Failed => format!("hook failed (exit {:?})", self.code),
+            HookRunState::TimedOut => "hook timed out".to_string(),
         }
     }
 
@@ -61,7 +64,7 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
         Ok(child) => child,
         Err(error) => {
             let stderr = format!("failed to start hook: {error}");
-            append_log(&log_path, context, spec, HookRunState::Failed, "", &stderr);
+            append_log(&log_path, context, HookRunState::Failed, "", &stderr);
             return HookRunResult {
                 command: spec.command.clone(),
                 state: HookRunState::Failed,
@@ -89,7 +92,14 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
                 break child.wait().ok();
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => break None,
+            Err(_) => {
+                // A wait error must not leave the child (or its descendants)
+                // running after the lifecycle operation has lost ownership of
+                // it. Kill the group and reap the direct child before leaving.
+                group.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
     };
     let stdout = join_pipe(out_thread);
@@ -104,7 +114,7 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
     } else {
         HookRunState::Failed
     };
-    append_log(&log_path, context, spec, state, &stdout, &stderr);
+    append_log(&log_path, context, state, &stdout, &stderr);
     HookRunResult {
         command: spec.command.clone(),
         state,
@@ -162,6 +172,9 @@ fn credential_shaped(key: &str) -> bool {
         "_SECRET",
         "_PASSWORD",
         "_PRIVATE_KEY",
+        "_API_KEY",
+        "_ACCESS_KEY",
+        "_AUTH",
         "_CREDENTIAL",
         "_SOCK",
         "_AGENT",
@@ -170,11 +183,33 @@ fn credential_shaped(key: &str) -> bool {
     .any(|suffix| upper.ends_with(suffix))
 }
 
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
 fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut output = Vec::new();
-        let _ = pipe.read_to_end(&mut output);
-        String::from_utf8_lossy(&output).into_owned()
+        let mut chunk = [0_u8; 8192];
+        let mut truncated = false;
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if output.len() < MAX_CAPTURE_BYTES {
+                        let keep = count.min(MAX_CAPTURE_BYTES - output.len());
+                        output.extend_from_slice(&chunk[..keep]);
+                        truncated |= keep < count;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let mut text = String::from_utf8_lossy(&output).into_owned();
+        if truncated {
+            text.push_str("\n[hook output truncated]");
+        }
+        text
     })
 }
 
@@ -251,9 +286,19 @@ fn failure_tail(output: &str) -> String {
     tail.lines()
         .map(|line| {
             let upper = line.to_ascii_uppercase();
-            if ["TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY"]
-                .iter()
-                .any(|marker| upper.contains(marker))
+            if [
+                "TOKEN",
+                "SECRET",
+                "PASSWORD",
+                "PRIVATE_KEY",
+                "API_KEY",
+                "ACCESS_KEY",
+                "_AUTH",
+                "BEARER ",
+                "CREDENTIAL",
+            ]
+            .iter()
+            .any(|marker| upper.contains(marker))
             {
                 "[redacted hook output]"
             } else {
@@ -264,32 +309,49 @@ fn failure_tail(output: &str) -> String {
         .join("\n")
 }
 
-fn append_log(
-    path: &Path,
-    context: &HookContext,
-    spec: &HookSpec,
-    state: HookRunState,
-    stdout: &str,
-    stderr: &str,
-) {
+fn append_log(path: &Path, context: &HookContext, state: HookRunState, stdout: &str, stderr: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        crate::platform::restrict_dir_owner_only(parent);
     }
     let line = format!(
-        "event={} state={state:?} command={:?}\nstdout:\n{}\nstderr:\n{}\n",
+        "event={} state={state:?} command=[redacted]\nstdout:\n{}\nstderr:\n{}\n",
         context.event.as_str(),
-        spec.command,
-        stdout,
-        stderr
+        redact_output(stdout),
+        redact_output(stderr),
     );
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut file) = crate::platform::append_private_file(path) {
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+fn redact_output(output: &str) -> String {
+    output
+        .lines()
+        .map(|line| {
+            let upper = line.to_ascii_uppercase();
+            if [
+                "TOKEN",
+                "SECRET",
+                "PASSWORD",
+                "PRIVATE_KEY",
+                "API_KEY",
+                "ACCESS_KEY",
+                "_AUTH",
+                "BEARER ",
+                "CREDENTIAL",
+            ]
+            .iter()
+            .any(|marker| upper.contains(marker))
+            {
+                "[redacted hook output]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Run a list in declaration order, stopping only when the configured failure
@@ -360,6 +422,8 @@ mod tests {
             ("THEGN_SAFE_MARKER".into(), "must-not-inherit".into()),
         ]);
         assert_eq!(env, vec![("PATH".to_string(), "/bin".to_string())]);
+        assert!(credential_shaped("SERVICE_API_KEY"));
+        assert!(credential_shaped("OIDC_AUTH"));
     }
 
     #[test]
@@ -398,5 +462,46 @@ mod tests {
         assert!(tail.len() <= FAILURE_TAIL_BYTES + 4);
         assert!(!tail.contains("do-not-show"));
         assert!(tail.contains("redacted hook output"));
+    }
+
+    #[test]
+    fn hook_output_is_capped_while_the_pipe_is_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(&spec("yes x | head -c 2000000", 2), &context(), dir.path());
+        assert_eq!(result.state, HookRunState::Succeeded);
+        assert!(result.stdout.len() <= MAX_CAPTURE_BYTES + "\n[hook output truncated]".len());
+        assert!(result.stdout.contains("[hook output truncated]"));
+    }
+
+    #[test]
+    fn hook_log_redacts_command_output_and_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks").join("post-create.log");
+        append_log(
+            &path,
+            &context(),
+            HookRunState::Failed,
+            "ACCESS_KEY=do-not-write",
+            "Bearer do-not-write",
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("command=[redacted]"));
+        assert!(!contents.contains("do-not-write"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 }
