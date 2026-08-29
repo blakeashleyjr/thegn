@@ -29,7 +29,7 @@ pub enum SourceKind {
     Env,
     /// `[profiles.<name>]` keybind profiles.
     Profile,
-    /// Built-in theme presets.
+    /// Built-in and valid local user themes.
     Theme,
     /// `[[agents]]` names.
     Agent,
@@ -458,11 +458,16 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // Theme names are the merged built-in/local catalog. The import path is a
+    // filesystem value and keeps clap's structural completion behavior.
+    slot("theme set", "name", SourceKind::Theme),
+    slot("theme import", "name", SourceKind::Theme),
     // --- structural (clap completes these from the tree) -------------------
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
     slot("", "config", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------
