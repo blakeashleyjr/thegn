@@ -215,6 +215,11 @@ facility, use `Bash(run_in_background=true)` for one
 `thegn dispatch wait --any --timeout <ms> --json`; its completion notification
 wakes the Lead for exactly one advance turn.
 
+The monitor is orchestration-only: it is not a `thegn session open` worker, is
+never assigned a pipeline stage, does not edit a worktree, and performs no
+stage work itself. Its only authority is to observe wakes, run the chart's
+explicit transition commands, and report facts back to the Lead.
+
 Feed the monitor the chart JSON (`thegn config get pipeline --json`), the issue
 id, and this loop:
 
