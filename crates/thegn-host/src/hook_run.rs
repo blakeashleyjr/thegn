@@ -29,6 +29,9 @@ pub struct HookRunResult {
     pub stdout: String,
     pub stderr: String,
     pub log_path: PathBuf,
+    /// Failure to persist the diagnostic log is reported separately from the
+    /// hook process result so it never masks the primary outcome.
+    pub log_error: Option<String>,
 }
 
 impl HookRunResult {
@@ -37,13 +40,17 @@ impl HookRunResult {
     }
 
     pub fn summary(&self) -> String {
-        match self.state {
+        let primary = match self.state {
             // Do not echo the shell command: it is user/repository supplied
             // data and may contain a literal secret. The detailed result keeps
             // it for internal callers, while notifications stay safe.
             HookRunState::Succeeded => "hook succeeded".to_string(),
             HookRunState::Failed => format!("hook failed (exit {:?})", self.code),
             HookRunState::TimedOut => "hook timed out".to_string(),
+        };
+        match &self.log_error {
+            Some(error) => format!("{primary}; hook log unavailable: {error}"),
+            None => primary,
         }
     }
 
@@ -64,7 +71,9 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
         Ok(child) => child,
         Err(error) => {
             let stderr = format!("failed to start hook: {error}");
-            append_log(&log_path, context, HookRunState::Failed, "", &stderr);
+            let log_error = append_log(&log_path, context, HookRunState::Failed, "", &stderr)
+                .err()
+                .map(|error| error.to_string());
             return HookRunResult {
                 command: spec.command.clone(),
                 state: HookRunState::Failed,
@@ -72,6 +81,7 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
                 stdout: String::new(),
                 stderr,
                 log_path,
+                log_error,
             };
         }
     };
@@ -114,7 +124,9 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
     } else {
         HookRunState::Failed
     };
-    append_log(&log_path, context, state, &stdout, &stderr);
+    let log_error = append_log(&log_path, context, state, &stdout, &stderr)
+        .err()
+        .map(|error| error.to_string());
     HookRunResult {
         command: spec.command.clone(),
         state,
@@ -122,6 +134,7 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
         stdout,
         stderr,
         log_path,
+        log_error,
     }
 }
 
@@ -309,10 +322,16 @@ fn failure_tail(output: &str) -> String {
         .join("\n")
 }
 
-fn append_log(path: &Path, context: &HookContext, state: HookRunState, stdout: &str, stderr: &str) {
+fn append_log(
+    path: &Path,
+    context: &HookContext,
+    state: HookRunState,
+    stdout: &str,
+    stderr: &str,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-        crate::platform::restrict_dir_owner_only(parent);
+        std::fs::create_dir_all(parent)?;
+        crate::platform::restrict_dir_owner_only_checked(parent)?;
     }
     let line = format!(
         "event={} state={state:?} command=[redacted]\nstdout:\n{}\nstderr:\n{}\n",
@@ -321,9 +340,9 @@ fn append_log(path: &Path, context: &HookContext, state: HookRunState, stdout: &
         redact_output(stderr),
     );
     use std::io::Write;
-    if let Ok(mut file) = crate::platform::append_private_file(path) {
-        let _ = file.write_all(line.as_bytes());
-    }
+    let mut file = crate::platform::append_private_file(path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 fn redact_output(output: &str) -> String {
@@ -457,6 +476,7 @@ mod tests {
             stdout: format!("{}\nAPI_TOKEN=do-not-show", "x".repeat(5000)),
             stderr: String::new(),
             log_path: PathBuf::new(),
+            log_error: None,
         };
         let tail = result.failure_tail();
         assert!(tail.len() <= FAILURE_TAIL_BYTES + 4);
@@ -483,7 +503,8 @@ mod tests {
             HookRunState::Failed,
             "ACCESS_KEY=do-not-write",
             "Bearer do-not-write",
-        );
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("command=[redacted]"));
         assert!(!contents.contains("do-not-write"));
@@ -503,5 +524,28 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn hook_log_write_failure_is_returned_without_hiding_hook_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-file");
+        std::fs::create_dir(&path).unwrap();
+        let error = append_log(&path, &context(), HookRunState::Failed, "output", "error")
+            .expect_err("a directory cannot be opened as an append log");
+        assert!(!error.to_string().is_empty());
+
+        let result = HookRunResult {
+            command: "false".into(),
+            state: HookRunState::Failed,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            log_path: path,
+            log_error: Some(error.to_string()),
+        };
+        assert!(!result.succeeded());
+        assert!(result.summary().contains("hook failed"));
+        assert!(result.summary().contains("hook log unavailable"));
     }
 }
