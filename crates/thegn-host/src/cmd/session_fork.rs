@@ -4,7 +4,7 @@
 //! worktree-create step and formats the resulting control response.
 
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use thegn_core::outln;
 use thegn_svc::control::client::ControlClient;
@@ -99,8 +99,14 @@ pub(crate) async fn run(
 
 fn remap_cwd(old_root: &Path, new_root: &Path, cwd: &Path) -> String {
     cwd.strip_prefix(old_root)
+        .ok()
+        .filter(|relative| {
+            !relative
+                .components()
+                .any(|component| component == Component::ParentDir)
+        })
         .map(|relative| new_root.join(relative))
-        .unwrap_or_else(|_| new_root.to_path_buf())
+        .unwrap_or_else(|| new_root.to_path_buf())
         .to_string_lossy()
         .into_owned()
 }
@@ -125,6 +131,18 @@ mod tests {
                 Path::new("/old"),
                 Path::new("/new"),
                 Path::new("/elsewhere")
+            ),
+            "/new"
+        );
+    }
+
+    #[test]
+    fn cwd_with_parent_traversal_falls_back_to_the_new_worktree_root() {
+        assert_eq!(
+            remap_cwd(
+                Path::new("/old"),
+                Path::new("/new"),
+                Path::new("/old/../outside")
             ),
             "/new"
         );
