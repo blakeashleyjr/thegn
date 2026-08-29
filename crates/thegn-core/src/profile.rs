@@ -334,6 +334,26 @@ fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>>
     }
 }
 
+/// Probe an existing singleton lock without creating its parent directory or
+/// lock file. Dry-run commands use this path so checking the source instance
+/// cannot violate their no-write contract.
+fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
 /// The active profile's singleton lock file (`<root>/run/thegn.lock`),
 /// creating the `run/` dir best-effort.
 fn singleton_lock_path() -> std::path::PathBuf {
@@ -373,10 +393,7 @@ pub fn acquire_singleton() -> Singleton {
 /// it. Errors fail closed because a migration must not delete source rows
 /// while an owner cannot safely be disproved.
 pub fn instance_running_at(paths: &ProfilePaths) -> bool {
-    match try_lock_nb(&singleton_lock_path_for(&paths.root)) {
-        Ok(Some(_)) => false,
-        Ok(None) | Err(_) => true,
-    }
+    lock_held(&paths.root.join("run/thegn.lock")).unwrap_or(true)
 }
 
 /// Best-effort: is another thegn process holding this profile's singleton
@@ -754,6 +771,21 @@ mod tests {
         };
         assert!(instance_running_at(&paths));
         let _ = std::fs::remove_file(&root); // best-effort: test cleanup
+    }
+
+    #[test]
+    fn singleton_probe_does_not_create_a_missing_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-profile-probe-missing-{}-{}",
+            std::process::id(),
+            util::now()
+        ));
+        let paths = ProfilePaths {
+            name: "default".into(),
+            root: root.clone(),
+        };
+        assert!(!instance_running_at(&paths));
+        assert!(!root.exists());
     }
 
     #[test]
