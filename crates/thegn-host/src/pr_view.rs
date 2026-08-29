@@ -20,12 +20,10 @@ use crate::panel::{CheckLine, CheckState, PrSummary};
 use crate::review_handoff::ReviewSelection;
 use crate::review_rows::{
     ReviewRow, expanded_file_rows, feedback_rows, file_stat, push_wrapped_body_lines,
-    render_review_row, review_state_marker, row_thread, sel_marker, trunc, wrap,
+    render_review_row, review_state_marker, row_thread, sel_marker, trunc,
 };
 use crate::seg::{Line, Seg, Tok, seg, sp};
-use thegn_core::forge::model::{
-    DiffFile, DiffLine, DiffLineKind, PrConversation, PrDiff, ReviewState,
-};
+use thegn_core::forge::model::{PrConversation, PrDiff, ReviewState};
 
 /// The four workflow tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1263,7 +1261,10 @@ impl PrView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::forge::model::{PrComment, ReviewThread};
+    use crate::review_rows::wrap;
+    use thegn_core::forge::model::{
+        DiffFile, DiffHunk, DiffLine, DiffLineKind, PrComment, ReviewThread,
+    };
     use thegn_core::review::PrReviewSnapshot;
 
     fn sample() -> PrView {
