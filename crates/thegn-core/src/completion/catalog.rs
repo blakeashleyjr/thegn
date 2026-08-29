@@ -475,6 +475,8 @@ pub const CATALOG: &[Slot] = &[
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
     slot("", "config", SourceKind::Structural),
+    // `config validate --repo <PATH>`: clap owns filesystem path completion.
+    slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),

@@ -41,6 +41,8 @@ pub(crate) mod proc;
 /// steers a thread to the efficiency cores on Apple silicon); a no-op elsewhere.
 pub(crate) mod qos;
 
+pub(crate) mod sound;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

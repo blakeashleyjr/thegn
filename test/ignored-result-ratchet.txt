@@ -238,6 +238,9 @@ crates/thegn-host/src/monitor.rs
 crates/thegn-host/src/monitor/state.rs
 crates/thegn-host/src/mq_assets.rs
 crates/thegn-host/src/notify.rs
+# THE-35: config reload and legacy command playback are advisory; failures leave
+# the prior snapshot or simply omit the optional sound.
+crates/thegn-host/src/notification_sound.rs
 crates/thegn-host/src/palette.rs
 crates/thegn-host/src/panel_util.rs
 crates/thegn-host/src/pane_pty.rs
