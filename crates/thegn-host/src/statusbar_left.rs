@@ -233,4 +233,47 @@ mod tests {
         assert!(!BarItemId::Help.has_detail());
         assert!(BarItemId::Widget("cpu".into()).has_detail());
     }
+
+    #[test]
+    fn drawer_widget_is_atomic_and_hit_tests_where_painted() {
+        let mut m = model_with(&["drawer", "keyhints"]);
+        m.drawer_bar.occupant_count = 2;
+        let (segs, _) = left_layout(&m, 80);
+        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("drawer (2)"), "closed indicator: {text:?}");
+
+        let spans = left_item_spans(&m, rect(120));
+        let (_, drawer_rect) = spans
+            .iter()
+            .find(|(id, _)| *id == BarItemId::Widget(DRAWER_ID.into()))
+            .expect("drawer span present");
+        let start = text.find("drawer").expect("drawer label painted");
+        let start = text[..start].width();
+        assert!(
+            drawer_rect.x <= start && start < drawer_rect.x + drawer_rect.cols,
+            "span {drawer_rect:?} covers drawer label at {start} in {text:?}"
+        );
+
+        m.drawer_bar.open = true;
+        m.drawer_bar.occupant = "atac".into();
+        let (segs, _) = left_layout(&m, 80);
+        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("atac (2)"), "open indicator: {text:?}");
+    }
+
+    #[test]
+    fn dropping_drawer_id_removes_indicator_and_span() {
+        let m = model_with(&["keyhints"]);
+        assert!(
+            !left_layout(&m, 80)
+                .0
+                .iter()
+                .any(|s| s.text.contains("drawer"))
+        );
+        assert!(
+            !left_item_spans(&m, rect(120))
+                .iter()
+                .any(|(id, _)| *id == BarItemId::Widget(DRAWER_ID.into()))
+        );
+    }
 }
