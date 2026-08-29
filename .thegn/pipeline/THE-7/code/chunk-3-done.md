@@ -30,6 +30,8 @@ for the theme builder popup.
 - `cargo nextest run -p thegn-svc control_wire` — 1 passed; control schema
   snapshot unchanged.
 - `cargo nextest run -p thegn-core completion` — 42 passed.
+- `cargo nextest run -p thegn-core --test env_overlay_coverage` — 2 passed;
+  env-overlay ratchet unchanged.
 - Manual `theme list` invocation passed with fresh temporary
   `XDG_STATE_HOME` and `XDG_CONFIG_HOME` directories.
 - `cargo fmt --all -- --check` and `git diff --check` — passed.
