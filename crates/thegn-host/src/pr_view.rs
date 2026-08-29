@@ -210,6 +210,8 @@ pub struct PrView {
     open_file: Option<usize>,
     include_resolved: bool,
     thread_sel: usize,
+    /// A headless handoff waiting for the confirmation menu to resolve.
+    pub(crate) pending_handoff: Option<ReviewSelection>,
     composer: Option<Composer>,
     /// An inline result/status line shown in the footer.
     pub status: Option<String>,
@@ -254,6 +256,7 @@ impl PrView {
             open_file: None,
             include_resolved: false,
             thread_sel: 0,
+            pending_handoff: None,
             composer: None,
             status: None,
         }

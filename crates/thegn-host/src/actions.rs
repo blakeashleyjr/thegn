@@ -887,22 +887,56 @@ pub(crate) fn dispatch_pr_view_key(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     model: &mut FrameModel,
+    active_menu: &mut Option<crate::menu::MenuOverlay>,
 ) {
     let Some(v) = view.as_mut() else { return };
     match v.handle_key(key, mods) {
         PrViewOutcome::Close => *view = None,
         PrViewOutcome::Pending => {}
         PrViewOutcome::Act(crate::pr_view::PrViewAction::Handoff(selection)) => {
-            if let Some(snapshot) = v.review.clone() {
-                crate::review_handoff::dispatch(
-                    session, panes, focus, cfg, model, refresh_tx, waker, snapshot, selection,
-                    &v.title, &v.url, &v.base,
-                );
+            if matches!(
+                crate::review_handoff::target(session, panes, cfg),
+                crate::review_handoff::PaneTarget::Headless { .. }
+            ) {
+                v.pending_handoff = Some(selection);
+                *active_menu = Some(crate::menu::confirm_menu(
+                    "send review to headless agent?",
+                    "Remote review text will be sent to the configured agent.",
+                    "pr-review-handoff",
+                    String::new(),
+                    true,
+                ));
+                model.status = "confirm headless review handoff".into();
             } else {
-                v.status = Some("review feedback is still loading".into());
+                dispatch_pr_handoff(
+                    view, session, panes, focus, cfg, model, refresh_tx, waker, selection,
+                );
             }
         }
         PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+    }
+}
+
+/// Dispatch a handoff that has already passed any required confirmation.
+pub(crate) fn dispatch_pr_handoff(
+    view: &mut Option<PrView>,
+    session: &mut Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    selection: crate::review_handoff::ReviewSelection,
+) {
+    let Some(v) = view.as_mut() else { return };
+    if let Some(snapshot) = v.review.clone() {
+        crate::review_handoff::dispatch(
+            session, panes, focus, cfg, model, refresh_tx, waker, snapshot, selection, &v.title,
+            &v.url, &v.base,
+        );
+    } else {
+        v.status = Some("review feedback is still loading".into());
     }
 }
 
