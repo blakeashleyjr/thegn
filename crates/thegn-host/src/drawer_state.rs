@@ -535,22 +535,57 @@ impl DrawerRuntime {
     }
 
     fn target_from_cache(
-        cache: &FlagCache,
+        cache: &mut FlagCache,
         dir: &Path,
+        policy: &DrawerPolicy,
     ) -> Option<(DrawerScope, DrawerPoolKey, String)> {
-        if let Some(id) = cache.occupant_for_key(&drawer_scope_key(DrawerScope::Worktree, dir)) {
-            return Some((DrawerScope::Worktree, DrawerPoolKey::worktree(dir, &id), id));
+        let worktree_key = drawer_scope_key(DrawerScope::Worktree, dir);
+        if let Some(id) = cache.occupant_for_key(&worktree_key) {
+            let valid = id == FILES_OCCUPANT_ID
+                || policy
+                    .occupant(&id)
+                    .is_some_and(|occupant| occupant.scope == Some(DrawerScope::Worktree));
+            if valid {
+                return Some((DrawerScope::Worktree, DrawerPoolKey::worktree(dir, &id), id));
+            }
+            // A renamed/removed tool, or a global tool left in a legacy
+            // worktree slot, must degrade to the built-in drawer rather than
+            // briefly close the drawer after an "unknown occupant" result.
+            cache.set_key(&worktree_key, Some(FILES_OCCUPANT_ID.to_string()));
+            return Some((
+                DrawerScope::Worktree,
+                DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID),
+                FILES_OCCUPANT_ID.to_string(),
+            ));
         }
-        cache
-            .occupant_for_key(GLOBAL_SCOPE_KEY)
-            .map(|id| (DrawerScope::Global, DrawerPoolKey::global(&id), id))
+        if let Some(id) = cache.occupant_for_key(GLOBAL_SCOPE_KEY) {
+            let valid = policy
+                .occupant(&id)
+                .is_some_and(|occupant| occupant.scope == Some(DrawerScope::Global));
+            if valid {
+                return Some((DrawerScope::Global, DrawerPoolKey::global(&id), id));
+            }
+            // The built-in files occupant is worktree-scoped; a stale global
+            // record cannot be restored as a global pane.
+            cache.set_key(GLOBAL_SCOPE_KEY, None);
+            return Some((
+                DrawerScope::Worktree,
+                DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID),
+                FILES_OCCUPANT_ID.to_string(),
+            ));
+        }
+        None
     }
 
-    fn target(dir: &Path) -> Option<(DrawerScope, DrawerPoolKey, String)> {
+    fn target(
+        cfg: &thegn_core::config::Config,
+        dir: &Path,
+    ) -> Option<(DrawerScope, DrawerPoolKey, String)> {
+        let policy = DrawerPolicy::from_config(cfg);
         flags()
             .lock()
             .ok()
-            .and_then(|cache| Self::target_from_cache(&cache, dir))
+            .and_then(|mut cache| Self::target_from_cache(&mut cache, dir, &policy))
     }
 
     fn stash_visible(&mut self, cfg: &thegn_core::config::Config, panes: &mut Panes) {
@@ -590,7 +625,7 @@ impl DrawerRuntime {
         panes: &mut Panes,
         _rect: Rect,
     ) {
-        let wanted = Self::target(dir);
+        let wanted = Self::target(cfg, dir);
         if let Some((scope, key, id)) = wanted {
             if self
                 .visible
@@ -707,7 +742,7 @@ impl DrawerRuntime {
             self.close(cfg, visible.scope, dir, panes, rect);
             return;
         }
-        if let Some((target_scope, _, _)) = Self::target(dir) {
+        if let Some((target_scope, _, _)) = Self::target(cfg, dir) {
             self.close(cfg, target_scope, dir, panes, rect);
             return;
         }
@@ -789,7 +824,7 @@ impl DrawerRuntime {
                 return;
             }
         };
-        let active = Self::target(dir).is_some_and(|(_, active_key, _)| active_key == key);
+        let active = Self::target(cfg, dir).is_some_and(|(_, active_key, _)| active_key == key);
         if active && self.visible.is_none() {
             if let Some(pane_id) = open_resolved(panes, launch, cfg, &request.worktree, rect) {
                 self.visible = Some(VisibleDrawer {
@@ -915,6 +950,40 @@ mod tests {
         let source = Path::new("/tmp/drawer-global-source");
         let destination = Path::new("/tmp/drawer-global-destination");
         let destination_key = drawer_scope_key(DrawerScope::Worktree, destination);
+        let cfg = thegn_core::config::Config {
+            tools: vec![
+                thegn_core::config::NamedCommand {
+                    name: "db".into(),
+                    command: "psql".into(),
+                    hints: Vec::new(),
+                    provider: None,
+                    harness: None,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
+                    resume: false,
+                    route_via_proxy: false,
+                    drawer_scope: Some(DrawerScope::Global),
+                    drawer_cwd: None,
+                },
+                thegn_core::config::NamedCommand {
+                    name: "local".into(),
+                    command: "atac".into(),
+                    hints: Vec::new(),
+                    provider: None,
+                    harness: None,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
+                    resume: false,
+                    route_via_proxy: false,
+                    drawer_scope: Some(DrawerScope::Worktree),
+                    drawer_cwd: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let policy = DrawerPolicy::from_config(&cfg);
         std::fs::write(store.join(GLOBAL_SCOPE_KEY), "tool:db").unwrap();
         std::fs::write(store.join(&destination_key), "tool:local").unwrap();
 
@@ -932,7 +1001,7 @@ mod tests {
         // worktree occupant still takes precedence.
         process.set_key(GLOBAL_SCOPE_KEY, Some("tool:db".into()));
         assert_eq!(
-            DrawerRuntime::target_from_cache(&process, source),
+            DrawerRuntime::target_from_cache(&mut process, source, &policy,),
             Some((
                 DrawerScope::Global,
                 DrawerPoolKey::global("tool:db"),
@@ -940,7 +1009,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            DrawerRuntime::target_from_cache(&process, destination),
+            DrawerRuntime::target_from_cache(&mut process, destination, &policy,),
             Some((
                 DrawerScope::Worktree,
                 DrawerPoolKey::worktree(destination, "tool:local"),
@@ -974,6 +1043,29 @@ mod tests {
         assert_eq!(cache.occupant_for_key("legacy-closed"), None);
         assert_eq!(cache.occupant_for_key("tool"), Some("tool:db".into()));
         let _ = std::fs::remove_dir_all(&store); // best-effort: test scratch cleanup
+    }
+
+    #[test]
+    fn stale_cached_occupant_falls_back_to_files() {
+        let mut cache = FlagCache::default();
+        let dir = Path::new("/tmp/drawer-stale");
+        let key = drawer_scope_key(DrawerScope::Worktree, dir);
+        cache.set_key(&key, Some("tool:renamed".into()));
+
+        let target = DrawerRuntime::target_from_cache(
+            &mut cache,
+            dir,
+            &DrawerPolicy::from_config(&thegn_core::config::Config::default()),
+        );
+        assert_eq!(
+            target,
+            Some((
+                DrawerScope::Worktree,
+                DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID),
+                FILES_OCCUPANT_ID.into(),
+            ))
+        );
+        assert_eq!(cache.occupant_for_key(&key), Some(FILES_OCCUPANT_ID.into()));
     }
 
     #[test]
