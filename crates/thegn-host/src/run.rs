@@ -1040,6 +1040,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         );
     }
 
+    let theme_store = crate::theme_store::ThemeStore::spawn(
+        waker.clone(),
+        cli.config
+            .clone()
+            .unwrap_or_else(thegn_core::config::Config::path),
+    );
     let result = event_loop(
         &mut buf,
         session,
@@ -1073,6 +1079,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         pane_pids,
         daemon_pid_atomic,
         waker,
+        theme_store,
         start,
         shutdown,
         event_bus,
@@ -5740,6 +5747,7 @@ async fn event_loop<T: Terminal>(
     pane_pids: crate::hydrate::PanePids,
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
+    mut theme_store: crate::theme_store::ThemeStore,
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: thegn_core::event_bus::EventBus,
@@ -6648,6 +6656,8 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    let mut theme_users: Vec<thegn_core::theme_user::UserTheme> = Vec::new();
+    let mut theme_builder: Option<crate::theme_builder::ThemeBuilder> = None;
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
     // subprocesses — is spawned only AFTER the first frame flushes (see the
@@ -7498,6 +7508,22 @@ async fn event_loop<T: Terminal>(
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
             crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
+        }
+        if let Some(builder) = theme_builder.as_mut() {
+            let result = crate::handlers::theme_builder::drain(
+                builder,
+                &mut theme_store,
+                &current_config,
+                &mut theme_users,
+            );
+            if result.close {
+                theme_builder = None;
+            }
+            if result.dirty {
+                dirty = true;
+            }
+        } else {
+            crate::handlers::theme_builder::drain_catalog(&mut theme_store, &mut theme_users);
         }
         // Writer-thread health: a transient write failure means the terminal's
         // actual content is unknown — resync with a full repaint (the async
@@ -10454,6 +10480,10 @@ async fn event_loop<T: Terminal>(
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
+                    if let Some(builder) = theme_builder.as_mut() {
+                        builder.config_reloaded(&new_cfg);
+                        crate::chrome::set_palette(builder.candidate().clone());
+                    }
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
                     crate::caps::install_themed(&new_cfg, resolve_termcaps(&new_cfg));
                     wire_renderer.set_depth(crate::caps::color_depth());
@@ -11721,6 +11751,7 @@ async fn event_loop<T: Terminal>(
                 && !app_tile_active
                 && mouse_sel.is_some()
                 && palette.is_none()
+                && theme_builder.is_none()
                 && monitor.is_none()
                 && board.is_none()
                 && active_menu.is_none()
@@ -11747,6 +11778,7 @@ async fn event_loop<T: Terminal>(
                 && drawer.is_none()
                 && mouse_sel.is_none()
                 && palette.is_none()
+                && theme_builder.is_none()
                 && monitor.is_none()
                 && board.is_none()
                 && active_menu.is_none()
@@ -12263,6 +12295,9 @@ async fn event_loop<T: Terminal>(
             if let Some(ov) = &media_overlay {
                 ov.render(&mut scratch, screen);
             }
+            if let Some(builder) = &theme_builder {
+                crate::handlers::theme_builder::render(builder, &mut scratch, screen);
+            }
             if let Some(h) = help_overlay.as_mut() {
                 h.render(&mut scratch, screen);
             }
@@ -12656,6 +12691,22 @@ async fn event_loop<T: Terminal>(
                 let mx = (m.x as usize).saturating_sub(1);
                 let my = (m.y as usize).saturating_sub(1);
                 let left = m.mouse_buttons.contains(MouseButtons::LEFT);
+                if let Some(builder) = theme_builder.as_mut() {
+                    let keep = crate::handlers::theme_builder::mouse(
+                        builder,
+                        &theme_store,
+                        &m,
+                        mx,
+                        my,
+                        Rect::full(cols, rows),
+                        current_config.ui.dismiss_overlay_on_click_outside,
+                    );
+                    if !keep {
+                        theme_builder = None;
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Front-matter: modal detail-popup capture (outside-click
                 // dismiss), hit-test, and forward into a mouse-reporting pane
                 // app. Consumes the event or hands back the resolved pane.
@@ -13861,6 +13912,21 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if let Some(builder) = theme_builder.as_mut() {
+                    let keep = crate::handlers::theme_builder::key(
+                        builder,
+                        &theme_store,
+                        &k.key,
+                        k.modifiers,
+                    );
+                    if !keep {
+                        theme_builder = None;
+                    } else {
+                        crate::chrome::set_palette(builder.candidate().clone());
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Register paste is armed (PasteRegister): the next key names the
                 // register (`a`–`z`/`0`–`9`, `"` default, `+` clipboard). It's a
                 // top-priority mini-modal so the char never leaks to the pane.
@@ -14327,6 +14393,7 @@ async fn event_loop<T: Terminal>(
                 let no_modal_owns_esc = active_menu.is_none()
                     && palette.is_none()
                     && host_input.is_none()
+                    && theme_builder.is_none()
                     && git_input.is_none()
                     && rollback.is_none()
                     && wizard_ui.is_none()
@@ -20373,6 +20440,15 @@ async fn event_loop<T: Terminal>(
                                 model.status =
                                     format!("Theme: {name} (set [theme] preset to keep)");
                             }
+                            Action::ThemeBuilderOpen => {
+                                let builder = crate::handlers::theme_builder::open(
+                                    &current_config,
+                                    &theme_users,
+                                    &theme_store,
+                                );
+                                crate::chrome::set_palette(builder.candidate().clone());
+                                theme_builder = Some(builder);
+                            }
                             Action::ToggleZoom => {
                                 // On the center, cycle tiled → maximize-in-chrome
                                 // → full-window fullscreen → tiled; on the
@@ -21946,6 +22022,11 @@ async fn event_loop<T: Terminal>(
             }
             Ok(Some(InputEvent::Paste(s))) => {
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
+                if let Some(builder) = theme_builder.as_mut() {
+                    builder.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
                 // A modal that collects text owns the paste — inject it into
                 // the field (workspace picker, new-worktree wizard) rather than
                 // leaking it into the pane behind the overlay.
