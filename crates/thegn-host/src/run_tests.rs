@@ -738,22 +738,24 @@ fn drawer_pool_respects_zero_limit_and_evicts_oldest() {
     let mut pool = DrawerPool::default();
     let a = std::path::Path::new("/tmp/a");
     let b = std::path::Path::new("/tmp/b");
+    let a_key = crate::drawer_state::DrawerPoolKey::worktree(a, "files");
+    let b_key = crate::drawer_state::DrawerPoolKey::worktree(b, "files");
 
     // limit 0 = no pooling; the just-hidden pane is torn down immediately.
-    pool.stash(a, 1, 0, &mut panes);
-    assert!(!pool.contains(a));
+    pool.stash_key(a_key.clone(), 1, 0, &mut panes);
+    assert!(!pool.contains_key(&a_key));
 
     // limit 1 keeps only the most recent; stashing b evicts a.
-    pool.stash(a, 1, 1, &mut panes);
-    assert!(pool.contains(a));
-    pool.stash(b, 2, 1, &mut panes);
-    assert!(!pool.contains(a));
-    assert!(pool.contains(b));
-    assert_eq!(pool.take(b), Some(2));
-    assert!(!pool.contains(b));
+    pool.stash_key(a_key.clone(), 1, 1, &mut panes);
+    assert!(pool.contains_key(&a_key));
+    pool.stash_key(b_key.clone(), 2, 1, &mut panes);
+    assert!(!pool.contains_key(&a_key));
+    assert!(pool.contains_key(&b_key));
+    assert_eq!(pool.take_key(&b_key), Some(2));
+    assert!(!pool.contains_key(&b_key));
 
-    // remove_id forgets a pooled drawer whose yazi exited on its own.
-    pool.stash(a, 3, 2, &mut panes);
+    // remove_id forgets a pooled drawer whose process exited on its own.
+    pool.stash_key(a_key.clone(), 3, 2, &mut panes);
     assert!(pool.remove_id(3));
     assert!(!pool.remove_id(3));
 }
@@ -2735,9 +2737,7 @@ fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
     let mut session = one_tab_session();
     let mut model = FrameModel::default();
     let mut sb = SidebarState::default();
-    let mut drawer = None;
-    let mut drawer_pool = DrawerPool::default();
-    let mut drawer_home = None;
+    let mut drawer_runtime = DrawerRuntime::default();
     let mut workspace_pool = WorkspacePool::default();
     let mut need_relayout = false;
     let mut clear_on_next_frame = false;
@@ -2751,9 +2751,7 @@ fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
         &mut model,
         &mut sb,
         &mut panes,
-        &mut drawer,
-        &mut drawer_pool,
-        &mut drawer_home,
+        &mut drawer_runtime,
         &mut workspace_pool,
         &thegn_core::config::Config::default(),
         crate::compositor::Rect {

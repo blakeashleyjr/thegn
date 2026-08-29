@@ -27,9 +27,7 @@ use crate::compositor::Rect;
 use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
-pub(crate) use crate::drawer_state::{
-    DrawerPool, DrawerRuntime, hide_drawer_into_pool, sync_drawer_persistence,
-};
+pub(crate) use crate::drawer_state::DrawerRuntime;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
     ProvisionProgress, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs,
@@ -84,6 +82,23 @@ fn sync_drawer_runtime_mirror(
     *drawer = next;
     *drawer_home = home;
     changed
+}
+
+/// Reconcile the one drawer runtime after any active-directory mutation. The
+/// pane-id locals are only a layout mirror; they never own drawer lifecycle.
+pub(crate) fn sync_drawer_persistence(
+    session: &crate::session::Session,
+    panes: &mut Panes,
+    drawer: &mut Option<u32>,
+    drawer_runtime: &mut DrawerRuntime,
+    drawer_home: &mut Option<std::path::PathBuf>,
+    cfg: &thegn_core::config::Config,
+    center: Rect,
+) {
+    if let Some(dir) = active_cwd(session) {
+        drawer_runtime.reconcile(cfg, &dir, panes, center);
+    }
+    sync_drawer_runtime_mirror(drawer_runtime, drawer, drawer_home);
 }
 
 /// Build the pure statusbar snapshot for the drawer widget. The built-in files
@@ -5912,13 +5927,8 @@ async fn event_loop<T: Terminal>(
     // as `LoadStep`s so the splash shows a rich "setting up your environment"
     // screen while a fresh provider sandbox is built. Keyed (group name, tab).
     let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
-    // Drawer cold-spawn pipeline: a cold drawer only *requests* its launch spec
-    // (`drawer_state::request_spawn` resolves it off-loop — DB opens + sandbox
-    // resolution) and the resolved spec lands here; the drain below opens the
-    // pane. The flag cache load is the one sanctioned pre-loop fs read.
-    let (drawer_tx, mut drawer_rx) =
-        tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerSpecMsg>();
-    crate::drawer_state::install_spawner(drawer_tx, waker.clone());
+    // Drawer cold-spawn pipeline: policy resolution and PATH/filesystem work
+    // run off-loop; the registry channel is the only result boundary.
     let (drawer_registry_tx, mut drawer_registry_rx) =
         tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerRegistryMsg>();
     crate::drawer_state::install_registry_spawner(drawer_registry_tx, waker.clone());
@@ -6627,17 +6637,9 @@ async fn event_loop<T: Terminal>(
     let mut region_last_w: Option<usize> = None;
     let mut region_last_t: Option<String> = None;
     let mut drawer: Option<u32> = None;
-    // Hidden keep-alive yazi panes per worktree (instant drawer toggles).
-    let mut drawer_pool = DrawerPool::default();
-    // The dir the VISIBLE drawer was opened for (its pool key when hidden).
+    // Geometry keeps a pane-id mirror for layout/focus integration; all
+    // ownership, pooling, persistence, and transitions live in this runtime.
     let mut drawer_home: Option<std::path::PathBuf> = None;
-    // A cold ToggleDrawer / Files-reveal wants its async spawn SHOWN when the
-    // spec lands (`(dir, take_focus)`), regardless of the persisted flag — the
-    // pooled path shows synchronously. Dir-keyed so a stale spec can't show.
-    let mut drawer_show_pending: Option<(std::path::PathBuf, bool)> = None;
-    // Scope-aware drawer lifecycle. The old pane-id locals above remain as a
-    // geometry compatibility mirror for the surrounding loop and helpers; all
-    // new occupant transitions go through this runtime.
     let mut drawer_runtime = DrawerRuntime::default();
     // The live corner-overlay pin pane (e.g. an `mpv --vo=tct` video player), if
     // any. A single slot, so the corner is inherently a singleton; the pin name
@@ -6902,9 +6904,7 @@ async fn event_loop<T: Terminal>(
                 &mut model,
                 &mut sb,
                 &mut panes,
-                &mut drawer,
-                &mut drawer_pool,
-                &mut drawer_home,
+                &mut drawer_runtime,
                 &mut workspace_pool,
                 keymap.config(),
                 chrome.center,
@@ -7027,12 +7027,11 @@ async fn event_loop<T: Terminal>(
                     need_relayout |= crate::escape::escape_to_center(
                         &mut focus,
                         &mut panel_ui,
-                        &mut drawer,
-                        &mut drawer_pool,
-                        &mut drawer_home,
+                        &mut drawer_runtime,
                         &session,
                         &mut panes,
                         keymap.config(),
+                        chrome.center,
                     );
                     // Collapse the Wide expand too (the sidebar analogue
                     // of the panel width reset in escape_to_center); the
@@ -7138,9 +7137,7 @@ async fn event_loop<T: Terminal>(
                             panes: &mut panes,
                             model: &mut model,
                             sb: &mut sb,
-                            drawer: &mut drawer,
-                            drawer_pool: &mut drawer_pool,
-                            drawer_home: &mut drawer_home,
+                            drawer_runtime: &mut drawer_runtime,
                             active_menu: &mut active_menu,
                             pending: &mut pending_confirm_delete_worktrees,
                             need_relayout: &mut need_relayout,
@@ -7186,15 +7183,14 @@ async fn event_loop<T: Terminal>(
                         refresh_tab_model(&mut model, &session, &mut sb);
                         sb.focus_active_row(&mut model);
                         need_relayout = true;
-                        sync_drawer_persistence(
-                            &session,
-                            &mut panes,
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
-                            keymap.config(),
-                            chrome.center,
-                        );
+                        if let Some(dir) = active_cwd(&session) {
+                            drawer_runtime.reconcile(
+                                keymap.config(),
+                                &dir,
+                                &mut panes,
+                                chrome.center,
+                            );
+                        }
                     }
                     dirty = true;
                     continue;
@@ -7206,9 +7202,7 @@ async fn event_loop<T: Terminal>(
                             panes: &mut panes,
                             model: &mut model,
                             sb: &mut sb,
-                            drawer: &mut drawer,
-                            drawer_pool: &mut drawer_pool,
-                            drawer_home: &mut drawer_home,
+                            drawer_runtime: &mut drawer_runtime,
                             active_menu: &mut active_menu,
                             pending: &mut pending_confirm_delete_worktrees,
                             need_relayout: &mut need_relayout,
@@ -7229,9 +7223,7 @@ async fn event_loop<T: Terminal>(
                             panes: &mut panes,
                             model: &mut model,
                             sb: &mut sb,
-                            drawer: &mut drawer,
-                            drawer_pool: &mut drawer_pool,
-                            drawer_home: &mut drawer_home,
+                            drawer_runtime: &mut drawer_runtime,
                             active_menu: &mut active_menu,
                             pending: &mut pending_confirm_delete_worktrees,
                             need_relayout: &mut need_relayout,
@@ -8151,17 +8143,14 @@ async fn event_loop<T: Terminal>(
                 model.pool = pool;
                 dirty = true;
             }
-            // And the new worktree's hidden yazi drawer, so the first toggle
-            // never waits on yazi's startup. Off by default ([drawer].prewarm)
-            // so invisible yazi instances never accumulate unbidden. Async: the
-            // spec resolves off-loop and the drawer drain stashes the pane.
-            if keymap.config().drawer.prewarm
-                && keymap.config().drawer.pool_limit > 0
-                && drawer.is_none()
-                && keymap.config().tool_command("yazi").is_some()
-                && !drawer_pool.contains(&current_worktree)
-            {
-                crate::drawer_state::request_spawn(keymap.config(), &current_worktree);
+            // Prewarm is routed through the runtime and remains files-only.
+            if keymap.config().drawer.prewarm {
+                drawer_runtime.prewarm_files(
+                    keymap.config(),
+                    &current_worktree,
+                    &mut panes,
+                    chrome.center,
+                );
             }
         }
 
@@ -8411,8 +8400,7 @@ async fn event_loop<T: Terminal>(
                 dirty: &mut dirty,
                 need_relayout: &mut need_relayout,
                 drawer: &mut drawer,
-                drawer_pool: &mut drawer_pool,
-                drawer_home: &mut drawer_home,
+                drawer_runtime: &mut drawer_runtime,
                 corner: &mut corner,
                 corner_name: &mut corner_name,
                 corner_kitty,
@@ -8450,9 +8438,6 @@ async fn event_loop<T: Terminal>(
         }
         if drain_summary.preempted {
             loop_perf.input_preempt();
-        }
-        for pane_id in &drain_summary.exited {
-            drawer_runtime.on_exit(*pane_id, &mut panes);
         }
         if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
             need_relayout = true;
@@ -8570,9 +8555,7 @@ async fn event_loop<T: Terminal>(
                 &mut focus,
                 &mut model,
                 &mut sb,
-                &mut drawer,
-                &mut drawer_pool,
-                &mut drawer_home,
+                &mut drawer_runtime,
                 &current_config,
                 chrome.center,
             ) {
@@ -9123,74 +9106,6 @@ async fn event_loop<T: Terminal>(
             if drawer_focus_pending && drawer.is_some() {
                 focus.zone = crate::focus::Zone::Drawer;
                 drawer_focus_pending = false;
-            }
-        }
-
-        // Resolved legacy file-manager launch specs (the async half of a cold
-        // drawer spawn). This compatibility path remains for older switch and
-        // helper call sites; registry occupants use the drain above.
-        // Policy by CURRENT state, not the state at request time: show it when
-        // the active worktree still wants its drawer; otherwise keep the work —
-        // stash it as a pre-warmed pool entry for the next visit; else drop.
-        while let Ok((ddir, res)) = drawer_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Spec);
-            crate::drawer_state::request_done(&ddir);
-            let launch = match res {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::debug!(target: "thegn::drawer", dir = %ddir.display(), %e,
-                        "drawer spec resolution failed");
-                    // Only clear the user's pending show/focus intent if THIS
-                    // failure is for the dir they toggled (audit run.rs:8577):
-                    // an unrelated background prewarm's Err must not cancel a
-                    // pending show for a different worktree. Mirrors the Ok
-                    // path's dir-key filter below.
-                    if drawer_show_pending
-                        .as_ref()
-                        .is_some_and(|(d, _)| d == &ddir)
-                    {
-                        drawer_show_pending = None;
-                    }
-                    continue;
-                }
-            };
-            let cfg = keymap.config();
-            let pending = drawer_show_pending
-                .as_ref()
-                .filter(|(d, _)| d == &ddir)
-                .map(|&(_, f)| f);
-            let want_show = drawer.is_none()
-                && (pending.is_some()
-                    || (active_cwd(&session).as_deref() == Some(ddir.as_path())
-                        && crate::drawer_state::flag(&ddir)));
-            if want_show {
-                if let Some(id) = crate::drawer_state::open_resolved(
-                    &mut panes,
-                    launch,
-                    cfg,
-                    &ddir,
-                    chrome.center,
-                ) {
-                    drawer = Some(id);
-                    drawer_home = Some(ddir.clone());
-                    if pending == Some(true) {
-                        focus.zone = crate::focus::Zone::Drawer;
-                    }
-                    need_relayout = true;
-                    dirty = true;
-                }
-                drawer_show_pending = None;
-            } else if cfg.drawer.pool_limit > 0 && !drawer_pool.contains(&ddir) {
-                let limit = cfg.drawer.pool_limit;
-                if let Some(id) = crate::drawer_state::open_resolved(
-                    &mut panes,
-                    launch,
-                    cfg,
-                    &ddir,
-                    chrome.center,
-                ) {
-                    drawer_pool.stash(&ddir, id, limit, &mut panes);
-                }
             }
         }
 
@@ -12781,13 +12696,9 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 if keymap.config().drawer.prewarm
-                    && keymap.config().drawer.pool_limit > 0
-                    && drawer.is_none()
-                    && keymap.config().tool_command("yazi").is_some()
                     && let Some(dir) = active_cwd(&session)
-                    && !drawer_pool.contains(&dir)
                 {
-                    crate::drawer_state::request_spawn(keymap.config(), &dir);
+                    drawer_runtime.prewarm_files(keymap.config(), &dir, &mut panes, chrome.center);
                 }
             }
         }
@@ -13563,7 +13474,7 @@ async fn event_loop<T: Terminal>(
                                 &session,
                                 &mut panes,
                                 &mut drawer,
-                                &mut drawer_pool,
+                                &mut drawer_runtime,
                                 &mut drawer_home,
                                 keymap.config(),
                                 chrome.center,
@@ -14771,9 +14682,7 @@ async fn event_loop<T: Terminal>(
                         &mut focus,
                         &mut model,
                         &mut sb,
-                        &mut drawer,
-                        &mut drawer_pool,
-                        &mut drawer_home,
+                        &mut drawer_runtime,
                         &current_config,
                         chrome.center,
                     ) {
@@ -15226,9 +15135,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -15292,9 +15199,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -15327,9 +15232,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -15373,9 +15276,7 @@ async fn event_loop<T: Terminal>(
                                         &mut focus,
                                         &mut model,
                                         &mut sb,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
+                                        &mut drawer_runtime,
                                         &current_config,
                                         chrome.center,
                                     ) {
@@ -15404,9 +15305,7 @@ async fn event_loop<T: Terminal>(
                                             &mut focus,
                                             &mut model,
                                             &mut sb,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
+                                            &mut drawer_runtime,
                                             &current_config,
                                             chrome.center,
                                         ) {
@@ -15445,7 +15344,7 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &mut panes,
                                     &mut drawer,
-                                    &mut drawer_pool,
+                                    &mut drawer_runtime,
                                     &mut drawer_home,
                                     keymap.config(),
                                     chrome.center,
@@ -16480,7 +16379,7 @@ async fn event_loop<T: Terminal>(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
-                                            &mut drawer_pool,
+                                            &mut drawer_runtime,
                                             &mut drawer_home,
                                             keymap.config(),
                                             chrome.center,
@@ -16511,7 +16410,7 @@ async fn event_loop<T: Terminal>(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
-                                            &mut drawer_pool,
+                                            &mut drawer_runtime,
                                             &mut drawer_home,
                                             keymap.config(),
                                             chrome.center,
@@ -16532,7 +16431,7 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -16840,12 +16739,11 @@ async fn event_loop<T: Terminal>(
                         need_relayout |= crate::escape::escape_to_center(
                             &mut focus,
                             &mut panel_ui,
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
+                            &mut drawer_runtime,
                             &session,
                             &mut panes,
                             keymap.config(),
+                            chrome.center,
                         );
                     } else if k.key == KeyCode::Enter {
                         let hit = if focus.masthead() {
@@ -17174,12 +17072,11 @@ async fn event_loop<T: Terminal>(
                                     need_relayout |= crate::escape::escape_to_center(
                                         &mut focus,
                                         &mut panel_ui,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
+                                        &mut drawer_runtime,
                                         &session,
                                         &mut panes,
                                         keymap.config(),
+                                        chrome.center,
                                     );
                                 }
                             }
@@ -18057,42 +17954,20 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- files / changes: yazi reveal + editor open ------
                         (Section::Files, KeyCode::Char('y')) => {
-                            // Yazi drawer anchored at the selection's dir.
-                            let wt = active_tab_path(&session);
-                            let dir = file_entry_at(
-                                &model,
-                                &panel_ui.files_collapsed,
-                                &panel_ui.files_filter,
-                                panel_ui.cursor,
-                            )
-                            .map(|e| {
-                                if e.is_dir {
-                                    wt.join(&e.path)
-                                } else {
-                                    wt.join(&e.path)
-                                        .parent()
-                                        .map(|d| d.to_path_buf())
-                                        .unwrap_or_else(|| wt.clone())
-                                }
-                            })
-                            .unwrap_or_else(|| wt.clone());
                             if let Some(cwd) = active_cwd(&session) {
-                                hide_drawer_into_pool(
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    &cwd,
+                                // File-manager control remains a runtime
+                                // transition; its provider-specific reveal
+                                // channel is handled by the pane itself.
+                                let _ = crate::handlers::drawer::select(
+                                    &mut drawer_runtime,
                                     keymap.config(),
+                                    thegn_core::config::DrawerScope::Worktree,
+                                    thegn_core::config_drawer::FILES_OCCUPANT_ID,
+                                    &cwd,
                                     &mut panes,
+                                    chrome.center,
                                 );
-                            } else if let Some(id) = drawer.take() {
-                                panes.table.remove(&id);
                             }
-                            // Async: the drawer drain shows the pane at `dir`
-                            // when its spec lands (no focus steal — parity with
-                            // the old synchronous reveal).
-                            crate::drawer_state::request_spawn(keymap.config(), &dir);
-                            drawer_show_pending = Some((dir, false));
                             true
                         }
                         (Section::Files, KeyCode::Char('o')) => {
@@ -20090,9 +19965,7 @@ async fn event_loop<T: Terminal>(
                                     &mut model,
                                     &mut sb,
                                     &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
+                                    &mut drawer_runtime,
                                     keymap.config(),
                                     chrome.center,
                                 );
@@ -20170,9 +20043,7 @@ async fn event_loop<T: Terminal>(
                                     &mut model,
                                     &mut sb,
                                     &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
+                                    &mut drawer_runtime,
                                     keymap.config(),
                                     chrome.center,
                                 ));
@@ -20262,7 +20133,7 @@ async fn event_loop<T: Terminal>(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
-                                                    &mut drawer_pool,
+                                                    &mut drawer_runtime,
                                                     &mut drawer_home,
                                                     keymap.config(),
                                                     chrome.center,
@@ -20298,7 +20169,7 @@ async fn event_loop<T: Terminal>(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
-                                                    &mut drawer_pool,
+                                                    &mut drawer_runtime,
                                                     &mut drawer_home,
                                                     keymap.config(),
                                                     chrome.center,
@@ -20373,7 +20244,7 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -20455,7 +20326,7 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -20483,7 +20354,7 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -21069,7 +20940,7 @@ async fn event_loop<T: Terminal>(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
-                                            &mut drawer_pool,
+                                            &mut drawer_runtime,
                                             &mut drawer_home,
                                             keymap.config(),
                                             chrome.center,
@@ -21103,7 +20974,7 @@ async fn event_loop<T: Terminal>(
                                                 &session,
                                                 &mut panes,
                                                 &mut drawer,
-                                                &mut drawer_pool,
+                                                &mut drawer_runtime,
                                                 &mut drawer_home,
                                                 keymap.config(),
                                                 chrome.center,
@@ -21220,7 +21091,7 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -21455,9 +21326,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,

@@ -13,7 +13,7 @@
 //!    on the loop.
 //! 2. **Cold spawns resolve off-loop.** Materializing a drawer pane means
 //!    resolving the manager's spawn spec + private config — so a cold
-//!    [`show_drawer`] only *requests* the spec ([`request_spawn`]); a
+//!    runtime transition only *requests* a spec ([`request_occupant_spawn`]); a
 //!    blocking task resolves it and the loop's drawer drain opens the pane when
 //!    it lands (or stashes it in the pool when the user has moved on).
 //! 3. **Panes are pooled.** Hiding stashes the live manager pane (position
@@ -45,9 +45,6 @@ pub(crate) struct FlagCache {
 }
 
 impl FlagCache {
-    pub(crate) fn key(dir: &Path) -> String {
-        thegn_core::util::slugify(&dir.to_string_lossy())
-    }
     /// Load every persisted flag from `store` — one readdir + tiny reads, only
     /// for worktrees that ever toggled a drawer.
     pub(crate) fn load_from(store: &Path) -> Self {
@@ -65,12 +62,6 @@ impl FlagCache {
             }
         }
         FlagCache { map }
-    }
-    pub(crate) fn get(&self, dir: &Path) -> bool {
-        self.occupant_for_key(&Self::key(dir)).is_some()
-    }
-    pub(crate) fn set(&mut self, dir: &Path, open: bool) {
-        self.set_key(&Self::key(dir), open.then(|| FILES_OCCUPANT_ID.to_string()));
     }
     pub(crate) fn occupant_for_key(&self, key: &str) -> Option<String> {
         self.map.get(key).cloned().flatten()
@@ -95,34 +86,6 @@ fn flags() -> &'static Mutex<FlagCache> {
 /// worktree's drawer open?".
 pub(crate) fn load_flags() {
     let _ = flags(); // best-effort: warm-up read: a failure just means defaults until the next flag write
-}
-
-/// Whether `dir`'s drawer is flagged open — memory only, safe on the loop.
-pub(crate) fn flag(dir: &Path) -> bool {
-    flags().lock().map(|f| f.get(dir)).unwrap_or(false)
-}
-
-/// Flip `dir`'s drawer flag: cache immediately, persist write-through off the
-/// loop (the `persist_active_focus` pattern — a dropped write only costs the
-/// flag on the next restart). The only staleness is a second concurrent thegn
-/// on the same worktree, an already-accepted edge.
-pub(crate) fn set_flag(dir: &Path, open: bool) {
-    if let Ok(mut f) = flags().lock() {
-        f.set(dir, open);
-    }
-    let path = store_dir().join(FlagCache::key(dir));
-    let write = move || {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-        }
-        // best-effort: the drawer flag is a UI cache; git/session are the truth.
-        let _ = std::fs::write(&path, if open { "true" } else { "false" });
-    };
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::spawn_blocking(write);
-    } else {
-        write(); // outside the runtime (tests, teardown)
-    }
 }
 
 /// Return the desired occupant for a scope from the memory cache. This is safe
@@ -213,16 +176,9 @@ pub(crate) struct DrawerPool {
 }
 
 impl DrawerPool {
-    fn legacy_key(dir: &Path) -> DrawerPoolKey {
-        DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID)
-    }
     /// Stash `id` for `dir`, enforcing `limit`. A `limit` of 0 tears the pane
     /// down immediately (no pool); otherwise the oldest entries beyond the
     /// limit are evicted and their panes dropped from the table.
-    pub(crate) fn stash(&mut self, dir: &Path, id: u32, limit: usize, panes: &mut Panes) {
-        self.stash_key(Self::legacy_key(dir), id, limit, panes);
-    }
-
     /// Stash a pane under its complete scope/occupant key.
     pub(crate) fn stash_key(
         &mut self,
@@ -243,16 +199,9 @@ impl DrawerPool {
             }
         }
     }
-    pub(crate) fn take(&mut self, dir: &Path) -> Option<u32> {
-        self.take_key(&Self::legacy_key(dir))
-    }
-
     pub(crate) fn take_key(&mut self, key: &DrawerPoolKey) -> Option<u32> {
         let idx = self.hidden.iter().position(|(k, _)| k == key)?;
         self.hidden.remove(idx).map(|(_, id)| id)
-    }
-    pub(crate) fn contains(&self, dir: &Path) -> bool {
-        self.contains_key(&Self::legacy_key(dir))
     }
     pub(crate) fn contains_key(&self, key: &DrawerPoolKey) -> bool {
         self.hidden.iter().any(|(k, _)| k == key)
@@ -282,7 +231,7 @@ impl DrawerPool {
 
 // ── async cold spawn ─────────────────────────────────────────────────────────
 
-/// A resolved drawer launch, produced OFF the loop by [`request_spawn`]'s
+/// A resolved drawer launch, produced OFF the loop by the registry spawner's
 /// blocking task and consumed by the loop's drawer drain.
 pub(crate) enum DrawerLaunch {
     /// The resolved file manager with its env + OOM-containment wrapper; cwd
@@ -305,9 +254,6 @@ pub(crate) enum DrawerLaunch {
     ShellFallback,
 }
 
-/// What rides the drawer channel: the worktree the spec is for + the result.
-pub(crate) type DrawerSpecMsg = (PathBuf, Result<DrawerLaunch, String>);
-
 /// A scope-aware cold-spawn request. Both fields are required to reject a
 /// result for a different occupant that raced with a picker/cycle change.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,66 +265,6 @@ pub(crate) struct DrawerRequest {
 }
 
 pub(crate) type DrawerRegistryMsg = (DrawerRequest, Result<DrawerLaunch, String>);
-
-struct Spawner {
-    tx: tokio_mpsc::UnboundedSender<DrawerSpecMsg>,
-    waker: TerminalWaker,
-    /// Worktree keys with a resolve in flight — rapid Alt+↑/↓ through a
-    /// drawer-open worktree must not pile up duplicate manager panes.
-    pending: Mutex<HashSet<String>>,
-}
-
-static SPAWNER: OnceLock<Spawner> = OnceLock::new();
-
-/// Install the loop's drawer-spec channel + waker (startup, before the loop).
-pub(crate) fn install_spawner(
-    tx: tokio_mpsc::UnboundedSender<DrawerSpecMsg>,
-    waker: TerminalWaker,
-) {
-    let _ = SPAWNER.set(Spawner {
-        // best-effort: first-set-wins: the loop's spawner serves for the process
-        tx,
-        waker,
-        pending: Mutex::new(HashSet::new()),
-    });
-}
-
-/// Resolve `dir`'s drawer launch spec off the loop and hand it to the drawer
-/// drain (channel send + waker pulse). Deduped per worktree: a second request
-/// while one is in flight is a no-op. Does nothing before [`install_spawner`]
-/// (headless/tests).
-pub(crate) fn request_spawn(cfg: &thegn_core::config::Config, dir: &Path) {
-    let Some(sp) = SPAWNER.get() else { return };
-    {
-        let Ok(mut pending) = sp.pending.lock() else {
-            return;
-        };
-        if !pending.insert(FlagCache::key(dir)) {
-            return;
-        }
-    }
-    let cfg = cfg.clone();
-    let dir = dir.to_path_buf();
-    let tx = sp.tx.clone();
-    let waker = sp.waker.clone();
-    tokio::task::spawn_blocking(move || {
-        // off-loop: launch_spec opens the DB and resolves the sandbox.
-        let res = resolve_launch(&cfg, &dir);
-        if tx.send((dir, res)).is_ok() {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
-    });
-}
-
-/// Mark `dir`'s in-flight request consumed. The drain calls this for every
-/// message it receives, so a dropped/stale spec can be re-requested later.
-pub(crate) fn request_done(dir: &Path) {
-    if let Some(sp) = SPAWNER.get()
-        && let Ok(mut p) = sp.pending.lock()
-    {
-        p.remove(&FlagCache::key(dir));
-    }
-}
 
 /// The off-loop half: resolve what the drawer pane should exec, through the
 /// `thegn_core::file_manager` seam. The provider owns the argv/env/prepare
@@ -606,80 +492,6 @@ fn contain_drawer_argv(
     wrapped
 }
 
-// ── show / hide / switch-sync ────────────────────────────────────────────────
-
-/// Show the worktree's drawer: pooled pane if alive (instant, position
-/// preserved), async spec request otherwise — the pane opens when the spec
-/// lands at the loop's drawer drain, so a cold spawn never blocks the switch
-/// frame. Records the dir the pane belongs to in `home` so hiding stashes it
-/// under the RIGHT key even after a switch.
-pub(crate) fn show_drawer(
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<PathBuf>,
-    cfg: &thegn_core::config::Config,
-    dir: &Path,
-) {
-    if drawer.is_some() {
-        return;
-    }
-    if let Some(id) = pool.take(dir) {
-        *drawer = Some(id);
-        *home = Some(dir.to_path_buf());
-        return;
-    }
-    request_spawn(cfg, dir);
-}
-
-/// Hide the visible drawer, keeping its pane alive in the pool under the dir
-/// it was opened for (`home`; `fallback` covers pre-tracking drawers). The
-/// stash honors `[drawer].pool_limit`, evicting/tearing down older drawers.
-pub(crate) fn hide_drawer_into_pool(
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<PathBuf>,
-    fallback: &Path,
-    cfg: &thegn_core::config::Config,
-    panes: &mut Panes,
-) {
-    if let Some(id) = drawer.take() {
-        let key = home.take().unwrap_or_else(|| fallback.to_path_buf());
-        pool.stash(&key, id, cfg.drawer.pool_limit, panes);
-    }
-}
-
-/// Reconcile the visible drawer with the active worktree's persisted flag on a
-/// tab/worktree switch: stash a drawer belonging to another worktree, then show
-/// (pool-or-request) / hide per the flag. Reads only the in-memory [`flag`]
-/// cache — no filesystem on the loop. `_center` is kept so the many existing
-/// call sites don't churn; a cold spawn is sized at the drawer drain instead.
-pub(crate) fn sync_drawer_persistence(
-    session: &crate::session::Session,
-    panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<PathBuf>,
-    cfg: &thegn_core::config::Config,
-    _center: Rect,
-) {
-    let _g = crate::perf::measure(crate::perf::Subsys::Drawer);
-    let Some(dir) = crate::run::active_cwd(session) else {
-        return;
-    };
-    let should_be_open = flag(&dir);
-
-    // The visible drawer belongs to whichever worktree opened it; on a
-    // mismatch stash it under ITS home before deciding for the new one.
-    if drawer.is_some() && home.as_deref() != Some(dir.as_path()) {
-        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
-    }
-    if should_be_open && drawer.is_none() {
-        show_drawer(drawer, pool, home, cfg, &dir);
-    } else if !should_be_open && drawer.is_some() {
-        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
-    }
-}
-
 /// The currently visible drawer occupant. The pool key is authoritative for
 /// reuse; `home` is retained for the legacy file-manager compatibility path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -774,6 +586,23 @@ impl DrawerRuntime {
         }
     }
 
+    /// Prewarm only the built-in files occupant. Configured occupants stay
+    /// lazy; this preserves the existing `[drawer].prewarm` contract while
+    /// ensuring the request uses the same pool and async boundary as normal
+    /// selection.
+    pub(crate) fn prewarm_files(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        dir: &Path,
+        _panes: &mut Panes,
+        _rect: Rect,
+    ) {
+        let key = DrawerPoolKey::worktree(dir, FILES_OCCUPANT_ID);
+        if self.visible.is_none() && !self.pool.contains_key(&key) && cfg.drawer.pool_limit > 0 {
+            request_occupant_spawn(cfg, DrawerScope::Worktree, FILES_OCCUPANT_ID, dir);
+        }
+    }
+
     /// Select an occupant from the active-worktree registry. Configured
     /// occupants persist under their declared scope, even though the picker
     /// itself is opened from worktree chrome.
@@ -787,10 +616,12 @@ impl DrawerRuntime {
         rect: Rect,
     ) -> bool {
         let policy = DrawerPolicy::from_config(cfg);
-        let Some(occupant) = policy.occupant(occupant_id) else {
+        let Some(_) = policy.occupant(occupant_id) else {
             return false;
         };
-        let state_scope = Self::selection_scope(&policy, scope, occupant_id)?;
+        let Some(state_scope) = Self::selection_scope(&policy, scope, occupant_id) else {
+            return false;
+        };
         let id = occupant_id;
         self.last
             .insert(drawer_scope_key(state_scope, dir), id.to_string());
@@ -812,6 +643,24 @@ impl DrawerRuntime {
     ) {
         set_desired_occupant(scope, dir, None);
         self.reconcile(cfg, dir, panes, rect);
+    }
+
+    /// Close whichever occupant is currently visible, preserving the scope
+    /// slot that owns it. This is the single close path for file-manager
+    /// control messages and keyboard escape handling.
+    pub(crate) fn close_visible(
+        &mut self,
+        cfg: &thegn_core::config::Config,
+        dir: &Path,
+        panes: &mut Panes,
+        rect: Rect,
+    ) {
+        let scope = self
+            .visible
+            .as_ref()
+            .map(|visible| visible.scope)
+            .unwrap_or(DrawerScope::Worktree);
+        self.close(cfg, scope, dir, panes, rect);
     }
 
     /// Toggle the last occupant in a scope. Closing remembers the occupant so
@@ -963,12 +812,18 @@ mod tests {
         let mut c = FlagCache::default();
         let a = Path::new("/tmp/wt-a");
         let b = Path::new("/tmp/wt-b");
-        assert!(!c.get(a), "unknown dirs default to closed");
-        c.set(a, true);
-        assert!(c.get(a));
-        assert!(!c.get(b), "flags are per-worktree");
-        c.set(a, false);
-        assert!(!c.get(a));
+        let a_key = drawer_scope_key(DrawerScope::Worktree, a);
+        let b_key = drawer_scope_key(DrawerScope::Worktree, b);
+        assert_eq!(
+            c.occupant_for_key(&a_key),
+            None,
+            "unknown dirs default to closed"
+        );
+        c.set_key(&a_key, Some(FILES_OCCUPANT_ID.into()));
+        assert_eq!(c.occupant_for_key(&a_key), Some(FILES_OCCUPANT_ID.into()));
+        assert_eq!(c.occupant_for_key(&b_key), None, "flags are per-worktree");
+        c.set_key(&a_key, None);
+        assert_eq!(c.occupant_for_key(&a_key), None);
     }
 
     #[test]
@@ -978,16 +833,42 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         let open = Path::new("/tmp/wt-open");
         let closed = Path::new("/tmp/wt-closed");
-        std::fs::write(store.join(FlagCache::key(open)), "true\n").unwrap();
-        std::fs::write(store.join(FlagCache::key(closed)), "false").unwrap();
+        std::fs::write(
+            store.join(drawer_scope_key(DrawerScope::Worktree, open)),
+            "true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            store.join(drawer_scope_key(DrawerScope::Worktree, closed)),
+            "false",
+        )
+        .unwrap();
 
         let c = FlagCache::load_from(&store);
-        assert!(c.get(open), "whitespace-tolerant true");
-        assert!(!c.get(closed));
-        assert!(!c.get(Path::new("/tmp/wt-never")), "missing file = closed");
+        assert_eq!(
+            c.occupant_for_key(&drawer_scope_key(DrawerScope::Worktree, open)),
+            Some(FILES_OCCUPANT_ID.into()),
+            "whitespace-tolerant true"
+        );
+        assert_eq!(
+            c.occupant_for_key(&drawer_scope_key(DrawerScope::Worktree, closed)),
+            None
+        );
+        assert_eq!(
+            c.occupant_for_key(&drawer_scope_key(
+                DrawerScope::Worktree,
+                Path::new("/tmp/wt-never")
+            )),
+            None,
+            "missing file = closed"
+        );
 
         let empty = FlagCache::load_from(&store.join("nope"));
-        assert!(!empty.get(open), "missing store dir = all closed");
+        assert_eq!(
+            empty.occupant_for_key(&drawer_scope_key(DrawerScope::Worktree, open)),
+            None,
+            "missing store dir = all closed"
+        );
         let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
