@@ -104,7 +104,9 @@ pub(crate) fn spawn_issue_cache_refresh(
                 .unwrap_or_default();
             for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked)
             {
-                let _ = db.put_notification(kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if !crate::notify::record_global(&db, kind, &source_ref, &msg, &repo_key) {
+                    let _ = db.put_notification(kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                }
             }
             // Overdue is re-derived (not diffed) each refresh; the store-side
             // emit-once (`put_notification_once`) keeps it to one row per
