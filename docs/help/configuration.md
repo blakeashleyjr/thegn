@@ -9,12 +9,14 @@ actions: [mode-normal, mode-vim-normal, mode-vim-insert, mode-emacs]
 
 Behavior lives in `~/.config/thegn/config.toml`. Trusted layers, low to high:
 built-in defaults < the config file < the active profile's
-`profiles/<name>/config.toml` < `THEGN_*` environment variables < `--set`.
-The trusted files are TOML. A repo-root `.thegn.toml`, `.thegn.yaml`,
-`.thegn.yml`, or `.thegn.json` overlays per-repo settings
-(`[sandbox]`, `[keybinds]`, `[notifications]`, `[issues]`, and `env`; sandbox
-values are trust-clamped). TOML wins, then YAML, YML, and JSON; if multiple
-files exist, thegn warns which file won and which paths are ignored.
+`profiles/<name>/config.toml` < `THEGN_*` value overlays < `--set` values or
+TOML fragments. The trusted files are TOML; `--config` changes the main file's
+path but not its parser. A repo-root `.thegn.toml`, `.thegn.yaml`,
+`.thegn.yml`, or `.thegn.json` is a separate untrusted overlay for
+`[sandbox]` (trust-clamped), `[keybinds]`, `[notifications]`, `[issues]`, the
+`env` selector, and metrics detection/refusal data. TOML wins, then YAML, YML,
+and JSON; if multiple readable candidates exist, thegn warns which path won
+and which paths were ignored.
 
 `[workspace.<slug>]` in your own config refines settings for one repo —
 including `[workspace.<slug>.merge_queue]` and
@@ -168,8 +170,10 @@ not having one.
 Unknown keys are dropped on load with a warning. `thegn config validate`
 reports them with a nearest-key hint and names the file and dotted key
 (`sandbox.enabeld: unknown key (did you mean `enabled`?)`) — run it after
-editing by hand. The generated config reference contains every documented key
-with its example value; those values are not promised to equal code defaults.
+editing by hand. It also checks the active profile and selected repo overlay
+when those files exist; missing optional layers are quiet. The generated
+config reference contains every documented key with its example value; those
+values are illustrative and are not promised to equal code defaults.
 
 The home-manager module (`programs.thegn.*`) renders a `config.toml` with
 the same keys; its options are checked against the schema in CI, so it

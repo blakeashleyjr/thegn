@@ -201,16 +201,23 @@ test, and `thegn plugin check` / `thegn plugin list` in `test/smoke.sh`.
 Rust structs are the schema (`schemars` → `thegn config schema`, the strict
 validator, the MCP resource). `config/config.toml.example` is hand-authored
 prose that documents every key and is the source of the runtime-generated
-config-reference help page; schema/example gates keep it from losing keys.
-Trusted configuration is TOML-only: built-in defaults →
-`$XDG_CONFIG_HOME/thegn/config.toml` (or `--config`) → the active external
-profile's `profiles/<name>/config.toml` → `THEGN_<SECTION>_<KEY>` env → `--set`.
+config-reference help page; schema/example gates keep it from losing keys, and
+the reference documents the example's values rather than promising code-default
+parity. Trusted configuration is TOML-only: built-in defaults →
+`$XDG_CONFIG_HOME/thegn/config.toml` (or `--config`, which changes the path but
+not the parser) → the active external profile's
+`profiles/<name>/config.toml` → `THEGN_<SECTION>_<KEY>` value overlays →
+`--set` values/fragments.
+
 A repo-local overlay is the deliberate untrusted exception and may be
-`.thegn.toml`, `.thegn.yaml`, `.thegn.yml`, or `.thegn.json` in that precedence
+`.thegn.toml`, `.thegn.yaml`, `.thegn.yml`, or `.thegn.json`, in that precedence
 order. It carries repo-scoped `[sandbox]` (trust-clamped), `[keybinds]`,
-`[notifications]`, `[issues]`, `env`, and metrics detection/refusal. Unknown
-keys and malformed values are dropped or warned on load so a launch is never
-blocked; `thegn config validate` reports them strictly with file/key context.
+`[notifications]`, `[issues]`, the `env` selector, and metrics
+detection/refusal data. Unknown keys and malformed values are dropped or
+warned on tolerant load so a launch is never blocked; `thegn config validate`
+strictly checks the main file, active profile, and selected repo overlay with
+file/key context. When candidates are shadowed, the loader warns with paths
+only.
 
 **Gate:** `tests/config_example.rs` (every key documented; example parses and
 validates clean, and the generated reference retains the documented key set),
