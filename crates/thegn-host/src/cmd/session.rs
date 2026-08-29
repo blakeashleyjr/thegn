@@ -131,6 +131,35 @@ pub enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Fork a live daemon or recorded native harness session into a new
+    /// process. A harness id selects a native session from agent sessions.
+    Fork {
+        /// Live daemon id, or native id when --harness is present.
+        session: String,
+        /// Harness id for a recorded native session.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Configured agent name for the child launch context.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Child working-directory override.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Child worktree override.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Include a bounded plain-text history handoff.
+        #[arg(long)]
+        scrollback: bool,
+        /// Create a new worktree first, then fork into it.
+        #[arg(long)]
+        fork_worktree: bool,
+        /// Adopt the child in a new tab.
+        #[arg(long)]
+        tab: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Close a session: terminate its PTY child (the daemon keeps a tombstone,
     /// so `session list` still shows how it ended and `session wait` still
     /// answers). The dedicated verb for what `thegn api call sessions.kill`
@@ -253,8 +282,13 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         .lease_expires_at
         .map(|at| format!("  lease→{at}"))
         .unwrap_or_default();
+    let lineage = s
+        .forked_from
+        .as_deref()
+        .map(|source| format!("  ← forked from {source}"))
+        .unwrap_or_default();
     format!(
-        "{}  {}  {}x{}  {} client(s)  {}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}{}",
         s.id,
         state,
         s.cols,
@@ -265,7 +299,8 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
             .as_deref()
             .map(|w| format!("  [{w}]"))
             .unwrap_or_default(),
-        lease
+        lease,
+        lineage
     )
 }
 
@@ -329,6 +364,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         &action,
         SessionAction::List { json: true, .. }
             | SessionAction::Open { json: true, .. }
+            | SessionAction::Fork { json: true, .. }
             | SessionAction::Close { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
             | SessionAction::Wait { json: true, .. }
@@ -484,6 +520,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         // model/env/permissions over the agent; None on a
                         // plain open.
                         stage,
+                        fork: false,
+                        native_session_id: None,
                     }),
                     // Default false: a fan-out that spawns eight agents should not
                     // yank eight panes into the user's session unasked. `--adopt`
@@ -498,6 +536,31 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     outln!("{}", info.id);
                 }
             }
+        }
+        SessionAction::Fork {
+            session,
+            harness,
+            agent,
+            cwd,
+            worktree,
+            scrollback,
+            fork_worktree,
+            tab,
+            json,
+        } => {
+            crate::cmd::session_fork::run(
+                &client,
+                session,
+                harness,
+                agent,
+                cwd,
+                worktree,
+                scrollback,
+                fork_worktree,
+                tab,
+                json,
+            )
+            .await?;
         }
         SessionAction::Close { session, json } => {
             client.kill(&session).await?;
@@ -937,6 +1000,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                 // `model`/`env`/`permissions` over the resolved agent and
                 // seeds the effective allow-list (THE-83's launch path).
                 stage: Some(stage.name.clone()),
+                fork: false,
+                native_session_id: None,
             }),
             adopt: d.adopt,
             already_capped: false,
@@ -1178,6 +1243,8 @@ async fn resume_work(
                 // `model`/`env`/`permissions` over the resolved agent exactly
                 // as for a fresh dispatch.
                 stage: Some(stage.name.clone()),
+                fork: false,
+                native_session_id: None,
             }),
             adopt,
             already_capped: false,

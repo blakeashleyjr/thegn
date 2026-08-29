@@ -20446,6 +20446,14 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&new);
                                 }
                             }
+                            Action::ForkSession => {
+                                model.status = crate::handlers::session_fork::request(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                    &waker,
+                                );
+                            }
                             Action::CycleTheme => {
                                 // Live theme cycle: presets resolve through
                                 // the config so [theme.colors] customizations
