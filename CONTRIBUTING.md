@@ -33,11 +33,12 @@ of them; on a bare Mac: `brew install gh lazygit fzf gum git-delta yazi`.
 ```sh
 git clone https://github.com/blakeashleyjr/thegn && cd thegn
 nix develop        # or: direnv allow   (auto-enters the shell per-cd)
-just build         # debug build of the workspace
+just build         # one-time debug build of the workspace
 just start name=dev  # run the compositor with isolated state (safe to poke)
 ```
 
-No Nix? `cargo build --workspace` and `cargo run -p thegn-host` work too —
+No Nix? The one-time `cargo build --workspace` and `cargo run -p thegn-host`
+commands work too —
 you just supply the tools above yourself. To install a real binary for daily
 use, `./install.sh` (see the README's Install section).
 
@@ -53,7 +54,8 @@ no hooks, so formatting and the heavy gates won't run until you push into CI.
 The heavy gates are full-workspace compiles — don't run them per-edit:
 
 - **While iterating:** `just quick [crate]` — clippy on lib/bin code only,
-  seconds not minutes.
+  seconds not minutes; run a touched test with
+  `cargo nextest run -p <crate> <filter>`.
 - **Before pushing:** `just test` and `just smoke` (pre-push hooks run these).
 - **Once, before opening a PR:** `just ci` — fmt-check + lint + build + test +
   coverage + smoke + nix-build. This is the merge gate; save it for the end.
@@ -141,7 +143,7 @@ Mac when touching anything platform-sensitive; it covers what neither
 
 1. `nix develop` — the dev shell builds (`openspec` is the heaviest derivation
    in it; it was OOM-killed on the 7 GB CI runner before its memory was capped).
-2. `just build && just test && just smoke && just lint`.
+2. Once, for final on-device validation: `just build && just test && just smoke && just lint`.
 3. `just start name=dev` in a real terminal: panes spawn, render and resize;
    sidebar/statusbar/pin strip draw; `thegn doctor` reports sane termcaps.
 4. Detach and re-attach a session — the pane daemon's socket resolves under
