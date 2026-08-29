@@ -7032,5 +7032,52 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod agent_error_signatures_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_load_and_empty_list_disables_matching() {
+        let defaults = NotificationsConfig::default();
+        assert_eq!(
+            defaults.agent_error_signatures,
+            crate::agent_error::DEFAULT_AGENT_ERROR_SIGNATURES
+                .iter()
+                .map(|signature| (*signature).to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let parsed: Config = toml::from_str("[notifications]\n").unwrap();
+        assert_eq!(
+            parsed.notifications.agent_error_signatures,
+            defaults.agent_error_signatures
+        );
+
+        let disabled: Config =
+            toml::from_str("[notifications]\nagent_error_signatures = []\n").unwrap();
+        assert!(disabled.notifications.agent_error_signatures.is_empty());
+    }
+
+    #[test]
+    fn validation_rejects_empty_and_overlong_entries() {
+        let mut cfg = NotificationsConfig::default();
+        cfg.agent_error_signatures = vec![String::new(), "x".repeat(257)];
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("agent_error_signatures[0]") && errors[0].contains("empty"));
+        assert!(errors[1].contains("agent_error_signatures[1]") && errors[1].contains("256"));
+
+        let strict_errors = crate::config_validate::validate_str(
+            "[notifications]\nagent_error_signatures = [\"\"]\n",
+        );
+        assert!(
+            strict_errors.iter().any(|error| error
+                .contains("notifications.agent_error_signatures[0]")
+                && error.contains("empty")),
+            "{strict_errors:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
