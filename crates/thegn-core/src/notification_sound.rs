@@ -30,7 +30,9 @@ impl SoundRef {
             _ => {}
         }
 
-        if let Some(name) = value.strip_prefix("pack:") {
+        if let Some((prefix, name)) = value.split_once(':')
+            && prefix.eq_ignore_ascii_case("pack")
+        {
             let name = name.trim();
             if name.is_empty() {
                 return Err("pack sound name is empty after pack:".into());
