@@ -19,13 +19,13 @@ use thegn_core::db::Db;
 use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
-    AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult,
+    AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult, ForkSpec,
     GitFileStatus, OpenSpec, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
     WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
-use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionActor, SessionMeta, SessionMsg};
+use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionMeta, SessionMsg};
 use super::tombstone::Tombstone;
 
 /// One live session in the daemon's table.
@@ -33,6 +33,9 @@ pub(crate) struct SessionEntry {
     pub msg_tx: mpsc::Sender<SessionMsg>,
     pub meta: SessionMeta,
     pub live: Arc<Mutex<LiveMeta>>,
+    /// The resolved source recipe used to create this live session. It is
+    /// deliberately absent only on test/legacy stubs and is never persisted.
+    pub recipe: Option<thegn_core::session_fork::DaemonRecipe>,
 }
 
 /// What a session id resolves to.
@@ -218,7 +221,7 @@ async fn with_timeout(
     }
 }
 
-fn fresh_id() -> String {
+pub(crate) fn fresh_id() -> String {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("csprng for session id");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -280,7 +283,7 @@ impl DaemonService {
         self.tombs.lock().await.get(id, now_ms()).cloned()
     }
 
-    fn not_found(session: &str) -> ControlError {
+    pub(crate) fn not_found(session: &str) -> ControlError {
         ControlError::NotFound(format!("session {session}"))
     }
 
@@ -310,7 +313,7 @@ impl DaemonService {
         }
     }
 
-    fn emit(&self, frame: EventFrame) {
+    pub(crate) fn emit(&self, frame: EventFrame) {
         let _ = self.events.send(Arc::new(frame)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     }
 
@@ -428,26 +431,42 @@ impl ControlApi for DaemonService {
             // identical to what a TUI-launched agent runs. Blocking work
             // (SQLite, sandbox prep, a bounded direnv warm), so it goes off the
             // runtime's worker threads.
-            let resolved = match &spec.agent {
+            // Keep only a memory-resident recipe for a later live fork. Raw
+            // argv/env never enter a response, tombstone, or cache row. For an
+            // agent, derive the recipe and launch from one effective config:
+            // deriving the recipe from self.config can retain a provider that
+            // was not the one actually launched.
+            let (recipe, resolved) = match &spec.agent {
                 Some(launch) => {
-                    let snapshot = self.config.clone();
+                    let snapshot = (*self.config).clone();
                     let launch = launch.clone();
                     let spec2 = spec.clone();
-                    Some(
-                        self.with_db(move |db| {
-                            // Per-request config: a `[[agents]]` entry added or
-                            // retuned since the daemon started is honoured now,
-                            // not after a restart. The snapshot is the fallback
-                            // when the file no longer loads.
-                            let fresh = crate::config_source::fresh();
-                            let cfg = fresh.as_ref().unwrap_or(&snapshot);
-                            super::agent_open::resolve(cfg, db, &spec2, &launch)
-                        })
-                        .await
-                        .map_err(|e| ControlError::Conflict(e.to_string()))?,
-                    )
+                    self.with_db(move |db| {
+                        // Per-request config: a `[[agents]]` entry added or
+                        // retuned since the daemon started is honoured now,
+                        // not after a restart. The snapshot is the fallback
+                        // when the file no longer loads. Both the retained
+                        // recipe and the actual resolution use this same cfg.
+                        let fresh = crate::config_source::fresh();
+                        let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                        let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
+                        let resolved = super::agent_open::resolve(cfg, db, &spec2, &launch)?;
+                        Ok((recipe, Some(resolved)))
+                    })
+                    .await
+                    .map_err(|e| ControlError::Conflict(e.to_string()))?
                 }
-                None => None,
+                None => (
+                    Some(thegn_core::session_fork::DaemonRecipe::Raw(
+                        thegn_core::session_fork::RawLaunchRecipe {
+                            argv: spec.argv.clone(),
+                            cwd: spec.cwd.clone(),
+                            env: spec.env.clone(),
+                            worktree: spec.worktree.clone(),
+                        },
+                    )),
+                    None,
+                ),
             };
 
             // The resolved argv is already sandbox-wrapped AND CPU-capped by
@@ -492,78 +511,33 @@ impl ControlApi for DaemonService {
             );
             let rows = spec.rows.max(1);
             let cols = spec.cols.max(1);
-            let (pane_tx, pane_rx) = mpsc::channel(256);
-            let cwd = cwd_s.as_ref().map(std::path::PathBuf::from);
             // Composition order, weakest first: what the launch resolved, then
             // the caller's explicit pairs, then the two keys that are the
             // daemon's alone.
             let mut env = env_pairs;
             env.extend(spec.env.iter().cloned());
             let env = session_identity_env(&id, &self.endpoint, &env);
-            let pty = crate::pane_pty::open_pty(
-                0, // per-session channel: the id tag is unused
-                &argv,
-                cwd.as_deref(),
-                &env,
-                rows,
-                cols,
-                pane_tx,
-                None, // a daemon has no render loop to wake
-                None, // ...and no grid — no off-thread feed sink
-            )
-            .map_err(ControlError::Internal)?;
-
-            let meta = SessionMeta {
-                id: id.clone(),
-                worktree: worktree.clone(),
-                // For an agent launch the *agent's* name is the program, not
-                // the `sh` that the sandbox wrapper happens to exec — that is
-                // what makes the session agent-bearing for the activity model.
-                program: match &spec.agent {
-                    Some(a) => a.agent.clone(),
-                    None => crate::pane::program_name(&argv),
+            let program = match &spec.agent {
+                Some(a) => a.agent.clone(),
+                None => crate::pane::program_name(&argv),
+            };
+            let info = super::fork::spawn_session(
+                self,
+                super::fork::SpawnRequest {
+                    id: id.clone(),
+                    argv,
+                    cwd: cwd_s,
+                    env,
+                    rows,
+                    cols,
+                    worktree: worktree.clone(),
+                    program,
+                    recipe,
+                    forked_from: None,
+                    handoff: None,
                 },
-                cwd: cwd_s.clone(),
-                created_at_ms: now_ms(),
-                pid: pty.pid,
-            };
-            let live = Arc::new(Mutex::new(LiveMeta {
-                rows,
-                cols,
-                attached: 0,
-                ..Default::default()
-            }));
-            let (msg_tx, msg_rx) = mpsc::channel(64);
-            let actor = SessionActor::new(
-                meta.clone(),
-                live.clone(),
-                pty,
-                rows,
-                cols,
-                self.events.clone(),
-                self.idle_tx.clone(),
-                self.sessions.clone(),
-                self.tombs.clone(),
-                self.db.clone(),
-                self.config.clone(),
-            );
-            let info = {
-                let live = live.lock().expect("live meta lock");
-                meta.info(&live, None)
-            };
-            // Insert the entry BEFORE spawning the actor. The actor's teardown
-            // removes its own entry (session.rs) — if the child exits instantly
-            // (exec failure / `sh -c true`) and the actor is scheduled first, a
-            // spawn-then-insert order runs the remove before the insert, leaving
-            // a PHANTOM entry for a dead actor: listed forever, `kill` no-ops, and
-            // idle-exit (busy = sessions non-empty) never fires. Inserting first
-            // guarantees the teardown removal always observes the entry.
-            self.sessions
-                .lock()
-                .await
-                .insert(id.clone(), SessionEntry { msg_tx, meta, live });
-            tokio::spawn(actor.run(pane_rx, msg_rx));
-            self.emit(EventFrame::Sessions);
+            )
+            .await?;
 
             // Ask a running compositor to graft this session into a real pane.
             // Best-effort by design: with no instance up, the session is simply
@@ -574,6 +548,7 @@ impl ControlApi for DaemonService {
                     session: id.clone(),
                     worktree,
                     focus: false,
+                    tab: false,
                 };
                 if let Err(e) = self
                     .with_db(move |db| {
@@ -587,6 +562,10 @@ impl ControlApi for DaemonService {
             }
             Ok(info)
         })
+    }
+
+    fn fork(&self, spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        super::fork::run(self, spec)
     }
 
     fn attach<'a>(
@@ -1582,6 +1561,7 @@ mod tests {
                     cwd: None,
                     created_at_ms: 0,
                     pid: None,
+                    forked_from: None,
                 },
                 live: Arc::new(Mutex::new(LiveMeta {
                     rows: 24,
@@ -1589,6 +1569,7 @@ mod tests {
                     attached: 0,
                     ..Default::default()
                 })),
+                recipe: None,
             },
         );
 
@@ -2035,6 +2016,7 @@ mod tests {
             cwd: None,
             created_at_ms: 0,
             pid: None,
+            forked_from: None,
         };
         let live = Arc::new(Mutex::new(LiveMeta {
             rows: 24,
@@ -2042,10 +2024,15 @@ mod tests {
             attached: 0,
             ..Default::default()
         }));
-        svc.sessions
-            .lock()
-            .await
-            .insert(id.to_string(), SessionEntry { msg_tx, meta, live });
+        svc.sessions.lock().await.insert(
+            id.to_string(),
+            SessionEntry {
+                msg_tx,
+                meta,
+                live,
+                recipe: None,
+            },
+        );
         tokio::spawn(async move {
             while let Some(msg) = msg_rx.recv().await {
                 if let SessionMsg::Attach { reply, .. } = msg {
@@ -2239,6 +2226,277 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// Exercise the actual control-plane fork through `ControlApi`. This keeps
+    /// the source alive while checking that resize state reaches the child,
+    /// identity and handoff data cross only through the child environment,
+    /// adopt placement is recorded, and validation/dead-session failures do
+    /// not create another daemon entry.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_control_path_inherits_geometry_and_cleans_handoff() {
+        use std::os::unix::fs::PermissionsExt;
+        use thegn_core::store::IntentStore;
+
+        let state = tempfile::tempdir().expect("isolated state dir");
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            state.path().to_str().expect("state path"),
+        )]);
+        let (svc, _events) = service(0);
+        let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
+        let script = "i=0; while [ $i -lt 2005 ]; do printf 'source-line-%s\\n' $i; i=$((i+1)); done; if [ -n \"$THEGN_FORKED_FROM\" ]; then printf 'forked=%s\\nscrollback=%s\\n' \"$THEGN_FORKED_FROM\" \"$THEGN_FORK_SCROLLBACK\"; fi; while :; do sleep 1; done";
+        let source = svc
+            .open(OpenSpec {
+                argv: vec![sh, "-c".into(), script.into()],
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+            .await
+            .expect("open source");
+        svc.resize(&source.id, 41, 137)
+            .await
+            .expect("resize source");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = svc.snapshot(&source.id).await.expect("source lives");
+            if let EventFrame::PaneSnapshot {
+                rows, cols, bytes, ..
+            } = snapshot
+                && rows == 41
+                && cols == 137
+                && String::from_utf8_lossy(&bytes).contains("source-line-2004")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "source output/resize arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let child = svc
+            .fork(ForkSpec {
+                session: source.id.clone(),
+                scrollback: true,
+                adopt: true,
+                tab: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fork source");
+        assert_ne!(child.id, source.id, "fork allocates a new daemon id");
+        assert_ne!(child.pid, source.pid, "fork allocates a new child pid");
+        assert_eq!((child.rows, child.cols), (41, 137));
+        assert_eq!(child.forked_from.as_deref(), Some(source.id.as_str()));
+
+        let handoff = state
+            .path()
+            .join("thegn/forks")
+            .join(format!("{}.txt", child.id));
+        let history = std::fs::read_to_string(&handoff).expect("handoff exists");
+        assert!(history.lines().count() <= 2_000, "snapshot bound is shared");
+        assert!(history.contains("source-line-2004"));
+        assert_eq!(
+            std::fs::metadata(&handoff).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let intents = svc
+            .db
+            .lock()
+            .unwrap()
+            .take_intents("adopt_session")
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        assert!(intents[0].payload.contains(&child.id));
+        assert!(intents[0].payload.contains("\"tab\":true"));
+
+        let mut child_text = String::new();
+        let child_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !child_text.contains(&format!("forked={}", source.id)) {
+            if let EventFrame::PaneSnapshot { bytes, .. } =
+                svc.snapshot(&child.id).await.expect("child lives")
+            {
+                child_text = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            assert!(
+                std::time::Instant::now() < child_deadline,
+                "child identity output arrived"
+            );
+        }
+        assert!(child_text.contains(&format!("scrollback={}", handoff.display())));
+        svc.kill(&child.id).await.expect("kill child");
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handoff.exists() {
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "handoff cleaned on exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let before = svc
+            .list_sessions()
+            .await
+            .expect("list after child exit")
+            .len();
+        let invalid = svc
+            .fork(ForkSpec {
+                session: "native-id".into(),
+                harness: Some("pi".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("reserved harness must not spawn");
+        assert!(invalid.to_string().contains("reserved"));
+        assert_eq!(
+            svc.list_sessions()
+                .await
+                .expect("list after validation")
+                .len(),
+            before
+        );
+
+        svc.kill(&source.id).await.expect("kill source");
+        let dead_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc
+                .list_sessions()
+                .await
+                .expect("list after source exit")
+                .iter()
+                .any(|row| row.id == source.id && row.exited_at_ms.is_some())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < dead_deadline,
+                "source tombstone published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let dead = svc
+            .fork(ForkSpec {
+                session: source.id,
+                ..Default::default()
+            })
+            .await
+            .expect_err("dead session must not fork");
+        assert!(dead.to_string().contains("sessions.open"));
+        // `EnvVarGuard` restores the caller's state root after all daemon work
+        // has stopped, so this test never touches the normal profile.
+    }
+
+    /// A daemon keeps its boot config as a fallback, but an agent open uses the
+    /// current per-request config. The retained recipe must use that same
+    /// provider or a later live fork can select a different native command
+    /// than the provider that actually launched.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_open_retains_the_provider_used_by_fresh_resolution() {
+        let state = tempfile::tempdir().expect("isolated state dir");
+        let config_home = tempfile::tempdir().expect("isolated config dir");
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let config_dir = config_home.path().join("thegn");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[sandbox]\nenabled = false\n\n[[agents]]\nname = \"worker\"\ncommand = \"sh\"\nprovider = \"codex\"\n",
+        )
+        .expect("fresh config");
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state.path().to_str().expect("state path")),
+            (
+                "XDG_CONFIG_HOME",
+                config_home.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let mut boot = thegn_core::config::Config::default();
+        boot.sandbox.enabled = false;
+        boot.agents.push(thegn_core::config::NamedCommand {
+            name: "worker".into(),
+            command: "sh".into(),
+            hints: Vec::new(),
+            provider: Some("claude".into()),
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        });
+        let (svc, _events) = service_with_config(0, boot);
+        // Model a config change after service construction: the daemon starts
+        // with the Claude snapshot, then the request reloads the Codex entry.
+        crate::config_source::install(Vec::new(), None);
+
+        let source = svc
+            .open(OpenSpec {
+                cwd: Some(worktree.path().to_string_lossy().into_owned()),
+                worktree: Some(worktree.path().to_string_lossy().into_owned()),
+                rows: 24,
+                cols: 80,
+                agent: Some(thegn_svc::control::AgentLaunch {
+                    agent: "worker".into(),
+                    prompt: String::new(),
+                    headless: Some(false),
+                    bind_worktree: false,
+                    resume: None,
+                    continue_last: false,
+                    stage: None,
+                    fork: false,
+                    native_session_id: Some("native-codex".into()),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("open configured agent");
+
+        let recipe = svc
+            .sessions
+            .lock()
+            .await
+            .get(&source.id)
+            .and_then(|entry| entry.recipe.clone())
+            .expect("agent recipe retained");
+        assert!(matches!(
+            &recipe,
+            thegn_core::session_fork::DaemonRecipe::Agent { harness, .. }
+                if harness == "codex"
+        ));
+
+        // The later fork plan must be built from that retained recipe, so a
+        // provider change cannot make the launched Codex session look like a
+        // Claude source (or vice versa).
+        let source_id = source.id.clone();
+        let source = svc
+            .sessions
+            .lock()
+            .await
+            .get(&source_id)
+            .and_then(super::super::fork::source)
+            .expect("fork source");
+        let plan = thegn_core::session_fork::ForkRequest {
+            source,
+            options: Default::default(),
+        }
+        .plan()
+        .expect("fork plan");
+        match plan {
+            thegn_core::session_fork::ForkPlan::Harness {
+                harness, command, ..
+            } => {
+                assert_eq!(harness, "codex");
+                assert!(command.starts_with("codex fork "), "got {command}");
+            }
+            other => panic!("fresh configured agent must retain a harness plan: {other:?}"),
+        }
+        svc.kill(&source_id).await.expect("kill source");
     }
 
     /// The transport-retry observer's contract (THE-86), driven as a stub: a

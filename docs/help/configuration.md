@@ -127,6 +127,12 @@ process-local rather than stored in SQLite. `[sandbox].init_script` is
 different: it remains a per-pane script executed inside the sandbox, not a
 lifecycle hook.
 
+## Session forking
+
+Live daemon sessions can be forked with `thegn session fork` or the
+`fork-session` pane action. Forking uses the daemon's retained launch recipe
+and current harness capabilities; it has no additional TOML setting.
+
 ## Agents, models and accounts
 
 An `[[agents]]` entry is _what runs_; four optional keys say _how_:

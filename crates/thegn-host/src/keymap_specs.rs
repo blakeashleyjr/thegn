@@ -174,6 +174,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "fork-session",
+        label: "Fork live session",
+        hint: "fork session",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "fork",
+            "session",
+            "conversation",
+            "native session",
+            "new session",
+        ],
+    },
+    ActionSpec {
         id: "paste-register",
         label: "Paste from register",
         hint: "paste reg",
