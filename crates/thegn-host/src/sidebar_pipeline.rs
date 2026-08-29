@@ -154,6 +154,7 @@ mod tests {
             artifact_path: None,
             note: None,
             chunk_path: None,
+            report: None,
         }
     }
 
