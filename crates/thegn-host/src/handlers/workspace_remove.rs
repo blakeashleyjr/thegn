@@ -132,6 +132,9 @@ pub(crate) fn remove_workspace(
     // Keep-files is a pure in-memory reconciliation on the loop. Its cache
     // cleanup runs on the DB writer and, by contract, does not run destroy
     // hooks or touch the checkout.
+    for path in &live_dirs {
+        crate::worktree_lifecycle::session_end_once(cfg, Path::new(path), waker.clone());
+    }
     remove_workspace_in_memory(session, panes, slug);
     let session_id = session.id.clone();
     let repo_path_owned = repo_path.to_string();
