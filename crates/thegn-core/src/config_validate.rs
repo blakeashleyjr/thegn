@@ -327,6 +327,20 @@ fn walk_object(
         }
         return;
     }
+    // JSON/YAML can represent `Option<T>` explicitly as null (TOML cannot).
+    // Once the schema says null is an allowed branch, do not descend into the
+    // non-null branch and report a false type error for a valid overlay.
+    if value.is_null()
+        && obj.subschemas.as_ref().is_some_and(|sub| {
+            sub.any_of
+                .iter()
+                .flatten()
+                .chain(sub.one_of.iter().flatten())
+                .any(is_null_schema)
+        })
+    {
+        return;
+    }
     // schemars 0.8 wraps a `$ref` field in `allOf` whenever the field carries
     // ANY metadata (a `default`, a doc comment, …), and `Option<Enum>` becomes
     // `anyOf [$ref, null]` — recurse all subschema lists unconditionally. Only

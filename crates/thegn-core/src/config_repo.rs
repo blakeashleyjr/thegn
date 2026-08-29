@@ -47,7 +47,9 @@ impl std::fmt::Display for OverlayFormat {
     }
 }
 
-/// A readable repo overlay candidate, in precedence order.
+/// A readable repo overlay candidate, in precedence order. The selected
+/// candidate carries its body; shadowed candidates carry only path/format so
+/// discovery does not read untrusted lower-precedence files unnecessarily.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoOverlayCandidate {
     pub path: PathBuf,
@@ -165,21 +167,66 @@ pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Ve
         .collect()
 }
 
-/// Discover every readable candidate without parsing it. The first candidate
-/// is the winner; all later readable candidates are shadowed and remain visible
-/// to validation/health callers. Existing candidates that cannot be read are
-/// retained separately so a lower-precedence readable file cannot hide them.
+/// Discover every candidate without parsing it. The first readable regular
+/// file is the winner; later readable candidates are shadowed and remain
+/// visible to validation/health callers without their bodies being read.
+/// Existing candidates that cannot be read are retained separately so a
+/// lower-precedence readable file cannot hide them. Symlinks and other
+/// non-regular files are rejected, preventing repo overlays from escaping the
+/// repo root or blocking on a FIFO/device.
 pub fn discover_repo_overlay(repo_root: &Path) -> RepoOverlayDiscovery {
     let mut candidates = Vec::new();
     let mut unreadable = Vec::new();
+    let mut selected = false;
     for extension in ["toml", "yaml", "yml", "json"] {
         let path = repo_root.join(format!(".thegn.{extension}"));
         let Some(format) = OverlayFormat::from_extension(extension) else {
             continue;
         };
+        // `read_to_string` alone cannot distinguish an absent path from a
+        // broken symlink (both commonly report NotFound). Inspect the
+        // directory entry first so an existing but unreadable candidate is
+        // never silently discarded, and so special files cannot block a
+        // synchronous caller.
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                unreadable.push(RepoOverlayUnreadableCandidate {
+                    path,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if !metadata.file_type().is_file() {
+            unreadable.push(RepoOverlayUnreadableCandidate {
+                path,
+                error: "candidate is not a regular file".to_string(),
+            });
+            continue;
+        }
+        if selected {
+            match std::fs::File::open(&path) {
+                Ok(_) => candidates.push(RepoOverlayCandidate {
+                    path,
+                    format,
+                    body: String::new(),
+                }),
+                Err(error) => unreadable.push(RepoOverlayUnreadableCandidate {
+                    path,
+                    error: error.to_string(),
+                }),
+            }
+            continue;
+        }
         match std::fs::read_to_string(&path) {
-            Ok(body) => candidates.push(RepoOverlayCandidate { path, format, body }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(body) => {
+                selected = true;
+                candidates.push(RepoOverlayCandidate { path, format, body });
+            }
             Err(error) => unreadable.push(RepoOverlayUnreadableCandidate {
                 path,
                 error: error.to_string(),
@@ -431,6 +478,19 @@ mod tests {
     }
 
     #[test]
+    fn explicit_null_is_accepted_for_optional_overlay_fields() {
+        for (format, body) in [
+            (OverlayFormat::Yaml, "sandbox:\n  remote: null\n"),
+            (OverlayFormat::Json, r#"{"sandbox":{"remote":null}}"#),
+        ] {
+            assert!(
+                validate_repo_overlay(body, format).is_empty(),
+                "{format}: {body:?}"
+            );
+        }
+    }
+
+    #[test]
     fn discovery_reports_shadowed_candidates_in_precedence_order() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -447,6 +507,7 @@ mod tests {
         assert_eq!(discovery.selected().unwrap().format, OverlayFormat::Toml);
         assert_eq!(discovery.shadowed().len(), 1);
         assert_eq!(discovery.shadowed()[0].path, dir.path().join(".thegn.yaml"));
+        assert!(discovery.shadowed()[0].body.is_empty());
         let warning = discovery.shadow_warning().unwrap();
         assert!(warning.contains(&dir.path().join(".thegn.toml").display().to_string()));
         assert!(warning.contains(&dir.path().join(".thegn.yaml").display().to_string()));
@@ -487,5 +548,37 @@ mod tests {
             dir.path().join(".thegn.toml")
         );
         assert!(!discovery.unreadable_candidates()[0].error.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_retains_broken_symlink_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing-config.toml", dir.path().join(".thegn.toml")).unwrap();
+
+        let discovery = discover_repo_overlay(dir.path());
+        assert!(discovery.selected().is_none());
+        assert_eq!(discovery.unreadable_candidates().len(), 1);
+        assert_eq!(
+            discovery.unreadable_candidates()[0].path,
+            dir.path().join(".thegn.toml")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_symlinked_candidates_even_when_target_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.toml");
+        std::fs::write(&target, "sandbox: {}\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".thegn.toml")).unwrap();
+
+        let discovery = discover_repo_overlay(dir.path());
+        assert!(discovery.selected().is_none());
+        assert_eq!(discovery.unreadable_candidates().len(), 1);
+        assert_eq!(
+            discovery.unreadable_candidates()[0].error,
+            "candidate is not a regular file"
+        );
     }
 }
