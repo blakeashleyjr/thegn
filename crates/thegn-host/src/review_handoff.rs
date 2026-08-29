@@ -8,8 +8,12 @@ use thegn_core::agent_task::{TaskKind, TaskVars};
 use thegn_core::config::Config;
 use thegn_core::review::{PrReviewSnapshot, format_review_feedback};
 
+use crate::chrome::FrameModel;
+use crate::focus::FocusState;
+use crate::hydrate::RefreshKind;
 use crate::panes::Panes;
 use crate::session::{Session, Tab};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewSelection {
@@ -70,12 +74,15 @@ pub(crate) fn target(session: &Session, panes: &Panes, cfg: &Config) -> PaneTarg
     if let Some(id) = live_agent_pane(session, panes, cfg) {
         return PaneTarget::Live(id);
     }
-    let Some(agent) = cfg.default_agent_name() else {
-        return PaneTarget::None;
+    let queue = &cfg.pr_queue;
+    let agent = if queue.agent.trim().is_empty() {
+        match cfg.default_agent_name() {
+            Some(agent) => agent,
+            None => return PaneTarget::None,
+        }
+    } else {
+        queue.agent.as_str()
     };
-    let repo = crate::hydrate::active_tab_path(session);
-    let repo_root = thegn_core::repo::main_worktree(&repo).unwrap_or(repo);
-    let queue = cfg.repo_pr_queue(&repo_root);
     thegn_core::agent_task::resolve_agent(cfg, agent, &queue.agent_command)
         .map(|command| PaneTarget::Headless { command })
         .unwrap_or(PaneTarget::None)
@@ -83,6 +90,7 @@ pub(crate) fn target(session: &Session, panes: &Panes, cfg: &Config) -> PaneTarg
 
 pub(crate) fn vars(
     snapshot: &PrReviewSnapshot,
+    base: &str,
     title: &str,
     url: &str,
     worktree: &str,
@@ -90,7 +98,7 @@ pub(crate) fn vars(
 ) -> TaskVars {
     TaskVars::new()
         .set("branch", &snapshot.branch)
-        .set("base", "")
+        .set("base", base)
         .set("worktree", worktree)
         .set("pr_number", snapshot.pr_number.to_string())
         .set("pr_url", url)
@@ -98,6 +106,138 @@ pub(crate) fn vars(
         .set("threads", feedback)
 }
 
-pub(crate) fn task_kind() -> TaskKind {
-    TaskKind::PrReview
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch(
+    session: &mut Session,
+    panes: &mut Panes,
+    focus: &mut FocusState,
+    cfg: &Config,
+    model: &mut FrameModel,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
+    snapshot: PrReviewSnapshot,
+    selection: ReviewSelection,
+    title: &str,
+    url: &str,
+    base: &str,
+) {
+    let text = feedback(&snapshot, &selection);
+    if text.is_empty() {
+        model.status = "no review feedback selected".into();
+        return;
+    }
+    match target(session, panes, cfg) {
+        PaneTarget::Live(id) => {
+            let result = panes
+                .table
+                .get_mut(&id)
+                .map(|pane| crate::run::paste_text_into_pane(pane, &text));
+            match result {
+                Some(Ok(())) => {
+                    if let Some(group) = session.active_group_mut()
+                        && let Some(tab) = group
+                            .tabs
+                            .iter_mut()
+                            .find(|tab| tab.center.pane_ids().contains(&id))
+                    {
+                        tab.focused_pane = id;
+                    }
+                    focus.zone = crate::focus::Zone::Center;
+                    model.status = "review feedback pasted (not submitted)".into();
+                }
+                Some(Err(e)) => model.status = format!("review handoff failed: {e}"),
+                None => model.status = "agent pane closed before handoff".into(),
+            }
+        }
+        PaneTarget::Headless { command } => {
+            let refresh_tx = refresh_tx.clone();
+            let waker = waker.clone();
+            let worktree = crate::hydrate::active_tab_path(session)
+                .to_string_lossy()
+                .into_owned();
+            let queue = cfg.repo_pr_queue(std::path::Path::new(&worktree));
+            let vars = vars(&snapshot, base, title, url, &worktree, text);
+            let prompt = match thegn_core::agent_task::render_prompt(
+                queue.prompts.resolve(TaskKind::PrReview),
+                &vars,
+            ) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    model.status = format!("review handoff template invalid: {error}");
+                    return;
+                }
+            };
+            tokio::task::spawn_blocking(move || {
+                let ok = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+                    kind: TaskKind::PrReview,
+                    worktree: &worktree,
+                    prompt: &prompt,
+                    command_template: &command,
+                    vars: &vars,
+                    timeout_secs: queue.agent_timeout_secs,
+                    sandbox: None,
+                });
+                if !ok {
+                    thegn_core::msg::warn("PR review agent handoff failed");
+                }
+                if refresh_tx.send(RefreshKind::Pr).is_ok() {
+                    let _ = waker.wake();
+                }
+            });
+            model.status = "review feedback sent to headless agent".into();
+        }
+        PaneTarget::None => {
+            model.status = "no live agent pane or configured headless agent".into();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::forge::model::{PrComment, PrConversation, ReviewThread};
+
+    fn snapshot() -> PrReviewSnapshot {
+        PrReviewSnapshot {
+            pr_number: 27,
+            branch: "feature/review".into(),
+            head_oid: "deadbeef".into(),
+            conversation: PrConversation {
+                threads: vec![
+                    ReviewThread {
+                        id: "one".into(),
+                        path: "src/lib.rs".into(),
+                        line: Some(9),
+                        comments: vec![PrComment {
+                            author: "reviewer".into(),
+                            body: "fix this".into(),
+                            ..PrComment::default()
+                        }],
+                        ..ReviewThread::default()
+                    },
+                    ReviewThread {
+                        id: "two".into(),
+                        path: "src/main.rs".into(),
+                        line: Some(4),
+                        comments: vec![PrComment {
+                            author: "reviewer".into(),
+                            body: "also this".into(),
+                            ..PrComment::default()
+                        }],
+                        ..ReviewThread::default()
+                    },
+                ],
+                ..PrConversation::default()
+            },
+            ..PrReviewSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn selected_feedback_contains_only_the_selected_thread() {
+        let text = feedback(&snapshot(), &ReviewSelection::Selected("one".into()));
+        assert!(text.contains("fix this"));
+        assert!(!text.contains("also this"));
+        assert!(!text.ends_with('\n'));
+    }
 }

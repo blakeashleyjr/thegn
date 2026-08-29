@@ -20,7 +20,7 @@ use crate::hydrate::{RefreshKind, active_tab_path};
 use crate::panes::{Panes, tool_drawer_argv};
 use crate::run::SidebarState;
 use crate::session::Session;
-use thegn_core::store::NotificationStore;
+use thegn_core::store::{CacheStore, NotificationStore};
 
 /// Spawn `command` into a brand-new tab in the active group.
 pub(crate) fn open_command_tab(
@@ -590,6 +590,7 @@ pub(crate) fn run_pr_view_action(
         A::Review { .. } => ("pr review", "Submitting review…"),
         A::Reply { .. } => ("pr reply", "Posting reply…"),
         A::LineComment { .. } => ("pr line-comment", "Posting line comment…"),
+        A::Handoff(_) => ("pr review handoff", "Passing review feedback…"),
         A::OpenUrl(_) => unreachable!("handled above"),
     };
     model.status = status.into();
@@ -632,6 +633,7 @@ pub(crate) fn run_pr_view_action(
                     body: &body,
                 },
             ),
+            A::Handoff(_) => Ok(()),
             A::OpenUrl(_) => Ok(()),
         };
         if let Err(e) = res {
@@ -705,20 +707,34 @@ pub(crate) fn panel_pr_action_key(
 /// loop and deliver it over `tx`. Single-flight via `generation` — the loop
 /// drops deliveries from a stale generation. Best-effort: a failed fetch leaves
 /// that half `None` (the view shows "loading" / degrades) and logs the reason.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pr_view_fetch(
     session: Session,
     owner: String,
     repo: String,
     number: u64,
+    branch: String,
+    head_oid: String,
     generation: u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) {
     let tx = tx.clone();
     let waker = waker.clone();
+    let refresh_tx = refresh_tx.clone();
     tokio::task::spawn_blocking(move || {
         let wt = active_tab_path(&session);
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
+        let cached = thegn_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.get_pr_review_cache(&cache_key).ok().flatten())
+            .filter(|snapshot| {
+                snapshot.branch == branch
+                    && snapshot.pr_number == number
+                    && snapshot.head_oid == head_oid
+            });
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let repo_ref = thegn_core::forge::RepoRef { owner, repo };
@@ -736,11 +752,53 @@ pub(crate) fn spawn_pr_view_fetch(
                 None
             }
         };
+        let live_complete = conversation.is_some() && diff.is_some();
+        let review = match (conversation, diff) {
+            (Some(conversation), Some(diff)) => {
+                let snapshot = thegn_core::review::PrReviewSnapshot {
+                    worktree_key: cache_key,
+                    branch,
+                    pr_number: number,
+                    head_oid,
+                    fetched_at: thegn_core::util::now(),
+                    conversation,
+                    diff,
+                };
+                // Branch/head are filled by the panel identity in the loop;
+                // an incomplete identity is intentionally not cached or
+                // presented as a current snapshot.
+                Some(snapshot)
+            }
+            _ => cached.clone(),
+        };
         let data = PrViewData {
             generation,
-            conversation,
-            diff,
+            conversation: review.as_ref().map(|r| r.conversation.clone()),
+            diff: review.as_ref().map(|r| r.diff.clone()),
+            review,
+            review_status: if live_complete {
+                None
+            } else if cached.is_some() {
+                Some("showing cached PR review".into())
+            } else {
+                Some("PR review unavailable or unsupported".into())
+            },
         };
+        // A complete remote result is delivered to the modal. The identity
+        // fields are stamped by the caller's current PR facts before the
+        // cache write, so a transient/partial fetch leaves the old row intact.
+        if live_complete
+            && let Some(snapshot) = data
+                .review
+                .clone()
+                .filter(|s| !s.branch.is_empty() && !s.head_oid.is_empty())
+            && let Ok(db) = thegn_core::db::Db::open()
+        {
+            let _ = db.put_pr_review_cache(&snapshot);
+            if refresh_tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        }
         if tx.send(data).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -756,6 +814,7 @@ pub(crate) fn open_pr_view(
     gen_ctr: &mut u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) -> Option<PrView> {
     let pr = model.panel.pr.as_ref()?;
     *gen_ctr += 1;
@@ -775,9 +834,12 @@ pub(crate) fn open_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.branch.clone(),
+            v.head_sha.clone(),
             *gen_ctr,
             tx,
             waker,
+            refresh_tx,
         );
     }
     Some(v)
@@ -790,6 +852,7 @@ pub(crate) fn refetch_pr_view(
     gen_ctr: &mut u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) {
     if let Some(v) = view
         && !v.owner.is_empty()
@@ -801,9 +864,12 @@ pub(crate) fn refetch_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.branch.clone(),
+            v.head_sha.clone(),
             *gen_ctr,
             tx,
             waker,
+            refresh_tx,
         );
     }
 }
@@ -814,7 +880,10 @@ pub(crate) fn dispatch_pr_view_key(
     view: &mut Option<PrView>,
     key: &KeyCode,
     mods: Modifiers,
-    session: &Session,
+    session: &mut Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    cfg: &thegn_core::config::Config,
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     model: &mut FrameModel,
@@ -823,6 +892,16 @@ pub(crate) fn dispatch_pr_view_key(
     match v.handle_key(key, mods) {
         PrViewOutcome::Close => *view = None,
         PrViewOutcome::Pending => {}
+        PrViewOutcome::Act(crate::pr_view::PrViewAction::Handoff(selection)) => {
+            if let Some(snapshot) = v.review.clone() {
+                crate::review_handoff::dispatch(
+                    session, panes, focus, cfg, model, refresh_tx, waker, snapshot, selection,
+                    &v.title, &v.url, &v.base,
+                );
+            } else {
+                v.status = Some("review feedback is still loading".into());
+            }
+        }
         PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
     }
 }
@@ -871,6 +950,8 @@ pub(crate) fn spawn_diff_view_fetch(
             generation,
             diff: Some(diff),
             structural,
+            review: None,
+            review_status: None,
         };
         if tx.send(data).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -883,6 +964,7 @@ pub(crate) fn spawn_diff_view_fetch(
 /// requests a structural render (delivered alongside the internal diff).
 pub(crate) fn open_diff_view(
     cfg: &thegn_core::config::Config,
+    model: &FrameModel,
     session: &Session,
     gen_ctr: &mut u64,
     tx: &UnboundedSender<DiffViewData>,
@@ -906,7 +988,16 @@ pub(crate) fn open_diff_view(
     });
     let want_structural = structural.is_some();
     spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker, structural);
-    DiffView::with_structural(title, *gen_ctr, want_structural)
+    let mut view = DiffView::with_structural(title, *gen_ctr, want_structural);
+    let review = model.panel.review_snapshot.clone().filter(|snapshot| {
+        model.panel.pr.as_ref().is_some_and(|pr| {
+            snapshot.branch == model.panel.branch
+                && snapshot.pr_number == pr.number
+                && snapshot.head_oid == model.panel.pr_head_oid
+        })
+    });
+    view.set_review(review, model.panel.review_snapshot_status.clone());
+    view
 }
 
 /// Route a key to the open diff viewer: close it, or consume it (read-only).
