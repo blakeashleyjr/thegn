@@ -272,13 +272,16 @@ fn create_and_register(
     if pre.blocked() {
         return Err(anyhow::anyhow!(pre.message()));
     }
-    worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
+    worktree::add_checked_with_state(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
-        let primary = e.to_string();
-        let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
-            Ok(()) => primary,
-            Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
-        };
+        let message = crate::worktree_lifecycle::create_failure_with_add_state(
+            e.message,
+            cfg,
+            root,
+            &path,
+            branch,
+            e.branch_created,
+        );
         anyhow::anyhow!(message)
     })?;
     // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
