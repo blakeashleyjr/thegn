@@ -27,6 +27,8 @@ struct PlaybackSnapshot {
     provider: Option<Box<dyn crate::platform::sound::SoundPlayer>>,
     pack: Option<PathBuf>,
     entries: BTreeMap<String, PathBuf>,
+    pack_entry_count: usize,
+    files: BTreeMap<String, PathBuf>,
     provider_report: ProbeReport,
     fallback: Option<String>,
 }
@@ -37,6 +39,8 @@ impl PlaybackSnapshot {
             provider: None,
             pack: None,
             entries: BTreeMap::new(),
+            pack_entry_count: 0,
+            files: BTreeMap::new(),
             provider_report: ProbeReport::new(
                 "sound",
                 "none",
@@ -138,10 +142,8 @@ impl SoundRuntime {
                                 runtime.request_fallback("no audio provider");
                                 continue;
                             };
-                            if !supported_format(&path, &provider.caps().formats)
-                                || !path.is_file()
-                            {
-                                runtime.request_fallback("sound file is missing or unsupported");
+                            if !supported_format(&path, &provider.caps().formats) {
+                                runtime.request_fallback("sound file format is unsupported");
                                 continue;
                             }
                             if let Err(error) = provider.play(&path, volume) {
@@ -174,7 +176,7 @@ impl SoundRuntime {
         serde_json::json!({
             "provider": snapshot.provider_report,
             "pack": snapshot.pack.as_ref().map(|p| p.display().to_string()),
-            "pack_entries": snapshot.entries.len(),
+            "pack_entries": snapshot.pack_entry_count,
             "fallback": snapshot.fallback,
         })
     }
@@ -194,6 +196,8 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
     let pack = (!cfg.pack.trim().is_empty())
         .then(|| PathBuf::from(thegn_core::util::expand_tilde(cfg.pack.trim())));
     let mut entries = BTreeMap::new();
+    let mut pack_entry_count = 0;
+    let mut files = BTreeMap::new();
     let mut fallback = None;
     if let Some(dir) = &pack {
         match std::fs::read_dir(dir) {
@@ -203,6 +207,7 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
                     if !path.is_file() {
                         continue;
                     }
+                    pack_entry_count += 1;
                     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
                         continue;
                     };
@@ -220,10 +225,27 @@ fn build_snapshot(cfg: &SoundConfig) -> PlaybackSnapshot {
     if provider.is_none() {
         fallback = Some("no supported audio player found; terminal bell is used".into());
     }
+    for raw in cfg
+        .per_kind
+        .values()
+        .chain(std::iter::once(&cfg.chime_file))
+    {
+        let Ok(SoundRef::File(path)) = SoundRef::parse(raw) else {
+            continue;
+        };
+        let expanded = PathBuf::from(thegn_core::util::expand_tilde(&path));
+        if expanded.is_file() {
+            files.insert(path, expanded);
+        } else {
+            fallback.get_or_insert_with(|| "a configured sound file is missing".into());
+        }
+    }
     PlaybackSnapshot {
         provider,
         pack,
         entries,
+        pack_entry_count,
+        files,
         provider_report,
         fallback,
     }
@@ -233,7 +255,7 @@ fn resolve(sound_ref: &SoundRef, snapshot: &PlaybackSnapshot) -> Option<PathBuf>
     match sound_ref {
         SoundRef::Off | SoundRef::Bell => None,
         SoundRef::Pack(name) => snapshot.entries.get(name).cloned(),
-        SoundRef::File(path) => Some(PathBuf::from(thegn_core::util::expand_tilde(path))),
+        SoundRef::File(path) => snapshot.files.get(path).cloned(),
     }
 }
 
@@ -274,6 +296,7 @@ mod tests {
         assert!(snapshot.entries.contains_key("attention.wav"));
         assert!(snapshot.entries.contains_key("attention"));
         assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.pack_entry_count, 1);
     }
 
     #[test]
@@ -289,7 +312,7 @@ mod tests {
     }
 
     fn needs_worker(cfg: &SoundConfig) -> bool {
-        cfg.mode == SoundMode::Command
+        cfg.mode == thegn_core::config::SoundMode::Command
             || !cfg.chime_file.trim().is_empty()
             || cfg.per_kind.values().any(|value| {
                 matches!(
