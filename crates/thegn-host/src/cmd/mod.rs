@@ -15,6 +15,7 @@ pub mod attach;
 pub mod bundle;
 pub mod ci;
 pub mod config;
+pub mod config_health;
 pub mod daemon;
 pub mod debug;
 pub mod diff;

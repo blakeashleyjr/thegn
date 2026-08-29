@@ -11,17 +11,21 @@ reinstall:
 
 ```sh
 nix develop            # or: direnv allow (the dev shell is on PATH)
-just ci                # the whole gate: fmt + lint + build + test + coverage + smoke + …
-# …or a single stage while iterating:
+just quick [crate]     # cheap scoped iteration check
+cargo nextest run -p <crate> <filter>  # only the tests you are touching
+# …or a deliberate stage for diagnosis or a final/pre-push/PR gate:
 just lint
 just test
 just smoke
+just ci                # the CI gate; use just ci-local when e2e is intended
 ```
 
-This is the same code the runners execute, so a green `just ci` locally means a
-green gate on GitHub (modulo the runner-only infra — see below). Follow the
-dev-loop policy in `CLAUDE.md`: iterate with `just quick`, run the heavy gates
-once before pushing.
+The scoped commands are the day-to-day loop. Individual heavy stages are useful
+for deliberate diagnosis or the pre-push/PR boundary, but are not per-edit
+commands. A green `just ci` locally covers the non-e2e CI gate (modulo
+runner-only infrastructure — see below); `just ci-local` adds the local e2e
+gate. Follow the dev-loop policy in `CLAUDE.md` and run the full gates once at
+the appropriate boundary.
 
 ## Faithful path — `act`
 
