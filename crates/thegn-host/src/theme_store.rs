@@ -29,7 +29,7 @@ enum Request {
     Apply {
         preset: String,
         theme: UserTheme,
-        overrides: Option<ThemeOverrides>,
+        overrides: Option<Box<ThemeOverrides>>,
     },
 }
 
@@ -98,7 +98,7 @@ impl ThemeStore {
         &self,
         preset: String,
         theme: UserTheme,
-        overrides: Option<ThemeOverrides>,
+        overrides: Option<Box<ThemeOverrides>>,
     ) {
         let _ = self.request.send(Work::Request(Box::new(Request::Apply {
             preset,
@@ -207,7 +207,7 @@ fn process_request(
             overrides,
         } => {
             let result =
-                write_theme_selection(config_path, &preset, overrides.as_ref()).map(|_| theme);
+                write_theme_selection(config_path, &preset, overrides.as_deref()).map(|_| theme);
             publish(result_tx, waker, ThemeStoreResult::Applied(result));
         }
     }
@@ -337,7 +337,7 @@ pub(crate) fn write_theme_selection(
     if let Some(focus) = &overrides.focus_border {
         theme_table.insert("focus_border", value(focus));
     }
-    let mut insert_colors = |colors: &mut Table| {
+    let insert_colors = |colors: &mut Table| {
         for (key, val) in [
             ("bg0", &overrides.colors.bg0),
             ("bg1", &overrides.colors.bg1),
@@ -441,6 +441,11 @@ mod tests {
         assert!(selected.contains("# keep this comment"));
         assert!(selected.contains("preset = \"storm\""));
         assert!(selected.contains("bg0 = \"#010203\""));
+
+        write_theme_selection(&path, "local-paper", None).unwrap();
+        let user_selected = std::fs::read_to_string(&path).unwrap();
+        assert!(user_selected.contains("preset = \"local-paper\""));
+        assert!(!user_selected.contains("text = \"#"));
 
         let mut overrides = ThemeOverrides::default();
         overrides.colors.text = Some("#abcdef".into());

@@ -82,7 +82,7 @@ pub(crate) enum BuilderEvent {
     Apply {
         preset: String,
         theme: UserTheme,
-        overrides: Option<ThemeOverrides>,
+        overrides: Option<Box<ThemeOverrides>>,
     },
 }
 
@@ -104,7 +104,7 @@ pub(crate) struct ThemeBuilder {
     catalog: Vec<CatalogItem>,
     selected: usize,
     focus: usize,
-    editing: Option<(ColorRole, String, usize)>,
+    editing: Option<(ColorRole, String, usize, bool)>,
     input: Option<(InputMode, String)>,
     status: Option<String>,
     pending: bool,
@@ -269,10 +269,13 @@ impl ThemeBuilder {
             return BuilderEvent::None;
         }
 
-        if let Some((role, original, cursor)) = &mut self.editing {
+        if let Some((role, original, cursor, was_edited)) = &mut self.editing {
             match key {
                 KeyCode::Escape => {
                     set_role(&mut self.draft, *role, original.clone());
+                    if !*was_edited {
+                        self.edited.retain(|edited| edited != role);
+                    }
                     self.refresh_candidate();
                     self.editing = None;
                 }
@@ -286,7 +289,7 @@ impl ThemeBuilder {
                         value.remove(*cursor - 1);
                         *cursor -= 1;
                         set_role(&mut self.draft, *role, value);
-                        self.remember_edit(*role);
+                        remember_edit(&mut self.edited, *role);
                         self.refresh_candidate();
                     }
                 }
@@ -302,7 +305,7 @@ impl ThemeBuilder {
                     value.insert(*cursor, *c);
                     *cursor += 1;
                     set_role(&mut self.draft, *role, value);
-                    self.remember_edit(*role);
+                    remember_edit(&mut self.edited, *role);
                     self.refresh_candidate();
                 }
                 _ => {}
@@ -350,7 +353,12 @@ impl ThemeBuilder {
             KeyCode::Enter => {
                 let (role, _) = ROLES[self.focus.min(TOKEN_ROWS - 1)];
                 let value = role_value(&self.draft, role);
-                self.editing = Some((role, value.clone(), value.len()));
+                self.editing = Some((
+                    role,
+                    value.clone(),
+                    value.len(),
+                    self.edited.contains(&role),
+                ));
                 BuilderEvent::None
             }
             _ => BuilderEvent::None,
@@ -370,7 +378,7 @@ impl ThemeBuilder {
         BuilderEvent::Apply {
             preset: self.active_name.clone(),
             theme: self.draft.clone(),
-            overrides: self.edited_overrides(),
+            overrides: self.edited_overrides().map(Box::new),
         }
     }
 
@@ -409,12 +417,6 @@ impl ThemeBuilder {
         );
         if self.draft.validate().is_err() {
             self.status = Some("Use #rgb or #rrggbb".into());
-        }
-    }
-
-    fn remember_edit(&mut self, role: ColorRole) {
-        if !self.edited.contains(&role) {
-            self.edited.push(role);
         }
     }
 
@@ -592,6 +594,12 @@ pub(crate) fn cycle_catalog(
             (item.name, palette)
         })
         .collect()
+}
+
+fn remember_edit(edited: &mut Vec<ColorRole>, role: ColorRole) {
+    if !edited.contains(&role) {
+        edited.push(role);
+    }
 }
 
 fn role_value(theme: &UserTheme, role: ColorRole) -> String {
@@ -971,8 +979,9 @@ mod tests {
     fn color_edit_cancel_restores_the_snapshot() {
         let mut b = builder();
         let original = role_value(&b.draft, ColorRole::Bg0);
-        b.editing = Some((ColorRole::Bg0, original.clone(), original.len()));
+        b.editing = Some((ColorRole::Bg0, original.clone(), original.len(), false));
         set_role(&mut b.draft, ColorRole::Bg0, "#ffffff".into());
+        remember_edit(&mut b.edited, ColorRole::Bg0);
         b.refresh_candidate();
         assert!(b.is_dirty());
         assert_eq!(
@@ -981,6 +990,7 @@ mod tests {
         );
         assert_eq!(b.cancel_palette(), b.snapshot);
         assert_eq!(role_value(&b.draft, ColorRole::Bg0), original);
+        assert!(b.edited.is_empty());
     }
 
     #[test]
@@ -1049,7 +1059,7 @@ mod tests {
     fn token_edit_persists_only_the_intentionally_edited_override() {
         let mut b = builder();
         b.set_role_for_test(ColorRole::Bg0, "#abcdef");
-        b.remember_edit(ColorRole::Bg0);
+        remember_edit(&mut b.edited, ColorRole::Bg0);
         let overrides = b.edited_overrides().expect("edited token");
         assert_eq!(overrides.colors.bg0.as_deref(), Some("#abcdef"));
         assert!(overrides.colors.text.is_none());

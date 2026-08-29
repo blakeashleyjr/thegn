@@ -65,13 +65,11 @@ fn print_preview(name: &str, pal: &theme::Palette) {
 }
 
 fn set(name: &str, config_path: &Path) -> Result<()> {
-    if PRESETS.contains(&name) {
-        write_selection(config_path, name)?;
-    } else if read_user_themes()
-        .into_iter()
-        .find(|theme| theme.meta.name == name)
-        .is_some()
-    {
+    let known = PRESETS.contains(&name)
+        || read_user_themes()
+            .iter()
+            .any(|theme| theme.meta.name == name);
+    if known {
         write_selection(config_path, name)?;
     } else {
         anyhow::bail!("unknown theme `{name}`; run `thegn theme list`");
