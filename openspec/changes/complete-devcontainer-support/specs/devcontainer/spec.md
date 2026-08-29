@@ -2,208 +2,246 @@
 
 ## ADDED Requirements
 
-### Requirement: A repo devcontainer.json is detected and parsed as JSONC with normalized polymorphic fields
+### Requirement: Repo devcontainer selection and parsing is deterministic and non-executing
 
-thegn SHALL detect `.devcontainer/devcontainer.json` and `.devcontainer.json`
-at a worktree root, parse the file as JSONC (line/block comments and trailing
-commas stripped to strict JSON), and normalize the spec's polymorphic fields —
-lifecycle commands (`string | [argv] | {name: cmd}`), `forwardPorts`
-(`int | "host:container"`), and `mounts` (shorthand string | object) — into one
-canonical shape. Parsing MUST be pure (no execution, no network). A file that
-fails to parse MUST surface a warning naming the parse error and apply no
-overlay — never a crash and never a silent half-parse.
+thegn SHALL give `.devcontainer/devcontainer.json` precedence over
+`.devcontainer.json`, and SHALL consider sorted
+`.devcontainer/<name>/devcontainer.json` variants only when neither primary
+file exists. It SHALL parse the selected file as JSONC, including line and
+block comments and trailing commas, without executing code, starting a
+container, or performing network I/O. Lifecycle command, forwarded-port, and
+mount polymorphic forms SHALL be normalized for later phases. A read or parse
+failure MUST apply no partial overlay and MUST be surfaced without preventing
+the worktree from opening.
 
-#### Scenario: JSONC with comments and trailing commas parses
+#### Scenario: JSONC is normalized without side effects
 
-- **WHEN** a repo ships a `devcontainer.json` containing `//` comments and a
-  trailing comma
-- **THEN** the file parses and its fields are available to the overlay
+- **WHEN** the selected file contains comments, a trailing comma, an integer
+  `forwardPorts` entry, and an argv lifecycle command
+- **THEN** parsing produces normalized values and performs no process or
+  network operation
 
-#### Scenario: A malformed file warns and is ignored
+#### Scenario: Malformed JSONC is visible and applies nothing
 
-- **WHEN** the `devcontainer.json` is not valid JSONC
-- **THEN** a warning names the parse error, no overlay is applied, and the
-  worktree still opens
+- **WHEN** the selected file is malformed
+- **THEN** its selection is reported as invalid with the parse reason, no
+  devcontainer overlay is applied, and the worktree can still open
 
-### Requirement: Multi-config layouts are discovered and selected explicitly
+### Requirement: Variant selection is explicit when discovery is ambiguous
 
-thegn SHALL discover `.devcontainer/<folder>/devcontainer.json` variant
-layouts. A repo-scoped selector (`.thegn.toml` `devcontainer = "<folder>"`)
-picks one variant. When more than one config exists and no selector is set,
-thegn MUST warn (naming the candidates) and apply none — ambiguity is never
-resolved by guessing.
+thegn SHALL allow a top-level repo setting `devcontainer = "<name>"` to select
+a `.devcontainer/<name>/devcontainer.json` variant. The selector SHALL grant no
+trust to the selected content. When multiple variants exist without a
+selector, or a selector matches no candidate, thegn MUST apply none and MUST
+surface the selection failure rather than guessing.
 
-#### Scenario: Two variants without a selector apply nothing
+#### Scenario: Ambiguous variants apply nothing
 
-- **WHEN** a repo has `.devcontainer/a/devcontainer.json` and
-  `.devcontainer/b/devcontainer.json` and no selector
-- **THEN** a warning names both candidates and no devcontainer overlay is
-  applied
+- **WHEN** `.devcontainer/a/devcontainer.json` and
+  `.devcontainer/b/devcontainer.json` exist and no selector is set
+- **THEN** both candidates are reported, the status is `ambiguous`, and no
+  overlay is applied
 
-#### Scenario: The selector picks a variant
+#### Scenario: A selector chooses but does not approve
 
-- **WHEN** the repo's `.thegn.toml` sets `devcontainer = "b"`
-- **THEN** `.devcontainer/b/devcontainer.json` is the config that overlays
+- **WHEN** the repo sets `devcontainer = "b"` and variant `b` requests an image
+- **THEN** variant `b` is selected and its `devcontainer.image` request remains
+  pending until separately approved
 
-### Requirement: The devcontainer overlay is trust-gated by category
+### Requirement: Host-affecting categories use canonical trust-on-first-use approvals
 
-The overlay SHALL gate each category — `image`, `build`, `compose`, `mounts`,
-`ports`, `lifecycle`, `features` — as a `GatedRequest` through the same
-repo-trust trust-on-first-use flow as a `.thegn.toml` overlay. An unapproved
-category MUST NOT be applied; it is surfaced as pending and the worktree still
-opens. Approval is matched by the request's canonical form, so an edited
-devcontainer.json re-prompts. `containerEnv`/`remoteEnv` are literal
-container-scoped values (they grant nothing repo code inside the container
-does not already have) and apply ungated.
+thegn SHALL create separate canonical trust requests for `image`, `build`,
+`compose`, `mounts`, `ports`, `lifecycle`, and `features`. A category without a
+matching persisted approval MUST remain pending and MUST NOT apply, while
+other independently approved categories may apply and the worktree may open.
+Changing the canonical request SHALL require a new approval. Literal
+`containerEnv` and `remoteEnv` entries SHALL apply without a category approval,
+but invalid environment-variable names MUST be dropped.
 
-#### Scenario: Unapproved lifecycle commands do not run
+#### Scenario: Lifecycle code awaits approval
 
-- **WHEN** a worktree opens on a repo whose devcontainer declares
-  `postCreateCommand` with no recorded approval for the lifecycle category
-- **THEN** no lifecycle command runs, the request is surfaced as pending, and
-  the worktree opens
+- **WHEN** an unapproved repo declares `postCreateCommand`
+- **THEN** no lifecycle command runs and `devcontainer.lifecycle` is reported
+  as pending
 
-#### Scenario: An approved category applies on the next launch
+#### Scenario: Editing an approved request re-prompts
 
-- **WHEN** the user approves the pending `devcontainer.image` request
-- **THEN** the image applies at the next worktree launch without re-prompting
+- **WHEN** an approved devcontainer image value changes
+- **THEN** the new canonical `devcontainer.image` request is pending and the
+  changed image is not used until approved
 
-### Requirement: User-pinned sandbox values take precedence over the devcontainer
+### Requirement: Host environment substitution is allowlisted and non-secret
 
-A sandbox value pinned by trusted config (global, profile, workspace, or a
-selected `[env.<name>]`) SHALL win over the devcontainer's: the overlay only
-fills unset gaps and appends to additive lists (mounts, ports, env), and MUST
-NOT override the user's hardening `profile`, `backend`, or `network`.
+thegn SHALL support workspace folder and basename substitutions,
+`${containerEnv:NAME}`, stable `${devcontainerId}`, and
+`${localEnv:NAME}`. Unknown substitution expressions SHALL remain verbatim.
+`${localEnv:NAME}` MUST read the host value only when `NAME` appears in the
+effective `sandbox.env_passthrough`; otherwise the result SHALL be empty and
+the variable name, but never its value, SHALL be reported. The native path
+SHALL use the path-preserving worktree mount for its workspace substitutions.
 
-#### Scenario: A user-pinned image is kept
+#### Scenario: A blocked local variable cannot cross into the container
 
-- **WHEN** the trusted sandbox config pins `image` and the devcontainer
-  declares a different one
-- **THEN** the user's image is used
+- **WHEN** `containerEnv.TOKEN` is `${localEnv:GH_TOKEN}` and `GH_TOKEN` is not
+  in effective `sandbox.env_passthrough`
+- **THEN** `TOKEN` receives an empty value and diagnostics name `GH_TOKEN`
+  without revealing its host value
 
-### Requirement: Lifecycle commands map onto thegn's hook points
+#### Scenario: A devcontainer identifier is stable per selected path
 
-With the lifecycle category approved, thegn SHALL map `initializeCommand` to
-the host-side one-time prepare hook, `onCreateCommand` →
-`updateContentCommand` → `postCreateCommand` to ordered one-time provisioning
-steps run in the container, and `postStartCommand`/`postAttachCommand` to the
-per-pane `init_script` (a multiplexer has no separate attach; per-pane is the
-honest analogue, and the mapping MUST be documented as such).
+- **WHEN** the same repo root and selected config path are resolved in two
+  sessions
+- **THEN** `${devcontainerId}` has the same value in both sessions
 
-#### Scenario: One-time versus per-pane execution
+### Requirement: The native fallback applies the supported container subset with user precedence
 
-- **WHEN** a trusted devcontainer declares `postCreateCommand` and
+For an approved container source, the native OCI path SHALL support a pullable
+`image`, a Dockerfile `build` with context/args/target, or a compose file and
+service/run-services selection. It SHALL fold supported mounts, forwarded
+ports, environment, lifecycle, and features onto the existing sandbox and host
+provisioning seams. Trusted user configuration MUST retain precedence for
+image, backend, profile, and network; mounts, ports, and environment are
+additive. A non-OCI backend MUST NOT claim to honor an image/build/compose
+source, and its backend honorability MUST be visible.
+
+#### Scenario: A trusted user image wins
+
+- **WHEN** trusted config pins an image and an approved devcontainer declares
+  another image
+- **THEN** the trusted user image remains effective
+
+#### Scenario: A non-OCI backend does not claim a container source
+
+- **WHEN** an approved devcontainer image resolves with a bwrap or host-family
+  backend
+- **THEN** doctor reports degraded backend honorability rather than reporting
+  the container source as honored
+
+### Requirement: Lifecycle frequency uses existing one-time and per-pane hooks
+
+With lifecycle approval, thegn SHALL map `initializeCommand` to the host-side
+one-time prepare hook. It SHALL run `onCreateCommand`,
+`updateContentCommand`, and `postCreateCommand` as ordered one-time container
+provisioning steps. It SHALL map `postStartCommand` and `postAttachCommand` to
+the existing per-pane `init_script`, executed before each pane shell, because
+the multiplexer has no distinct attach event.
+
+#### Scenario: postCreate is one-time and postStart is per pane
+
+- **WHEN** an approved config declares both `postCreateCommand` and
   `postStartCommand`
-- **THEN** `postCreateCommand` runs once at container creation and
-  `postStartCommand` runs before each pane's shell
+- **THEN** postCreate participates in the container's one-time provisioning
+  sequence and postStart runs through init_script for each pane shell
 
-### Requirement: Features install natively in-container with honest ordering
+### Requirement: Native feature installation has bounded ordering claims
 
-With the features category approved, thegn SHALL resolve `features` as OCI
-artifacts fetched inside the container (oras with curl fallback), pass options
-as the spec's env contract, and execute each feature's `install.sh`. Install
-order SHALL honour `overrideFeatureInstallOrder` first, then
-`installsAfter`/`dependsOn` from fetched feature metadata when available, then
-declaration order. Build-time feature layering (the reference CLI's generated
-Dockerfile) is reserved, and MUST be surfaced as such when a feature requires
-it rather than silently downgraded.
+With `devcontainer.features` approved, thegn SHALL plan enabled feature OCI
+artifacts after toolchain provisioning and before one-time lifecycle commands,
+map scalar feature options to the install environment, fetch in-container with
+`oras` or the curl fallback, and invoke `install.sh`.
+`overrideFeatureInstallOrder` SHALL take priority over the planner's
+deterministic fallback order. Fetched `installsAfter`/`dependsOn` metadata,
+dependency topological sorting, cycle handling, and generated-Dockerfile
+feature layering SHALL remain reserved and MUST NOT be represented as
+implemented behavior.
 
-#### Scenario: Override order wins
+#### Scenario: Explicit feature override order takes priority
 
-- **WHEN** two features are declared and `overrideFeatureInstallOrder` lists
-  them in reverse declaration order
-- **THEN** they install in the override order
+- **WHEN** two enabled features are named in reverse order by
+  `overrideFeatureInstallOrder`
+- **THEN** their native install steps follow the override order
 
-### Requirement: Variable substitution is complete and localEnv is clamped to the passthrough allowlist
+#### Scenario: Metadata dependency ordering is not promised
 
-thegn SHALL substitute the spec's variables (`${localWorkspaceFolder}`,
-`${containerWorkspaceFolder}`, their `Basename` forms, `${localEnv:VAR}`,
-`${containerEnv:VAR}`, `${devcontainerId}`), leaving unknown variables
-verbatim. `${devcontainerId}` SHALL be a stable identifier derived from the
-repo root and config path, identical across sessions. `${localEnv:VAR}` MUST
-resolve only variables on the effective `[sandbox] env_passthrough` allowlist;
-any other variable resolves to empty and a warning names it — a repo file must
-not be able to copy arbitrary host env (tokens) into the container.
+- **WHEN** a feature artifact's fetched metadata declares `installsAfter`
+- **THEN** thegn makes no dependency-order guarantee beyond explicit override
+  order and its deterministic fallback
 
-#### Scenario: devcontainerId is stable
+### Requirement: Unsafe, reserved, editor-only, and unknown fields have distinct outcomes
 
-- **WHEN** the same worktree's devcontainer is resolved in two sessions
-- **THEN** `${devcontainerId}` substitutes to the same value both times
+thegn MUST refuse `privileged`, `capAdd`, `securityOpt`, `runArgs`, and `init`
+without creating an approval path or passing them to the CLI provider. It SHALL
+report recognized reserved repo fields, including `hostRequirements`, port
+attributes, `waitFor`, `userEnvProbe`, `shutdownAction`, remote-UID settings,
+`secrets`, `workspaceMount`, `overrideCommand`, compose override, and user
+settings beyond feature-user seeding. It SHALL ignore editor-only
+`customizations` without warning and SHALL report any other unknown top-level
+key as unknown and reserved. This inventory SHALL describe the fields known to
+this thegn version and MUST NOT promise automatic parity with the complete or
+future containers.dev reference.
 
-#### Scenario: A non-allowlisted localEnv read is refused
+Image-label `devcontainer.metadata` inspection and merging SHALL remain
+reserved. Because selection and doctor do not inspect images, thegn MUST NOT
+claim to detect that label.
 
-- **WHEN** a devcontainer sets
-  `containerEnv = { T = "${localEnv:SOME_SECRET}" }` and `SOME_SECRET` is not
-  in `env_passthrough`
-- **THEN** the value substitutes to empty and a warning names `SOME_SECRET`
+#### Scenario: Privileged cannot be approved
 
-### Requirement: Every recognized-but-unapplied field is classified, never silently eaten
+- **WHEN** a devcontainer declares `privileged: true`, even alongside approved
+  categories
+- **THEN** privileged mode is not applied or passed to the CLI and the field is
+  reported as refused for weakening isolation
 
-thegn SHALL classify every devcontainer.json field it does not apply:
+#### Scenario: Unknown fields do not silently execute
 
-- **Refused by design** (isolation-weakening): `privileged`, `capAdd`,
-  `securityOpt`, `runArgs`, `init` — never applied, not even behind trust
-  approval, surfaced with a warning naming the key and the reason.
-- **Reserved** (recognized, not yet honoured): `hostRequirements`,
-  `portsAttributes`/`otherPortsAttributes`, `waitFor`, `userEnvProbe`,
-  `shutdownAction`, `updateRemoteUserUID`, `secrets`, `workspaceMount`,
-  `overrideCommand`, `remoteUser`/`containerUser` beyond seeding feature
-  installs, and the `devcontainer.metadata` image label — each surfaced as a
-  one-line warning naming the key.
-- **Editor-only** (`customizations`) — silently dropped, per the spec's
-  intent.
+- **WHEN** a selected file contains an unrecognized top-level field
+- **THEN** the field is not applied and is reported as unknown and reserved
 
-A field in none of these classes MUST be applied; silence is never an outcome
-for a recognized key outside the editor-only class.
+#### Scenario: Editor customization stays silent
 
-#### Scenario: privileged is refused even when trusted
+- **WHEN** a selected file contains `customizations.vscode`
+- **THEN** it is ignored without a warning
 
-- **WHEN** a fully trust-approved devcontainer declares `privileged: true`
-- **THEN** the container is not privileged and a warning states the key is
-  refused by design
+### Requirement: Auto mode uses a safe CLI provider with native OCI fallback
 
-#### Scenario: A reserved key warns once
+`[sandbox] devcontainer` SHALL accept `auto` and `off`, defaulting to `auto`.
+`off` MUST short-circuit before parsing or trust lookup. In `auto`, a local,
+unprojected config MAY be CLI-ready only when its container source and all
+requests are approved, it contains no refused/reserved/unknown field, and the
+bounded provider version probe succeeds. Raw repo JSON MUST NOT reach the CLI
+when those safety conditions fail. If the CLI is unavailable, degraded,
+ineligible, or fails to start, thegn SHALL retain the native OCI fallback for
+the supported approved subset.
 
-- **WHEN** a devcontainer declares `hostRequirements`
-- **THEN** a one-line warning names `hostRequirements` as reserved
+#### Scenario: Off bypasses the repo file
 
-#### Scenario: customizations stay silent
+- **WHEN** effective `[sandbox] devcontainer = "off"`
+- **THEN** the file is not parsed or trust-queried and status is `off`
 
-- **WHEN** a devcontainer carries `customizations.vscode` settings
-- **THEN** no warning is emitted for them
+#### Scenario: Reserved content prevents raw CLI execution
 
-### Requirement: Backend interplay is visible and the overlay has an opt-out
+- **WHEN** an otherwise approved config contains `hostRequirements`
+- **THEN** the CLI provider does not receive the raw config and the native path
+  may apply only the supported approved subset
 
-A new `[sandbox] devcontainer = "auto" | "off"` key (default `auto`,
-documented in `config/config.toml.example`) SHALL control the overlay; `off`
-ignores the file entirely (one notice, no per-key warnings). When a trusted
-devcontainer declares a container source (image/build/compose) and the
-effective sandbox backend family is not OCI, thegn MUST surface a warning
-naming the effective backend instead of silently dropping the container shape.
+#### Scenario: CLI startup failure degrades to the native path
 
-#### Scenario: Off means off
+- **WHEN** a CLI-ready provider fails during `devcontainer up`
+- **THEN** thegn surfaces the failure and continues through the existing OCI
+  fallback instead of executing on the host without isolation
 
-- **WHEN** `[sandbox] devcontainer = "off"` and the repo ships a
-  devcontainer.json
-- **THEN** the file is not applied and no trust prompt is raised
+### Requirement: Doctor and chrome expose the same transient state without a live build
 
-#### Scenario: A non-OCI backend is named
+For a repo context, `thegn doctor` SHALL report the `Devcontainer support`
+block with mode, candidates, selected path or selection error, provider probe,
+status, pending trust and field dispositions, and backend honorability. The
+probe MUST NOT pull an image, build, start a container, execute lifecycle code,
+or perform network I/O; it MAY run bounded `devcontainer --version`.
 
-- **WHEN** a trusted devcontainer declares an image and the effective backend
-  is bwrap
-- **THEN** a warning states the image is not honoured because the backend is
-  bwrap
+Off-loop hydration SHALL expose the same transient status in sidebar and
+active tab-bar tokens as `dc:<selected-path> [<state>]`, or `dc:[<state>]`
+without a selected path. Supported states SHALL be `off`, `ambiguous`,
+`invalid`, `pending`, `ready`, and `degraded`; no status SHALL be persisted in
+SQLite. `ready` SHALL mean CLI-ready, while `degraded` MAY still use the native
+OCI fallback for the supported subset.
 
-### Requirement: thegn doctor reports the devcontainer state
+#### Scenario: Doctor does not build to answer status
 
-`thegn doctor` SHALL include a devcontainer section for a repo context:
-presence and which config was selected, parse result, per-category trust state
-(approved/pending), refused and reserved keys found in the file, and whether
-the effective backend can honour the declared container source.
+- **WHEN** doctor examines a selected Dockerfile devcontainer
+- **THEN** it reports selection, trust, provider, and backend state without
+  building the Dockerfile or starting a container
 
-#### Scenario: Doctor surfaces pending trust and reserved keys
+#### Scenario: Pending status is consistent across surfaces
 
-- **WHEN** `thegn doctor` runs against a worktree whose devcontainer has an
-  unapproved `mounts` category and a `hostRequirements` key
-- **THEN** the output lists `mounts` as pending and `hostRequirements` as
-  reserved
+- **WHEN** a selected devcontainer has an unapproved category
+- **THEN** doctor reports the pending request and chrome shows a `pending`
+  devcontainer token derived from current approvals
