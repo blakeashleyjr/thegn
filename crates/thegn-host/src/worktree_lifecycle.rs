@@ -402,7 +402,17 @@ fn report_failure(context: &HookContext, result: &crate::hook_run::HookRunResult
     let Ok(db) = Db::open() else {
         return;
     };
-    let message = format!("{}: {}", context.event.as_str(), result.summary());
+    let tail = result.failure_tail();
+    let message = if tail.is_empty() {
+        format!("{}: {}", context.event.as_str(), result.summary())
+    } else {
+        format!(
+            "{}: {}\noutput tail:\n{}",
+            context.event.as_str(),
+            result.summary(),
+            tail
+        )
+    };
     let (decision, _) = crate::notify::record(
         &db,
         state,

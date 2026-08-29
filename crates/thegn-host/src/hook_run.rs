@@ -7,6 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thegn_core::hooks::{HookContext, HookSpec};
@@ -42,13 +43,20 @@ impl HookRunResult {
             HookRunState::TimedOut => format!("hook timed out: {}", self.command),
         }
     }
+
+    /// A bounded, line-oriented tail suitable for notifications. Hook output
+    /// is untrusted command output, so redact common credential-shaped lines
+    /// before putting it in the durable inbox/toast path.
+    pub fn failure_tail(&self) -> String {
+        failure_tail(&format!("{}\n{}", self.stdout, self.stderr))
+    }
 }
 
 /// Run one hook. Callers must invoke this from a worker, never from the
 /// compositor loop: the CPU wrapper probes the host and the child wait blocks.
 #[expect(clippy::disallowed_methods)]
 pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult {
-    let log_path = log_path(&context.worktree);
+    let log_path = log_path(&context.worktree, context.event);
     let mut child = match spawn(spec, context, cwd) {
         Ok(child) => child,
         Err(error) => {
@@ -143,15 +151,81 @@ fn kill_process_group(child: &mut Child) {
     crate::platform::kill_hook_process_group(child);
 }
 
-fn log_path(worktree: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(worktree.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+static LOG_INDICES: OnceLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
+    OnceLock::new();
+
+fn log_path(worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
+    let worktree_slug = thegn_core::util::slugify(worktree);
+    let slug = if worktree_slug.is_empty() {
+        "worktree".to_string()
+    } else {
+        format!(
+            "{}-{}",
+            worktree_slug,
+            thegn_core::util::short_hash(worktree, 6)
+        )
+    };
+    let event_name = event.as_str().to_string();
+    let next = LOG_INDICES
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("hook log index mutex poisoned")
+        .entry((slug.clone(), event_name.clone()))
+        .or_insert_with(|| {
+            let dir = thegn_core::util::xdg_state_home()
+                .join("thegn")
+                .join("hooks")
+                .join(&slug);
+            std::fs::read_dir(dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|name| {
+                    name.strip_prefix(&format!("{event_name}-"))
+                        .and_then(|n| n.strip_suffix(".log"))
+                        .and_then(|n| n.parse::<u64>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        });
+    *next += 1;
     thegn_core::util::xdg_state_home()
         .join("thegn")
         .join("hooks")
-        .join(format!("{digest}.log"))
+        .join(slug)
+        .join(format!("{event_name}-{next}.log"))
+}
+
+const FAILURE_TAIL_BYTES: usize = 4096;
+
+fn failure_tail(output: &str) -> String {
+    let mut tail = if output.len() > FAILURE_TAIL_BYTES {
+        String::from_utf8_lossy(&output.as_bytes()[output.len() - FAILURE_TAIL_BYTES..])
+            .into_owned()
+    } else {
+        output.to_string()
+    };
+    if let Some(first_newline) = tail.find('\n')
+        && output.len() > FAILURE_TAIL_BYTES
+    {
+        tail.replace_range(..=first_newline, "…\n");
+    }
+    tail.lines()
+        .map(|line| {
+            let upper = line.to_ascii_uppercase();
+            if ["TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY"]
+                .iter()
+                .any(|marker| upper.contains(marker))
+            {
+                "[redacted hook output]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn append_log(
@@ -259,5 +333,21 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].state, HookRunState::Failed);
+    }
+
+    #[test]
+    fn failure_tail_is_bounded_and_redacts_credential_shaped_output() {
+        let result = HookRunResult {
+            command: "false".into(),
+            state: HookRunState::Failed,
+            code: Some(1),
+            stdout: format!("{}\nAPI_TOKEN=do-not-show", "x".repeat(5000)),
+            stderr: String::new(),
+            log_path: PathBuf::new(),
+        };
+        let tail = result.failure_tail();
+        assert!(tail.len() <= FAILURE_TAIL_BYTES + 4);
+        assert!(!tail.contains("do-not-show"));
+        assert!(tail.contains("redacted hook output"));
     }
 }
