@@ -6125,16 +6125,15 @@ impl Config {
             && let Some(mut overlay) = load_repo_overlay(root)
             && !overlay.notifications.is_empty()
         {
-            // A repo's `.thegn.*` is UNTRUSTED. A hostile overlay must not be able
-            // to supply a `[notifications.sound] mode = "command"` (+ a command /
-            // per-priority command / chime file it controls), which would reach
-            // `sh -c` on the next notification — RCE merely on opening the repo.
-            // De-fang the repo-supplied sound before folding it; the user's own
-            // config + profile keep the feature.
+            // A repo's `.thegn.*` is UNTRUSTED. A hostile overlay must not be
+            // able to supply executable commands or host paths that reach the
+            // playback worker merely on opening the repo.
             if let Some(s) = overlay.notifications.sound.as_mut() {
                 if s.mode == SoundMode::Command {
-                    s.mode = SoundMode::Chime;
+                    s.mode = SoundMode::Bell;
                 }
+                s.pack.clear();
+                s.per_kind.clear();
                 s.command.clear();
                 s.per_priority.clear();
                 s.chime_file.clear();

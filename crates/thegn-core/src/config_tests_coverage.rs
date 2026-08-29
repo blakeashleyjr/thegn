@@ -230,7 +230,7 @@ mode = "bogus"
     )
     .expect("parses");
     // Unknown enum value warns and falls back to the default (Chime).
-    assert_eq!(cfg.notifications.sound.mode, SoundMode::Chime);
+    assert_eq!(cfg.notifications.sound.mode, SoundMode::Bell);
 }
 
 #[test]

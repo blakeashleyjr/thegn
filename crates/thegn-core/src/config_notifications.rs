@@ -71,7 +71,7 @@ impl Default for NotificationsConfig {
 
 impl NotificationsConfig {
     pub fn validate(&self) -> Vec<String> {
-        let mut errors = self.validate_sound();
+        let mut errors = Vec::new();
         if self.agent_error_signatures.len() > crate::agent_error::MAX_AGENT_ERROR_SIGNATURES {
             errors.push(format!(
                 "notifications.agent_error_signatures: more than {} entries",
