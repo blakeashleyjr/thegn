@@ -13,6 +13,7 @@ impl Db {
     /// nullable `report` column. Errors when the row does not exist (checks
     /// `get_dispatch` first, naming the id).
     pub fn set_dispatch_report(&self, id: i64, text: &str) -> Result<()> {
+        let text = crate::pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         // Existence check: a silent UPDATE on a missing row is silently wrong.
         if self.get_dispatch(id)?.is_none() {
             anyhow::bail!("roster row {id} does not exist");
@@ -28,6 +29,7 @@ impl Db {
     /// `agent_dispatch_notes`. Returns the new note's id. Errors when the row
     /// does not exist.
     pub fn append_dispatch_note(&self, id: i64, text: &str) -> Result<i64> {
+        let text = crate::pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         if self.get_dispatch(id)?.is_none() {
             anyhow::bail!("roster row {id} does not exist");
         }
@@ -174,5 +176,22 @@ mod tests {
         db.set_dispatch_report(id, "second").unwrap();
         let row = db.get_dispatch(id).unwrap().unwrap();
         assert_eq!(row.report.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn db_writes_reapply_hostile_text_policy() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-5", "/wt/x");
+        db.set_dispatch_report(id, "before\x1b[2J\nafter\r")
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().report.as_deref(),
+            Some("before[2J\nafter")
+        );
+        db.append_dispatch_note(id, "first\nsecond\x07").unwrap();
+        assert_eq!(
+            db.dispatch_notes(id, None, 0).unwrap()[0].text,
+            "firstsecond"
+        );
     }
 }
