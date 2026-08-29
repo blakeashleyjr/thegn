@@ -149,10 +149,26 @@ fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
 }
 
 fn collect_repo(health: &mut ConfigHealth, discovery: &RepoOverlayDiscovery) {
+    if let Some(candidate) = discovery.selected() {
+        health.repo_path = Some(candidate.path.clone());
+    } else if let Some(candidate) = discovery.unreadable_candidates().first() {
+        // There is no selected readable layer, but an existing unreadable
+        // candidate is still the repo layer that validation must identify.
+        health.repo_path = Some(candidate.path.clone());
+    }
+
+    for candidate in discovery.unreadable_candidates() {
+        add_problem(
+            health,
+            Layer::Repo,
+            &candidate.path,
+            format!("cannot read repo overlay: {}", candidate.error),
+        );
+    }
+
     let Some(candidate) = discovery.selected() else {
         return;
     };
-    health.repo_path = Some(candidate.path.clone());
 
     if let Some(warning) = discovery.shadow_warning() {
         add_warning(health, &candidate.path, warning);
@@ -287,5 +303,34 @@ mod tests {
             !marker.exists(),
             "config health must not execute collectors"
         );
+    }
+
+    #[test]
+    fn unreadable_repo_candidate_is_a_path_owned_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".thegn.toml")).unwrap();
+        std::fs::write(dir.path().join(".thegn.yaml"), "sandbox: {}\n").unwrap();
+
+        let discovery = thegn_core::config_repo::discover_repo_overlay(dir.path());
+        let mut health = ConfigHealth {
+            main_path: dir.path().join("config.toml"),
+            profile_path: None,
+            repo_path: None,
+            main_present: false,
+            findings: Vec::new(),
+            main_problems: 0,
+            profile_problems: 0,
+            repo_problems: 0,
+            warnings: 0,
+        };
+        collect_repo(&mut health, &discovery);
+
+        let unreadable = dir.path().join(".thegn.toml");
+        let selected = dir.path().join(".thegn.yaml");
+        assert_eq!(health.repo_path.as_deref(), Some(selected.as_path()));
+        assert_eq!(health.repo_problems, 1);
+        assert!(health.findings().any(|finding| {
+            finding.path == unreadable && finding.message.starts_with("cannot read repo overlay:")
+        }));
     }
 }

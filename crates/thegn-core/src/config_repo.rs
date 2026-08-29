@@ -55,12 +55,24 @@ pub struct RepoOverlayCandidate {
     pub body: String,
 }
 
-/// All readable candidates and the selected winner. TOML wins, followed by
-/// YAML/YML, then JSON; shadowed files are intentionally reported without
-/// inspecting or printing their contents.
+/// An existing repo overlay candidate whose contents could not be read.
+///
+/// The error is kept so validation can explain why the candidate was omitted;
+/// its contents are never retained or included in diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoOverlayUnreadableCandidate {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// All readable candidates, unreadable candidates, and the selected winner.
+/// TOML wins, followed by YAML/YML, then JSON among readable candidates;
+/// unreadable files are never selected, but remain visible to validation and
+/// health reporting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoOverlayDiscovery {
     pub candidates: Vec<RepoOverlayCandidate>,
+    pub unreadable: Vec<RepoOverlayUnreadableCandidate>,
 }
 
 impl RepoOverlayDiscovery {
@@ -70,6 +82,10 @@ impl RepoOverlayDiscovery {
 
     pub fn shadowed(&self) -> &[RepoOverlayCandidate] {
         self.candidates.get(1..).unwrap_or_default()
+    }
+
+    pub fn unreadable_candidates(&self) -> &[RepoOverlayUnreadableCandidate] {
+        &self.unreadable
     }
 
     /// The path-only warning for a multi-candidate repo overlay.
@@ -150,21 +166,30 @@ pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Ve
 }
 
 /// Discover every readable candidate without parsing it. The first candidate
-/// is the winner; all later candidates are shadowed and remain visible to
-/// validation/health callers.
+/// is the winner; all later readable candidates are shadowed and remain visible
+/// to validation/health callers. Existing candidates that cannot be read are
+/// retained separately so a lower-precedence readable file cannot hide them.
 pub fn discover_repo_overlay(repo_root: &Path) -> RepoOverlayDiscovery {
     let mut candidates = Vec::new();
+    let mut unreadable = Vec::new();
     for extension in ["toml", "yaml", "yml", "json"] {
         let path = repo_root.join(format!(".thegn.{extension}"));
         let Some(format) = OverlayFormat::from_extension(extension) else {
             continue;
         };
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        candidates.push(RepoOverlayCandidate { path, format, body });
+        match std::fs::read_to_string(&path) {
+            Ok(body) => candidates.push(RepoOverlayCandidate { path, format, body }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => unreadable.push(RepoOverlayUnreadableCandidate {
+                path,
+                error: error.to_string(),
+            }),
+        }
     }
-    RepoOverlayDiscovery { candidates }
+    RepoOverlayDiscovery {
+        candidates,
+        unreadable,
+    }
 }
 
 /// Parse a repo overlay into the format-neutral JSON value used by the schema
@@ -441,5 +466,26 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("repo-command"));
+    }
+
+    #[test]
+    fn discovery_retains_unreadable_candidates_and_selects_lower_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the candidate path reliably exercises a read failure
+        // even when tests run with elevated permissions.
+        std::fs::create_dir(dir.path().join(".thegn.toml")).unwrap();
+        std::fs::write(dir.path().join(".thegn.yaml"), "sandbox: {}\n").unwrap();
+
+        let discovery = discover_repo_overlay(dir.path());
+        assert_eq!(
+            discovery.selected().unwrap().path,
+            dir.path().join(".thegn.yaml")
+        );
+        assert_eq!(discovery.unreadable_candidates().len(), 1);
+        assert_eq!(
+            discovery.unreadable_candidates()[0].path,
+            dir.path().join(".thegn.toml")
+        );
+        assert!(!discovery.unreadable_candidates()[0].error.is_empty());
     }
 }
