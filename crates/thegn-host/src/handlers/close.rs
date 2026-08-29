@@ -108,7 +108,7 @@ pub(crate) fn close_tab(
             }
             if let Some((name, path, gi, ti)) = target {
                 tab_state.on_tab_closed(&name, gi, ti);
-                if !path.is_empty() && !cx.session.worktrees.iter().any(|g| g.name == name) {
+                if !path.is_empty() {
                     crate::worktree_lifecycle::session_end_once(
                         cx.lifecycle_cfg,
                         std::path::Path::new(&path),

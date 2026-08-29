@@ -561,7 +561,6 @@ pub fn spawn_workspace_destroy(
             );
         }
         if failed_paths.is_empty()
-            && session_id == repo_root.to_string_lossy()
             && let Some(db) = db.as_ref()
         {
             crate::handlers::workspace_remove::forget_workspace_in_db(

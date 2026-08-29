@@ -1439,7 +1439,7 @@ mod tests {
         assert_eq!(m.selected(), 0, "k clamps at the top");
         m.handle_key(&KeyCode::Char('j'), NONE);
         m.handle_key(&KeyCode::DownArrow, NONE);
-        assert_eq!(m.selected(), 3);
+        assert_eq!(m.selected(), 2);
         assert_eq!(
             m.handle_key(&KeyCode::Char('j'), NONE),
             MenuOutcome::Pending
