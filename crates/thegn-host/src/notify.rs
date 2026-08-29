@@ -397,7 +397,7 @@ fn emit_channels(
     }
     // Push-to-phone rides the same decision. The publisher worker exists only
     // when `[notifications.push]` is configured; otherwise this is a no-op.
-    state.emit_push(&decision, kind, message, "", worktree);
+    state.emit_push(decision, kind, message, "", worktree);
 }
 
 /// Route a hydration/worker notification through the live host state when it
