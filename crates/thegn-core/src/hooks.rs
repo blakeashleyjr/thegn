@@ -410,12 +410,18 @@ mod tests {
 
     #[test]
     fn ordered_accumulation_filters_empty_commands_and_applies_defaults() {
-        let mut global = HooksConfig::default();
-        global.pre_create = vec![command(" global "), command(" ")];
-        let mut workspace = HooksConfig::default();
-        workspace.pre_create = vec![command("workspace")];
-        let mut repo = HooksConfig::default();
-        repo.pre_create = vec![command("repo")];
+        let global = HooksConfig {
+            pre_create: vec![command(" global "), command(" ")],
+            ..Default::default()
+        };
+        let workspace = HooksConfig {
+            pre_create: vec![command("workspace")],
+            ..Default::default()
+        };
+        let repo = HooksConfig {
+            pre_create: vec![command("repo")],
+            ..Default::default()
+        };
 
         let resolved = resolve(
             &global,
@@ -439,15 +445,19 @@ mod tests {
 
     #[test]
     fn approved_repo_hooks_are_warn_only_and_legacy_prepare_is_first() {
-        let mut global = HooksConfig::default();
-        global.post_create = vec![command("global")];
-        let mut repo = HooksConfig::default();
-        repo.post_create = vec![HookEntry::Spec(HookEntrySpec {
-            command: "repo".into(),
-            wait: Some(true),
-            timeout_secs: Some(9),
-            on_failure: Some(HookFailure::Block),
-        })];
+        let global = HooksConfig {
+            post_create: vec![command("global")],
+            ..Default::default()
+        };
+        let repo = HooksConfig {
+            post_create: vec![HookEntry::Spec(HookEntrySpec {
+                command: "repo".into(),
+                wait: Some(true),
+                timeout_secs: Some(9),
+                on_failure: Some(HookFailure::Block),
+            })],
+            ..Default::default()
+        };
         let repo_entry = HookSpec {
             command: "repo".into(),
             wait: true,
@@ -485,8 +495,10 @@ mod tests {
 
     #[test]
     fn repo_request_is_pending_until_the_normalized_event_list_is_approved() {
-        let mut repo = HooksConfig::default();
-        repo.pre_destroy = vec![command("echo one")];
+        let mut repo = HooksConfig {
+            pre_destroy: vec![command("echo one")],
+            ..Default::default()
+        };
         let denied = resolve(
             &HooksConfig::default(),
             None,
