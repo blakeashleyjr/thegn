@@ -7,8 +7,9 @@
 ## Context
 
 `thegn-metrics` directly owns feature-trimmed `sysinfo 0.39`
-(`crates/thegn-metrics/Cargo.toml:16-25`), while `thegn-core` uses it only on
-non-Linux targets (`crates/thegn-core/Cargo.toml:88-93`). `StatsSampler` reuses
+(`crates/thegn-metrics/Cargo.toml:16-25`; lock edge at
+`Cargo.lock:8409-8418`), while `thegn-core` uses it only on non-Linux targets
+(`crates/thegn-core/Cargo.toml:88-93`). `StatsSampler` reuses
 one configured `System`, refreshes cheap fields each tick, and slow fields
 every fifth tick (`crates/thegn-metrics/src/sample.rs:1-23,46-88`). Sampling
 runs off the event loop (`crates/thegn-host/src/hydrate.rs:608-613`; the
@@ -29,8 +30,11 @@ permission to enumerate processes every tick. Keep GPU, battery, and
 Apple-specific thermal providers at their existing edges
 (`crates/thegn-metrics/src/lib.rs:1-24`). Feature trimming controls binary and
 build cost; MSRV 1.89 is already the workspace floor, and the dependency is
-already paid in the Linux/musl and cross-target leaves. Replacing it would be
-a substantive migration with no measured gain.
+already paid in the Linux/musl and cross-target leaves. Linux and musl retain
+the periodic metrics sampler; macOS retains sysinfo for hostname while using
+libproc for measured activity hot paths; mingw/Windows retains the sysinfo
+activity and metrics leaves. Replacing it would be a substantive migration
+with no measured gain.
 
 ## Reopen condition
 

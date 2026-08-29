@@ -26,6 +26,12 @@ binary/build and maintenance cost on the musl and mingw target matrix for no
 behavioral benefit. Keeping the environment-based session identity preserves
 the existing degradation behavior and adds no unsafe surface.
 
+Linux and musl keep their current procfs/fallback hostname path and do not
+gain an identity lookup. macOS continues to use the non-Linux `sysinfo`
+hostname fallback, while mingw/Windows retains `USERNAME` for the existing
+`icacls` seam. A new direct crate would add build and binary cost across those
+target graphs without replacing a current dependency or a user-visible need.
+
 ## Reopen condition
 
 If a daemonized path must resolve an account with no environment, file a

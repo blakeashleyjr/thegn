@@ -16,10 +16,11 @@ media leaf uses the higher-level `windows` WinRT SMTC API
 binding family.
 
 The direct pins are `windows-sys = 0.59` and `windows = 0.58`
-(`Cargo.toml:165-177`). The lock also contains newer transitive cohorts
-(`Cargo.lock:9607-9628,9810-9840`), so version alignment is real maintenance
-debt. It is not a safe one-line adoption: the WinRT leaf may require source
-changes and Windows target validation.
+(`Cargo.toml:165-177`; direct package edges at
+`Cargo.lock:8344-8392,8395-8406`). The lock also contains newer transitive
+cohorts (`Cargo.lock:9607-9628,9810-9840`), so version alignment is real
+maintenance debt. It is not a safe one-line adoption: the WinRT leaf may
+require source changes and Windows target validation.
 
 ## Decision
 
