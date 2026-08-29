@@ -471,7 +471,12 @@ pub fn target_subset(bundle: &MigrationBundle, target: &MigrationTarget) -> Migr
             .cloned()
             .collect(),
         target.notes.clone(),
-        target.pin_state.clone(),
+        bundle
+            .pin_state
+            .as_ref()
+            .is_some()
+            .then(|| target.pin_state.clone())
+            .flatten(),
         target.pin_updated_at,
     )
 }
@@ -806,6 +811,21 @@ mod tests {
             plan_migration(source, target),
             Err(MigrationConflict::UiState("pin:api".into()))
         );
+    }
+
+    #[test]
+    fn target_owned_pin_is_preserved_when_source_has_no_pin() {
+        let mut source = bundle();
+        source.pin_state = None;
+        let target = MigrationTarget {
+            groups: source.groups.clone(),
+            ui_state: source.ui_state.clone(),
+            pin_state: Some("target-owned".into()),
+            ..Default::default()
+        };
+
+        let plan = plan_migration(source, target).unwrap();
+        assert!(plan.resumed);
     }
 
     #[test]

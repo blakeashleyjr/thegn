@@ -32,7 +32,7 @@
       refuse moving a group open in a running UI (message: close it or kill
       its panes).
 - [x] 3.3 Best-effort target-daemon notification via its `notify.push` door;
-      unreachable target is silent success.
+      an unreachable target is reported as a warning after confirmed success.
 - [ ] 3.4 Smoke coverage with two isolated `XDG_STATE_HOME` profile roots
       (cold move, --kill move, collision, dry-run).
 
