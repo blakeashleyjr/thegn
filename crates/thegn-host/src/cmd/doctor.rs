@@ -8,6 +8,8 @@
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
 use thegn_core::config::{Config, SandboxProfile};
+use thegn_core::db::Db;
+use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
 use thegn_core::outln;
 use thegn_core::placement::{Placement, RuntimeProbe};
@@ -1125,7 +1127,84 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "agents": agents_json(cfg),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
+        "lifecycle_hooks": lifecycle_hooks_json(cfg),
     })
+}
+
+/// Report lifecycle-hook sources without exposing command text. Repo hooks are
+/// read only for the diagnostic surface; execution still goes through the
+/// normal trust-gated resolver.
+fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
+    let repo_root = current_repo_root();
+    let repo_hooks = repo_root
+        .as_deref()
+        .and_then(thegn_core::config::load_repo_hooks)
+        .map(|(hooks, _)| hooks)
+        .unwrap_or_default();
+    let db = Db::open().ok();
+    let resolved = repo_root
+        .as_deref()
+        .map(|root| crate::worktree_lifecycle::resolve(cfg, root, db.as_ref()));
+
+    let events = HookEvent::ALL
+        .into_iter()
+        .map(|event| {
+            let global = cfg.hooks.entries(event).len();
+            let workspace = cfg
+                .workspace
+                .values()
+                .map(|w| w.hooks.entries(event).len())
+                .sum::<usize>();
+            let repo = repo_hooks.entries(event).len();
+            let trust = if repo == 0 {
+                "none"
+            } else if db.is_none() {
+                "unknown (state DB unavailable)"
+            } else if resolved.as_ref().is_some_and(|r| {
+                r.pending
+                    .iter()
+                    .any(|request| request.key == format!("hooks.{}", event.as_str()))
+            }) {
+                "pending"
+            } else {
+                "approved"
+            };
+            (
+                event.as_str().to_string(),
+                serde_json::json!({
+                    "global": global,
+                    "workspace": workspace,
+                    "repo": repo,
+                    "repo_trust": trust,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "repo": repo_root.map(|root| root.display().to_string()),
+        "events": events,
+    })
+}
+
+fn lifecycle_hooks_report(cfg: &Config) {
+    let report = lifecycle_hooks_json(cfg);
+    outln!("Lifecycle hooks ([hooks])");
+    if let Some(repo) = report["repo"].as_str() {
+        outln!("  repo          {repo}");
+    } else {
+        outln!("  repo          (not inside a repository)");
+    }
+    for event in HookEvent::ALL {
+        let row = &report["events"][event.as_str()];
+        outln!(
+            "  {:<13} global={} workspace={} repo={} trust={}",
+            event.as_str(),
+            row["global"],
+            row["workspace"],
+            row["repo"],
+            row["repo_trust"].as_str().unwrap_or("unknown"),
+        );
+    }
 }
 
 /// Reports the model proxy: a single quiet line when disabled, else enabled
@@ -1371,6 +1450,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     model_proxy_report(cfg);
+
+    outln!("");
+    lifecycle_hooks_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
@@ -3074,6 +3156,19 @@ mod tests {
         // Tests never own a tty, so the probe is skipped and every field is
         // null — which is exactly the "unknown ⇒ assume it works" state.
         assert!(kb["ctrl_digits_reportable"].is_null());
+    }
+
+    #[test]
+    fn doctor_json_exposes_lifecycle_hook_sources() {
+        let hooks = doctor_json(&Config::default())["lifecycle_hooks"].clone();
+        assert!(hooks["events"].is_object());
+        for event in HookEvent::ALL {
+            let row = &hooks["events"][event.as_str()];
+            assert!(row["global"].is_u64());
+            assert!(row["workspace"].is_u64());
+            assert!(row["repo"].is_u64());
+            assert!(row["repo_trust"].is_string());
+        }
     }
 
     #[test]
