@@ -392,7 +392,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     &agent_name,
                 ));
                 let _ = db.link_issue(&wt_str, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                crate::worktree_lifecycle::schedule_post_create(
+                if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
                     &cfg2,
                     &root,
                     &path,
@@ -400,7 +400,18 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     &slug,
                     Some(&db),
                     None,
-                );
+                ) {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch post_create: {}", report.message()),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    let _ = db.del_worktree(&wt_str);
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
             let env = crate::wizard::ambient_env_name_live(&cfg2, &root);
