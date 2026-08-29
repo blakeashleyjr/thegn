@@ -9,8 +9,8 @@
 //! - **config-derived** ([`ConfigSource`], and the pure
 //!   [`config_candidates`] behind it) — pure functions over an already-loaded
 //!   [`Config`], so the caller decides when (and whether) to pay for the load.
-//! - **in-process** ([`StaticSource`]) — theme presets, capability ids, action
-//!   ids: constants already compiled into the binary, free to serve.
+//! - **in-process** ([`StaticSource`]) — theme presets plus bounded local theme
+//!   metadata, capability ids, and action ids. This path never creates state.
 //!
 //! ## The read-only contract
 //!
@@ -39,6 +39,9 @@ use super::Deadline;
 use super::candidate::Candidate;
 use super::catalog::SourceKind;
 use crate::config::Config;
+
+const MAX_THEME_FILES: usize = 256;
+const MAX_THEME_FILE_BYTES: usize = 64 * 1024;
 
 /// Busy timeout for the read-only handle. Short on purpose: a `<TAB>` that
 /// blocks behind a compositor's write transaction should give up and complete
@@ -300,12 +303,45 @@ impl CompletionSource for ConfigSource<'_> {
 
 // ── in-process ───────────────────────────────────────────────────────────────
 
-/// The selectable theme presets.
+/// The selectable merged built-in and local theme catalog.
 pub fn theme_candidates() -> Vec<Candidate> {
-    crate::theme::PRESETS
+    let mut out: Vec<Candidate> = crate::theme::PRESETS
         .iter()
         .map(|p| Candidate::new(*p))
-        .collect()
+        .collect();
+    let builtins: std::collections::HashSet<&str> = crate::theme::PRESETS.iter().copied().collect();
+    let dir = crate::util::xdg_config_home().join("thegn/themes");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut users = Vec::new();
+    for entry in entries.flatten().take(MAX_THEME_FILES) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if size > MAX_THEME_FILE_BYTES {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(theme) = crate::theme_user::UserTheme::from_toml(&text) else {
+            continue;
+        };
+        if !builtins.contains(theme.meta.name.as_str()) {
+            users.push(theme.meta.name);
+        }
+    }
+    users.sort();
+    out.extend(users.into_iter().map(Candidate::new));
+    out
 }
 
 /// Capability ids, from the one capability catalog. This is the right direction
@@ -657,7 +693,7 @@ mod tests {
     fn in_process_sources_project_the_existing_catalogs() {
         let themes: Vec<String> = theme_candidates().into_iter().map(|c| c.value).collect();
         assert!(themes.contains(&"prism".to_string()));
-        assert_eq!(themes.len(), crate::theme::PRESETS.len());
+        assert!(themes.len() >= crate::theme::PRESETS.len());
 
         let caps = capability_candidates();
         assert_eq!(caps.len(), crate::capability::CATALOG.len());
@@ -669,7 +705,10 @@ mod tests {
         assert!(actions.iter().any(|c| c.value == "new-worktree"));
 
         assert_eq!(
-            in_process_candidates(SourceKind::Theme).len(),
+            in_process_candidates(SourceKind::Theme)
+                .iter()
+                .filter(|candidate| crate::theme::PRESETS.contains(&candidate.value.as_str()))
+                .count(),
             crate::theme::PRESETS.len()
         );
         assert!(in_process_candidates(SourceKind::Worktree).is_empty());
