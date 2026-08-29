@@ -777,10 +777,10 @@ pub(crate) fn build_launch_palette(
 /// `drawer:<occupant-id>` prefix before generic action dispatch.
 pub(crate) fn build_drawer_palette(
     cfg: &thegn_core::config::Config,
-    scope: thegn_core::config::DrawerScope,
+    _scope: thegn_core::config::DrawerScope,
 ) -> Vec<crate::palette::PaletteItem> {
     thegn_core::config_drawer::drawer_policy(cfg)
-        .occupants_for(scope)
+        .occupants()
         .into_iter()
         .map(|occupant| {
             let label = if occupant.id == thegn_core::config_drawer::FILES_OCCUPANT_ID {
@@ -1405,7 +1405,7 @@ mod tests {
         let rows = build_drawer_palette(&cfg, thegn_core::config::DrawerScope::Worktree);
         assert_eq!(
             rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
-            vec!["drawer:files", "drawer:tool:atac"]
+            vec!["drawer:files", "drawer:tool:atac", "drawer:tool:db"]
         );
         assert!(rows.iter().all(|row| row.key.starts_with("drawer:")));
         assert_eq!(drawer_picker_occupant(&rows[0].key), Some("files"));
