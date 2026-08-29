@@ -52,6 +52,21 @@ pub fn install_refresh(tx: tokio::sync::mpsc::UnboundedSender<crate::hydrate::Re
     let _ = REFRESH_TX.set(tx);
 }
 
+/// Deliver a typed background result to the compositor and pulse its existing
+/// wake source. The producer is off-loop; a closed channel only means the
+/// compositor has already gone away.
+pub(crate) fn send_refresh(
+    kind: crate::hydrate::RefreshKind,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) {
+    if let Some(tx) = REFRESH_TX.get() {
+        let _ = tx.send(kind); // best-effort: the consumer may be gone
+    }
+    if let Some(waker) = waker {
+        let _ = waker.wake(); // best-effort: the compositor may be shutting down
+    }
+}
+
 pub fn take_completions() -> Vec<LifecycleCompletion> {
     std::mem::take(&mut *completions().lock().expect("lifecycle mutex poisoned"))
 }
@@ -785,6 +800,19 @@ pub fn create_failure_with_rollback(
     }
 }
 
+/// Run a worktree add and route every failure through the shared force-cleanup
+/// transaction. The closure keeps the git seam injectable for callers/tests,
+/// while the returned error always preserves the original add diagnostic.
+pub fn add_checked_with_rollback(
+    add: impl FnOnce() -> Result<(), String>,
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    add().map_err(|error| create_failure_with_rollback(error, cfg, repo_root, worktree, branch))
+}
+
 static SESSION_LATCHES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
 
 fn session_latches() -> &'static Mutex<HashSet<(String, String)>> {
@@ -995,12 +1023,12 @@ mod tests {
 
     #[test]
     fn rollback_removes_branch_when_add_left_no_checkout() {
-        let _env = crate::testenv::EnvVarGuard::set(&[(
-            "XDG_STATE_HOME",
-            &std::env::temp_dir()
-                .join(format!("tg-lifecycle-rollback-{}", std::process::id()))
-                .to_string_lossy(),
-        )]);
+        let state_home = std::env::temp_dir().join(format!(
+            "tg-lifecycle-rollback-state-{}",
+            std::process::id()
+        ));
+        let _env =
+            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
         let root = std::env::temp_dir().join(format!(
             "tg-lifecycle-rollback-repo-{}-{}",
             std::process::id(),
@@ -1020,6 +1048,40 @@ mod tests {
         let result = rollback_remove(&Config::default(), &root, &missing, "partial");
 
         assert!(result.is_ok(), "rollback failed: {result:?}");
+        assert!(!thegn_core::worktree::branch_exists(&root, "partial"));
+    }
+
+    #[test]
+    fn add_failure_preserves_primary_error_after_force_cleanup() {
+        let state_home =
+            std::env::temp_dir().join(format!("tg-lifecycle-add-state-{}", std::process::id()));
+        let _env =
+            crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+        let root = std::env::temp_dir().join(format!(
+            "tg-lifecycle-add-repo-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "test"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        std::fs::write(root.join("file"), "base\n").unwrap();
+        git(&root, &["add", "file"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        git(&root, &["branch", "partial", "main"]);
+
+        let error = add_checked_with_rollback(
+            || Err("git worktree add failed: partial checkout".into()),
+            &Config::default(),
+            &root,
+            &root.join("missing"),
+            "partial",
+        )
+        .expect_err("injected add failure");
+
+        assert!(error.contains("git worktree add failed: partial checkout"));
         assert!(!thegn_core::worktree::branch_exists(&root, "partial"));
     }
 }
