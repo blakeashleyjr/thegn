@@ -746,16 +746,15 @@ pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()>
     Ok(())
 }
 
-/// Keep the status read bounded while retaining the newest notes. The DB API
-/// returns notes oldest-first (which makes a natural timeline); taking the
-/// suffix here gives `/btw` its "last 20" contract without changing that
-/// shared read convention.
-fn status_notes(db: &Db, id: i64, since_ms: Option<i64>) -> Result<Vec<DispatchNote>> {
-    let mut notes = db.dispatch_notes(id, since_ms, 0)?;
+/// The row-mode status display is bounded to the newest notes. The digest
+/// itself receives the full since-filtered set so its `note_count` remains a
+/// count of all matching notes, not merely the displayed suffix.
+fn newest_status_notes(notes: &[DispatchNote]) -> &[DispatchNote] {
     if notes.len() > 20 {
-        notes = notes.split_off(notes.len() - 20);
+        &notes[notes.len() - 20..]
+    } else {
+        notes
     }
-    Ok(notes)
 }
 
 /// `dispatch status [row] [--since <epoch-ms>] [--all] [--json]` — the
@@ -794,26 +793,31 @@ pub(crate) fn read_status(
     let row_mode = row.is_some();
     let mut notes_map: HashMap<i64, Vec<DispatchNote>> = HashMap::new();
     for r in &rows {
-        notes_map.insert(r.id, status_notes(db, r.id, since_ms)?);
+        // Keep the full since-filtered set for `digest`: the output is capped,
+        // but `note_count` must still describe the complete queue window.
+        notes_map.insert(r.id, db.dispatch_notes(r.id, since_ms, 0)?);
     }
     let digests = pipeline_report::digest(&rows, &notes_map, since_ms);
     if json {
         if row_mode {
             let digest = digests.into_iter().next().expect("one selected row");
             let mut v = serde_json::to_value(digest)?;
-            let notes = notes_map
-                .get(&row.expect("row mode"))
-                .into_iter()
-                .flatten()
-                .map(|n| {
-                    serde_json::json!({
-                        "id": n.id,
-                        "dispatch_id": n.dispatch_id,
-                        "created_at_ms": n.created_at_ms,
-                        "text": n.text,
-                    })
+            let notes = newest_status_notes(
+                notes_map
+                    .get(&row.expect("row mode"))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "dispatch_id": n.dispatch_id,
+                    "created_at_ms": n.created_at_ms,
+                    "text": n.text,
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
             v["notes"] = serde_json::Value::Array(notes);
             super::emit_json(&v)?;
         } else {
@@ -837,9 +841,17 @@ pub(crate) fn read_status(
                 latest
             );
         }
-        if row_mode && let Some(report) = digests.first().and_then(|d| d.report.as_deref()) {
-            outln!("report:");
-            outln!("{report}");
+        if row_mode {
+            if let Some(report) = digests.first().and_then(|d| d.report.as_deref()) {
+                outln!("report:");
+                outln!("{report}");
+            }
+            outln!("notes:");
+            if let Some(all_notes) = notes_map.get(&row.expect("row mode")) {
+                for note in newest_status_notes(all_notes) {
+                    outln!("- {}", note.text);
+                }
+            }
         }
     }
     Ok(())
@@ -1036,6 +1048,23 @@ mod tests {
             note_cell(Some(two_lines)),
             "transport: connection error. (at…"
         );
+    }
+
+    #[test]
+    fn status_display_keeps_only_the_newest_twenty_notes() {
+        let notes: Vec<DispatchNote> = (0..21)
+            .map(|id| DispatchNote {
+                id,
+                dispatch_id: 7,
+                created_at_ms: id,
+                text: format!("note-{id}"),
+            })
+            .collect();
+        let shown = newest_status_notes(&notes);
+        assert_eq!(shown.len(), 20);
+        assert_eq!(shown.first().map(|n| n.id), Some(1));
+        assert_eq!(shown.last().map(|n| n.id), Some(20));
+        assert_eq!(notes.len(), 21);
     }
 
     #[test]
