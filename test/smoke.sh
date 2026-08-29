@@ -1225,6 +1225,8 @@ sopen_ok=1
 [[ $sopen_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sopen_out" || sopen_ok=0
 check "session open without a daemon exits 1 with a clear message" \
   "[[ $sopen_ok -eq 1 ]]"
+check "session fork help is available in an isolated state" \
+  "'$SZ' session fork --help | grep -q -- '--fork-worktree'"
 # THE-76: `session close` shares that same connect path, `session list --live`
 # degrades identically in both modes, and `session open`'s offline refusals
 # (stage lookup, clap conflict, empty-prompt-with-headless) are answerable
