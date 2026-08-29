@@ -164,8 +164,8 @@ sidebar_icon_status = ""
 # focused chrome edge. Unfocused frames use `colors.border`.
 [theme]
 # Named palette preset: "prism" (default), "storm", "light", "abyss", "ember",
-# "aurora". Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues]
-# overrides apply on top.
+# "aurora", or a local theme name from $XDG_CONFIG_HOME/thegn/themes.
+# Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues] overrides apply on top.
 preset = "prism"
 accent = "#6ee7d8"
 focus_border = "#6ee7d8"
