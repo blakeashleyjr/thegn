@@ -12,7 +12,6 @@
 
 agent_configs.rs
 agent_run.rs
-chime.rs
 clipboard.rs
 cmd/debug.rs
 daemon/mod.rs
