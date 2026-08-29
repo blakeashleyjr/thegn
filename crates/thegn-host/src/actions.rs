@@ -1504,4 +1504,40 @@ mod tests {
             crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Dismiss)
         );
     }
+
+    #[test]
+    fn review_identity_uses_local_branch_when_remote_head_name_differs() {
+        let mut panel = crate::panel::PanelData {
+            branch: "local/topic".into(),
+            pr: Some(crate::panel::PrSummary {
+                number: 27,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/widget/pull/27".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            pr_head_oid: "head-27".into(),
+            ..Default::default()
+        };
+        let local_snapshot = thegn_core::review::PrReviewSnapshot {
+            branch: "local/topic".into(),
+            pr_number: 27,
+            head_oid: "head-27".into(),
+            ..Default::default()
+        };
+        assert!(review_snapshot_matches_panel(&panel, &local_snapshot));
+
+        // A provider's remote head ref is not the local cache identity and is
+        // rejected rather than being silently attached to this checkout.
+        panel.branch = "local/topic".into();
+        let remote_named_snapshot = thegn_core::review::PrReviewSnapshot {
+            branch: "fork/topic".into(),
+            ..local_snapshot
+        };
+        assert!(!review_snapshot_matches_panel(
+            &panel,
+            &remote_named_snapshot
+        ));
+    }
 }
