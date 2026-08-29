@@ -10524,10 +10524,10 @@ async fn event_loop<T: Terminal>(
                 want_model_refresh: &mut want_model_refresh,
                 dirty: &mut dirty,
                 loop_perf: &mut loop_perf,
-                // Reap a tab whose worktree an `on_landed = remove/detach` land deleted.
-                session: &mut session,
-                panes: &mut panes,
-                need_relayout: &mut need_relayout,
+                // Probe a tab whose worktree an `on_landed = remove/detach`
+                // land deleted; the typed result returns through refresh_rx.
+                session: &session,
+                waker: &waker,
             };
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
             crate::handlers::merge_queue::drain_drive_msgs(&mut drive_rx, &mut mq_ctx);
@@ -10655,6 +10655,18 @@ async fn event_loop<T: Terminal>(
                                 ),
                             );
                         }
+                    }
+                }
+                RefreshKind::VanishedTabs(result) => {
+                    if crate::merge_lifecycle::apply_vanished_tabs(
+                        &mut session,
+                        &mut panes,
+                        &result.paths,
+                    ) {
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                        dirty = true;
+                        want_model_refresh = true;
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
@@ -10896,12 +10908,8 @@ async fn event_loop<T: Terminal>(
             // speculative-create window), and reaping on a missing dir would kill
             // the pane mid-create. Creations are short-lived, so a ghost simply
             // waits for the next tick after they settle.
-            if creating_tabs.is_empty()
-                && crate::merge_lifecycle::reconcile_removed_tabs(&mut session, &mut panes)
-            {
-                refresh_tab_model(&mut model, &session, &mut sb);
-                need_relayout = true;
-                dirty = true;
+            if creating_tabs.is_empty() {
+                crate::merge_lifecycle::spawn_reconcile_removed_tabs(&session, Some(waker.clone()));
             }
             crate::agent_output::publish(
                 &session,
