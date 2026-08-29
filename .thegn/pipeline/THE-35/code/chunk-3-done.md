@@ -42,7 +42,7 @@ Commits:
 - The exact `cargo nextest run -p thegn-core config_example` filter matched
   no tests in this checkout; the explicit `--test config_example` invocation
   passed both integration tests.
-- `bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\\.ok\\(\\);' crates`
+- `bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates`
   reports the sibling-owned `crates/thegn-host/src/notification_sound.rs`.
   This chunk leaves that implementation and the ratchet allowlist untouched.
 - No full-workspace `just test`, `just ci`, coverage, or e2e run was performed,
