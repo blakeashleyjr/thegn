@@ -507,6 +507,7 @@ pub fn spawn_worktree_destroy(
                 &worktree.to_string_lossy(),
             );
         }
+        release_destroy_path(&worktree);
         complete(
             LifecycleCompletion::WorktreeDelete {
                 group_name,
@@ -532,6 +533,31 @@ pub fn spawn_workspace_destroy(
     std::thread::spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let db = Db::open().ok();
+        let mut candidates = paths;
+        if let Some(db) = db.as_ref() {
+            candidates.extend(crate::handlers::workspace_remove::workspace_worktree_dirs(
+                db,
+                &repo_root.to_string_lossy(),
+            ));
+        }
+        candidates.sort();
+        candidates.dedup();
+        let had_candidates = !candidates.is_empty();
+        let paths: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| try_claim_destroy_path(Path::new(path)))
+            .collect();
+        if had_candidates && paths.is_empty() {
+            complete(
+                LifecycleCompletion::WorkspaceDeleteFinished {
+                    repo_path: repo_root.to_string_lossy().into_owned(),
+                    slug,
+                    failed_paths: vec!["all worktrees are already being deleted".into()],
+                },
+                waker,
+            );
+            return;
+        }
         let mut failed_paths = Vec::new();
         for path in paths {
             let branch = thegn_core::util::git_out(
@@ -559,6 +585,7 @@ pub fn spawn_workspace_destroy(
                     &path,
                 );
             }
+            release_destroy_path(Path::new(&path));
             complete(
                 LifecycleCompletion::WorkspaceDelete {
                     repo_path: repo_root.to_string_lossy().into_owned(),
@@ -862,9 +889,31 @@ pub fn create_failure_with_add_state(
 }
 
 static SESSION_LATCHES: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+static DESTROY_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 fn session_latches() -> &'static Mutex<HashSet<(String, String)>> {
     SESSION_LATCHES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn destroy_claims() -> &'static Mutex<HashSet<PathBuf>> {
+    DESTROY_CLAIMS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Atomically claim one physical worktree path for teardown. The same claim is
+/// shared by sidebar and workspace deletion so overlapping requests cannot run
+/// destroy hooks or git removal twice.
+pub(crate) fn try_claim_destroy_path(path: &Path) -> bool {
+    destroy_claims()
+        .lock()
+        .expect("destroy claim mutex poisoned")
+        .insert(path.to_path_buf())
+}
+
+fn release_destroy_path(path: &Path) {
+    destroy_claims()
+        .lock()
+        .expect("destroy claim mutex poisoned")
+        .remove(path);
 }
 
 /// Schedule `session_start` once for the current host session and worktree.
@@ -964,6 +1013,7 @@ fn end_session_before_destroy(
 pub fn session_end_after_pane_exit(
     cfg: &Config,
     session: &crate::session::Session,
+    panes: &crate::panes::Panes,
     exited_pane: u32,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) {
@@ -980,7 +1030,7 @@ pub fn session_end_after_pane_exit(
                 tab.center
                     .pane_ids()
                     .into_iter()
-                    .any(|id| id != exited_pane)
+                    .any(|id| id != exited_pane && panes.table.contains_key(&id))
             });
             if !other_live {
                 session_end_once(cfg, Path::new(&group.path), waker);
@@ -1097,6 +1147,20 @@ mod tests {
         assert_eq!(mode_for_user(false, false), HookExecutionMode::User);
         assert_eq!(mode_for_user(true, false), HookExecutionMode::Force);
         assert_eq!(mode_for_user(false, true), HookExecutionMode::Unattended);
+    }
+
+    #[test]
+    fn duplicate_destroy_requests_share_one_path_claim() {
+        let path = std::env::temp_dir().join(format!(
+            "tg-lifecycle-destroy-claim-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        assert!(try_claim_destroy_path(&path));
+        assert!(!try_claim_destroy_path(&path));
+        release_destroy_path(&path);
+        assert!(try_claim_destroy_path(&path));
+        release_destroy_path(&path);
     }
 
     #[test]

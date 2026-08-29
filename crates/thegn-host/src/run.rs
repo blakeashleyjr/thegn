@@ -1830,7 +1830,7 @@ pub(crate) fn delete_groups_with_mode(
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
-    let (mut deleted, mut skipped) = (0usize, 0usize);
+    let (mut deleted, mut skipped, mut already_deleting) = (0usize, 0usize, 0usize);
     for gi in targets {
         if gi >= session.worktrees.len() {
             continue;
@@ -1841,6 +1841,10 @@ pub(crate) fn delete_groups_with_mode(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
+            if !crate::worktree_lifecycle::try_claim_destroy_path(Path::new(&path)) {
+                already_deleting += 1;
+                continue;
+            }
             let group_name = session.worktrees[gi].name.clone();
             crate::worktree_lifecycle::spawn_worktree_destroy(
                 PathBuf::from(&path),
@@ -1858,6 +1862,9 @@ pub(crate) fn delete_groups_with_mode(
     let mut status = format!("Deleting {deleted} worktree(s) from disk…");
     if skipped > 0 {
         status.push_str(" (home checkout skipped)");
+    }
+    if already_deleting > 0 {
+        status.push_str(&format!(" ({already_deleting} already deleting)"));
     }
     status
 }
@@ -5510,6 +5517,16 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     let snap = session.layout_snapshot(&session.id, now_secs());
     crate::db_task::persist(move |db| {
         let _ = crate::session::Session::write_layout(db, &snap); // best-effort: cache write: the DB is a cache; the layout rows are resurrection state
+    });
+}
+
+/// Persist a layout from a loop-side reconciliation without probing live pane
+/// state. Close/delete handlers must not perform even `/proc` reads; the
+/// cached pane hints are sufficient for this best-effort cache write.
+pub(crate) fn persist_session_layout_cached(session: &crate::session::Session) {
+    let snap = session.layout_snapshot(&session.id, now_secs());
+    crate::db_task::persist(move |db| {
+        let _ = crate::session::Session::write_layout(db, &snap);
     });
 }
 
