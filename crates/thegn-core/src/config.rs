@@ -6290,8 +6290,19 @@ impl Config {
     /// uses this. Extension tokens a legacy preset leaves empty are derived
     /// last, so derivations follow any user-overridden base colors.
     pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
-        crate::theme_resolve::palette_with_config(
+        self.palette_with_user_themes(preset, &[])
+    }
+
+    /// Resolve a named built-in or loaded user theme, then apply this config's
+    /// overrides. Built-in names take precedence over user-theme collisions.
+    pub fn palette_with_user_themes(
+        &self,
+        preset: &str,
+        user_themes: &[crate::theme_user::UserTheme],
+    ) -> crate::theme::Palette {
+        crate::theme_resolve::palette_with_catalog(
             preset,
+            user_themes,
             &self.theme.colors,
             &self.theme.hues,
             &self.theme.accent,
