@@ -49,6 +49,38 @@ pub struct ControlClient {
     addr: ControlAddr,
 }
 
+/// An HTTP response rejected by the control API.
+///
+/// Keep the status alongside the server's message so callers that have a
+/// narrow, protocol-defined recovery (for example, a session disappearing
+/// after selection) do not have to classify an error by matching display text.
+#[derive(Debug)]
+pub struct ControlRequestError {
+    status: u16,
+    message: String,
+}
+
+impl ControlRequestError {
+    pub fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
+impl std::fmt::Display for ControlRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (http {})", self.message, self.status)
+    }
+}
+
+impl std::error::Error for ControlRequestError {}
+
 /// Control messages for an attached session stream.
 pub enum AttachControl {
     Input(Vec<u8>),
@@ -103,7 +135,7 @@ impl ControlClient {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("control request failed");
-            Err(anyhow!("{msg} (http {status})"))
+            Err(anyhow::Error::new(ControlRequestError::new(status, msg)))
         }
     }
 

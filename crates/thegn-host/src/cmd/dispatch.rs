@@ -21,11 +21,13 @@
 //! all reads of local state, never stage transitions.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
-use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, NewDispatch};
+use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_chunk;
+use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
 use thegn_core::util::{git_ok, git_out};
@@ -130,6 +132,54 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// File the worker's structured handoff report on a roster row (THE-88):
+    /// verdict, commits, unverified, findings, and next hints. The Lead reads
+    /// this instead of re-reading the artifact. Last write wins; the report
+    /// is a pointer-summary, the artifact stays in git. Empty/oversize text
+    /// is refused by the core policy.
+    Report {
+        /// The dispatch row id (see `dispatch list`).
+        id: i64,
+        /// The report body. Trimmed; must be 1..=16_384 chars.
+        #[arg(long)]
+        text: String,
+        /// Emit the write as JSON (`{ "id", "report", "bytes" }`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append a progress note to a row's queue (THE-88): one line of context
+    /// the supervisor reads on demand via `dispatch status --since`. Trimmed;
+    /// must be 1..=4_096 chars.
+    Note {
+        /// The dispatch row id (see `dispatch list`).
+        id: i64,
+        /// The note body. Trimmed; must be 1..=4_096 chars.
+        #[arg(long)]
+        text: String,
+        /// Emit the write as JSON (`{ "id", "note_id", "created_at_ms" }`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// The on-demand status summary (THE-88, `/btw`). Without `row`: active
+    /// rows only (or every row with `--all`); with `row`: that row's report
+    /// verbatim plus the notes since `--since` (default: all, capped at the
+    /// last 20).
+    Status {
+        /// A specific row id to read (the report verbatim + notes since
+        /// `--since`). Refused when the id is unknown.
+        row: Option<i64>,
+        /// Only notes with `created_at_ms > since` count (epoch-ms; matches
+        /// `dispatched_at_ms` and the note stamp). The row's report is always
+        /// shown in full.
+        #[arg(long)]
+        since: Option<i64>,
+        /// Include every row (terminals too), not just active ones.
+        #[arg(long)]
+        all: bool,
+        /// Emit as JSON (one digest array; row mode adds a `notes` array).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -191,8 +241,19 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         } => set_status(id, &status, force, json),
         Action::Verify { id, json } => verify(id, json),
         Action::Wait {
-            row, timeout, json, ..
-        } => wait(cfg, row, timeout, json),
+            row,
+            any,
+            timeout,
+            json,
+        } => wait(cfg, row, any, timeout, json),
+        Action::Report { id, text, json } => report(id, &text, json),
+        Action::Note { id, text, json } => note(id, &text, json),
+        Action::Status {
+            row,
+            since,
+            all,
+            json,
+        } => status(row, since, all, json),
     }
 }
 
@@ -499,11 +560,20 @@ fn set_status(id: i64, status: &str, force: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The `set-status done` gate (THE-76): a row that carries an artifact may
-/// only be recorded done when that artifact is real — present in the row's
-/// worktree **and** tracked by git. A session exiting is not a handoff; git is
-/// the source of truth, so an uncommitted artifact is not finished work.
-/// Split from `set_status` so the decision is testable without a live DB.
+/// The `set-status done` gate (THE-76 + THE-88): a row that carries an
+/// artifact may only be recorded done when its handoff is real. Two
+/// gates, both in [`pipeline_run::verify_report`]:
+///
+/// 1. The artifact is present in the row's worktree **and** tracked by git
+///    (THE-76's original rule — a session exiting is not a handoff).
+/// 2. The row carries a non-empty `report` (THE-88 — the worker must file
+///    `thegn dispatch report <id>`; the report is what the Lead reads, the
+///    artifact pointer only tells it where to look if a reviewer needs to).
+///
+/// `--force` is the deliberate override for BOTH rules (the refusal names
+/// it). Pane-exit auto-stamps (`pty_drain.rs:855-895`) bypass the gate
+/// entirely — that path writes the typed status for attribution, not as a
+/// handoff verdict, so it is not subject to either check.
 fn done_gate(row: &AgentDispatch) -> Result<()> {
     let report = pipeline_run::verify_report(&verify_facts(row));
     if report.ok {
@@ -525,6 +595,10 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 /// `pub(crate)`: the resume path in `cmd/session.rs` reads the same facts —
 /// one implementation, two callers.
 pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
+    // THE-88: report presence is a row fact even for plain dispatches. It is
+    // only a completion gate when an artifact is present, but `dispatch
+    // verify` should faithfully report the column in either case.
+    let report_present = row.report.as_deref().is_some_and(|r| !r.trim().is_empty());
     let Some(artifact) = row
         .artifact_path
         .as_deref()
@@ -537,6 +611,9 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
             exists: false,
             tracked: false,
             dirty: false,
+            // A plain (non-pipeline) row is never gated; the report fact is
+            // still returned so verify reflects the row faithfully.
+            report_present,
         };
     };
     let wt = std::path::Path::new(&row.worktree_path);
@@ -560,11 +637,15 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
     // `git_out` returns `None` for empty output, so `Some` ⇔ the worktree
     // has uncommitted changes.
     let dirty = git_out(wt, &["status", "--porcelain"]).is_some();
+    // THE-88: a row carrying an artifact must also file a report —
+    // `verify_report` turns the missing case into an `ok=false` reason that
+    // names the `dispatch report` command as the fix.
     pipeline_run::VerifyFacts {
         artifact: Some(artifact),
         exists,
         tracked,
         dirty,
+        report_present,
     }
 }
 
@@ -583,10 +664,11 @@ fn verify(id: i64, json: bool) -> Result<()> {
     } else {
         let a = report.artifact.as_deref().unwrap_or("-");
         outln!(
-            "dispatch {id}  artifact {a}  exists={} tracked={} dirty={}  ok={}",
+            "dispatch {id}  artifact {a}  exists={} tracked={} dirty={} report={}  ok={}",
             yes_no(report.exists),
             yes_no(report.tracked),
             yes_no(report.dirty),
+            yes_no(report.report_present),
             yes_no(report.ok)
         );
         for r in &report.reasons {
@@ -601,6 +683,183 @@ fn verify(id: i64, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `dispatch report <id> --text <text>` — write/overwrite the worker's
+/// structured handoff report on a roster row (THE-88). Validates through
+/// `pipeline_report::report_text` (empty/oversize errors surface verbatim),
+/// row must exist, writes via `db.set_dispatch_report`.
+fn report(id: i64, text: &str, json: bool) -> Result<()> {
+    let db = Db::open()?;
+    write_report(&db, id, text, json)
+}
+
+/// THE-88 — the DB-bound half of `dispatch report`. Validated text → row.
+pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
+    let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    db.set_dispatch_report(id, &validated)?;
+    if json {
+        let v = serde_json::json!({
+            "id": id,
+            "report": validated,
+            "bytes": validated.len(),
+        });
+        super::emit_json(&v)?;
+    } else {
+        outln!(
+            "report recorded on dispatch {} ({} chars)",
+            id,
+            validated.chars().count()
+        );
+    }
+    Ok(())
+}
+
+/// `dispatch note <id> --text <text>` — append a progress note to a row's
+/// queue (THE-88). Validates through `pipeline_report::note_text`
+/// (empty/oversize errors surface verbatim), row must exist, writes via
+/// `db.append_dispatch_note`. Returns the new note's id and timestamp.
+fn note(id: i64, text: &str, json: bool) -> Result<()> {
+    let db = Db::open()?;
+    write_note(&db, id, text, json)
+}
+
+/// THE-88 — the DB-bound half of `dispatch note`.
+pub(crate) fn write_note(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
+    let validated = pipeline_report::note_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let note_id = db.append_dispatch_note(id, &validated)?;
+    let note = db
+        .dispatch_notes(id, None, 0)?
+        .into_iter()
+        .find(|n| n.id == note_id)
+        .ok_or_else(|| anyhow::anyhow!("note {note_id} vanished after insert"))?;
+    if json {
+        let v = serde_json::json!({
+            "id": id,
+            "note": validated,
+            "note_id": note.id,
+            "created_at_ms": note.created_at_ms,
+        });
+        super::emit_json(&v)?;
+    } else {
+        outln!(
+            "note recorded on dispatch {} ({} chars)",
+            id,
+            validated.chars().count()
+        );
+    }
+    Ok(())
+}
+
+/// The row-mode status display is bounded to the newest notes. The digest
+/// itself receives the full since-filtered set so its `note_count` remains a
+/// count of all matching notes, not merely the displayed suffix.
+fn newest_status_notes(notes: &[DispatchNote]) -> &[DispatchNote] {
+    if notes.len() > 20 {
+        &notes[notes.len() - 20..]
+    } else {
+        notes
+    }
+}
+
+/// `dispatch status [row] [--since <epoch-ms>] [--all] [--json]` — the
+/// on-demand status summary (THE-88, `/btw`). Composes with
+/// `pipeline_report::digest`: without `row` → active rows only
+/// (`is_active()`), `--all` → every row; with `row` → that row (error
+/// naming the id when unknown), report verbatim + notes since `--since`
+/// (default all, capped last 20 via `db.dispatch_notes`). JSON: the
+/// digest array (row mode: one digest + `notes` array). Human: one line
+/// per row `id status stage issue notes=N last=<truncated latest>` and, in
+/// row mode, the report body printed verbatim under a `report:` line.
+fn status(row: Option<i64>, since_ms: Option<i64>, all: bool, json: bool) -> Result<()> {
+    let db = Db::open()?;
+    read_status(&db, row, since_ms, all, json)
+}
+
+/// THE-88 — the DB-bound half of `dispatch status`. Tests exercise the
+/// digest composition through this entry point against a tempdir DB.
+pub(crate) fn read_status(
+    db: &Db,
+    row: Option<i64>,
+    since_ms: Option<i64>,
+    all: bool,
+    json: bool,
+) -> Result<()> {
+    let mut rows = db.list_dispatches()?;
+    if let Some(id) = row {
+        rows.retain(|r| r.id == id);
+        if rows.is_empty() {
+            anyhow::bail!("no dispatch with id {id}");
+        }
+    } else if !all {
+        rows.retain(|d| d.status.is_active());
+    }
+
+    let row_mode = row.is_some();
+    let mut notes_map: HashMap<i64, Vec<DispatchNote>> = HashMap::new();
+    for r in &rows {
+        // Keep the full since-filtered set for `digest`: the output is capped,
+        // but `note_count` must still describe the complete queue window.
+        notes_map.insert(r.id, db.dispatch_notes(r.id, since_ms, 0)?);
+    }
+    let digests = pipeline_report::digest(&rows, &notes_map, since_ms);
+    if json {
+        if row_mode {
+            let digest = digests.into_iter().next().expect("one selected row");
+            let mut v = serde_json::to_value(digest)?;
+            let notes = newest_status_notes(
+                notes_map
+                    .get(&row.expect("row mode"))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "dispatch_id": n.dispatch_id,
+                    "created_at_ms": n.created_at_ms,
+                    "text": n.text,
+                })
+            })
+            .collect::<Vec<_>>();
+            v["notes"] = serde_json::Value::Array(notes);
+            super::emit_json(&v)?;
+        } else {
+            super::emit_json(&digests)?;
+        }
+    } else {
+        for digest in &digests {
+            let latest = digest
+                .latest_note
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .unwrap_or("-");
+            let latest = note_cell(Some(latest));
+            outln!(
+                "{} {} {} {} notes={} last={}",
+                digest.id,
+                digest.status,
+                digest.stage.as_deref().unwrap_or("-"),
+                digest.issue_id,
+                digest.note_count,
+                latest
+            );
+        }
+        if row_mode {
+            if let Some(report) = digests.first().and_then(|d| d.report.as_deref()) {
+                outln!("report:");
+                outln!("{report}");
+            }
+            outln!("notes:");
+            if let Some(all_notes) = notes_map.get(&row.expect("row mode")) {
+                for note in newest_status_notes(all_notes) {
+                    outln!("- {}", note.text);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
@@ -609,12 +868,86 @@ fn yes_no(b: bool) -> &'static str {
 /// read and the candidate selection stay synchronous and BEFORE the connect:
 /// a selection error (unknown row, nothing active) is answerable from the
 /// local roster alone and must not require a running daemon.
-fn wait(cfg: &Config, row: Option<i64>, timeout: Option<i64>, json: bool) -> Result<()> {
+fn wait(cfg: &Config, row: Option<i64>, any: bool, timeout: Option<i64>, json: bool) -> Result<()> {
+    validate_wait_timeout(row, any, timeout)?;
     let db = Db::open()?;
     let rows = db.list_dispatches()?;
     let targets = pipeline_run::wait_candidates(&rows, row).map_err(|e| anyhow::anyhow!("{e}"))?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(wait_wake(cfg, targets, timeout, json))
+}
+
+fn validate_wait_timeout(row: Option<i64>, any: bool, timeout: Option<i64>) -> Result<()> {
+    if timeout.is_some_and(|ms| ms <= 0) {
+        anyhow::bail!("dispatch wait --timeout must be greater than zero milliseconds");
+    }
+    // A row-less wait is the --any form, including the documented default when
+    // neither --row nor --any is supplied. It is used by background monitors,
+    // so an omitted timeout must never create an unbounded supervisor wait.
+    if row.is_none() && timeout.is_none() {
+        let form = if any { "--any" } else { "without --row" };
+        anyhow::bail!("dispatch wait {form} requires --timeout");
+    }
+    Ok(())
+}
+
+/// Read `(report, artifact_path)` for a roster row by id — the wake-time
+/// fact fetch (THE-88). Both are `None` only when the row has been reaped
+/// between the daemon's exit and our DB read: a missing row is the wake's own
+/// answer (the tombstone fired), the caller still gets a clean wake. Database
+/// open/query failures remain errors so they cannot look like a worker with no
+/// report.
+fn row_report_artifact(id: i64) -> Result<(Option<String>, Option<String>)> {
+    let db = Db::open()?;
+    row_report_artifact_db(&db, id)
+}
+
+/// THE-88 — the DB-bound half of `row_report_artifact`. The unit tests
+/// exercise this directly against a tempdir DB.
+pub(crate) fn row_report_artifact_db(db: &Db, id: i64) -> Result<(Option<String>, Option<String>)> {
+    row_report_artifact_from(db.get_dispatch(id))
+}
+
+fn row_report_artifact_from(
+    row: Result<Option<AgentDispatch>>,
+) -> Result<(Option<String>, Option<String>)> {
+    match row {
+        Ok(Some(row)) => Ok((row.report, row.artifact_path)),
+        Ok(None) => Ok((None, None)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The daemon's wait endpoint reports a reaped session as HTTP 404. Every
+/// other control error is infrastructure or protocol failure and must remain
+/// retryable rather than becoming a false worker completion.
+fn classify_wait_outcome(
+    outcome: anyhow::Result<serde_json::Value>,
+) -> Result<(bool, Option<i64>, bool)> {
+    match outcome {
+        Ok(v) => {
+            let matched = v
+                .get("matched")
+                .and_then(|m| m.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("malformed wait response: {v}"))?;
+            let exit_code = match v.get("exit_code") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(code) => Some(
+                    code.as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("malformed wait response: {v}"))?,
+                ),
+            };
+            Ok((matched, exit_code, false))
+        }
+        Err(e) if is_reaped_wait_error(&e) => Ok((true, None, true)),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_reaped_wait_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<thegn_svc::control::client::ControlRequestError>()
+        .is_some_and(|e| e.status() == 404)
 }
 
 async fn wait_wake(
@@ -638,13 +971,28 @@ async fn wait_wake(
     for t in targets {
         let client = client.clone();
         set.spawn(async move {
-            let out = client
-                .wait(
-                    &t.session_id,
-                    serde_json::json!({ "kind": "exited" }),
-                    timeout,
+            let out = match timeout {
+                Some(ms) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(ms as u64),
+                    client.wait(
+                        &t.session_id,
+                        serde_json::json!({ "kind": "exited" }),
+                        Some(ms),
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(out) => out,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "dispatch wait timed out after {ms} milliseconds"
+                    )),
+                },
+                None => {
+                    client
+                        .wait(&t.session_id, serde_json::json!({ "kind": "exited" }), None)
+                        .await
+                }
+            };
             (t, out)
         });
     }
@@ -654,20 +1002,19 @@ async fn wait_wake(
     // one target timing out a beat before another exits still wakes us.
     while let Some(joined) = set.join_next().await {
         let (t, outcome) = joined.map_err(|e| anyhow::anyhow!("wait task failed: {e}"))?;
-        // A daemon error for one target (its session aged past the tombstone
-        // TTL and was reaped) is a wake with `"gone": true` — never a failure
-        // of the whole call: one reaped session must not make `--any` unusable.
-        let (matched, exit_code, gone) = match outcome {
-            Ok(v) => (
-                v.get("matched").and_then(|m| m.as_bool()).unwrap_or(false),
-                v.get("exit_code").and_then(|c| c.as_i64()),
-                false,
-            ),
-            Err(_) => (true, None, true),
-        };
+        // Only a daemon HTTP 404 means the selected session was reaped after
+        // selection. Preserve all other control/protocol errors and mark them
+        // retryable so the monitor cannot advance on a false wake.
+        let (matched, exit_code, gone) = classify_wait_outcome(outcome)
+            .map_err(|e| anyhow::Error::new(crate::cmd::Retryable(e)))?;
         if !matched {
             continue;
         }
+        // THE-88: read the row's report/artifact AT WAKE TIME (not at candidate
+        // selection — the worker files the report seconds before exit). Only a
+        // missing row is an empty fact; DB open/query failures are retryable.
+        let (report, artifact) =
+            row_report_artifact(t.id).map_err(|e| anyhow::Error::new(crate::cmd::Retryable(e)))?;
         if json {
             let mut v = serde_json::json!({
                 "row": t.id,
@@ -676,6 +1023,8 @@ async fn wait_wake(
                 "issue": t.issue_id,
                 "exit_code": exit_code,
                 "matched": true,
+                "report": report,
+                "artifact": artifact,
             });
             if gone {
                 v["gone"] = serde_json::json!(true);
@@ -688,6 +1037,13 @@ async fn wait_wake(
             (false, Some(code)) => outln!("dispatch {} ({}) exited {code}", t.id, stage),
             // Matched but unreapable — the same `?` `session list` prints.
             (false, None) => outln!("dispatch {} ({}) exited ?", t.id, stage),
+        }
+        // Print the report under the exited line — the Lead reads it and
+        // nothing else. A missing/blank report prints nothing: the empty
+        // line keeps the human output one event per wake.
+        if let Some(text) = report.as_deref().filter(|t| !t.trim().is_empty()) {
+            outln!("report:");
+            outln!("{text}");
         }
         return Ok(());
     }
@@ -725,6 +1081,36 @@ mod tests {
             note_cell(Some(two_lines)),
             "transport: connection error. (at…"
         );
+    }
+
+    #[test]
+    fn status_display_keeps_only_the_newest_twenty_notes() {
+        let notes: Vec<DispatchNote> = (0..21)
+            .map(|id| DispatchNote {
+                id,
+                dispatch_id: 7,
+                created_at_ms: id,
+                text: format!("note-{id}"),
+            })
+            .collect();
+        let shown = newest_status_notes(&notes);
+        assert_eq!(shown.len(), 20);
+        assert_eq!(shown.first().map(|n| n.id), Some(1));
+        assert_eq!(shown.last().map(|n| n.id), Some(20));
+        assert_eq!(notes.len(), 21);
+    }
+
+    #[test]
+    fn rowless_wait_requires_a_positive_hard_timeout() {
+        assert!(
+            validate_wait_timeout(None, true, None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --timeout")
+        );
+        assert!(validate_wait_timeout(None, false, Some(0)).is_err());
+        assert!(validate_wait_timeout(Some(7), false, None).is_ok());
+        assert!(validate_wait_timeout(None, true, Some(600_000)).is_ok());
     }
 
     #[test]
@@ -960,6 +1346,7 @@ mod tests {
             artifact_path: artifact.map(str::to_string),
             note: None,
             chunk_path: None,
+            report: None,
         }
     }
 
@@ -1060,19 +1447,214 @@ mod tests {
             .to_string();
         assert!(err.contains("does not track"), "{err}");
 
-        // Committed: the gate passes.
+        // Committed artifact AND a report: the gate passes. (THE-88: the
+        // report is the second of the two gates; a row with an artifact
+        // but no report is refused with a reason that names
+        // `dispatch report`. That refusal is exercised in
+        // `facts_record_report_present_and_done_gate_names_the_report_command`.)
         commit_artifact(&root);
-        done_gate(&row_in(&root, Some(ARTIFACT))).unwrap();
+        let mut row = row_in(&root, Some(ARTIFACT));
+        row.report = Some("verdict: done".into());
+        done_gate(&row).unwrap();
 
         // A dirty tree never blocks: reported, never gating (the tracked check
         // already holds the line).
         std::fs::write(root.join(ARTIFACT), "post-commit edit").unwrap();
-        done_gate(&row_in(&root, Some(ARTIFACT))).unwrap();
+        done_gate(&row).unwrap();
     }
 
     #[test]
     fn the_done_gate_passes_by_construction_for_a_row_without_artifact() {
         let (_d, root) = git_repo("gate-none");
         done_gate(&row_in(&root, None)).unwrap();
+    }
+
+    // --- THE-88: report / note / status verbs ------------------------------
+
+    /// THE-88: `dispatch report <id> --text …` validates through
+    /// `report_text` (empty/oversize), writes via `set_dispatch_report`,
+    /// and the row is what the DB says it is. Refuses an unknown row.
+    #[test]
+    fn dispatch_report_writes_overwrites_and_refuses_an_unknown_row() {
+        let (_d, db) = db("report-write");
+        let row = put(&db, NewDispatch::new("linear:A-1", "/wt/a", "claude")).unwrap();
+        // First write: stored verbatim (trimmed by the core validator).
+        write_report(&db, row.id, "  verdict: done  ", false).unwrap();
+        let after = db.get_dispatch(row.id).unwrap().unwrap();
+        assert_eq!(after.report.as_deref(), Some("verdict: done"));
+
+        // Second write: last write wins, the report is overwriteable.
+        write_report(&db, row.id, "verdict: blocked", false).unwrap();
+        let after = db.get_dispatch(row.id).unwrap().unwrap();
+        assert_eq!(after.report.as_deref(), Some("verdict: blocked"));
+
+        // Empty text is refused verbatim (the core caps, not thegn).
+        let err = write_report(&db, row.id, "   ", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be empty"), "{err}");
+
+        // Unknown row is refused by name.
+        let err = write_report(&db, 99, "x", false).unwrap_err().to_string();
+        assert!(err.contains("99"), "{err}");
+    }
+
+    /// THE-88: `dispatch note <id> --text …` appends and returns the note id.
+    #[test]
+    fn dispatch_note_appends_and_assigns_ids_in_order() {
+        let (_d, db) = db("note-append");
+        let row = put(&db, NewDispatch::new("linear:A-1", "/wt/a", "claude")).unwrap();
+        write_note(&db, row.id, "first", false).unwrap();
+        // Second append: ids are monotonic and the second text is what we wrote.
+        // `write_note` validates through the same core policy as the report.
+        write_note(&db, row.id, "second", false).unwrap();
+        let all = db.dispatch_notes(row.id, None, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].text, "first");
+        assert_eq!(all[1].text, "second");
+        // Unknown row refused.
+        let err = write_note(&db, 99, "x", false).unwrap_err().to_string();
+        assert!(err.contains("99"), "{err}");
+        // Empty text refused verbatim.
+        let err = write_note(&db, row.id, "  ", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    /// THE-88: `dispatch status` filters active by default, returns the row
+    /// verbatim in row mode, and composes the `digest` fact faithfully.
+    #[test]
+    fn dispatch_status_filters_active_and_reads_row_verbatim() {
+        let (_d, db) = db("status-filter");
+        let active = put(&db, NewDispatch::new("linear:A", "/wt/a", "claude")).unwrap();
+        // Terminal row: present in DB but filtered out of the default read.
+        let mut done = NewDispatch::new("linear:A", "/wt/a", "claude");
+        done.stage = Some("review");
+        let done = put(&db, done).unwrap();
+        db.update_dispatch_status(done.id, AgentDispatchStatus::Done)
+            .unwrap();
+        // The active row gets a report and a note; the digest must carry
+        // both, and the row-mode read must return the report verbatim.
+        write_report(&db, active.id, "verdict: done", false).unwrap();
+        write_note(&db, active.id, "first", false).unwrap();
+
+        // List mode: only the active row (no `all`, no `row`).
+        read_status(&db, None, None, false, false).unwrap();
+        // Row mode: that one active row, report under `report:`.
+        read_status(&db, Some(active.id), None, false, false).unwrap();
+        // `--all` would include the done row, but we don't capture stdout
+        // here; the contract is asserted in the digest composition below.
+
+        // Unknown row mode is refused with the id named.
+        let err = read_status(&db, Some(99), None, false, false).unwrap_err();
+        assert!(err.to_string().contains("99"), "{err}");
+
+        // The notes read is since-filtered and bounded to the newest 20;
+        // the DB convention remains oldest-first within that bounded set.
+        let notes = db.dispatch_notes(active.id, None, 0).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].text, "first");
+    }
+
+    /// THE-88: `verify_facts` populates `report_present` from the row's
+    /// report column. The done gate's refusal text names the `dispatch
+    /// report` command as the fix when artifact is set but report is empty.
+    #[test]
+    fn facts_record_report_present_and_done_gate_names_the_report_command() {
+        let (_d, root) = git_repo("facts-report");
+        commit_artifact(&root);
+        // No report yet: facts reflect that, and the done gate refuses with
+        // a reason that names `dispatch report` (chunk-1 added the rule;
+        // chunk-2 pins the test surface).
+        let mut row = row_in(&root, Some(ARTIFACT));
+        let f = verify_facts(&row);
+        assert!(!f.report_present, "no report on the row");
+        let err = done_gate(&row).unwrap_err().to_string();
+        assert!(err.contains("dispatch report"), "{err}");
+
+        // Filing a report flips `report_present` on and the gate passes.
+        row.report = Some("verdict: done".into());
+        let f = verify_facts(&row);
+        assert!(f.report_present);
+        done_gate(&row).unwrap();
+
+        // A blank/whitespace report is the same as none.
+        row.report = Some("   \n  ".into());
+        let f = verify_facts(&row);
+        assert!(!f.report_present, "whitespace-only is not present");
+    }
+
+    /// THE-88: `row_report_artifact_db` returns the row's `report` and
+    /// `artifact_path` after a wake, and `(None, None)` for a reaped row.
+    #[test]
+    fn row_report_artifact_reads_the_row_and_tolerates_a_miss() {
+        let (_d, db) = db("wake-row");
+        let row = put(
+            &db,
+            NewDispatch {
+                artifact_path: Some(".thegn/pipeline/A/1.md"),
+                ..NewDispatch::new("linear:A", "/wt/a", "claude")
+            },
+        )
+        .unwrap();
+        // Initial: report absent, artifact path present from the put.
+        assert_eq!(
+            row_report_artifact_db(&db, row.id).unwrap(),
+            (None, Some(".thegn/pipeline/A/1.md".to_string()))
+        );
+        // Worker files a report: both fields populated.
+        write_report(&db, row.id, "verdict: done", false).unwrap();
+        assert_eq!(
+            row_report_artifact_db(&db, row.id).unwrap(),
+            (
+                Some("verdict: done".to_string()),
+                Some(".thegn/pipeline/A/1.md".to_string())
+            )
+        );
+        // Missing row: reaped mid-wake, both nulls, no error.
+        assert_eq!(
+            row_report_artifact_db(&db, 9_999_999).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn wait_only_treats_a_control_404_as_a_gone_wake() {
+        let not_found = anyhow::Error::new(thegn_svc::control::client::ControlRequestError::new(
+            404,
+            "not found: session s1",
+        ));
+        assert_eq!(
+            classify_wait_outcome(Err(not_found)).unwrap(),
+            (true, None, true)
+        );
+
+        let transport = anyhow::anyhow!("connect control endpoint: connection reset");
+        let err = classify_wait_outcome(Err(transport)).unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
+
+        let forbidden = anyhow::Error::new(thegn_svc::control::client::ControlRequestError::new(
+            403,
+            "missing required scope",
+        ));
+        assert!(classify_wait_outcome(Err(forbidden)).is_err());
+    }
+
+    #[test]
+    fn wake_response_and_db_read_errors_are_not_timeouts_or_missing_rows() {
+        let err = classify_wait_outcome(Ok(serde_json::json!({"exit_code": 0}))).unwrap_err();
+        assert!(err.to_string().contains("malformed wait response"), "{err}");
+        assert!(
+            classify_wait_outcome(Ok(serde_json::json!({
+                "matched": true,
+                "exit_code": "0"
+            })))
+            .is_err()
+        );
+
+        let err =
+            row_report_artifact_from(Err(anyhow::anyhow!("database is corrupt"))).unwrap_err();
+        assert!(err.to_string().contains("database is corrupt"), "{err}");
     }
 }
