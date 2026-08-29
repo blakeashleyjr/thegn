@@ -301,13 +301,13 @@ pub fn name() -> String {
 /// Holds the profile's advisory singleton lock for the process lifetime. The
 /// `flock` is tied to the open fd, so it auto-releases on `Drop` and on process
 /// death (incl. SIGKILL) — never a stale lock. `None` when the lock could not
-/// be taken (contended default profile, permissions quirk, Windows).
+/// be taken because of a permissions quirk or platform error.
 #[must_use = "the lock releases as soon as the guard is dropped"]
 pub struct SingletonGuard(#[allow(dead_code)] Option<std::fs::File>);
 
 /// Result of the startup singleton check.
 pub enum Singleton {
-    /// This process owns the profile (default profile always lands here).
+    /// This process owns the profile.
     Acquired(SingletonGuard),
     /// Another process already holds this profile's lock. **Advisory** — the
     /// caller warns but continues (per-profile DBs are separate files and
@@ -337,7 +337,11 @@ fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>>
 /// The active profile's singleton lock file (`<root>/run/thegn.lock`),
 /// creating the `run/` dir best-effort.
 fn singleton_lock_path() -> std::path::PathBuf {
-    let run = active().root.join("run");
+    singleton_lock_path_for(&active().root)
+}
+
+fn singleton_lock_path_for(root: &std::path::Path) -> std::path::PathBuf {
+    let run = root.join("run");
     let _ = std::fs::create_dir_all(&run); // best-effort: dir prep: a later write reports the real failure
     run.join("thegn.lock")
 }
@@ -345,10 +349,10 @@ fn singleton_lock_path() -> std::path::PathBuf {
 /// Acquire the active profile's advisory singleton lock at
 /// `<root>/run/thegn.lock`. One-shot non-blocking (never a poll loop — the
 /// 0%-idle contract). Every profile (incl. default) takes the lock so
-/// [`instance_running`] can detect a live compositor; contention on the
-/// **default** profile still returns `Acquired` silently (no warn, no refusal)
-/// — the lock was always advisory-only there and nested thegn launches must
-/// keep working exactly as before.
+/// [`instance_running`] can detect a live compositor. Contention remains
+/// advisory at the host boundary: the interactive caller warns for named
+/// profiles and continues, while the default profile remains silent so nested
+/// thegn launches keep working exactly as before.
 pub fn acquire_singleton() -> Singleton {
     match try_lock_nb(&singleton_lock_path()) {
         Ok(Some(file)) => {
@@ -358,18 +362,28 @@ pub fn acquire_singleton() -> Singleton {
             let _ = writeln!(&file, "{}", std::process::id());
             Singleton::Acquired(SingletonGuard(Some(file)))
         }
-        Ok(None) if active().is_default() => Singleton::Acquired(SingletonGuard(None)),
         Ok(None) => Singleton::AlreadyRunning,
         // A permissions quirk must never wedge the user out — degrade to running.
         Err(_) => Singleton::Acquired(SingletonGuard(None)),
     }
 }
 
+/// Is another thegn process holding `paths`' singleton lock (i.e. a live
+/// interactive compositor)? Probes the existing profile lock without keeping
+/// it. Errors fail closed because a migration must not delete source rows
+/// while an owner cannot safely be disproved.
+pub fn instance_running_at(paths: &ProfilePaths) -> bool {
+    match try_lock_nb(&singleton_lock_path_for(&paths.root)) {
+        Ok(Some(_)) => false,
+        Ok(None) | Err(_) => true,
+    }
+}
+
 /// Best-effort: is another thegn process holding this profile's singleton
-/// lock (i.e. a live interactive compositor)? Probes the lock without keeping
-/// it. `false` on any error — callers degrade to "no instance" (launch).
+/// lock? The migration caller uses the same probe in fail-closed mode through
+/// [`instance_running_at`].
 pub fn instance_running() -> bool {
-    matches!(try_lock_nb(&singleton_lock_path()), Ok(None))
+    instance_running_at(&active())
 }
 
 /// Argv to launch a fresh window for `profile` in a new terminal: the
@@ -697,6 +711,49 @@ mod tests {
         // Released on drop → acquirable again.
         assert!(try_lock_nb(&path).unwrap().is_some(), "lock frees on drop");
         std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn singleton_probe_detects_default_and_named_owners() {
+        for name in ["default", "work"] {
+            let root = std::env::temp_dir().join(format!(
+                "tg-profile-probe-{name}-{}-{}",
+                std::process::id(),
+                util::now()
+            ));
+            let paths = ProfilePaths {
+                name: name.to_string(),
+                root: root.clone(),
+            };
+            let lock_path = singleton_lock_path_for(&root);
+            let owner = try_lock_nb(&lock_path).unwrap().unwrap();
+            assert!(
+                instance_running_at(&paths),
+                "{name} owner must block a source migration"
+            );
+            drop(owner);
+            assert!(
+                !instance_running_at(&paths),
+                "{name} probe must clear when the owner exits"
+            );
+            let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
+        }
+    }
+
+    #[test]
+    fn singleton_probe_fails_closed_when_lock_state_is_unknown() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-profile-probe-error-{}-{}",
+            std::process::id(),
+            util::now()
+        ));
+        std::fs::write(&root, b"not a directory").unwrap();
+        let paths = ProfilePaths {
+            name: "default".into(),
+            root: root.clone(),
+        };
+        assert!(instance_running_at(&paths));
+        let _ = std::fs::remove_file(&root); // best-effort: test cleanup
     }
 
     #[test]

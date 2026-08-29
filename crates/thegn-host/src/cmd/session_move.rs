@@ -122,38 +122,32 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     let target = profile::resolve_active_target(&to_profile)?;
     let mut audit = MigrationAudit::new(&source.name, &target.name, &worktree, dry_run);
 
-    if profile::instance_running() {
-        return fail(
-            &mut audit,
-            json,
-            "the source profile has another interactive instance running",
-            false,
-        );
-    }
-
-    let source_db = if dry_run {
-        Db::open_read_only()
-            .context("open source profile database read-only")?
-            .ok_or_else(|| anyhow!("source profile database does not exist"))?
-    } else {
-        Db::open().context("open source profile database")?
-    };
-    let target_db_path = profile_db_path(&target, &profile::default_state_home());
-    let target_db = if dry_run {
-        Db::open_read_only_at(&target_db_path).with_context(|| {
-            format!(
-                "open target profile database read-only at {}",
-                target_db_path.display()
-            )
-        })?
-    } else {
-        Some(Db::open_at(&target_db_path).with_context(|| {
-            format!(
-                "open target profile database at {}",
-                target_db_path.display()
-            )
-        })?)
-    };
+    let (source_db, target_db_path, target_db) = with_source_instance_guard(&source, || {
+        let source_db = if dry_run {
+            Db::open_read_only()
+                .context("open source profile database read-only")?
+                .ok_or_else(|| anyhow!("source profile database does not exist"))?
+        } else {
+            Db::open().context("open source profile database")?
+        };
+        let target_db_path = profile_db_path(&target, &profile::default_state_home());
+        let target_db = if dry_run {
+            Db::open_read_only_at(&target_db_path).with_context(|| {
+                format!(
+                    "open target profile database read-only at {}",
+                    target_db_path.display()
+                )
+            })?
+        } else {
+            Some(Db::open_at(&target_db_path).with_context(|| {
+                format!(
+                    "open target profile database at {}",
+                    target_db_path.display()
+                )
+            })?)
+        };
+        Ok((source_db, target_db_path, target_db))
+    })?;
     let session = thegn_core::db::session();
     let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
     fill_bundle_audit(&mut audit, &bundle);
@@ -223,6 +217,19 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     )
     .await;
     report(&audit, json)
+}
+
+/// Check the source compositor's existing profile lock before opening either
+/// migration database. The closure is deliberately the only DB-open boundary
+/// so the no-race ordering is testable without touching a live state root.
+fn with_source_instance_guard<T>(
+    source: &ProfilePaths,
+    open_databases: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if profile::instance_running_at(source) {
+        bail!("the source profile has another interactive instance running");
+    }
+    open_databases()
 }
 
 fn fill_bundle_audit(audit: &mut MigrationAudit, bundle: &MigrationBundle) {
@@ -941,5 +948,38 @@ mod tests {
                 .unwrap()
                 .contains("carried unchanged")
         );
+    }
+
+    #[test]
+    fn source_owner_blocks_default_and_named_move_before_database_open() {
+        for name in ["default", "work"] {
+            let root = std::env::temp_dir().join(format!(
+                "tg-move-owner-{name}-{}-{}",
+                std::process::id(),
+                thegn_core::util::now()
+            ));
+            std::fs::create_dir_all(root.join("run")).unwrap();
+            let lock_path = root.join("run/thegn.lock");
+            let owner = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            owner.try_lock().unwrap();
+            let source = ProfilePaths {
+                name: name.into(),
+                root: root.clone(),
+            };
+            let mut database_opens = 0;
+            let result = with_source_instance_guard(&source, || {
+                database_opens += 1;
+                Ok::<_, anyhow::Error>(())
+            });
+            assert!(result.is_err(), "{name} owner must block migration");
+            assert_eq!(database_opens, 0, "{name} DBs must not open");
+            drop(owner);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
+        }
     }
 }
