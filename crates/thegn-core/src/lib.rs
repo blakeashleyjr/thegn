@@ -236,6 +236,7 @@ pub mod scan_sched;
 pub mod scheduler;
 pub mod seam;
 pub mod search;
+pub mod session_fork;
 // The value-free secret audit trail (target `thegn::secret::audit`).
 pub mod secret_audit;
 // Enumerate every configured secret reference in a Config (one source for the
