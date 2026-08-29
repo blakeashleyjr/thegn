@@ -2,129 +2,106 @@
 
 ## Context
 
-The config surface is unusually well-gated already: the Rust structs are the
-schema (`schemars`), strict validation walks the raw TOML in lockstep with that
-schema (`config_validate::validate_str` — unknown keys with nearest-key hints,
-`config_enum!` values, template placeholders, tz names), the example file is
-coverage-gated in both directions, and the help page is generated from the
-example. The branch already has tri-format repo parsing, profile loading,
-home-manager drift checks, and generated-page registration. The audit adds
-only the missing shared overlay walk, layer aggregation, shadow warning,
-diagnostic context, and generated-reference key assertion.
+The config surface already has a schemars schema, strict validation for the
+trusted TOML document, bidirectional example coverage, profile loading,
+tri-format repo parsing, trust clamping, home-manager drift checks, and
+runtime-generated config-reference registration. THE-38 adds the missing
+shared repo-overlay validation, shadow visibility, layer aggregation, source
+context, and generated-reference key assertion without adding a format
+selector or a new config key.
 
-## Format decision (THE-38's first question)
+## Format decision
 
-| Layer                              | Trust                | Format(s)                | Why                                                                  |
-| ---------------------------------- | -------------------- | ------------------------ | -------------------------------------------------------------------- |
-| defaults                           | code                 | —                        |                                                                      |
-| `config.toml` / `--config`         | user                 | TOML                     | one hand-edited file; the whole gate + write chain is TOML-native    |
-| `profiles/<name>/config.toml`      | user                 | TOML                     | same file shape, same chain                                          |
-| `THEGN_*` env / `--set`            | user                 | scalars / TOML fragments | `coerce_override_value` already parses bracketed TOML                |
-| repo `.thegn.{toml,yaml,yml,json}` | **repo (untrusted)** | TOML, YAML, JSON         | checked into other people's repos; meets their ecosystem where it is |
+| Layer                              | Trust           | Format(s)               | Contract                                    |
+| ---------------------------------- | --------------- | ----------------------- | ------------------------------------------- |
+| defaults                           | code            | —                       | Rust defaults                               |
+| `config.toml` / `--config`         | user            | TOML                    | `--config` changes the path, not the parser |
+| `profiles/<name>/config.toml`      | user            | TOML                    | active external profile overlay             |
+| `THEGN_*` / `--set`                | user            | values / TOML fragments | overlays, not document readers              |
+| repo `.thegn.{toml,yaml,yml,json}` | repo, untrusted | TOML, YAML, JSON        | TOML > YAML > YML > JSON                    |
 
-The asymmetry is a feature: format tolerance belongs at the layer whose author
-is _not_ the thegn user. Widening the trusted layers to JSON/YAML would need a
-multi-format `config set` (comment-preserving editing exists only for TOML), a
-multi-format example gate, multi-format live-reload watching, and hm-module
-changes — all to serve a file the user writes once. Rejected.
+Format tolerance belongs only at the repo edge. Trusted config writes,
+example coverage, runtime reference generation, home-manager output, and
+live reload are TOML-native; widening trusted readers would create parallel
+paths without a demonstrated need.
 
-## Validation across layers
+## Core validation substrate
 
-`validate_str` stays as-is for `Config`-shaped documents. Added in a new
-`thegn-core` sibling module plus the shared validator (pure, unit-testable):
+`crates/thegn-core/src/config_repo.rs` owns the repo candidate seam. Its
+`OverlayFormat` identifies TOML, YAML, or JSON; `discover_repo_overlay` returns
+all readable candidates in precedence order; `selected` is the winner and
+`shadowed` exposes the rest. The tolerant loader keeps the winner-only
+behavior: a malformed winner is ignored rather than falling through. A
+path-only shadow warning is deduplicated for repeated loads of the same
+candidate set.
 
-- `validate_repo_overlay_str(body: &str, format: OverlayFormat) -> Vec<String>`
-  — parses the body in its format to a format-neutral value
-  (`serde_json::Value` via the format adapters), then runs the same schema walk
-  against `schema_for!(RepoConfigFile)`. `RepoConfigFile` already derives
-  `JsonSchema`; expose a validation entry point rather than its internal
-  fields. The walk takes the schema root as a parameter instead of hard-coding
-  the `Config` schema.
-- The nearest-key hint, dotted type diagnostics, and map-valued-table tolerance
-  behave identically — they are properties of the walk, not of the `Config`
-  schema.
+`parse_overlay_value(body, format)` adapts each document to a
+`serde_json::Value`. `validate_repo_overlay(body, format)` returns structured
+`RepoOverlayDiagnostic` values, including the source format, dotted path, and
+message. It invokes the shared schema walker with the actual
+`RepoConfigFile` schema. `validate_str` remains the trusted `Config` entry
+point and retains its semantic checks. The walker reports syntax, unknown
+keys with nearest-key hints, expected/actual types, and enum problems while
+accepting intentionally dynamic maps and avoiding duplicate reports for
+legacy keys.
 
-Host side, `cmd/config.rs::validate` becomes a loop over located layers:
+The repo schema is the real `RepoConfigFile`: trust-clamped `[sandbox]`,
+`[keybinds]`, `[notifications]`, `[issues]`, the `env` selector, and the
+metrics detection/refusal table. No repo authority is widened by validation.
 
-1. main file (existing behaviour, message format unchanged for it),
-2. `Config::profile_overlay_path` when a non-default profile is active
-   (validated as a `Config`-shaped overlay — it is a full `Config` overlay),
-3. the repo overlay found from cwd (or `--repo <path>`), when present.
+## Host layer collection
 
-Each problem line is prefixed `<path>: ` so three files' reports don't blur;
-type failures include the dotted key. Exit is non-zero when any layer has
-problems; a missing layer is skipped silently (absence is normal, not a
-warning). `config get/set` add the effective config path as context without
-inventing key provenance.
+`crates/thegn-host/src/cmd/config_health.rs` owns synchronous filesystem and
+repository-path work. `collect` checks, in order:
 
-## Shadowed-overlay warning
+1. the selected main TOML;
+2. the active external profile TOML, when the non-default profile file exists;
+3. the selected repo candidate, when cwd or `--repo` resolves to a repository.
 
-`load_repo_overlay` / `repo_overlay_parse_error` currently `return` on the
-first existing extension. The new candidate seam records which candidates
-exist; when >1, `config_warn` names the winner and ignored files once per load.
-Warning text contains only file _paths_ (never file contents — the files are
-untrusted). The precedence order itself does not change.
+Each finding carries its owning path. Missing optional layers are silent.
+`config validate` renders findings and returns non-zero for strict problems;
+repo shadow notices remain warnings. `config get` and `config set` include the
+effective config path in relevant diagnostics while preserving typed JSON and
+atomic rollback.
 
-## Doctor line
+## Doctor health
 
-`cmd/doctor.rs` adds to the text report and the JSON document:
+Doctor consumes the same `ConfigHealth` collector rather than reimplementing
+validation. Text reports include main/profile/repo paths, problem and warning
+counts, and the follow-up `thegn config validate`. JSON places the same
+information under `config_health`, with `main_path`, `profile_path`,
+`repo_path`, `problem_count`, `warning_count`, `validate_command`, and per-layer
+`path`/`problems` objects. The bundle reuses that JSON. Doctor remains a
+synchronous diagnostic-only CLI path and does not alter exit policy.
 
-```
-"config_health": { "config": {"path": "...", "problems": <n>},
-                   "profile": {"path": "...", "problems": <n>} | null,
-                   "repo_overlay": {"path": "...", "problems": <n>} | null,
-                   "validate": "thegn config validate" }
-```
+## Documentation and ratchets
 
-Doctor reuses the same core validation functions; no second policy. It reads
-files only — no blocking additions to any event loop (doctor is a one-shot CLI
-command, off the compositor entirely). Render damage channels: none touched.
+Architecture §7 and the configuration help page describe trusted TOML-only
+layers, the active profile, repo precedence and tables, tolerant loading,
+strict validation, and example-value wording. No separate lenient validation
+flag is implied.
+No new action, help page, config key, capability, control-schema row, or
+ratchet entry is required. `config validate --repo` is a structural completion
+value slot, owned by clap path completion.
 
-## Docs
+The change does not touch render damage (`Skip`/`Panes`/`Full`), the compositor
+event loop, SQLite schema, or the canonical OpenSpec spec.
 
-`docs/help/configuration.md`: reconcile the two layer paragraphs (real table
-set: sandbox — clamped —, keybinds, notifications, issues, `env` selector,
-and metrics detection/refusal), drop `--strict` from all mentions, add
-multi-format precedence plus the shadow warning, and describe example values
-instead of code-default parity. The config-reference page remains generated;
-its key-coverage test is strengthened. Help ratchet: no new action ids, no
-new pages — the existing `configuration` page keeps its registration.
+## Alternatives and security
 
-## Alternatives considered
+- A lenient-by-default validation flag was rejected: validate is already the
+  explicit strict check, while loading remains tolerant.
+- Validating every overlay during launch was rejected: it adds startup work and
+  would conflict with the launch-never-blocked contract; doctor is the
+  opt-in health view.
+- A `[config] format` knob and trusted auto-detected YAML/JSON were rejected
+  because they would multiply the trusted write and gate paths.
 
-- **Add a real `--strict` flag (lenient by default)** to match the docs
-  instead of fixing the docs: rejected — `validate` exists to be the strict
-  check (lenient behaviour is what every _load_ already does); a lenient
-  validate validates nothing.
-- **Validate overlays on load** (warn at startup rather than via `validate`):
-  rejected for scope — load-time is tolerant by contract ("a launch is never
-  blocked by configuration"), and unknown-key scanning on every launch adds
-  cost to the startup path for a check the user runs deliberately. Doctor is
-  the middle ground.
-- **A `[config] format` knob or auto-detected `config.{yaml,json}`**: see
-  proposal Non-goals.
+Repo files are untrusted. Diagnostics echo paths and schema-derived hints, not
+file contents; shadow warnings are path-only. Existing trust clamping,
+metrics command-collector refusal, and secret handling remain unchanged.
 
-## Security
+## Deferred question
 
-- **No new write surface.** All additions are read-and-report.
-- **Untrusted input**: repo overlays are attacker-authored. Validation output
-  echoes key _paths_ and nearest-hint suggestions derived from the schema, not
-  raw file content; parse-error strings from serde are already surfaced today
-  via `repo_overlay_parse_error` and are length-bounded by the existing
-  `config_warn` path. The shadow warning prints paths only.
-- **No credential handling**: no keys in scope carry secrets; `SecretRef`
-  handling is unchanged.
-- **Sandbox implications**: none — the trust clamp
-  (`add-config-trust-resolution`) is untouched; this change never widens what
-  a repo overlay can set, it only reports on the files.
-- **Doctor JSON** may be piped to other tools; it includes paths and counts,
-  no file contents.
-
-## Open questions
-
-- Defaults-accuracy gate for the example's commented `# key = value` lines:
-  worth a heuristic pass (only lines whose value parses as the field's type
-  and differs from the schema default)? Deferred — noise risk until measured.
-- Should `config validate` also name layers it _skipped_ (no profile overlay,
-  no repo overlay) for discoverability? No: quiet absence is the Unix contract;
-  doctor reports only layers that exist.
+Whether commented example values should be compared heuristically with code
+defaults remains deferred because those values are intentionally illustrative.

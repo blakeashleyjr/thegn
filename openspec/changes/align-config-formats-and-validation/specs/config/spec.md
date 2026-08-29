@@ -5,14 +5,15 @@
 ### Requirement: Configuration layers in a fixed order
 
 Configuration SHALL be resolved from built-in defaults, then
-`$XDG_CONFIG_HOME/thegn/config.toml` (or `--config`), then the active named
-profile's overlay `profiles/<name>/config.toml` (absent for the default
-profile), then `THEGN_<SECTION>_<KEY>` environment overrides, then
-`--set key=value`. A repository's selected `.thegn.*` overlay is a separate
-repo-scoped layer and MAY carry `[sandbox]` (resolved through the trust clamp),
-`[keybinds]`, `[notifications]`, `[issues]`, the `env` selector, and the
-metrics detection/refusal table. A malformed or unknown value MUST warn and
-fall back to the layer below — a launch is never blocked by configuration.
+`$XDG_CONFIG_HOME/thegn/config.toml` (or `--config`, which changes the path but
+not the TOML parser), then the active named profile's overlay
+`profiles/<name>/config.toml` (absent for the default profile), then
+`THEGN_<SECTION>_<KEY>` environment value overrides, then `--set key=value`.
+A repository's selected `.thegn.*` overlay is a separate repo-scoped layer and
+MAY carry `[sandbox]` (resolved through the trust clamp), `[keybinds]`,
+`[notifications]`, `[issues]`, the `env` selector, and the metrics
+detection/refusal table. A malformed or unknown value MUST warn and fall back
+to the layer below — a launch is never blocked by configuration.
 
 #### Scenario: Env beats file
 
@@ -38,7 +39,8 @@ dotted key and expected/actual type. Every problem MUST be prefixed with the
 file that carries it. Map-valued tables accept any name; legacy sections the
 loader already warns about are not double-reported; an absent layer is
 skipped without comment. The exit code MUST be non-zero when any layer has a
-problem. Lenient load MUST keep dropping unknown keys with at most a warning.
+problem. Syntax diagnostics MUST identify their source format. Lenient load
+MUST keep dropping unknown keys with at most a warning.
 
 #### Scenario: Typo'd key
 
@@ -103,11 +105,11 @@ only (never echoing file contents).
 ### Requirement: Doctor reports configuration health
 
 `thegn doctor` SHALL report the loaded config file's path and its
-strict-validation problem count (and the repo overlay's, when run inside a
-repository), in both the text report and the JSON document, pointing at
-`thegn config validate` for the detail. Doctor MUST NOT duplicate the
-validation logic — it consumes the same core validators the `config validate`
-verb uses.
+strict-validation problem count, plus the active profile and repo overlay
+paths and counts when present, in both the text report and the JSON document,
+pointing at `thegn config validate` for the detail. Doctor MUST NOT duplicate
+the validation logic — it consumes the same collector and core validators the
+`config validate` verb uses.
 
 #### Scenario: A broken key surfaces in doctor
 
@@ -115,3 +117,9 @@ verb uses.
   `thegn doctor` runs
 - **THEN** the report includes the config path with a problem count of 2 and
   names `thegn config validate` as the follow-up
+
+#### Scenario: Doctor includes an active profile
+
+- **WHEN** an active profile has a readable `profiles/<name>/config.toml`
+- **THEN** doctor reports that profile path and its strict-validation problem
+  count alongside the main configuration health
