@@ -46,26 +46,15 @@ pub(crate) fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) 
 pub(crate) fn spawn_delete_workspace_dirs(
     repo_path: &str,
     dirs: Vec<String>,
+    cfg: thegn_core::config::Config,
+    slug: &str,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) {
     if dirs.is_empty() {
         return;
     }
     let root = Path::new(repo_path).to_path_buf();
-    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-    let slug = thegn_core::repo::repo_slug(&root);
-    let paths = dirs
-        .into_iter()
-        .map(|path| {
-            let branch = thegn_core::util::git_out(
-                Path::new(&path),
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            )
-            .unwrap_or_default();
-            (path, branch)
-        })
-        .collect();
-    crate::worktree_lifecycle::spawn_workspace_destroy(cfg, root, slug, paths, waker);
+    crate::worktree_lifecycle::spawn_workspace_destroy(cfg, root, slug.to_string(), dirs, waker);
 }
 
 /// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
@@ -87,6 +76,7 @@ pub(crate) fn remove_workspace(
     slug: &str,
     display: &str,
     keep_files: bool,
+    cfg: &thegn_core::config::Config,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
     let db = thegn_core::db::Db::open().ok(); // best-effort: cache: removal proceeds on disk/git; a failed open just leaves stale rows
@@ -111,7 +101,7 @@ pub(crate) fn remove_workspace(
             }
             return workspace_removed_status(display, false, 0);
         }
-        spawn_delete_workspace_dirs(repo_path, worktree_dirs.clone(), waker);
+        spawn_delete_workspace_dirs(repo_path, worktree_dirs.clone(), cfg.clone(), slug, waker);
         return workspace_removed_status(display, false, worktree_dirs.len());
     }
 

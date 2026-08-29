@@ -299,16 +299,6 @@ pub(crate) fn confirm_delete_worktrees(
             .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
     };
 
-    // Capture the worktree paths being deleted BEFORE `delete_groups` shifts
-    // indices, so we can optimistically drop their merge-queue rows from the
-    // in-memory model (the authoritative DB delete happens in
-    // `forget_worktree_group`; this just updates the MQ badge on the same frame).
-    let removed_paths: Vec<String> = targets
-        .iter()
-        .filter_map(|&gi| cx.session.worktrees.get(gi).map(|g| g.path.clone()))
-        .filter(|p| !p.is_empty())
-        .collect();
-
     cx.model.status = crate::run::delete_groups(
         cx.session,
         cx.panes,
@@ -316,11 +306,6 @@ pub(crate) fn confirm_delete_worktrees(
         keep_files,
         Some(cx.waker.clone()),
     );
-    cx.model
-        .panel
-        .merge_queue
-        .retain(|r| !removed_paths.contains(&r.worktree));
-
     // Restore focus: (a) keep the still-living active group (it survived the
     // delete); (b) if it was deleted, land on the next/prev worktree in the same
     // workspace (sidebar-visual order); (c) fall back to the workspace home, then
