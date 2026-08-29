@@ -1839,20 +1839,6 @@ pub(crate) fn delete_groups_with_mode(
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
-    let db = match thegn_core::db::Db::open() {
-        Ok(db) => Some(db),
-        Err(e) => {
-            tracing::warn!(target: "thegn::worktree", error = %e, "DB unavailable while resolving delete targets; sandbox teardown may be degraded");
-            None
-        }
-    };
-    // by the SAME precedence launch uses (DB selection → repo `.thegn.toml`
-    // `env=` → global default), not just the DB — a repo-selected provider env
-    // (e.g. thegn's `env = "sprites"`) isn't stored in the DB, so a DB-only
-    // lookup returned None and LEAKED the sprite on delete.
-    let mut del_cfg =
-        thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-    thegn_core::host_config::merge_db_hosts(&mut del_cfg);
     let (mut deleted, mut skipped) = (0usize, 0usize);
     for gi in targets {
         if gi >= session.worktrees.len() {
@@ -1865,24 +1851,8 @@ pub(crate) fn delete_groups_with_mode(
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
             let group_name = session.worktrees[gi].name.clone();
-            let root = db
-                .as_ref()
-                .and_then(|db| db.repo_root_for(&path).ok().flatten())
-                .map(PathBuf::from)
-                .or_else(|| thegn_core::repo::main_worktree(Path::new(&path)))
-                .unwrap_or_else(|| PathBuf::from(&path));
-            let branch = thegn_core::util::git_out(
-                Path::new(&path),
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            )
-            .unwrap_or_default();
-            let workspace = thegn_core::repo::repo_slug(&root);
             crate::worktree_lifecycle::spawn_worktree_destroy(
-                del_cfg.clone(),
-                root,
                 PathBuf::from(&path),
-                branch,
-                workspace,
                 group_name,
                 keep_files,
                 mode,
@@ -7043,6 +7013,7 @@ async fn event_loop<T: Terminal>(
                             &slug,
                             &display,
                             true,
+                            &current_config,
                             Some(waker.clone()),
                         );
                         crate::handlers::workspace_remove::forget_workspace_in_model(
@@ -15215,11 +15186,14 @@ async fn event_loop<T: Terminal>(
                                     &slug,
                                     &display,
                                     keep_files,
+                                    &current_config,
                                     Some(waker.clone()),
                                 );
-                                crate::handlers::workspace_remove::forget_workspace_in_model(
-                                    &mut model, &slug, &repo_path,
-                                );
+                                if keep_files {
+                                    crate::handlers::workspace_remove::forget_workspace_in_model(
+                                        &mut model, &slug, &repo_path,
+                                    );
+                                }
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
@@ -20948,11 +20922,9 @@ async fn event_loop<T: Terminal>(
                                             &slug,
                                             &display,
                                             false,
+                                            &current_config,
                                             Some(waker.clone()),
                                         );
-                                    crate::handlers::workspace_remove::forget_workspace_in_model(
-                                        &mut model, &slug, &repo_path,
-                                    );
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);

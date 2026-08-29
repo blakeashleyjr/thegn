@@ -439,11 +439,7 @@ pub fn spawn_event(
 /// The caller does not prune the live group until the completion says the disk
 /// operation really succeeded.
 pub fn spawn_worktree_destroy(
-    cfg: Config,
-    repo_root: PathBuf,
     worktree: PathBuf,
-    branch: String,
-    workspace: String,
     group_name: String,
     keep_files: bool,
     mode: HookExecutionMode,
@@ -451,9 +447,25 @@ pub fn spawn_worktree_destroy(
 ) {
     std::thread::spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-        let (success, message) = destroy_one(
-            &cfg, &repo_root, &worktree, &branch, &workspace, keep_files, mode,
-        );
+        let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+        let (success, message) = thegn_core::repo::main_worktree(&worktree)
+            .map(|repo_root| {
+                let branch = thegn_core::util::git_out(
+                    &worktree,
+                    &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                )
+                .unwrap_or_default();
+                let workspace = thegn_core::repo::repo_slug(&repo_root);
+                destroy_one(
+                    &cfg, &repo_root, &worktree, &branch, &workspace, keep_files, mode,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    false,
+                    format!("could not resolve repository for {}", worktree.display()),
+                )
+            });
         complete(
             LifecycleCompletion::WorktreeDelete {
                 group_name,
@@ -472,13 +484,18 @@ pub fn spawn_workspace_destroy(
     cfg: Config,
     repo_root: PathBuf,
     slug: String,
-    paths: Vec<(String, String)>,
+    paths: Vec<String>,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) {
     std::thread::spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let mut failed_paths = Vec::new();
-        for (path, branch) in paths {
+        for path in paths {
+            let branch = thegn_core::util::git_out(
+                Path::new(&path),
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            )
+            .unwrap_or_default();
             let (success, message) = destroy_one(
                 &cfg,
                 &repo_root,
