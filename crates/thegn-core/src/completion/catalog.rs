@@ -315,6 +315,7 @@ pub const CATALOG: &[Slot] = &[
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
     slot("session open", "worktree", SourceKind::Worktree),
+    slot("session fork", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
     slot("share stop", "worktree", SourceKind::Worktree),
     slot("sprite-proxy", "worktree", SourceKind::Worktree),
@@ -337,6 +338,15 @@ pub const CATALOG: &[Slot] = &[
     slot("dispatch put", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
     slot("session browse", "session", SourceKind::Session),
+    slot("session fork", "session", SourceKind::Session),
+    // A native harness id is not enumerable through the daemon session source;
+    // recorded rows are selected through `agent.sessions` and the remaining
+    // provider-specific value is deliberately free-form.
+    slot(
+        "session fork",
+        "harness",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("session record", "session", SourceKind::Session),
     slot("session send", "session", SourceKind::Session),
     slot("session snapshot", "session", SourceKind::Session),
@@ -369,9 +379,12 @@ pub const CATALOG: &[Slot] = &[
     // configured agents are the useful majority and the arg stays free-form.
     slot("dispatch put", "agent_name", SourceKind::Agent),
     slot("session open", "agent", SourceKind::Agent),
+    slot("session fork", "agent", SourceKind::Agent),
     // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
     slot("dispatch put", "stage", SourceKind::Stage),
     slot("session open", "stage", SourceKind::Stage),
+    // A cwd is a filesystem path; clap's structural/path completer owns it.
+    slot("session fork", "cwd", SourceKind::Structural),
     // --- pipeline run-completion (THE-76) -----------------------------------
     // Roster row ids: local SQLite, so a real source is implementable — but
     // nothing serves them yet (see `Reserved::DispatchRow`).
