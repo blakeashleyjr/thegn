@@ -624,6 +624,20 @@ pub(crate) fn additive_schema(conn: &Connection) {
          CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
            ON agent_dispatch_notes (dispatch_id, created_at_ms);",
     );
+    // v62: one complete PR review snapshot per canonical worktree key. The
+    // identity columns are deliberately duplicated outside the JSON so a
+    // caller can reject stale feedback before presenting it.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS pr_review_cache (
+           worktree   TEXT PRIMARY KEY,
+           branch     TEXT NOT NULL,
+           pr_number  INTEGER NOT NULL,
+           head_oid   TEXT NOT NULL,
+           json       TEXT NOT NULL,
+           fetched_at INTEGER NOT NULL
+         )",
+        [],
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
@@ -674,6 +688,44 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Verify the v62 review-cache table after the best-effort additive ladder and
+/// before `Db::init` stamps the new schema version.
+pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
+    verify_v61_schema(conn)?;
+    let table_type: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='pr_review_cache'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if table_type.as_deref() != Some("table") {
+        anyhow::bail!("schema v62 migration did not create pr_review_cache");
+    }
+    let mut stmt = conn.prepare("PRAGMA table_info(pr_review_cache)")?;
+    let columns: Vec<(String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(1)?, r.get(3)?, r.get(5)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let expected = [
+        ("worktree", 0, 1),
+        ("branch", 1, 0),
+        ("pr_number", 1, 0),
+        ("head_oid", 1, 0),
+        ("json", 1, 0),
+        ("fetched_at", 1, 0),
+    ];
+    if columns.len() != expected.len()
+        || expected.iter().any(|wanted| {
+            !columns
+                .iter()
+                .any(|column| column.0 == wanted.0 && column.1 == wanted.1 && column.2 == wanted.2)
+        })
+    {
+        anyhow::bail!("schema v62 pr_review_cache has an invalid shape");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
@@ -695,6 +747,78 @@ mod tests {
             .unwrap();
         let err = super::verify_v61_schema(&conn).unwrap_err();
         assert!(err.to_string().contains("agent_dispatch_notes"), "{err}");
+    }
+
+    #[test]
+    fn pre_v62_db_gains_review_cache_without_resetting_user_data() {
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v62-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE repos (path TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO repos (path,name) VALUES ('/repo/a', 'a');
+                 PRAGMA user_version = 61;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM repos WHERE path='/repo/a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "a");
+        let snapshot = crate::review::PrReviewSnapshot {
+            worktree_key: "/wt/a".into(),
+            branch: "feature".into(),
+            pr_number: 27,
+            head_oid: "head".into(),
+            ..Default::default()
+        };
+        crate::store::CacheStore::put_pr_review_cache(&db, &snapshot).unwrap();
+        assert!(
+            crate::store::CacheStore::get_pr_review_cache(&db, "/wt/a")
+                .unwrap()
+                .is_some()
+        );
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_cache_migration_is_idempotent_and_preserves_rows() {
+        let db = Db::open_memory().unwrap();
+        let snapshot = crate::review::PrReviewSnapshot {
+            worktree_key: "/wt/a".into(),
+            branch: "feature".into(),
+            pr_number: 27,
+            head_oid: "head".into(),
+            ..Default::default()
+        };
+        crate::store::CacheStore::put_pr_review_cache(&db, &snapshot).unwrap();
+        super::additive_schema(db.conn());
+        super::additive_schema(db.conn());
+        let got = crate::store::CacheStore::get_pr_review_cache(&db, "/wt/a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.pr_number, 27);
+        let tables: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pr_review_cache'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
     }
 
     #[test]
