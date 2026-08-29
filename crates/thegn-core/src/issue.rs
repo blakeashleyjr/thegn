@@ -279,6 +279,17 @@ pub struct AgentDispatch {
     /// filed one.
     #[serde(default)]
     pub report: Option<String>,
+    /// The worker process's exit status, stamped when its session ended (v63).
+    /// `None` means **unknown** — a pre-v63 row, or one whose daemon went away
+    /// before it could stamp — never "still running": absence of evidence that
+    /// the worker exited must not be read as evidence that it did.
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// When the exit above was recorded (epoch ms, v63). Paired with
+    /// `exit_code` so a supervisor can age an unclosed row and see that its
+    /// worker has been gone for hours.
+    #[serde(default)]
+    pub exited_at_ms: Option<i64>,
 }
 
 /// A note on the per-row progress queue (see `agent_dispatch_notes`).
@@ -881,6 +892,8 @@ mod spec {
             note: Some("transport: connection error. (attempt 1/3)".into()),
             chunk_path: Some(".thegn/pipeline/ABC-1/code/chunk-1.md".into()),
             report: None,
+            exit_code: Some(0),
+            exited_at_ms: Some(1_700_000_100_000),
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: AgentDispatch = serde_json::from_str(&json).unwrap();

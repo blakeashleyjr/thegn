@@ -916,6 +916,15 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                             ),
                             Ok(None) | Err(_) => None,
                         };
+                        // Stamp the exit on the row REGARDLESS of whether the
+                        // status moves (v63). A pipeline row deliberately keeps
+                        // its `running` status here — closing it is the
+                        // supervisor's verified call — and that is exactly the
+                        // row whose worker is gone with nothing to say so. The
+                        // stamp is what makes it read as `exited-unverified`
+                        // instead of masquerading as a live worker.
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                        let _ = db.stamp_dispatch_exit(dispatch_id, exit_code.map(i64::from));
                         if let Some(status) = auto_status {
                             // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                             let _ = db.update_dispatch_status(dispatch_id, status);

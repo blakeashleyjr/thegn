@@ -414,6 +414,29 @@ pub const CATALOG: &[Slot] = &[
     // engine's filesystem completion is the intended behavior.
     slot("dispatch put", "chunk", SourceKind::Structural),
     slot("session open", "chunk", SourceKind::Structural),
+    // --- pipeline slot claim + monitor lease --------------------------------
+    // `dispatch claim` takes the same operands as `dispatch put`, so it takes
+    // the same sources; `--artifact` is a path under the worktree (structural),
+    // which is also why the claim verb does not inherit `put`'s pinned
+    // `artifact` debt.
+    slot("dispatch claim", "worktree_path", SourceKind::Worktree),
+    slot("dispatch claim", "agent_name", SourceKind::Agent),
+    slot("dispatch claim", "stage", SourceKind::Stage),
+    slot("dispatch claim", "artifact", SourceKind::Structural),
+    slot("dispatch claim", "chunk", SourceKind::Structural),
+    slot(
+        "dispatch claim",
+        "parent",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    // The override's justification — operator prose, like a report body.
+    slot("dispatch claim", "allow_duplicate", SourceKind::Structural),
+    // The lease verbs take an action word, an owner token, a TTL and a lease
+    // name: all operator-chosen strings with no enumerable source.
+    slot("dispatch lease", "action", SourceKind::Structural),
+    slot("dispatch lease", "owner", SourceKind::Structural),
+    slot("dispatch lease", "ttl", SourceKind::Structural),
+    slot("dispatch lease", "name", SourceKind::Structural),
     // A tracker issue id in roster form (`linear:THE-76`) — network, like
     // every issue argument.
     slot(
@@ -490,6 +513,11 @@ pub const CATALOG: &[Slot] = &[
     slot("pr queue rm", "number", SourceKind::Reserved(Reserved::Pr)),
     slot(
         "dispatch put",
+        "issue_id",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    slot(
+        "dispatch claim",
         "issue_id",
         SourceKind::Reserved(Reserved::Issue),
     ),

@@ -1004,6 +1004,75 @@ fn daemon_health() -> (&'static str, Option<String>) {
     }
 }
 
+/// The binary a running process is executing, via `/proc/<pid>/exe`.
+///
+/// No `#[cfg]`: on a platform without procfs the read simply fails and the
+/// caller prints "(unknown)", which is the honest answer there.
+fn exe_of_pid(pid: i64) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// Print the two facts that distinguish "the rebuild took" from "the rebuild
+/// took for the CLI only".
+///
+/// # Why `--version` is not enough
+///
+/// On 2026-08-29 a v57 daemon drove a v62 database for hours while both the CLI
+/// and the daemon reported `0.1.0-alpha.2` — the crate version had not changed,
+/// only the schema and the code had. The decisive facts are the **schema pair**
+/// (what the database is at vs what this build expects) and the **binary paths**
+/// (whether the daemon is executing the same file the CLI is), so `doctor`
+/// prints both.
+fn build_parity_lines() {
+    let build = thegn_core::db::SCHEMA_VERSION;
+    match thegn_core::db::on_disk_schema_version() {
+        Some(on_disk) if on_disk == build => {
+            outln!("  schema        db v{on_disk} == build v{build}");
+        }
+        Some(on_disk) if on_disk > build => {
+            outln!(
+                "  schema        db v{on_disk} > build v{build}  ** THIS BUILD IS TOO OLD — \
+                 rebuild/reinstall; it cannot see what the newer build writes **"
+            );
+        }
+        Some(on_disk) => {
+            outln!("  schema        db v{on_disk} < build v{build} (migrates on next open)");
+        }
+        None => outln!("  schema        (no database yet) build v{build}"),
+    }
+    let cli = std::env::current_exe().ok();
+    outln!(
+        "  cli binary    {}",
+        cli.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown)".into())
+    );
+    // Every registered daemon's actual executable — a daemon still running an
+    // older build is invisible in its reported version but obvious here.
+    use thegn_core::store::ControlStore;
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return;
+    };
+    for d in db.daemons().unwrap_or_default() {
+        let exe = exe_of_pid(d.pid);
+        let same = match (&cli, &exe) {
+            (Some(a), Some(b)) => {
+                if a == b {
+                    "  (same as CLI)"
+                } else {
+                    "  ** DIFFERENT FROM THE CLI — restart the daemon from this build **"
+                }
+            }
+            _ => "",
+        };
+        outln!(
+            "  daemon binary {}{same}",
+            exe.map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("(pid {} — unreadable)", d.pid))
+        );
+    }
+}
+
 /// Report thegn's own identity: version, channel, build, OS, the daemon's
 /// version + reachability, the `[log]` sinks with sizes/caps, and recent crash
 /// reports — the first questions any bug report needs answered.
@@ -1024,6 +1093,7 @@ fn identification_report(cfg: &Config) {
         dver.as_deref().unwrap_or("unknown")
     );
     outln!("  run id        {}", thegn_core::diagnostics::run_id());
+    build_parity_lines();
     outln!("");
     outln!("Logs ([log])");
     outln!("  level         {}", cfg.log.level.as_str());
