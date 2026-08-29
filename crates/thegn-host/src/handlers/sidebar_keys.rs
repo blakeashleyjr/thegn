@@ -84,6 +84,8 @@ pub(crate) enum SidebarOutcome {
     CloseTerminal { name: String },
     /// Open the sort-mode menu (`s`).
     SortMenu,
+    /// Open the existing Work → Merge queue section for this workspace.
+    OpenMergeQueue { repo_path: String },
     /// Show the sidebar help overlay (`?`).
     ShowHelp,
     /// A merge-queue action fired from the row/workspace context menu (mirrors
@@ -414,6 +416,9 @@ impl SidebarState {
                     "Row detail: all / cursor / off",
                     Some(chord_of(Id::CycleDetail)),
                 ));
+                if row.worktree_path.is_some() {
+                    entries.push(e("open-merge-queue", "Open merge queue", None));
+                }
                 // Workspace-wide merge-queue controls (panel `A` / clear / `D`).
                 entries.push(sep());
                 entries.push(e("mq-add-all", "Queue all worktrees", None));
@@ -1246,6 +1251,15 @@ impl SidebarState {
                 }
             }
             "sort" => return SidebarOutcome::SortMenu,
+            "open-merge-queue" => {
+                if let Some(repo_path) = self
+                    .selected_row(model)
+                    .filter(|row| row.kind == crate::sidebar::RowKind::Workspace)
+                    .and_then(|row| row.worktree_path.clone())
+                {
+                    return SidebarOutcome::OpenMergeQueue { repo_path };
+                }
+            }
             "mq-add" | "mq-remove" | "mq-land" | "mq-retry" => {
                 use crate::handlers::merge_queue::SidebarMq;
                 if let Some(path) = self
@@ -1547,5 +1561,40 @@ mod tests {
         for s in [MqStatus::Landed, MqStatus::AgentRunning] {
             assert_eq!(ids(Some(s)), vec!["mq-remove"], "{s:?}");
         }
+    }
+
+    #[test]
+    fn workspace_menu_opens_merge_queue_without_a_new_keybind() {
+        use crate::sidebar::{RowKind, SidebarRow};
+
+        let mut model = FrameModel {
+            sidebar_rows: vec![SidebarRow {
+                worktree_path: Some("/repos/app".into()),
+                pin_key: "app".into(),
+                ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+            }],
+            ..Default::default()
+        };
+        let sb = SidebarState::default();
+        let menu = sb
+            .menu_for_cursor(&model, &crate::session::Session::default())
+            .expect("workspace menu");
+        assert!(
+            menu.entries
+                .iter()
+                .any(|entry| entry.id == "open-merge-queue")
+        );
+
+        let mut sb = sb;
+        let out = sb.run_menu_action(
+            "open-merge-queue",
+            &mut model,
+            &crate::session::Session::default(),
+        );
+        assert!(matches!(
+            out,
+            SidebarOutcome::OpenMergeQueue { ref repo_path }
+                if repo_path == "/repos/app"
+        ));
     }
 }

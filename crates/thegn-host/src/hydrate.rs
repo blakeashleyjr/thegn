@@ -3601,7 +3601,9 @@ pub(crate) fn spawn_pr_cache_refresh(
             let pr_ref = format!("pr:{}", pr.number);
             let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
             let wt = cwd.to_string_lossy();
-            let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if !crate::notify::record_global(&db, "pr_state_changed", &pr_ref, &msg, &wt) {
+                let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            }
 
             // Lifecycle automation: on merge, move this worktree's linked
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
@@ -3723,7 +3725,9 @@ pub(crate) fn spawn_pr_cache_refresh(
                 }
                 for (source_ref, msg, wt) in pr_linked_notifications(&old_open, &prs, &wts, &hints)
                 {
-                    let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    if !crate::notify::record_global(&db, "pr_linked", &source_ref, &msg, &wt) {
+                        let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    }
                 }
             }
 
@@ -3754,9 +3758,21 @@ pub(crate) fn spawn_pr_cache_refresh(
                 let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Ok(mentions) = forge.mentions(&loc, &repo) {
                     for (source_ref, msg) in mentions {
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ =
-                            db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
+                        if !crate::notify::record_global_once(
+                            &db,
+                            "mentioned",
+                            &source_ref,
+                            &msg,
+                            &repo_root,
+                        ) {
+                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            let _ = db.put_notification_once(
+                                "mentioned",
+                                &source_ref,
+                                &msg,
+                                &repo_root,
+                            );
+                        }
                     }
                 }
             }

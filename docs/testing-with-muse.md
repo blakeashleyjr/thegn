@@ -7,7 +7,8 @@ web-first checks, and snapshots frames. thegn uses it two ways:
 
 1. **The gate** — `just e2e` runs `test/muse/specs/*.yaml` against the built
    binary and diffs snapshots against `test/muse/snapshots/` (`just ci-local`;
-   opt-in in CI with `[ci-e2e]` until the baselines are re-recorded).
+   opt-in in CI with the extras workflow input until the baselines are
+   re-recorded).
 2. **The loop** — `muse session` keeps a thegn alive between commands so a
    developer or an agent can look, act, and look again while iterating.
 
@@ -22,10 +23,14 @@ Contents: [Quick start](#quick-start-the-loop) · [Environment](#the-environment
 
 ## Quick start (the loop)
 
+Build only the host crate when the interactive binary needs refreshing, then
+keep the isolated session open while you look, act, and look again:
+
 ```bash
-just build                                   # target/debug/thegn (+ fake_lsp)
+cargo build -p thegn-host                     # refresh target/debug/thegn when needed
 T=$(mktemp -d); mkdir -p "$T/home" "$T/cfg/thegn" "$T/state" "$T/run" "$T/bin"
 printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$T/cfg/thegn/config.toml"
+printf '[user]\nname = muse\nemail = muse@example.invalid\n' > "$T/gitconfig"
 printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$T/bin/e2esh"
 chmod +x "$T/bin/e2esh"
 export MUSE_SOCKET="$T/muse.sock"            # a private daemon for this session
@@ -33,6 +38,8 @@ export MUSE_SOCKET="$T/muse.sock"            # a private daemon for this session
 muse session open --name tg --size 120x40 --cwd "$PWD" \
   --env HOME="$T/home" --env XDG_CONFIG_HOME="$T/cfg" --env XDG_STATE_HOME="$T/state" \
   --env XDG_RUNTIME_DIR="$T/run" --env SHELL="$T/bin/e2esh" \
+  --env GIT_CONFIG_GLOBAL="$T/gitconfig" --env GIT_CONFIG_SYSTEM=/dev/null \
+  --env DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null/e2e-no-dbus" \
   --env THEGN_E2E=1 --env MUSE_READY=1 --env THEGN_NO_DAEMON=1 --env THEGN_SKIP_ONBOARDING=1 \
   --env THEGN_LOG=debug --env TERM=xterm-256color -- "$PWD/target/debug/thegn"
 
@@ -42,7 +49,7 @@ muse session send tg --key ctrl+alt+p                      # a host chord
 muse session send tg --text "echo hi" --key enter          # pane input
 muse session wait tg --visible "hi" --timeout-ms 5000
 muse session snap tg --kind pixel --out "$T/shot.png"      # a PNG (open it)
-muse session close tg                                      # always
+muse session close tg                                      # close when the iteration is done
 ```
 
 `wait` exits 0 when the condition holds, 1 when it doesn't (with the reason),
@@ -61,18 +68,18 @@ Chords are `ctrl+alt+p`, `alt+t`, `shift+tab`, `f1`, `escape`, `ctrl+space`.
 above is the same thing by hand. Every piece is there because its absence
 made frames differ between runs or machines:
 
-| Knob                                                                                          | Why                                                                                                                                                                                                                                                                                                |
-| --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| throwaway `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `GIT_CONFIG_GLOBAL` | never read your config, never touch your DB, never find your daemon socket                                                                                                                                                                                                                         |
-| `THEGN_E2E=1`                                                                                 | the determinism freeze (`crates/thegn-host/src/e2e_freeze.rs`): fixed stats, clock `Thu Jan 1 · 12:00`, version `v0.0.0-e2e`, activity dots never decay, media badge off                                                                                                                           |
-| `MUSE_READY=1`                                                                                | skips the dormant launch splash and makes thegn emit `OSC 5379;muse:ready` after each flushed frame, so muse knows a frame is complete without guessing from timing                                                                                                                                |
-| `THEGN_NO_DAEMON=1`                                                                           | panes run in-process. The daemon route would leave a detached daemon + shell behind per run. Drop it only to test that route (see `31-daemon-panes.yaml`, which cleans up after itself) — and **never** against your real state dir: a no-daemon launch claims and stops persisted daemon sessions |
-| `THEGN_SKIP_ONBOARDING=1`                                                                     | no first-run wizard eating the keystrokes                                                                                                                                                                                                                                                          |
-| `SHELL=…/e2esh` (fixed `$ ` prompt)                                                           | the pane's prompt, title and the sidebar row label would otherwise carry `user@host:cwd`. thegn's pane env allowlist drops `ENV`/`PS1`, and NixOS bash sources `/etc/bashrc`, hence a wrapper                                                                                                      |
-| `[sandbox] backend = "none"`, `THEGN_SANDBOX_BACKEND=none`, `[media] enabled = false`         | no container bring-up; the media watcher reaches the player even with the session bus cut                                                                                                                                                                                                          |
-| `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null/…`                                              | belt and braces for the above                                                                                                                                                                                                                                                                      |
-| fixture repo with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` pinned                               | commit hashes appear in the git panel; pinned dates make them identical everywhere                                                                                                                                                                                                                 |
-| `THEGN_LOG=warn` (specs) / `debug` (by hand)                                                  | the log file exists from the start, so the spec's log guard can read it; panics are routed into it                                                                                                                                                                                                 |
+| Knob                                                                                                                         | Why                                                                                                                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| throwaway `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM=/dev/null` | never read your config, never touch your DB, never find your daemon socket                                                                                                                                                                                                                         |
+| `THEGN_E2E=1`                                                                                                                | the determinism freeze (`crates/thegn-host/src/e2e_freeze.rs`): fixed stats, clock `Thu Jan 1 · 12:00`, version `v0.0.0-e2e`, activity dots never decay, media badge off                                                                                                                           |
+| `MUSE_READY=1`                                                                                                               | skips the dormant launch splash and makes thegn emit `OSC 5379;muse:ready` after each flushed frame, so muse knows a frame is complete without guessing from timing                                                                                                                                |
+| `THEGN_NO_DAEMON=1`                                                                                                          | panes run in-process. The daemon route would leave a detached daemon + shell behind per run. Drop it only to test that route (see `31-daemon-panes.yaml`, which cleans up after itself) — and **never** against your real state dir: a no-daemon launch claims and stops persisted daemon sessions |
+| `THEGN_SKIP_ONBOARDING=1`                                                                                                    | no first-run wizard eating the keystrokes                                                                                                                                                                                                                                                          |
+| `SHELL=…/e2esh` (fixed `$ ` prompt)                                                                                          | the pane's prompt, title and the sidebar row label would otherwise carry `user@host:cwd`. thegn's pane env allowlist drops `ENV`/`PS1`, and NixOS bash sources `/etc/bashrc`, hence a wrapper                                                                                                      |
+| `[sandbox] backend = "none"`, `THEGN_SANDBOX_BACKEND=none`, `[media] enabled = false`                                        | no container bring-up; the media watcher reaches the player even with the session bus cut                                                                                                                                                                                                          |
+| `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null/…`                                                                             | belt and braces for the above                                                                                                                                                                                                                                                                      |
+| fixture repo with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` pinned                                                              | commit hashes appear in the git panel; pinned dates make them identical everywhere                                                                                                                                                                                                                 |
+| `THEGN_LOG=warn` (specs) / `debug` (by hand)                                                                                 | the log file exists from the start, so the spec's log guard can read it; panics are routed into it                                                                                                                                                                                                 |
 
 ## Reading the screen
 
@@ -228,7 +235,10 @@ snapshots get `#styled` in the directory name). `just e2e` runs with `--ci`:
 a missing baseline is a **failure**, never an auto-create. After an
 intentional UI change run `just e2e-update`, then review the diff under
 `test/muse/snapshots/` like code — it is the rendered consequence of your
-change. `just e2e` must then pass twice.
+change. Treat the full `just e2e` suite as final UI validation: run it after the
+change is settled, not after every small edit. `just e2e-update` is likewise an
+intentional baseline update followed by review; run `just e2e` again afterward
+to verify the reviewed baselines.
 
 Masks and normalizers in a spec's `snapshot_defaults` apply to every
 snapshot in it; per-step `masks:`/`normalize:` add to them. A `content` mask

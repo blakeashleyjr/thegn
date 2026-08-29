@@ -352,6 +352,13 @@ dispatch.
 
 ## 10. Before you call a stage done — run the cheap ratchet suites
 
+During implementation, keep the coder loop scoped: use `just quick <crate>`
+for lib/bin clippy and `cargo nextest run -p <crate> <filter>` for the tests
+being touched. Do not run `just test`, `just lint`, `just coverage`, `just ci`,
+or the full `just e2e` suite after every edit; reserve those for deliberate
+pre-push, diagnostic, pre-PR, or final UI validation. The stage-specific suites
+below remain the cheap ratchets required when a chunk claims them.
+
 A reviewer's verdict is only as good as the gates behind it. These suites are
 scoped (seconds each, no full-workspace compile) and MUST be green before you
 record a verdict on any chunk that claims to pass them:
