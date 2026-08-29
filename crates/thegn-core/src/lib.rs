@@ -158,6 +158,7 @@ pub mod mcp;
 pub mod media;
 pub mod merge_guard;
 pub mod merge_lifecycle;
+pub mod merge_queue_view;
 pub mod merge_sweep;
 pub mod metrics;
 pub mod migrate_brand;

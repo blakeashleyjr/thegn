@@ -201,6 +201,7 @@ mod sidebar;
 mod sidebar_help;
 mod sidebar_keytable;
 mod sidebar_legend;
+mod sidebar_mq;
 mod sidebar_order;
 mod sidebar_pipeline;
 mod sidebar_view;
