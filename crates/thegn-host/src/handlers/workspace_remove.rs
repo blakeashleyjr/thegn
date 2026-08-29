@@ -7,10 +7,9 @@
 //! remote-dir removal, and a recursive `remove_dir_all` (a Rust worktree with a
 //! `target/` is easily multi-GB → tens of seconds). That work MUST NOT run on
 //! the event loop, so it is handed to a spawned thread that pulses the
-//! `TerminalWaker` when done — mirroring [`crate::run::delete_groups_with_mode`]. Only the
-//! in-memory session prune + DB-row pruning (cheap, cache writes) stays on the
-//! loop, and the status line reports "removing N worktrees…" until the thread
-//! finishes.
+//! `TerminalWaker` when done — mirroring [`crate::run::delete_groups_with_mode`]. The
+//! loop retains live groups until each worker reports success, then only
+//! performs the in-memory prune; cache writes stay on the worker.
 
 use std::path::Path;
 
@@ -41,8 +40,8 @@ pub(crate) fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) 
 /// Delete a workspace's worktree directories from disk OFF the event loop.
 /// Runs `git worktree remove` + `purge_worktree_files` (local + remote ssh) per
 /// dir on a dedicated thread, then pulses `waker` so the loop repaints. Callers
-/// keep the in-memory/DB prune on the loop and show a pending status until this
-/// finishes. No-op (no thread spawned) when `dirs` is empty.
+/// keep the in-memory groups and show a pending status until this finishes.
+/// No-op (no thread spawned) when `dirs` is empty.
 pub(crate) fn spawn_delete_workspace_dirs(
     repo_path: &str,
     dirs: Vec<String>,
@@ -269,8 +268,15 @@ pub(crate) fn remove_workspace_in_memory(
 /// Remove a successfully destroyed worktree from the cache on a worker. The
 /// loop later reconciles the corresponding live group separately.
 pub(crate) fn forget_worktree_path_in_db(db: &thegn_core::db::Db, session_id: &str, path: &str) {
+    if let Ok(groups) = db.groups_for_session(session_id) {
+        for group in groups.into_iter().filter(|group| group.worktree == path) {
+            let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: layout is resurrection state
+            del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", &group.name);
+        }
+    }
     let _ = db.del_worktree(path); // best-effort: cache write: git is the source of truth
-    let _ = db.delete_tab_groups_for_worktree(session_id, path); // best-effort: cache write: layout is resurrection state
+    let _ = db.delete_tab_groups_for_worktree(session_id, path); // best-effort: cache write: clean up legacy layout rows
+    thegn_core::activity::forget(path);
 }
 
 /// Remove a successfully destroyed workspace from the cache on a worker. The

@@ -72,8 +72,8 @@ pub fn take_completions() -> Vec<LifecycleCompletion> {
 }
 
 /// Apply worker outcomes on the compositor loop. No hook, git, or filesystem
-/// work occurs here; this only reconciles the in-memory session and cache after
-/// a worker has proven that its requested removal completed.
+/// work occurs here; this only reconciles in-memory session, pane, model, and
+/// focus state after a worker has proven that its requested removal completed.
 pub fn apply_completions(
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
@@ -1160,14 +1160,25 @@ mod tests {
         });
         assert!(session.worktrees.is_empty());
 
-        let (session, mut model) =
-            apply_test_completion(LifecycleCompletion::WorkspaceDeleteFinished {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut session = completion_test_session();
+        let mut model = crate::chrome::FrameModel::default();
+        model.sidebar_workspaces =
+            vec![("repo".into(), "repo".into(), "repo".into(), "repo".into())];
+        let mut sb = crate::run::SidebarState::default();
+        assert!(apply_completions_from(
+            vec![LifecycleCompletion::WorkspaceDeleteFinished {
                 repo_path: "repo".into(),
                 slug: "repo".into(),
                 failed_paths: Vec::new(),
-            });
-        model.sidebar_workspaces =
-            vec![("repo".into(), "repo".into(), "repo".into(), "repo".into())];
-        assert!(session.worktrees.len() <= 1);
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        ));
+        assert!(session.worktrees.is_empty());
+        assert!(model.sidebar_workspaces.is_empty());
     }
 }
