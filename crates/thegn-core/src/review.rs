@@ -435,7 +435,7 @@ mod tests {
         };
         let out = format_review_feedback(&snapshot, None);
         assert!(out.chars().count() <= MAX_REVIEW_FEEDBACK_CHARS);
-        assert!(!out.chars().any(|ch| is_terminal_control(ch)));
+        assert!(!out.chars().any(is_terminal_control));
         assert!(!out.ends_with('\n'));
         snapshot.conversation.threads[0].resolved = true;
         let resolved = format_review_feedback(&snapshot, None);
