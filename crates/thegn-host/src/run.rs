@@ -7063,12 +7063,18 @@ async fn event_loop<T: Terminal>(
                             crate::perf::SwitchKind::Workspace
                         },
                     ));
-                    if activate_row!(crate::sidebar::RowTarget::Workspace {
+                    let activated = activate_row!(crate::sidebar::RowTarget::Workspace {
                         repo_path: repo_path.clone(),
                         group: None,
-                    }) {
-                        kick_model_hydration!();
+                    });
+                    if !activated {
+                        // Activation reports a user-visible status on DB/path
+                        // failure. Do not replace that diagnostic with a
+                        // queue panel for the previous workspace.
+                        dirty = true;
+                        continue;
                     }
+                    kick_model_hydration!();
 
                     panel_auto_revealed = None;
                     if chrome.panel.is_none() {
