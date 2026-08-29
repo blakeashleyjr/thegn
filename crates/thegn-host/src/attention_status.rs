@@ -275,6 +275,15 @@ pub(crate) fn collect_attention(
             .agent
             .get(path)
             .is_some_and(|a| thegn_core::activity::is_real_agent(a));
+        // THE-89: the daemon-classified error state for this worktree, if
+        // any of its sessions has emitted a harness failure banner that
+        // has not been cleared. The cache is process-global: the in-process
+        // actor writes directly, and a subscription bridge from the
+        // compositor to the daemon's `events` feed populates the same map
+        // for the cross-process case. An empty cache (the pre-THE-89
+        // behaviour, or a process without a wired bridge) reports `false`
+        // — exactly the old code's score.
+        let agent_error_active = crate::daemon::agent_error_cache::worktree_has_error(path);
         let inputs = AttentionInputs {
             activity: activity_kind,
             activity_since,
@@ -289,6 +298,7 @@ pub(crate) fn collect_attention(
             has_agent,
             stage_blocked_since: stage_blocked.get(path).copied(),
             attention_signal_since: raised.get(path).copied(),
+            agent_error_active,
         };
         scores.insert(path.clone(), attention::score(&inputs));
     }
@@ -497,6 +507,29 @@ mod tests {
         let mut cleared = crate::sidebar::SidebarStatus::default();
         collect_attention(&session, &db, &mut cleared);
         assert!(!status_needs_user(&cleared, "/wt/hand"));
+    }
+
+    /// A daemon error state is projected into the worktree's Failure score.
+    #[test]
+    fn agent_error_active() {
+        crate::daemon::agent_error_cache::clear_all();
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/error", "/repo", "/wt/error", "error", None, None)
+            .unwrap();
+        crate::daemon::agent_error_cache::set("session-error", Some("/wt/error".into()), true);
+
+        let session = session_with(&[("app/error", "/wt/error")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+
+        let score = status.attention.get("/wt/error").expect("score exists");
+        assert_eq!(score.tier, thegn_core::attention::AttentionTier::Failure);
+        assert_eq!(
+            score.reason,
+            thegn_core::attention::AttentionReason::AgentFailed
+        );
+        crate::daemon::agent_error_cache::clear_all();
     }
 
     fn status_needs_user(status: &crate::sidebar::SidebarStatus, path: &str) -> bool {
