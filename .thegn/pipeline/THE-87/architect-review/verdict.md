@@ -1,7 +1,7 @@
 # THE-87 — Architecture review verdict: APPROVED
 
 Reviewer: ARCHITECT  
-Branch: `tg/the-87-live-fallback-workspace` (HEAD `9a5af10a`)  
+Branch: `tg/the-87-live-fallback-workspace` (implementation reviewed at `9a5af10a`; verdict commit follows)  
 Base: `main` (merged first; already up to date)
 
 Verdict: **APPROVED**
