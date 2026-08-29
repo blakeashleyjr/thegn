@@ -342,6 +342,15 @@ pub enum Verb {
     DispatchesVerify,
     /// Block until an active roster row's session exits. Observes only.
     DispatchesWait,
+    /// File a worker's structured handoff report on a roster row — writes to
+    /// the local DB (thegn's own data). CLI-only (local SQLite).
+    DispatchesReport,
+    /// Append a progress note to a dispatch row's queue — writes to the local
+    /// DB. CLI-only.
+    DispatchesNote,
+    /// Read status digests for roster rows with reports and notes — observes
+    /// only. CLI-only.
+    DispatchesStatus,
     /// Create a worktree (optionally from an issue) — writes to git + the fs.
     WorktreeCreate,
     /// Run a workspace text/structural search (read-only; `thegn search`).
@@ -447,6 +456,9 @@ impl Verb {
         Verb::DispatchesSetStatus,
         Verb::DispatchesVerify,
         Verb::DispatchesWait,
+        Verb::DispatchesReport,
+        Verb::DispatchesNote,
+        Verb::DispatchesStatus,
         Verb::WorktreeCreate,
         Verb::SearchQuery,
         Verb::SearchReplace,
@@ -493,10 +505,12 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesList
         | Verb::IssuesGet
         | Verb::DispatchesList
-        // `dispatches.verify`/`wait` (THE-76) observe only: verify reads the
-        // worktree + roster, wait composes the routed `sessions.wait`.
+        // `dispatches.verify`/`wait`/`status` (THE-76/THE-88) observe only: verify reads the
+        // worktree + roster, wait composes the routed `sessions.wait`,
+        // status reads the roster + notes.
         | Verb::DispatchesVerify
         | Verb::DispatchesWait
+        | Verb::DispatchesStatus
         | Verb::SearchQuery
         | Verb::HostDiscover
         | Verb::ContainersList
@@ -530,6 +544,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesComment
         | Verb::DispatchesPut
         | Verb::DispatchesSetStatus
+        | Verb::DispatchesReport
+        | Verb::DispatchesNote
         | Verb::SearchReplace
         | Verb::ContainersControl
         | Verb::Split
@@ -828,6 +844,7 @@ mod tests {
             DispatchesList,
             DispatchesVerify,
             DispatchesWait,
+            DispatchesStatus,
             SearchQuery,
             HostDiscover,
             ContainersList,
@@ -861,6 +878,8 @@ mod tests {
             IssuesComment,
             DispatchesPut,
             DispatchesSetStatus,
+            DispatchesReport,
+            DispatchesNote,
             SearchReplace,
             ContainersControl,
         ];

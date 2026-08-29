@@ -598,6 +598,32 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE agent_dispatches ADD COLUMN chunk_path TEXT",
         [],
     );
+    // v61: `agent_dispatches.report` — the worker's structured handoff summary
+    // (verdict/commits/unverified/findings/next), ≤16 KiB, stored on the row
+    // because the Lead reads it WITHOUT opening the worktree — the artifact
+    // pointer (artifact_path) still points at the full document, which stays
+    // git's. Nullable everywhere; a pre-v61 row reads back `None`, which is
+    // exactly the pre-change behaviour. Idempotent (`ALTER` fails harmlessly
+    // once the column exists) so parallel-branch DBs sharing the file tolerate
+    // it.
+    if !has_column(conn, "agent_dispatches", "report") {
+        let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN report TEXT", []);
+    }
+    // v61 companion: per-row progress queue — a worker or monitor appends short
+    // notes (≤4 KiB), read newest-last by `dispatch status`. Kept separate from
+    // `agent_dispatches.note` (the daemon's transport-retry observer ledger):
+    // conflating them would make every progress read re-parse for transport
+    // artifacts.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_dispatch_notes (
+           id             INTEGER PRIMARY KEY AUTOINCREMENT,
+           dispatch_id    INTEGER NOT NULL,
+           created_at_ms  INTEGER NOT NULL,
+           text           TEXT    NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
+           ON agent_dispatch_notes (dispatch_id, created_at_ms);",
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
@@ -614,6 +640,40 @@ fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
     rows.flatten().any(|name| name == col)
 }
 
+/// The legacy additive ladder is intentionally best-effort for cache-only
+/// tables, but v61 adds the storage contract used by the report/note commands.
+/// Verify that contract before `Db::init` stamps the schema version; otherwise
+/// a disk/lock/schema error swallowed by the historical ladder would make a
+/// broken upgrade look complete on the next open.
+pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
+    // Preparing the projection catches a missing `report` column without
+    // reading any user payload.
+    conn.prepare("SELECT report FROM agent_dispatches LIMIT 0")?;
+
+    let notes_table: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='agent_dispatch_notes'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if notes_table.as_deref() != Some("table") {
+        anyhow::bail!("schema v61 migration did not create agent_dispatch_notes");
+    }
+
+    let notes_index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_dispatch_notes_dispatch'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if notes_index.is_none() {
+        anyhow::bail!("schema v61 migration did not create the dispatch notes index");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
@@ -626,6 +686,15 @@ mod tests {
         assert_eq!(super::detect_newer_schema(5, 10), None);
         assert_eq!(super::detect_newer_schema(10, 10), None);
         assert_eq!(super::detect_newer_schema(12, 10), Some(12));
+    }
+
+    #[test]
+    fn v61_schema_verifier_rejects_an_incomplete_upgrade() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE agent_dispatches (id INTEGER PRIMARY KEY, report TEXT);")
+            .unwrap();
+        let err = super::verify_v61_schema(&conn).unwrap_err();
+        assert!(err.to_string().contains("agent_dispatch_notes"), "{err}");
     }
 
     #[test]
@@ -901,6 +970,79 @@ mod tests {
             })
             .unwrap();
         assert_eq!(db.get_dispatch(id).unwrap().unwrap().chunk_path, None);
+
+        // And the stamp advanced.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_v61_db_gains_report_column_and_notes_table_without_resetting_anything() {
+        use crate::issue::AgentDispatchStatus as S;
+        use crate::store::NotificationStore;
+        // A v60-shaped `agent_dispatches` (through v60's `chunk_path`, before
+        // v61's `report` + `agent_dispatch_notes`) carrying a real in-flight
+        // roster row. The v61 migration is one idempotent ALTER plus a
+        // CREATE TABLE IF NOT EXISTS, so the row must survive with the new
+        // column reading NULL and notes must be appendable.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v61-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id         TEXT    NOT NULL,
+                   worktree_path    TEXT    NOT NULL,
+                   agent_name       TEXT    NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status           TEXT    NOT NULL DEFAULT 'queued',
+                   stage            TEXT,
+                   parent_id        INTEGER,
+                   session_id       TEXT,
+                   artifact_path    TEXT,
+                   note             TEXT,
+                   chunk_path       TEXT
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,note,chunk_path)
+                   VALUES ('linear:OLD-4','/wt/old','claude',1000,'running','code',
+                           'transport: retry 2/3', 'code/chunk-1.md');
+                 PRAGMA user_version = 60;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+
+        // The pre-existing row is untouched and now reads the new column as
+        // `None` — exactly the pre-change behaviour.
+        let rows = db.list_dispatches().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].issue_id, "linear:OLD-4");
+        assert_eq!(rows[0].status, S::Running);
+        assert_eq!(rows[0].note.as_deref(), Some("transport: retry 2/3"));
+        assert_eq!(rows[0].chunk_path.as_deref(), Some("code/chunk-1.md"));
+        assert_eq!(rows[0].report, None);
+
+        // The notes table is empty but writable.
+        let note_id = db
+            .append_dispatch_note(rows[0].id, "stage progress: linting")
+            .unwrap();
+        assert!(note_id > 0);
+        let notes = db.dispatch_notes(rows[0].id, None, 0).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].text, "stage progress: linting");
+
+        // The report column is writable.
+        db.set_dispatch_report(rows[0].id, "verdict: done").unwrap();
+        let reloaded = db.get_dispatch(rows[0].id).unwrap().unwrap();
+        assert_eq!(reloaded.report.as_deref(), Some("verdict: done"));
 
         // And the stamp advanced.
         let ver: i64 = db

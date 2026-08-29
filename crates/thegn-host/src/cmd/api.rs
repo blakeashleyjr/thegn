@@ -91,8 +91,9 @@ pub(crate) fn surface_ledgers() -> Vec<thegn_core::capability::SurfaceLedger> {
 
 /// Every capability id the `thegn` CLI drives through the control API — the
 /// non-streaming rows of the `API_CALLS` route table (`thegn api call` reaches
-/// them generically) plus `sessions.attach` (the dedicated `thegn attach`
-/// verb). Mirrors `cmd::session::cli_control_caps` (that copy is test-only).
+/// them generically), `sessions.attach` (the dedicated `thegn attach` verb),
+/// and local dispatch roster verbs which have no control route. Mirrors the
+/// catalog's CLI projection in `cmd::session::cli_control_caps`.
 fn cli_control_caps() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = thegn_svc::control::routes::API_CALLS
         .iter()
@@ -100,6 +101,7 @@ fn cli_control_caps() -> Vec<&'static str> {
         .map(|(cap, _, _)| *cap)
         .collect();
     v.push("sessions.attach");
+    v.extend(["dispatches.report", "dispatches.note", "dispatches.status"]);
     v.sort_unstable();
     v.dedup();
     v

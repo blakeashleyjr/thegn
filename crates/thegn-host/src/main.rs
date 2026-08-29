@@ -961,6 +961,10 @@ fn main() -> anyhow::Result<()> {
     // kills the whole process group atomically, matching what alacritty/kitty do.
     let code: i32 = match &result {
         Ok(()) => cmd::EXIT_OK,
+        Err(e) if e.downcast_ref::<cmd::Retryable>().is_some() => {
+            thegn_core::msg::error(&format!("{e:#}"));
+            cmd::EXIT_RETRYABLE
+        }
         Err(e) => {
             // Print the error chain: the compositor redirected stderr to the
             // logfile during the session, and the alt screen is now torn down,

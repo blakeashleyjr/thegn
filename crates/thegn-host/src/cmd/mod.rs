@@ -85,6 +85,24 @@ impl std::fmt::Display for NotFound {
 
 impl std::error::Error for NotFound {}
 
+/// A command failed for a transient reason and should be retried by a
+/// supervisor. The original error is retained so the command's diagnostic is
+/// not reduced to an exit code.
+#[derive(Debug)]
+pub struct Retryable(pub anyhow::Error);
+
+impl std::fmt::Display for Retryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for Retryable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 /// Emit one machine-readable JSON document (compact, single line, no ANSI) on
 /// stdout. The `--json` convention for list-shaped read commands: exactly one
 /// document per invocation, shape treated as a stable API. (`notify list

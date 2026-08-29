@@ -147,6 +147,8 @@ pub const STAGE_VARS: &[&str] = &[
     "stage",
     "artifact",
     "parent_artifact",
+    // — what thegn binds at session-open time (THE-88) —
+    "row",
 ];
 
 /// Variables the `[merge_queue] land_message` template may reference: the
@@ -1268,12 +1270,12 @@ mod tests {
                 "STAGE_VARS dropped the issue variable {v}"
             );
         }
-        for v in ["stage", "artifact", "parent_artifact"] {
+        for v in ["stage", "artifact", "parent_artifact", "row"] {
             assert!(STAGE_VARS.contains(&v), "STAGE_VARS is missing {v}");
         }
         assert_eq!(
             validate_template(
-                "Stage {stage} for issue {issue_number}: write {artifact}, read {parent_artifact}",
+                "Stage {stage} for issue {issue_number}: write {artifact}, read {parent_artifact}, row {row}",
                 STAGE_VARS,
                 false
             ),
