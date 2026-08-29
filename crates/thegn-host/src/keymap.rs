@@ -152,6 +152,8 @@ pub enum Action {
     PoolDecrement,
     TogglePanel,
     ToggleRecorder,
+    /// Fork the focused live daemon session into a fresh process.
+    ForkSession,
     /// Open time-travel replay for the focused pane — scrub its recorded byte
     /// stream (play/pause, seek, search across time). See `[replay]`.
     EnterReplay,
@@ -544,6 +546,7 @@ impl Action {
             Action::PoolDecrement => "warm-pool-decrement",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
+            Action::ForkSession => "fork-session",
             Action::EnterReplay => "enter-replay",
             Action::ExportCast => "export-cast",
             Action::PasteRegister => "paste-register",
@@ -690,6 +693,7 @@ impl Action {
             "warm-pool-decrement" => Action::PoolDecrement,
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
+            "fork-session" => Action::ForkSession,
             "enter-replay" | "replay" => Action::EnterReplay,
             "export-cast" => Action::ExportCast,
             "paste-register" => Action::PasteRegister,
