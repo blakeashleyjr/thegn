@@ -490,7 +490,7 @@ impl AgentDispatchStatus {
     /// fixed plain-text output — `Queued`, `Spawning` and `Running` are
     /// **distinct** here: three states that all rendered as ⚙ made a whole
     /// pipeline look identically busy whatever it was actually doing. `Unknown`
-    /// keeps [`Glyph::DotHollow`] — the same token [`Self::glyph_token`] gives
+    /// keeps [`crate::termcaps::Glyph::DotHollow`] — the same token [`Self::glyph_token`] gives
     /// it — so the CLI and the chrome stay one vocabulary; it does not read as
     /// a queued row.
     pub fn glyph_set(self, gl: &crate::termcaps::GlyphSet) -> (&'static str, crate::theme::Hue) {
