@@ -25,7 +25,7 @@ use thegn_svc::control::{
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
-use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionActor, SessionMeta, SessionMsg};
+use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionMeta, SessionMsg};
 use super::tombstone::Tombstone;
 
 /// One live session in the daemon's table.
@@ -508,85 +508,33 @@ impl ControlApi for DaemonService {
             );
             let rows = spec.rows.max(1);
             let cols = spec.cols.max(1);
-            let (pane_tx, pane_rx) = mpsc::channel(256);
-            let cwd = cwd_s.as_ref().map(std::path::PathBuf::from);
             // Composition order, weakest first: what the launch resolved, then
             // the caller's explicit pairs, then the two keys that are the
             // daemon's alone.
             let mut env = env_pairs;
             env.extend(spec.env.iter().cloned());
             let env = session_identity_env(&id, &self.endpoint, &env);
-            let pty = crate::pane_pty::open_pty(
-                0, // per-session channel: the id tag is unused
-                &argv,
-                cwd.as_deref(),
-                &env,
-                rows,
-                cols,
-                pane_tx,
-                None, // a daemon has no render loop to wake
-                None, // ...and no grid — no off-thread feed sink
-            )
-            .map_err(ControlError::Internal)?;
-
-            let meta = SessionMeta {
-                id: id.clone(),
-                worktree: worktree.clone(),
-                // For an agent launch the *agent's* name is the program, not
-                // the `sh` that the sandbox wrapper happens to exec — that is
-                // what makes the session agent-bearing for the activity model.
-                program: match &spec.agent {
-                    Some(a) => a.agent.clone(),
-                    None => crate::pane::program_name(&argv),
-                },
-                cwd: cwd_s.clone(),
-                created_at_ms: now_ms(),
-                pid: pty.pid,
-                forked_from: None,
+            let program = match &spec.agent {
+                Some(a) => a.agent.clone(),
+                None => crate::pane::program_name(&argv),
             };
-            let live = Arc::new(Mutex::new(LiveMeta {
-                rows,
-                cols,
-                attached: 0,
-                ..Default::default()
-            }));
-            let (msg_tx, msg_rx) = mpsc::channel(64);
-            let actor = SessionActor::new(
-                meta.clone(),
-                live.clone(),
-                pty,
-                rows,
-                cols,
-                self.events.clone(),
-                self.idle_tx.clone(),
-                self.sessions.clone(),
-                self.tombs.clone(),
-                self.db.clone(),
-                self.config.clone(),
-                None,
-            );
-            let info = {
-                let live = live.lock().expect("live meta lock");
-                meta.info(&live, None)
-            };
-            // Insert the entry BEFORE spawning the actor. The actor's teardown
-            // removes its own entry (session.rs) — if the child exits instantly
-            // (exec failure / `sh -c true`) and the actor is scheduled first, a
-            // spawn-then-insert order runs the remove before the insert, leaving
-            // a PHANTOM entry for a dead actor: listed forever, `kill` no-ops, and
-            // idle-exit (busy = sessions non-empty) never fires. Inserting first
-            // guarantees the teardown removal always observes the entry.
-            self.sessions.lock().await.insert(
-                id.clone(),
-                SessionEntry {
-                    msg_tx,
-                    meta,
-                    live,
+            let info = super::fork::spawn_session(
+                self,
+                super::fork::SpawnRequest {
+                    id: id.clone(),
+                    argv,
+                    cwd: cwd_s,
+                    env,
+                    rows,
+                    cols,
+                    worktree: worktree.clone(),
+                    program,
                     recipe,
+                    forked_from: None,
+                    handoff: None,
                 },
-            );
-            tokio::spawn(actor.run(pane_rx, msg_rx));
-            self.emit(EventFrame::Sessions);
+            )
+            .await?;
 
             // Ask a running compositor to graft this session into a real pane.
             // Best-effort by design: with no instance up, the session is simply
@@ -2235,6 +2183,169 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// Exercise the actual control-plane fork through `ControlApi`. This keeps
+    /// the source alive while checking that resize state reaches the child,
+    /// identity and handoff data cross only through the child environment,
+    /// adopt placement is recorded, and validation/dead-session failures do
+    /// not create another daemon entry.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_control_path_inherits_geometry_and_cleans_handoff() {
+        use std::os::unix::fs::PermissionsExt;
+        use thegn_core::store::IntentStore;
+
+        let state = tempfile::tempdir().expect("isolated state dir");
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            state.path().to_str().expect("state path"),
+        )]);
+        let (svc, _events) = service(0);
+        let sh = thegn_core::util::which_path("sh").unwrap_or_else(|| "/bin/sh".into());
+        let script = "i=0; while [ $i -lt 2005 ]; do printf 'source-line-%s\\n' $i; i=$((i+1)); done; if [ -n \"$THEGN_FORKED_FROM\" ]; then printf 'forked=%s\\nscrollback=%s\\n' \"$THEGN_FORKED_FROM\" \"$THEGN_FORK_SCROLLBACK\"; fi; while :; do sleep 1; done";
+        let source = svc
+            .open(OpenSpec {
+                argv: vec![sh, "-c".into(), script.into()],
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+            .await
+            .expect("open source");
+        svc.resize(&source.id, 41, 137)
+            .await
+            .expect("resize source");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = svc.snapshot(&source.id).await.expect("source lives");
+            if let EventFrame::PaneSnapshot {
+                rows, cols, bytes, ..
+            } = snapshot
+                && rows == 41
+                && cols == 137
+                && String::from_utf8_lossy(&bytes).contains("source-line-2004")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "source output/resize arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let child = svc
+            .fork(ForkSpec {
+                session: source.id.clone(),
+                scrollback: true,
+                adopt: true,
+                tab: true,
+                ..Default::default()
+            })
+            .await
+            .expect("fork source");
+        assert_ne!(child.id, source.id, "fork allocates a new daemon id");
+        assert_ne!(child.pid, source.pid, "fork allocates a new child pid");
+        assert_eq!((child.rows, child.cols), (41, 137));
+        assert_eq!(child.forked_from.as_deref(), Some(source.id.as_str()));
+
+        let handoff = state
+            .path()
+            .join("thegn/forks")
+            .join(format!("{}.txt", child.id));
+        let history = std::fs::read_to_string(&handoff).expect("handoff exists");
+        assert!(history.lines().count() <= 2_000, "snapshot bound is shared");
+        assert!(history.contains("source-line-2004"));
+        assert_eq!(
+            std::fs::metadata(&handoff).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let intents = svc
+            .db
+            .lock()
+            .unwrap()
+            .take_intents("adopt_session")
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        assert!(intents[0].payload.contains(&child.id));
+        assert!(intents[0].payload.contains("\"tab\":true"));
+
+        let mut child_text = String::new();
+        let child_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !child_text.contains(&format!("forked={}", source.id)) {
+            if let EventFrame::PaneSnapshot { bytes, .. } =
+                svc.snapshot(&child.id).await.expect("child lives")
+            {
+                child_text = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            assert!(
+                std::time::Instant::now() < child_deadline,
+                "child identity output arrived"
+            );
+        }
+        assert!(child_text.contains(&format!("scrollback={}", handoff.display())));
+        svc.kill(&child.id).await.expect("kill child");
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handoff.exists() {
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "handoff cleaned on exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let before = svc
+            .list_sessions()
+            .await
+            .expect("list after child exit")
+            .len();
+        let invalid = svc
+            .fork(ForkSpec {
+                session: "native-id".into(),
+                harness: Some("pi".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("reserved harness must not spawn");
+        assert!(invalid.to_string().contains("reserved"));
+        assert_eq!(
+            svc.list_sessions()
+                .await
+                .expect("list after validation")
+                .len(),
+            before
+        );
+
+        svc.kill(&source.id).await.expect("kill source");
+        let dead_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc
+                .list_sessions()
+                .await
+                .expect("list after source exit")
+                .iter()
+                .any(|row| row.id == source.id && row.exited_at_ms.is_some())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < dead_deadline,
+                "source tombstone published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let dead = svc
+            .fork(ForkSpec {
+                session: source.id,
+                ..Default::default()
+            })
+            .await
+            .expect_err("dead session must not fork");
+        assert!(dead.to_string().contains("sessions.open"));
+        // `EnvVarGuard` restores the caller's state root after all daemon work
+        // has stopped, so this test never touches the normal profile.
     }
 
     /// The transport-retry observer's contract (THE-86), driven as a stub: a
