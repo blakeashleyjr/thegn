@@ -239,6 +239,7 @@ pub(crate) fn on_left_press(
     // is checked after caret/Ctrl-click guards so those established gestures
     // keep their precedence, and before ordinary workspace activation.
     if hit.kind == RowKind::Workspace
+        && my >= hit.y + hit.lead_gap
         && hit
             .mq_span
             .is_some_and(|(start, end)| mx >= start && mx < end)
@@ -2021,14 +2022,15 @@ mod tests {
         use thegn_core::merge_queue_view::{MqRollup, MqTier};
 
         let (mut model, rect) = fixture();
-        model.sidebar_rows[0].mq_rollup = Some(MqRollup {
+        model.sidebar_rows[5].mq_rollup = Some(MqRollup {
             tier: MqTier::Blocked,
             count: 1,
         });
         let hit = hit_rows(&model, rect)
             .into_iter()
-            .find(|hit| hit.pin_key == "app")
+            .find(|hit| hit.pin_key == "lib")
             .expect("workspace token row");
+        assert_eq!(hit.lead_gap, 1, "the test must cover a painted divider gap");
         let (start, end) = hit.mq_span.expect("workspace token span");
         let mut sb = SidebarState::default();
         let mut ui = MouseUi::default();
@@ -2046,9 +2048,29 @@ mod tests {
         assert!(matches!(
             out,
             PressOut::Outcome(SidebarOutcome::OpenMergeQueue { ref repo_path })
-                if repo_path == "/repos/app"
+                if repo_path == "/repos/lib"
         ));
         assert!(end > start);
+
+        // The token is not painted on a workspace's leading divider gap, even
+        // though that gap belongs to the same row hit box.
+        let mut gap_ui = MouseUi::default();
+        let mut gap_sb = SidebarState::default();
+        let gap = on_left_press(
+            &mut gap_ui,
+            &mut gap_sb,
+            &mut model,
+            &crate::session::Session::default(),
+            rect,
+            start,
+            hit.y,
+            false,
+            Instant::now(),
+        );
+        assert!(!matches!(
+            gap,
+            PressOut::Outcome(SidebarOutcome::OpenMergeQueue { .. })
+        ));
     }
 
     #[test]
