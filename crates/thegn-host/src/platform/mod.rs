@@ -81,12 +81,12 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
             return;
         };
         if file.write_all(value.as_bytes()).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+            drop(std::fs::remove_file(&tmp));
             return;
         }
         drop(file);
         if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+            drop(std::fs::remove_file(&tmp));
         }
     }
 
@@ -97,7 +97,7 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => return,
             _ => {}
         }
-        let _ = std::fs::write(path, value);
+        drop(std::fs::write(path, value));
     }
 }
 
@@ -117,7 +117,7 @@ pub(crate) fn test_symlink(
     }
     #[cfg(not(unix))]
     {
-        let _ = (original, link);
+        drop((original, link));
         Err(std::io::Error::other(
             "symlinks are not supported by this test",
         ))
