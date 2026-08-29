@@ -363,17 +363,20 @@ recipes for adding a config key, action, provider or plugin are in
 Run inside `nix develop` (rust toolchain + tools).
 
 ```sh
-just quick [crate]   # fast inner-loop check while iterating (clippy, no tests)
-just build           # cargo build --workspace (debug)
-just test            # unit tests
-just smoke           # hermetic end-to-end CLI test
-just lint            # clippy -D warnings + shellcheck + yamllint + taplo
+just quick [crate]   # inner loop: clippy on lib/bin only (no tests)
+cargo nextest run -p <crate> <filter>  # targeted tests while iterating
+just build           # one-time workspace debug build
+just test            # pre-push correctness gate
+just smoke           # pre-push correctness gate
+just lint            # deliberate pre-PR/diagnostic gate
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
-just ci              # fmt-check + lint + build + test + coverage + smoke + nix-build + …
+just ci              # final CI gate (coverage; no `just e2e` snapshot suite)
 ```
 
-Iterate with `just quick`; save the heavy gates (`just test`, `just coverage`,
-`just ci`) for when you're preparing to push or open a PR. See
+Iterate with the scoped commands above; save the heavy gates (`just test`,
+`just lint`, `just coverage`, `just ci`) for deliberate pre-push, diagnostic, or
+pre-PR validation. For UI work, run the full `just e2e` suite once the change is
+settled. See
 [`docs/coverage.md`](docs/coverage.md) for the tier breakdown, and
 [`docs/testing-with-muse.md`](docs/testing-with-muse.md) for driving and
 testing the TUI itself — by hand, in CI, or from an agent.
