@@ -1,6 +1,6 @@
 //! Unix impls of the platform seam: real fds, signals, and process groups.
 
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
