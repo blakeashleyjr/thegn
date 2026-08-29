@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) use crate::config_repo::lenient_env_selector;
+pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
+
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
 pub fn config_warn(msg: &str) {
@@ -4362,62 +4366,6 @@ impl RemoteOverlay {
     }
 }
 
-/// The shape of a repo-root `.thegn.*` file: a `[sandbox]` table overlay
-/// plus an optional `[keybinds]` table (the most-specific keybind layer).
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
-pub(crate) struct RepoConfigFile {
-    pub(crate) sandbox: SandboxOverlay,
-    keybinds: KeybindConfig,
-    /// Per-repo notification routing overlay, applied on top of global +
-    /// profile (see [`Config::effective_notifications`]).
-    #[serde(default)]
-    notifications: NotificationsOverlay,
-    /// Per-repo issue-tracker overlay (Linear team / Jira project) that scopes
-    /// this repo's "My Work" feed (see [`Config::repo_issues`]).
-    #[serde(default)]
-    issues: crate::config_issues::IssuesOverlay,
-    /// Selects a named `[env.<name>]` for every worktree of this repo (the
-    /// repo-level layer of env selection). Empty ⇒ inherit the global default.
-    #[serde(default)]
-    env: String,
-    /// A repo overlay's `[metrics]` table exists ONLY so a `kind = "command"`
-    /// collector defined here can be *detected and refused* — its targets are
-    /// never merged into the running scraper (metrics are global config only).
-    /// See [`Config::repo_command_collector_warnings`].
-    #[serde(default)]
-    metrics: RepoMetricsOverlay,
-}
-
-/// The `[metrics]` shape a repo-root `.thegn.*` might carry. Deliberately
-/// minimal: only the target list, and only so command collectors can be
-/// rejected with a warning. Nothing here reaches the live scraper.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
-pub(crate) struct RepoMetricsOverlay {
-    pub(crate) targets: Vec<MetricsTarget>,
-}
-
-/// Warnings for command collectors declared in an untrusted (repo/workspace)
-/// metrics overlay. A command collector is a config-driven code-execution door,
-/// so it is global config only; a repo overlay attempting one is refused here.
-/// Prometheus targets from an overlay are simply not merged (no warning) — a
-/// command target gets a loud, named warning because running it would be RCE on
-/// opening the repo.
-pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Vec<String> {
-    targets
-        .iter()
-        .filter(|t| t.kind == MetricsTargetKind::Command)
-        .map(|t| {
-            format!(
-                "ignoring metrics target '{}': command collectors are global config only \
-                 (a repo .thegn.* overlay cannot run commands)",
-                t.name
-            )
-        })
-        .collect()
-}
-
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
 /// Ctrl+Alt+f). Runs yazi by default, with its config kept separate from the
 /// system under a private `config_home`.
@@ -6916,36 +6864,17 @@ fn render_scalar(v: serde_json::Value) -> String {
 // Strict `config validate` lives in the sibling `config_validate` module
 // (schema-driven: every `config_enum!` reachable from `Config` is checked).
 // Re-exported here so callers keep the historical `config::validate_str` path.
+pub use crate::config_repo::{
+    OverlayFormat, RepoOverlayCandidate, RepoOverlayDiagnostic, RepoOverlayDiscovery,
+    discover_repo_overlay, parse_overlay_value, validate_repo_overlay,
+};
 pub use crate::config_validate::validate_str;
 
 /// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
 /// YAML, then JSON (first existing file wins); parse errors warn and are ignored
 /// so a malformed repo file never blocks opening a worktree.
 pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
-    for (ext, kind) in [
-        ("toml", "toml"),
-        ("yaml", "yaml"),
-        ("yml", "yaml"),
-        ("json", "json"),
-    ] {
-        let path = repo_root.join(format!(".thegn.{ext}"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let parsed: Result<RepoConfigFile, String> = match kind {
-            "toml" => toml::from_str(&text).map_err(|e| e.to_string()),
-            "yaml" => serde_yaml::from_str(&text).map_err(|e| e.to_string()),
-            _ => serde_json::from_str(&text).map_err(|e| e.to_string()),
-        };
-        return match parsed {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                config_warn(&format!("{}: parse error: {e}; ignoring", path.display()));
-                None
-            }
-        };
-    }
-    None
+    crate::config_repo::load_repo_overlay(repo_root)
 }
 
 /// A repo-root `.thegn.*` overlay that EXISTS but failed to parse. Returned by
@@ -6953,14 +6882,7 @@ pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfi
 /// dropped overlay can change placement (e.g. a malformed file that was selecting
 /// `env = "sprites"` → falls back to local/host), which is exactly the silent
 /// degradation a failover-off env forbids.
-#[derive(Debug, Clone)]
-pub struct RepoOverlayParseError {
-    pub path: PathBuf,
-    pub error: String,
-    /// Best-effort lenient read of the `env = "…"` selector (empty if absent), so
-    /// a parse failure elsewhere in the file doesn't hide which env it requested.
-    pub selected_env: String,
-}
+pub use crate::config_repo::RepoOverlayParseError;
 
 /// If a repo-root `.thegn.*` file exists but fails to parse, return the error
 /// (+ a lenient `env =` read). `None` when there's no file or it parses cleanly.
@@ -6969,55 +6891,7 @@ pub struct RepoOverlayParseError {
 /// the caller surface it (a visible halt/warning) so a dropped overlay that
 /// changes placement is never silent.
 pub fn repo_overlay_parse_error(repo_root: &Path) -> Option<RepoOverlayParseError> {
-    for (ext, kind) in [
-        ("toml", "toml"),
-        ("yaml", "yaml"),
-        ("yml", "yaml"),
-        ("json", "json"),
-    ] {
-        let path = repo_root.join(format!(".thegn.{ext}"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let err = match kind {
-            "toml" => toml::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-            "yaml" => serde_yaml::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-            _ => serde_json::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-        };
-        return err.map(|error| RepoOverlayParseError {
-            path,
-            error,
-            selected_env: lenient_env_selector(&text),
-        });
-    }
-    None
-}
-
-/// Best-effort extraction of a top-level `env = "VALUE"` (TOML/JSON-ish) or
-/// `env: VALUE` (YAML) selector from a repo overlay's raw text, so a parse failure
-/// elsewhere doesn't hide which env it was selecting. Empty when absent.
-fn lenient_env_selector(text: &str) -> String {
-    for line in text.lines() {
-        let t = line.trim();
-        let Some(rest) = t.strip_prefix("env") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':')) else {
-            continue; // `environment = …`, `env_name = …`, `[env.x]` — not the selector
-        };
-        let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
-        if !v.is_empty() && !v.starts_with('{') && !v.starts_with('[') {
-            return v.to_string();
-        }
-    }
-    String::new()
+    crate::config_repo::repo_overlay_parse_error(repo_root)
 }
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
