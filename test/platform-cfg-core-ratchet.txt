@@ -14,3 +14,5 @@ profile.rs
 ssh_creds.rs
 startup.rs
 util.rs
+# config_repo.rs: two symlink-only tests (#[cfg(unix)] on std::os::unix::fs::symlink); no runtime cfg.
+config_repo.rs
