@@ -270,6 +270,7 @@ pub mod testenv;
 pub mod theme;
 pub mod theme_contrast;
 pub mod toolchain;
+pub mod toolchain_activation;
 pub mod transport_error;
 pub mod trust_class;
 pub mod usage;
