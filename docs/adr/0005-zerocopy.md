@@ -38,3 +38,9 @@ If a measured hot fixed-layout wire or storage format is introduced, evaluate a
 small codec module at the owning service edge. Specify endian/alignment,
 fuzz malformed input, and keep the domain model independent. This would be a
 new dependency, not a cleanup of the current FFI sites.
+
+## Audit
+
+Any future direct adoption must pass `deny.toml:8-39,41-63,70-78,94-97` and
+`just deps-audit` (`justfile:455-462`), with `cargo machete` confirming the
+codec import is real and the owning edge remaining outside `thegn-core`.

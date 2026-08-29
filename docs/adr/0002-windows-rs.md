@@ -36,6 +36,11 @@ mingw and MSRV checks, and inspect `cargo tree --target all -i windows-sys` and
 deduplication; MSRV 1.89 is not the blocker. The musl and macOS products must
 remain unaffected.
 
+The generated Win32 bindings remain unsafe at the existing platform boundary;
+no binding is exposed through `thegn-core`, and this record adds no new unsafe
+surface. The maintenance cost is the deliberately retained duplicate Windows
+cohorts until a target-tested alignment can remove them.
+
 ## Reopen condition
 
 Perform version alignment only as a separate migration with the Windows GNU

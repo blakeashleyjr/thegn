@@ -38,3 +38,14 @@ Track axum's tungstenite major on every update. Change the direct pin and axum
 cohort together, inspect `cargo tree --target all -i tokio-tungstenite` and
 `-i tungstenite`, and preserve service-task ownership of all network work.
 No transport behavior changes are part of this record.
+
+The client and server APIs keep network I/O in service tasks and add no unsafe
+surface to `thegn-core`; the maintenance risk is async transport and TLS
+version skew at that service edge. The direct declaration remains feature
+trimmed so an update does not silently widen the build graph.
+
+## Audit
+
+Future pin or axum-cohort changes must pass
+`deny.toml:8-39,41-63,70-78,94-97` and `just deps-audit`
+(`justfile:455-462`), with `cargo machete` retaining the direct client use.

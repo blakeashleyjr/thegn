@@ -36,9 +36,20 @@ libproc for measured activity hot paths; mingw/Windows retains the sysinfo
 activity and metrics leaves. Replacing it would be a substantive migration
 with no measured gain.
 
+Sysinfo's public sampling API adds no new unsafe surface in thegn's callers;
+the maintenance boundary is the owned sampler, feature trim, and periodic
+cadence. Any dependency update still has to pass the workspace audit and keep
+the existing cross-target implementation choices intact.
+
 ## Reopen condition
 
 Any replacement must be measured and occur behind `StatsSampler`/`ProcSampler`,
 preserving background ownership, PID deduplication, selective refresh, and
 missing-metric degradation. It must be checked for the musl, macOS, and mingw
 lanes before changing the direct dependency.
+
+## Audit
+
+The direct declaration remains subject to `deny.toml:8-39,41-63,70-78,94-97`
+and `just deps-audit` (`justfile:455-462`); `cargo machete` must continue to
+see the direct sampler use.

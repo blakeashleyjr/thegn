@@ -15,7 +15,8 @@ uses are `USER` for the bare-host remote default
 (`crates/thegn-core/src/remote.rs:147-164`) and `USERNAME` for the Windows
 `icacls` grant target (`crates/thegn-core/src/fsperm.rs:43-68`).
 
-There is no `whoami` direct dependency in `Cargo.toml` or `Cargo.lock`.
+There is no `whoami` direct dependency in the workspace dependency declarations
+(`Cargo.toml:35-220`) or package entries in `Cargo.lock`.
 
 ## Decision
 
@@ -38,3 +39,10 @@ If a daemonized path must resolve an account with no environment, file a
 focused platform change. Prefer a narrow `getpwuid_r` seam with explicit
 degradation over adopting a broad identity crate for unused fields. That would
 be a new dependency, subject to MSRV, cross-target, and audit review.
+
+## Safety and audit
+
+Rejecting the crate adds no unsafe surface or maintenance/build cost. If the
+future identity seam is opened, keep the FFI in the platform edge and run
+`deny.toml:8-39,41-63,70-78,94-97` plus `just deps-audit`
+(`justfile:455-462`) before adoption.
