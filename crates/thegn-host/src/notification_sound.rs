@@ -57,6 +57,7 @@ impl PlaybackSnapshot {
 pub(crate) struct SoundRuntime {
     snapshot: Mutex<Arc<PlaybackSnapshot>>,
     queue: Mutex<Option<std::sync::mpsc::SyncSender<SoundJob>>>,
+    reload_generation: AtomicU64,
     dropped: AtomicU64,
     fallback_bell: AtomicBool,
     waker: TerminalWaker,
@@ -67,6 +68,7 @@ impl SoundRuntime {
         Arc::new(Self {
             snapshot: Mutex::new(Arc::new(PlaybackSnapshot::empty())),
             queue: Mutex::new(None),
+            reload_generation: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             fallback_bell: AtomicBool::new(false),
             waker,
@@ -75,13 +77,28 @@ impl SoundRuntime {
 
     /// Build a fresh snapshot off the compositor loop, then swap it atomically.
     pub(crate) fn reload(self: &Arc<Self>, cfg: SoundConfig) {
+        // Linearize the generation bump with snapshot installation. Otherwise a
+        // worker can pass its generation check just before a newer reload bumps
+        // the counter and then install the stale snapshot afterward.
+        let generation = {
+            let _snapshot = self.snapshot.lock().unwrap();
+            self.reload_generation
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+        };
         let runtime = Arc::clone(self);
         std::thread::Builder::new()
             .name("notify-sound-config".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let snapshot = Arc::new(build_snapshot(&cfg));
-                *runtime.snapshot.lock().unwrap() = snapshot;
+                // Config reloads may overlap while pack/provider inspection is
+                // in flight. Never let a slower, older build roll back a
+                // snapshot from a newer config.
+                let mut current = runtime.snapshot.lock().unwrap();
+                if runtime.reload_generation.load(Ordering::Acquire) == generation {
+                    *current = snapshot;
+                }
             })
             // best-effort: a failed config worker leaves the last snapshot in place
             .ok();
@@ -153,7 +170,13 @@ impl SoundRuntime {
                             }
                         }
                         SoundJob::Command(command) => {
-                            run_command(&command);
+                            if let Err(error) = run_command(&command) {
+                                tracing::debug!(
+                                    target: "thegn::notify_sound",
+                                    %error,
+                                    "legacy sound command failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -273,13 +296,19 @@ fn supported_format(path: &Path, formats: &[&str]) -> bool {
 }
 
 #[expect(clippy::disallowed_methods)]
-fn run_command(command: &str) {
-    let _ = std::process::Command::new("sh")
+fn run_command(command: &str) -> Result<(), String> {
+    let status = std::process::Command::new("sh")
         .args(["-c", command])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status(); // best-effort: a configured command is an advisory sound
+        .status()
+        .map_err(|error| format!("could not start legacy sound command: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("legacy sound command exited with {status}"))
+    }
 }
 
 pub(crate) fn emit(runtime: &Arc<SoundRuntime>, emit: &SoundEmit) {
@@ -315,6 +344,19 @@ mod tests {
             ..bell.clone()
         };
         assert!(needs_worker(&command));
+    }
+
+    #[test]
+    fn stale_reload_generation_cannot_replace_newer_snapshot() {
+        let generation = AtomicU64::new(1);
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        generation.store(2, Ordering::Release);
+        assert_ne!(generation.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn legacy_command_failure_is_reported() {
+        assert!(run_command("exit 7").is_err());
     }
 
     fn needs_worker(cfg: &SoundConfig) -> bool {
