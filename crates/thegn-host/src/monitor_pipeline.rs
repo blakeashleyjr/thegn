@@ -97,7 +97,7 @@ impl DispatchRoster {
 /// The configured stage order, from `[[pipeline.stages]]`.
 ///
 /// Declaration order IS the board's column order (the org chart). Unnamed or
-/// blank stages are skipped by [`Pipeline::stage_names`], so a half-written
+/// blank stages are skipped by `Pipeline::stage_names`, so a half-written
 /// entry never opens a phantom column. An empty `[[pipeline.stages]]` yields an
 /// empty order and the board falls back to alphabetical stage names (see
 /// [`ordered_rows`]) — stable, just not the org chart's.

@@ -24,7 +24,7 @@
 //!
 //! # Staleness
 //!
-//! [`crate::store::IntentStore::take_intents`] is claim-and-delete over the
+//! `IntentStore::take_intents` is claim-and-delete over the
 //! whole kind, so the drain is **drain-all**: nothing is left behind to
 //! accumulate, which is the leak this fixes. Drain-all alone is not enough
 //! though — rows written while no compositor was running would all be applied at
