@@ -3578,7 +3578,10 @@ pub(crate) fn spawn_pr_cache_refresh(
             ) {
                 let snapshot = thegn_core::review::PrReviewSnapshot {
                     worktree_key: cache_key.clone(),
-                    branch: pr.head_ref_name.clone(),
+                    // Review-cache identity follows the checked-out local
+                    // branch, just like pr_cache. The PR head ref may use a
+                    // different name for fork/remote workflows.
+                    branch: panel.branch.clone(),
                     pr_number: pr.number,
                     head_oid: pr.head_ref_oid.clone(),
                     fetched_at: thegn_core::util::now(),
