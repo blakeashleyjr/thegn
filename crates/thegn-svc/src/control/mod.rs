@@ -64,6 +64,11 @@ pub struct SessionInfo {
     pub cols: u16,
     pub created_at_ms: i64,
     pub attached_clients: u32,
+    /// Whether the live session currently has a harness-level error banner.
+    /// This is included in session listings so a new event subscriber can
+    /// bootstrap its cache before consuming activity deltas.
+    #[serde(default)]
+    pub error_active: bool,
     /// Set while a relay lease is keeping this detached session warm.
     pub lease_expires_at: Option<i64>,
     /// The PTY child's pid on the daemon's host. A same-host compositor uses
@@ -229,6 +234,9 @@ pub enum BrowserAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionActivityEvent {
     pub session: String,
+    /// Worktree owning this session, when it is attached to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     /// `blocked` | `working` | `done` | `idle`.
     pub state: String,
     /// `none` | `active` | `waiting` | `read`.
@@ -241,6 +249,17 @@ pub struct SessionActivityEvent {
     /// What the agent said when it raised its hand, for a `blocked` state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Whether the live agent has emitted a harness failure banner that has
+    /// not yet been cleared by resumed normal output. Drives the sidebar's
+    /// `Failure` tier (with `AttentionReason::AgentFailed`) via the
+    /// `AttentionInputs::agent_error_active` input the attention model
+    /// already understands.
+    ///
+    /// `#[serde(default)]` so older clients (v1.0 alpha) can still decode new
+    /// frames; the field defaults to `false` for them, which is exactly the
+    /// pre-THE-89 behaviour (no error banner ⇒ no error state).
+    #[serde(default)]
+    pub error_active: bool,
 }
 
 /// A condition for the agent-driving `wait` verb: block until a session reaches

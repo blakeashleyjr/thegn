@@ -63,6 +63,7 @@ message SessionInfo {
   int64 created_at_ms = 7;
   uint32 attached_clients = 8;
   optional int64 lease_expires_at = 9;
+  bool error_active = 10;
 }
 
 message AttachRequest {

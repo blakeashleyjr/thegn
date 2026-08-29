@@ -225,6 +225,7 @@ network.mode
 network.offline_after_failures
 network.recovery_probe_secs
 notifications.active_mode
+notifications.agent_error_signatures
 notifications.desktop
 notifications.desktop_min_urgency
 notifications.github_mentions

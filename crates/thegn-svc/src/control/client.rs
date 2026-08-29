@@ -45,6 +45,7 @@ pub fn discover(store: &dyn ControlStore, scope: &str, now_ms: i64) -> Option<Co
         .map(|d| ControlAddr::Unix(PathBuf::from(d.endpoint)))
 }
 
+#[derive(Clone)]
 pub struct ControlClient {
     addr: ControlAddr,
 }

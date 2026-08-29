@@ -83,6 +83,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
             if let Err(e) = cfg.diagnostics.validate_crash_sink() {
                 errs.push(e);
             }
+            // `[notifications]` live-agent signatures must be non-empty and
+            // bounded; otherwise an empty substring would match every line.
+            errs.extend(cfg.notifications.validate());
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());

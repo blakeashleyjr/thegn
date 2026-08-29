@@ -462,6 +462,9 @@ pub struct AttentionInputs {
     /// no new state anywhere. `None` when no hand is up. Mirrors
     /// [`Self::stage_blocked_since`].
     pub attention_signal_since: Option<i64>,
+    /// Whether the live agent has emitted a harness failure banner that has
+    /// not yet been cleared by resumed normal output.
+    pub agent_error_active: bool,
 }
 
 /// Score one worktree: evaluate every signal, keep the most urgent
@@ -566,6 +569,14 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
     }
     if inputs.ci_running {
         consider(T::Working, 2, R::CiRunning, None, inputs.ci_episode);
+    }
+
+    // A live harness banner is a failure signal, but ranks below a stored agent
+    // failure and process failure and above CI-derived failures. It has no
+    // timestamp or episode: this is ephemeral session state, not a persisted
+    // notification.
+    if inputs.agent_error_active {
+        consider(T::Failure, 3, R::AgentFailed, None, 0);
     }
 
     match inputs.activity {
@@ -1023,6 +1034,47 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((s.tier, s.reason), (T::Failure, R::CiFailed));
+    }
+
+    #[test]
+    fn score_with_agent_error() {
+        let s = score(&AttentionInputs {
+            agent_error_active: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            (s.tier, s.reason, s.sub, s.since),
+            (T::Failure, R::AgentFailed, 3, None)
+        );
+
+        let quiet = score(&AttentionInputs::default());
+        assert_eq!(
+            quiet,
+            score(&AttentionInputs {
+                agent_error_active: false,
+                ..Default::default()
+            })
+        );
+
+        // Existing higher-priority failure/blocking signals still win.
+        let blocked = score(&AttentionInputs {
+            agent_error_active: true,
+            unread: vec![note(NotificationKind::AgentAttention, 42)],
+            ..Default::default()
+        });
+        assert_eq!(
+            (blocked.tier, blocked.reason),
+            (T::Blocked, R::AgentNeedsInput)
+        );
+        let process_failed = score(&AttentionInputs {
+            agent_error_active: true,
+            unread: vec![note(NotificationKind::ProcessFailed, 42)],
+            ..Default::default()
+        });
+        assert_eq!(
+            (process_failed.tier, process_failed.reason),
+            (T::Failure, R::ProcessFailed)
+        );
     }
 
     #[test]
