@@ -570,6 +570,9 @@ lint:
     # Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
     # removed per-file size limit, "e2e runs every push") must not come back.
     bash test/stale-docs-guard.sh
+    # Guardrail: the hand-run Muse recipe must keep the same config and D-Bus
+    # isolation as the hermetic e2e environment.
+    bash test/muse-docs-guard.sh
     # Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
     # explain each rule). The Rust-side ones run in `just test`.
     bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
