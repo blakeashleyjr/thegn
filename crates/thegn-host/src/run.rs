@@ -1831,6 +1831,7 @@ pub(crate) fn delete_groups_with_mode(
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
     let (mut deleted, mut skipped, mut already_deleting) = (0usize, 0usize, 0usize);
+    let mut spawn_errors = Vec::new();
     for gi in targets {
         if gi >= session.worktrees.len() {
             continue;
@@ -1846,14 +1847,17 @@ pub(crate) fn delete_groups_with_mode(
                 continue;
             }
             let group_name = session.worktrees[gi].name.clone();
-            crate::worktree_lifecycle::spawn_worktree_destroy(
+            if let Err(error) = crate::worktree_lifecycle::spawn_worktree_destroy(
                 PathBuf::from(&path),
                 group_name,
                 session.id.clone(),
                 keep_files,
                 mode,
                 waker.clone(),
-            );
+            ) {
+                spawn_errors.push(format!("{path}: {error}"));
+                continue;
+            }
         }
         // The group and its cache rows remain available until the worker reports
         // that pre_destroy and the requested disk operation both succeeded.
@@ -1865,6 +1869,9 @@ pub(crate) fn delete_groups_with_mode(
     }
     if already_deleting > 0 {
         status.push_str(&format!(" ({already_deleting} already deleting)"));
+    }
+    if !spawn_errors.is_empty() {
+        status.push_str(&format!(" (failed to start: {})", spawn_errors.join("; ")));
     }
     status
 }
@@ -4982,7 +4989,7 @@ pub(crate) fn spawn_worktree_shell_pane(
     if let Some(dir) = dir
         && dir.is_dir()
     {
-        let session_start_claimed = crate::worktree_lifecycle::session_start_once(cfg, dir, None);
+        let session_start_claimed = crate::worktree_lifecycle::session_start_once(cfg, dir, None)?;
         let result = (|| {
             let wt = dir.to_string_lossy().into_owned();
             // Failover off + a non-local env that's known-down (token unset / native

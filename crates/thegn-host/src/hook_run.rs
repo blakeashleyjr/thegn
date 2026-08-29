@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use thegn_core::hooks::{HookContext, HookSpec};
@@ -117,8 +117,13 @@ pub fn run(spec: &HookSpec, context: &HookContext, cwd: &Path) -> HookRunResult 
             }
         }
     };
-    let stdout = join_pipe(out_thread);
-    let stderr = join_pipe(err_thread);
+    // A successful direct shell may leave a background descendant holding one
+    // of these pipe writers open. Give both readers one shared, bounded grace
+    // period, then snapshot what they captured and let any straggling reader
+    // finish detached. Hook completion must not inherit a descendant's lifetime.
+    let pipe_deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    let stdout = join_pipe(out_thread, pipe_deadline);
+    let stderr = join_pipe(err_thread, pipe_deadline);
     let state = if timed_out {
         HookRunState::TimedOut
     } else if status
@@ -202,38 +207,78 @@ fn credential_shaped(key: &str) -> bool {
 }
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const PIPE_DRAIN_TIMEOUT_MARKER: &str = "\n[hook output pipe remained open]";
 
-fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
+#[derive(Default)]
+struct PipeCapture {
+    output: Vec<u8>,
+    truncated: bool,
+}
+
+impl PipeCapture {
+    fn push(&mut self, chunk: &[u8]) {
+        if self.output.len() < MAX_CAPTURE_BYTES {
+            let keep = chunk.len().min(MAX_CAPTURE_BYTES - self.output.len());
+            self.output.extend_from_slice(&chunk[..keep]);
+            self.truncated |= keep < chunk.len();
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn text(&self, drain_timed_out: bool) -> String {
+        let mut text = String::from_utf8_lossy(&self.output).into_owned();
+        if self.truncated {
+            text.push_str("\n[hook output truncated]");
+        }
+        if drain_timed_out {
+            text.push_str(PIPE_DRAIN_TIMEOUT_MARKER);
+        }
+        text
+    }
+}
+
+struct PipeReader {
+    captured: Arc<Mutex<PipeCapture>>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> PipeReader {
+    let captured = Arc::new(Mutex::new(PipeCapture::default()));
+    let worker_capture = Arc::clone(&captured);
+    let (finished_tx, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut output = Vec::new();
         let mut chunk = [0_u8; 8192];
-        let mut truncated = false;
         loop {
             match pipe.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(count) => {
-                    if output.len() < MAX_CAPTURE_BYTES {
-                        let keep = count.min(MAX_CAPTURE_BYTES - output.len());
-                        output.extend_from_slice(&chunk[..keep]);
-                        truncated |= keep < count;
-                    } else {
-                        truncated = true;
-                    }
+                    worker_capture
+                        .lock()
+                        .expect("hook pipe capture mutex poisoned")
+                        .push(&chunk[..count]);
                 }
                 Err(_) => break,
             }
         }
-        let mut text = String::from_utf8_lossy(&output).into_owned();
-        if truncated {
-            text.push_str("\n[hook output truncated]");
-        }
-        text
-    })
+        let _ = finished_tx.send(()); // best-effort: the runner may have timed out its drain
+    });
+    PipeReader { captured, finished }
 }
 
-fn join_pipe(pipe: Option<std::thread::JoinHandle<String>>) -> String {
-    pipe.and_then(|thread| thread.join().ok())
-        .unwrap_or_default()
+fn join_pipe(pipe: Option<PipeReader>, deadline: Instant) -> String {
+    let Some(pipe) = pipe else {
+        return String::new();
+    };
+    let finished = pipe
+        .finished
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .is_ok();
+    pipe.captured
+        .lock()
+        .expect("hook pipe capture mutex poisoned")
+        .text(!finished)
 }
 
 static LOG_INDICES: OnceLock<Mutex<std::collections::HashMap<(String, String), u64>>> =
@@ -462,6 +507,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = run(&spec("true", u64::MAX), &context(), dir.path());
         assert_eq!(result.state, HookRunState::Succeeded);
+    }
+
+    #[test]
+    fn background_descendant_cannot_hold_hook_completion_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let result = run(&spec("printf ready; sleep 2 &", 5), &context(), dir.path());
+        assert_eq!(result.state, HookRunState::Succeeded);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "inherited pipe delayed completion for {:?}",
+            started.elapsed()
+        );
+        assert!(result.stdout.starts_with("ready"));
+        assert!(result.stdout.contains(PIPE_DRAIN_TIMEOUT_MARKER));
     }
 
     #[test]

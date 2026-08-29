@@ -101,6 +101,7 @@ pub(crate) fn close_tab(
         .worktrees
         .get(gi)
         .map(|g| (g.name.clone(), g.path.clone(), gi, g.active_tab));
+    let mut session_end_error = None;
     match cx.session.close_active_tab() {
         crate::session::CloseResult::Tab(tab) => {
             for id in tab.center.pane_ids() {
@@ -114,12 +115,13 @@ pub(crate) fn close_tab(
                         .worktrees
                         .get(gi)
                         .is_some_and(|group| group.tabs.is_empty())
-                {
-                    crate::worktree_lifecycle::session_end_once(
+                    && let Err(error) = crate::worktree_lifecycle::session_end_once(
                         cx.lifecycle_cfg,
                         std::path::Path::new(&path),
                         Some(cx.waker.clone()),
-                    );
+                    )
+                {
+                    session_end_error = Some(error);
                 }
             }
         }
@@ -130,6 +132,9 @@ pub(crate) fn close_tab(
     // now active.
     cx.focus.zone = crate::focus::Zone::Center;
     refresh_tab_model(cx.model, cx.session, cx.sb);
+    if let Some(error) = session_end_error {
+        cx.model.status = format!("Tab closed; session_end failed to start: {error}");
+    }
     *cx.need_relayout = true;
     false
 }
