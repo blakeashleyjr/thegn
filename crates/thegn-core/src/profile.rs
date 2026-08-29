@@ -86,6 +86,55 @@ pub fn profile_root(base: &std::path::Path, name: &str) -> Option<PathBuf> {
     (name != "default").then(|| base.join("profiles").join(name))
 }
 
+/// Resolve an already-created target profile without changing process state.
+///
+/// Migration is a two-store operation, so it must never call [`reroot`] for the
+/// target: doing so would switch the active profile's config and credential
+/// environment in the middle of a command. `base` is the pre-reroot thegn
+/// directory; callers migrating from the active profile should pass the base
+/// returned by [`base_for`].
+pub fn resolve_existing_target(
+    base: &std::path::Path,
+    source_name: &str,
+    raw_target: &str,
+) -> anyhow::Result<ProfilePaths> {
+    let source = normalize_name(source_name);
+    let requested = normalize_name(raw_target);
+    let target_name = on_disk_name(base, &requested);
+    if source == target_name {
+        anyhow::bail!("source and target profiles are the same: {target_name}");
+    }
+    let root = profile_root(base, &target_name).unwrap_or_else(|| base.to_path_buf());
+    if !root.exists() {
+        anyhow::bail!("target profile does not exist: {requested}");
+    }
+    Ok(ProfilePaths {
+        name: target_name,
+        root,
+    })
+}
+
+/// Return the un-rerooted profile base for an active profile. This is pure path
+/// arithmetic and does not inspect config or credentials.
+pub fn base_for(paths: &ProfilePaths) -> PathBuf {
+    if paths.is_default() {
+        paths.root.clone()
+    } else {
+        paths
+            .root
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| paths.root.clone())
+    }
+}
+
+/// Resolve a target relative to the active profile without rerooting it.
+pub fn resolve_active_target(raw_target: &str) -> anyhow::Result<ProfilePaths> {
+    let source = active();
+    resolve_existing_target(&base_for(&source), &source.name, raw_target)
+}
+
 /// Resolve the on-disk name for a profile, applying [`cap_name`] only to
 /// profiles that do not exist yet.
 ///
