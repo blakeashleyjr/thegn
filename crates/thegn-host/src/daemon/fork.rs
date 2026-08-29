@@ -190,13 +190,6 @@ pub(crate) fn run<'a>(
             None
         };
         let child_id = super::service::fresh_id();
-        let handoff = match history.as_deref().filter(|text| !text.is_empty()) {
-            Some(text) => Some(write_handoff(&child_id, text).map_err(ControlError::Internal)?),
-            None => None,
-        };
-        let handoff_s = handoff
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
         let (argv, cwd, env, worktree, program, recipe) = match &plan {
             thegn_core::session_fork::ForkPlan::Raw {
                 argv,
@@ -207,13 +200,7 @@ pub(crate) fn run<'a>(
             } => (
                 thegn_core::sandbox_cpucap::wrap_control_argv(argv.clone(), false),
                 cwd.clone(),
-                thegn_core::session_fork::compose_identity_env(
-                    env,
-                    &child_id,
-                    &service.endpoint,
-                    plan.lineage(),
-                    handoff_s.as_deref(),
-                ),
+                env.clone(),
                 worktree.clone(),
                 crate::pane::program_name(argv),
                 DaemonRecipe::Raw(thegn_core::session_fork::RawLaunchRecipe {
@@ -277,17 +264,10 @@ pub(crate) fn run<'a>(
                     .cwd
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned());
-                let env = thegn_core::session_fork::compose_identity_env(
-                    &resolved.env,
-                    &child_id,
-                    &service.endpoint,
-                    plan.lineage(),
-                    handoff_s.as_deref(),
-                );
                 (
                     resolved.argv,
                     cwd.clone(),
-                    env,
+                    resolved.env,
                     worktree.clone(),
                     agent.clone(),
                     DaemonRecipe::Agent {
@@ -300,6 +280,23 @@ pub(crate) fn run<'a>(
                 )
             }
         };
+        // Resolve the complete launch before creating a handoff file. If a
+        // fresh-config/provider lookup rejects a native fork, no orphaned
+        // context file should remain in the state directory.
+        let handoff = match history.as_deref().filter(|text| !text.is_empty()) {
+            Some(text) => Some(write_handoff(&child_id, text).map_err(ControlError::Internal)?),
+            None => None,
+        };
+        let handoff_s = handoff
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let env = thegn_core::session_fork::compose_identity_env(
+            &env,
+            &child_id,
+            &service.endpoint,
+            plan.lineage(),
+            handoff_s.as_deref(),
+        );
         let info = spawn_session(
             service,
             SpawnRequest {
@@ -371,12 +368,42 @@ pub(crate) fn handoff_path(child_id: &str) -> PathBuf {
 pub(crate) fn write_handoff(child_id: &str, text: &str) -> Result<PathBuf> {
     let path = handoff_path(child_id);
     let dir = path.parent().context("fork handoff has no parent")?;
+
+    // Do not follow an attacker-controlled `forks` symlink. The final file is
+    // opened with CREATE|EXCL as well, so a pre-existing file or symlink can
+    // never be truncated by a scrollback handoff.
+    if let Ok(metadata) = std::fs::symlink_metadata(dir)
+        && (metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        anyhow::bail!(
+            "fork handoff directory is not a real directory: {}",
+            dir.display()
+        );
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     thegn_core::fsperm::restrict_dir_to_owner(dir)
         .with_context(|| format!("restrict {}", dir.display()))?;
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-    thegn_core::fsperm::restrict_to_owner(&path)
-        .with_context(|| format!("restrict {}", path.display()))?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {}", path.display()));
+        }
+    };
+    let result = (|| {
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        thegn_core::fsperm::restrict_to_owner(&path)
+            .with_context(|| format!("restrict {}", path.display()))?;
+        Ok::<(), anyhow::Error>(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(path)
 }
 
@@ -405,7 +432,7 @@ pub(crate) fn agent_recipe(
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_handoff, handoff_path, source_geometry};
+    use super::{cleanup_handoff, handoff_path, source_geometry, write_handoff};
     use crate::daemon::session::LiveMeta;
 
     #[test]
@@ -430,6 +457,28 @@ mod tests {
         std::fs::write(&path, "context").expect("write handoff");
         cleanup_handoff(Some(&path));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn handoff_never_overwrites_a_preexisting_file_link() {
+        let state = tempfile::tempdir().expect("state tempdir");
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            state.path().to_str().expect("state path"),
+        )]);
+        let dir = state.path().join("thegn/forks");
+        std::fs::create_dir_all(&dir).expect("fork directory");
+        let target = state.path().join("outside.txt");
+        std::fs::write(&target, "must remain unchanged").expect("target");
+        std::fs::hard_link(&target, dir.join("child.txt")).expect("hard link");
+
+        let error = write_handoff("child", "attacker-controlled context")
+            .expect_err("existing link must be rejected");
+        assert!(error.to_string().contains("create"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "must remain unchanged"
+        );
     }
 
     #[test]
