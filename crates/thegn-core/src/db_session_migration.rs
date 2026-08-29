@@ -133,7 +133,11 @@ impl SessionMigrationStore for Db {
     }
 
     fn import_migration(&self, plan: &MigrationPlan) -> Result<MigrationImportResult> {
-        if plan.resumed || self.confirm_migration(plan)? {
+        // The fingerprint deliberately excludes target-owned worktree metadata.
+        // Therefore an empty target can otherwise look confirmed for a bundle
+        // whose only transferable row is the worktree registration.
+        let worktree_ready = plan.bundle.worktree.is_none() || plan.target.worktree.is_some();
+        if plan.resumed || (worktree_ready && self.confirm_migration(plan)?) {
             return Ok(MigrationImportResult {
                 counts: MigrationCounts::default(),
                 dispatch_id_map: BTreeMap::new(),
@@ -617,6 +621,39 @@ mod tests {
         assert_eq!(
             target.import_migration(&plan).unwrap().counts,
             MigrationCounts::default()
+        );
+    }
+
+    #[test]
+    fn db_import_does_not_skip_a_worktree_only_bundle() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+                 VALUES('/only','source','tab','/repo','feature','agent',1,'',3)",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "source", "/only")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target.migration_target_snapshot("source", "/only").unwrap(),
+        )
+        .unwrap();
+        let imported = target.import_migration(&plan).unwrap();
+
+        assert_eq!(imported.counts.worktrees, 1);
+        assert!(
+            target
+                .migration_target_snapshot("source", "/only")
+                .unwrap()
+                .worktree
+                .is_some()
         );
     }
 }
