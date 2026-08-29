@@ -5,16 +5,14 @@
 //! review rows after a new-side diff line; the local worktree diff never calls
 //! it.
 
-use thegn_core::forge::model::{DiffFile, DiffLine, PrComment, ReviewThread};
-use thegn_core::review::{AnchoredReview, AnchoredThread};
+use thegn_core::forge::model::{DiffFile, DiffLine, ReviewThread};
+use thegn_core::review::AnchoredReview;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewRow {
     Hunk(String),
     Diff(DiffLine),
     Thread(ReviewThread),
-    Comment(PrComment),
-    Notice(String),
 }
 
 /// Build one file's selectable/renderable rows in PR diff order.
@@ -31,20 +29,11 @@ pub(crate) fn file_rows(
             rows.push(ReviewRow::Diff(line.clone()));
             if let Some(file_review) = anchored {
                 for thread in file_review.threads.iter().filter(|t| {
-                    t.line == line.new_lineno && (include_resolved || !t.thread.resolved)
+                    Some(t.line) == line.new_lineno && (include_resolved || !t.thread.resolved)
                 }) {
                     rows.push(ReviewRow::Thread(thread.thread.clone()));
                 }
             }
-        }
-    }
-    if let Some(file_review) = anchored {
-        for thread in file_review
-            .outdated
-            .iter()
-            .filter(|t| include_resolved || !t.resolved)
-        {
-            rows.push(ReviewRow::Thread(thread.clone()));
         }
     }
     rows
@@ -66,16 +55,4 @@ pub(crate) fn outdated_rows(review: &AnchoredReview, include_resolved: bool) -> 
                 .cloned(),
         )
         .collect()
-}
-
-/// Find the anchored row for a thread without making a nearest-line guess.
-pub(crate) fn anchored_thread<'a>(
-    review: &'a AnchoredReview,
-    thread: &ReviewThread,
-) -> Option<&'a AnchoredThread> {
-    review
-        .files
-        .iter()
-        .flat_map(|file| file.threads.iter())
-        .find(|candidate| candidate.thread.id == thread.id)
 }

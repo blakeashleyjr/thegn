@@ -232,7 +232,7 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 /// queued chunk, so a congestion drop ([`crate::pane_writer::StdinSendError::Full`]) can never
 /// leave the app inside an open paste bracket, and no keystroke can land
 /// between the markers.
-fn paste_text_into_pane(
+pub(crate) fn paste_text_into_pane(
     pane: &mut crate::pane::PtyPane,
     text: &str,
 ) -> Result<(), crate::pane_writer::StdinSendError> {
@@ -11001,6 +11001,7 @@ async fn event_loop<T: Terminal>(
                 &mut pr_view_gen,
                 &pr_view_tx,
                 &waker,
+                &refresh_tx,
             );
         }
         if want_calendar_sync {
@@ -14198,7 +14199,10 @@ async fn event_loop<T: Terminal>(
                         &mut pr_view,
                         &k.key,
                         k.modifiers,
-                        &session,
+                        &mut session,
+                        &mut panes,
+                        &mut focus,
+                        keymap.config(),
                         &refresh_tx,
                         &waker,
                         &mut model,
@@ -17117,6 +17121,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut pr_view_gen,
                                                 &pr_view_tx,
                                                 &waker,
+                                                &refresh_tx,
                                             ) {
                                                 Some(v) => pr_view = Some(v),
                                                 None => model.status = "No pull request".into(),
@@ -21387,6 +21392,7 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     diff_view = Some(crate::actions::open_diff_view(
                                         cfg,
+                                        &model,
                                         &session,
                                         &mut diff_view_gen,
                                         &diff_view_tx,

@@ -23,6 +23,26 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
 fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     let (data, ui, deep) = (&ctx.model.panel, ctx.ui, ctx.deep());
     let mut rows: Vec<PanelRow> = Vec::new();
+    if let Some(snapshot) = &data.review_snapshot {
+        let unresolved = snapshot
+            .conversation
+            .threads
+            .iter()
+            .filter(|thread| !thread.resolved)
+            .count();
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g2(), "PR review"),
+            seg(
+                g(),
+                format!(" · {unresolved} unresolved · open Diff and press Tab"),
+            ),
+        ])));
+    } else if let Some(status) = &data.review_snapshot_status {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g2(), "PR review"),
+            seg(hue(Hue::Amber), format!(" · {status}")),
+        ])));
+    }
     if data.changes.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             g(),
