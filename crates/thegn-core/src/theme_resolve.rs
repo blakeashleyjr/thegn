@@ -60,15 +60,15 @@ pub fn apply_config_overrides(
 
     // The defaults intentionally do not clobber the accent/focus selected by
     // a preset. This preserves the long-standing cycle behavior.
-    if !DEFAULTISH_FOCUS.contains(&focus) {
-        if let Some(rgb) = parse_hex_rgb(focus) {
-            palette.focus = rgb;
-        }
+    if !DEFAULTISH_FOCUS.contains(&focus)
+        && let Some(rgb) = parse_hex_rgb(focus)
+    {
+        palette.focus = rgb;
     }
-    if !DEFAULTISH_ACCENTS.contains(&accent) {
-        if let Some(rgb) = parse_hex_rgb(accent) {
-            palette.accent = rgb;
-        }
+    if !DEFAULTISH_ACCENTS.contains(&accent)
+        && let Some(rgb) = parse_hex_rgb(accent)
+    {
+        palette.accent = rgb;
     }
 }
 

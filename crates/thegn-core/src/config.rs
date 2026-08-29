@@ -6721,13 +6721,15 @@ impl Config {
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
-        crate::theme_resolve::parse_hex_rgb(&self.theme.accent)
-            .unwrap_or_else(|| crate::theme::HUE_TEAL.to_string())
+        parse_hex_rgb(&self.theme.accent).unwrap_or_else(|| crate::theme::HUE_TEAL.to_string())
     }
 
     /// The accent as "#rrggbb" (validated; falls back to the default teal).
     pub fn accent_hex(&self) -> String {
-        crate::theme_resolve::normalize_hex(&self.theme.accent).unwrap_or_else(|| "#6ee7d8".into())
+        match parse_hex_rgb(&self.theme.accent) {
+            Some(_) => self.theme.accent.to_ascii_lowercase(),
+            None => "#6ee7d8".into(),
+        }
     }
 
     /// Resolve the full chrome palette: built-in defaults overlaid with any
@@ -6971,6 +6973,12 @@ fn lenient_env_selector(text: &str) -> String {
         }
     }
     String::new()
+}
+
+// Compatibility shim for the config unit tests and existing private callers;
+// color parsing itself lives in the shared theme resolver.
+fn parse_hex_rgb(hex: &str) -> Option<String> {
+    crate::theme_resolve::parse_hex_rgb(hex)
 }
 
 #[cfg(test)]

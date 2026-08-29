@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::theme::{Hue, Palette, blend_over, contrast_ratio, extend_palette};
 use crate::theme_resolve::normalize_hex;
-use crate::theme_user::{
-    USER_THEME_VERSION, UserTheme, UserThemeColors, UserThemeHues, UserThemeMeta,
-};
+use crate::theme_user::UserTheme;
 
 /// Maximum size accepted by the pure importer.
 pub const MAX_GOGH_BYTES: usize = 64 * 1024;
@@ -134,23 +132,25 @@ pub fn import_gogh(input: &[u8]) -> Result<UserTheme, ThemeImportError> {
 pub fn convert_gogh(scheme: &GoghScheme) -> UserTheme {
     let background = rgb(scheme.background.as_str());
     let foreground = rgb(scheme.foreground.as_str());
-    let dark_anchor = blend_over(&scheme.ansi.colors[0], &scheme.ansi.colors[8], 0.35);
-    let light_anchor = blend_over(&scheme.ansi.colors[15], &scheme.ansi.colors[7], 0.35);
+    let cursor = rgb(scheme.cursor.as_str());
+    let ansi: [String; 16] = std::array::from_fn(|index| rgb(&scheme.ansi.colors[index]));
+    let dark_anchor = blend_over(&ansi[0], &ansi[8], 0.35);
+    let light_anchor = blend_over(&ansi[15], &ansi[7], 0.35);
 
     // Surfaces are relative blends, so a light Gogh scheme remains light and
     // a dark scheme remains dark without a hard-coded terminal assumption.
     let mut palette = Palette {
-        bg0: background,
-        bg1: blend_over(&dark_anchor, scheme.background.as_str(), 0.20),
-        panel: blend_over(&dark_anchor, scheme.background.as_str(), 0.34),
-        panel2: blend_over(&light_anchor, scheme.background.as_str(), 0.20),
-        raise: blend_over(&light_anchor, scheme.background.as_str(), 0.34),
+        bg0: background.clone(),
+        bg1: blend_over(&dark_anchor, &background, 0.20),
+        panel: blend_over(&dark_anchor, &background, 0.34),
+        panel2: blend_over(&light_anchor, &background, 0.20),
+        raise: blend_over(&light_anchor, &background, 0.34),
         border: blend_over(&dark_anchor, &light_anchor, 0.50),
-        focus: scheme.cursor.clone(),
+        focus: cursor,
         text: foreground,
-        dim: blend_over(scheme.foreground.as_str(), scheme.background.as_str(), 0.24),
-        faint: blend_over(scheme.foreground.as_str(), scheme.background.as_str(), 0.48),
-        ghost: blend_over(scheme.foreground.as_str(), scheme.background.as_str(), 0.68),
+        dim: blend_over(&rgb(&scheme.foreground), &background, 0.24),
+        faint: blend_over(&rgb(&scheme.foreground), &background, 0.48),
+        ghost: blend_over(&rgb(&scheme.foreground), &background, 0.68),
         accent: String::new(),
         ghost2: String::new(),
         ghost3: String::new(),
@@ -175,10 +175,10 @@ pub fn convert_gogh(scheme: &GoghScheme) -> UserTheme {
     let mut representatives = Vec::with_capacity(pairs.len());
     let mut losers = Vec::with_capacity(pairs.len());
     for (hue, normal, bright) in pairs {
-        let normal_color = &scheme.ansi.colors[normal];
-        let bright_color = &scheme.ansi.colors[bright];
-        let (winner, loser) = if contrast_ratio(normal_color, &scheme.background)
-            >= contrast_ratio(bright_color, &scheme.background)
+        let normal_color = &ansi[normal];
+        let bright_color = &ansi[bright];
+        let (winner, loser) = if contrast_ratio(normal_color, &background)
+            >= contrast_ratio(bright_color, &background)
         {
             (normal_color, bright_color)
         } else {
@@ -208,14 +208,15 @@ pub fn convert_gogh(scheme: &GoghScheme) -> UserTheme {
     palette.accent = representatives
         .iter()
         .max_by(|(_, left), (_, right)| {
-            contrast_ratio(left, &scheme.background)
-                .total_cmp(&contrast_ratio(right, &scheme.background))
+            contrast_ratio(left, &background).total_cmp(&contrast_ratio(right, &background))
         })
         .map(|(_, color)| color.clone())
-        .unwrap_or_else(|| scheme.foreground.clone());
+        .unwrap_or_else(|| rgb(&scheme.foreground));
     extend_palette(&mut palette);
 
-    UserTheme::from_palette(&scheme.name, &palette)
+    let mut theme = UserTheme::from_palette(&scheme.name, &palette);
+    theme.meta.variant = scheme.variant.clone();
+    theme
 }
 
 fn parse_json(text: &str) -> Result<GoghScheme, ThemeImportError> {
