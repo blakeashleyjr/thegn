@@ -89,6 +89,11 @@ pub struct VerifyFacts {
     pub tracked: bool,
     /// The worktree has uncommitted changes.
     pub dirty: bool,
+    /// The row's `report` column is Some and non-empty after trimming.
+    /// A dispatch with an `artifact_path` set must also file a report;
+    /// the gated rule in [`verify_report`] names `dispatch report` as the
+    /// fix.
+    pub report_present: bool,
 }
 
 /// The verdict for one run-completion claim, plus the reasons a caller can
@@ -101,6 +106,7 @@ pub struct VerifyReport {
     pub exists: bool,
     pub tracked: bool,
     pub dirty: bool,
+    pub report_present: bool,
     /// Only the things that make `ok` false — a caller prints this verbatim
     /// on refusal. `dirty` is deliberately *not* here: it never blocks.
     pub reasons: Vec<String>,
@@ -114,10 +120,12 @@ pub struct VerifyReport {
 ///   (non-pipeline) dispatch; the column has been optional since the roster
 ///   gained pipeline columns, and gating those would break `set-status done`
 ///   for every non-pipeline user while catching nothing.
-/// - Otherwise `ok = exists && tracked`, with one reason per miss. The tracked
-///   check is what catches the real pilot failure ("session exit ≠ done": the
-///   worker wrote the file and never committed it) — git is the source of
-///   truth, so an uncommitted artifact is not a handoff yet.
+/// - Otherwise `ok = exists && tracked && report_present`, with one reason per
+///   miss. The tracked check is what catches the real pilot failure ("session
+///   exit ≠ done": the worker wrote the file and never committed it) — git is
+///   the source of truth, so an uncommitted artifact is not a handoff yet. The
+///   report check gates on the worker filing a handoff summary via `thegn
+///   dispatch report` — a row with an artifact set must also deliver a report.
 /// - A dirty worktree is **reported, never blocking**: it is legitimate
 ///   mid-review, and the tracked check already holds the line.
 pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
@@ -128,6 +136,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             exists: f.exists,
             tracked: f.tracked,
             dirty: f.dirty,
+            report_present: f.report_present,
             reasons: Vec::new(),
         };
     };
@@ -139,12 +148,18 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             "artifact {a:?} exists but git does not track it — commit it"
         ));
     }
+    if !f.report_present {
+        reasons.push(format!(
+            "row has artifact {a:?} but no report — file one with `thegn dispatch report <id>`"
+        ));
+    }
     VerifyReport {
         ok: reasons.is_empty(),
         artifact: f.artifact.clone(),
         exists: f.exists,
         tracked: f.tracked,
         dirty: f.dirty,
+        report_present: f.report_present,
         reasons,
     }
 }
@@ -356,11 +371,25 @@ mod tests {
     // --- run-completion verdict ----------------------------------------------
 
     fn facts(artifact: Option<&str>, exists: bool, tracked: bool, dirty: bool) -> VerifyFacts {
+        // Default report_present to true so existing tests on artifact/tracking
+        // behavior are not affected by the report gate (THE-88 added the report
+        // rule; the old tests test artifact/tracking/dirty, not report).
+        facts_report(artifact, exists, tracked, dirty, true)
+    }
+
+    fn facts_report(
+        artifact: Option<&str>,
+        exists: bool,
+        tracked: bool,
+        dirty: bool,
+        report_present: bool,
+    ) -> VerifyFacts {
         VerifyFacts {
             artifact: artifact.map(str::to_string),
             exists,
             tracked,
             dirty,
+            report_present,
         }
     }
 
@@ -428,6 +457,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_missing_report_blocks_when_artifact_is_set() {
+        let r = verify_report(&facts_report(
+            Some(".thegn/pipeline/THE-76/code/5.md"),
+            true,
+            true,
+            false,
+            false,
+        ));
+        assert!(!r.ok);
+        assert_eq!(r.reasons.len(), 1);
+        assert!(
+            r.reasons[0].contains("no report") && r.reasons[0].contains("dispatch report"),
+            "reason must name the fix: {r:?}"
+        );
+    }
+
+    #[test]
+    fn report_present_unblocks_the_verdict() {
+        // The full positive case: artifact, tracked, and report filed.
+        let r = verify_report(&facts_report(
+            Some(".thegn/pipeline/THE-76/code/5.md"),
+            true,
+            true,
+            false,
+            true,
+        ));
+        assert!(r.ok);
+        assert!(r.reasons.is_empty());
+        assert!(r.report_present);
+    }
+
+    #[test]
+    fn missing_report_is_reported_but_still_stacks_with_other_reasons() {
+        // Both missing-report and untracked reasons appear.
+        let r = verify_report(&facts_report(Some("a.md"), true, false, false, false));
+        assert!(!r.ok);
+        assert_eq!(r.reasons.len(), 2);
+        assert!(r.reasons.iter().any(|s| s.contains("no report")), "{r:?}");
+        assert!(r.reasons.iter().any(|s| s.contains("commit it")), "{r:?}");
+    }
+
     // --- wait-target selection -------------------------------------------------
 
     fn row(
@@ -450,6 +521,7 @@ mod tests {
             artifact_path: None,
             note: None,
             chunk_path: None,
+            report: None,
         }
     }
 

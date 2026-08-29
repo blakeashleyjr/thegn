@@ -34,9 +34,11 @@ impl IssueFacts {
     }
 }
 
-/// Bind the nine `agent_task::STAGE_VARS` for one stage dispatch. The single
-/// place the CLI assembles them, so the render step is unit-testable without
-/// a client or a daemon.
+/// Bind the ten `agent_task::STAGE_VARS` for one stage dispatch (THE-88:
+/// `{row}` joins the nine from THE-86 — a worker must know its row id so it
+/// can call `thegn dispatch report {row} --text …`). The single place the
+/// CLI assembles them, so the render step is unit-testable without a client
+/// or a daemon.
 pub(crate) fn stage_task_vars(
     facts: &IssueFacts,
     branch: &str,
@@ -44,6 +46,7 @@ pub(crate) fn stage_task_vars(
     stage: &str,
     artifact: &str,
     parent_artifact: &str,
+    row_id: i64,
 ) -> TaskVars {
     TaskVars::new()
         .set("issue_number", facts.number.as_str())
@@ -55,6 +58,7 @@ pub(crate) fn stage_task_vars(
         .set("stage", stage)
         .set("artifact", artifact)
         .set("parent_artifact", parent_artifact)
+        .set("row", row_id.to_string())
 }
 
 /// Whether the template reads a tracker-backed var (`{issue_title}`,
@@ -81,4 +85,53 @@ pub(crate) fn render_stage(stage_name: &str, template: &str, vars: &TaskVars) ->
         );
     }
     Ok(prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::agent_task::render_prompt;
+
+    #[test]
+    fn stage_task_vars_binds_row_alongside_the_other_nine() {
+        // THE-88: a worker must know its row id so it can file the
+        // `thegn dispatch report {row} --text …` handoff the Lead reads.
+        // `agent_task::STAGE_VARS` already admits the name; this pins the
+        // binding so a future edit cannot silently drop it.
+        let facts = IssueFacts {
+            number: "THE-88".into(),
+            title: "pipeline token efficiency".into(),
+            body: "data".into(),
+            url: "https://example.test/THE-88".into(),
+        };
+        let vars = stage_task_vars(
+            &facts,
+            "tg/the-88",
+            "/wt/the-88",
+            "code",
+            ".thegn/pipeline/THE-88/code/7.md",
+            ".thegn/pipeline/THE-88/architect/3.md",
+            7,
+        );
+        // The ten expected keys are present, in insertion-stable order.
+        let names = vars.names();
+        for key in [
+            "issue_number",
+            "issue_title",
+            "issue_body",
+            "issue_url",
+            "branch",
+            "worktree",
+            "stage",
+            "artifact",
+            "parent_artifact",
+            "row",
+        ] {
+            assert!(names.contains(&key), "missing {key} in {names:?}");
+        }
+        assert_eq!(vars.get("row"), Some("7"));
+        // And the renderer substitutes it like every other stage var.
+        let rendered = render_prompt("row={row} stage={stage}", &vars).expect("renders");
+        assert_eq!(rendered, "row=7 stage=code");
+    }
 }

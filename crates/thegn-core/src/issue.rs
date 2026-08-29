@@ -271,6 +271,25 @@ pub struct AgentDispatch {
     /// row written before v60 and on any dispatch made without `--chunk`.
     #[serde(default)]
     pub chunk_path: Option<String>,
+    /// The worker's structured handoff summary — verdict, commits, unverified
+    /// items, findings, and next hints — as a free-form text block ≤16 KiB. The
+    /// Lead reads this WITHOUT opening the worktree; the artifact pointer
+    /// (`artifact_path`) still points at the full document, which stays git's.
+    /// `None` on every row written before v61 and on any row whose worker never
+    /// filed one.
+    #[serde(default)]
+    pub report: Option<String>,
+}
+
+/// A note on the per-row progress queue (see `agent_dispatch_notes`).
+/// Kept separate from [`AgentDispatch::note`] — the daemon's transport-retry
+/// observer ledger — so a progress read never conflates the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchNote {
+    pub id: i64,
+    pub dispatch_id: i64,
+    pub created_at_ms: i64,
+    pub text: String,
 }
 
 /// Unix-epoch cutoff separating a SECONDS stamp from a MILLISECONDS one.
@@ -861,6 +880,7 @@ mod spec {
             artifact_path: Some(".thegn/pipeline/architect/3.md".into()),
             note: Some("transport: connection error. (attempt 1/3)".into()),
             chunk_path: Some(".thegn/pipeline/ABC-1/code/chunk-1.md".into()),
+            report: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: AgentDispatch = serde_json::from_str(&json).unwrap();

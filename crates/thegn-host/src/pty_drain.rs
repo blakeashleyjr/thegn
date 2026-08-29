@@ -589,6 +589,23 @@ fn is_daemon_agent_exit(daemon_backed: bool, program: &str) -> bool {
         && !crate::pane::is_runtime_wrapper(program)
 }
 
+/// A successful pane exit is not a completion permission for a pipeline row.
+/// The supervisor must still read the report and pass the artifact/report gate
+/// through `dispatch set-status done`; `None` means leave the row as-is.
+fn automatic_dispatch_exit_status(
+    failed: bool,
+    is_pipeline_row: bool,
+) -> Option<thegn_core::issue::AgentDispatchStatus> {
+    use thegn_core::issue::AgentDispatchStatus;
+    if failed {
+        Some(AgentDispatchStatus::Failed)
+    } else if is_pipeline_row {
+        None
+    } else {
+        Some(AgentDispatchStatus::Done)
+    }
+}
+
 /// A pane's PTY closed: drawer/pool/corner/pin routing, then the owning-tab
 /// respawn-or-remove logic with fast-crash detection and process-exit
 /// notification routing. Moved verbatim from the run.rs drain (`continue`s
@@ -886,16 +903,24 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // resumes from (`AgentDispatchStatus`), so exactly the
                         // rows that mattered were unreadable. `Done`/`Failed`
                         // round-trip through `AgentDispatchStatus::parse`.
-                        use thegn_core::issue::AgentDispatchStatus;
-                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ = db.update_dispatch_status(
-                            dispatch_id,
-                            if failed {
-                                AgentDispatchStatus::Failed
-                            } else {
-                                AgentDispatchStatus::Done
-                            },
-                        );
+                        // A pane exit is attribution, not permission to close a
+                        // pipeline handoff. In particular, a fast worker may
+                        // exit before open_stage stamps its artifact path, so
+                        // checking only that column here has a race. Leave every
+                        // pipeline/artifact row for the supervisor's verified
+                        // `set-status done`; only plain dispatches retain the
+                        // legacy automatic Done stamp.
+                        let auto_status = match db.get_dispatch(dispatch_id) {
+                            Ok(Some(row)) => automatic_dispatch_exit_status(
+                                failed,
+                                row.stage.is_some() || row.artifact_path.is_some(),
+                            ),
+                            Ok(None) | Err(_) => None,
+                        };
+                        if let Some(status) = auto_status {
+                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            let _ = db.update_dispatch_status(dispatch_id, status);
+                        }
                         // Tell the pipeline board its roster moved. A flag, not
                         // a channel send: this task holds no refresh sender, and
                         // the exit has already dirtied the frame — so the board
@@ -1334,6 +1359,26 @@ mod tests {
         assert!(!is_daemon_agent_exit(true, "bwrap"));
         assert!(!is_daemon_agent_exit(true, "ssh"));
         assert!(!is_daemon_agent_exit(true, "systemd-run"));
+    }
+
+    #[test]
+    fn pane_exit_cannot_auto_complete_a_pipeline_row() {
+        use thegn_core::issue::AgentDispatchStatus;
+
+        assert_eq!(
+            automatic_dispatch_exit_status(false, true),
+            None,
+            "a successful pipeline exit still needs supervisor verification"
+        );
+        assert_eq!(
+            automatic_dispatch_exit_status(false, false),
+            Some(AgentDispatchStatus::Done)
+        );
+        assert_eq!(
+            automatic_dispatch_exit_status(true, true),
+            Some(AgentDispatchStatus::Failed),
+            "failure attribution remains recordable without a handoff"
+        );
     }
 
     #[test]
