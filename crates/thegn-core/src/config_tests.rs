@@ -2576,6 +2576,20 @@ fn sound_config_validation_rejects_bad_bounds_and_kind_names() {
 }
 
 #[test]
+fn strict_validation_checks_profile_sound_maps() {
+    let errors = crate::config_validate::validate_str(
+        "[profiles.work.notifications.sound]\nper_kind = { agent_dnoe = \"bell\" }\n",
+    );
+    assert!(
+        errors.iter().any(
+            |error| error.contains("profiles.work.notifications.sound.per_kind")
+                && error.contains("agent_done")
+        ),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn repo_notification_overlay_cannot_supply_sound_paths_or_commands() {
     let dir = tmpdir("notification-sound-trust");
     std::fs::write(

@@ -240,36 +240,40 @@ impl SoundConfig {
     }
 
     pub fn validate(&self) -> Vec<String> {
+        self.validate_at("notifications.sound")
+    }
+
+    pub(crate) fn validate_at(&self, field: &str) -> Vec<String> {
         let mut errors = Vec::new();
         if !self.volume.is_finite() || !(0.0..=1.0).contains(&self.volume) {
             errors.push(format!(
-                "notifications.sound.volume: expected a finite number from 0.0 to 1.0, got {}",
-                self.volume
+                "{field}.volume: expected a finite number from 0.0 to 1.0, got {}",
+                self.volume,
             ));
         }
         if !self.pack.trim().is_empty() && !SoundRef::is_user_path(self.pack.trim()) {
             errors.push(format!(
-                "notifications.sound.pack: expected an absolute or ~-expanded directory path, got {:?}",
+                "{field}.pack: expected an absolute or ~-expanded directory path, got {:?}",
                 self.pack
             ));
         }
         for kind in &self.always_kinds {
-            if let Some(error) = validate_kind_name("notifications.sound.always_kinds", kind) {
+            if let Some(error) = validate_kind_name(&format!("{field}.always_kinds"), kind) {
                 errors.push(error);
             }
         }
         for (kind, reference) in &self.per_kind {
-            if let Some(error) = validate_kind_name("notifications.sound.per_kind", kind) {
+            if let Some(error) = validate_kind_name(&format!("{field}.per_kind"), kind) {
                 errors.push(error);
             }
             if let Err(error) = SoundRef::parse(reference) {
-                errors.push(format!("notifications.sound.per_kind.{kind}: {error}"));
+                errors.push(format!("{field}.per_kind.{kind}: {error}"));
             }
         }
         if !self.chime_file.trim().is_empty()
             && let Err(error) = SoundRef::parse(&self.chime_file)
         {
-            errors.push(format!("notifications.sound.chime_file: {error}"));
+            errors.push(format!("{field}.chime_file: {error}"));
         }
         errors
     }
@@ -362,6 +366,13 @@ impl NotificationsOverlay {
             && self.sound.is_none()
             && self.modes.is_none()
             && self.active_mode.is_none()
+    }
+
+    pub(crate) fn validate_sound(&self, field: &str) -> Vec<String> {
+        self.sound
+            .as_ref()
+            .map(|sound| sound.validate_at(field))
+            .unwrap_or_default()
     }
 
     pub fn apply(self, base: &mut NotificationsConfig) {

@@ -172,6 +172,11 @@ impl SoundRuntime {
         self.fallback_bell.swap(false, Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn latch_fallback_bell_for_test(&self) {
+        self.fallback_bell.store(true, Ordering::Relaxed);
+    }
+
     pub(crate) fn report(cfg: &SoundConfig) -> serde_json::Value {
         let snapshot = build_snapshot(cfg);
         serde_json::json!({
