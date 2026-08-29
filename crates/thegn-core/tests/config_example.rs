@@ -258,3 +258,32 @@ fn example_config_parses_as_config() {
         panic!("config.toml.example does not parse as Config: {e}");
     }
 }
+
+#[test]
+fn generated_config_reference_keeps_example_schema_keys() {
+    let path = example_path();
+    let example = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let generated = thegn_core::help::config_ref::page(&example);
+    let doc = scan_example(&generated);
+    let required = common::required();
+    let mut missing = Vec::new();
+    let mut expected = BTreeSet::new();
+    for (pattern, key) in &required.keys {
+        if allowlisted(pattern, Some(key)) {
+            continue;
+        }
+        expected.insert(key);
+    }
+    let generated_keys: BTreeSet<&String> = doc.keys.iter().map(|(_, key)| key).collect();
+    for key in expected {
+        if !generated_keys.contains(key) {
+            missing.push(key.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "generated config reference dropped schema/example keys:\n  {}",
+        missing.join("\n  ")
+    );
+}
