@@ -492,7 +492,7 @@ pub fn spawn_worktree_destroy(
             });
         if success && let Some(db) = db.as_ref() {
             crate::handlers::workspace_remove::forget_worktree_path_in_db(
-                &db,
+                db,
                 &session_id,
                 &worktree.to_string_lossy(),
             );
@@ -1163,9 +1163,10 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut panes = crate::panes::Panes::new(tx);
         let mut session = completion_test_session();
-        let mut model = crate::chrome::FrameModel::default();
-        model.sidebar_workspaces =
-            vec![("repo".into(), "repo".into(), "repo".into(), "repo".into())];
+        let mut model = crate::chrome::FrameModel {
+            sidebar_workspaces: vec![("repo".into(), "repo".into(), "repo".into(), "repo".into())],
+            ..Default::default()
+        };
         let mut sb = crate::run::SidebarState::default();
         assert!(apply_completions_from(
             vec![LifecycleCompletion::WorkspaceDeleteFinished {
