@@ -1828,6 +1828,32 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_call_error_followed_by_activity_stays_clear() {
+        let mut harness = spawn_actor_as(
+            "printf 'Error: Command failed with no output\\n'; printf 'normal output\\n'; sleep 0.2; cat",
+            None,
+            "claude",
+        );
+        let feed = &mut harness.feed;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), feed.recv()).await
+            else {
+                continue;
+            };
+            if let EventFrame::Activity { json } = frame.as_ref() {
+                let event: SessionActivityEvent =
+                    serde_json::from_str(json).expect("activity event decodes");
+                assert!(
+                    !event.error_active,
+                    "tool-call noise must stay below failure"
+                );
+            }
+        }
+    }
+
     #[test]
     fn error_state_uses_the_last_completed_line_in_a_chunk() {
         let signatures = AgentErrorSignatures::defaults();
