@@ -143,14 +143,21 @@ impl Db {
     /// is hashed and matched against the stored sha-256 hex.
     pub fn verify_iroh_token(&self, token: &str) -> Result<Option<String>> {
         let hash = sha256_hex(token);
-        let sandbox = self
-            .conn()
-            .query_row(
-                "SELECT sandbox FROM iroh_tokens WHERE token = ?1",
-                params![hash],
-                |r| r.get::<_, String>(0),
-            )
-            .ok();
+        let res = self.conn().query_row(
+            "SELECT sandbox FROM iroh_tokens WHERE token = ?1",
+            params![hash],
+            |r| r.get::<_, String>(0),
+        );
+        // best-effort read: no rows is the None case (no live token); a real
+        // DB error is surfaced but still degrades to a rejection.
+        let sandbox = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "iroh token lookup failed; treating as unmatched");
+                None
+            }
+        };
         Ok(sandbox)
     }
 
@@ -259,7 +266,7 @@ mod tests {
                 params![secret],
                 |r| r.get(0),
             )
-            .ok();
+            .ok(); // best-effort: test: asserts the miss (raw plaintext finds no row)
         assert_eq!(by_plain, None);
         // But verify() (which hashes) still resolves it.
         assert_eq!(

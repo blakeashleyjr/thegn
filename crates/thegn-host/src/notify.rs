@@ -150,7 +150,7 @@ impl NotifyState {
                 })
                 .is_ok()
         {
-            let _ = self.waker.wake();
+            let _ = self.waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     }
 
@@ -230,7 +230,7 @@ impl NotifyState {
     /// Latch a terminal bell and wake the loop to flush it.
     pub fn ring_bell(&self) {
         self.pending_bell.store(true, Ordering::Relaxed);
-        let _ = self.waker.wake();
+        let _ = self.waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
 
     /// Consume the latched bell (called once per render flush by the loop).
@@ -242,7 +242,7 @@ impl NotifyState {
     pub fn toggle_dnd(&self) -> bool {
         let now = self.dnd_active();
         *self.dnd_forced.lock().unwrap() = Some(!now);
-        let _ = self.waker.wake();
+        let _ = self.waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         !now
     }
 
@@ -271,7 +271,7 @@ impl NotifyState {
         let idx = names.iter().position(|m| m == &*mode).unwrap_or(0);
         let next = names[(idx + 1) % names.len()].clone();
         *mode = next.clone();
-        let _ = self.waker.wake();
+        let _ = self.waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         next
     }
 
@@ -347,13 +347,14 @@ pub(crate) fn spawn_sound_command(cmd: &str) {
         .spawn(move || {
             // Utility: an audible cue paired with a toast — the user hears the result.
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let _ = std::process::Command::new("sh")
+            let _ = std::process::Command::new("sh") // best-effort: sound playback is advisory: a missing player just skips it
                 .arg("-c")
                 .arg(&cmd)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+            // best-effort: sound thread: a failed spawn just skips the sound
         })
         .ok();
 }

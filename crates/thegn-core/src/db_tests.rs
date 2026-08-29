@@ -524,6 +524,7 @@ fn split_page_suffix_cases() {
 #[test]
 fn migrates_v5_tab_layout_into_groups() {
     let dir = std::env::temp_dir().join(format!("tg-db-mig-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -580,6 +581,7 @@ fn migrates_v5_tab_layout_into_groups() {
     drop(db);
     let db = Db::open_at(&path).unwrap();
     assert_eq!(db.groups_for_session("/r").unwrap().len(), 3);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -994,6 +996,7 @@ fn migrates_workspaces_position_from_recency() {
     // workspace sorts first — preserving the old recency order on the first
     // launch after upgrade.
     let dir = std::env::temp_dir().join(format!("tg-db-ws-mig-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -1025,6 +1028,7 @@ fn migrates_workspaces_position_from_recency() {
         vec!["/newest", "/mid", "/old"],
         "backfill must rank position 0 = most-recently-active"
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1048,6 +1052,7 @@ fn migrates_registers_additive_from_v26() {
     // A pre-v27 DB (no `registers` table): opening it creates the table
     // additively without touching existing data.
     let dir = std::env::temp_dir().join(format!("tg-db-reg-mig-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -1082,6 +1087,7 @@ fn migrates_registers_additive_from_v26() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ver, SCHEMA_VERSION);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1577,6 +1583,7 @@ fn empty_and_miss_paths() {
 #[test]
 fn open_on_disk() {
     let dir = std::env::temp_dir().join(format!("tg-db-disk-{}-{:p}", std::process::id(), &0u8));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     // Open at an explicit path rather than mutating the global XDG_STATE_HOME
     // (which other parallel tests read via Db::open()/db_path()).
@@ -1591,6 +1598,7 @@ fn open_on_disk() {
         let db = Db::open_at(&path).unwrap();
         assert!(db.is_known_repo("/r").unwrap());
     }
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     // db_path() still derives the default location from XDG_STATE_HOME.
     assert!(db_path().ends_with("thegn/thegn.db"));
@@ -2634,6 +2642,7 @@ fn migrate_v6_skips_extra_kind_rows_with_empty_name() {
     // branch) and another session has no recorded active_tab (active_idx
     // defaults to 0). Exercises the migration's edge branches.
     let dir = std::env::temp_dir().join(format!("tg-db-mig6e-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -2664,6 +2673,7 @@ fn migrate_v6_skips_extra_kind_rows_with_empty_name() {
     );
     // No active marker recorded → group active_tab defaulted to 0.
     assert_eq!(groups[0].active_tab, 0);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2673,6 +2683,7 @@ fn migrates_v2_drops_and_recreates_session_tables() {
     // v2→v3 remap drops worktrees/workspaces but preserves the `repos`
     // recents history (the only irreplaceable data).
     let dir = std::env::temp_dir().join(format!("tg-db-v2-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -2700,6 +2711,7 @@ fn migrates_v2_drops_and_recreates_session_tables() {
     // The pre-v3 worktrees/workspaces rows were dropped & recreated empty.
     assert!(db.worktrees().unwrap().is_empty());
     assert!(db.workspaces().unwrap().is_empty());
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2752,6 +2764,7 @@ fn schema_snapshot(
 /// checks; the caller removes the dir when done.
 fn open_ladder_fixture(tag: &str, seed_sql: &str) -> (std::path::PathBuf, Db) {
     let dir = std::env::temp_dir().join(format!("tg-db-ladder-{tag}-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -2801,6 +2814,7 @@ fn ladder_v2_per_session_schema_preserves_repos() {
     // The per-session tables were dropped and recreated empty.
     assert!(db.worktrees().unwrap().is_empty());
     assert!(db.workspaces().unwrap().is_empty());
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2835,6 +2849,7 @@ fn ladder_v5_flat_tab_layout_becomes_groups() {
     assert_eq!(db.active_tab("/r").unwrap().as_deref(), Some("app/feat"));
     let tabs = db.group_tabs_for_session("/r").unwrap();
     assert_eq!(tabs.len(), 2, "one migrated tab per legacy row");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2874,6 +2889,7 @@ fn ladder_v7_worktrees_position_backfilled_from_creation_order() {
     assert_eq!(wts[0].branch, "tg/a");
     assert_eq!(wts[0].repo_root, "/r");
     assert_eq!(wts[0].tab_name, "app/a");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2914,6 +2930,7 @@ fn ladder_v13_group_tabs_gain_pane_columns() {
     assert_eq!(tabs[0].pane_cmds, "");
     assert_eq!(tabs[0].pane_sessions, "");
     assert_eq!(tabs[0].scrollback_snapshot, "");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2945,6 +2962,7 @@ fn ladder_v15_workspaces_position_backfilled_from_recency() {
     );
     // The ALTERed `kind` reads back as the repo default on legacy rows.
     assert!(ws.iter().all(|w| w.kind == "repo"));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2989,6 +3007,7 @@ fn ladder_v21_gains_merge_queue_forwards_pool_and_registers() {
         db.all_registers().unwrap(),
         vec![('a', "migrated".to_string())]
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3020,6 +3039,7 @@ fn fast_reopen_round_trips_and_reports_no_mismatch() {
     // identically. The round trip is the behavioral pin: if the fast path ever
     // skipped a table the write or read here would fail.
     let dir = std::env::temp_dir().join(format!("thegn-fastopen-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("thegn.db");
     {
@@ -3048,6 +3068,7 @@ fn fast_reopen_round_trips_and_reports_no_mismatch() {
             Some("v2")
         );
     }
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3191,6 +3212,7 @@ fn del_worktrees_for_repo_cascades_to_session_attention() {
 #[test]
 fn v57_retires_the_unread_agent_attention_backlog_once() {
     let dir = std::env::temp_dir().join(format!("thegn-mig-v57-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("thegn.db");
     {
@@ -3231,12 +3253,14 @@ fn v57_retires_the_unread_agent_attention_backlog_once() {
     drop(db);
     let db = Db::open_at(&path).unwrap();
     assert_eq!(db.get_unread_notifications().unwrap().len(), 2);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn v58_rewrites_legacy_seconds_dispatch_stamps_in_place() {
     let dir = std::env::temp_dir().join(format!("thegn-mig-v58-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("thegn.db");
     let secs = crate::util::now();
@@ -3293,6 +3317,7 @@ fn v58_rewrites_legacy_seconds_dispatch_stamps_in_place() {
         )
         .unwrap();
     assert_eq!(raw2, secs * 1000, "a second open must not scale again");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3306,6 +3331,7 @@ fn v58_leaves_a_value_at_the_ms_epoch_floor_alone() {
     // hand-drift between them (in either direction: a row just below the
     // floor MUST scale, a row at or above it must not).
     let dir = std::env::temp_dir().join(format!("thegn-mig-v58-floor-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("thegn.db");
     let at_floor = crate::issue::MS_EPOCH_FLOOR;
@@ -3369,6 +3395,7 @@ fn v58_leaves_a_value_at_the_ms_epoch_floor_alone() {
             .dispatched_at_ms,
         at_floor
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3379,6 +3406,7 @@ fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
     // warn, and tolerates the unknown tables. Exactly the pre-fast-path
     // behavior.
     let dir = std::env::temp_dir().join(format!("thegn-fastdown-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("thegn.db");
     {
@@ -3396,6 +3424,7 @@ fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ver, SCHEMA_VERSION + 1);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 

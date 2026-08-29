@@ -55,7 +55,7 @@ pub(crate) fn rename_folder(
             }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
     "Folder renamed".into()
@@ -129,7 +129,7 @@ pub(crate) fn create_empty_folder(
             }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
     format!("Created folder \"{name}\"")
@@ -197,6 +197,7 @@ pub(crate) fn delete_folder(
                 // prefix delete would wipe those sibling folders' persisted
                 // collapse/pin state. toggle_collapse/toggle_pin unpersist
                 // these same keys exactly, so match that.
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.del_ui_state(
                     crate::handlers::sidebar_persist::SIDEBAR_SCOPE,
                     &format!("collapse:{key}"),
@@ -204,11 +205,11 @@ pub(crate) fn delete_folder(
                 let _ = db.del_ui_state(
                     crate::handlers::sidebar_persist::SIDEBAR_SCOPE,
                     &format!("pin:{key}"),
-                );
+                ); // best-effort: cache write: pin state unpersist; toggle_pin does the same
             }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
     if name.is_empty() {
@@ -258,7 +259,7 @@ pub(crate) fn close_terminal(
                 }
             }
             if refresh_tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
     }

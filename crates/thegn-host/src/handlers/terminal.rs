@@ -43,7 +43,7 @@ pub(crate) fn persist(choice: &TerminalChoice) -> bool {
     if !choice.sandbox.is_empty() && choice.sandbox != "host" && choice.sandbox != "none" {
         // best-effort: the sandbox column only matters across restarts; the
         // live session spawns from the registry below.
-        let _ = db.set_terminal_sandbox(&choice.name, &choice.sandbox);
+        let _ = db.set_terminal_sandbox(&choice.name, &choice.sandbox); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     ok
 }
@@ -55,7 +55,7 @@ pub(crate) fn persist(choice: &TerminalChoice) -> bool {
 /// cache, and a failed write only costs a chip until the next launch.
 pub(crate) fn record_observed(name: &str, backend: &str) {
     if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.set_terminal_observed(name, backend);
+        let _ = db.set_terminal_observed(name, backend); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 

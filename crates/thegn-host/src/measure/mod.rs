@@ -78,8 +78,8 @@ pub(crate) fn permit(what: &'static str) -> Option<tokio::sync::OwnedSemaphorePe
 /// to) is measured within a second or two instead of waiting out a full pump
 /// interval.
 pub(crate) fn kick(tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>) {
-    let _ = tx.send(crate::hydrate::RefreshKind::Disk);
-    let _ = tx.send(crate::hydrate::RefreshKind::Loc { watch: false });
+    let _ = tx.send(crate::hydrate::RefreshKind::Disk); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+    let _ = tx.send(crate::hydrate::RefreshKind::Loc { watch: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
 }
 
 /// Every path a background scan should cover: the worktree registry, plus each

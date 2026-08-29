@@ -107,12 +107,12 @@ pub(crate) fn apply_local_parity(
     } else {
         false
     };
-    let _ = std::fs::remove_file(&list_host);
+    let _ = std::fs::remove_file(&list_host); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 
     if !has_bundle && patch.is_none() && !has_tar {
         // Clean working tree with nothing unpushed — the origin clone is parity.
-        let _ = std::fs::remove_file(&bundle_host);
-        let _ = std::fs::remove_file(&tar_host);
+        let _ = std::fs::remove_file(&bundle_host); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_file(&tar_host); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         return Ok(());
     }
 
@@ -131,8 +131,8 @@ pub(crate) fn apply_local_parity(
         let dst = artifact_path(STEM, "tar");
         block_on_provider(|| async { provider.write(id, &dst, &bytes).await })?;
     }
-    let _ = std::fs::remove_file(&bundle_host);
-    let _ = std::fs::remove_file(&tar_host);
+    let _ = std::fs::remove_file(&bundle_host); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    let _ = std::fs::remove_file(&tar_host); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 
     // Replay over the clone, in the workdir. Each stage is independently guarded
     // (`[ -s file ]`) and non-fatal so a partial capture still helps.

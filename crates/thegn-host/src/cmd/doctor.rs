@@ -667,7 +667,7 @@ fn sampler_disk_path(cfg: &Config) -> std::path::PathBuf {
 /// never rides the compositor's fast path.
 fn sample_metric_coverage(cfg: &Config) -> Vec<thegn_metrics::FamilyReport> {
     let mut s = thegn_metrics::StatsSampler::new(sampler_disk_path(cfg));
-    let _ = s.sample();
+    let _ = s.sample(); // best-effort: warm-up sample: CPU/net are deltas, so the first only primes
     std::thread::sleep(std::time::Duration::from_millis(300));
     let snap = s.sample();
     thegn_metrics::coverage(&snap)
@@ -1429,7 +1429,13 @@ fn hosts_report(cfg: &Config) {
         outln!("  (none — add one with `thegn host add user@box` or [host.<name>])");
         return;
     }
-    let db = thegn_core::db::Db::open().ok();
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(e) => {
+            outln!("  (db unavailable: {e} — host sections below may be incomplete)");
+            None
+        }
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

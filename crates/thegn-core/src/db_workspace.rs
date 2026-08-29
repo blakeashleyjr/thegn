@@ -480,14 +480,21 @@ impl WorkspaceStore for Db {
     /// The worktree path for a (session, tab) pair — how the panel plugin maps
     /// the focused tab to a worktree (PaneInfo carries no cwd).
     fn worktree_for_tab(&self, session: &str, tab: &str) -> Result<Option<String>> {
-        let r = self
-            .conn()
-            .query_row(
-                "SELECT worktree FROM worktrees WHERE session_name=?1 AND tab_name=?2 LIMIT 1",
-                params![session, tab],
-                |r| r.get::<_, String>(0),
-            )
-            .ok();
+        let res = self.conn().query_row(
+            "SELECT worktree FROM worktrees WHERE session_name=?1 AND tab_name=?2 LIMIT 1",
+            params![session, tab],
+            |r| r.get::<_, String>(0),
+        );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to a miss (the pane maps to nothing).
+        let r = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "worktree_for_tab read failed; treating as a miss");
+                None
+            }
+        };
         Ok(r)
     }
 
@@ -758,14 +765,21 @@ impl WorkspaceStore for Db {
 
     /// The serialized spec for a named layout, if present.
     fn get_layout(&self, name: &str) -> Result<Option<String>> {
-        let r = self
-            .conn()
-            .query_row(
-                "SELECT spec FROM layouts WHERE name=?1",
-                params![name],
-                |r| r.get::<_, String>(0),
-            )
-            .ok();
+        let res = self.conn().query_row(
+            "SELECT spec FROM layouts WHERE name=?1",
+            params![name],
+            |r| r.get::<_, String>(0),
+        );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to a miss (the layout reads as absent).
+        let r = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "get_layout read failed; treating as a miss");
+                None
+            }
+        };
         Ok(r)
     }
 

@@ -176,10 +176,10 @@ pub fn forget(name: &str) {
         m.clear();
     }
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, name) {
-        let _ = entry.delete_credential();
+        let _ = entry.delete_credential(); // best-effort: cleanup: the credential may already be absent
     }
     if let Ok(path) = secrets_file(name) {
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }
 
@@ -276,7 +276,7 @@ fn probe_keyring() -> bool {
         Ok(e) => {
             let ok = e.set_password("1").is_ok();
             if ok {
-                let _ = e.delete_credential();
+                let _ = e.delete_credential(); // best-effort: probe cleanup: a failed delete leaves a stray probe credential
             }
             ok
         }
@@ -549,8 +549,8 @@ pub fn mcp_keyring_probe() -> thegn_core::seam::ProbeReport {
 fn mcp_index_path() -> Option<PathBuf> {
     let cfg = thegn_core::config::Config::path();
     let dir = std::path::Path::new(&cfg).parent()?.join("secrets");
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
+    let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
+    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir); // best-effort: hardening: a failed chmod must never block the caller
     Some(dir.join("mcp-index.json"))
 }
 
@@ -616,7 +616,7 @@ mod tests {
             resolve(&format!("file:{}", f.display())).as_deref(),
             Some("filetoken")
         );
-        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_file(&f); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

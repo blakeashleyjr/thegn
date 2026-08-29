@@ -120,7 +120,7 @@ fn frecency() -> &'static SharedFrecency {
     static FRECENCY: OnceLock<SharedFrecency> = OnceLock::new();
     FRECENCY.get_or_init(|| {
         let shared = SharedFrecency::default();
-        let _ = std::fs::create_dir_all(fff_dir());
+        let _ = std::fs::create_dir_all(fff_dir()); // best-effort: dir prep: a later write reports the real failure
         match FrecencyTracker::open(fff_dir().join("frecency")) {
             Ok(tracker) => {
                 if shared.init(tracker).is_err() {
@@ -141,7 +141,7 @@ fn query_tracker() -> &'static SharedQueryTracker {
     static QUERIES: OnceLock<SharedQueryTracker> = OnceLock::new();
     QUERIES.get_or_init(|| {
         let shared = SharedQueryTracker::default();
-        let _ = std::fs::create_dir_all(fff_dir());
+        let _ = std::fs::create_dir_all(fff_dir()); // best-effort: dir prep: a later write reports the real failure
         match QueryTracker::open(fff_dir().join("queries")) {
             Ok(tracker) => {
                 if shared.init(tracker).is_err() {
@@ -272,7 +272,7 @@ fn file_search_tracked(root: &Path, query: &str, limit: usize) -> Vec<PathHit> {
     };
 
     let parsed = QueryParser::default().parse(query);
-    let qt_guard = query_tracker().read().ok();
+    let qt_guard = query_tracker().read().ok(); // best-effort: advisory tracking: a poisoned lock just skips frecency/query tracking
     let qt = qt_guard.as_ref().and_then(|g| g.as_ref());
 
     let result = picker.fuzzy_search(
@@ -446,12 +446,12 @@ pub fn record_open(root: &Path, query: &str, rel_path: &str) {
     if let Ok(guard) = frecency().read()
         && let Some(tracker) = guard.as_ref()
     {
-        let _ = tracker.track_access(&abs);
+        let _ = tracker.track_access(&abs); // best-effort: advisory tracking: a failed record just loses one frecency point
     }
     if let Ok(mut guard) = query_tracker().write()
         && let Some(tracker) = guard.as_mut()
     {
-        let _ = tracker.track_query_completion(query, root, &abs);
+        let _ = tracker.track_query_completion(query, root, &abs); // best-effort: advisory tracking: a failed record just loses one query-completion hint
     }
 }
 

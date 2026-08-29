@@ -69,7 +69,7 @@ pub fn run_setup_cmd(mut cmd: Command, ctx: &str, fail: &str) -> Result<()> {
 fn drain(pipe: Option<impl Read>) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(mut p) = pipe {
-        let _ = p.read_to_end(&mut buf);
+        let _ = p.read_to_end(&mut buf); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
     }
     buf
 }
@@ -86,8 +86,8 @@ fn wait_with_deadline(child: &mut Child, deadline: Instant, ctx: &str) -> Result
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
+            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             return Err(anyhow::anyhow!(
                 "{ctx} timed out after {}s",
                 SETUP_CMD_TIMEOUT.as_secs()
@@ -225,7 +225,7 @@ fn is_archive(asset: &str) -> bool {
 #[expect(clippy::disallowed_methods)]
 fn extract_binary(archive: &Path, asset: &str, want: &str, dest: &Path) -> Result<()> {
     let scratch = dest.with_file_name(format!(".{want}.x"));
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&scratch); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
     let a = asset.to_ascii_lowercase();
     let status = if a.ends_with(".zip") {

@@ -102,7 +102,7 @@ pub(crate) fn restart_media_watch(
         // of the session after `[media] enabled = false` (and activating the
         // badge opened a popup for a stale track).
         if tx.send(None).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
         return;
     }
@@ -123,7 +123,7 @@ pub(crate) fn spawn_media_op(
             return;
         };
         let cur = client.snapshot().await.unwrap_or(None);
-        let _ = match op {
+        let res = match op {
             MediaOp::PlayPause => client.play_pause().await,
             MediaOp::Next => client.next().await,
             MediaOp::Previous => client.previous().await,
@@ -156,8 +156,11 @@ pub(crate) fn spawn_media_op(
             MediaOp::ChapterPrev => client.chapter_prev().await,
             MediaOp::FullscreenToggle => client.toggle_fullscreen().await,
         };
-        let _ = tx.send(client.snapshot().await.unwrap_or(None));
-        let _ = waker.wake();
+        if let Err(e) = res {
+            tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
+        }
+        let _ = tx.send(client.snapshot().await.unwrap_or(None)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -177,8 +180,8 @@ pub(crate) fn spawn_media_pick(
         } else {
             MediaPick::Playlists(client.playlists().await.unwrap_or_default())
         };
-        let _ = tx.send(pick);
-        let _ = waker.wake();
+        let _ = tx.send(pick); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -220,7 +223,7 @@ pub(crate) fn spawn_media_queue(
             return;
         };
         let q = client.queue().await.unwrap_or_default();
-        let _ = tx.send(q);
-        let _ = waker.wake();
+        let _ = tx.send(q); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }

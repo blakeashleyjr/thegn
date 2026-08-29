@@ -68,14 +68,22 @@ impl HibernationStore for Db {
     }
 
     fn hibernation_for(&self, worktree_path: &str) -> Result<Option<HibernationRow>> {
-        let r = self
-            .conn()
-            .query_row(
-                &format!("SELECT {COLS} FROM worktree_hibernations WHERE worktree_path=?1"),
-                params![worktree_path],
-                row_from,
-            )
-            .ok();
+        let res = self.conn().query_row(
+            &format!("SELECT {COLS} FROM worktree_hibernations WHERE worktree_path=?1"),
+            params![worktree_path],
+            row_from,
+        );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to a miss (the worktree just isn't
+        // known-hibernated).
+        let r = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "hibernation_for read failed; treating as a miss");
+                None
+            }
+        };
         Ok(r)
     }
 

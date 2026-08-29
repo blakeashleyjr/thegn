@@ -4,8 +4,10 @@
 # never take down the compositor — DB cache persists, waker pulses, cleanup,
 # sends to a possibly-gone consumer — and CLAUDE.md asks for a
 # `// best-effort: <why>` comment wherever that isn't obvious. A file leaves
-# this list when every ignore in it is either annotated that way or handled
-# (surfaced via status/msg/tracing on a user-invoked path). The dangerous
+# this list only when no non-comment line in it matches the pattern any more —
+# every ignore handled or the swallow rewritten. A `// best-effort:` annotation
+# is CLAUDE.md hygiene for an ignore that stays; it does not release the pin.
+# The dangerous
 # subset — `let _ = <future>`, which never runs — is a clippy error regardless
 # (`let_underscore_future` in Cargo.toml [workspace.lints]).
 #
@@ -23,7 +25,6 @@ crates/thegn-core/src/account.rs
 crates/thegn-core/src/activity.rs
 crates/thegn-core/src/ansi_cells.rs
 crates/thegn-core/src/bundle.rs
-crates/thegn-core/src/calendar/recur.rs
 crates/thegn-core/src/ci.rs
 crates/thegn-core/src/config_resolve.rs
 crates/thegn-core/src/config.rs
@@ -34,11 +35,9 @@ crates/thegn-core/src/connectivity.rs
 crates/thegn-core/src/db_aux.rs
 crates/thegn-core/src/db_cache.rs
 crates/thegn-core/src/db_calendar.rs
-crates/thegn-core/src/db_hibernate.rs
 crates/thegn-core/src/db_iroh.rs
 crates/thegn-core/src/db_migrate.rs
 crates/thegn-core/src/db_model_proxy.rs
-crates/thegn-core/src/db_pool.rs
 crates/thegn-core/src/db_projects.rs
 crates/thegn-core/src/db.rs
 crates/thegn-core/src/db_tests.rs
@@ -57,7 +56,6 @@ crates/thegn-core/src/dns_filter.rs
 crates/thegn-core/src/envplan.rs
 crates/thegn-core/src/event_bus.rs
 crates/thegn-core/src/file_manager/yazi.rs
-crates/thegn-core/src/forge/mod.rs
 crates/thegn-core/src/fsperm.rs
 crates/thegn-core/src/heal.rs
 crates/thegn-core/src/host_db.rs
@@ -240,8 +238,6 @@ crates/thegn-host/src/monitor/state.rs
 crates/thegn-host/src/mq_assets.rs
 crates/thegn-host/src/notify.rs
 crates/thegn-host/src/palette.rs
-crates/thegn-host/src/panel/gitfull.rs
-crates/thegn-host/src/panel/sections/misc.rs
 crates/thegn-host/src/panel_util.rs
 crates/thegn-host/src/pane_pty.rs
 crates/thegn-host/src/pane.rs
@@ -297,7 +293,6 @@ crates/thegn-host/src/workspace_create.rs
 crates/thegn-host/src/workspace_picker.rs
 crates/thegn-media/src/lib.rs
 crates/thegn-media/src/mediaremote.rs
-crates/thegn-media/src/mpd.rs
 crates/thegn-media/src/smtc.rs
 crates/thegn-metrics/src/battery.rs
 crates/thegn-metrics/src/lib.rs
@@ -308,11 +303,9 @@ crates/thegn-proxy/src/router.rs
 crates/thegn-svc/src/bin/fake_lsp.rs
 crates/thegn-svc/src/bridge/mod.rs
 crates/thegn-svc/src/calendar/tests.rs
-crates/thegn-svc/src/ci.rs
 crates/thegn-svc/src/control/client.rs
 crates/thegn-svc/src/control/grpc.rs
 crates/thegn-svc/src/control/http.rs
-crates/thegn-svc/src/control/mod.rs
 crates/thegn-svc/src/fly/mod.rs
 crates/thegn-svc/src/git/branch.rs
 crates/thegn-svc/src/git/mod.rs
@@ -335,7 +328,6 @@ crates/thegn-svc/src/plugin/session.rs
 crates/thegn-svc/src/projection/mod.rs
 crates/thegn-svc/src/provider.rs
 crates/thegn-svc/src/revtunnel/mod.rs
-crates/thegn-svc/src/seam/registry.rs
 crates/thegn-svc/src/sessions.rs
 crates/thegn-svc/src/share/mod.rs
 crates/thegn-svc/src/share/tests.rs

@@ -40,7 +40,7 @@ pub fn run(
     let hook_tx = tx.clone();
     let hook: ChangeHook = std::sync::Arc::new(move || {
         // A closed channel just means we're shutting down; ignore.
-        let _ = hook_tx.send(Wake::Pump);
+        let _ = hook_tx.send(Wake::Pump); // best-effort: closed channel means shutdown (see above)
     });
 
     let mut tile = build(hook)?;
@@ -115,8 +115,8 @@ fn setup_terminal() -> anyhow::Result<Term> {
     // Restore the terminal even if the tile panics, so the shell stays usable.
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        let _ = disable_raw_mode(); // best-effort: panic hook: restore what we can, never mask the panic
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste); // best-effort: panic hook: restore what we can, never mask the panic
         prev(info);
     }));
 

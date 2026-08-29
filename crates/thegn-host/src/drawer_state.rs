@@ -81,7 +81,7 @@ fn flags() -> &'static Mutex<FlagCache> {
 /// I/O); after this the loop never touches the filesystem to answer "is this
 /// worktree's drawer open?".
 pub(crate) fn load_flags() {
-    let _ = flags();
+    let _ = flags(); // best-effort: warm-up read: a failure just means defaults until the next flag write
 }
 
 /// Whether `dir`'s drawer is flagged open — memory only, safe on the loop.
@@ -100,7 +100,7 @@ pub(crate) fn set_flag(dir: &Path, open: bool) {
     let path = store_dir().join(FlagCache::key(dir));
     let write = move || {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
         }
         // best-effort: the drawer flag is a UI cache; git/session are the truth.
         let _ = std::fs::write(&path, if open { "true" } else { "false" });
@@ -214,6 +214,7 @@ pub(crate) fn install_spawner(
     waker: TerminalWaker,
 ) {
     let _ = SPAWNER.set(Spawner {
+        // best-effort: first-set-wins: the loop's spawner serves for the process
         tx,
         waker,
         pending: Mutex::new(HashSet::new()),
@@ -242,7 +243,7 @@ pub(crate) fn request_spawn(cfg: &thegn_core::config::Config, dir: &Path) {
         // off-loop: launch_spec opens the DB and resolves the sandbox.
         let res = resolve_launch(&cfg, &dir);
         if tx.send((dir, res)).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -460,7 +461,7 @@ mod tests {
     #[test]
     fn flag_cache_loads_persisted_files() {
         let store = std::env::temp_dir().join(format!("tg-drawer-flags-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&store).unwrap();
         let open = Path::new("/tmp/wt-open");
         let closed = Path::new("/tmp/wt-closed");
@@ -474,7 +475,7 @@ mod tests {
 
         let empty = FlagCache::load_from(&store.join("nope"));
         assert!(!empty.get(open), "missing store dir = all closed");
-        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

@@ -146,7 +146,7 @@ mod tests {
     fn deletes_on_dismiss() {
         let mut g = PreviewGfx::new();
         g.set("a.png".to_string(), raster());
-        let _ = g.frame(Some(panel()), Some("a.png"), false, true);
+        let _ = g.frame(Some(panel()), Some("a.png"), false, true); // best-effort: test: the frame's effect is the point; the assert below checks it
         // Preview closed → no open path → the image is deleted next frame.
         assert_eq!(
             g.frame(Some(panel()), None, false, true),
@@ -158,7 +158,7 @@ mod tests {
     fn deletes_when_occluded_then_redraws_when_clear() {
         let mut g = PreviewGfx::new();
         g.set("a.png".to_string(), raster());
-        let _ = g.frame(Some(panel()), Some("a.png"), false, true);
+        let _ = g.frame(Some(panel()), Some("a.png"), false, true); // best-effort: test: the frame's effect is the point; the assert below checks it
         // Overlay comes up → delete.
         assert_eq!(
             g.frame(Some(panel()), Some("a.png"), true, true),
@@ -175,7 +175,7 @@ mod tests {
     fn deletes_when_preview_path_changes() {
         let mut g = PreviewGfx::new();
         g.set("a.png".to_string(), raster());
-        let _ = g.frame(Some(panel()), Some("a.png"), false, true);
+        let _ = g.frame(Some(panel()), Some("a.png"), false, true); // best-effort: test: the frame's effect is the point; the assert below checks it
         // A different file is open now → the stale image is deleted.
         assert_eq!(
             g.frame(Some(panel()), Some("b.rs"), false, true),

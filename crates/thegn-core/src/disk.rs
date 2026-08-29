@@ -233,6 +233,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-disk-{tag}-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -260,6 +261,7 @@ mod tests {
         assert_eq!(walk_size(&sub), 2000);
         assert_eq!(walk_size(&dir), 3000);
         assert_eq!(walk_size(&dir.join("missing")), 0);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -279,6 +281,7 @@ mod tests {
 
         // Missing path → zeroes, never panics.
         assert_eq!(measure_worktree(&dir.join("gone")), DiskUsage::default());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -311,6 +314,7 @@ mod tests {
             walk_size(&dir.join("target")),
             "target subtotal matches the reference"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -331,6 +335,7 @@ mod tests {
             walk_size(&dir),
             "and the fast walk still agrees with the reference recursion"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -362,6 +367,7 @@ mod tests {
         let u = measure_worktree(&dir);
         assert_eq!(u.target_bytes, 0, "no target/ subtree");
         assert!(u.total_bytes >= 100);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 

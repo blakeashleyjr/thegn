@@ -88,7 +88,7 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
                 return Some((status.success(), stdout));
             }
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                let _ = child.kill(); // best-effort: probe teardown: force-kill the wedged child at the deadline
                 // Reap on a DETACHED thread, never inline: a probe subprocess
                 // wedged in an uninterruptible syscall (dead daemon socket,
                 // stalled DNS, hung NFS) doesn't die the instant SIGKILL lands
@@ -100,7 +100,7 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
                 // the child off and return at the deadline; the zombie is
                 // reaped whenever it finally dies.
                 std::thread::spawn(move || {
-                    let _ = child.wait();
+                    let _ = child.wait(); // best-effort: detached reap: the probe must not block on a wedged child
                 });
                 return None;
             }
@@ -151,9 +151,9 @@ pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<
             // synchronous wait here would block the pane-spawn path for as long
             // as the wedge lasts.
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                let _ = child.kill(); // best-effort: probe teardown: force-kill the wedged child at the deadline
                 std::thread::spawn(move || {
-                    let _ = child.wait();
+                    let _ = child.wait(); // best-effort: detached reap: the probe must not block on a wedged child
                 });
                 return None;
             }
@@ -1736,7 +1736,7 @@ pub fn teardown_by_path(worktree: &str) {
                 agent.clone(),
                 vpn.clone(),
             ]);
-            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
+            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT); // best-effort: teardown: rm -f of a missing container is a harmless no-op (see comment above)
         }
     }
 }
@@ -1768,7 +1768,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
                 agent.clone(),
                 vpn.clone(),
             ]);
-            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
+            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT); // best-effort: teardown: rm -f of a missing container is a harmless no-op (see comment above)
         }
     }
 }
@@ -1830,6 +1830,7 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
     std::thread::spawn(move || {
         for c in &cmds {
             // `detached`: null stdio + own group so a hook can't steal the tty.
+            // best-effort: prepare hook: advisory; a failing hook doesn't block the launch
             let _ = crate::util::detached("sh")
                 .arg("-lc")
                 .arg(c)
@@ -2195,7 +2196,7 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
     }
     let dir = util::xdg_state_home().join("thegn/sandbox-env");
     std::fs::create_dir_all(&dir).ok()?;
-    let _ = crate::fsperm::restrict_dir_to_owner(&dir);
+    let _ = crate::fsperm::restrict_dir_to_owner(&dir); // best-effort: hardening: a failed chmod must not block the env write
     let path = dir.join(format!("{name}.env"));
     // Create empty + lock down to 0600 before writing any secret bytes, so the
     // token never lands in a world-readable file even momentarily.
@@ -2873,7 +2874,7 @@ pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String
         for orphan in identify_orphans(db_worktrees, &containers) {
             let mut rm = backend_prefix(backend);
             rm.extend(["rm".into(), "-f".into(), orphan.clone()]);
-            let _ = status_with_timeout(&rm, PROBE_TIMEOUT);
+            let _ = status_with_timeout(&rm, PROBE_TIMEOUT); // best-effort: teardown: orphan container rm -f is best-effort
             removed.push(orphan);
         }
         if !removed.is_empty() {
@@ -2939,7 +2940,7 @@ pub fn prune_local(kinds: PruneKinds, execute: bool) -> PruneReport {
     let rm = |prefix: &[String], sub: Vec<String>| {
         let mut a = prefix.to_vec();
         a.extend(sub);
-        let _ = status_with_timeout(&a, PROBE_TIMEOUT);
+        let _ = status_with_timeout(&a, PROBE_TIMEOUT); // best-effort: teardown: orphan container rm -f is best-effort
     };
     for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
         if available(&Placement::Local, backend) != RuntimeProbe::Present {

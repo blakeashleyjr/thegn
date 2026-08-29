@@ -407,7 +407,7 @@ fn workspace_list_with_db_lists_current_workspace_once() {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    let _ = std::fs::remove_dir_all(p.parent().unwrap()); // best-effort: test cleanup: scratch removal must never fail the test
     let db = thegn_core::db::Db::open_at(&p).unwrap();
 
     // A mixed-case repo registered in the DB, with its live home group
@@ -505,8 +505,8 @@ fn load_or_seed_session_registers_bootstrap_workspace() {
         std::env::temp_dir().join(format!("tg-hydrate-bootstrap-{}-state", std::process::id()));
     let ws_dir =
         std::env::temp_dir().join(format!("tg-hydrate-bootstrap-{}-ws", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_home);
-    let _ = std::fs::remove_dir_all(&ws_dir);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&ws_dir); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
     std::fs::create_dir_all(&ws_dir).unwrap();
     let ws_str = ws_dir.to_string_lossy().into_owned();
@@ -530,8 +530,8 @@ fn load_or_seed_session_registers_bootstrap_workspace() {
     assert_eq!(row.kind, "dir", "a plain dir bootstraps as a dir workspace");
 
     drop(_env);
-    let _ = std::fs::remove_dir_all(&state_home);
-    let _ = std::fs::remove_dir_all(&ws_dir);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&ws_dir); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -543,8 +543,8 @@ fn load_or_seed_session_does_not_resurrect_tombstoned_workspace() {
         std::env::temp_dir().join(format!("tg-hydrate-tombstone-{}-state", std::process::id()));
     let ws_dir =
         std::env::temp_dir().join(format!("tg-hydrate-tombstone-{}-ws", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_home);
-    let _ = std::fs::remove_dir_all(&ws_dir);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&ws_dir); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
     std::fs::create_dir_all(&ws_dir).unwrap();
     let ws_str = ws_dir.to_string_lossy().into_owned();
@@ -582,8 +582,8 @@ fn load_or_seed_session_does_not_resurrect_tombstoned_workspace() {
     );
 
     drop(_env);
-    let _ = std::fs::remove_dir_all(&state_home);
-    let _ = std::fs::remove_dir_all(&ws_dir);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&ws_dir); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -597,7 +597,7 @@ fn bootstrap_workspace_survives_switch_in_workspace_list() {
     let ws_a = std::env::temp_dir().join(format!("tg-hydrate-survive-{}-a", std::process::id()));
     let ws_b = std::env::temp_dir().join(format!("tg-hydrate-survive-{}-b", std::process::id()));
     for d in [&state_home, &ws_a, &ws_b] {
-        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(d); // best-effort: test cleanup: scratch removal must never fail the test
     }
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
     std::fs::create_dir_all(&ws_a).unwrap();
@@ -626,7 +626,7 @@ fn bootstrap_workspace_survives_switch_in_workspace_list() {
 
     drop(_env);
     for d in [&state_home, &ws_a, &ws_b] {
-        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(d); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }
 
@@ -751,7 +751,7 @@ fn update_log_error_total_is_incremental_and_resets_on_rotation() {
     let t3 = update_log_error_total(&path, len3);
     assert_eq!(t3, 1, "rotation resets the running total");
 
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -786,7 +786,7 @@ fn read_log_tail_lines_is_bounded_and_snaps_to_line() {
     // Every parsed row is well-formed (no partial first line).
     assert!(lines.iter().all(|l| l.message.starts_with("line ")));
 
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -842,7 +842,7 @@ fn inherited_remote_ambient_env_survives_missing_local_dir() {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    let _ = std::fs::remove_dir_all(p.parent().unwrap()); // best-effort: test cleanup: scratch removal must never fail the test
     let db = thegn_core::db::Db::open_at(&p).unwrap();
 
     let mut cfg = Config::default();
@@ -906,7 +906,7 @@ fn inherited_remote_ambient_env_survives_missing_local_dir() {
         &mut cache2
     ));
 
-    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    let _ = std::fs::remove_dir_all(p.parent().unwrap()); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 // --- THE-73: only git may condemn a worktree row -----------------------
@@ -966,7 +966,7 @@ fn row_is_git_listed_is_not_a_worktrees_dir_prefix_test() {
     let base = std::env::temp_dir().join(format!("tg-the73-listed-{}", std::process::id()));
     let repo = base.join("repo");
     let far = base.join("somewhere-else-entirely").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
 
     let mut cache = std::collections::HashMap::new();
@@ -993,7 +993,7 @@ fn row_is_git_listed_is_not_a_worktrees_dir_prefix_test() {
         "a missing dir is not proof of deletion while git still lists it"
     );
 
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1002,7 +1002,7 @@ fn row_is_git_listed_is_false_for_a_path_git_never_knew() {
     let base = std::env::temp_dir().join(format!("tg-the73-unknown-{}", std::process::id()));
     let repo = base.join("repo");
     let far = base.join("elsewhere").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     let (root_s, _far_s) = git_repo_with_linked_worktree(&repo, &far);
 
     let mut cache = std::collections::HashMap::new();
@@ -1018,7 +1018,7 @@ fn row_is_git_listed_is_false_for_a_path_git_never_knew() {
         &mut cache
     ));
 
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1031,7 +1031,7 @@ fn row_is_git_listed_fails_safe_when_the_repo_root_is_unreadable() {
         .join(format!("tg-the73-no-such-repo-{}", std::process::id()))
         .to_string_lossy()
         .into_owned();
-    let _ = std::fs::remove_dir_all(&absent);
+    let _ = std::fs::remove_dir_all(&absent); // best-effort: test cleanup: scratch removal must never fail the test
     assert!(row_is_git_listed(&absent, "/anywhere/at/all", &mut cache));
     // An empty worktree path has nothing to match either.
     assert!(row_is_git_listed("/tmp", "", &mut cache));
@@ -1044,7 +1044,7 @@ fn row_is_git_listed_probes_each_repo_root_once() {
     let base = std::env::temp_dir().join(format!("tg-the73-memo-{}", std::process::id()));
     let repo = base.join("repo");
     let far = base.join("elsewhere").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
 
     let mut cache = std::collections::HashMap::new();
@@ -1067,7 +1067,7 @@ fn row_is_git_listed_probes_each_repo_root_once() {
         "an unaskable root is cached as `None`, not re-probed"
     );
 
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1079,7 +1079,7 @@ fn prune_keeps_a_git_listed_group_whose_dir_is_gone() {
     let state_home = base.join("state");
     let repo = base.join("repo");
     let far = base.join("way-over-here").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
     let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
 
@@ -1127,7 +1127,7 @@ fn prune_keeps_a_git_listed_group_whose_dir_is_gone() {
     );
 
     drop(_env);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1143,7 +1143,7 @@ fn prune_reaps_a_removed_group_whose_registry_row_is_already_gone() {
     let state_home = base.join("state");
     let repo = base.join("repo");
     let far = base.join("way-over-here").join("wt");
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
     let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
 
@@ -1180,7 +1180,7 @@ fn prune_reaps_a_removed_group_whose_registry_row_is_already_gone() {
     assert!(session.worktrees.is_empty());
 
     drop(_env);
-    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]

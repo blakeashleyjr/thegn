@@ -89,6 +89,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
             .unwrap()
             .subsec_nanos()
     ));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -155,6 +156,7 @@ fn guard_refuses_a_sandboxed_merge_from_the_legacy_position() {
     );
     // The framework still ran — we did not silence it to get here.
     assert!(o.stderr.contains("FRAMEWORK_RAN"), "stderr: {}", o.stderr);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -171,6 +173,7 @@ fn guard_allows_a_host_merge_and_still_runs_the_framework() {
     let o = git(&dir, &["merge", "--no-ff", "side", "-m", "m"]);
     assert!(o.ok, "host merge must succeed: {}", o.stderr);
     assert!(o.stderr.contains("FRAMEWORK_RAN"), "stderr: {}", o.stderr);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -198,6 +201,7 @@ fn guard_allows_a_sandboxed_merge_in_a_linked_worktree() {
         "a linked-worktree merge must not be refused: {}",
         o.stderr
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -213,6 +217,7 @@ fn escape_hatch_lets_a_sandboxed_merge_through() {
         &["merge", "--no-ff", "side", "-m", "m"],
     );
     assert!(o.ok, "THEGN_MERGE_GUARD_OFF must allow: {}", o.stderr);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -270,7 +275,9 @@ fn repaired_checkout_merges_again() {
         o2.stderr
     );
 
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir2);
 }
 
@@ -308,6 +315,7 @@ fn hook_script_skips_an_orphaned_shim() {
     );
     // The framework in the slot still ran — skipping the orphan is not silence.
     assert!(o.stderr.contains("FRAMEWORK_RAN"), "stderr: {}", o.stderr);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -345,6 +353,7 @@ fn install_clears_an_orphaned_shim() {
         "stderr: {}",
         o.stderr
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -381,5 +390,6 @@ fn a_user_hook_still_runs_when_we_own_the_slot() {
         "stderr: {}",
         o.stderr
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }

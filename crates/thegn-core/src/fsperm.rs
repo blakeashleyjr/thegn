@@ -86,7 +86,7 @@ mod tests {
         restrict_to_owner(&p).unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
         std::fs::write(&p, b"secret").unwrap();
         restrict_to_owner(&p).unwrap();
         assert_eq!(mode_bits(&p).unwrap(), Some(0o600));
-        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p); // best-effort: test cleanup: scratch removal must never fail the test
         assert!(mode_bits(&p).is_err(), "a missing path is an error");
     }
 
@@ -106,6 +106,6 @@ mod tests {
         restrict_dir_to_owner(&d).unwrap();
         let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

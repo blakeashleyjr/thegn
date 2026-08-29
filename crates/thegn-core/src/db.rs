@@ -274,10 +274,10 @@ impl Db {
             // secret-file writes elsewhere (sandbox/vpn/share). (THE-66 moved the
             // Kaneo device-flow token OUT of the DB into the broker; the
             // `kaneo_auth` row now holds only a `file:`/`env:` SecretRef.)
-            let _ = crate::fsperm::restrict_dir_to_owner(dir);
+            let _ = crate::fsperm::restrict_dir_to_owner(dir); // best-effort: hardening: a failed chmod must never block DB open
         }
         let db = Self::init(Connection::open(&path)?)?;
-        let _ = crate::fsperm::restrict_to_owner(&path);
+        let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the
         // startup prunes so a plain open takes NO write lock. Run them once
         // per process here so a long-lived install still gets its growth
@@ -351,14 +351,14 @@ impl Db {
             )?;
             // Add the session_name column to a pre-existing repos table (no-op /
             // ignored error on a fresh DB, where the CREATE below adds it).
-            let _ = conn.execute("ALTER TABLE repos ADD COLUMN session_name TEXT", []);
+            let _ = conn.execute("ALTER TABLE repos ADD COLUMN session_name TEXT", []); // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         }
         // v28: `my_work_cache` re-keyed from a single `id=0` row to per-`scope`
         // rows. It's a pure cache (rebuilt by the background worker), so drop the
         // old-shape table here; the CREATE below recreates it with the new shape
         // and the next refresh repopulates it.
         if ver < 28 {
-            let _ = conn.execute("DROP TABLE IF EXISTS my_work_cache", []);
+            let _ = conn.execute("DROP TABLE IF EXISTS my_work_cache", []); // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         }
         // v45: `issue_cache`/`issue_projects` gain an `account` PK column so
         // multiple accounts per provider don't clobber each other. Pure caches
@@ -366,6 +366,7 @@ impl Db {
         // the CREATE below recreates them with the new PK and the next refresh
         // repopulates. `account=''` is the legacy/synthesized-account sentinel.
         if ver < 45 {
+            // best-effort: idempotent additive migration: the ignore is the already-applied no-op
             let _ = conn.execute_batch(
                 "DROP TABLE IF EXISTS issue_cache;
                  DROP TABLE IF EXISTS issue_projects;",
@@ -378,9 +379,9 @@ impl Db {
         // A newer-schema DB (different branch sharing this file): warn + tolerate.
         let schema_mismatch = crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION);
 
-        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_backend TEXT", []);
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_backend TEXT", []); // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         // v31: per-language LOC report JSON alongside the total (idempotent).
-        let _ = conn.execute("ALTER TABLE loc_cache ADD COLUMN report_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE loc_cache ADD COLUMN report_json TEXT", []); // best-effort: idempotent additive migration: the ignore is the already-applied no-op
 
         // One transaction for the whole schema: execute_batch otherwise
         // autocommits per statement — a dozen WAL commits where one will do.
@@ -949,10 +950,10 @@ impl Db {
     ///   session ending, so a row still up a week later belongs to a session
     ///   that went away without either — a leak, not a demand.
     fn startup_prune(&self) {
-        let _ = self.prune_notifications(30 * 24 * 3600);
+        let _ = self.prune_notifications(30 * 24 * 3600); // best-effort: startup prune: growth bound on a disposable table; failure never fails an open
         {
             use crate::store::NotificationStore as _;
-            let _ = self.prune_attention_acks(90 * 24 * 3600);
+            let _ = self.prune_attention_acks(90 * 24 * 3600); // best-effort: startup prune: growth bound on a disposable table; failure never fails an open
         }
         // A raised hand outliving its session by a week is a leak, not a demand.
         {
@@ -966,7 +967,7 @@ impl Db {
         {
             use crate::store::CalendarStore as _;
             let cutoff_ms = (crate::util::now() - 365 * 24 * 3600) * 1000;
-            let _ = self.prune_calendar_events(cutoff_ms);
+            let _ = self.prune_calendar_events(cutoff_ms); // best-effort: startup prune: growth bound on a disposable table; failure never fails an open
         }
     }
 

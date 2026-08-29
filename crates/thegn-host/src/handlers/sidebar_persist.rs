@@ -137,7 +137,7 @@ impl SidebarState {
                     let _ = db.set_ui_state(scope, "sort_mode", self.view.sort.as_str());
                 }
             } else if key == "sidebar_cols" {
-                self.width = value.parse().ok();
+                self.width = value.parse().ok(); // best-effort: optional input: an unparseable persisted width means 'no override'
             } else if key == "sidebar_expanded" {
                 self.expanded = value == "1";
             } else if key == "sidebar_flat" {
@@ -170,7 +170,7 @@ impl SidebarState {
         if let Ok(db) = thegn_core::db::Db::open() {
             // best-effort: the DB is a cache; a failed persist only loses a
             // view preference, never sidebar correctness
-            let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value);
+            let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 

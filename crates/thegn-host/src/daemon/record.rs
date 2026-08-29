@@ -96,7 +96,7 @@ impl Recorder {
             }
         }
         if self.max_bytes > 0 && self.writer.bytes_written() >= self.max_bytes {
-            let _ = self.writer.flush();
+            let _ = self.writer.flush(); // best-effort: flush: display-only
             self.done = true;
             self.capped = true;
         }
@@ -201,7 +201,7 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(l).unwrap();
             assert!(v.is_array());
         }
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// A full disk must not be reported as a clean save. `/dev/full` opens
@@ -258,6 +258,6 @@ mod tests {
         let text = std::fs::read_to_string(&fin.path).unwrap();
         let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(header["version"], 2);
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

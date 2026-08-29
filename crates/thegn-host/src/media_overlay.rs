@@ -524,12 +524,12 @@ mod tests {
         ]);
         assert_eq!(ov.sel, 1); // starts on current
         // Down clamps at the end.
-        let _ = ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        let _ = ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE); // best-effort: test: the key's effect is the point; the sel asserts below check it
         assert_eq!(ov.sel, 1);
         // Up moves to 0, and again clamps.
-        let _ = ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+        let _ = ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE); // best-effort: test: the key's effect is the point; the sel asserts below check it
         assert_eq!(ov.sel, 0);
-        let _ = ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE);
+        let _ = ov.handle_key(&KeyCode::UpArrow, Modifiers::NONE); // best-effort: test: the key's effect is the point; the sel asserts below check it
         assert_eq!(ov.sel, 0);
     }
 

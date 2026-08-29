@@ -296,7 +296,7 @@ fn start_keeps_draining_so_child_survives_post_return() {
         url_rule: UrlRule::Fixed("http://fixed.example".into()),
     };
     let tmp = std::env::temp_dir().join(format!("thegn-share-test-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp); // best-effort: test setup; later asserts fail loudly if missing
 
     let mut running = start(&plan, &tmp, Duration::from_secs(5)).expect("start");
     assert_eq!(running.public_url, "http://fixed.example");
@@ -310,7 +310,7 @@ fn start_keeps_draining_so_child_survives_post_return() {
     );
 
     running.stop();
-    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&tmp); // best-effort: test tmp cleanup
 }
 
 #[test]

@@ -669,14 +669,13 @@ fn year_day_matches(list: &[i16], d: NaiveDate) -> bool {
 }
 
 /// The days a WEEKLY rule produces in the week beginning at `period`.
-fn week_dates(r: &RRule, start: NaiveDateTime, period: NaiveDate) -> Vec<NaiveDate> {
+fn week_dates(r: &RRule, _start: NaiveDateTime, period: NaiveDate) -> Vec<NaiveDate> {
     if r.by_day.is_empty() {
         return vec![period];
     }
     // Walk the seven days from the week's WKST-aligned start so BYDAY order
     // doesn't dictate chronological order.
     let base = week_start_of(period, r.wkst);
-    let _ = start;
     (0..7)
         .filter_map(|i| base.checked_add_days(Days::new(i)))
         .filter(|d| r.by_day.iter().any(|bd| bd.weekday == d.weekday()))

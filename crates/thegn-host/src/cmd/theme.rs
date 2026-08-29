@@ -57,7 +57,7 @@ fn set(_cfg: &Config, config_path: std::path::PathBuf) -> Result<()> {
 
     if let Some(mut stdin) = child.stdin.take() {
         for name in PRESETS {
-            let _ = writeln!(stdin, "{}", name);
+            let _ = writeln!(stdin, "{}", name); // best-effort: the preset chooser may exit early; EPIPE on its stdin is normal
         }
     }
 

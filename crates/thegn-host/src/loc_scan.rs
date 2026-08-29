@@ -74,9 +74,9 @@ mod tests {
 
         // A real but empty directory has nothing countable in it.
         let empty = std::env::temp_dir().join(format!("tg-loc-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&empty); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&empty).unwrap();
         assert!(scan(&empty).is_none(), "empty dir");
-        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&empty); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

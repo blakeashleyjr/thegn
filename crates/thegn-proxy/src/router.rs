@@ -287,7 +287,7 @@ async fn try_chain(
             // us, and it is the last one — so the request proceeds either way.
             // The value is discarded because a lost race with a concurrent
             // acquire changes nothing about that decision.
-            let _ = state
+            let _ = state // best-effort: value deliberately discarded (see above)
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
@@ -463,7 +463,7 @@ async fn try_stream_chain(
             // us, and it is the last one — so the request proceeds either way.
             // The value is discarded because a lost race with a concurrent
             // acquire changes nothing about that decision.
-            let _ = state
+            let _ = state // best-effort: value deliberately discarded (see above)
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
         }

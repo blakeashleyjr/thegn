@@ -139,7 +139,7 @@ pub(crate) fn drive_queue(
 
     for item in items {
         let set = |db: &Db, status: &str, oid: Option<&str>, detail: Option<&str>| {
-            let _ = db.update_merge_status(&item.worktree, status, oid, detail, None);
+            let _ = db.update_merge_status(&item.worktree, status, oid, detail, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         };
         // Sidebar-folder lifecycle: move the worktree on a settled transition
         // (landed ⇒ Merged/cleanup, failure ⇒ the failed folder). No-op unless
@@ -295,7 +295,7 @@ pub(crate) fn drive_queue(
                     crate::agent_run::AgentDispatch::Run(spec) => spec,
                 };
                 agent_runs += 1;
-                let _ = db.set_merge_agent_attempts(&item.worktree, agent_runs);
+                let _ = db.set_merge_agent_attempts(&item.worktree, agent_runs); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
                 set(db, "agent_running", None, Some(&note));
                 progress(&DriveStep {
@@ -308,6 +308,7 @@ pub(crate) fn drive_queue(
                 // arbiter of whether the fix worked, so ignore the exit code.
                 if let Some(template) = agent_cmd.as_deref() {
                     let _ = run_agent(
+                        // best-effort: the re-attempt at the top of the loop is the real arbiter (comment above)
                         cfg,
                         template,
                         &item.worktree,
@@ -630,8 +631,8 @@ mod tests {
                 util::now()
             ));
             let feat_wt = root.with_extension("feat");
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
             std::fs::create_dir_all(&root).unwrap();
             git(&root, &["init", "-q", "-b", "main"]);
             git(&root, &["config", "user.name", "t"]);
@@ -713,8 +714,8 @@ mod tests {
             );
             assert!(out_.needs_human.is_empty());
             assert_ne!(out(&root, &["rev-parse", "main"]), before, "main advanced");
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
@@ -739,8 +740,8 @@ mod tests {
             assert_eq!(out_.needs_human, ["feat"]);
             assert!(out_.landed.is_empty());
             assert_eq!(out(&root, &["rev-parse", "main"]), before, "main held");
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         /// The fixing script, as a `sh` one-liner. Ends in `&& true` so the
@@ -788,8 +789,8 @@ mod tests {
                 "a named [[agents]] entry should have been dispatched"
             );
             assert!(out_.warnings.is_empty());
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
@@ -813,8 +814,8 @@ mod tests {
             // ...but the reason is reported rather than looking like a clean no-op.
             assert_eq!(out_.warnings.len(), 1, "{:?}", out_.warnings);
             assert!(out_.warnings[0].contains("not-configured"));
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
@@ -841,8 +842,8 @@ mod tests {
                 ["feat"],
                 "the configured prompt template should have reached the agent"
             );
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
@@ -865,8 +866,8 @@ mod tests {
             );
             assert_eq!(out_.needs_human, ["feat"]);
             assert!(out_.landed.is_empty());
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
+            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
 }

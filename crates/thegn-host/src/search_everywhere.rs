@@ -559,10 +559,10 @@ impl PaletteSession {
         // result left to ping-pong against.
         if !deferred_ready.is_empty() {
             for ev in deferred_ready {
-                let _ = self.result_tx.send(ev);
+                let _ = self.result_tx.send(ev); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
             if let Some(w) = &self.waker {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
         dirty
@@ -995,12 +995,13 @@ pub fn spawn_file_index_build(
         // `FileIndexReady` is now a pure readiness signal — the path list lives
         // inside the picker, so the payload carries an empty vec.
         crate::fff_backend::rebuild(&root);
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(AsyncSearchResult::FileIndexReady {
             sg,
             index: Arc::new(Vec::new()),
             root,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -1020,8 +1021,8 @@ pub fn spawn_file_search(
                 score: hit.score,
             })
             .collect();
-        let _ = tx.send(AsyncSearchResult::FileMatches { sg, matches });
-        let _ = waker.wake();
+        let _ = tx.send(AsyncSearchResult::FileMatches { sg, matches }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -1050,12 +1051,13 @@ pub fn spawn_content_search(
                 line_text: hit.line_text,
             })
             .collect();
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(AsyncSearchResult::ContentMatches {
             sg,
             matches,
             done: true,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -1154,8 +1156,8 @@ pub fn spawn_git_search(
             }
         }
 
-        let _ = tx.send(AsyncSearchResult::GitMatches { sg, matches });
-        let _ = waker.wake();
+        let _ = tx.send(AsyncSearchResult::GitMatches { sg, matches }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -1181,22 +1183,24 @@ pub fn spawn_symbol_search(
             index_hits.into_iter().chain(regex_hits.iter().cloned()),
             max_results,
         );
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(AsyncSearchResult::SymbolMatches {
             sg,
             matches: non_lsp.clone(),
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
 
         // 2. Upgrade: query each present language's server (lazily starting it)
         //    for workspace symbols, and re-send LSP-first results when richer.
         let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &keys);
         if !lsp_hits.is_empty() {
             let merged = merge_symbol_hits(lsp_hits.into_iter().chain(non_lsp), max_results);
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx.send(AsyncSearchResult::SymbolMatches {
                 sg,
                 matches: merged,
             });
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -1796,7 +1800,7 @@ mod tests {
             match s.result_rx.try_recv() {
                 Ok(AsyncSearchResult::FileIndexReady { .. }) => installed = true,
                 Ok(other) => {
-                    let _ = s.result_tx.send(other);
+                    let _ = s.result_tx.send(other); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     break;
                 }
                 Err(_) => break,

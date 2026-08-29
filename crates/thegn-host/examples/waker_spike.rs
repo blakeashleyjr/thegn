@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     }
     term.set_cooked_mode()?;
     drop(term);
-    let _ = pulse.join();
+    let _ = pulse.join(); // best-effort: test scratch teardown
     println!("done: {ticks} waker ticks observed");
     Ok(())
 }

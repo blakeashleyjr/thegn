@@ -82,6 +82,8 @@ fn subscribe_thread(
             let mut sink = BatchForwarder { tx };
             events.subscribe(kind, &mut sink);
         })
+        // best-effort: listener thread: a failed spawn just disables sandbox
+        // event recording for this session
         .ok();
 }
 

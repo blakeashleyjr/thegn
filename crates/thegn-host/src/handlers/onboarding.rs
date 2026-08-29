@@ -400,7 +400,7 @@ pub(crate) fn spawn_probe(
             ProbeRequest::Host { name, ssh } => probe_host(name, &ssh),
         };
         if tx.send(RefreshKind::Onboarding(Box::new(result))).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

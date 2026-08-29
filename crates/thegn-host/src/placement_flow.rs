@@ -227,10 +227,11 @@ fn snapshot_host(
             {
                 Ok(h) => {
                     let now = unix_now();
-                    let _ = db.host_set_headroom(&id, &h, now);
+                    let _ = db.host_set_headroom(&id, &h, now); // best-effort: cache write: headroom bookkeeping; display freshness only
                     // Mirror into the capacity index so every surface
                     // (placement list, panel, ranking) reads one table.
                     let _ = db.capacity_set_measured(
+                        // best-effort: cache write: capacity bookkeeping; display freshness only
                         &id,
                         &MeasuredLoad {
                             cpu_milli: u64::from(h.load1_milli),
@@ -446,7 +447,7 @@ pub(crate) fn place(
         }
         // Host vanished from config: release the orphan row; a Commit caller
         // re-decides below, a Query caller reports "not placed".
-        let _ = db.tenancy_release(worktree, unix_now());
+        let _ = db.tenancy_release(worktree, unix_now()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     if intent == PlaceIntent::Query {
         return Ok(None);
@@ -502,7 +503,7 @@ pub(crate) fn place(
                         }
                         // Unresolvable binding (config changed mid-flight):
                         // release + fall to the next candidate.
-                        let _ = db.tenancy_release(worktree, unix_now());
+                        let _ = db.tenancy_release(worktree, unix_now()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     }
                 }
                 // Lost every race this round: re-snapshot + re-decide.
@@ -869,7 +870,7 @@ pub(crate) fn maintain_tick(cfg: &Config) {
             // affects display freshness, never totals.
             let now_ms = unix_now() * 1000;
             for m in db.live_compute_meters().unwrap_or_default() {
-                let _ = db.accrue_compute_meter(&m.resource, now_ms);
+                let _ = db.accrue_compute_meter(&m.resource, now_ms); // best-effort: cache write: meter accrual is ledger bookkeeping; display freshness only
             }
         }
         crate::autoscale::scaledown_tick(&cfg);

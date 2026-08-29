@@ -192,7 +192,7 @@ impl MediaWatch for MediaRemoteWatch {
 impl Drop for MediaRemoteWatch {
     fn drop(&mut self) {
         // Best-effort: don't leave the streaming adapter process behind.
-        let _ = self.child.start_kill();
+        let _ = self.child.start_kill(); // best-effort: child may already have exited
     }
 }
 

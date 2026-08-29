@@ -877,7 +877,7 @@ pub(crate) fn deregister_vpn(path: &str) {
         vec!["sudo".to_string(), "-n".to_string(), "podman".to_string()],
     ] {
         let rt = thegn_svc::vpn::OciRuntime::new(prefix);
-        let _ = provider.down(&rt, &sidecar);
+        let _ = provider.down(&rt, &sidecar); // best-effort: teardown pass: the next runtime attempt reports the real failure
     }
 }
 
@@ -911,7 +911,7 @@ pub(crate) fn deproject(path: &str) {
         .and_then(|mut r| r.remove(path));
     if let Some(spec) = spec {
         let backend = thegn_svc::projection::for_data_mode(&spec);
-        let _ = backend.unmount(&spec);
+        let _ = backend.unmount(&spec); // best-effort: teardown: unmount of a possibly-already-gone mount
     }
 }
 
@@ -2010,6 +2010,7 @@ pub fn provision_provider_env_named(
             if crate::provision_recover::step_signals_sandbox_restart(&e.to_string()) {
                 tracing::warn!(target: "thegn::startup", step = %step.id, "step may have restarted the sandbox; waiting for it to become ready before continuing");
                 let _ = block_on_provider(|| async {
+                    // best-effort: advisory re-wait: the next provision step reports its own connect error
                     provider
                         .wait_ready(&id, std::time::Duration::from_secs(90))
                         .await
@@ -2023,7 +2024,7 @@ pub fn provision_provider_env_named(
     }
 
     // Drop the marker (+ local mirror for the attach gate) so a later open skips it.
-    let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await });
+    let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await }); // best-effort: marker write: a failed write just re-provisions on the next open
     crate::provider_workdir::mark_provisioned(&id);
     // Record the provisioned-base checkpoint per (repo, env), keyed by the
     // flake.lock hash so a lockfile change invalidates it (see env_base_snapshots).
@@ -2440,7 +2441,7 @@ fn push_devshell_closure(
     })();
     // Host cleanup (best-effort): the gcroot symlink + the cache dir.
     let _ = std::fs::remove_dir_all(&cache);
-    let _ = std::fs::remove_file(&gcroot);
+    let _ = std::fs::remove_file(&gcroot); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     result
 }
 
@@ -2763,6 +2764,7 @@ pub(crate) fn deprovision_sync(path: &str) {
     };
     let p = path.to_string();
     let _ = block_on_provider(|| async {
+        // best-effort: documented best-effort contract (doc above): a no-op when nothing was synced; a failed pull just loses the sandbox-side changes at close
         provider
             .download_dir(&id, &workdir, std::path::Path::new(&p))
             .await
@@ -3071,7 +3073,7 @@ pub fn launch_spec_full(
     }
 
     // One DB handle for the whole spec resolution (each open re-runs pragmas).
-    let db = Db::open().ok();
+    let db = Db::open().ok(); // best-effort: cache: choice recording and repo-root/sandbox lookups all fall back to local git below
 
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
     // Two launches are deliberately NOT recorded as the worktree's remembered
@@ -3084,7 +3086,7 @@ pub fn launch_spec_full(
             && choice != "clean-shell"
             && cfg.tool_command(choice).is_none()
         {
-            let _ = db.set_worktree_agent(worktree, choice);
+            let _ = db.set_worktree_agent(worktree, choice); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         db.worktree_sandbox(worktree).ok().flatten()
     });
@@ -3181,7 +3183,7 @@ pub fn launch_spec_full(
         .unwrap_or_default();
     // Credential/HOME dirs the child writes into must exist before launch.
     for dir in &resolved.ensure_dirs {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::create_dir_all(dir); // best-effort: dir prep: a later write reports the real failure
     }
     // Tier-2 dotfiles: materialize each active bundle's dotfile tree into its
     // managed HOME (idempotent, off the event loop — launch_spec is blocking).
@@ -3289,7 +3291,7 @@ pub fn launch_spec_full(
     // drives the next resolution. Best-effort: the DB is a cache, and failing to
     // record a label must never take down a launch.
     if let Some(db) = db.as_ref() {
-        let _ = db.set_worktree_observed(worktree, &spec.backend);
+        let _ = db.set_worktree_observed(worktree, &spec.backend); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     Ok(spec)
 }

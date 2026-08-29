@@ -96,7 +96,7 @@ fn mount_sshfs(spec: &ProjectionSpec) -> Result<Mounted> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sshfs projection requires an ssh placement");
     };
-    std::fs::create_dir_all(&spec.mountpoint).ok();
+    std::fs::create_dir_all(&spec.mountpoint).ok(); // best-effort: failure surfaces via the mount error below
     let argv = s.sshfs_mount_argv(&spec.remote_dir, &spec.mountpoint);
     run(&argv)?;
     Ok(Mounted {
@@ -140,7 +140,7 @@ fn mount_sync(spec: &ProjectionSpec) -> Result<Mounted> {
     let Placement::Ssh(s) = &spec.placement else {
         bail!("sync projection requires an ssh placement");
     };
-    std::fs::create_dir_all(&spec.mountpoint).ok();
+    std::fs::create_dir_all(&spec.mountpoint).ok(); // best-effort: failure surfaces via the mount error below
     let mut argv = vec!["rsync".into(), "-az".into(), "--delete".into()];
     argv.extend(rsync_ssh_opt(s));
     argv.push(rsync_remote(s, &spec.remote_dir));

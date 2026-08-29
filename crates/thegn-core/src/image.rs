@@ -95,7 +95,7 @@ impl ImageRef {
     pub fn default_base() -> ImageRef {
         let mut r = ImageRef::parse(DEFAULT_BASE_IMAGE).expect("default base ref parses");
         if !DEFAULT_BASE_DIGEST.is_empty() {
-            r.manifest_list_digest = Digest::parse(DEFAULT_BASE_DIGEST).ok();
+            r.manifest_list_digest = Digest::parse(DEFAULT_BASE_DIGEST).ok(); // best-effort: optional input: an unparseable pinned digest falls back to pulling by tag
         }
         r
     }

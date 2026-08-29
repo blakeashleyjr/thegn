@@ -251,7 +251,7 @@ mod tests {
         );
         assert!(recs.is_empty());
 
-        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&home).ok(); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(recs[0].worktree.as_deref(), Some("/srv/app"));
         assert_eq!(recs[0].summary, "Add a flag");
 
-        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&home).ok(); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -287,6 +287,6 @@ mod tests {
         let home = tmpdir("empty-home");
         let cfg = cfg_for("claude", &home);
         assert!(discover(&cfg, &SessionFilter::default(), &HashSet::new()).is_empty());
-        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&home).ok(); // best-effort: test tmp cleanup
     }
 }

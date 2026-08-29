@@ -54,7 +54,7 @@ pub(crate) fn spawn_month_fetch(
     crate::sched::spawn_bg(move || {
         let (wide_from, wide_to) = widen(from, to);
         let home = home_zone(&cfg);
-        let db = Db::open().ok();
+        let db = Db::open().ok(); // best-effort: cache: the popup falls back to the provider fetch when the DB is out
 
         // Sync first when anything is stale, so the popup shows current data
         // rather than yesterday's; `sync_accounts` no-ops when everything is
@@ -202,7 +202,7 @@ fn sync_accounts(
                     error = %e,
                     "calendar sync failed — keeping the cached events"
                 );
-                let _ = db.set_calendar_error(&r.account, &e.to_string());
+                let _ = db.set_calendar_error(&r.account, &e.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 continue;
             }
         };
@@ -227,7 +227,7 @@ fn apply_page(
     // A conditional fetch that came back 304: nothing to write, but the sync
     // stamp must still advance or we would re-hit the provider every tick.
     if page.unchanged {
-        let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms);
+        let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         return false;
     }
 
@@ -245,7 +245,7 @@ fn apply_page(
             account = %account,
             "empty full fetch — keeping the prior cache rather than erasing it"
         );
-        let _ = db.set_calendar_error(account, "provider returned an empty calendar");
+        let _ = db.set_calendar_error(account, "provider returned an empty calendar"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         return false;
     }
 
@@ -260,7 +260,7 @@ fn apply_page(
     if !wrote {
         return false;
     }
-    let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms);
+    let _ = db.put_calendar_sync(account, provider, &page.sync_token, from_ms, to_ms); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     !rows.is_empty() || !page.deleted.is_empty()
 }
 

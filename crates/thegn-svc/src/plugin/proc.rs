@@ -181,7 +181,7 @@ pub fn spawn_ndjson(
         }
         if Instant::now() >= deadline {
             kill_group(pid);
-            let _ = child.wait();
+            let _ = child.wait(); // best-effort: reap-or-not is terminal here
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -222,7 +222,7 @@ fn kill_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_group(pid: u32) {
     // No process groups here; `taskkill /T` walks the tree instead.
-    let _ = Command::new("taskkill")
+    let _ = Command::new("taskkill") // best-effort: kill failure surfaces via the next poll of the child
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

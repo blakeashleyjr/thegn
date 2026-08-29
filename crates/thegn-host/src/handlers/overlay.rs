@@ -334,7 +334,7 @@ pub(crate) fn forward_pane_mouse(
         && let Some(bytes) = encode_mouse(ev, mode, sgr, col, row)
         && let Some(p) = panes.table.get_mut(&id)
     {
-        let _ = p.write_input(&bytes);
+        let _ = p.write_input(&bytes); // best-effort: input write: the pane may be gone; a dropped click is harmless
     }
     *mouse_left_down = left;
     *mouse_selecting = false;

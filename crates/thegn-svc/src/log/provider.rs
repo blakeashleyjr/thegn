@@ -51,7 +51,7 @@ fn tail_file(
     // Seek to end: we tail live appends, not the whole (potentially many-MB)
     // historical log. Backfill would parse the entire file into batches on an
     // unbounded channel whether or not the log view is ever opened.
-    let _ = reader.seek(SeekFrom::End(0));
+    let _ = reader.seek(SeekFrom::End(0)); // best-effort: a failed seek only risks a one-time backfill
 
     let mut line = String::new();
     let mut batch = Vec::new();
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn tails_only_appends_not_history() {
         let dir = std::env::temp_dir().join(format!("tg-logprov-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.log");
         // Pre-existing history that must NOT be replayed.
@@ -160,7 +160,7 @@ mod tests {
             }
         };
         assert!(joined, "tailer did not exit after the consumer was dropped");
-        let _ = handle.join();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = handle.join(); // best-effort: join failure must not mask the assert above
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 }

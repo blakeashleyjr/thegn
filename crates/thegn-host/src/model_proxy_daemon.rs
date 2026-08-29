@@ -248,6 +248,7 @@ pub fn spawn_supervisor(cfg: &Config) {
                 target: "thegn::proxy",
                 "model-proxy supervisor thread could not be spawned: {e}"
             );
+            // best-effort: spawn failure already warned by the inspect_err above
         })
         .ok();
 }

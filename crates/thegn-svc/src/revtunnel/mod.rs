@@ -66,7 +66,7 @@ pub fn exec_stream(session: crate::provider::ExecSession) -> tokio::io::DuplexSt
         loop {
             match far_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => {
-                    let _ = control.send(ExecControl::Close).await;
+                    let _ = control.send(ExecControl::Close).await; // best-effort: control end may already be gone
                     break;
                 }
                 Ok(n) => {
@@ -93,7 +93,7 @@ pub fn exec_stream(session: crate::provider::ExecSession) -> tokio::io::DuplexSt
                 ExecFrame::Exit(_) => break,
             }
         }
-        let _ = far_wr.shutdown().await;
+        let _ = far_wr.shutdown().await; // best-effort: peer may already be gone
     });
     near
 }
@@ -133,7 +133,7 @@ fn spawn_sink<W: AsyncWrite + Unpin + Send + 'static>(mut wr: W) -> Sender<Vec<u
             if wr.write_all(&bytes).await.is_err() {
                 break;
             }
-            let _ = wr.flush().await;
+            let _ = wr.flush().await; // best-effort: sink may be gone
         }
     });
     tx
@@ -159,7 +159,7 @@ async fn pump_conn(
                 break;
             }
         }
-        let _ = wr.shutdown().await;
+        let _ = wr.shutdown().await; // best-effort: peer may already be gone
     });
     // local → peer (Data frames), Close(id) at EOF/err (a half-close, not a full
     // teardown — the writer above keeps delivering the reverse direction).
@@ -176,7 +176,7 @@ async fn pump_conn(
             }
         }
     }
-    let _ = sink.send(encode(&Frame::Close(id))).await;
+    let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
 }
 
 /// Shared per-connection routing table: id → inbound payload sender.
@@ -261,7 +261,7 @@ where
                         // so throttles the peer's send rate for this connection.
                         let tx = conns.lock().await.get(&id).cloned();
                         if let Some(tx) = tx {
-                            let _ = tx.send(d).await;
+                            let _ = tx.send(d).await; // best-effort: connection may be gone
                         }
                     }
                     Frame::Close(id) => {
@@ -313,7 +313,7 @@ where
                     match dialer.dial().await {
                         Ok(local) => pump_conn(id, local, in_rx, sink).await,
                         Err(_) => {
-                            let _ = sink.send(encode(&Frame::Close(id))).await;
+                            let _ = sink.send(encode(&Frame::Close(id))).await; // best-effort: remote may be gone
                         }
                     }
                 });
@@ -336,7 +336,7 @@ where
     // Emit the sync marker as the FIRST bytes on stdout, before any frame, so the
     // host can skip whatever one-time preamble the exec transport prepended (a
     // runtime banner/MOTD/shell echo) and lock onto the framing. See `SYNC_MAGIC`.
-    let _ = sink.send(SYNC_MAGIC.to_vec()).await;
+    let _ = sink.send(SYNC_MAGIC.to_vec()).await; // best-effort: remote may have vanished before the sync bytes
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU32::new(1));
 
@@ -385,7 +385,7 @@ mod tests {
             // Echo task on the far end: copy its input back to its output.
             tokio::spawn(async move {
                 let (mut r, mut w) = tokio::io::split(far);
-                let _ = tokio::io::copy(&mut r, &mut w).await;
+                let _ = tokio::io::copy(&mut r, &mut w).await; // best-effort: copy error just ends the pump
             });
             Ok(Box::new(near))
         }
@@ -510,7 +510,7 @@ mod tests {
                 .write_all(b"sprite-vm ready\r\n\x1b[0m$ ")
                 .await
                 .unwrap();
-            let _ = tokio::io::copy(&mut sbx_out_b_rd, &mut s2h_a_wr).await;
+            let _ = tokio::io::copy(&mut sbx_out_b_rd, &mut s2h_a_wr).await; // best-effort: test pipe pump; copy error ends the loop
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

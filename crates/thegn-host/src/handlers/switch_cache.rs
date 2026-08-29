@@ -179,7 +179,7 @@ pub(crate) fn clear_and_fill(
             })
             .is_ok()
         {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

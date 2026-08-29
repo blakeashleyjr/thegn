@@ -608,6 +608,7 @@ pub(crate) fn spawn_refresh_ticker(
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
         let mut sampler = thegn_metrics::StatsSampler::new(disk_path);
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = stats_tx.send(StatsTick::now(sampler.sample())); // prime rate deltas
         let mut last_stats = Instant::now();
         // Seeded from `now` so the first boundary crossing (not startup itself)
@@ -647,7 +648,7 @@ pub(crate) fn spawn_refresh_ticker(
             };
         // Prime once so the sampler watches the daemon PID from the first sample.
         if let Some(status) = refresh_daemon(&mut sampler) {
-            let _ = daemon_tx.send(status);
+            let _ = daemon_tx.send(status); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         }
         loop {
             std::thread::sleep(tick);
@@ -874,7 +875,7 @@ pub(crate) fn spawn_refresh_ticker(
                 wake = true;
             }
             if wake {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
     });
@@ -976,13 +977,13 @@ pub(crate) fn prune_stale_worktree_groups(
         for g in &dead {
             // `del_worktree` cascades caches + merge-queue; the activity-FSM
             // entry is file-based and pruned separately.
-            let _ = db.del_worktree(&g.path);
+            let _ = db.del_worktree(&g.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             thegn_core::activity::forget(&g.path);
         }
         session.active = active_name
             .and_then(|n| session.worktrees.iter().position(|g| g.name == n))
             .unwrap_or(0);
-        let _ = session.persist(db, session_name, now_secs());
+        let _ = session.persist(db, session_name, now_secs()); // best-effort: cache write: the DB is a cache; the session rows are resurrection state
         tracing::info!(
             target: "thegn::startup",
             pruned = dead.len(),
@@ -1012,7 +1013,7 @@ pub(crate) fn load_or_seed_session(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".into());
 
-    let mut env_session = std::env::var("THEGN_SESSION").ok();
+    let mut env_session = std::env::var("THEGN_SESSION").ok(); // best-effort: optional input: the variable may legitimately be unset
     if let Some(ref s) = env_session
         && s == "thegn"
     {
@@ -1127,7 +1128,7 @@ pub(crate) fn load_or_seed_session(
         ));
         session.active = 0;
         seeded = true;
-        let _ = session.persist(&db, &session_name, now_secs());
+        let _ = session.persist(&db, &session_name, now_secs()); // best-effort: cache write: the DB is a cache; the session rows are resurrection state
     }
     session.id = session_name; // Need to add id to session
     // Register the resolved workspace so it survives switches: without a
@@ -1157,13 +1158,13 @@ pub(crate) fn load_or_seed_session(
         };
         // best-effort: the DB is a cache; git is the source of truth
         let _ = db.put_workspace(&session.id, &name, kind);
-        let _ = db.touch_repo(&session.id, &name);
+        let _ = db.touch_repo(&session.id, &name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     // Record the resolved workspace as the active pointer so the next cold
     // start reopens it even on a first run (where no switch has happened yet).
     // Skipped for a tombstoned workspace so it doesn't re-pin itself active.
     if !tombstoned {
-        let _ = db.set_active_workspace(&session.id);
+        let _ = db.set_active_workspace(&session.id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     (session, seeded)
 }
@@ -1529,7 +1530,7 @@ pub(crate) fn db_worktree_list(
                 );
                 // `del_worktree` cascades caches + merge-queue; the activity-FSM
                 // entry is file-based and pruned separately.
-                let _ = db.del_worktree(&w.worktree);
+                let _ = db.del_worktree(&w.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 thegn_core::activity::forget(&w.worktree);
                 continue;
             }
@@ -1908,7 +1909,7 @@ fn collect_sidebar_status(
     // of truth. These writes are now outside the mutex so a stalled WAL write
     // can never block a loop-side `seed_from_global_cache`.
     for (p, json) in &to_persist {
-        let _ = db.put_glyph_cache(p, json);
+        let _ = db.put_glyph_cache(p, json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 
     let scanned_n = scanned.len();
@@ -2320,7 +2321,7 @@ fn merge_total(
 ) -> Option<usize> {
     let key = format!("merge_total:{worktree}");
     if !in_merge {
-        let _ = db.set_ui_state("panel", &key, "");
+        let _ = db.set_ui_state("panel", &key, ""); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         return None;
     }
     let stored = db
@@ -2331,7 +2332,7 @@ fn merge_total(
     match stored {
         Some(total) if total >= unresolved.max(1) => Some(total),
         _ if unresolved > 0 => {
-            let _ = db.set_ui_state("panel", &key, &unresolved.to_string());
+            let _ = db.set_ui_state("panel", &key, &unresolved.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             Some(unresolved)
         }
         other => other,
@@ -3316,7 +3317,7 @@ pub(crate) fn spawn_model_hydration(
             if tx.send((generation, first)).is_ok()
                 && let Some(w) = &waker
             {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
 
             // `git log` can be expensive; run it only after the cache-backed model
@@ -3334,7 +3335,7 @@ pub(crate) fn spawn_model_hydration(
                         .is_ok()
                     && let Some(w) = &waker
                 {
-                    let _ = w.wake();
+                    let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
             }
             Some(())
@@ -3355,7 +3356,7 @@ pub(crate) fn spawn_model_hydration(
             if tx.send((generation, fallback)).is_ok()
                 && let Some(w) = &waker
             {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
     });
@@ -3396,7 +3397,7 @@ pub(crate) fn spawn_panel_prefetch(
             .is_ok()
             && let Some(w) = &waker
         {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -3462,7 +3463,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // `pr_state_is_definitive` and `github.rs`'s Offline doc ("Stale cached
         // data may still be shown").
         if pr_state_is_definitive(&panel.state) {
-            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json);
+            let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
         // Emit a notification when the PR transitions between states
@@ -3475,7 +3476,7 @@ pub(crate) fn spawn_pr_cache_refresh(
             let pr_ref = format!("pr:{}", pr.number);
             let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
             let wt = cwd.to_string_lossy();
-            let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt);
+            let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
             // Lifecycle automation: on merge, move this worktree's linked
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
@@ -3497,7 +3498,9 @@ pub(crate) fn spawn_pr_cache_refresh(
                         ..Default::default()
                     };
                     for id in &linked {
-                        let _ = rt.block_on(router.update_issue(id, &patch));
+                        if let Err(e) = rt.block_on(router.update_issue(id, &patch)) {
+                            tracing::warn!(target: "thegn::issues", error = %e, "failed to move linked issue {id} to Done on merge");
+                        }
                     }
                 }
             }
@@ -3506,7 +3509,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // PR cache landing should surface via a model rehydrate; pulse the waker
         // so an idle loop repaints promptly.
         if let Some(w) = &waker {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
     // Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
@@ -3595,11 +3598,11 @@ pub(crate) fn spawn_pr_cache_refresh(
                 }
                 for (source_ref, msg, wt) in pr_linked_notifications(&old_open, &prs, &wts, &hints)
                 {
-                    let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt);
+                    let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
             }
 
-            let _ = db.put_pr_branch_cache(&repo_root, &json);
+            let _ = db.put_pr_branch_cache(&repo_root, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
             // Mentioned producer: poll GitHub's notifications API for
             // @mentions in this repo (`reason == "mention"`). Throttled to
@@ -3623,9 +3626,10 @@ pub(crate) fn spawn_pr_cache_refresh(
                 && let Some(repo) = forge.repo_ref(&loc)
             {
                 // Stamp before the fetch so a failing fetch can't retry hot.
-                let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string());
+                let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Ok(mentions) = forge.mentions(&loc, &repo) {
                     for (source_ref, msg) in mentions {
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         let _ =
                             db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
                     }
@@ -3633,7 +3637,7 @@ pub(crate) fn spawn_pr_cache_refresh(
             }
 
             if let Some(w) = &branch_waker {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
     });
@@ -3776,14 +3780,14 @@ fn maybe_clean_merged_worktrees(
         if let Ok(reclaimed) = thegn_core::worktree::clean_target(&path)
             && reclaimed > 0
         {
-            let _ = db.delete_worktree_disk(&row.worktree);
+            let _ = db.delete_worktree_disk(&row.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             let verb = if merged { "merged" } else { "closed" };
             let msg = format!(
                 "{} cleaned ({} reclaimed)",
                 verb,
                 thegn_core::disk::human(reclaimed)
             );
-            let _ = db.put_notification("disk_cleaned", &row.branch, &msg, &row.worktree);
+            let _ = db.put_notification("disk_cleaned", &row.branch, &msg, &row.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }
@@ -3821,7 +3825,7 @@ static CONFIG_SOURCE: std::sync::OnceLock<(Vec<String>, Option<std::path::PathBu
 
 /// Record the CLI config source (called once from startup).
 pub(crate) fn set_config_source(overrides: Vec<String>, config: Option<std::path::PathBuf>) {
-    let _ = CONFIG_SOURCE.set((overrides, config));
+    let _ = CONFIG_SOURCE.set((overrides, config)); // best-effort: first-set-wins: the first config source serves for the process
 }
 
 /// The one config loader every off-loop hydration path uses: layered load with
@@ -4010,10 +4014,10 @@ pub(crate) fn spawn_my_work_refresh(
         if let Ok(db) = thegn_core::db::Db::open()
             && let Ok(json) = serde_json::to_string(&feed)
         {
-            let _ = db.put_my_work_cache(&scope_key, &json);
+            let _ = db.put_my_work_cache(&scope_key, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         if let Some(w) = &waker {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -4246,7 +4250,7 @@ pub(crate) fn retarget_diff_watcher(
         let ignore = {
             let mut b =
                 ignore::gitignore::GitignoreBuilder::new(crate::git_watch::watch_canonical(&cwd));
-            let _ = b.add(cwd.join(".gitignore"));
+            let _ = b.add(cwd.join(".gitignore")); // best-effort: a malformed/missing .gitignore just means fewer ignores; the scan below still works
             b.build()
                 .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
         };
@@ -4279,14 +4283,14 @@ pub(crate) fn retarget_diff_watcher(
                 && last_send.elapsed() > Duration::from_millis(500)
             {
                 if tx.send(RefreshKind::Model).is_ok() {
-                    let _ = wake.wake();
+                    let _ = wake.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
                 // The tree just changed under the ACTIVE worktree, so its line
                 // count is the one that can actually be wrong. `watch: true`
                 // lets the scan bypass the long `[loc] scan_interval_secs` for
                 // that single path — bounded by `watch_invalidate_secs`, so a
                 // save storm still recounts at most once per window.
-                let _ = tx.send(RefreshKind::Loc { watch: true });
+                let _ = tx.send(RefreshKind::Loc { watch: true }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 // A branch-ref move also kicks the guarded main-checkout self-heal
                 // so a checkout sitting on that branch fast-forwards its own tree
                 // (external `update-ref` / a fold-actor CAS land elsewhere) without
@@ -4296,7 +4300,7 @@ pub(crate) fn retarget_diff_watcher(
                     .iter()
                     .any(|p| crate::git_watch::is_ref_move_path(p))
                 {
-                    let _ = tx.send(RefreshKind::MainRefMoved);
+                    let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
                 // A remote-tracking ref moved — the local signature of a push
                 // (or fetch): kick the PR + CI caches now so the just-pushed
@@ -4307,13 +4311,13 @@ pub(crate) fn retarget_diff_watcher(
                     .iter()
                     .any(|p| crate::git_watch::is_remote_ref_path(p))
                 {
-                    let _ = tx.send(RefreshKind::Pr);
-                    let _ = tx.send(RefreshKind::Ci { force: false });
+                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    let _ = tx.send(RefreshKind::Ci { force: false }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     // The PR queue cares about exactly this event: a push is
                     // what unblocks a PR (or is the teammate the queue must not
                     // race), so re-evaluate now rather than up to a minute later.
                     // Inert when the queue is off — the pass finds no rows.
-                    let _ = tx.send(RefreshKind::PrQueue);
+                    let _ = tx.send(RefreshKind::PrQueue); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
                 last_send = Instant::now();
             }
@@ -4404,12 +4408,12 @@ pub(crate) fn retarget_diff_watcher(
             if root.starts_with(&cwd) {
                 continue;
             }
-            let _ = nw.watch(root, RecursiveMode::NonRecursive);
-            let _ = nw.watch(&root.join("logs"), RecursiveMode::Recursive);
-            let _ = nw.watch(&root.join("refs"), RecursiveMode::Recursive);
+            let _ = nw.watch(root, RecursiveMode::NonRecursive); // best-effort: watch registration: a missed root just delays fs-triggered hydration until another event
+            let _ = nw.watch(&root.join("logs"), RecursiveMode::Recursive); // best-effort: watch registration: a missed root just delays fs-triggered hydration until another event
+            let _ = nw.watch(&root.join("refs"), RecursiveMode::Recursive); // best-effort: watch registration: a missed root just delays fs-triggered hydration until another event
         }
         if wtx.send((cwd, nw)).is_ok() {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

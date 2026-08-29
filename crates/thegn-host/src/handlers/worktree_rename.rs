@@ -54,12 +54,13 @@ pub(crate) fn request(
             &want,
             &cfg,
         );
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(RenameDone {
             old_path,
             want,
             result,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 

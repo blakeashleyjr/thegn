@@ -154,7 +154,7 @@ pub(crate) fn open_pty(
                             return; // consumer gone — don't bother reaping
                         }
                         if let Some(w) = &waker {
-                            let _ = w.wake();
+                            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                         }
                     }
                     Err(_) => break, // read error: treat as exit, status unknown
@@ -167,16 +167,16 @@ pub(crate) fn open_pty(
             // The pid is reusable from here on — tell the pane's Drop to stop
             // treating it as this child's.
             reaped_reader.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = tx.blocking_send(PaneEvent::Exit(id, code));
+            let _ = tx.blocking_send(PaneEvent::Exit(id, code)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             if let Some(w) = &waker {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
         if std::panic::catch_unwind(body).is_err() {
             tracing::error!("pane {id} reader thread panicked; reporting pane exit");
-            let _ = tx_panic.blocking_send(PaneEvent::Exit(id, None));
+            let _ = tx_panic.blocking_send(PaneEvent::Exit(id, None)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             if let Some(w) = &waker_panic {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         }
     });

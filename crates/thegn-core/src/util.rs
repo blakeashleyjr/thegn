@@ -260,7 +260,7 @@ static HOST_ENV_ALLOW_EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceL
 /// Install the config-driven extra host-env allowlist. Idempotent-by-first-write
 /// (`OnceLock`): call once at startup after config load. Later calls are no-ops.
 pub fn set_host_env_allow_extra(extra: Vec<String>) {
-    let _ = HOST_ENV_ALLOW_EXTRA.set(extra);
+    let _ = HOST_ENV_ALLOW_EXTRA.set(extra); // best-effort: first-set-wins: later calls are no-ops (see doc)
 }
 
 /// The configured extra host-env allowlist (empty if never set).
@@ -800,6 +800,7 @@ pub fn shell() -> String {
 /// discarded). For GUI apps launched from a pane that is about to close.
 pub fn spawn_detached(cmd: &str, cwd: &Path) {
     use std::process::Stdio;
+    // best-effort: detached GUI launch: failure is not actionable
     let _ = Command::new(shell())
         .args(["-lc", cmd])
         .current_dir(cwd)
@@ -815,7 +816,7 @@ pub fn spawn_detached(cmd: &str, cwd: &Path) {
 pub fn set_terminal_title(title: &str) {
     use std::io::Write;
     crate::out!("\u{1b}]0;{title}\u{07}");
-    let _ = std::io::stdout().flush();
+    let _ = std::io::stdout().flush(); // best-effort: title flush at exit: display-only
 }
 
 /// Replace this process with an interactive login shell.
@@ -1001,7 +1002,7 @@ mod tests {
     #[test]
     fn git_common_dir_resolves_main_and_linked() {
         let tmp = std::env::temp_dir().join(format!("tg-gcd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test setup: fresh scratch dir
         // Main checkout: `.git` is a directory → it IS the common dir.
         let main = tmp.join("main");
         std::fs::create_dir_all(main.join(".git")).unwrap();
@@ -1019,13 +1020,13 @@ mod tests {
         .unwrap();
         // `../..` from `<main>/.git/worktrees/feat` resolves to `<main>/.git`.
         assert_eq!(git_common_dir(&wt), wt_gitdir.join("../.."));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
     fn git_lock_acquires_and_re_acquires_after_drop() {
         let tmp = std::env::temp_dir().join(format!("tg-glock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
         let guard = lock_git_mutations(&tmp);
         assert!(guard.is_some(), "first acquire succeeds");
@@ -1034,7 +1035,7 @@ mod tests {
             lock_git_mutations(&tmp).is_some(),
             "re-acquire after drop succeeds"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1204,7 +1205,7 @@ mod tests {
         // Build a real main checkout, then inject the pollution by TEXT — a
         // missing target path, the worst case where `git config` itself aborts.
         let dir = std::env::temp_dir().join(format!("tg-heal-strip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
             git_cmd(&dir)
@@ -1231,7 +1232,7 @@ mod tests {
         // Idempotent: a clean repo is a no-op.
         assert!(!heal_main_checkout_worktree(&dir));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1239,7 +1240,7 @@ mod tests {
         // A linked worktree's `.git` is a FILE, and its config legitimately
         // sets core.worktree — heal must never touch those.
         let dir = std::env::temp_dir().join(format!("tg-heal-linked-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
 
@@ -1248,7 +1249,7 @@ mod tests {
             "a .git FILE (linked worktree) is never healed"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     /// Build a real repo whose `main` ref has been advanced c0→c1 by plumbing
@@ -1256,7 +1257,7 @@ mod tests {
     /// leaves behind. Returns `(dir, c0, c1)`; the tree is still at `c0`.
     fn drifted_repo(tag: &str) -> (PathBuf, String, String) {
         let dir = std::env::temp_dir().join(format!("tg-resync-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&dir).unwrap();
         let g = |args: &[&str]| {
             assert!(
@@ -1281,6 +1282,7 @@ mod tests {
         g(&["commit", "-qm", "c1"]);
         let c1 = git_out(&dir, &["rev-parse", "HEAD"]).unwrap();
         g(&["checkout", "-q", "main"]);
+        // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::remove_file(dir.join("a.txt")).ok(); // main's tree is c0 again
         g(&["update-ref", "refs/heads/main", &c1, &c0]);
         (dir, c0, c1)
@@ -1376,7 +1378,7 @@ bare
         );
         assert!(dir.join("a.txt").exists());
         assert_eq!(git_out(&dir, &["status", "--porcelain"]), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1406,7 +1408,7 @@ bare
             resync_ff_checkout(&dir, "main", &c0, &c1),
             ResyncOutcome::Skipped("detached HEAD")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1424,7 +1426,7 @@ bare
             std::fs::read_to_string(dir.join("a.txt")).unwrap(),
             "MINE\n"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1440,7 +1442,7 @@ bare
         assert_eq!(git_out(&dir, &["status", "--porcelain"]), None);
         // Idempotent once coherent.
         assert!(!heal_main_checkout_worktree(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

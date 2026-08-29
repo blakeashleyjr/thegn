@@ -72,8 +72,8 @@ pub fn read(name: &str) -> Option<VpsRecord> {
 
 /// Remove a record (and the instance's known_hosts pin). Idempotent.
 pub fn remove_at(d: &Path, name: &str) {
-    let _ = std::fs::remove_file(record_path(d, name));
-    let _ = std::fs::remove_file(d.join("known_hosts.d").join(name));
+    let _ = std::fs::remove_file(record_path(d, name)); // best-effort: idempotent removal; absence is fine
+    let _ = std::fs::remove_file(d.join("known_hosts.d").join(name)); // best-effort: idempotent removal; absence is fine
 }
 
 pub fn remove(name: &str) {

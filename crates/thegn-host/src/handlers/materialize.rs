@@ -139,8 +139,8 @@ pub(crate) fn maybe_materialize(
             let _sink = thegn_core::progress::scoped(Box::new(move |ev| {
                 let steps = observer.on_event(ev);
                 if !quiet {
-                    let _ = ptx.send((gname.clone(), ti, steps));
-                    let _ = wk.wake();
+                    let _ = ptx.send((gname.clone(), ti, steps)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                    let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
             }));
             f()
@@ -198,8 +198,8 @@ pub(crate) fn maybe_materialize(
                     worktree = %gname,
                     "splash cleared: warm spare claimed (no provisioning)"
                 );
-                let _ = ptx.send((gname.clone(), ti, Vec::new()));
-                let _ = wk.wake();
+                let _ = ptx.send((gname.clone(), ti, Vec::new())); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 observed(&|| {
                     crate::direnv_warm::launch_spec_synced_with(
                         &cfg,
@@ -231,8 +231,8 @@ pub(crate) fn maybe_materialize(
                         // Quiet split: swallow provider progress so it can't
                         // re-raise the splash over the already-live tab.
                         if !quiet {
-                            let _ = ptx_p.send((gname_p.clone(), ti, provision_load_steps(views)));
-                            let _ = wk_p.wake();
+                            let _ = ptx_p.send((gname_p.clone(), ti, provision_load_steps(views))); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                            let _ = wk_p.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                         }
                     },
                     hui.as_ref(),
@@ -304,7 +304,7 @@ pub(crate) fn maybe_materialize(
             })
             .is_ok()
         {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

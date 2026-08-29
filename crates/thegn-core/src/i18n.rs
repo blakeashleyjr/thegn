@@ -31,7 +31,7 @@ pub fn init(config_lang: &str) {
         "en-US".parse().unwrap()
     });
 
-    let _ = ACTIVE_LANG.set(lang_id);
+    let _ = ACTIVE_LANG.set(lang_id); // best-effort: first-set-wins: later calls are ignored by design
 }
 
 /// Retrieve the active language identifier.

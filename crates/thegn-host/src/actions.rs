@@ -154,7 +154,7 @@ pub(crate) fn spawn_detached_reaped(mut cmd: std::process::Command) -> bool {
                     clippy::disallowed_methods,
                     reason = "reaper thread, off the event loop"
                 )]
-                let _ = child.wait();
+                let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             });
             true
         }
@@ -276,7 +276,7 @@ pub(crate) fn spawn_ci_action(
         // Forced: the user just mutated a run, so the ttl guard must not
         // swallow the follow-up refetch.
         if tx.send(RefreshKind::Ci { force: true }).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -345,7 +345,7 @@ pub(crate) fn spawn_ci_detail(
             log_tail,
         };
         if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -438,7 +438,7 @@ pub(crate) fn spawn_usage(
             proxy_spend,
         };
         if tx.send(RefreshKind::Usage(Box::new(payload))).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     };
     tokio::task::spawn_blocking(work);
@@ -480,7 +480,7 @@ fn spawn_usage_rollup(
             skipped: r.skipped,
         };
         if tx.send(RefreshKind::UsageTokens(Box::new(view))).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -547,7 +547,7 @@ fn record_usage_history(
     // best-effort: history is a nicety; a write failure must not fail the poll.
     let _ = db.put_usage_samples(&samples);
     let since = now - i64::from(cfg.history_days) * 86_400;
-    let _ = db.prune_usage_samples(since);
+    let _ = db.prune_usage_samples(since); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     for s in &samples {
         let hist = db
             .usage_history(&s.account_key, &s.window, since)
@@ -638,7 +638,7 @@ pub(crate) fn run_pr_view_action(
             thegn_core::msg::warn(&format!("{label} failed: {}", e.describe()));
         }
         if tx.send(RefreshKind::Pr).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -692,7 +692,7 @@ pub(crate) fn panel_pr_action_key(
                     thegn_core::msg::warn(&format!("pr create failed: {}", e.describe()));
                 }
                 if tx.send(RefreshKind::Pr).is_ok() {
-                    let _ = waker.wake();
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
             });
         }
@@ -704,7 +704,7 @@ pub(crate) fn panel_pr_action_key(
 /// Fetch the full-screen PR view's async data (conversation + diff) off the
 /// loop and deliver it over `tx`. Single-flight via `generation` — the loop
 /// drops deliveries from a stale generation. Best-effort: a failed fetch leaves
-/// that half `None` (the view shows "loading" / degrades).
+/// that half `None` (the view shows "loading" / degrades) and logs the reason.
 pub(crate) fn spawn_pr_view_fetch(
     session: Session,
     owner: String,
@@ -722,15 +722,27 @@ pub(crate) fn spawn_pr_view_fetch(
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let repo_ref = thegn_core::forge::RepoRef { owner, repo };
-        let conversation = forge.conversation(&loc, &repo_ref, number).ok();
-        let diff = forge.pr_diff(&loc, thegn_core::forge::PrRef::Current).ok();
+        let conversation = match forge.conversation(&loc, &repo_ref, number) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(target: "thegn::panel", error = %e, "PR conversation fetch failed; the view opens without it");
+                None
+            }
+        };
+        let diff = match forge.pr_diff(&loc, thegn_core::forge::PrRef::Current) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(target: "thegn::panel", error = %e, "PR diff fetch failed; the view opens without it");
+                None
+            }
+        };
         let data = PrViewData {
             generation,
             conversation,
             diff,
         };
         if tx.send(data).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -861,7 +873,7 @@ pub(crate) fn spawn_diff_view_fetch(
             structural,
         };
         if tx.send(data).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -994,7 +1006,7 @@ impl CiActionCtx<'_> {
             .send(RefreshKind::Ci { force: true })
             .is_ok()
         {
-            let _ = self.waker.wake();
+            let _ = self.waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     }
 
@@ -1140,7 +1152,7 @@ impl CiActionCtx<'_> {
                 let _ = db.mark_notification_read(id); // best-effort: DB is a cache
             }
             if tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
         // Optimistic: the chip drops on the next frame, not after the rehydrate.
@@ -1171,7 +1183,7 @@ impl CiActionCtx<'_> {
                 // The worktree's inbox rows are the same item seen from the
                 // other side; leaving them unread made a quieted needs-you
                 // entry reappear under Alerts with the ⚑ count unchanged.
-                let _ = db.mark_notifications_read_for_worktree(&path);
+                let _ = db.mark_notifications_read_for_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 // Same item from the other side: a quieted needs-you worktree
                 // must also lower its live raised hand, or the demand returns
                 // on the very next hydration.
@@ -1179,7 +1191,7 @@ impl CiActionCtx<'_> {
                 let _ = db.clear_session_attention_for_worktree(&path);
             }
             if tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
         // Optimistic: quiet the worktree in the model now (the rehydrate

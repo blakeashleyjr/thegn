@@ -143,6 +143,7 @@ pub fn sync_compute_budget_caps<S: crate::store::ComputeLedgerStore>(
     db: &S,
 ) {
     if cfg.placement.max_monthly_spend > 0.0 {
+        // best-effort: budget limit push: config is the source of truth; a failed write keeps the previous limits
         let _ = db.set_compute_budget_limits(
             "global",
             "monthly",
@@ -152,6 +153,7 @@ pub fn sync_compute_budget_caps<S: crate::store::ComputeLedgerStore>(
     }
     for (name, zc) in &cfg.zone {
         if let Some(limit) = zc.budget.as_ref().and_then(|b| b.limit_compute_cost) {
+            // best-effort: budget limit push: config is the source of truth; a failed write keeps the previous limits
             let _ =
                 db.set_compute_budget_limits(&format!("zone:{name}"), "monthly", Some(limit), 0);
         }

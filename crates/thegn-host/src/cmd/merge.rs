@@ -395,7 +395,7 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // enqueue time (e.g. under `--set merge_queue.target_branch=…`), which is
     // why `merge list` used to keep showing the stale value. Re-stamp it.
     for it in &items {
-        let _ = db.set_merge_target(&it.worktree, &target);
+        let _ = db.set_merge_target(&it.worktree, &target); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     let out = merge_driver::drive_queue(mq, cfg, &root, &db, items, |step: &DriveStep| {
         if json {
@@ -558,13 +558,13 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let mut failure: Option<String> = None;
     match outcome {
         AttemptOutcome::Landed { commit, resyncs } => {
-            let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None);
+            let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             lifecycle(LifecycleEvent::Landed);
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
             integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate => {
-            let _ = db.update_merge_status(&wt_s, "landed", None, Some("already merged"), None);
+            let _ = db.update_merge_status(&wt_s, "landed", None, Some("already merged"), None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }
@@ -586,14 +586,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             } else {
                 format!("{reason}\n{}", log.trim())
             };
-            let _ = db.update_merge_status(&wt_s, "gate_error", None, None, Some(&detail));
+            let _ = db.update_merge_status(&wt_s, "gate_error", None, None, Some(&detail)); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch} was NOT gated — {reason}.");
             outln!("  The branch was not judged; fix the gate environment and re-run.");
             failure = Some(format!("land failed: {branch} gate could not run"));
         }
         AttemptOutcome::Unreachable { detail } => {
-            let _ = db.update_merge_status(&wt_s, "deferred", None, Some(&detail), None);
+            let _ = db.update_merge_status(&wt_s, "deferred", None, Some(&detail), None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             lifecycle(LifecycleEvent::Failed);
             outln!("✗ {branch}: {detail}");
             failure = Some(format!("land failed: {branch} unreachable"));

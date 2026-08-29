@@ -186,7 +186,7 @@ fn spawn_control(argv: Vec<String>, label: String, waker: TerminalWaker) {
             g.push(outcome);
         }
         // Wake the loop to drain the queue and (in ~5s) re-list the containers.
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -206,14 +206,14 @@ fn run_bounded(argv: &[String], timeout: Duration) -> Option<bool> {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status.success()),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
                 // Reap off-thread so a wedged runtime can't block this worker.
                 std::thread::spawn(move || {
                     #[expect(
                         clippy::disallowed_methods,
                         reason = "off-loop reap of a killed child on its own thread; never the event loop"
                     )]
-                    let _ = child.wait();
+                    let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
                 });
                 return None;
             }

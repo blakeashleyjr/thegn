@@ -158,7 +158,7 @@ mod tests {
         // A pre-v32 DB (no `repo_trust` table): opening it adds the table
         // additively without disturbing existing data.
         let dir = std::env::temp_dir().join(format!("tg-db-trust-mig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
         {
@@ -181,6 +181,6 @@ mod tests {
         db.repo_trust_decide("/keep", "id", "{\"k\":1}", "approved", 7)
             .unwrap();
         assert_eq!(db.repo_trust_approved("/keep").unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

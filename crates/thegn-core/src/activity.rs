@@ -884,7 +884,7 @@ fn save(path: &Path, snap: &Snapshot) {
         return;
     };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::create_dir_all(dir); // best-effort: atomic save: a failed mkdir surfaces as the write failure below
     }
     // Unique per write: pid + a monotonic counter, so two threads in the same
     // process (ack + poll) never truncate+write the *same* tmp file and publish
@@ -892,7 +892,7 @@ fn save(path: &Path, snap: &Snapshot) {
     let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.{}.{seq}", std::process::id()));
     if std::fs::write(&tmp, json).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+        let _ = std::fs::rename(&tmp, path); // best-effort: atomic publish: on failure the previous snapshot stays in place
     } else {
         // best-effort: drop a failed tmp so it doesn't accumulate.
         let _ = std::fs::remove_file(&tmp);
@@ -931,6 +931,7 @@ mod tests {
         fn drop(&mut self) {
             // best-effort: the child may already have exited or been reaped.
             let _ = self.0.kill();
+            // best-effort: test cleanup: reaping a dead child must never panic the test
             let _ = self.0.wait(); // reap, so no zombie outlives the test binary
         }
     }
@@ -1037,6 +1038,7 @@ mod tests {
     #[test]
     fn missing_file_is_empty() {
         let path = tmp("missing");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         assert!(read_states_at(&path).is_empty());
     }
@@ -1050,6 +1052,7 @@ mod tests {
         let m = read_states_at(&path);
         assert_eq!(m.get("app/home").map(String::as_str), Some("waiting"));
         assert_eq!(m.get("app/feat").map(String::as_str), Some("read"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1068,6 +1071,7 @@ mod tests {
         // Forgetting an unknown path is a no-op (and never writes).
         forget_at(&path, "/wt/nope");
         assert_eq!(read_states_at(&path).len(), 1);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1090,8 +1094,10 @@ mod tests {
         // `last_active_at` round-trips from disk — the `Live` recency key.
         assert_eq!(b.last_active_at, Some(2100.0));
         // Missing file → empty map; default-path wrapper never panics.
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         assert!(read_entries_at(&path).is_empty());
+        // best-effort: test smoke: this path must not panic
         let _ = read_entries();
     }
 
@@ -1100,17 +1106,20 @@ mod tests {
         let path = tmp("bad");
         std::fs::write(&path, b"{ this is not json").unwrap();
         assert!(read_states_at(&path).is_empty());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn read_states_uses_default_path_without_panicking() {
+        // best-effort: test smoke: this path must not panic
         let _ = read_states();
     }
 
     #[test]
     fn poll_records_baseline_then_waiting_then_read() {
         let path = tmp("fsm");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt".into(),
@@ -1139,12 +1148,14 @@ mod tests {
             read_states_at(&path).get("app/home").map(String::as_str),
             Some("read")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn poll_skips_when_called_too_soon() {
         let path = tmp("skip");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: "/x".into(),
@@ -1154,6 +1165,7 @@ mod tests {
         // < MIN_SCAN_INTERVAL_SECS later: no rescan, snapshot unchanged.
         poll_and_save_at(&path, &managed, 1000.5);
         assert_eq!(read_states_at(&path).len(), 1);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1164,6 +1176,7 @@ mod tests {
     #[test]
     fn active_goes_waiting_after_confirmed_quiet() {
         let path = tmp("waiting");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-waiting".into(),
@@ -1206,6 +1219,7 @@ mod tests {
             snap.worktrees["/nonexistent/wt-waiting"].quiet_since,
             Some(1010.0)
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1215,6 +1229,7 @@ mod tests {
     #[test]
     fn waiting_is_sticky_and_survives_absence() {
         let path = tmp("sticky");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-sticky".into(),
@@ -1244,6 +1259,7 @@ mod tests {
             read_states_at(&path).get("app/s").map(String::as_str),
             Some("waiting")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1257,6 +1273,7 @@ mod tests {
         let wt = std::env::temp_dir().join(format!("tg-act-resume-{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
         let path = tmp("resume");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: wt.to_string_lossy().into_owned(),
@@ -1331,7 +1348,9 @@ mod tests {
         );
         drop(burner);
 
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&wt);
     }
 
@@ -1340,6 +1359,7 @@ mod tests {
     #[test]
     fn active_holds_within_grace() {
         let path = tmp("hold");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-hold".into(),
@@ -1360,6 +1380,7 @@ mod tests {
         poll_and_save_at(&path, &managed, 1001.0);
         let st = read_states_at(&path);
         assert_eq!(st.get("app/h").map(String::as_str), Some("active"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1373,6 +1394,7 @@ mod tests {
         let wt = std::env::temp_dir().join(format!("tg-act-burn-{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
         let path = tmp("burn");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: wt.to_string_lossy().into_owned(),
@@ -1407,7 +1429,9 @@ mod tests {
         // was told, so the delta clears the 3-jiffy threshold.
         assert_eq!(st.get("app/burn").map(String::as_str), Some("active"));
 
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&wt);
     }
 
@@ -1426,6 +1450,7 @@ mod tests {
         let line = "42 ((weird cmd)) R 1 1 1 0 -1 0 0 0 0 0 7 11 0 0";
         std::fs::write(&p, line).unwrap();
         assert_eq!(stat_jiffies(p.clone()), Some(18));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1436,6 +1461,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("tg-stat-bad-{}.txt", std::process::id()));
         std::fs::write(&p, "no parens here").unwrap();
         assert_eq!(stat_jiffies(p.clone()), None);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         // A missing file also yields None.
         assert_eq!(stat_jiffies(PathBuf::from("/no/such/stat")), None);
@@ -1455,6 +1481,7 @@ mod tests {
     #[test]
     fn non_linux_scanner_sees_a_child_processes_cwd() {
         let dir = std::env::temp_dir().join(format!("tg-scan-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Resolve symlinks: macOS hands back /private/var… for /var…, and the
@@ -1480,6 +1507,7 @@ mod tests {
         let targets = vec![(dir.clone(), "wt/probe".to_string())];
         let sums = scan_proc(&targets);
         drop(child); // kills + reaps
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
@@ -1506,6 +1534,7 @@ mod tests {
         assert!(numer > 0 && denom > 0, "timebase must be usable");
 
         let dir = std::env::temp_dir().join(format!("tg-mach-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
@@ -1533,6 +1562,7 @@ mod tests {
 
         let sums = scan_proc(&[(dir.clone(), "wt/burn".to_string())]);
         drop(child); // kills + reaps
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
 
         let jiffies = sums.get("wt/burn").copied().unwrap_or(0);
@@ -1552,6 +1582,7 @@ mod tests {
     #[test]
     fn injected_jiffies_drive_active() {
         let path = tmp("inject");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/remote-wt".into(),
@@ -1573,6 +1604,7 @@ mod tests {
             read_states_at(&path).get("app/remote").map(String::as_str),
             Some("active")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1589,6 +1621,7 @@ mod tests {
     #[test]
     fn output_hint_drives_none_to_active() {
         let path = tmp("hint-wake");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/hint-wt";
         let managed = vec![ManagedWorktree {
@@ -1604,6 +1637,7 @@ mod tests {
             read_states_at(&path).get("app/hint").map(String::as_str),
             Some("active")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1614,6 +1648,7 @@ mod tests {
     #[test]
     fn output_hint_keeps_active_then_waiting_when_stale() {
         let path = tmp("hint-hold");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/hint-hold-wt";
         let managed = vec![ManagedWorktree {
@@ -1655,6 +1690,7 @@ mod tests {
             read_states_at(&path).get("app/hold").map(String::as_str),
             Some("waiting")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1664,6 +1700,7 @@ mod tests {
     #[test]
     fn red_resumes_only_after_sustained_output() {
         let path = tmp("hint-red");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/hint-red-wt";
         let managed = vec![ManagedWorktree {
@@ -1697,6 +1734,7 @@ mod tests {
             read_states_at(&path).get("app/red").map(String::as_str),
             Some("active")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1713,6 +1751,7 @@ mod tests {
     #[test]
     fn stale_future_or_foreign_hints_ignored() {
         let path = tmp("hint-bounds");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/hint-bounds-wt";
         let managed = vec![ManagedWorktree {
@@ -1764,6 +1803,7 @@ mod tests {
             read_states_at(&path).get("app/bounds").map(String::as_str),
             Some("waiting")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1928,6 +1968,7 @@ mod tests {
     #[test]
     fn shell_worktree_settles_to_none_instead_of_red() {
         let path = tmp("shell-none");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/wt-shell";
         let managed = vec![ManagedWorktree {
@@ -1957,6 +1998,7 @@ mod tests {
     #[test]
     fn inherited_red_heals_for_a_shell_worktree() {
         let path = tmp("shell-heal");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/wt-heal";
         let managed = vec![ManagedWorktree {
@@ -1986,6 +2028,7 @@ mod tests {
     #[test]
     fn unclassified_worktree_still_arms_red() {
         let path = tmp("unknown-agent");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt = "/nonexistent/wt-unknown";
         let managed = vec![ManagedWorktree {
@@ -2023,6 +2066,7 @@ mod tests {
         let wt = std::env::temp_dir().join(format!("tg-act-churn-{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
         let path = tmp("churn");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let wt_s = wt.to_string_lossy().into_owned();
         let managed = vec![ManagedWorktree {
@@ -2035,7 +2079,7 @@ mod tests {
         // Churn: each command is a *new* pid that does a little work and exits,
         // exactly like a shell prompt hook or a one-off `git status`.
         let churn = || {
-            let _ = Command::new("sh")
+            let _ = Command::new("sh") // best-effort: test churn: the sh child's status is irrelevant to the assertion
                 .arg("-c")
                 .arg("for i in 1 2 3 4 5; do echo $i >/dev/null; done")
                 .current_dir(&wt)
@@ -2101,7 +2145,9 @@ mod tests {
             "a bare terminal that went quiet must clear, not turn red"
         );
 
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&wt);
     }
 
@@ -2109,6 +2155,7 @@ mod tests {
     /// `state_path`/`unix_now` plumbing.
     #[test]
     fn default_path_wrappers_dont_panic() {
+        // best-effort: test smoke: this path must not panic
         let _ = read_states();
         // poll_and_save against the real default path with no managed worktrees:
         // a no-op step that just persists an empty snapshot.
@@ -2153,6 +2200,7 @@ mod tests {
     #[test]
     fn coerce_stale_states_downgrades_phantom_but_keeps_fresh() {
         let path = tmp("coerce");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         // Two worktrees left "active" by a killed session, plus a genuinely-stuck
         // "waiting" dot. polled_at 1000; one entry was last active long ago, the
@@ -2176,6 +2224,7 @@ mod tests {
     #[test]
     fn coerce_stale_states_no_snapshot_is_noop() {
         let path = tmp("coerce-missing");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         // Missing file: no write, no panic.
         coerce_stale_states_at(&path, 600_000, 2000.0);
@@ -2193,6 +2242,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         let path = Arc::new(tmp("race"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&*path);
         let managed = vec![ManagedWorktree {
             worktree: "/nonexistent/wt-race".into(),
@@ -2248,6 +2298,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         poller.join().unwrap();
         assert!(acked_seen, "ack never took effect at all");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&*path);
     }
 
@@ -2256,14 +2307,17 @@ mod tests {
     #[test]
     fn save_tmp_path_is_unique_per_write() {
         let seq0 = WRITE_SEQ.load(Ordering::Relaxed);
+        // best-effort: test scratch: best-effort by design
         let _ = seq0; // counter is monotonic; two saves advance it.
         let path = tmp("tmp-unique");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
         let snap = Snapshot::default();
         save(&path, &snap);
         save(&path, &snap);
         let seq1 = WRITE_SEQ.load(Ordering::Relaxed);
         assert!(seq1 >= seq0 + 2, "each save must consume a fresh counter");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&path);
     }
 }

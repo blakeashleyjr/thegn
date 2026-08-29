@@ -137,6 +137,7 @@ fn spawn_heal(name: &str, cfg: &thegn_core::config::Config, host_ui: &crate::hos
     let ui = host_ui.clone();
     tokio::task::spawn_blocking(move || {
         let _ = crate::host_flow::ensure_host_ready(
+            // best-effort: background heal drive: step failures surface via host events; the outer result is consent/abort
             &binding,
             crate::host_flow::ConsentPolicy::BackgroundSkip,
             &mut |_| {},
@@ -237,7 +238,7 @@ mod tests {
     fn reconcile_recovery_resets_and_reports() {
         let mut st = test_state();
         let snaps = [failed_snap("a", true)];
-        let _ = st.due_hosts(&snaps, 1000);
+        let _ = st.due_hosts(&snaps, 1000); // best-effort: test: the call's effect (stamping inflight state) is the point; the asserts below check it
         let due = st.due_hosts(&snaps, 1016);
         assert_eq!(due.len(), 1);
         let rt = rt_with(vec![HostUiEvent::Done {
@@ -254,6 +255,7 @@ mod tests {
     fn reconcile_refailure_bumps_attempts_toward_longer_backoff() {
         let mut st = test_state();
         let snaps = [failed_snap("a", true)];
+        // best-effort: test: the call's effect (stamping inflight state) is the point; the asserts below check it
         let _ = st.due_hosts(&snaps, 1000); // stamp (0, 1000)
         assert_eq!(st.due_hosts(&snaps, 1016).len(), 1); // attempt 1 spawned
         let rt = rt_with(vec![HostUiEvent::Done {
@@ -278,12 +280,13 @@ mod tests {
     fn inflight_marks_expire_after_ttl() {
         let mut st = test_state();
         let snaps = [failed_snap("a", true)];
-        let _ = st.due_hosts(&snaps, 1000);
+        let _ = st.due_hosts(&snaps, 1000); // best-effort: test: the call's effect (stamping inflight state) is the point; the asserts below check it
+        // best-effort: test: the call's effect (stamping inflight state) is the point; the asserts below check it
         let _ = st.due_hosts(&snaps, 1016); // inflight at 1016
         // A drive that never reports (deferred consent, silent death) expires,
         // so healing can resume. No live view at all in rt.
         let rt = empty_rt();
-        let _ = st.reconcile(&rt, 1016 + INFLIGHT_TTL_SECS + 1);
+        let _ = st.reconcile(&rt, 1016 + INFLIGHT_TTL_SECS + 1); // best-effort: test: the call's effect (clearing expired inflight state) is the point; the assert below checks it
         assert!(st.inflight.is_empty(), "TTL expiry unblocks future heals");
     }
 }

@@ -24,6 +24,7 @@ pub fn spawn(
     if !enabled {
         // Drain-and-drop so the bus never blocks on a full channel, but never
         // deliver. Cheap: the thread parks on recv until the bus is dropped.
+        // best-effort: drain thread for the disabled path: a failed spawn just drops notifications (feature is off)
         std::thread::Builder::new()
             .name("desktop-notify-drain".into())
             .spawn(move || {
@@ -44,6 +45,7 @@ pub fn spawn(
                     deliver(&notif);
                 }
             }
+            // best-effort: delivery thread: a failed spawn just skips notifications, matching the module's no-notifier degradation
         })
         .ok();
 }
@@ -77,7 +79,7 @@ fn deliver_linux(notif: &DesktopNotification) {
     if !thegn_core::util::have("notify-send") {
         return;
     }
-    let _ = Command::new("notify-send")
+    let _ = Command::new("notify-send") // best-effort: spawn: a missing/broken notifier just skips the notification
         .arg("--app-name=thegn")
         .arg("--urgency")
         .arg(notify_send_urgency(notif.urgency))
@@ -115,7 +117,7 @@ fn deliver_macos(notif: &DesktopNotification) {
     let title = applescript_escape(&notif.title);
     let body = applescript_escape(&notif.body);
     let script = format!("display notification \"{body}\" with title \"{title}\"");
-    let _ = Command::new("osascript")
+    let _ = Command::new("osascript") // best-effort: spawn: a missing/broken notifier just skips the notification
         .arg("-e")
         .arg(script)
         .stdin(std::process::Stdio::null())
@@ -151,7 +153,7 @@ fn deliver_windows(notif: &DesktopNotification) {
     else {
         return;
     };
-    let _ = Command::new(ps)
+    let _ = Command::new(ps) // best-effort: spawn: a missing/broken notifier just skips the notification
         .args(["-NoProfile", "-Command", &script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

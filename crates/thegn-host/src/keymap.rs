@@ -1922,7 +1922,7 @@ mod tests {
         );
         // which-key has a continuation to show after the prefix.
         map.reset();
-        let _ = map.dispatch(Mode::Normal, space);
+        let _ = map.dispatch(Mode::Normal, space); // best-effort: test: the dispatch's effect is the point; the continuation assert below checks it
         assert!(
             map.pending_continuations(Mode::Normal)
                 .iter()

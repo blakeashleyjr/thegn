@@ -124,7 +124,7 @@ pub fn seed_persisted_worktrees(cfg: &Config) {
         use thegn_core::store::WorkspaceStore;
         for wt in db.worktrees().unwrap_or_default() {
             if wt.location.is_empty() {
-                let _ = seed(cfg, std::path::Path::new(&wt.worktree));
+                let _ = seed(cfg, std::path::Path::new(&wt.worktree)); // best-effort: discoverability seed: a failed seed just means untracked assets
             }
         }
     }
@@ -170,10 +170,10 @@ fn exclude_locally(worktree: &Path) {
         // best-effort throughout: a failed write just means the seeded assets
         // show as untracked.
         if !contents.is_empty() && !contents.ends_with('\n') {
-            let _ = writeln!(f);
+            let _ = writeln!(f); // best-effort: discoverability seed: a failed write just means the assets show as untracked (comment above)
         }
         for pat in missing {
-            let _ = writeln!(f, "{pat}");
+            let _ = writeln!(f, "{pat}"); // best-effort: discoverability seed: a failed write just means the assets show as untracked (comment above)
         }
     }
 }
@@ -279,7 +279,7 @@ mod tests {
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("tg-mq-assets-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(d.join(".git").join("info")).unwrap();
         // A real-ish info/exclude so the append path runs, mirroring a
         // git-initialised repo.
@@ -337,7 +337,7 @@ mod tests {
             assert_eq!(n, 1, "{pat} should be excluded exactly once");
         }
 
-        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// A repo with no `info/exclude` (or no `info/`) still gets one, rather than
@@ -350,7 +350,7 @@ mod tests {
         for (pat, n) in excl_hits(&wt) {
             assert_eq!(n, 1, "{pat} should be excluded exactly once");
         }
-        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// An exclude file with no trailing newline must not get its last line
@@ -368,7 +368,7 @@ mod tests {
         for (pat, n) in excl_hits(&wt) {
             assert_eq!(n, 1, "{pat} should be excluded exactly once");
         }
-        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// `ASSETS` and `EXCLUDE_PATS` are two hand-maintained lists; a new asset
@@ -409,7 +409,7 @@ mod tests {
         // Gate closes again: the copy stays.
         seed(&cfg, &wt).unwrap();
         assert!(wt.join(".claude/skills/pipeline/SKILL.md").exists());
-        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

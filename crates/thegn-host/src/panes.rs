@@ -936,6 +936,7 @@ impl Panes {
                 }
                 Err(e) => {
                     let _ = std::fs::write(
+                        // best-effort: debug trace: the real error is returned right below
                         "/tmp/thegn-spawn-err.log",
                         format!("Materialize spawn failed: {e:?}"),
                     );
@@ -1036,7 +1037,7 @@ pub(crate) fn relayout(panes: &mut Panes, tree: &crate::center::CenterTree, cent
             continue;
         }
         if let Some(p) = panes.table.get_mut(&id) {
-            let _ = p.resize(content.rows.max(1) as u16, content.cols.max(1) as u16);
+            let _ = p.resize(content.rows.max(1) as u16, content.cols.max(1) as u16); // best-effort: resize: a failed resize keeps the old size until the next layout pass
         }
     }
 }
@@ -1091,7 +1092,7 @@ pub(crate) fn relayout_strip(
     for (id, rect) in supervisor.strip_layout(strip) {
         if let Some(p) = panes.table.get_mut(&id) {
             let body_rows = rect.rows.saturating_sub(1).max(1);
-            let _ = p.resize(body_rows as u16, rect.cols.max(1) as u16);
+            let _ = p.resize(body_rows as u16, rect.cols.max(1) as u16); // best-effort: resize: a failed resize keeps the old size until the next layout pass
         }
     }
 }

@@ -338,7 +338,7 @@ where
                  session or hung) so the pool refills",
                 s.sandbox_name
             ));
-            let _ = crate::provision_gate::destroy_spare(cfg, env_name, &s.sandbox_name);
+            let _ = crate::provision_gate::destroy_spare(cfg, env_name, &s.sandbox_name); // best-effort: stale-spare cleanup: a failed destroy is retried on the next reconcile
             notify();
         } else {
             provisioning += 1;
@@ -381,7 +381,7 @@ where
                 .find(|s| &s.sandbox_name == name)
                 .is_some_and(|s| recycle_spare(cfg, env_name, s, &current_lock));
         if !recycled {
-            let _ = crate::provision_gate::destroy_spare(cfg, env_name, name);
+            let _ = crate::provision_gate::destroy_spare(cfg, env_name, name); // best-effort: spare cleanup: a failed destroy is retried on the next reconcile
         }
         notify();
     }
@@ -478,12 +478,13 @@ fn recycle_spare(cfg: &Config, env_name: &str, spare: &PoolSpare, current_lock: 
             let workdir = crate::provider_workdir::resolve(&env.provider, name);
             let marker = thegn_core::envplan::EnvPlan::marker_path(&workdir);
             let _ = crate::agent::block_on_provider(|| async {
+                // best-effort: marker write: a failed touch just re-runs init on the next claim
                 provider.write(name, &marker, b"ok\n").await
             });
             if let Ok(db) = thegn_core::db::Db::open() {
                 // best-effort: the DB is a cache; a miss just means the spare is
                 // re-observed (and maybe destroyed) on a later reconcile tick.
-                let _ = db.set_pool_spare_ready(name, Some(cp), current_lock);
+                let _ = db.set_pool_spare_ready(name, Some(cp), current_lock); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             tracing::debug!(
                 target: "thegn::lifecycle",
@@ -544,7 +545,7 @@ pub fn recycle_claimed_on_delete(cfg: &Config, env_name: &str, name: &str) -> bo
     }
     // best-effort: drop the stale claimed row so it never lingers as a phantom
     // spare; the caller proceeds to destroy the sandbox itself.
-    let _ = db.delete_pool_spare(name);
+    let _ = db.delete_pool_spare(name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     false
 }
 
@@ -787,7 +788,7 @@ mod live_recycle {
     impl Drop for SpareGuard {
         fn drop(&mut self) {
             if !self.done {
-                let _ = crate::provision_gate::destroy_spare(&self.cfg, "tglive", &self.name);
+                let _ = crate::provision_gate::destroy_spare(&self.cfg, "tglive", &self.name); // best-effort: rollback in Drop: failure cannot unwind; the reconcile scan reaps the leak
             }
         }
     }
@@ -814,7 +815,7 @@ mod live_recycle {
             return;
         };
         let tmp = std::env::temp_dir().join(format!("tg-live-recycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&tmp).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[(
             "XDG_STATE_HOME",
@@ -915,7 +916,7 @@ mod live_recycle {
             return;
         };
         let tmp = std::env::temp_dir().join(format!("tg-live-claim-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&tmp).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[(
             "XDG_STATE_HOME",
@@ -977,7 +978,7 @@ mod live_recycle {
             return;
         };
         let tmp = std::env::temp_dir().join(format!("tg-live-fallback-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&tmp).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[(
             "XDG_STATE_HOME",

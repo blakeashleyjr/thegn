@@ -81,12 +81,12 @@ pub(crate) fn spawn_scan(
             let Some(report) = crate::loc_scan::scan(path) else {
                 // Unreadable or empty: drop any previous count rather than let
                 // the chip keep showing a number for a tree that is gone.
-                let _ = db.delete_loc_cache(path_s);
+                let _ = db.delete_loc_cache(path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 counted += 1;
                 continue;
             };
             if let Ok(json) = serde_json::to_string(&report) {
-                let _ = db.put_loc_cache(path_s, report.total_code, &json);
+                let _ = db.put_loc_cache(path_s, report.total_code, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 counted += 1;
             }
         }
@@ -94,7 +94,7 @@ pub(crate) fn spawn_scan(
         if counted > 0
             && let Some(w) = &waker
         {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -131,7 +131,7 @@ fn sweep_orphans(db: &Db) -> usize {
         live.iter().map(String::as_str),
     );
     for path in &gone {
-        let _ = db.delete_loc_cache(path);
+        let _ = db.delete_loc_cache(path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     gone.len()
 }

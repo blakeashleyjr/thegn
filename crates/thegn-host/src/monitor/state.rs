@@ -195,7 +195,7 @@ pub(crate) fn persist(prefs: &MonitorPrefs) {
     crate::db_task::persist(move |db| {
         use thegn_core::store::WorkspaceStore;
         for (k, v) in &entries {
-            let _ = db.set_ui_state(SCOPE, k, v);
+            let _ = db.set_ui_state(SCOPE, k, v); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     });
 }

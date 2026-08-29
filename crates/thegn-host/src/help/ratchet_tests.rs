@@ -81,7 +81,7 @@ fn documented_ids(reg: &thegn_core::help::HelpRegistry) -> BTreeSet<String> {
 
 #[test]
 fn registry_validates_cleanly() {
-    let _ = registry();
+    let _ = registry(); // best-effort: test: asserts the registry validates without panicking
 }
 
 #[test]

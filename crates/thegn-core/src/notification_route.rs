@@ -989,7 +989,7 @@ mod tests {
         assert!(message_regex("(cache-unclosed").is_none());
         // …and flooding past the bound clears without breaking matching.
         for i in 0..70 {
-            let _ = message_regex(&format!("cache-flood-{i}"));
+            let _ = message_regex(&format!("cache-flood-{i}")); // best-effort: test: filling the regex cache
         }
         let d = message_regex("cache-hit-[0-9]+").unwrap();
         assert!(d.is_match("cache-hit-7"));
