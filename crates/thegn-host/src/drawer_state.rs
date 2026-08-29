@@ -951,6 +951,8 @@ impl DrawerRuntime {
 mod tests {
     use super::*;
 
+    const TEST_PANE_EVENT_CHANNEL_CAPACITY: usize = 256;
+
     #[test]
     fn flag_cache_round_trips_and_defaults_closed() {
         let mut c = FlagCache::default();
@@ -1010,7 +1012,7 @@ mod tests {
         assert_ne!(files, tool);
         assert_ne!(tool, global);
 
-        let (tx, _rx) = tokio_mpsc::channel(crate::panes::PANE_EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = tokio_mpsc::channel(TEST_PANE_EVENT_CHANNEL_CAPACITY);
         let mut panes = Panes::new(tx);
         let mut pool = DrawerPool::default();
         pool.stash_key(tool.clone(), 7, 3, &mut panes);
