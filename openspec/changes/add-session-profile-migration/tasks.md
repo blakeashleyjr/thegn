@@ -33,7 +33,7 @@
       its panes).
 - [x] 3.3 Best-effort target-daemon notification via its `notify.push` door;
       an unreachable target is reported as a warning after confirmed success.
-- [ ] 3.4 Smoke coverage with two isolated `XDG_STATE_HOME` profile roots
+- [x] 3.4 Smoke coverage with two isolated `XDG_STATE_HOME` profile roots
       (cold move, --kill move, collision, dry-run).
 
 ## 4. Docs + gate
