@@ -1292,6 +1292,24 @@ command = "lazygit"
 # permissions = []      # headless allow-list seeded into the worktree at launch
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
+# drawer_scope = "worktree"  # add this tool to the drawer: worktree | global
+# drawer_cwd = ".atac"       # optional; relative to worktree, or absolute/~ for global
+
+# Drawer occupants reuse this same [[tools]] catalog. The built-in files drawer
+# is always first; entries without drawer_scope remain picker-only.
+# Worktree ATAC keeps its state under each worktree. A global database tool uses
+# one process-local pane shared while switching worktrees.
+[[tools]]
+name = "atac"
+command = "atac"
+drawer_scope = "worktree"
+# drawer_cwd = ".atac"
+# env = { ATAC_MAIN_DIR = ".atac" }
+
+[[tools]]
+name = "db"
+command = "psql"
+drawer_scope = "global"
 
 [[tools]]
 name = "yazi"

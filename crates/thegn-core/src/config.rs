@@ -272,6 +272,7 @@ pub use crate::file_manager::DrawerKind;
 pub use crate::account::Account;
 pub use crate::config_activity::ActivityConfig;
 pub use crate::config_daemon::{DaemonConfig, ServeConfig};
+pub use crate::config_drawer::{DrawerOccupant, DrawerPolicy, DrawerScope};
 
 config_enum! {
     /// Where worktrees live on disk.
@@ -1745,6 +1746,17 @@ pub struct NamedCommand {
     /// Off by default. See [`crate::config_model_proxy`].
     #[serde(default)]
     pub route_via_proxy: bool,
+    /// Opt this tool into the bottom drawer as a worktree- or process-global
+    /// occupant. Absent keeps the existing picker-only behavior.
+    #[serde(
+        default,
+        deserialize_with = "crate::config_drawer::deserialize_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drawer_scope: Option<DrawerScope>,
+    /// Optional scope-relative working directory for a drawer occupant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawer_cwd: Option<String>,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -6268,6 +6280,8 @@ impl Config {
     }
 
     pub(crate) fn post_process(&mut self) {
+        crate::config_drawer::warn_policy_issues(self);
+        crate::config_drawer::strip_agent_metadata(&mut self.agents);
         // Install the resolved [remote] tuning into the process-global holders
         // (ssh keepalives / control-plane retry / heal cadence); first set wins.
         self.remote.install();
@@ -6285,6 +6299,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "shell".into(),
@@ -6297,6 +6313,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -6313,6 +6331,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "yazi".into(),
@@ -6325,6 +6345,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "editor".into(),
@@ -6337,6 +6359,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "diff".into(),
@@ -6349,6 +6373,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
