@@ -58,7 +58,7 @@ pub(crate) fn resolve_personal_dotfiles(
     let mut dotfiles = Vec::new();
     let mut roots: Vec<String> = Vec::new();
     for name in candidates {
-        let contents = std::fs::read_to_string(home_dir.join(&name)).ok();
+        let contents = std::fs::read_to_string(home_dir.join(&name)).ok(); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
         match home.strategy {
             ShellStrategy::Clean => {} // nothing personal under clean
             ShellStrategy::HostParity => {

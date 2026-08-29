@@ -613,7 +613,7 @@ fn forgetting_closed_worktree_registry_prevents_restart_readoption() {
             .unwrap()
             .is_none()
     );
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -674,7 +674,7 @@ fn resurrect_orders_worktrees_by_persisted_position() {
         vec!["app/home", "app/beta", "app/alpha"]
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -948,7 +948,7 @@ fn move_active_worktree_reorders_within_workspace_and_anchors_home() {
     let order: Vec<&str> = session.worktrees.iter().map(|g| g.name.as_str()).collect();
     assert_eq!(order, vec!["app/home", "app/beta", "app/alpha"]);
 
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -974,7 +974,7 @@ fn move_under_computed_sort_flips_to_manual() {
     assert!(sb.move_active_worktree(&mut model, &mut session, true));
     assert_eq!(sb.view.sort, crate::sidebar::SortMode::Manual);
 
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1046,7 +1046,7 @@ fn sidebar_width_adjust_clamps_and_relayouts() {
     let mut sb = focused_state(&mut model, &session);
     // Narrow past the minimum: clamps at SIDEBAR_MIN_WIDTH.
     for _ in 0..20 {
-        let _ = press(&mut sb, '<', &mut model, &session);
+        let _ = press(&mut sb, '<', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
     }
     assert_eq!(sb.width, Some(crate::layout::SIDEBAR_MIN_WIDTH));
     let out = press(&mut sb, '>', &mut model, &session);
@@ -1060,7 +1060,7 @@ fn sidebar_width_adjust_clamps_and_relayouts() {
     );
 
     // SAFETY: test is single-threaded.
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1078,7 +1078,7 @@ fn sidebar_width_nudge_ceiling_is_half_the_window() {
 
     crate::layout::set_window_cols(200);
     for _ in 0..100 {
-        let _ = press(&mut sb, '>', &mut model, &session);
+        let _ = press(&mut sb, '>', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
     }
     assert_eq!(sb.width, Some(100), "ceiling should be half of 200 columns");
     assert!(
@@ -1088,12 +1088,12 @@ fn sidebar_width_nudge_ceiling_is_half_the_window() {
 
     // Shrinking the window pulls the ceiling in on the next nudge.
     crate::layout::set_window_cols(100);
-    let _ = press(&mut sb, '>', &mut model, &session);
+    let _ = press(&mut sb, '>', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
     assert_eq!(sb.width, Some(50));
 
     crate::layout::set_window_cols(0);
     // SAFETY: test is single-threaded.
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1161,23 +1161,23 @@ fn sidebar_e_toggles_wide_expand_and_persists() {
     assert_eq!(sb.effective_cols(160), 80);
 
     // `e` again restores.
-    let _ = press(&mut sb, 'e', &mut model, &session);
+    let _ = press(&mut sb, 'e', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
     assert!(!sb.expanded);
 
     // The flag round-trips through the DB: re-expand, then a fresh state
     // loaded from the same scope comes back expanded.
-    let _ = press(&mut sb, 'e', &mut model, &session);
+    let _ = press(&mut sb, 'e', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
     let db = thegn_core::db::Db::open().unwrap();
     let mut reloaded = SidebarState::default();
     reloaded.load(&db, SIDEBAR_SCOPE);
     assert!(reloaded.expanded, "expanded state restored from the DB");
 
     // A fine `<` nudge drops out of Wide so the change is visible.
-    let _ = press(&mut sb, '<', &mut model, &session);
+    let _ = press(&mut sb, '<', &mut model, &session); // best-effort: test: the keypress effect is the point; the assert below checks it
     assert!(!sb.expanded);
 
     // SAFETY: test is single-threaded.
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 /// `i` cycles the per-row detail line and the choice survives a reload. This
@@ -1218,7 +1218,7 @@ fn sidebar_i_cycles_row_detail_and_persists() {
     reloaded.load(&db, SIDEBAR_SCOPE);
     assert_eq!(reloaded.focus_detail_override, Some(FocusDetail::Cursor));
 
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1298,7 +1298,7 @@ fn workspace_pin_persists_globally_not_per_active_workspace() {
     );
 
     // SAFETY: test is single-threaded.
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1309,7 +1309,7 @@ fn load_or_seed_session_recovers_tabs_from_db_when_present() {
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
     let db = thegn_core::db::Db::open_at(&db_path).unwrap();
-    let _ = db.put_workspace("/tmp/app", "app", "repo");
+    let _ = db.put_workspace("/tmp/app", "app", "repo"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     // The worktree dir must exist on disk — vanished dirs are pruned at
     // load (git is the source of truth).
     let wt_dir = state_home.join("app-feat");
@@ -1360,13 +1360,13 @@ fn load_or_seed_session_ignores_launch_directory() {
     // most-recently-active workspace, never a workspace keyed to the cwd.
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let state_home = std::env::temp_dir().join(format!("test_db_agnostic_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
     let db_path = state_home.join("thegn/thegn.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
     let db = thegn_core::db::Db::open_at(&db_path).unwrap();
     // A registered workspace unrelated to the launch cwd below.
-    let _ = db.put_workspace("/tmp/app", "app", "repo");
+    let _ = db.put_workspace("/tmp/app", "app", "repo"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     let wt_dir = state_home.join("app-feat");
     std::fs::create_dir_all(&wt_dir).unwrap();
     db.put_tab_group(
@@ -1388,7 +1388,7 @@ fn load_or_seed_session_ignores_launch_directory() {
         std::path::Path::new("/tmp/somewhere-unrelated"),
         &Default::default(),
     );
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
 
     assert_eq!(
         session.id, "/tmp/app",
@@ -1405,7 +1405,7 @@ fn load_or_seed_session_reports_fresh_seed() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let state_home =
         std::env::temp_dir().join(format!("test_db_seed_{}_state", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
 
     // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around one call.
@@ -1430,10 +1430,10 @@ fn hydration_worker_loads_real_workspaces_into_sidebar() {
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
     let db = thegn_core::db::Db::open_at(&db_path).unwrap();
-    let _ = db.put_workspace("/tmp/repo1", "repo1", "repo");
+    let _ = db.put_workspace("/tmp/repo1", "repo1", "repo"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     // Ensure some time passes so timestamps are distinctly different
     std::thread::sleep(std::time::Duration::from_millis(10));
-    let _ = db.put_workspace("/tmp/repo2", "repo2", "repo");
+    let _ = db.put_workspace("/tmp/repo2", "repo2", "repo"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
     // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
     let _xdg = XdgGuard::set(&state_home);
@@ -1620,7 +1620,7 @@ fn new_workspace_discovery_finds_repos_under_repo_roots() {
         "discover_repos should find the temp repo: {repos:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 /// End-to-end input path for the Ctrl+1..9 workspace jump: raw terminal
@@ -2575,7 +2575,7 @@ fn the73_worktree_dir(tag: &str) -> String {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&p);
+    let _ = std::fs::remove_dir_all(&p); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(&p).unwrap();
     p.to_string_lossy().into_owned()
 }
@@ -2594,7 +2594,7 @@ fn a_warm_switch_adopts_worktrees_registered_while_it_was_parked() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let state_home =
         std::env::temp_dir().join(format!("tg-run-the73-warm-{}-state", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state_home);
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(state_home.join("thegn")).unwrap();
     // SAFETY: test holds ENV_LOCK; sets/restores an XDG var around the switch.
     let _xdg = XdgGuard::set(&state_home);
@@ -2678,7 +2678,7 @@ fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
         std::process::id(),
         now_secs()
     ));
-    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&db_path); // best-effort: test cleanup: scratch removal must never fail the test
     let db = thegn_core::db::Db::open_at(&db_path).unwrap();
     let repo = "/tmp/the73-active";
     let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));

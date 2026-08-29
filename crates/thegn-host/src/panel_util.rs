@@ -128,12 +128,12 @@ pub(crate) fn toggle_files_collapse(panel_ui: &mut crate::panel::PanelUi, dir: &
     if panel_ui.files_collapsed.contains(&dir) {
         panel_ui.files_collapsed.remove(&dir);
         crate::db_task::persist(move |db| {
-            let _ = db.del_ui_state("panel.files.col", &dir);
+            let _ = db.del_ui_state("panel.files.col", &dir); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         });
     } else {
         panel_ui.files_collapsed.insert(dir.clone());
         crate::db_task::persist(move |db| {
-            let _ = db.set_ui_state("panel.files.col", &dir, "1");
+            let _ = db.set_ui_state("panel.files.col", &dir, "1"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         });
     }
 }
@@ -148,13 +148,13 @@ pub(crate) fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
         panel_ui.tab.as_key(),
     );
     crate::db_task::persist(move |db| {
-        let _ = db.set_ui_state("panel", "open", open);
-        let _ = db.set_ui_state("panel", "width", width);
-        let _ = db.set_ui_state("panel", "tab", tab);
+        let _ = db.set_ui_state("panel", "open", open); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let _ = db.set_ui_state("panel", "width", width); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let _ = db.set_ui_state("panel", "tab", tab); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         // Per-section width memory: one row per section under its own scope
         // (mirrors `panel.files.col`), so each section reopens at the width
         // it was last used at.
-        let _ = db.set_ui_state("panel.width", open, width);
+        let _ = db.set_ui_state("panel.width", open, width); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     });
 }
 

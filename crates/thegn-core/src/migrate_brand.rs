@@ -95,7 +95,7 @@ fn old_db_busy(db: &Path) -> bool {
     let Ok(conn) = rusqlite::Connection::open(db) else {
         return false;
     };
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(0)); // best-effort: timeout hint before the brand probe; failure doesn't affect the probe
     match conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
         Ok(()) => false,
         Err(e) => {
@@ -143,7 +143,7 @@ fn rewrite_db_path_prefixes(db: &Path, old_root: &str, new_root: &str) -> Vec<St
             return warnings;
         }
     };
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(250)); // best-effort: restore the busy timeout after the probe; failure doesn't affect the probe
     let old_prefix = format!("{old_root}/");
     let new_prefix = format!("{new_root}/");
     for (table, col) in PATH_COLUMNS {
@@ -328,7 +328,8 @@ pub(crate) fn migrate_at(
             .map(|(o, n)| format!("{} -> {}\n", o.display(), n.display()))
             .collect::<String>();
         let marker_dir = if home_moved { &new_home } else { &new_state };
-        let _ = std::fs::create_dir_all(marker_dir);
+        let _ = std::fs::create_dir_all(marker_dir); // best-effort: marker dir prep; the marker write below reports nothing either way
+        // best-effort: marker write is advisory: absence just allows a re-migrate
         let _ = std::fs::write(
             marker_dir.join(".migrated-from-superzej"),
             format!("migrated_at_epoch_s: {stamp}\n{body}"),

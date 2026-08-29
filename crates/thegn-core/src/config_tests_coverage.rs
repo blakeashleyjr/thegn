@@ -1274,6 +1274,7 @@ fn post_process_populates_default_agents_and_tools() {
     assert!(c.tools.iter().any(|t| t.name == "editor"));
     // repo_roots defaults to [workspaces_dir] when unset.
     assert_eq!(c.repo_roots, vec![c.workspaces_dir.clone()]);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1286,6 +1287,7 @@ fn post_process_expands_pin_cwd_tilde() {
     let cwd = c.pins[0].cwd.as_deref().unwrap();
     assert!(!cwd.starts_with('~'), "{cwd}");
     assert!(cwd.ends_with("/sub"));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1310,6 +1312,7 @@ fn load_layered_recovers_on_parse_error_and_still_applies_layers() {
     let c = Config::load_layered(&env, &flags, Some(f));
     assert_eq!(c.branch_prefix, "env/");
     assert_eq!(c.picker, Picker::Fzf);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1434,6 +1437,7 @@ fn env_failover_resolves_override_then_global() {
         },
     );
     assert_eq!(cfg.env_failover_mode(&dir, "prompt"), FailoverMode::Ask);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1495,6 +1499,7 @@ fn repo_overlay_malformed_file_is_ignored() {
     let sb = cfg.repo_sandbox(&dir);
     assert!(sb.enabled);
     assert_eq!(sb.image, "");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1518,6 +1523,7 @@ fn repo_overlay_parse_error_surfaces_dropped_env_selection() {
         repo_overlay_parse_error(&dir).is_none(),
         "valid overlay parses"
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1554,6 +1560,7 @@ fn repo_overlay_json_format_loads() {
     assert!(r.pending.iter().any(|p| p.key == "sandbox.ports"));
     assert!(r.events.iter().any(|e| e.key == "sandbox.backend"));
     assert!(r.events.iter().any(|e| e.key == "sandbox.file_access"));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 

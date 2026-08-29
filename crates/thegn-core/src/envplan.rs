@@ -146,7 +146,7 @@ pub fn detect_from_probe(out: &str) -> EnvRequirements {
 }
 
 pub fn detect(worktree: &Path) -> EnvRequirements {
-    let read = |name: &str| std::fs::read_to_string(worktree.join(name)).ok();
+    let read = |name: &str| std::fs::read_to_string(worktree.join(name)).ok(); // best-effort: optional input: a missing/unreadable manifest just means 'not detected'
     let exists = |name: &str| worktree.join(name).exists();
 
     let flake = read("flake.nix");
@@ -1551,7 +1551,7 @@ mod tests {
     fn tmp(tag: &str) -> std::path::PathBuf {
         let mut d = std::env::temp_dir();
         d.push(format!("tg-envplan-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1570,6 +1570,7 @@ mod tests {
         assert!(r.direnv);
         assert!(r.direnv_uses_flake);
         assert_eq!(r.tier(), Tier::Nix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1580,6 +1581,7 @@ mod tests {
         let r = detect(&d);
         assert!(r.devenv);
         assert_eq!(r.tier(), Tier::Nix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1595,6 +1597,7 @@ mod tests {
         assert!(r.tool_versions);
         // tool-versions outranks bare language manifests.
         assert_eq!(r.tier(), Tier::ToolVersions);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1603,6 +1606,7 @@ mod tests {
         let d = tmp("bare");
         write(&d, "README.md", "hi");
         assert_eq!(detect(&d).tier(), Tier::Bare);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1613,6 +1617,7 @@ mod tests {
         let r = detect(&d);
         assert_eq!(r.languages, vec![Language::Deno]);
         assert_eq!(r.tier(), Tier::SynthNix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1621,6 +1626,7 @@ mod tests {
         let d = tmp("deno_jsonc");
         write(&d, "deno.jsonc", "// jsonc\n{}");
         assert_eq!(detect(&d).languages, vec![Language::Deno]);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1629,6 +1635,7 @@ mod tests {
         let d = tmp("jvm_sbt");
         write(&d, "build.sbt", "name := \"x\"\n");
         assert_eq!(detect(&d).languages, vec![Language::Jvm]);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1640,6 +1647,7 @@ mod tests {
         let r = detect(&d);
         assert_eq!(r.languages, vec![Language::Jvm]);
         assert_eq!(r.tier(), Tier::SynthNix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1648,6 +1656,7 @@ mod tests {
         let d = tmp("jvm_scala_version");
         write(&d, ".scala-version", "3.4.2\n");
         assert_eq!(detect(&d).languages, vec![Language::Jvm]);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1665,6 +1674,7 @@ mod tests {
         assert!(r.nix_classic);
         assert!(!r.nix_flake_devshell && !r.devenv);
         assert_eq!(r.tier(), Tier::Nix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1675,6 +1685,7 @@ mod tests {
         let r = detect(&d);
         assert!(r.nix_classic);
         assert_eq!(r.tier(), Tier::Nix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1685,6 +1696,7 @@ mod tests {
         write(&d, "shell.nix", "{ }: { }");
         let r = detect(&d);
         assert!(r.nix_flake_devshell && !r.nix_classic);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
         let d2 = tmp("devenv_over_classic");
         write(&d2, "devenv.nix", "{ }\n");
@@ -1692,6 +1704,7 @@ mod tests {
         let r2 = detect(&d2);
         assert!(r2.devenv && !r2.nix_classic);
         assert_eq!(r2.tier(), Tier::Nix);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d2);
     }
 

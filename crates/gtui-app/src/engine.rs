@@ -120,7 +120,7 @@ impl QueryEngine {
                 ))),
             };
             // Best-effort: if the receiver is gone the tab is closing.
-            let _ = self.frames_tx.send(PanelUpdate {
+            let _ = self.frames_tx.send(PanelUpdate { // best-effort: UI may be gone during shutdown
                 panel_id: panel.id,
                 result,
             });

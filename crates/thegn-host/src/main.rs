@@ -693,7 +693,7 @@ async fn sprite_proxy_relay(
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Ensure the in-sandbox sshd is listening (idempotent; survives restarts).
-    let _ = provider
+    let _ = provider // best-effort: warm-up: open_proxy below reports the real failure
         .run_exec(
             &id,
             &[

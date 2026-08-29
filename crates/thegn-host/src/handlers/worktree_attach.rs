@@ -383,7 +383,7 @@ mod tests {
         ));
         // best-effort: scratch temp dir for this test; a leftover dir is
         // harmless and the create below retargets it.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let old = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: guarded by crate::testenv::ENV_LOCK, same critical-section
@@ -400,7 +400,7 @@ mod tests {
                 let path = std::env::temp_dir().join(format!("tg-wta-{}.sock", std::process::id()));
                 // best-effort: a stale socket file from a previous run would
                 // just fail the bind below; no state to preserve.
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
                 let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
                 std::thread::spawn(move || {
                     for stream in l.incoming() {
@@ -435,7 +435,7 @@ mod tests {
         }
         // best-effort: teardown of this test's scratch dir; the contents are
         // disposable by construction.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         if listener.is_some() {
             let elapsed = started.elapsed();
             assert!(

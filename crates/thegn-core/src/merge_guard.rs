@@ -725,6 +725,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("tg-mg-{tag}-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -749,6 +750,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
         #[cfg(unix)]
         assert!(is_executable(&path), "hook must be executable");
         assert_eq!(install(&dir).unwrap().action, InstallAction::AlreadyCurrent);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -768,6 +770,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
         // Re-running sees our own hook and refreshes without re-chaining.
         assert_eq!(install(&dir).unwrap().action, InstallAction::AlreadyCurrent);
         assert_eq!(read(&chained), USER_HOOK);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -790,6 +793,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
             is_executable(&chained),
             "chained binary hook must stay executable"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -800,6 +804,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
         std::fs::write(&path, format!("#!/bin/sh\n# {MARKER}\nexit 0\n")).unwrap();
         assert_eq!(install(&dir).unwrap().action, InstallAction::Wrote);
         assert_eq!(read(&path), HOOK_SCRIPT);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -822,6 +827,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
         // Idempotent — this is where the flip-flop used to start.
         assert_eq!(install(&dir).unwrap().action, InstallAction::AlreadyCurrent);
         assert_eq!(read(&dir.join(HOOK_NAME)), PREK_SHIM);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -848,6 +854,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
 
         // And it stays repaired.
         assert_eq!(install(&dir).unwrap().action, InstallAction::AlreadyCurrent);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -866,12 +873,14 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
         assert_eq!(read(&dir.join(HOOK_NAME)), PREK_SHIM);
         assert_eq!(read(&dir.join(LEGACY_NAME)), HOOK_SCRIPT);
         assert_eq!(read(&dir.join(CHAINED_NAME)), USER_HOOK);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn install_errors_on_a_missing_hooks_dir() {
         let missing = std::env::temp_dir().join(format!("tg-mg-nope-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&missing);
         assert!(install(&missing).is_err());
     }

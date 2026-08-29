@@ -643,7 +643,7 @@ where
     }
     for f in first {
         // The channel is fresh (cap 256); the greeting burst always fits.
-        let _ = frames.send(f).await;
+        let _ = frames.send(f).await; // best-effort: fresh channel always fits (see above)
     }
     tokio::spawn(pump_attach_inner(ws, decoder, frames, ctrl));
     Ok(())
@@ -698,7 +698,7 @@ async fn pump_attach_inner<S>(
                     }
                 }
                 Some(AttachControl::Close) | None => {
-                    let _ = ws.send(Message::Close(None)).await;
+                    let _ = ws.send(Message::Close(None)).await; // best-effort: peer may be gone
                     return;
                 }
             },
@@ -723,7 +723,7 @@ where
         .context("control http handshake")?;
     // The connection task ends when the request completes (no pool).
     tokio::spawn(async move {
-        let _ = conn.await;
+        let _ = conn.await; // best-effort: conn error surfaces via the request path
     });
 
     let mut req = hyper::Request::builder()
@@ -848,8 +848,8 @@ mod tests {
                 server: "oldhost thegn 0.0".into(),
                 scopes: vec![],
             });
-            let _ = ws.send(Message::Binary(hello.encode().into())).await;
-            let _ = ws.next().await; // hold the socket open until the client reacts
+            let _ = ws.send(Message::Binary(hello.encode().into())).await; // best-effort: test fixture; client may be gone
+            let _ = ws.next().await; // hold the socket open until the client reacts // best-effort: hold open; client may be gone
         });
 
         let client = ControlClient::new(ControlAddr::Tcp {

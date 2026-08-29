@@ -62,7 +62,7 @@ pub(crate) fn spawn_delete_workspace_dirs(
             thegn_core::worktree::purge_worktree_files(Path::new(path));
         }
         if let Some(waker) = waker {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -88,7 +88,7 @@ pub(crate) fn remove_workspace(
     keep_files: bool,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
-    let db = thegn_core::db::Db::open().ok();
+    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: removal proceeds on disk/git; a failed open just leaves stale rows
     let was_active = session.id == repo_path;
 
     // Read the workspace's branch-worktree dirs from the registry BEFORE
@@ -205,16 +205,16 @@ pub(crate) fn remove_workspace_with_db(
 
     if let Some(db) = db {
         // Prune every DB trace so the workspace doesn't re-render or resurrect.
-        let _ = db.del_worktrees_for_repo(repo_path);
-        let _ = db.del_workspace(repo_path);
-        let _ = db.del_repo_slug(repo_path);
+        let _ = db.del_worktrees_for_repo(repo_path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let _ = db.del_workspace(repo_path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        let _ = db.del_repo_slug(repo_path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         // Tombstone the removal: pruning the rows isn't enough because the home
         // checkout stays on disk (git is truth), so a later cold start standing
         // in this directory would `put_workspace` it back (hydrate / switch).
         // The tombstone makes "remove workspace" stick until an explicit reopen.
-        let _ = db.tombstone_workspace(repo_path);
+        let _ = db.tombstone_workspace(repo_path); // best-effort: cache write: the tombstone drives sidebar resurrection only
         if db.active_workspace().ok().flatten().as_deref() == Some(repo_path) {
-            let _ = db.del_ui_state("", "active_workspace");
+            let _ = db.del_ui_state("", "active_workspace"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         // …including its sidebar view state: `collapse:{slug}`, `pin:{slug}`,
         // `pin:{slug}/{branch}`, `collapse:{slug}/folder:{id}` would otherwise
@@ -227,7 +227,7 @@ pub(crate) fn remove_workspace_with_db(
         del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", slug);
         // Persist the trimmed layout: otherwise `tab_groups`/`group_tabs`
         // resurrect the closed groups on the next launch (see `delete_groups`).
-        let _ = session.persist(db, &session.id, now_secs());
+        let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the trimmed layout feed; git/disk removal already reported
     }
 }
 
@@ -237,8 +237,8 @@ pub(crate) fn remove_workspace_with_db(
 /// leading substring (e.g. `pin:api` must not touch `pin:api-v2/…`). See audit
 /// run.rs:1457. All best-effort: these are cache-only sidebar view keys.
 pub(crate) fn del_ui_state_segment(db: &thegn_core::db::Db, scope: &str, prefix: &str, name: &str) {
-    let _ = db.del_ui_state(scope, &format!("{prefix}:{name}"));
-    let _ = db.del_ui_state_prefix(scope, &format!("{prefix}:{name}/"));
+    let _ = db.del_ui_state(scope, &format!("{prefix}:{name}")); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let _ = db.del_ui_state_prefix(scope, &format!("{prefix}:{name}/")); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 }
 
 /// Drop a just-removed workspace (and the registered-worktree rows its
@@ -321,7 +321,7 @@ mod tests {
             ],
             "only this workspace's branch worktrees, never home or siblings"
         );
-        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -422,7 +422,7 @@ mod tests {
             "sibling registry row kept: {wt_roots:?}"
         );
         assert_eq!(db.active_workspace().unwrap(), None);
-        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -473,7 +473,7 @@ mod tests {
         assert!(session.id.is_empty(), "session id cleared");
         assert!(session.worktrees.is_empty(), "no groups remain");
         assert_eq!(session.active, 0);
-        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -517,6 +517,6 @@ mod tests {
             Some("1".to_string()),
             "sibling workspace child pin must survive"
         );
-        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

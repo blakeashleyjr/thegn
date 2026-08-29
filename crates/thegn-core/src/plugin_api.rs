@@ -1312,7 +1312,7 @@ mod wire_tests {
             RpcErrorCode::Invalid,
             RpcErrorCode::Other,
         ] {
-            let _ = c.class();
+            let _ = c.class(); // best-effort: test smoke: this path must not panic
             let j = serde_json::to_string(&c).unwrap();
             let back: RpcErrorCode = serde_json::from_str(&j).unwrap();
             assert_eq!(back, c);

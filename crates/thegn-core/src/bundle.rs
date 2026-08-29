@@ -633,7 +633,7 @@ pub fn materialize_dotfiles(
             continue;
         };
         let to = dest_home.join(base);
-        let _ = std::fs::remove_file(&to).or_else(|_| std::fs::remove_dir_all(&to));
+        let _ = std::fs::remove_file(&to).or_else(|_| std::fs::remove_dir_all(&to)); // best-effort: cleanup: clear the destination (file or dir) before rematerializing
         let res = match spec.mode {
             DotfileMode::Symlink => symlink(&from, &to),
             DotfileMode::Template => copy_tree(&from, &to),
@@ -647,7 +647,7 @@ pub fn materialize_dotfiles(
             )),
         }
     }
-    let _ = std::fs::write(&meta, sig);
+    let _ = std::fs::write(&meta, sig); // best-effort: cache write: the signature meta only enables the skip-fast-path; failure just re-copies
     n
 }
 
@@ -868,7 +868,7 @@ mod tests {
         };
         assert_eq!(materialize_dotfiles(&spec, &dest), 1);
         assert_eq!(std::fs::read(dest.join("nested").join("f")).unwrap(), b"hi");
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1030,7 +1030,7 @@ mod tests {
         let r = compose(&cfg, &db, "/wt", None, Some("claude"));
 
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
 
         assert_eq!(get(&r.overrides, "CLAUDE_CONFIG_DIR"), Some(dir_s.as_str()));
         assert!(
@@ -1128,7 +1128,7 @@ mod tests {
         assert!(dest.join(".bashrc").exists());
         // …the second is a no-op (unchanged signature).
         assert_eq!(materialize_dotfiles(&spec, &dest), 0);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1196,7 +1196,7 @@ mod tests {
         allow_dotenv(&db, &dir.join(".env").to_string_lossy(), &content).unwrap();
         let r = compose(&cfg, &db, &wt, None, None);
         assert_eq!(get(&r.overrides, "EDITOR"), Some("vim"));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -1537,7 +1537,7 @@ mod tests {
             r.mounts.iter().any(|m| m.dest == dir_s && !m.ro),
             "an existing identity dir is mounted read-write path-preserving"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

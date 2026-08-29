@@ -119,6 +119,7 @@ fn clear_stale_raised_hands() {
                     // failed clear costs one stale hand until the next boot.
                     let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&db);
                 }
+                // best-effort: spawn: a failed spawn costs one stale hand until the next boot (cost described above)
             })
             .ok();
     });
@@ -244,7 +245,7 @@ pub(crate) fn reseed_default_terminal(db: Option<&Db>) {
     if empty {
         // best-effort: the DB is a cache; a failed seed just means the sidebar
         // shows its empty-state hint until the next successful launch.
-        let _ = db.put_terminal("local", "local", "", None);
+        let _ = db.put_terminal("local", "local", "", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 

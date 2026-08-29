@@ -310,7 +310,7 @@ pub fn install_shutdown_signal(flag: Arc<AtomicBool>, waker: termwiz::terminal::
             _ = shut.recv() => {}
         }
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 

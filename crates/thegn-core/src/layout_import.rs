@@ -297,7 +297,7 @@ name = "scratch"
     #[test]
     fn discover_layouts_walks_conventional_locations() {
         let home = std::env::temp_dir().join(format!("tg-layouts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(home.join("tmuxinator")).unwrap();
         std::fs::create_dir_all(home.join("sesh")).unwrap();
         std::fs::write(home.join("tmuxinator/widget.yml"), TMUXINATOR).unwrap();
@@ -316,6 +316,6 @@ name = "scratch"
         );
         // A missing config home is just an empty offer.
         assert!(discover_layouts(&home.join("missing")).is_empty());
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

@@ -301,7 +301,7 @@ pub(crate) fn spawn_main_checkout_heal(
         if thegn_core::util::heal_main_checkout_worktree(&common_parent)
             && refresh_tx.send(RefreshKind::Model).is_ok()
         {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

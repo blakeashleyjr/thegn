@@ -55,7 +55,7 @@ pub(crate) fn spawn_scan(
             if reaped > 0
                 && let Some(w) = &waker
             {
-                let _ = w.wake();
+                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
             return;
         }
@@ -86,7 +86,7 @@ pub(crate) fn spawn_scan(
             if !path.is_dir() {
                 // Vanished since the registry row was written — drop any stale
                 // size so the badge clears instead of freezing at its last value.
-                let _ = db.delete_worktree_disk(path_s);
+                let _ = db.delete_worktree_disk(path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 measured += 1;
                 continue;
             }
@@ -106,7 +106,7 @@ pub(crate) fn spawn_scan(
             let known: Vec<(&std::path::Path, u64)> =
                 known.iter().map(|(p, b)| (p.as_path(), *b)).collect();
             let total = thegn_core::disk::net_root_bytes(path, usage.total_bytes, &known);
-            let _ = db.put_worktree_disk(path_s, total as i64, usage.target_bytes as i64);
+            let _ = db.put_worktree_disk(path_s, total as i64, usage.target_bytes as i64); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             fresh.push((path_s.clone(), usage));
             measured += 1;
         }
@@ -116,7 +116,7 @@ pub(crate) fn spawn_scan(
         if (measured > 0 || reaped > 0 || reclaimed > 0)
             && let Some(w) = &waker
         {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -141,7 +141,7 @@ fn sweep_orphans(db: &Db) -> usize {
         live.iter().map(String::as_str),
     );
     for path in &gone {
-        let _ = db.delete_worktree_disk(path);
+        let _ = db.delete_worktree_disk(path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     gone.len()
 }
@@ -216,7 +216,7 @@ fn reclaim(
                 total += bytes;
                 // best-effort: the size cache is a cache; a failed delete just
                 // means the badge shows a stale number until the next round.
-                let _ = db.delete_worktree_disk(&item.path);
+                let _ = db.delete_worktree_disk(&item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let branch = branch_of(db, &item.path);
                 let msg = format!(
                     "target/ reclaimed ({} — {})",
@@ -227,7 +227,7 @@ fn reclaim(
                 // and this says why rather than looking like a broken cache.
                 // best-effort: the reclaim already happened and is logged; a
                 // failed insert must not abort the rest of the round.
-                let _ = db.put_notification("disk_cleaned", &branch, &msg, &item.path);
+                let _ = db.put_notification("disk_cleaned", &branch, &msg, &item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 tracing::info!(
                     target: LOG,
                     worktree = %item.path,

@@ -28,6 +28,7 @@ fn skip() -> bool {
 }
 
 fn force_rm(name: &str) {
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("podman")
         .args(["rm", "-f", name])
         .output();

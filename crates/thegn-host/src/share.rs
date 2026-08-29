@@ -327,17 +327,18 @@ fn supervise(
 
     let provider = share::for_provider(&spec).kind();
     let emit = |ev: ShareEvent| {
-        let _ = tx.send(ev);
-        let _ = waker.wake();
+        let _ = tx.send(ev); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     };
     let fail = |e: String| {
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(ShareEvent::Failed {
             worktree: worktree.clone(),
             port,
             provider,
             error: e,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     };
 
     let launch = match share::for_provider(&spec).launch() {
@@ -365,7 +366,7 @@ fn supervise(
                         url: running.public_url.clone(),
                     });
                     let share::RunningShare { mut child, .. } = running;
-                    let _ = child.wait();
+                    let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
                     *shared.pid.lock().unwrap() = None;
                     emit(ShareEvent::Down { worktree, port });
                 }

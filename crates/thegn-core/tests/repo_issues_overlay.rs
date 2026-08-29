@@ -5,6 +5,7 @@ use thegn_core::config::{Config, IssueProviderKind};
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("tg-cfg-issues-{}-{tag}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -36,6 +37,8 @@ fn repo_issues_overlay_scopes_linear_and_jira() {
     // A repo with no [issues] overlay inherits the global config.
     let empty = tmpdir("empty");
     assert_eq!(cfg.repo_issues(Some(&empty)).jira.project_key, "GLOB");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&empty);
 }

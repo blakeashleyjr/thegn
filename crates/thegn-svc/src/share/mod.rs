@@ -433,8 +433,8 @@ pub struct RunningShare {
 impl RunningShare {
     /// Best-effort terminate the child.
     pub fn stop(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill(); // best-effort: child may already have exited
+        let _ = self.child.wait(); // best-effort: reap-or-not is terminal here
     }
 }
 
@@ -545,8 +545,8 @@ pub fn start(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: child may already have exited
+            let _ = child.wait(); // best-effort: reap-or-not is terminal here
             anyhow::bail!(
                 "share: '{}' did not report a URL within {}s",
                 plan.program,
@@ -564,7 +564,7 @@ pub fn start(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.wait();
+                let _ = child.wait(); // best-effort: reap the child; error reported below
                 anyhow::bail!("share: '{}' exited before reporting a URL", plan.program);
             }
         }
@@ -583,7 +583,7 @@ fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()>
         std::fs::write(&path, &f.contents)
             .with_context(|| format!("share: write {}", path.display()))?;
         // best-effort: shared-credential files are owner-only everywhere.
-        let _ = thegn_core::fsperm::restrict_to_owner(&path);
+        let _ = thegn_core::fsperm::restrict_to_owner(&path); // best-effort: shared-credential files are owner-only everywhere (see above)
     }
     Ok(())
 }

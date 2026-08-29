@@ -16,7 +16,7 @@ static WAKER: OnceLock<TerminalWaker> = OnceLock::new();
 /// on every Offline↔Online edge, pulse the loop waker so the statusbar chip
 /// updates promptly. The core holder also emits a `tracing` line per edge.
 pub(crate) fn install_transition_waker(waker: TerminalWaker) {
-    let _ = WAKER.set(waker);
+    let _ = WAKER.set(waker); // best-effort: first-set-wins: the first waker serves for the process
     thegn_core::connectivity::set_on_transition(on_transition);
 }
 

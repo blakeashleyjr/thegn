@@ -146,8 +146,8 @@ fn output_stderr_with_timeout(
                 return Some((status.success(), stderr));
             }
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.kill(); // best-effort: probe teardown: force-kill the child at the deadline
+                let _ = child.wait(); // best-effort: probe teardown: the reaper must not block the preflight
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),

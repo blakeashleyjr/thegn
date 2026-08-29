@@ -53,7 +53,12 @@ pub fn prepare_ssh_config_at(home: &Path, state: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600));
+        // A failed tighten would leave the flattened ssh_config at the
+        // default 0644 inside `state/thegn/sandbox` — surface it rather than
+        // silently shipping a world-readable file.
+        if let Err(e) = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(target: "thegn::sandbox", error = %e, "failed to tighten ssh_config to 0600");
+        }
     }
     Some(out.to_string_lossy().into_owned())
 }
@@ -320,7 +325,7 @@ mod tests {
     /// Fresh scratch dir per test (house pattern: no tempfile dev-dep).
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-sshcreds-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         fs::create_dir_all(&dir).unwrap();
         dir
     }

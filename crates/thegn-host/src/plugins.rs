@@ -141,7 +141,7 @@ impl PluginsHost {
                 };
                 // best-effort: the loop may be shutting down.
                 let _ = tx.send(PluginMsg::Respawned { plugin: id, writer });
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
         if let Err(e) = spawn {
             tracing::warn!(target: "thegn::plugin", error = %e, "respawn thread failed to start");
@@ -169,7 +169,7 @@ impl PluginsHost {
                 );
                 // best-effort: the loop may be shutting down.
                 let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
         if let Err(e) = spawn {
             tracing::warn!(target: "thegn::plugin", error = %e, "one-shot thread failed to start");
@@ -227,7 +227,7 @@ fn spawn_session(
                 plugin: id.clone(),
                 event,
             });
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         },
     )
 }
@@ -347,18 +347,19 @@ fn setup_and_schedule(
 
     // best-effort: the loop may already be tearing down.
     let _ = tx.send(PluginMsg::Loaded(loaded));
-    let _ = waker.wake();
+    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
 
     for r in initial_runs {
         if stop.load(Ordering::SeqCst) {
             return;
         }
         let run = thegn_svc::plugin::spawn_ndjson(&r.command, &r.env, r.cwd.as_deref(), r.timeout);
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(PluginMsg::OneShot {
             plugin: r.plugin,
             run,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
 
     if sched.is_empty() {
@@ -405,11 +406,12 @@ fn setup_and_schedule(
                         entry.cwd.as_deref(),
                         entry.timeout,
                     );
+                    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     let _ = tx.send(PluginMsg::OneShot {
                         plugin: entry.plugin.clone(),
                         run,
                     });
-                    let _ = waker.wake();
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
             }
         }

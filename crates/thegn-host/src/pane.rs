@@ -805,7 +805,7 @@ impl PtyPane {
                     .context("pty resize")?;
             }
             PaneIo::Stream { control, .. } => {
-                let _ = control.try_send(ExecControl::Resize { cols, rows });
+                let _ = control.try_send(ExecControl::Resize { cols, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
         }
         self.emulator.resize(rows, cols);
@@ -1017,7 +1017,7 @@ async fn relay_exec(
 ) {
     let wake = || {
         if let Some(w) = &waker {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     };
     let (cols, rows) = match &open {
@@ -1082,6 +1082,7 @@ async fn relay_exec(
             // Mark the provider unhealthy so `exec=auto` panes fall back to the
             // CLI during the cooldown; surface the failure + a non-zero exit.
             source.report_health(false);
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx
                 .send(PaneEvent::Output(
                     id,
@@ -1089,14 +1090,14 @@ async fn relay_exec(
                 ))
                 .await;
             wake();
-            let _ = tx.send(PaneEvent::Exit(id, Some(1))).await;
+            let _ = tx.send(PaneEvent::Exit(id, Some(1))).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             wake();
             return;
         }
     };
 
     if fell_back {
-        let _ = tx.send(PaneEvent::SessionFallback(id)).await;
+        let _ = tx.send(PaneEvent::SessionFallback(id)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         wake();
     }
 
@@ -1135,7 +1136,7 @@ async fn relay_exec(
                     pane = id, sandbox = %sandbox_id, code,
                     "exec session exited (command returned)"
                 );
-                let _ = tx.send(PaneEvent::Exit(id, Some(code))).await;
+                let _ = tx.send(PaneEvent::Exit(id, Some(code))).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 wake();
                 return;
             }
@@ -1183,7 +1184,7 @@ async fn relay_exec(
                         tracing::debug!(target: "thegn::sandbox", pane = id, "reattached exec session");
                         // Tell the loop the replay burst that follows is not
                         // agent work (see `PaneEvent::Reattached`).
-                        let _ = tx.send(PaneEvent::Reattached(id)).await;
+                        let _ = tx.send(PaneEvent::Reattached(id)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         session = s;
                         continue;
                     }
@@ -1224,7 +1225,7 @@ async fn relay_exec(
                     pane = id, sandbox = %sandbox_id, dead,
                     "exec session gone after reconnect attempts; pane exits"
                 );
-                let _ = tx.send(PaneEvent::Exit(id, None)).await;
+                let _ = tx.send(PaneEvent::Exit(id, None)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 wake();
                 return;
             }
@@ -1249,7 +1250,7 @@ async fn relay_session(
 ) -> SessionEnd {
     let wake = || {
         if let Some(w) = waker {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     };
     let ExecSession {
@@ -1705,7 +1706,7 @@ mod tests {
                 std::time::Duration::ZERO,
             )
             .await;
-            let _ = done_tx.send(end);
+            let _ = done_tx.send(end); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         });
 
         // 1. provider stdout → PaneEvent::Output, and it lands in the grid.
@@ -2177,7 +2178,7 @@ mod tests {
                 std::time::Duration::from_secs(3600),
             )
             .await;
-            let _ = done_tx.send(end);
+            let _ = done_tx.send(end); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         });
 
         // Replay burst arrives immediately (well within the grace window).
@@ -2227,7 +2228,7 @@ mod tests {
                 std::time::Duration::from_millis(50),
             )
             .await;
-            let _ = done_tx.send(end);
+            let _ = done_tx.send(end); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         });
         // Wait out the (short) grace, then emit — this is live output, not replay.
         std::thread::sleep(std::time::Duration::from_millis(120));

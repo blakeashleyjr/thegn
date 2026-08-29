@@ -19,6 +19,7 @@ fn skip() -> bool {
 }
 
 fn force_rm(name: &str) {
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("podman")
         .args(["rm", "-f", name])
         .output();
@@ -123,6 +124,7 @@ fn g3_dns_events_captured() {
         return;
     }
     // Start the dns filter explicitly with a known policy to prime the singleton.
+    // best-effort: test scratch: best-effort by design
     let _ = thegn_core::dns_filter::get_or_start(DnsPolicy {
         block: vec!["blocked.internal".into()],
         allow: vec![],
@@ -134,7 +136,9 @@ fn g3_dns_events_captured() {
     let spec = spec_with_network_block(name, vec!["blocked.internal".into()]);
     ensure(&spec).expect("ensure failed");
     // Query a blocked and an allowed domain inside the container.
+    // best-effort: test scratch: best-effort by design
     let _ = run_in(&spec, "nslookup blocked.internal 2>&1 || true");
+    // best-effort: test scratch: best-effort by design
     let _ = run_in(&spec, "nslookup example.com 2>&1 || true");
     force_rm(name);
     std::thread::sleep(std::time::Duration::from_millis(200));

@@ -531,7 +531,7 @@ impl VpsProvider {
         let ip = inst
             .ip
             .ok_or_else(|| anyhow!("vps: instance {name} has no public IPv4 yet"))?;
-        let _ = registry::write(&registry::VpsRecord {
+        let _ = registry::write(&registry::VpsRecord { // best-effort: registry is a cache; write failure just means no resurrection row
             name: name.to_string(),
             provider: self.spec.kind.as_str().into(),
             state: "ready".into(),
@@ -613,7 +613,7 @@ impl VpsProvider {
                       cloud-init status --wait >/dev/null 2>&1; true"
             .to_string();
         let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
-        let _ = tokio::time::timeout(
+        let _ = tokio::time::timeout( // best-effort: cloud-init wait is advisory (see comment above)
             std::time::Duration::from_secs(240),
             shim.run_exec(&argv, None, &[]),
         )

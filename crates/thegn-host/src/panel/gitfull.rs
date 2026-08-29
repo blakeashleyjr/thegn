@@ -242,9 +242,8 @@ fn flow_chips(flow: &GitFlow, merge_banner: bool) -> Vec<Seg> {
 /// The `1 STATUS` strip — ONE row (the frame header above already carries
 /// the branch + divergence; repeating them was dead weight): the numbered
 /// label, the live flow chips, and the pending spinner on the right.
-fn status_rows(model: &FrameModel, ui: &PanelUi, focused: bool) -> Vec<PanelRow> {
+fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow> {
     let data = &model.panel;
-    let _ = focused;
     let mut right: Vec<Seg> = Vec::new();
     if let Some(p) = &ui.git.pending {
         right.push(seg(ac(), viz::spin(ui.docs.tick).to_string()));

@@ -282,8 +282,8 @@ fn app_change_hook(
     let tx = app_tx.clone();
     let wk = waker.clone();
     std::sync::Arc::new(move || {
-        let _ = tx.send(idx);
-        let _ = wk.wake();
+        let _ = tx.send(idx); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     })
 }
 

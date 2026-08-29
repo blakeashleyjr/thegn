@@ -106,7 +106,7 @@ pub(crate) fn file_worktree_path(
             }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 
@@ -154,7 +154,7 @@ pub(crate) fn unfile_worktree_path(
             }
         }
         if refresh_tx.send(RefreshKind::Model).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 

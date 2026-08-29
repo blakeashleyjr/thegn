@@ -1017,7 +1017,7 @@ pub fn interpret_probe(bytes: &[u8]) -> ProbeResult {
     // safer than a wrong level.
     if let Some(params) = csi_reply(&s, "\u{1b}[>4;", 'm') {
         r.responded = true;
-        r.modify_other_keys = params.parse::<u8>().ok();
+        r.modify_other_keys = params.parse::<u8>().ok(); // best-effort: optional input: an unparseable reply means 'not reported'
     }
 
     // kitty progressive-enhancement reply: `ESC [ ? <flags> u`. Same prefix as
@@ -1025,7 +1025,7 @@ pub fn interpret_probe(bytes: &[u8]) -> ProbeResult {
     // them apart, which `csi_reply` keys on.
     if let Some(params) = csi_reply(&s, "\u{1b}[?", 'u') {
         r.responded = true;
-        r.kitty_keyboard = params.parse::<u8>().ok();
+        r.kitty_keyboard = params.parse::<u8>().ok(); // best-effort: optional input: an unparseable reply means 'not reported'
     }
 
     r

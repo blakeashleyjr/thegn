@@ -178,7 +178,7 @@ fn status(worktree: Option<String>) -> Result<()> {
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {
         // Host-path cache key — matches the panel's reader (never `loc.path()`).
-        let _ = db.put_pr_cache(&GitLoc::worktree_cache_key(&wt), &panel.branch, &json);
+        let _ = db.put_pr_cache(&GitLoc::worktree_cache_key(&wt), &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     print_summary(&panel);
     Ok(())

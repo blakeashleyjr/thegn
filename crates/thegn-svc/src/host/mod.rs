@@ -115,8 +115,8 @@ pub struct IrohTunnel {
 
 impl Drop for IrohTunnel {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill(); // best-effort: child may already have exited
+        let _ = self.child.wait(); // best-effort: reap-or-not is terminal here
     }
 }
 
@@ -147,7 +147,7 @@ fn lower_iroh(i: &IrohReach) -> Result<(IrohTunnel, thegn_core::placement::SshPl
                     if let Ok(p) = digits.parse::<u16>()
                         && p != 0
                     {
-                        let _ = tx.send(p);
+                        let _ = tx.send(p); // best-effort: waiter may have timed out
                         return;
                     }
                 }
@@ -161,8 +161,8 @@ fn lower_iroh(i: &IrohReach) -> Result<(IrohTunnel, thegn_core::placement::SshPl
         scan(Box::new(err), tx);
     }
     let port = rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.kill(); // best-effort: teardown before the error return
+        let _ = child.wait(); // best-effort: reap-or-not is terminal here
         "iroh: dumbpipe printed no local listen address within 30s \
              (bad ticket, or the remote listener is down)"
             .to_string()
@@ -395,14 +395,14 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
     let out_h = std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(mut r) = stdout_pipe.take() {
-            let _ = r.read_to_string(&mut s);
+            let _ = r.read_to_string(&mut s); // best-effort: read error just truncates captured output
         }
         s
     });
     let err_h = std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(mut r) = stderr_pipe.take() {
-            let _ = r.read_to_string(&mut s);
+            let _ = r.read_to_string(&mut s); // best-effort: read error just truncates captured output
         }
         s
     });
@@ -421,11 +421,11 @@ fn exec_argv(argv: &[String], timeout: Duration) -> Result<ExecOut, ExecFail> {
                 });
             }
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.kill(); // best-effort: child may already have exited
+                let _ = child.wait(); // best-effort: reap-or-not is terminal here
                 // Killing the child closes the pipes, unblocking the readers.
-                let _ = out_h.join();
-                let _ = err_h.join();
+                let _ = out_h.join(); // best-effort: join failure (thread panic) must not mask the timeout
+                let _ = err_h.join(); // best-effort: join failure (thread panic) must not mask the timeout
                 return Err(ExecFail::Timeout {
                     secs: timeout.as_secs(),
                 });
@@ -585,14 +585,14 @@ impl OciRunner {
         loop {
             match consumer.try_wait() {
                 Ok(Some(status)) => {
-                    let _ = producer.wait();
+                    let _ = producer.wait(); // best-effort: producer may already have exited
                     if status.success() {
                         return Ok(());
                     }
                     let mut err = String::new();
                     if let Some(mut r) = consumer.stderr.take() {
                         use std::io::Read;
-                        let _ = r.read_to_string(&mut err);
+                        let _ = r.read_to_string(&mut err); // best-effort: read error just truncates captured output
                     }
                     return Err(describe_exec_failure(
                         "pipe: host cmd",
@@ -602,10 +602,10 @@ impl OciRunner {
                     ));
                 }
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = consumer.kill();
-                    let _ = producer.kill();
-                    let _ = consumer.wait();
-                    let _ = producer.wait();
+                    let _ = consumer.kill(); // best-effort: teardown before the error return
+                    let _ = producer.kill(); // best-effort: teardown before the error return
+                    let _ = consumer.wait(); // best-effort: reap-or-not is terminal here
+                    let _ = producer.wait(); // best-effort: reap-or-not is terminal here
                     return Err(format!("pipe: timed out after {}s", timeout.as_secs()));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -1011,7 +1011,7 @@ impl HostRunner for OciRunner {
         }
         match &spec.seed {
             VolumeSeed::ImageCopyUp => {
-                let _ = image;
+                let _ = image; // best-effort: non-Result discard — image unused for this seed
                 let target = thegn_core::image::managed_tag(digest);
                 let cmd = format!(
                     "{bin} volume create --label thegn.managed=true \
@@ -1026,11 +1026,14 @@ impl HostRunner for OciRunner {
                     .map_err(|f| f.cerr(&label))?;
                 if !out.ok {
                     // Never leave a half-seeded volume: a later run would see
-                    // `volume exists` and trust it.
-                    let _ = self.exec(
+                    // `volume exists` and trust it. Rollback is best-effort —
+                    // the primary error is returned below either way.
+                    if let Err(e) = self.exec(
                         &format!("{bin} volume rm -f {}", spec.name),
                         Duration::from_secs(60),
-                    );
+                    ) {
+                        tracing::warn!("volume seed rollback failed for {}: {:?}", spec.name, e);
+                    }
                     return Err(out.cerr(&label));
                 }
                 Ok(())
@@ -1189,8 +1192,8 @@ mod tests {
         // tar a staging dir into a destination dir via the exec channel.
         let src = std::env::temp_dir().join(format!("tg-pipe-src-{}", std::process::id()));
         let dst = std::env::temp_dir().join(format!("tg-pipe-dst-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&src);
-        let _ = std::fs::remove_dir_all(&dst);
+        let _ = std::fs::remove_dir_all(&src); // best-effort: test tmp cleanup
+        let _ = std::fs::remove_dir_all(&dst); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("hello.txt"), b"hi").unwrap();
         let r = OciRunner::new(Placement::Local);

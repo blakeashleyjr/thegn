@@ -245,7 +245,7 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         }
                     }
                     Some(EventFrame::SessionExit { code, .. }) => {
-                        let _ = out_tx.send(ExecFrame::Exit(exec_exit_code(code))).await;
+                        let _ = out_tx.send(ExecFrame::Exit(exec_exit_code(code))).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         return;
                     }
                     Some(_) => {} // Hello / feed frames: not pane bytes
@@ -263,7 +263,7 @@ fn adapt(session_id: String, stream: AttachStream) -> ExecSession {
                         }
                     }
                     Some(ExecControl::Close) | None => {
-                        let _ = control.send(AttachControl::Close).await;
+                        let _ = control.send(AttachControl::Close).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         return;
                     }
                 },

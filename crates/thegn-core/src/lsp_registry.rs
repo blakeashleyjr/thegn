@@ -344,6 +344,6 @@ mod tests {
         .unwrap();
         let n = repo_overlay_lsp_notice(&dir).expect("notice");
         assert!(n.contains(".thegn.toml") && n.contains("ignored"), "{n}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

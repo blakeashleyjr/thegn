@@ -181,10 +181,13 @@ fn a4_multiple_queries_all_logged() {
     let port = dns_port();
     drain_events();
     // blocked
+    // best-effort: test smoke: this path must not panic
     let _ = query(port, "evil.test");
     // not-blocked
+    // best-effort: test smoke: this path must not panic
     let _ = query(port, "allowed.example");
     // not-blocked
+    // best-effort: test smoke: this path must not panic
     let _ = query(port, "other.example");
     let events = collect_events_until(Duration::from_secs(5), |e| {
         e.iter().filter(|x| !x.allowed).count() >= 1 && e.iter().filter(|x| x.allowed).count() >= 2

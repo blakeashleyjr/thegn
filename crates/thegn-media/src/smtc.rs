@@ -241,10 +241,10 @@ impl SessionBind {
     fn clear(&mut self) {
         if let Some(sess) = self.session.take() {
             if let Some(t) = self.info_token.take() {
-                let _ = sess.RemovePlaybackInfoChanged(t);
+                let _ = sess.RemovePlaybackInfoChanged(t); // best-effort: session may already be gone
             }
             if let Some(t) = self.props_token.take() {
-                let _ = sess.RemoveMediaPropertiesChanged(t);
+                let _ = sess.RemoveMediaPropertiesChanged(t); // best-effort: session may already be gone
             }
         }
     }
@@ -260,7 +260,7 @@ struct Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         if let Some(t) = self.session_changed_token.take() {
-            let _ = self.manager.RemoveCurrentSessionChanged(t);
+            let _ = self.manager.RemoveCurrentSessionChanged(t); // best-effort: session may already be gone
         }
         self.bind.lock().unwrap().clear();
     }
@@ -281,17 +281,17 @@ fn rebind(
     let tx_info = tx.clone();
     b.info_token = session
         .PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_info.send(());
+            let _ = tx_info.send(()); // best-effort: listener may be gone
             Ok(())
         }))
-        .ok();
+        .ok(); // best-effort: registration failure just means no auto-updates
     let tx_props = tx.clone();
     b.props_token = session
         .MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx_props.send(());
+            let _ = tx_props.send(()); // best-effort: listener may be gone
             Ok(())
         }))
-        .ok();
+        .ok(); // best-effort: registration failure just means no auto-updates
     b.session = Some(session);
 }
 
@@ -372,7 +372,7 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         .ok()
         .and_then(|r| r.Value().ok())
         .map(|m| loop_from_repeat(m.0));
-    let controls = info.Controls().ok();
+    let controls = info.Controls().ok(); // best-effort: optional read; absence is a normal condition
     let can_go_next = controls
         .as_ref()
         .and_then(|c| c.IsNextEnabled().ok())
@@ -393,7 +393,7 @@ fn snapshot_blocking() -> Result<Option<MediaState>, MediaError> {
         .map(|h| h.to_string())
         .unwrap_or_default();
 
-    let timeline = session.GetTimelineProperties().ok();
+    let timeline = session.GetTimelineProperties().ok(); // best-effort: optional read; absence is a normal condition
     let position = timeline
         .as_ref()
         .and_then(|t| t.Position().ok())

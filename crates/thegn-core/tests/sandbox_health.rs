@@ -16,6 +16,7 @@ fn skip() -> bool {
 }
 
 fn force_rm(name: &str) {
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("podman")
         .args(["rm", "-f", name])
         .output();
@@ -85,6 +86,7 @@ fn f2_stopped_container_is_unhealthy() {
     let spec = base_spec(name);
     ensure(&spec).expect("ensure failed");
     // Stop the container.
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("podman")
         .args(["stop", name])
         .output();

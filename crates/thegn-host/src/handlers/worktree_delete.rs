@@ -111,7 +111,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         .collect();
 
     // Close from the highest index down so earlier indices stay valid.
-    let db = thegn_core::db::Db::open().ok();
+    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: deletion proceeds on disk/git; a failed open just leaves stale rows
     targets.sort_unstable_by(|a, b| b.cmp(a));
     for gi in targets {
         if gi < cx.session.worktrees.len() {

@@ -16,7 +16,7 @@ pub struct StderrGuard {
 impl Drop for StderrGuard {
     fn drop(&mut self) {
         // Restore fd 2 from the copy; `saved` then closes itself.
-        nix::unistd::dup2_stderr(&self.saved).ok();
+        nix::unistd::dup2_stderr(&self.saved).ok(); // best-effort: stderr restore in Drop: failure cannot unwind (crash path)
     }
 }
 
@@ -28,7 +28,7 @@ impl StderrGuard {
     pub fn register_crash_notice(&self) {
         if let Ok(fd) = nix::unistd::dup(&self.saved) {
             thegn_core::log_trace::register_crash_notice(move |s: &str| {
-                let _ = nix::unistd::write(&fd, s.as_bytes());
+                let _ = nix::unistd::write(&fd, s.as_bytes()); // best-effort: crash notice: best-effort write during a panic; failure loses the notice
             });
         }
     }
@@ -69,7 +69,7 @@ impl TerminalRestore {
         // it is defensive against an inner app that pushed flags and died
         // without popping them. Leave the bytes.
         const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l";
-        let _ = nix::unistd::write(&self.tty, SEQ);
+        let _ = nix::unistd::write(&self.tty, SEQ); // best-effort: terminal teardown: leave the bytes; the tty drops anyway
         // SAFETY: `tcsetattr` on our own controlling-terminal fd with a termios
         // we captured from it. Result ignored — this runs during a panic unwind
         // and must not itself panic.
@@ -117,6 +117,7 @@ pub fn pid_alive(pid: i64) -> bool {
 
 /// Best-effort graceful termination of a single process (`SIGTERM`).
 pub fn terminate_pid(pid: u32) {
+    // best-effort: signal: the process may already be gone
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGTERM,
@@ -169,7 +170,7 @@ pub fn restrict_dir_owner_only(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     // best-effort: 0700 is defence-in-depth; the dir is already under the
     // per-profile state root.
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)); // best-effort: hardening: a failed chmod must never block the caller
 }
 
 /// A spawned child's process group — what [`GroupHandle::terminate`] reaps
@@ -190,6 +191,7 @@ impl GroupHandle {
 
     /// Best-effort `SIGTERM` to the whole group.
     pub fn terminate(&self) {
+        // best-effort: signal: the process may already be gone
         nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(self.pgid),
             nix::sys::signal::Signal::SIGTERM,
@@ -227,7 +229,7 @@ pub fn install_shutdown_signal(flag: Arc<AtomicBool>, waker: termwiz::terminal::
             _ = hup.recv() => {}
         }
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 

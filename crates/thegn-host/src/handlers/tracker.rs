@@ -66,10 +66,10 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
         let already_linked = ctx.model.panel.tracker_links.contains(&id);
         if let Ok(db) = thegn_core::db::Db::open() {
             if already_linked {
-                let _ = db.unlink_issue(&wt_str, &id);
+                let _ = db.unlink_issue(&wt_str, &id); // best-effort: cache write: the link row is bookkeeping; the tracker is the source of truth
                 ctx.model.status = format!("Unlinked {id}");
             } else {
-                let _ = db.link_issue(&wt_str, &id);
+                let _ = db.link_issue(&wt_str, &id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 ctx.model.status = format!("Linked {id}");
             }
         }
@@ -199,7 +199,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                     // reporting) instead of silently claiming success.
                     if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
                         thegn_core::msg::warn(&format!("assign failed: {e}"));
-                        let _ = waker2.wake();
+                        let _ = waker2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                         return;
                     }
                     crate::hydrate_tracker::spawn_issue_cache_refresh(cwd2, full_cfg, Some(waker2));
@@ -325,13 +325,14 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             // Register the dispatch in the DB.
             if let Ok(db) = thegn_core::db::Db::open() {
                 let root_s = root.to_string_lossy();
-                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None);
+                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
                     &issue_id,
                     &wt_str,
                     &agent_name,
                 ));
-                let _ = db.link_issue(&wt_str, &issue_id);
+                let _ = db.link_issue(&wt_str, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
             let env = crate::wizard::ambient_env_name_live(&cfg2, &root);
@@ -343,11 +344,12 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 spec,
                 env,
             };
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx2.send(crate::wizard::CreateEvent::Done {
                 generation: dispatch_gen,
                 payload: Box::new(payload),
             });
-            let _ = wk2.wake();
+            let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
         ctx.model.status = format!("Dispatching agent to {}…", issue.number);
     }
@@ -365,7 +367,7 @@ pub(crate) fn on_worktree_created(
     if let Some((g, issue_id)) = pending_issue_link.take() {
         if g == generation {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.link_issue(path, &issue_id);
+                let _ = db.link_issue(path, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         } else {
             // Not ours — put it back for the matching Done event.

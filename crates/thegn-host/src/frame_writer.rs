@@ -192,7 +192,7 @@ impl Drop for FrameWriter {
         }
         self.inner.cv.notify_one();
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            let _ = h.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
         }
     }
 }
@@ -235,7 +235,7 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
         }
         if errored {
             // The loop acts on the status (full repaint / teardown) — wake it.
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     }
 }

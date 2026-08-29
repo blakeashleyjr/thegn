@@ -414,7 +414,7 @@ mod tests {
             EntityKind::Const,
             EntityKind::Module,
         ] {
-            let _ = kind_weight(k);
+            let _ = kind_weight(k); // best-effort: test smoke: this path must not panic
         }
     }
 }

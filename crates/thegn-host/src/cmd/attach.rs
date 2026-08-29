@@ -120,13 +120,13 @@ async fn interactive(
             },
             msg = tty_rx.recv() => match msg {
                 Some(FromTty::Input(bytes)) => {
-                    let _ = stream.control.send(AttachControl::Input(bytes)).await;
+                    let _ = stream.control.send(AttachControl::Input(bytes)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
                 Some(FromTty::Resize { rows, cols }) => {
-                    let _ = stream.control.send(AttachControl::Resize { rows, cols }).await;
+                    let _ = stream.control.send(AttachControl::Resize { rows, cols }).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
                 Some(FromTty::Detach) => {
-                    let _ = stream.control.send(AttachControl::Close).await;
+                    let _ = stream.control.send(AttachControl::Close).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     exit_note = Some("[detached — session still running]".into());
                     break;
                 }
@@ -139,8 +139,8 @@ async fn interactive(
     // Tear the terminal down: signal the input thread and wake its blocking
     // poll so it exits the alt screen + restores cooked mode, then join it.
     done.store(true, Ordering::SeqCst);
-    let _ = waker.wake();
-    let _ = input_thread.join();
+    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    let _ = input_thread.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
 
     if let Some(note) = exit_note {
         outln!("{note}");
@@ -163,7 +163,7 @@ fn input_loop<T: Terminal>(
         match term.poll_input(None) {
             Ok(Some(InputEvent::Key(k))) => {
                 if is_detach_chord(&k) {
-                    let _ = tx.blocking_send(FromTty::Detach);
+                    let _ = tx.blocking_send(FromTty::Detach); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     break;
                 }
                 if let Some(bytes) = crate::input::key_bytes(&k.key, k.modifiers)
@@ -178,6 +178,7 @@ fn input_loop<T: Terminal>(
                 }
             }
             Ok(Some(InputEvent::Resized { rows, cols })) => {
+                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 let _ = tx.blocking_send(FromTty::Resize {
                     rows: rows as u16,
                     cols: cols as u16,
@@ -192,7 +193,7 @@ fn input_loop<T: Terminal>(
     // Best-effort restore: leave the alt screen; termwiz restores cooked mode
     // when the terminal drops.
     let _ = term.exit_alternate_screen();
-    let _ = term.flush();
+    let _ = term.flush(); // best-effort: flush: display-only
 }
 
 /// The detach chord: Ctrl-\ (`0x1c`), spelled either as `Char('\\')`+CTRL or as

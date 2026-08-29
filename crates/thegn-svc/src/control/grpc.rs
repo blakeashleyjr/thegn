@@ -274,7 +274,7 @@ impl Control for GrpcControl {
         let snapshot = frame_to_proto(&reply.snapshot);
         let mut frames = reply.frames;
         let stream = async_stream(move |tx| async move {
-            let _ = tx.send(Ok(snapshot)).await;
+            let _ = tx.send(Ok(snapshot)).await; // best-effort: client may be gone
             while let Some(f) = frames.recv().await {
                 if tx.send(Ok(frame_to_proto(&f))).await.is_err() {
                     return;
@@ -640,7 +640,7 @@ impl Control for GrpcControl {
         }));
         let mut rx = self.api.subscribe();
         let stream = async_stream(move |tx| async move {
-            let _ = tx.send(Ok(hello)).await;
+            let _ = tx.send(Ok(hello)).await; // best-effort: client may be gone
             loop {
                 match rx.recv().await {
                     Ok(frame) => {

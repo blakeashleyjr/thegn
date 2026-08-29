@@ -157,12 +157,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // original mode (e.g. an executable script loses +x), and the content edit
     // — the thing the user asked for — still lands.
     if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        let _ = std::fs::set_permissions(&tmp, meta.permissions()); // best-effort: hardening: a failed chmod must never block the caller
     }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
             Err(e)
         }
     }
@@ -228,7 +228,7 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "X bar Y\n"
         );
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -250,7 +250,7 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "current\n"
         );
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -294,7 +294,7 @@ mod tests {
                 .any(|f| f.path == "ok.txt" && f.applied == 1)
         );
         assert_eq!(std::fs::read_to_string(&ok).unwrap(), "BAR\n");
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
             std::fs::read_to_string(root.join("s.rs")).unwrap(),
             "debug(x)\n"
         );
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -364,7 +364,7 @@ mod tests {
             "foo\n"
         );
         assert!(!root.exists());
-        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&base).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -386,6 +386,6 @@ mod tests {
         assert_eq!(report.files.len(), 1);
         assert!(report.files[0].error.is_some());
         assert_eq!(report.total_applied(), 0);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

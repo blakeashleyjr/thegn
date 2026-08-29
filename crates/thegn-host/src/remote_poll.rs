@@ -361,7 +361,7 @@ fn notify_behind(
         }
         lock().notified.insert(key, behind);
         if db.is_none() {
-            db = thegn_core::db::Db::open().ok();
+            db = thegn_core::db::Db::open().ok(); // best-effort: cache: the None path below reports and degrades
         }
         let Some(db) = db.as_ref() else {
             return; // no DB, no inbox — nothing left to do this round
@@ -415,8 +415,8 @@ pub(crate) fn poll(
             crate::branch_cache::invalidate_all();
             // …then re-hydrate so the sidebar's ahead/behind markers and the
             // panel header repaint at once instead of on the next ticker beat.
-            let _ = refresh_tx.send(RefreshKind::Model);
-            let _ = waker.wake();
+            let _ = refresh_tx.send(RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -651,8 +651,8 @@ mod tests {
         let tag = std::process::id();
         let origin = std::env::temp_dir().join(format!("thegn-rp-origin-{tag}"));
         let clone = std::env::temp_dir().join(format!("thegn-rp-clone-{tag}"));
-        let _ = std::fs::remove_dir_all(&origin);
-        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&origin); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&clone); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&origin).unwrap();
 
         git(&origin, &["init", "-q", "-b", "main"]);
@@ -734,14 +734,14 @@ mod tests {
 
         // A repo with no remotes at all resolves to nothing to poll.
         let bare = std::env::temp_dir().join(format!("thegn-rp-solo-{tag}"));
-        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&bare); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&bare).unwrap();
         git(&bare, &["init", "-q", "-b", "main"]);
         assert_eq!(remote_for(&GitLoc::Local(bare.clone())), None);
 
-        let _ = std::fs::remove_dir_all(&origin);
-        let _ = std::fs::remove_dir_all(&clone);
-        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&origin); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&clone); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&bare); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

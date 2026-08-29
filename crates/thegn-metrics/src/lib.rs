@@ -253,7 +253,7 @@ mod tests {
             pid: std::process::id(),
             group: "test-group".into(),
         }]);
-        let _ = s.sample();
+        let _ = s.sample(); // best-effort: primes the CPU delta; sample value irrelevant in test
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let snap = s.sample();
 
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn no_registered_children_reports_nothing_rather_than_zeroes() {
         let mut s = StatsSampler::new(std::env::temp_dir());
-        let _ = s.sample();
+        let _ = s.sample(); // best-effort: primes the CPU delta; sample value irrelevant in test
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let snap = s.sample();
         assert!(snap.children.is_empty());
@@ -299,7 +299,7 @@ mod tests {
             pid: 0,
             group: "ghost".into(),
         }]);
-        let _ = s.sample();
+        let _ = s.sample(); // best-effort: primes the CPU delta; sample value irrelevant in test
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let snap = s.sample();
         assert!(
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn sample_is_well_formed() {
         let mut s = StatsSampler::new(std::env::temp_dir());
-        let _ = s.sample();
+        let _ = s.sample(); // best-effort: primes the CPU delta; sample value irrelevant in test
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let snap = s.sample();
 
@@ -375,7 +375,7 @@ mod tests {
         // Point at our own PID as a stand-in daemon: it exists, so the field
         // populates; toggling it re-primes the CPU delta cleanly.
         s.set_daemon_pid(Some(std::process::id()));
-        let _ = s.sample();
+        let _ = s.sample(); // best-effort: primes the CPU delta; sample value irrelevant in test
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let snap = s.sample();
         assert!(snap.daemon_rss_bytes.unwrap_or(0) > 0, "daemon rss");

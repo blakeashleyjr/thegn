@@ -73,7 +73,7 @@ pub fn probe_outer_terminal_cli() -> Option<thegn_core::termcaps::ProbeResult> {
     let out = probe_outer_terminal();
     // best-effort: dropping `term` restores termios regardless, but ask first so
     // the restore is ordered rather than implicit.
-    let _ = term.set_cooked_mode();
+    let _ = term.set_cooked_mode(); // best-effort: probe teardown: the terminal restores itself at exit
     out
 }
 

@@ -107,7 +107,7 @@ pub fn emit_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 /// out of the box.
 pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let env_wt = std::env::var("THEGN_WORKTREE").ok();
+    let env_wt = std::env::var("THEGN_WORKTREE").ok(); // best-effort: optional input: the variable may legitimately be unset
     resolve_worktree_from(arg, env_wt, &cwd)
 }
 
@@ -135,7 +135,7 @@ pub fn confirm(message: &str) -> bool {
     }
     eprint!("{message} [y/N] ");
     use std::io::{BufRead, Write};
-    let _ = std::io::stderr().flush();
+    let _ = std::io::stderr().flush(); // best-effort: flush: display-only
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return false;

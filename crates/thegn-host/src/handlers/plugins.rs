@@ -197,6 +197,7 @@ fn send_activate(entry: &PluginEntry) {
     granted.sort();
     // best-effort: a session that died between spawn and activate surfaces
     // via its Exit event.
+    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     let _ = writer.notify(
         thegn_core::plugin_api::PluginCallback::Activate,
         serde_json::json!({ "api": API_VERSION, "granted": granted }),
@@ -475,7 +476,7 @@ fn respond(entry: &PluginEntry, resp: RpcResponse) {
     match &entry.writer {
         // best-effort: a session mid-exit errors; the Exit event cleans up.
         Some(w) => {
-            let _ = w.respond(&resp);
+            let _ = w.respond(&resp); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         }
         None => tracing::debug!(
             target: "thegn::plugin",
@@ -855,6 +856,7 @@ impl Dispatcher {
     fn dispatch(&self, writer: SessionWriter, id: u64, cap: String, params: serde_json::Value) {
         // best-effort: a dead dispatcher thread means the daemon reply is lost;
         // the plugin's request times out on its own side.
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = self.tx.send(DispatchReq {
             writer,
             id,

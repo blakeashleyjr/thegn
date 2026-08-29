@@ -187,7 +187,8 @@ pub fn request_stop_after(
             crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             std::thread::sleep(Duration::from_millis(ms));
             shutdown.store(true, Ordering::Relaxed);
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            // best-effort: deadline timer: a failed spawn just means no auto-shutdown of the perf run
         })
         .ok();
     Some(ms)

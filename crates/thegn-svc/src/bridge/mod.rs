@@ -462,8 +462,8 @@ impl Drop for BridgeClient {
         if let Ok(mut guard) = self.child.lock()
             && let Some(mut c) = guard.take()
         {
-            let _ = c.kill();
-            let _ = c.wait();
+            let _ = c.kill(); // best-effort: child may already have exited
+            let _ = c.wait(); // best-effort: reap-or-not is terminal here
         }
     }
 }
@@ -493,7 +493,7 @@ static LOOP_WARNED: AtomicBool = AtomicBool::new(false);
 /// any bridge RPC issued on it. Called once by the host at startup; a no-op
 /// second call is harmless.
 pub fn note_loop_thread() {
-    let _ = LOOP_THREAD.set(std::thread::current().id());
+    let _ = LOOP_THREAD.set(std::thread::current().id()); // best-effort: first set wins, later calls are no-ops
 }
 
 /// Whether the caller is running on the event-loop thread recorded by
@@ -579,7 +579,7 @@ fn reader_loop(
                         .and_then(|p| serde_json::from_value::<FsEventNote>(p).ok())
                         && let Some(tx) = subs.lock().unwrap().get(&note.watch_id)
                     {
-                        let _ = tx.send(FsEvent {
+                        let _ = tx.send(FsEvent { // best-effort: subscriber may be gone
                             paths: note.paths,
                             kind: note.kind,
                         });
@@ -598,7 +598,7 @@ fn reader_loop(
                         match B64.decode(&note.data) {
                             Ok(data) => {
                                 if let Some(tx) = procs.lock().unwrap().get(&note.chan) {
-                                    let _ = tx.send(ProcEvent::Out {
+                                    let _ = tx.send(ProcEvent::Out { // best-effort: subscriber may be gone
                                         stream: note.stream,
                                         data,
                                     });
@@ -620,7 +620,7 @@ fn reader_loop(
                     {
                         // Final event, then drop the sub so the receiver ends.
                         if let Some(tx) = procs.lock().unwrap().remove(&note.chan) {
-                            let _ = tx.send(ProcEvent::Exit { code: note.code });
+                            let _ = tx.send(ProcEvent::Exit { code: note.code }); // best-effort: subscriber may be gone
                         }
                     }
                     continue;
@@ -635,7 +635,7 @@ fn reader_loop(
                     Some(e) => Err(e),
                     None => Ok(resp.ok.unwrap_or(serde_json::Value::Null)),
                 };
-                let _ = tx.send(payload);
+                let _ = tx.send(payload); // best-effort: requester may have disconnected
             }
         }
     }
@@ -651,11 +651,11 @@ fn reader_loop(
         let mut p = pending.lock().unwrap();
         closed.store(true, Ordering::SeqCst);
         for (_, tx) in p.drain() {
-            let _ = tx.send(Err("bridge connection closed".into()));
+            let _ = tx.send(Err("bridge connection closed".into())); // best-effort: nobody may be listening
         }
     }
     for (_, tx) in procs.lock().unwrap().drain() {
-        let _ = tx.send(ProcEvent::Exit { code: -1 });
+        let _ = tx.send(ProcEvent::Exit { code: -1 }); // best-effort: shutdown, receivers may be gone
     }
     // Dropping the Senders disconnects each fs.watch receiver's `recv()`.
     subs.lock().unwrap().clear();
@@ -715,7 +715,8 @@ pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
                 // through one connection).
                 "exec" | "exec.batch" | "proc.list" => {
                     let w = writer.clone();
-                    let _ = std::thread::Builder::new()
+                    let req_id = req.id;
+                    if let Err(e) = std::thread::Builder::new()
                         .name("bridge-exec".into())
                         .spawn(move || {
                             let resp = match req.method.as_str() {
@@ -724,7 +725,12 @@ pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
                                 _ => proc_response(&req),
                             };
                             write_frame(&w, &resp);
-                        });
+                        })
+                    {
+                        // Primary path: a failed spawn would leave the host
+                        // waiting on a response that never comes — answer now.
+                        write_frame(&writer, &resp_err(req_id, format!("spawn exec worker: {e}")));
+                    }
                 }
                 // Stateful / fast: stay inline (they borrow `watchers`/`procs`).
                 _ => {
@@ -784,8 +790,8 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     let relays = spawn_stream_relay(stdout, chan, "stdout", writer.clone())
         .and_then(|()| spawn_stream_relay(stderr, chan, "stderr", writer.clone()));
     if let Err(e) = relays {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.kill(); // best-effort: child may already have exited
+        let _ = child.wait(); // best-effort: reap-or-not is terminal here
         return Err(e).context("spawn bridge proc relay thread");
     }
     // A dedicated writer thread owns stdin: proc.stdin bytes arrive over a bounded
@@ -809,8 +815,8 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
             // Drop stdin → child sees EOF.
         });
     if let Err(e) = writer_thread {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.kill(); // best-effort: child may already have exited
+        let _ = child.wait(); // best-effort: reap-or-not is terminal here
         return Err(e).context("spawn bridge-proc-stdin thread");
     }
     procs.lock().unwrap().insert(chan, ProcState { stdin_tx });
@@ -938,7 +944,7 @@ fn write_frame(w: &SharedWriter, msg: &impl Serialize) {
         return;
     };
     if let Ok(mut g) = w.lock() {
-        let _ = g.write_all(&framing::encode(&s)).and_then(|_| g.flush());
+        let _ = g.write_all(&framing::encode(&s)).and_then(|_| g.flush()); // best-effort: peer may be gone; connection is dead either way
     }
 }
 
@@ -1127,12 +1133,12 @@ fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
     // not be holding the process open.
     let out_h = std::thread::spawn(move || {
         let mut b = Vec::new();
-        let _ = stdout.read_to_end(&mut b);
+        let _ = stdout.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
     });
     let err_h = std::thread::spawn(move || {
         let mut b = Vec::new();
-        let _ = stderr.read_to_end(&mut b);
+        let _ = stderr.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
     });
     let start = Instant::now();
@@ -1140,8 +1146,8 @@ fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
         match child.try_wait().context("wait")? {
             Some(s) => break Some(s),
             None if start.elapsed() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.kill(); // best-effort: child may already have exited
+                let _ = child.wait(); // best-effort: reap-or-not is terminal here
                 break None;
             }
             None => std::thread::sleep(Duration::from_millis(20)),
@@ -1220,7 +1226,7 @@ mod tests {
         // Prove the git-over-bridge path: run git in a temp repo via exec, and the
         // existing CliGit porcelain parse shape works on the returned stdout.
         let dir = std::env::temp_dir().join(format!("tg-bridge-git-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
         let c = connect();
@@ -1239,7 +1245,7 @@ mod tests {
         assert_eq!(r.exit, 0);
         // Untracked file shows as "?? new.rs" in porcelain.
         assert!(r.stdout.contains("?? new.rs"), "porcelain: {:?}", r.stdout);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -1288,7 +1294,7 @@ mod tests {
         use thegn_core::remote::GitLoc;
 
         let dir = std::env::temp_dir().join(format!("tg-bridge-route-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
 
@@ -1310,7 +1316,7 @@ mod tests {
 
         drop_key(&key);
         assert!(for_loc(&loc).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -1329,7 +1335,7 @@ mod tests {
     fn fs_watch_streams_create_events_and_filters_git_churn() {
         let c = connect();
         let dir = std::env::temp_dir().join(format!("tg-bridge-watch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let rx = c.watch(&dir.to_string_lossy()).unwrap();
         // Let the fs-watch initialize before mutating.
@@ -1344,7 +1350,7 @@ mod tests {
             "event paths: {:?}",
             ev.paths
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -1378,7 +1384,7 @@ mod tests {
                 break;
             }
         }
-        let _ = saw_end; // the receiver ending (sender dropped) is also acceptance
+        drop(saw_end); // non-Result discard: the receiver ending (sender dropped) is also acceptance
     }
 
     #[test]
@@ -1602,7 +1608,7 @@ mod tests {
         // Push enough to overflow both the pipe and the bounded queue; some sends
         // may error (backlog full) — that's the fast-fail, not a hang.
         for _ in 0..256 {
-            let _ = c.proc_stdin(chan, &chunk);
+            let _ = c.proc_stdin(chan, &chunk); // best-effort: overflow is the fast-fail under test, not a hang
         }
         // The read loop is still alive: proc.kill returns promptly instead of
         // sitting behind a blocked pipe write.

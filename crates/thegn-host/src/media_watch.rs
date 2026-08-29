@@ -114,7 +114,7 @@ async fn push_snapshot(
     if tx.send(snap).is_err() {
         return None;
     }
-    let _ = waker.wake();
+    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     Some(active)
 }
 

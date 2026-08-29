@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn merged_templates_add_imports_without_clobbering_config() {
         let home = std::env::temp_dir().join(format!("tg-tmplmerge-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(home.join("tmuxinator")).unwrap();
         std::fs::write(
             home.join("tmuxinator/widget.yml"),
@@ -387,6 +387,6 @@ mod tests {
         assert_eq!(merged[1].commands, vec!["nvim"]);
         // No config home: just the config templates.
         assert_eq!(merged_worktree_templates(&cfg, None).len(), 1);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

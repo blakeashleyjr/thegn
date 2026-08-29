@@ -97,7 +97,7 @@ impl HostUiTx {
     fn send(&self, ev: HostUiEvent) {
         // best-effort: the loop may be gone during shutdown
         let _ = self.tx.send(ev);
-        self.waker.wake().ok();
+        self.waker.wake().ok(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
 }
 
@@ -401,7 +401,7 @@ pub(crate) fn ensure_host_ready_with(
     }
     // Golden fast path: one SQLite read, zero network.
     if ready_fresh(db, binding) {
-        let _ = db.host_touch_used(&binding.id, unix_now());
+        let _ = db.host_touch_used(&binding.id, unix_now()); // best-effort: cache write: last-used bookkeeping
         if let Some(spec) = spec_from_inventory(db, binding) {
             return Ok(HostOutcome::Ready(spec));
         }
@@ -659,7 +659,7 @@ fn run_effect(
     let key = binding.id.to_string();
     let ev = match effect {
         HostEffect::Connect => {
-            let _ = db.host_heartbeat(&binding.id, "connect", now);
+            let _ = db.host_heartbeat(&binding.id, "connect", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(HostStep::Connect, None);
             publish(board);
             // Transient transport failures retry with backoff — a single flap
@@ -670,7 +670,7 @@ fn run_effect(
                 &mut |s| {
                     board.start(HostStep::Connect, Some(s));
                     publish(board);
-                    let _ = db.host_heartbeat(&binding.id, "connect", unix_now());
+                    let _ = db.host_heartbeat(&binding.id, "connect", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                 },
                 &mut || {},
                 &mut || runner.connect(),
@@ -684,7 +684,7 @@ fn run_effect(
             }
         }
         HostEffect::Probe => {
-            let _ = db.host_heartbeat(&binding.id, "probe", now);
+            let _ = db.host_heartbeat(&binding.id, "probe", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(HostStep::Probe, None);
             publish(board);
             let res = with_retry(
@@ -693,14 +693,14 @@ fn run_effect(
                 &mut |s| {
                     board.start(HostStep::Probe, Some(s));
                     publish(board);
-                    let _ = db.host_heartbeat(&binding.id, "probe", unix_now());
+                    let _ = db.host_heartbeat(&binding.id, "probe", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                 },
                 &mut || {},
                 &mut || runner.probe(),
             );
             match res {
                 Ok(caps) => {
-                    let _ = db.host_touch_probe(&binding.id, unix_now());
+                    let _ = db.host_touch_probe(&binding.id, unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                     let detail = caps
                         .runtime
                         .as_ref()
@@ -719,18 +719,18 @@ fn run_effect(
             publish(board);
             match consent_answer(db, binding, policy, runtime, ui) {
                 Some(true) => {
-                    let _ = db.host_set_consent(&binding.id, true, unix_now());
+                    let _ = db.host_set_consent(&binding.id, true, unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                     MachineEvent::ConsentGranted
                 }
                 Some(false) => {
-                    let _ = db.host_set_consent(&binding.id, false, unix_now());
+                    let _ = db.host_set_consent(&binding.id, false, unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                     MachineEvent::ConsentDenied
                 }
                 None => return Some(DriveFlow::Deferred),
             }
         }
         HostEffect::Install { runtime } => {
-            let _ = db.host_heartbeat(&binding.id, "install", now);
+            let _ = db.host_heartbeat(&binding.id, "install", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(
                 HostStep::Install,
                 Some(format!("installing {}", runtime.as_str())),
@@ -749,7 +749,7 @@ fn run_effect(
             }
         }
         HostEffect::ResolveImage { reference } => {
-            let _ = db.host_heartbeat(&binding.id, "resolve_image", now);
+            let _ = db.host_heartbeat(&binding.id, "resolve_image", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(HostStep::ResolveImage, Some(format!("resolve {reference}")));
             publish(board);
             let res = with_retry(
@@ -758,7 +758,7 @@ fn run_effect(
                 &mut |s| {
                     board.start(HostStep::ResolveImage, Some(s));
                     publish(board);
-                    let _ = db.host_heartbeat(&binding.id, "resolve_image", unix_now());
+                    let _ = db.host_heartbeat(&binding.id, "resolve_image", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                 },
                 &mut || {},
                 &mut || runner.resolve_image(&reference),
@@ -769,7 +769,7 @@ fn run_effect(
             }
         }
         HostEffect::CheckImage { digest } => {
-            let _ = db.host_heartbeat(&binding.id, "verify", now);
+            let _ = db.host_heartbeat(&binding.id, "verify", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(HostStep::Verify, Some(format!("check {}", digest.short())));
             publish(board);
             let res = with_retry(
@@ -778,7 +778,7 @@ fn run_effect(
                 &mut |s| {
                     board.start(HostStep::Verify, Some(s));
                     publish(board);
-                    let _ = db.host_heartbeat(&binding.id, "verify", unix_now());
+                    let _ = db.host_heartbeat(&binding.id, "verify", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                 },
                 &mut || {},
                 &mut || runner.image_present(&binding.image, &digest),
@@ -794,7 +794,7 @@ fn run_effect(
             }
         }
         HostEffect::Deliver { strategy, digest } => {
-            let _ = db.host_heartbeat(&binding.id, "deliver", now);
+            let _ = db.host_heartbeat(&binding.id, "deliver", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(
                 HostStep::Deliver,
                 Some(format!("via {}", strategy.as_str())),
@@ -814,7 +814,7 @@ fn run_effect(
                 };
                 board.start(HostStep::Deliver, Some(detail));
                 publish(board);
-                let _ = db.host_heartbeat(&binding.id, "deliver", unix_now());
+                let _ = db.host_heartbeat(&binding.id, "deliver", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             };
             // Same-strategy retry on transient transport failures: resume
             // offsets make a second pass cheap, and the machine's strategy
@@ -832,7 +832,7 @@ fn run_effect(
                     Duration::from_secs(3600),
                 ),
                 &mut |s| {
-                    let _ = db.host_event(&binding.id, HostStep::Deliver.as_str(), &s, unix_now());
+                    let _ = db.host_event(&binding.id, HostStep::Deliver.as_str(), &s, unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                 },
                 &mut || {},
                 &mut || runner.deliver(strategy, &binding.image, &digest, &mut on_bytes),
@@ -841,6 +841,7 @@ fn run_effect(
                 Ok(verified) => {
                     record_image(db, binding, ctx, &verified, false);
                     let _ = db.host_event(
+                        // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                         &binding.id,
                         HostStep::Deliver.as_str(),
                         &format!("delivered {} via {}", verified.short(), strategy.as_str()),
@@ -855,7 +856,7 @@ fn run_effect(
             }
         }
         HostEffect::SeedVolume { spec } => {
-            let _ = db.host_heartbeat(&binding.id, "seed_volume", now);
+            let _ = db.host_heartbeat(&binding.id, "seed_volume", now); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             board.start(HostStep::SeedVolume, Some(format!("seed {}", spec.name)));
             publish(board);
             let digest = ctx
@@ -884,7 +885,7 @@ fn run_effect(
                 &mut |s| {
                     board.start(HostStep::SeedVolume, Some(s));
                     publish(board);
-                    let _ = db.host_heartbeat(&binding.id, "seed_volume", unix_now());
+                    let _ = db.host_heartbeat(&binding.id, "seed_volume", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
                 },
                 &mut || {},
                 &mut || runner.seed_volume(&spec, &binding.image, &digest),
@@ -903,6 +904,7 @@ fn run_effect(
         HostEffect::Checkpoint { state } => {
             let name = binding.id.config_name().unwrap_or("").to_string();
             let _ = db.host_checkpoint(
+                // best-effort: checkpoint cache: the row seeds UPDATE-based helpers and the UI board
                 &binding.id,
                 &name,
                 binding.reach.kind(),
@@ -911,12 +913,12 @@ fn run_effect(
                 unix_now(),
             );
             if matches!(state, HostState::Ready | HostState::Failed(_)) {
-                let _ = db.host_heartbeat_clear(&binding.id);
+                let _ = db.host_heartbeat_clear(&binding.id); // best-effort: cache write: stale-heartbeat cleanup
             }
             return None;
         }
         HostEffect::Emit { step, detail } => {
-            let _ = db.host_event(&binding.id, step.as_str(), &detail, unix_now());
+            let _ = db.host_event(&binding.id, step.as_str(), &detail, unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
             if let Some(ui) = ui {
                 ui.send(HostUiEvent::Progress {
                     host: key,
@@ -952,9 +954,9 @@ fn record_image(
         verified_at: verified_now.then_some(now),
         size_bytes: None,
     };
-    let _ = db.host_inventory_put(&entry);
+    let _ = db.host_inventory_put(&entry); // best-effort: inventory cache: a missed row just costs a re-probe
     if verified_now {
-        let _ = db.host_inventory_verify(&entry.key, now);
+        let _ = db.host_inventory_verify(&entry.key, now); // best-effort: inventory cache: a missed row just costs a re-probe
     }
 }
 
@@ -969,6 +971,7 @@ fn record_volume(
         return;
     };
     let _ = db.host_inventory_put(&thegn_core::inventory::InventoryEntry {
+        // best-effort: inventory cache: a missed row just costs a re-probe
         key: thegn_core::inventory::InventoryKey {
             host: binding.id.clone(),
             kind: ArtifactKind::Volume,
@@ -1116,6 +1119,7 @@ fn drive(
         // set_consent) have something to land on from the first step.
         let name = binding.id.config_name().unwrap_or("").to_string();
         let _ = db.host_checkpoint(
+            // best-effort: checkpoint cache: seeds the row so UPDATE-based helpers land from the first step
             &binding.id,
             &name,
             binding.reach.kind(),
@@ -1144,7 +1148,7 @@ fn drive(
             });
     }
     // A retryable failed row re-enters: also clear a stale heartbeat.
-    let _ = db.host_heartbeat(&binding.id, "resume", unix_now());
+    let _ = db.host_heartbeat(&binding.id, "resume", unix_now()); // best-effort: host board bookkeeping: the row feeds the UI board; the drive's own events carry the outcome
 
     loop {
         let mut event: Option<MachineEvent> = None;
@@ -1157,6 +1161,7 @@ fn drive(
                     HostEffect::Checkpoint { .. } | HostEffect::Emit { .. }
                 ) {
                     let _ = run_effect(
+                        // best-effort: effect outcome is advisory here: the drive reports its own progress events; the effect re-runs on the next reconcile
                         db,
                         binding,
                         policy,
@@ -1184,7 +1189,7 @@ fn drive(
                 None => {}
                 Some(DriveFlow::Event(ev)) => event = Some(ev),
                 Some(DriveFlow::Deferred) => {
-                    let _ = db.host_heartbeat_clear(&binding.id);
+                    let _ = db.host_heartbeat_clear(&binding.id); // best-effort: cache write: stale-heartbeat cleanup
                     return Ok(HostOutcome::Deferred);
                 }
             }
@@ -1201,6 +1206,7 @@ fn drive(
                 // Drain trailing checkpoints/emits, then finish.
                 for effect in pending.drain(..) {
                     let _ = run_effect(
+                        // best-effort: drain effect is advisory here: the drive has already reached Ready; the effect re-runs on the next reconcile
                         db,
                         binding,
                         policy,
@@ -1214,7 +1220,7 @@ fn drive(
                 }
                 board.all_done();
                 publish(&board);
-                let _ = db.host_touch_used(&binding.id, unix_now());
+                let _ = db.host_touch_used(&binding.id, unix_now()); // best-effort: cache write: last-used bookkeeping
                 return spec_from_inventory(db, binding)
                     .map(HostOutcome::Ready)
                     .ok_or_else(|| HostFailure {
@@ -1226,6 +1232,7 @@ fn drive(
             HostState::Failed(f) => {
                 for effect in pending.drain(..) {
                     let _ = run_effect(
+                        // best-effort: drain effect is advisory here: the drive has already failed with its own report; the effect re-runs on the next reconcile
                         db,
                         binding,
                         policy,

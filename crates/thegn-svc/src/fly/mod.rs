@@ -717,8 +717,8 @@ mod tests {
                         "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.flush().await;
+                    let _ = sock.write_all(resp.as_bytes()).await; // best-effort: client may be gone
+                    let _ = sock.flush().await; // best-effort: client may be gone
                 });
             }
         });

@@ -16,10 +16,7 @@ use thegn_core::seam::{Availability, Kind, Probe, ProbeReport};
 /// `Ready` when `bin` is on `PATH`, else `Unavailable` naming it.
 pub fn binary_availability(bin: &str) -> Availability {
     match thegn_core::util::which_path(bin) {
-        Some(path) => {
-            let _ = path;
-            Availability::Ready
-        }
+        Some(_) => Availability::Ready,
         None => Availability::Unavailable(format!("`{bin}` not found on PATH")),
     }
 }

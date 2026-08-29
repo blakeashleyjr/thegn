@@ -194,23 +194,23 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
     let out_h = std::thread::spawn(move || {
         if let Some(o) = stdout {
             let mut b = Vec::new();
-            let _ = o.take(1 << 20).read_to_end(&mut b);
+            let _ = o.take(1 << 20).read_to_end(&mut b); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
         }
     });
     let err_h = std::thread::spawn(move || {
         if let Some(e) = stderr {
             let mut b = Vec::new();
-            let _ = e.take(1 << 20).read_to_end(&mut b);
+            let _ = e.take(1 << 20).read_to_end(&mut b); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
         }
     });
 
     let status = child.wait();
     done.store(true, Ordering::Relaxed);
     if let Some(w) = watchdog {
-        let _ = w.join();
+        let _ = w.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
     }
-    let _ = out_h.join();
-    let _ = err_h.join();
+    let _ = out_h.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
+    let _ = err_h.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
 
     if timed_out.load(Ordering::Relaxed) {
         tracing::warn!(target: "thegn::agent", kind = %task.kind, "agent timed out");

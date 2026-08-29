@@ -602,11 +602,10 @@ pub trait ControlApi: Send + Sync + 'static {
     /// conditions light up when the per-pane state feed lands.
     fn wait<'a>(
         &'a self,
-        session: &'a str,
-        cond: WaitCondition,
-        timeout_ms: Option<i64>,
+        _session: &'a str,
+        _cond: WaitCondition,
+        _timeout_ms: Option<i64>,
     ) -> BoxFuture<'a, ControlResult<WaitOutcome>> {
-        let _ = (session, cond, timeout_ms);
         Box::pin(async { Err(ControlError::Unimplemented("wait")) })
     }
 
@@ -617,11 +616,10 @@ pub trait ControlApi: Send + Sync + 'static {
     /// for that future placement.
     fn split<'a>(
         &'a self,
-        session: &'a str,
-        dir: SplitDir,
+        _session: &'a str,
+        _dir: SplitDir,
         spec: OpenSpec,
     ) -> BoxFuture<'a, ControlResult<SessionInfo>> {
-        let _ = (session, dir);
         self.open(spec)
     }
 
@@ -632,10 +630,9 @@ pub trait ControlApi: Send + Sync + 'static {
     /// the recorded contents.
     fn record_session<'a>(
         &'a self,
-        session: &'a str,
-        spec: RecordSpec,
+        _session: &'a str,
+        _spec: RecordSpec,
     ) -> BoxFuture<'a, ControlResult<RecordStatus>> {
-        let _ = (session, spec);
         Box::pin(async { Err(ControlError::Unimplemented("record_session")) })
     }
 
@@ -686,10 +683,9 @@ pub trait ControlApi: Send + Sync + 'static {
     /// ISO dates).
     fn calendar_events<'a>(
         &'a self,
-        from: &'a str,
-        to: &'a str,
+        _from: &'a str,
+        _to: &'a str,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::calendar::CalEvent>>> {
-        let _ = (from, to);
         Box::pin(async { Err(ControlError::Unimplemented("calendar is not configured")) })
     }
 
@@ -704,10 +700,9 @@ pub trait ControlApi: Send + Sync + 'static {
     /// read-only towards those.
     fn calendar_ingest<'a>(
         &'a self,
-        account: &'a str,
-        events: Vec<thegn_core::calendar::CalEvent>,
+        _account: &'a str,
+        _events: Vec<thegn_core::calendar::CalEvent>,
     ) -> BoxFuture<'a, ControlResult<usize>> {
-        let _ = (account, events);
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "calendar ingest is not enabled",
@@ -734,38 +729,34 @@ pub trait ControlApi: Send + Sync + 'static {
     /// List tracker issues matching `filter` (`issues.list`).
     fn issues_list<'a>(
         &'a self,
-        filter: &'a thegn_core::issue::IssueFilter,
+        _filter: &'a thegn_core::issue::IssueFilter,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
-        let _ = filter;
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
     /// Read one issue with its detail and comments (`issues.get`).
     fn issues_get<'a>(
         &'a self,
-        id: &'a str,
+        _id: &'a str,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
-        let _ = id;
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
     /// Patch an issue (`issues.update`); returns the updated issue.
     fn issues_update<'a>(
         &'a self,
-        id: &'a str,
-        patch: &'a thegn_core::issue::IssuePatch,
+        _id: &'a str,
+        _patch: &'a thegn_core::issue::IssuePatch,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
-        let _ = (id, patch);
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
     /// Post a comment on an issue (`issues.comment`).
     fn issues_comment<'a>(
         &'a self,
-        id: &'a str,
-        body: &'a str,
+        _id: &'a str,
+        _body: &'a str,
     ) -> BoxFuture<'a, ControlResult<()>> {
-        let _ = (id, body);
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
@@ -779,28 +770,25 @@ pub trait ControlApi: Send + Sync + 'static {
     /// Record a new dispatch (`dispatches.put`); returns the stored row.
     fn dispatch_put(
         &self,
-        req: DispatchPutReq,
+        _req: DispatchPutReq,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
-        let _ = req;
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
 
     /// Advance a dispatch's status (`dispatches.set_status`).
     fn dispatch_set_status(
         &self,
-        id: i64,
-        status: thegn_core::issue::AgentDispatchStatus,
+        _id: i64,
+        _status: thegn_core::issue::AgentDispatchStatus,
     ) -> BoxFuture<'_, ControlResult<()>> {
-        let _ = (id, status);
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
 
     /// Create a worktree, optionally from an issue (`worktrees.create`).
     fn worktree_create(
         &self,
-        req: WorktreeCreateReq,
+        _req: WorktreeCreateReq,
     ) -> BoxFuture<'_, ControlResult<WorktreeInfo>> {
-        let _ = req;
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree creation is not available",
@@ -816,10 +804,9 @@ pub trait ControlApi: Send + Sync + 'static {
     /// it to run the scan on `spawn_blocking`.
     fn agent_sessions<'a>(
         &'a self,
-        worktree: Option<&'a str>,
-        harness: Option<&'a str>,
+        _worktree: Option<&'a str>,
+        _harness: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::harness::SessionRecord>>> {
-        let _ = (worktree, harness);
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "agent session discovery is not available",
@@ -855,8 +842,7 @@ pub trait ControlApi: Send + Sync + 'static {
     /// successful pair/approve/revoke so `require_approval` pairings surface
     /// instead of parking silently. Default no-op: transport-only impls and
     /// test fakes need no feed wiring.
-    fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
-        let _ = (pairing_id, label, scope, state);
+    fn publish_pairing(&self, _pairing_id: &str, _label: &str, _scope: &str, _state: PairingState) {
     }
 
     /// The broadcast event feed (activity, lease, pairing, session-list

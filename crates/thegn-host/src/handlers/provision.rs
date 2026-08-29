@@ -180,7 +180,7 @@ pub(crate) fn note_provider_degraded(
         let path = path.to_string();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.put_notification("provider_degraded", &path, &msg, &path);
+                let _ = db.put_notification("provider_degraded", &path, &msg, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         });
     }
@@ -296,19 +296,20 @@ pub(crate) fn kick_eager(
                 // provisioning (before the first step), so switching here can
                 // never catch a half-ready shell — the splash wins while
                 // `loading_state` is non-empty.
-                let _ = ptx.send((gname.clone(), ti, vec![LoadStep::active("provisioning")]));
-                let _ = wk.wake();
+                let _ = ptx.send((gname.clone(), ti, vec![LoadStep::active("provisioning")])); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 let prov = crate::host_flow::provision_worktree(
                     &cfg,
                     &wt,
                     crate::host_flow::ConsentPolicy::BackgroundSkip,
                     |views| {
+                        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         let _ = ptx.send((
                             gname.clone(),
                             ti,
                             crate::loading::provision_load_steps(views),
                         ));
-                        let _ = wk.wake();
+                        let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                     },
                     Some(&hui),
                 );
@@ -316,9 +317,9 @@ pub(crate) fn kick_eager(
                 // stale splash (materialize takes over on open). On failure,
                 // leave the failed steps visible.
                 if prov.is_ok() {
-                    let _ = ptx.send((gname.clone(), ti, Vec::new()));
+                    let _ = ptx.send((gname.clone(), ti, Vec::new())); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
-                let _ = wk.wake();
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
     }

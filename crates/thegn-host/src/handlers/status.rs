@@ -151,7 +151,7 @@ pub(crate) fn probe_sessions(
             .send(RefreshKind::DaemonSessions(Box::new(payload)))
             .is_ok()
         {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

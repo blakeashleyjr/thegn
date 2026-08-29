@@ -692,12 +692,12 @@ fn output_bounded_with(
     let mut se = child.stderr.take().expect("piped stderr");
     let so_h = std::thread::spawn(move || {
         let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b);
+        let _ = so.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
     });
     let se_h = std::thread::spawn(move || {
         let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b);
+        let _ = se.read_to_end(&mut b); // best-effort: read error just truncates captured output
         b
     });
     let deadline = Instant::now() + timeout;
@@ -708,8 +708,8 @@ fn output_bounded_with(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: child may already have exited
+            let _ = child.wait(); // best-effort: reap-or-not is terminal here
             anyhow::bail!(
                 "git {} timed out after {}s (killed)",
                 args.join(" "),
@@ -1257,7 +1257,7 @@ impl GitBackend for CliGit {
         run_root(root, &["worktree", "remove", "--force", &p])?;
         if let Some(branch) = branch {
             // Best-effort: the branch may still be checked out elsewhere.
-            let _ = run_root(root, &["branch", "-D", &branch]);
+            let _ = run_root(root, &["branch", "-D", &branch]); // best-effort: delete failure leaves the branch for later cleanup
         }
         Ok(())
     }
@@ -1480,7 +1480,7 @@ pub(crate) mod testutil {
                     .unwrap()
                     .subsec_nanos()
             ));
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
             std::fs::create_dir_all(&dir).unwrap();
             git_in(&dir, &["init", "-q", "-b", "main"]);
             TestRepo { dir }
@@ -1543,7 +1543,7 @@ pub(crate) mod testutil {
 
     impl Drop for TestRepo {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(&self.dir); // best-effort: test tmp cleanup
         }
     }
 
@@ -1905,8 +1905,8 @@ mod tests {
     fn status_and_diff_run_without_error() {
         let loc = GitLoc::for_worktree(&repo_root());
         // Should not error on a normal repo (content is environment-dependent).
-        let _ = CliGit.status(&loc).unwrap();
-        let _ = CliGit.diff_files(&loc, "HEAD").unwrap();
+        let _ = CliGit.status(&loc).unwrap(); // best-effort: error already surfaced by unwrap; value unused
+        let _ = CliGit.diff_files(&loc, "HEAD").unwrap(); // best-effort: error already surfaced by unwrap; value unused
     }
 
     #[test]
@@ -2032,7 +2032,7 @@ mod tests {
     #[test]
     fn gix_and_cli_agree_on_is_dirty() {
         let base = std::env::temp_dir().join(format!("tg-dirty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
         commit_empty(&base, "c0");
@@ -2066,7 +2066,7 @@ mod tests {
         assert!(cli.is_dirty(&loc).unwrap());
         assert!(gix.is_dirty(&loc).unwrap());
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -2179,7 +2179,7 @@ mod tests {
     #[test]
     fn merge_state_detects_a_live_merge_and_clears_after_abort() {
         let base = std::env::temp_dir().join(format!("tg-merge-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
@@ -2198,7 +2198,7 @@ mod tests {
         // A conflicting merge leaves MERGE_HEAD behind (merge itself fails).
         // Via the scrubbed core `git_cmd` so an inherited GIT_DIR can't make
         // this hit the outer repo's shared config (the core.worktree bug).
-        let _ = thegn_core::util::git_cmd(&base)
+        let _ = thegn_core::util::git_cmd(&base) // best-effort: conflicting merge fails by design; state asserted below
             .args(GIT_FIXTURE_OVERRIDES)
             .args(["merge", "feat"])
             .output();
@@ -2212,7 +2212,7 @@ mod tests {
 
         git_in(&base, &["merge", "--abort"]);
         assert!(CliGit.merge_state(&loc).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -2222,7 +2222,7 @@ mod tests {
         // ref pinned the "REBASING" banner on forever. Detection must key off
         // the on-disk rebase state dir, which git removes when the rebase ends.
         let base = std::env::temp_dir().join(format!("tg-rebase-cont-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
@@ -2253,7 +2253,7 @@ mod tests {
                 .unwrap()
         };
 
-        let _ = raw(&["rebase", "main"]);
+        let _ = raw(&["rebase", "main"]); // best-effort: paused rebase exits non-zero by design; banner asserted below
         // Paused mid-rebase: the banner is live.
         let st = CliGit.merge_state(&loc).unwrap().expect("rebase detected");
         assert_eq!(st.kind, MergeKind::Rebase);
@@ -2271,13 +2271,13 @@ mod tests {
             CliGit.merge_state(&loc).unwrap().is_none(),
             "REBASING banner must clear once the rebase state dir is gone"
         );
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 
     #[test]
     fn log_graph_stash_and_stage_roundtrip_on_a_fixture_repo() {
         let base = std::env::temp_dir().join(format!("tg-ops-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
         commit_empty(&base, "c0");
@@ -2324,13 +2324,13 @@ mod tests {
         let hunks = CliGit.diff_hunks(&loc, "HEAD", "h.txt", 16).unwrap();
         assert_eq!(hunks.len(), 1);
         assert!(hunks[0].lines.iter().any(|(o, t)| *o == '+' && t == "two"));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 
     #[test]
     fn ahead_behind_counts_divergence_and_is_none_without_upstream() {
         let base = std::env::temp_dir().join(format!("tg-ab-{}-{:p}", std::process::id(), &0u8));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         let remote = base.join("remote.git");
         let clone = base.join("clone");
         std::fs::create_dir_all(&base).unwrap();
@@ -2387,7 +2387,7 @@ mod tests {
         assert_eq!(gix.ahead_behind(&solo_loc).unwrap(), None);
         assert_eq!(cli.ahead_behind(&solo_loc).unwrap(), None);
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 }
 

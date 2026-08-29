@@ -816,8 +816,8 @@ diff --git a/x.rs b/x.rs
 
     #[test]
     fn malformed_source_never_panics() {
-        let _ = parse_entities("fn fn fn (((", Lang::Rust);
-        let _ = parse_entities("", Lang::Python);
+        let _ = parse_entities("fn fn fn (((", Lang::Rust); // best-effort: test smoke: this path must not panic
+        let _ = parse_entities("", Lang::Python); // best-effort: test smoke: this path must not panic
     }
 
     #[test]

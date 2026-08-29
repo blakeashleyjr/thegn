@@ -86,7 +86,7 @@ pub fn run(
         }
         let raw = String::from_utf8_lossy(&output.stdout);
         let highlighted = diff_highlight::highlight_diff(&raw, file_path.unwrap_or(""));
-        let _ = std::io::stdout().write_all(highlighted.as_bytes());
+        let _ = std::io::stdout().write_all(highlighted.as_bytes()); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
         Ok(())
     };
 

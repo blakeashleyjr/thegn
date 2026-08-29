@@ -255,7 +255,7 @@ mod tests {
         git_in(&repo.dir, &["checkout", "-q", "main"]);
         repo.commit_file("f.txt", "main2\n", "main edit");
         let head = repo.head();
-        let _ = CliGit.merge(&loc, "feat2");
+        let _ = CliGit.merge(&loc, "feat2"); // best-effort: conflicting merge fails by design; state asserted below
         let st = CliGit
             .merge_state(&loc)
             .unwrap()

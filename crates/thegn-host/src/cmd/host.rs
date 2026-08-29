@@ -124,7 +124,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             // clearing last_probe first (cheap: Ready hosts re-verify only).
             let binding = binding_for(cfg, &name)?;
             let db = Db::open()?;
-            let _ = db.host_touch_probe(&binding.id, 0);
+            let _ = db.host_touch_probe(&binding.id, 0); // best-effort: probe reset is advisory; provision below reports the real failure
             provision(cfg, &name, false)
         }
         Action::RmCache { name, force } => rm_cache(cfg, &name, force),
@@ -257,12 +257,12 @@ fn rm(cfg: &Config, name: &str, force: bool) -> Result<()> {
     if force {
         use thegn_core::store::PlacementStore;
         for t in &tenants {
-            let _ = db.tenancy_release(&t.sandbox, now());
+            let _ = db.tenancy_release(&t.sandbox, now()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
     {
         use thegn_core::store::PlacementStore;
-        let _ = db.capacity_delete(&id);
+        let _ = db.capacity_delete(&id); // best-effort: cache write: the capacity row is bookkeeping; the host_delete below reports the real failure
     }
     db.host_delete(&id)?;
     outln!("host {name} removed (definition + recorded state + inventory)");
@@ -417,7 +417,7 @@ fn provision(cfg: &Config, name: &str, mut yes: bool) -> Result<()> {
         if !has_runtime {
             eprint!("If {name} has no container runtime, install podman on it? [y/N] ");
             let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
+            let _ = std::io::stdin().read_line(&mut line); // best-effort: a failed/EOF read answers no (the default)
             yes = matches!(line.trim(), "y" | "Y" | "yes");
         }
     }

@@ -100,7 +100,7 @@ pub(crate) fn spawn_fold(fold_tx: &FoldTx, waker: &TerminalWaker, cfg: Config, a
     tokio::task::spawn_blocking(move || {
         let r = integrate::fold_active_repo(&cfg, &any_path);
         if tx.send(r).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -120,7 +120,7 @@ pub(crate) fn spawn_drive(
     tokio::task::spawn_blocking(move || {
         let send = |m: DriveMsg| {
             if tx.send(m).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         };
         let Some(root) = integrate::main_checkout(&any_path) else {
@@ -857,9 +857,9 @@ impl NoteWire {
         self.send_msg(DriveMsg::Note(note));
     }
     fn send_msg(&self, msg: DriveMsg) {
-        let _ = self.drive_tx.send(msg);
-        let _ = self.refresh_tx.send(RefreshKind::Model);
-        let _ = self.waker.wake();
+        let _ = self.drive_tx.send(msg); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = self.refresh_tx.send(RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = self.waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
 }
 
@@ -938,7 +938,7 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
         Ok(r) => r,
         Err(e) => return DriveMsg::Failed(format!("land: {e}")),
     };
-    let db = Db::open().ok();
+    let db = Db::open().ok(); // best-effort: cache: queue record writes only; the land outcome is reported regardless
     let record = |status: &str, oid: Option<&str>, detail: Option<&str>| {
         if let Some(db) = &db {
             // best-effort: the DB is a cache; the ref move is the record.

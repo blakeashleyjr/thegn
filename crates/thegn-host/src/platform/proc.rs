@@ -348,6 +348,7 @@ mod tests {
         fn drop(&mut self) {
             // best-effort: the child may already have exited or been reaped.
             let _ = self.0.kill();
+            // best-effort: teardown: the child may already have exited or been reaped
             let _ = self.0.wait(); // reap, so no zombie outlives the test binary
         }
     }
@@ -448,7 +449,7 @@ mod tests {
     #[cfg(unix)]
     fn child_cwd_and_argv_are_readable_from_the_parent() {
         let dir = std::env::temp_dir().join(format!("tg-proc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         // macOS hands back /private/var… for /var…; compare resolved paths.
         let dir = std::fs::canonicalize(&dir).unwrap();
@@ -475,7 +476,7 @@ mod tests {
         let newest = newest_child(std::process::id());
 
         drop(child); // kills + reaps
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 
         assert_eq!(
             got_cwd.as_deref(),
@@ -529,7 +530,8 @@ mod tests {
             .spawn()
             .expect("spawn fixture child");
         let dead = child.id();
-        let _ = child.kill();
+        let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
+        // best-effort: teardown: the child may already have exited or been reaped
         let _ = child.wait(); // reaped: the pid is now truly gone, not a zombie
 
         assert_eq!(cwd_of(dead), None, "cwd_of(dead pid)");

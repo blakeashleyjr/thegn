@@ -38,6 +38,7 @@ fn exec_in(name: &str, script: &str) -> String {
 }
 
 fn force_rm(name: &str) {
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("podman")
         .args(["rm", "-f", name])
         .output();
@@ -46,6 +47,7 @@ fn force_rm(name: &str) {
 /// Write a temp worktree with a `.devcontainer/` holding the given files.
 fn worktree_with(files: &[(&str, &str)]) -> PathBuf {
     let base = std::env::temp_dir().join(format!("tg-dc-e2e-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(base.join(".devcontainer")).unwrap();
     for (rel, body) in files {
@@ -125,6 +127,7 @@ fn e1_build_dockerfile_builds_and_runs() {
     );
 
     force_rm(name);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&wt);
 }
 
@@ -167,6 +170,7 @@ fn e2_image_env_and_poststart() {
     assert_eq!(ps, "poststart-ran", "postStartCommand did not run");
 
     force_rm(name);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&wt);
 }
 
@@ -200,6 +204,7 @@ fn e3_compose_up_and_exec() {
 
     let spec = spec_for(&wt, &sb, name);
     // Tear down any prior project first, then bring it up.
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("docker")
         .args(["compose", "-p", name, "down", "-t", "1"])
         .output();
@@ -233,9 +238,11 @@ fn e3_compose_up_and_exec() {
         .expect("compose exec");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "compose-ok");
 
+    // best-effort: test scratch: best-effort by design
     let _ = std::process::Command::new("docker")
         .args(["compose", "-p", name, "down", "-t", "1"])
         .output();
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&wt);
     let _ = container_name; // silence unused in the docker-only branch
 }

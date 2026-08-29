@@ -212,6 +212,7 @@ pub(crate) fn drive_queue(
                     describe(&e)
                 );
                 tracing::warn!(target: "thegn::prq", "{msg}");
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     &current_status(db, &item.key),
@@ -236,7 +237,7 @@ pub(crate) fn drive_queue(
         let mut attempts = item.agent_attempts;
         if moved && pr_queue::attempts_reset(item.last_head_oid.as_deref(), &head, cfg) {
             attempts = 0;
-            let _ = db.set_pr_agent_attempts(&item.key, 0);
+            let _ = db.set_pr_agent_attempts(&item.key, 0); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
         let facts = PrQueueFacts {
@@ -270,6 +271,7 @@ pub(crate) fn drive_queue(
                 } else {
                     PrqStatus::Closed
                 };
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     status.as_str(),
@@ -284,6 +286,7 @@ pub(crate) fn drive_queue(
             QueueAction::Wait => {
                 let status = PrqStatus::for_blocker(&blocker);
                 let detail = blocker_detail(&blocker, &fetched);
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     status.as_str(),
@@ -298,6 +301,7 @@ pub(crate) fn drive_queue(
             }
 
             QueueAction::MarkReady => {
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     PrqStatus::Ready.as_str(),
@@ -316,6 +320,7 @@ pub(crate) fn drive_queue(
             QueueAction::EnableAutoMerge | QueueAction::Merge => {
                 let direct = matches!(action, QueueAction::Merge);
                 let method = merge_method(cfg.merge_method);
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     PrqStatus::Merging.as_str(),
@@ -348,6 +353,7 @@ pub(crate) fn drive_queue(
                                 "auto-merge enabled — the forge will merge it".to_string(),
                             )
                         };
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         let _ = db.update_pr_status(
                             &item.key,
                             status.as_str(),
@@ -363,6 +369,7 @@ pub(crate) fn drive_queue(
                         // thegn cannot see (a required check, a CODEOWNERS
                         // review). That is a human's problem, not a retry.
                         let detail = format!("merge refused: {}", describe(&e));
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         let _ = db.update_pr_status(
                             &item.key,
                             PrqStatus::NeedsHuman.as_str(),
@@ -377,6 +384,7 @@ pub(crate) fn drive_queue(
             }
 
             QueueAction::NeedsHuman(reason) => {
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     PrqStatus::NeedsHuman.as_str(),
@@ -399,6 +407,7 @@ pub(crate) fn drive_queue(
                 {
                     {
                         let detail = format!("re-ran {n} failed check(s) before dispatching");
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         let _ = db.update_pr_status(
                             &item.key,
                             PrqStatus::BlockedCi.as_str(),
@@ -425,6 +434,7 @@ pub(crate) fn drive_queue(
                 );
                 let sandbox = match dispatch {
                     crate::agent_run::AgentDispatch::InfraHold(reason) => {
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         let _ = db.update_pr_status(
                             &item.key,
                             PrqStatus::BlockedCi.as_str(),
@@ -444,8 +454,9 @@ pub(crate) fn drive_queue(
                 };
 
                 let next = attempts + 1;
-                let _ = db.set_pr_agent_attempts(&item.key, next);
+                let _ = db.set_pr_agent_attempts(&item.key, next); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({next}/{})", cfg.agent_max_attempts);
+                // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.update_pr_status(
                     &item.key,
                     PrqStatus::AgentRunning.as_str(),

@@ -131,7 +131,7 @@ pub fn reroot(cli_profile: Option<&str>) {
         // Named profile: reroot storage + advertise the name to children/config.
         Some(root) => {
             let state = root.join("state");
-            let _ = std::fs::create_dir_all(&state);
+            let _ = std::fs::create_dir_all(&state); // best-effort: dir prep: a later write reports the real failure
             unsafe {
                 std::env::set_var("THEGN_DIR", &root);
                 std::env::set_var("XDG_STATE_HOME", &state);
@@ -149,7 +149,7 @@ pub fn reroot(cli_profile: Option<&str>) {
             root: util::thegn_dir(),
         },
     };
-    let _ = ACTIVE.set(paths);
+    let _ = ACTIVE.set(paths); // best-effort: first-set-wins: the active profile is set once
 }
 
 /// The profile-scoped credential environment for a named profile's `root`:
@@ -190,9 +190,9 @@ pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<Strin
 /// Apply [`credential_env`] to the process and create the config dirs. Called
 /// from [`reroot`] (single-threaded startup).
 fn apply_credential_env(root: &std::path::Path) {
-    let _ = std::fs::create_dir_all(root.join("config/git"));
-    let _ = std::fs::create_dir_all(root.join("config/gh"));
-    let _ = std::fs::create_dir_all(root.join("gnupg"));
+    let _ = std::fs::create_dir_all(root.join("config/git")); // best-effort: dir prep: a later write reports the real failure
+    let _ = std::fs::create_dir_all(root.join("config/gh")); // best-effort: dir prep: a later write reports the real failure
+    let _ = std::fs::create_dir_all(root.join("gnupg")); // best-effort: dir prep: a later write reports the real failure
     for (var, val) in credential_env(root) {
         unsafe {
             match val {
@@ -276,7 +276,7 @@ fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>>
 /// creating the `run/` dir best-effort.
 fn singleton_lock_path() -> std::path::PathBuf {
     let run = active().root.join("run");
-    let _ = std::fs::create_dir_all(&run);
+    let _ = std::fs::create_dir_all(&run); // best-effort: dir prep: a later write reports the real failure
     run.join("thegn.lock")
 }
 
@@ -477,7 +477,7 @@ pub mod order {
             assert!(load_from(&path).is_empty(), "missing file ⇒ empty");
             save_to(&path, &v(&["washu", "default", "personal"])).unwrap();
             assert_eq!(load_from(&path), v(&["washu", "default", "personal"]));
-            std::fs::remove_dir_all(&dir).ok();
+            std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
         }
 
         #[test]
@@ -491,7 +491,7 @@ pub mod order {
             let path = dir.join("profiles-order.json");
             std::fs::write(&path, b"{ not json").unwrap();
             assert!(load_from(&path).is_empty());
-            std::fs::remove_dir_all(&dir).ok();
+            std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
         }
     }
 }
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn on_disk_name_grandfathers_an_existing_long_profile() {
         let base = std::env::temp_dir().join(format!("thegn-prof-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
         let long = "client-acme-frontend-migration-squad-two";
 
         // Not yet created ⇒ the new name is capped.
@@ -556,7 +556,7 @@ mod tests {
 
         // `default` is never rerooted, so never capped.
         assert_eq!(on_disk_name(&base, "default"), "default");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         drop(held);
         // Released on drop → acquirable again.
         assert!(try_lock_nb(&path).unwrap().is_some(), "lock frees on drop");
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

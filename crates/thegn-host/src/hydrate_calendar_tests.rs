@@ -20,7 +20,7 @@ impl TmpDb {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open_at(&dir.join("thegn.db")).unwrap();
         TmpDb { dir, db }
@@ -29,7 +29,7 @@ impl TmpDb {
 
 impl Drop for TmpDb {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }
 

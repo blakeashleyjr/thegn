@@ -250,7 +250,7 @@ pub(crate) fn maybe_spawn_crawl(
             return;
         };
         if crawl_worktree(&cwd, cap, &db).changed {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

@@ -37,7 +37,7 @@ pub(crate) fn master_hygiene(placement: &Placement) {
     // Dead or wedged: ask it to exit (unblocks a half-dead master process),
     // then unlink the socket so ControlMaster=auto starts clean.
     // best-effort: a failure here just means the next exec reports the error.
-    let _ = Command::new("ssh")
+    let _ = Command::new("ssh") // best-effort: ask the master to exit; failure is fine (see above)
         .arg("-o")
         .arg(format!("ControlPath={}", sock.display()))
         .args(["-O", "exit", &p.host])
@@ -45,7 +45,7 @@ pub(crate) fn master_hygiene(placement: &Placement) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&sock); // best-effort: stale socket may already be gone
 }
 
 #[cfg(test)]

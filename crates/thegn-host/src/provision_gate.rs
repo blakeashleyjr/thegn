@@ -183,7 +183,7 @@ pub(crate) fn try_claim_spare(cfg: &thegn_core::config::Config, worktree: &str) 
     if !loc.is_remote() || worktree_live(worktree) {
         return false;
     }
-    let db = thegn_core::db::Db::open().ok();
+    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: the git fallback below decides liveness
     let repo_root = db
         .as_ref()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -312,7 +312,7 @@ pub fn provision_spare(
     let repo = repo_root.to_string_lossy().to_string();
     let name = mint_spare_name(&repo);
     if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.insert_pool_spare(&name, &repo, env_name);
+        let _ = db.insert_pool_spare(&name, &repo, env_name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     // The repo's main worktree gives env-resolution + origin context; the name is
     // overridden to the generic spare name (the clone is branch-less either way).
@@ -336,18 +336,18 @@ pub fn provision_spare(
         Ok((true, checkpoint)) => {
             let lock = flake_lock_hash(repo_root);
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.set_pool_spare_ready(&name, checkpoint.as_deref(), &lock);
+                let _ = db.set_pool_spare_ready(&name, checkpoint.as_deref(), &lock); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             Ok(name)
         }
         Ok((false, _)) => {
-            let _ = destroy_spare(cfg, env_name, &name);
+            let _ = destroy_spare(cfg, env_name, &name); // best-effort: rollback: the original error is returned below
             Err(anyhow::anyhow!(
                 "env '{env_name}' cannot host a pool spare (no configured provider)"
             ))
         }
         Err(e) => {
-            let _ = destroy_spare(cfg, env_name, &name);
+            let _ = destroy_spare(cfg, env_name, &name); // best-effort: rollback: the original error is returned below
             Err(e)
         }
     }
@@ -397,6 +397,7 @@ pub fn claim_spare(
             );
             let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
             let _ = crate::agent::block_on_provider(|| async {
+                // best-effort: warm-up checkout: the parity step below reconciles the branch
                 provider.run_exec(&name, &argv, None, &[]).await
             });
         }
@@ -428,7 +429,7 @@ pub fn claim_spare(
                 && crate::agent::block_on_provider(|| async { dp.read(&d, &marker).await })
                     .is_err();
             if bare {
-                let _ = crate::agent::block_on_provider(|| async { dp.destroy(&d).await });
+                let _ = crate::agent::block_on_provider(|| async { dp.destroy(&d).await }); // best-effort: cleanup: a leftover sandbox dir with no marker; the next claim re-creates it
             }
         }
     }
@@ -453,7 +454,7 @@ pub fn claim_spare(
     // same sandbox, same host, amounts unchanged. No-op otherwise.
     {
         use thegn_core::store::PlacementStore;
-        let _ = db.tenancy_rebind(&name, worktree);
+        let _ = db.tenancy_rebind(&name, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     thegn_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
     // The claim consumed this spare — refill the pool now rather than waiting for
@@ -493,13 +494,13 @@ pub fn destroy_spare(
     if let Some(env) = cfg.env.get(env_name)
         && let Some(provider) = crate::agent::provider_for_named(&env.provider, name)
     {
-        let _ = crate::agent::block_on_provider(|| async { provider.destroy(name).await });
+        let _ = crate::agent::block_on_provider(|| async { provider.destroy(name).await }); // best-effort: spare teardown: a failed destroy is reaped by the reconcile scan
     }
     if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.delete_pool_spare(name);
+        let _ = db.delete_pool_spare(name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         // Free any placement-engine slot the spare held (no-op otherwise).
         use thegn_core::store::PlacementStore;
-        let _ = db.tenancy_release(name, unix_now_secs());
+        let _ = db.tenancy_release(name, unix_now_secs()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     Ok(())
 }
@@ -670,7 +671,7 @@ mod tests {
     #[test]
     fn flake_lock_hash_empty_without_lockfile() {
         let dir = std::env::temp_dir().join("tg-gate-no-flake");
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
         assert_eq!(flake_lock_hash(&dir), "");
     }
 }

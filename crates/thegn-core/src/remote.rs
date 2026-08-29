@@ -756,7 +756,7 @@ mod tests {
             dir.exists(),
             "local loc must NOT be removed by remove_remote_dir"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         // Guard: an empty / root / ~ remote path must never `rm -rf` — the
         // command is skipped entirely (constructing a Remote with such a path
         // and calling it must not attempt to run anything destructive).

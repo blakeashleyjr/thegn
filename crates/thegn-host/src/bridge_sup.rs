@@ -130,7 +130,10 @@ impl BridgeSupervisor {
                         (on_event)();
                     }
                 })
-                .ok();
+                .inspect_err(|e| {
+                    tracing::warn!(target: "thegn::bridge", error = %e, "bridge fs-watch pump failed to spawn");
+                })
+                .ok(); // best-effort: spawn failure is now logged above
         }
     }
 
@@ -158,7 +161,7 @@ impl BridgeSupervisor {
 static GLOBAL: OnceLock<BridgeSupervisor> = OnceLock::new();
 
 pub fn set_global(sup: BridgeSupervisor) {
-    let _ = GLOBAL.set(sup);
+    let _ = GLOBAL.set(sup); // best-effort: first-set-wins: the first supervisor serves for the process
 }
 
 /// Disconnect a worktree's bridge by path (called from the close thread).
@@ -477,7 +480,7 @@ mod tests {
     #[test]
     fn connect_registers_routes_and_forwards_then_disconnect() {
         let dir = std::env::temp_dir().join(format!("tg-sup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
 
@@ -510,6 +513,6 @@ mod tests {
         sup.disconnect_path(&d);
         assert!(bridge::for_loc(&loc).is_none());
         assert!(!sup.is_connected(&loc));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }
