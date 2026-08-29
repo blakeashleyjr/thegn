@@ -913,6 +913,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             &stage.name,
             &artifact,
             &parent_artifact,
+            row_id,
         );
         let prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
         let spec = OpenSpec {
@@ -1110,6 +1111,7 @@ async fn resume_work(
         &stage.name,
         &artifact_old,
         &parent_artifact,
+        row.id,
     );
     // The shared render step (render + invalid-template wrap + empty-prompt
     // refusal), so the finisher's re-render and a fresh dispatch's render
@@ -1409,6 +1411,7 @@ mod open_stage_tests {
             "code",
             ".thegn/pipeline/THE-76/code/1.md",
             "",
+            1,
         );
         let out = render_prompt("work {issue_number}: {issue_body}", &vars).expect("renders");
         assert_eq!(
@@ -1437,6 +1440,7 @@ mod resume_work_tests {
             artifact_path: None,
             note: None,
             chunk_path: None,
+            report: None,
         }
     }
 
