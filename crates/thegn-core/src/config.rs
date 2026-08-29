@@ -6866,8 +6866,8 @@ fn render_scalar(v: serde_json::Value) -> String {
 // Re-exported here so callers keep the historical `config::validate_str` path.
 pub use crate::config_repo::{
     OverlayFormat, RepoOverlayCandidate, RepoOverlayDiagnostic, RepoOverlayDiscovery,
-    discover_repo_overlay, parse_overlay_value, repo_command_collector_warnings_for_overlay,
-    validate_repo_overlay,
+    RepoOverlayUnreadableCandidate, discover_repo_overlay, parse_overlay_value,
+    repo_command_collector_warnings_for_overlay, validate_repo_overlay,
 };
 pub use crate::config_validate::validate_str;
 
