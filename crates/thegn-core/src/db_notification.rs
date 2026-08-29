@@ -424,7 +424,7 @@ impl NotificationStore for Db {
     /// running/active agent signal through [`crate::activity::coerce_stale`], so a
     /// phantom forever-running dot from a session killed mid-run is downgraded.
     /// Wrapped in [`crate::issue::normalize_dispatch_ms`] like every other read
-    /// of this column — this row never passes through [`Self::map_dispatch`], and
+    /// of this column — this row never passes through `map_dispatch`, and
     /// a seconds stamp must age nowhere as milliseconds.
     fn dispatch_dispatched_at_ms(&self, worktree_path: &str) -> Result<Option<i64>> {
         Ok(self

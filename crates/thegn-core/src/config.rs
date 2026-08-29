@@ -3122,7 +3122,7 @@ pub struct DiskConfig {
     /// with no PR, or one the work drifted away from, holding GiB forever. It is
     /// deliberately timid — the active worktree, one with a running build, one
     /// with uncommitted changes, and any `target/` under
-    /// [`thegn_core::disk_reclaim::MIN_RECLAIM_BYTES`] are all exempt — because
+    /// [`crate::disk_reclaim::MIN_RECLAIM_BYTES`] are all exempt — because
     /// an unexpected cold rebuild costs an agent mid-task real wall-clock.
     pub idle_clean_days: u32,
     /// Under genuine disk pressure, evict least-recently-touched `target/` dirs

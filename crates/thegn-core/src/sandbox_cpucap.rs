@@ -8,7 +8,7 @@
 //! host lacks cgroup `cpu` delegation it degrades to a soft `nice` (priority
 //! only). thegn's own background jobs (the fold gate, an agent handoff, an LSP
 //! server, a control-API session) join the same slice but carry no per-pane
-//! `CPUQuota` — see [`CapRole`]. The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
+//! `CPUQuota` — see `CapRole`. The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
 //! backend caps inline via `systemd_cap_args`, so neither is scope-wrapped.
 //!
 //! Extracted from the oversized `sandbox.rs` (kept flat). The
@@ -618,7 +618,7 @@ fn background_scope_usable() -> bool {
 /// top of it. Same mechanism ladder as an interactive pane.
 ///
 /// **It gets the slice and `MemoryMax`, but NOT the per-pane `CPUQuota`** — see
-/// [`CapRole`]. The aggregate slice is already the ceiling for everything thegn
+/// `CapRole`. The aggregate slice is already the ceiling for everything thegn
 /// runs; `[sandbox.limits] cpu` is a tab's share of the machine, and applying it
 /// here quietly ran full gate builds on a fraction of the cores on a box that
 /// had already reserved the rest for exactly this.
@@ -644,7 +644,7 @@ pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
 /// no limit at all.
 ///
 /// Like the background path it takes the slice and `MemoryMax` but not the
-/// per-pane `CPUQuota` ([`CapRole::Background`]): a control-API session is
+/// per-pane `CPUQuota` (`CapRole::Background`): a control-API session is
 /// thegn's own work inside the aggregate ceiling, not a tab competing with the
 /// other tabs for the machine.
 ///
