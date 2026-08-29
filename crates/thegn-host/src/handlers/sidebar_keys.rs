@@ -126,6 +126,24 @@ fn worktree_mq_entries(
     }
 }
 
+/// What `Action::NewWorktree` should do, given the sidebar cursor.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NewWorktreeTarget {
+    /// The cursor row's repo resolved — open the wizard there.
+    Root(String),
+    /// The cursor row names a workspace/worktree/folder but its repo is
+    /// unresolvable (a live fallback whose registry heal also failed).
+    /// Refuse — NEVER silently build in another workspace's repo.
+    Refuse(&'static str),
+    /// No sidebar row in play (no sidebar focus, no selected row, or a
+    /// terminals-region row): the active tab's repo is the intent, as before.
+    ActiveFallback,
+}
+
+/// The refusal message displayed when `NewWorktreeTarget::Refuse` fires.
+pub(crate) const NEW_WORKTREE_REFUSAL: &str =
+    "No repo path for this workspace yet — it registers on the next refresh";
+
 impl SidebarState {
     /// What the cursor row activates, if anything.
     pub(crate) fn cursor_target(&self, model: &FrameModel) -> Option<crate::sidebar::RowTarget> {
@@ -179,6 +197,40 @@ impl SidebarState {
         self.selected_row(model)
             .map(|r| r.workspace_slug == "terminals" || r.workspace_slug.starts_with("terminals/"))
             .unwrap_or(false)
+    }
+
+    /// Determine the new-worktree target from sidebar focus + cursor position.
+    pub(crate) fn new_worktree_target(
+        &self,
+        model: &FrameModel,
+        sidebar_focus: bool,
+    ) -> NewWorktreeTarget {
+        if !sidebar_focus || self.selected_row(model).is_none() {
+            return NewWorktreeTarget::ActiveFallback;
+        }
+        if self.cursor_in_terminals(model) {
+            return NewWorktreeTarget::ActiveFallback;
+        }
+        match self.cursor_repo_root(model) {
+            Some(root) => NewWorktreeTarget::Root(root),
+            None => NewWorktreeTarget::Refuse(NEW_WORKTREE_REFUSAL),
+        }
+    }
+
+    /// The sidebar outcome for `Id::NewWorktree` and the `"new-worktree"`
+    /// context-menu entry, factoring refusal + redraw vs unresolved rows.
+    pub(crate) fn new_worktree_outcome(&self, model: &mut FrameModel) -> SidebarOutcome {
+        if self.cursor_in_terminals(model) {
+            return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
+        }
+        match self.cursor_repo_root(model) {
+            Some(repo_root) => SidebarOutcome::NewWorktreeIn { repo_root },
+            None => {
+                model.status = NEW_WORKTREE_REFUSAL.into();
+                self.sync(model);
+                SidebarOutcome::Redraw
+            }
+        }
     }
 
     /// The remove-workspace outcome for the cursor row, when it is a Workspace
@@ -737,13 +789,7 @@ impl SidebarState {
                 model.status = "Only worktrees and folders can be renamed".into();
             }
             Id::NewWorktree => {
-                if self.cursor_in_terminals(model) {
-                    return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
-                }
-                return match self.cursor_repo_root(model) {
-                    Some(repo_root) => SidebarOutcome::NewWorktreeIn { repo_root },
-                    None => SidebarOutcome::Synthetic(crate::keymap::Action::NewWorktree),
-                };
+                return self.new_worktree_outcome(model);
             }
             Id::NewWorkspace => {
                 return SidebarOutcome::Synthetic(crate::keymap::Action::NewWorkspace);
@@ -1184,10 +1230,7 @@ impl SidebarState {
                 }
             }
             "new-worktree" => {
-                return match self.cursor_repo_root(model) {
-                    Some(repo_root) => SidebarOutcome::NewWorktreeIn { repo_root },
-                    None => SidebarOutcome::Synthetic(crate::keymap::Action::NewWorktree),
-                };
+                return self.new_worktree_outcome(model);
             }
             "new-folder" => {
                 if let Some(out) = self.folder_outcome(model) {
@@ -1328,6 +1371,128 @@ mod tests {
             _ => panic!("expected Fork outcome"),
         }
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    /// A Workspace row whose `sidebar_workspaces` entry has an empty repo path
+    /// resolves to `None` — the precondition for `new_worktree_outcome`
+    /// returning a refusal and for `NewWorktreeTarget::Refuse`.
+    #[test]
+    fn cursor_repo_root_is_none_for_a_live_fallback_workspace_row() {
+        use crate::sidebar::{RowKind, SidebarRow};
+        let mut model = FrameModel::default();
+        // Empty repo_path (4th tuple element) simulates a live fallback whose
+        // registry heal also failed.
+        model.sidebar_workspaces = vec![(
+            "live-fb".to_string(),
+            "live-fb".to_string(),
+            "git".to_string(),
+            "".to_string(),
+        )];
+        let row = SidebarRow::base(RowKind::Workspace, 1, "live-fb", "live-fb");
+        model.sidebar_rows = vec![row];
+
+        let sb = SidebarState::default();
+        assert_eq!(
+            sb.cursor_repo_root(&model),
+            None,
+            "cursor_repo_root must be None for a live-fallback workspace with empty repo path"
+        );
+    }
+
+    /// Pressing the new-worktree key on a live-fallback workspace row MUST
+    /// set a non-empty status message and return `Redraw` — it must NOT
+    /// return `Synthetic(Action::NewWorktree)` (which would silently cross
+    /// workspaces via the old active-group fallback).
+    #[test]
+    fn new_worktree_key_refuses_a_live_fallback_workspace_row() {
+        use crate::sidebar::{RowKind, SidebarRow};
+        let mut model = FrameModel::default();
+        model.sidebar_workspaces = vec![(
+            "live-fb".to_string(),
+            "live-fb".to_string(),
+            "git".to_string(),
+            "".to_string(),
+        )];
+        let row = SidebarRow::base(RowKind::Workspace, 1, "live-fb", "live-fb");
+        model.sidebar_rows = vec![row];
+
+        let sb = SidebarState::default();
+        let outcome = sb.new_worktree_outcome(&mut model);
+        assert!(
+            !model.status.is_empty(),
+            "model.status must be non-empty after refusal"
+        );
+        // The return type must be Redraw — never Synthetic(NewWorktree).
+        match outcome {
+            SidebarOutcome::Redraw => {}
+            _ => panic!("expected Redraw from new_worktree_outcome on unresolvable row"),
+        }
+    }
+
+    /// `NewWorktreeTarget` mapping: focus/selection semantics, and defensive
+    /// terminals-row handling.
+    #[test]
+    fn new_worktree_target_maps_focus_rows_and_fallbacks() {
+        use crate::sidebar::{RowKind, SidebarRow};
+
+        // Resolvable workspace row => Root
+        let mut model = FrameModel::default();
+        model.sidebar_workspaces = vec![(
+            "ok".to_string(),
+            "ok".to_string(),
+            "git".to_string(),
+            "/repo".to_string(),
+        )];
+        let mut row = SidebarRow::base(RowKind::Workspace, 0, "ok", "ok");
+        row.worktree_path = Some("/repo".to_string());
+        model.sidebar_rows = vec![row];
+        let sb = SidebarState::default();
+        match sb.new_worktree_target(&model, true) {
+            crate::handlers::sidebar_keys::NewWorktreeTarget::Root(p) => {
+                assert_eq!(p, "/repo");
+            }
+            other => panic!("expected Root for focused resolvable workspace, got {other:?}"),
+        }
+
+        // Unresolvable workspace row => Refuse
+        let mut model2 = FrameModel::default();
+        model2.sidebar_workspaces = vec![(
+            "live-fb".to_string(),
+            "live-fb".to_string(),
+            "git".to_string(),
+            "".to_string(),
+        )];
+        model2.sidebar_rows = vec![SidebarRow::base(
+            RowKind::Workspace,
+            1,
+            "live-fb",
+            "live-fb",
+        )];
+        match sb.new_worktree_target(&model2, true) {
+            crate::handlers::sidebar_keys::NewWorktreeTarget::Refuse(msg) => {
+                assert!(!msg.is_empty());
+            }
+            other => panic!("expected Refuse for focused unresolvable row, got {other:?}"),
+        }
+
+        // No sidebar focus => ActiveFallback
+        match sb.new_worktree_target(&model, false) {
+            crate::handlers::sidebar_keys::NewWorktreeTarget::ActiveFallback => {}
+            other => panic!("expected ActiveFallback when sidebar_focus=false, got {other:?}"),
+        }
+
+        // Terminals row => ActiveFallback (defensive)
+        let mut model_terms = FrameModel::default();
+        model_terms.sidebar_rows = vec![SidebarRow::base(
+            RowKind::SectionHeading,
+            0,
+            "TERMINALS",
+            "terminals",
+        )];
+        match sb.new_worktree_target(&model_terms, true) {
+            crate::handlers::sidebar_keys::NewWorktreeTarget::ActiveFallback => {}
+            other => panic!("expected ActiveFallback for terminals row, got {other:?}"),
+        }
     }
 
     fn ids(status: Option<MqStatus>) -> Vec<&'static str> {
