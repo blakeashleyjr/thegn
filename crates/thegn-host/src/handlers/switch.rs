@@ -94,6 +94,12 @@ pub(crate) fn refresh_tab_model(model: &mut FrameModel, session: &Session, sb: &
     let prev = std::mem::take(&mut model.sidebar_workspaces);
     model.sidebar_workspaces =
         crate::hydrate::merge_workspace_lists(prev, crate::hydrate::workspace_list(session, None));
+    // Recover lost repo paths from the worktree registry after a switch:
+    // a live-fallback workspace that has registered worktrees picks up its
+    // real root so those rows render in the sidebar.
+    let registry = std::mem::take(&mut model.sidebar_db_worktrees);
+    crate::hydrate::heal_workspace_paths(&mut model.sidebar_workspaces, &registry);
+    model.sidebar_db_worktrees = registry;
     // Overlay last-known-good git glyphs from the persistent cache so
     // dirty-dots / ahead-behind arrows persist instantly across a switch
     // instead of blanking until the async hydration lands. Seed every path
