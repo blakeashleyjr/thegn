@@ -18,10 +18,10 @@ use termwiz::surface::Surface;
 use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
-use crate::pr_view::{
-    diff_line, file_stat, review_feedback_lines, review_thread_lines, sel_marker, trunc,
+use crate::review_rows::{
+    ReviewRow, diff_line, expanded_file_rows, feedback_rows, file_stat, review_feedback_lines,
+    review_thread_lines, sel_marker, top_level_feedback_lines, trunc,
 };
-use crate::review_rows::{ReviewRow, feedback_rows, file_rows};
 use crate::seg::{Line, Tok, Under, seg};
 use thegn_core::ansi_cells::StyledLine;
 use thegn_core::forge::model::{DiffLine, PrDiff};
@@ -150,20 +150,19 @@ impl DiffView {
         match self.open_file {
             None => {
                 self.active_diff().map_or(0, |d| d.files.len())
-                    + self
-                        .anchored_review()
-                        .map_or(0, |review| feedback_rows(&review, false).len())
+                    + if self.source == DiffSource::PrReview {
+                        self.anchored_review()
+                            .map_or(0, |review| feedback_rows(&review, false).len())
+                    } else {
+                        0
+                    }
             }
             Some(i) => {
                 if self.source == DiffSource::PrReview {
                     self.active_diff()
                         .and_then(|d| d.files.get(i))
                         .map(|file| {
-                            let review = self.anchored_review();
-                            file_rows(file, review.as_ref(), false).len()
-                                + review
-                                    .as_ref()
-                                    .map_or(0, |review| feedback_rows(review, false).len())
+                            expanded_file_rows(file, self.anchored_review().as_ref(), false).len()
                         })
                         .unwrap_or(0)
                 } else {
@@ -485,7 +484,7 @@ impl DiffView {
                     ));
                     let review = self.anchored_review();
                     let rows: Vec<ReviewRow> = if self.source == DiffSource::PrReview {
-                        file_rows(f, review.as_ref(), false)
+                        expanded_file_rows(f, review.as_ref(), false)
                     } else {
                         f.hunks
                             .iter()
@@ -529,18 +528,7 @@ impl DiffView {
         if self.source == DiffSource::PrReview {
             let snapshot = self.review.as_ref();
             if let Some(snapshot) = snapshot {
-                for comment in &snapshot.conversation.comments {
-                    out.push((
-                        Line::segs(vec![
-                            seg(Tok::Slot(S::Accent), "TOP-LEVEL · "),
-                            seg(
-                                Tok::Slot(S::Dim),
-                                format!("{} · {}", comment.author, comment.body),
-                            ),
-                        ]),
-                        false,
-                    ));
-                }
+                out.extend(top_level_feedback_lines(&snapshot.conversation, cols));
             }
             if self.open_file.is_none() {
                 for (i, row) in self
@@ -607,7 +595,7 @@ fn structural_line(styled: &StyledLine) -> Line {
 mod tests {
     use super::*;
     use thegn_core::forge::model::{
-        DiffFile, DiffHunk, DiffLineKind, PrComment, PrConversation, ReviewThread,
+        DiffFile, DiffHunk, DiffLineKind, PrComment, PrConversation, PrReview, ReviewThread,
     };
 
     fn line(kind: DiffLineKind, text: &str) -> DiffLine {
@@ -801,6 +789,85 @@ mod tests {
             2,
             "the PR diff arrived without losing the view"
         );
+    }
+
+    #[test]
+    fn worktree_rows_stay_file_only_and_pr_rows_have_no_invisible_feedback() {
+        let diff = sample();
+        let snapshot = thegn_core::review::PrReviewSnapshot {
+            diff: diff.clone(),
+            conversation: PrConversation {
+                threads: vec![ReviewThread {
+                    id: "general".into(),
+                    comments: vec![PrComment {
+                        author: "reviewer".into(),
+                        body: "general body".into(),
+                        ..PrComment::default()
+                    }],
+                    ..ReviewThread::default()
+                }],
+                ..PrConversation::default()
+            },
+            ..Default::default()
+        };
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(diff),
+            structural: None,
+            review: Some(snapshot),
+            review_status: None,
+        });
+
+        assert_eq!(v.row_count(), 2, "Worktree has only its two file rows");
+        let worktree_body = format!("{:?}", v.body_lines(80));
+        assert!(!worktree_body.contains("general body"));
+
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(
+            v.row_count(),
+            3,
+            "PR list has two files plus one feedback row"
+        );
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.open_file, Some(0));
+        assert_eq!(v.row_count(), 4, "expanded PR rows match their renderer");
+        let expanded_body = format!("{:?}", v.body_lines(80));
+        assert!(expanded_body.contains("general body"));
+    }
+
+    #[test]
+    fn pr_review_diff_renders_comments_and_submitted_reviews() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: sample(),
+                conversation: PrConversation {
+                    comments: vec![PrComment {
+                        author: "commenter".into(),
+                        body: "top-level comment".into(),
+                        ..PrComment::default()
+                    }],
+                    reviews: vec![PrReview {
+                        author: "approver".into(),
+                        state: "APPROVED".into(),
+                        body: "submitted review".into(),
+                        ..PrReview::default()
+                    }],
+                    ..PrConversation::default()
+                },
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+
+        let rendered = format!("{:?}", v.body_lines(80));
+        assert!(rendered.contains("top-level comment"));
+        assert!(rendered.contains("submitted review"));
     }
 
     #[test]
