@@ -71,14 +71,13 @@ pub(crate) struct DrainCtx<'a> {
     pub session: &'a mut crate::session::Session,
     pub panes: &'a mut crate::panes::Panes,
     pub need_relayout: &'a mut bool,
-    pub waker: &'a TerminalWaker,
 }
 
 impl DrainCtx<'_> {
     /// Reap any tab whose worktree dir vanished (an `on_landed = remove/detach`
     /// land). No-op when nothing was removed. Kept here so both drains share it.
     fn reap_removed_tabs(&mut self) {
-        if crate::merge_lifecycle::reconcile_removed_tabs(self.session, self.panes, self.waker) {
+        if crate::merge_lifecycle::reconcile_removed_tabs(self.session, self.panes) {
             *self.need_relayout = true;
             *self.want_model_refresh = true;
         }

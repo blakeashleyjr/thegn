@@ -191,7 +191,7 @@ pub(crate) fn remove_workspace_with_db(
             continue;
         }
         if let Some(db) = db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
+            forget_worktree_group(db, &session.id, &session.worktrees[gi], true);
         }
         for tab in &session.worktrees[gi].tabs {
             for id in tab.center.pane_ids() {

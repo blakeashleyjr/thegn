@@ -16,7 +16,7 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 
 // Teardown fns live in a sibling (kept flat); same call paths.
-pub use crate::agent_teardown::{checkpoint_on_close, destroy_provider_sandbox};
+pub use crate::agent_teardown::checkpoint_on_close;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{PoolStore, WorkspaceStore};
 use thegn_core::{bundle, devenv, repo, sandbox};

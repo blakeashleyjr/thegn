@@ -49,38 +49,40 @@ pub fn checkpoint_on_close(worktree: &str) {
     }
 }
 
-/// Tear down a worktree's managed-provider sandbox when the worktree is deleted —
-/// a deleted worktree should not leave a paid-for per-worktree sandbox running.
-/// The worktree-delete path resolves the env name from the DB *before* it forgets
-/// the worktree's rows (a later DB-based resolve would return nothing and leak the
-/// sandbox). Best-effort + off-loop (a network DELETE); idempotent (the provider
-/// treats a 404 as already-gone, so racing a TTL/manual delete is fine). No-op for
-/// local/ssh/k8s envs or an unconfigured/tokenless provider.
-pub fn destroy_provider_sandbox(worktree: &str, env_name: &str) {
-    let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+/// Destroy a provider sandbox using an already-resolved configuration. The
+/// lifecycle transaction calls this before deleting the worktree row, so the
+/// selected environment and provider identity cannot be lost to cache pruning.
+pub fn destroy_provider_sandbox_with(
+    cfg: &Config,
+    worktree: &str,
+    env_name: &str,
+) -> Result<(), String> {
     let Some(env) = cfg.env.get(env_name) else {
-        return;
+        return Ok(());
     };
     let pc = &env.provider;
-    let Some(name) = provider_sandbox_name(&cfg, worktree, env_name).filter(|s| !s.is_empty())
+    let Some(name) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty())
     else {
-        return;
+        return Ok(());
     };
     // A CLAIMED pool spare with a fresh provisioned-base checkpoint is RECYCLED
     // back into the pool (restore-in-place, row → `ready`) instead of destroyed
     // — see `lifecycle::recycle_claimed_on_delete`. `false` ⇒ destroy as usual.
-    if crate::lifecycle::recycle_claimed_on_delete(&cfg, env_name, &name) {
+    if crate::lifecycle::recycle_claimed_on_delete(cfg, env_name, &name) {
         thegn_core::msg::info(&format!("recycled spare {name} into the pool on delete"));
-        return;
+        return Ok(());
     }
     let Some(provider) = provider_for_named(pc, &name) else {
-        return;
+        return Ok(());
     };
     match block_on_provider(|| async { provider.destroy(&name).await }) {
-        Ok(()) => thegn_core::msg::info(&format!("destroyed sandbox {name} on worktree delete")),
-        Err(e) => thegn_core::msg::warn(&format!("sandbox teardown on delete failed: {e}")),
+        Ok(()) => {
+            thegn_core::msg::info(&format!("destroyed sandbox {name} on worktree delete"));
+        }
+        Err(e) => return Err(e.to_string()),
     }
     // Drop the local provisioned marker so a later sandbox reusing this id isn't
     // treated as provisioned (the attach gate would skip re-provisioning).
     crate::provider_workdir::clear_provisioned(&name);
+    Ok(())
 }

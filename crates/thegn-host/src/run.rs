@@ -1670,6 +1670,7 @@ pub(crate) fn forget_worktree_group(
     db: &thegn_core::db::Db,
     session_id: &str,
     group: &crate::session::WorktreeGroup,
+    cleanup_runtime: bool,
 ) {
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
@@ -1691,6 +1692,13 @@ pub(crate) fn forget_worktree_group(
     // everything under `pin:{name}/`, NOT the bare `pin:{name}` prefix — a raw
     // `LIKE 'pin:myrepo/fix%'` also wipes an unrelated sibling `myrepo/fixup`.
     crate::handlers::workspace_remove::del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", &group.name);
+    // A lifecycle destroy transaction already performed runtime teardown before
+    // it called this cache-prune helper. Only the non-destructive close path
+    // needs the legacy background cleanup here; never run it twice after a
+    // successful physical removal.
+    if !cleanup_runtime {
+        return;
+    }
     // Tear down any sandbox container for this worktree in the background
     // (best-effort: we fire-and-forget on a dedicated thread so the event loop
     // is never blocked by a slow container runtime).
@@ -1812,23 +1820,6 @@ fn connect_worktree_bridge(
     });
 }
 
-pub(crate) fn delete_groups(
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    targets: Vec<usize>,
-    keep_files: bool,
-    waker: Option<termwiz::terminal::TerminalWaker>,
-) -> String {
-    delete_groups_with_mode(
-        session,
-        panes,
-        targets,
-        keep_files,
-        thegn_core::hooks::HookExecutionMode::User,
-        waker,
-    )
-}
-
 pub(crate) fn delete_groups_with_mode(
     session: &mut crate::session::Session,
     _panes: &mut Panes,
@@ -1874,7 +1865,7 @@ pub(crate) fn delete_groups_with_mode(
 /// externally); returns its pane ids for the caller to reap. Lands the user
 /// on the workspace's home group. Pure w.r.t. disk/DB so it's unit-testable;
 /// the caller handles the registry row + persist.
-fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec<u32> {
+pub(crate) fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec<u32> {
     if gi >= session.worktrees.len() {
         return Vec::new();
     }
@@ -10503,7 +10494,6 @@ async fn event_loop<T: Terminal>(
                 session: &mut session,
                 panes: &mut panes,
                 need_relayout: &mut need_relayout,
-                waker: &waker,
             };
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
             crate::handlers::merge_queue::drain_drive_msgs(&mut drive_rx, &mut mq_ctx);
@@ -10536,12 +10526,10 @@ async fn event_loop<T: Terminal>(
         }
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
         dirty |= crate::worktree_lifecycle::apply_completions(
-            &current_config,
             &mut session,
             &mut panes,
             &mut model,
             &mut sb,
-            &waker,
         );
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
@@ -10875,7 +10863,7 @@ async fn event_loop<T: Terminal>(
             // the pane mid-create. Creations are short-lived, so a ghost simply
             // waits for the next tick after they settle.
             if creating_tabs.is_empty()
-                && crate::merge_lifecycle::reconcile_removed_tabs(&mut session, &mut panes, &waker)
+                && crate::merge_lifecycle::reconcile_removed_tabs(&mut session, &mut panes)
             {
                 refresh_tab_model(&mut model, &session, &mut sb);
                 need_relayout = true;
@@ -15063,7 +15051,8 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
+                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files, force } =
+                                choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
                             {
                                 // Re-resolve the stashed names to current indices so a
@@ -15094,6 +15083,7 @@ async fn event_loop<T: Terminal>(
                                     },
                                     targets,
                                     keep_files,
+                                    force,
                                 );
                                 dirty = true;
                                 continue;
