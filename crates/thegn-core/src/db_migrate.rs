@@ -624,7 +624,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
          CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
            ON agent_dispatch_notes (dispatch_id, created_at_ms);",
     );
-    // v62: one complete PR review snapshot per canonical worktree key. The
+    // v63: one complete PR review snapshot per canonical worktree key. The
     // identity columns are deliberately duplicated outside the JSON so a
     // caller can reject stale feedback before presenting it.
     let _ = conn.execute(
@@ -638,6 +638,24 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+}
+
+/// v62: credential-free lineage for successful session forks. Recipes remain
+/// in the live daemon entry only; this cache cannot resurrect a process.
+pub(crate) fn migrate_v62(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_forks (
+           child_id     TEXT PRIMARY KEY,
+           source_kind  TEXT NOT NULL,
+           source_id    TEXT NOT NULL,
+           harness      TEXT,
+           worktree     TEXT,
+           created_at   INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_forks_source
+           ON session_forks (source_kind, source_id);",
+    )?;
+    Ok(())
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
@@ -688,10 +706,33 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Verify the v62 review-cache table after the best-effort additive ladder and
-/// before `Db::init` stamps the new schema version.
+/// Verify the v62 cache shape before stamping the schema version. The cache is
+/// intentionally metadata-only: preparing this projection also protects the
+/// no-recipe contract from an incomplete upgrade.
 pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
     verify_v61_schema(conn)?;
+    conn.prepare(
+        "SELECT child_id, source_kind, source_id, harness, worktree, created_at
+         FROM session_forks LIMIT 0",
+    )?;
+    let index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type='index' AND name='idx_session_forks_source'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if index.is_none() {
+        anyhow::bail!("schema v62 migration did not create the session forks index");
+    }
+    Ok(())
+}
+
+/// Verify the v63 review-cache table after the best-effort additive ladder and
+/// before `Db::init` stamps the new schema version.
+pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
+    verify_v62_schema(conn)?;
     let table_type: Option<String> = conn
         .query_row(
             "SELECT type FROM sqlite_master WHERE name='pr_review_cache'",
@@ -700,7 +741,7 @@ pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
         )
         .optional()?;
     if table_type.as_deref() != Some("table") {
-        anyhow::bail!("schema v62 migration did not create pr_review_cache");
+        anyhow::bail!("schema v63 migration did not create pr_review_cache");
     }
     let mut stmt = conn.prepare("PRAGMA table_info(pr_review_cache)")?;
     let columns: Vec<(String, i64, i64)> = stmt
@@ -721,7 +762,7 @@ pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
                 .any(|column| column.0 == wanted.0 && column.1 == wanted.1 && column.2 == wanted.2)
         })
     {
-        anyhow::bail!("schema v62 pr_review_cache has an invalid shape");
+        anyhow::bail!("schema v63 pr_review_cache has an invalid shape");
     }
     Ok(())
 }
@@ -729,7 +770,7 @@ pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
-    use crate::store::WorkspaceStore;
+    use crate::store::{SessionForkStore, WorkspaceStore};
 
     #[test]
     fn detect_newer_schema_flags_only_a_newer_db() {
@@ -750,8 +791,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_v62_db_gains_review_cache_without_resetting_user_data() {
-        let dir = std::env::temp_dir().join(format!("thegn-mig-v62-{}", std::process::id()));
+    fn pre_v63_db_gains_review_cache_without_resetting_user_data() {
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v63-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.db");
@@ -819,6 +860,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn pre_v62_db_gains_session_fork_lineage_cache_without_recipes() {
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v62-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 61;").unwrap();
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        db.put_session_fork(&crate::session_fork::ForkRecord {
+            child_id: "child-v62".into(),
+            source_kind: crate::session_fork::ForkSourceKind::Daemon,
+            source_id: "parent-v62".into(),
+            harness: None,
+            worktree: Some("/wt".into()),
+            created_at: 62,
+        })
+        .unwrap();
+        assert_eq!(db.session_forks().unwrap().len(), 1);
+        let columns: Vec<String> = db
+            .conn()
+            .prepare("PRAGMA table_info(session_forks)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "child_id",
+                "source_kind",
+                "source_id",
+                "harness",
+                "worktree",
+                "created_at"
+            ]
+        );
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

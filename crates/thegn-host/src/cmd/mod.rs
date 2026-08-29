@@ -51,6 +51,7 @@ pub mod sandbox;
 pub mod search;
 pub mod secret;
 pub mod session;
+pub mod session_fork;
 pub mod share;
 pub mod target;
 pub mod theme;

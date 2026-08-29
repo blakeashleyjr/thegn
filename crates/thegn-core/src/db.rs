@@ -133,11 +133,15 @@ use std::path::PathBuf;
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-/// v62: adds `pr_review_cache`, one complete PR review snapshot per canonical
+///
+/// v62: adds `session_forks`, a credential-free lineage cache. Live fork
+/// recipes remain daemon memory only; the cache cannot resurrect a process.
+///
+/// v63: adds `pr_review_cache`, one complete PR review snapshot per canonical
 /// worktree key. It is a best-effort cache; the branch, PR number, and head OID
 /// are retained beside the JSON so stale feedback cannot silently attach to a
 /// different PR.
-pub const SCHEMA_VERSION: i64 = 62;
+pub const SCHEMA_VERSION: i64 = 63;
 
 pub struct Db {
     conn: Connection,
@@ -480,7 +484,7 @@ impl Db {
               json       TEXT,
               fetched_at INTEGER
             );
-            -- v62: complete PR review conversation + PR-head diff snapshot.
+            -- v63: complete PR review conversation + PR-head diff snapshot.
             -- Identity columns make stale cache validation possible without
             -- parsing the payload and the JSON is replaced atomically.
             CREATE TABLE IF NOT EXISTS pr_review_cache (
@@ -945,9 +949,6 @@ impl Db {
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
-        if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v62_schema(&conn)?;
-        }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
@@ -958,6 +959,10 @@ impl Db {
         crate::db_control::migrate_v40(&conn)?;
         crate::db_calendar::migrate_v52(&conn)?;
         crate::db_model_proxy::migrate_v54(&conn)?;
+        crate::db_migrate::migrate_v62(&conn)?;
+        if ver < SCHEMA_VERSION {
+            crate::db_migrate::verify_v63_schema(&conn)?;
+        }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
         // relay-lost `None` exits) were mis-classified as failures — see

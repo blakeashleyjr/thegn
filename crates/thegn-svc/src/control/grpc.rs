@@ -21,8 +21,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir,
-    WaitCondition,
+    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec,
+    SplitDir, WaitCondition,
 };
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
@@ -227,6 +227,7 @@ fn info_to_proto(i: &super::SessionInfo) -> proto::SessionInfo {
         attached_clients: i.attached_clients,
         lease_expires_at: i.lease_expires_at,
         error_active: i.error_active,
+        forked_from: i.forked_from.clone(),
     }
 }
 
@@ -317,6 +318,29 @@ impl Control for GrpcControl {
             ..Default::default()
         };
         let info = self.api.open(spec).await.map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&info)))
+    }
+
+    async fn fork_session(
+        &self,
+        req: Request<proto::ForkSessionRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::ForkSession)?;
+        let r = req.into_inner();
+        let info = self
+            .api
+            .fork(ForkSpec {
+                session: r.session,
+                harness: (!r.harness.is_empty()).then_some(r.harness),
+                agent: (!r.agent.is_empty()).then_some(r.agent),
+                cwd: (!r.cwd.is_empty()).then_some(r.cwd),
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                scrollback: r.scrollback,
+                adopt: r.adopt,
+                tab: r.tab,
+            })
+            .await
+            .map_err(Status::from)?;
         Ok(Response::new(info_to_proto(&info)))
     }
 
@@ -752,6 +776,7 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.attach",
     "sessions.detach",
     "sessions.open",
+    "sessions.fork",
     "sessions.input",
     "sessions.resize",
     "sessions.snapshot",
@@ -902,5 +927,19 @@ mod tests {
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");
         }
+    }
+
+    #[test]
+    fn session_info_lineage_is_additive_on_the_grpc_wire() {
+        let info = crate::control::SessionInfo {
+            id: "child".into(),
+            forked_from: Some("parent".into()),
+            ..Default::default()
+        };
+        let wire = super::info_to_proto(&info);
+        assert_eq!(wire.forked_from.as_deref(), Some("parent"));
+
+        let legacy = crate::control::SessionInfo::default();
+        assert_eq!(super::info_to_proto(&legacy).forked_from, None);
     }
 }
