@@ -54,7 +54,15 @@ impl fmt::Display for NoteError {
 /// Trim and validate a report. Returns the trimmed text, or an error on
 /// empty / over the cap.
 pub fn report_text(text: &str) -> Result<String, ReportError> {
-    let t = text.trim();
+    // Reports are printed by the CLI and may be copied into a supervisor
+    // prompt. Preserve LF because the handoff format is intentionally
+    // multiline, but remove every other control character (including ESC,
+    // BEL, CR, and C1 controls) before storing it.
+    let t: String = text
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    let t = t.trim();
     if t.is_empty() {
         return Err(ReportError::Empty);
     }
@@ -68,7 +76,11 @@ pub fn report_text(text: &str) -> Result<String, ReportError> {
 /// Trim and validate a progress note. Returns the trimmed text, or an error
 /// on empty / over the cap.
 pub fn note_text(text: &str) -> Result<String, NoteError> {
-    let t = text.trim();
+    // Notes are rendered as one roster line / bullet. Remove all control
+    // characters rather than allowing a worker note to emit terminal escape
+    // sequences or forge additional output lines.
+    let t: String = text.chars().filter(|c| !c.is_control()).collect();
+    let t = t.trim();
     if t.is_empty() {
         return Err(NoteError::Empty);
     }
@@ -182,6 +194,10 @@ mod tests {
         assert_eq!(report_text("  hi  ").unwrap(), "hi");
         assert_eq!(report_text("  "), Err(ReportError::Empty));
         assert_eq!(report_text(""), Err(ReportError::Empty));
+        assert_eq!(
+            report_text("\x1b[31mhi\x07\nthere\r"),
+            Ok("[31mhi\nthere".into())
+        );
     }
 
     #[test]
@@ -198,6 +214,10 @@ mod tests {
         assert_eq!(note_text("  hi  ").unwrap(), "hi");
         assert_eq!(note_text("  "), Err(NoteError::Empty));
         assert_eq!(note_text(""), Err(NoteError::Empty));
+        assert_eq!(
+            note_text("first\nsecond\x1b[2J"),
+            Ok("firstsecond[2J".into())
+        );
     }
 
     #[test]
