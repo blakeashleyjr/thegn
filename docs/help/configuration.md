@@ -218,11 +218,14 @@ falls back to the default; `thegn config validate` rejects it by name, and
 ## Layers, env vars, unknown keys
 
 Settings resolve in a fixed order: built-in defaults → your `config.toml` →
-`THEGN_<SECTION>_<KEY>` environment variables → `--set key=value` on the
-command line. A repo's `.thegn.toml` can provide the documented repo-local
-overlays, including clamped `[sandbox]` settings and trust-gated `[hooks]`.
-Every layer is tolerant: a malformed value warns and the layer below stands,
-so a typo never blocks a launch.
+the active profile overlay → `THEGN_<SECTION>_<KEY>` environment variables →
+`--set key=value` on the command line. A repo's selected `.thegn.*` overlays
+`[sandbox]`, `[keybinds]`, `[notifications]`, `[issues]`, the `env` selector,
+and trust-gated `[hooks]`; a metrics table is recognized for the existing
+refusal diagnostic. Every load is tolerant: a malformed value warns and the
+layer below stands, so a typo never blocks a launch. Explicit
+`thegn config validate` checks every layer it can locate and exits non-zero
+for a problem.
 
 Env overrides exist for the knobs a CI job or launcher would flip —
 `THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,
