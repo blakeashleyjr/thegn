@@ -1119,6 +1119,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "drawer-cycle",
+        label: "Cycle drawer occupant",
+        hint: "drawer+",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "cycle drawer", "next drawer tool", "files drawer"],
+    },
+    ActionSpec {
+        id: "drawer-pick",
+        label: "Pick drawer occupant",
+        hint: "drawer?",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "pick drawer", "drawer tool", "choose drawer"],
+    },
+    ActionSpec {
         id: "toggle-corner",
         label: "Toggle corner overlay (video)",
         hint: "corner",
