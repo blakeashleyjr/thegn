@@ -2214,7 +2214,14 @@ max_results = 1000
 #
 # Per-repo overrides go in `.thegn.{toml,yaml,yml,json}` at the repo root
 # under a `[sandbox]` table — only the keys you set override these globals.
+# A repo with multiple `.devcontainer/<name>/devcontainer.json` variants may
+# add the top-level selector `devcontainer = "gpu"` to that same repo file;
+# it chooses a file but grants no trust for its contents.
 [sandbox]
+# Repo-authored `.devcontainer/devcontainer.json` overlay mode. `auto` reads
+# and trust-gates supported categories; `off` ignores the file before parsing.
+devcontainer = "auto"
+
 enabled = true
 
 # ── Hardening preset ─────────────────────────────────────────────────────────

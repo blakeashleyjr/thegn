@@ -717,6 +717,27 @@ fn sandbox_profile_defaults_and_env_overlay() {
     assert_eq!(base.profile, SandboxProfile::Open);
 }
 
+#[test]
+fn devcontainer_mode_round_trips_and_repo_can_only_opt_out() {
+    let cfg: Config = toml::from_str("[sandbox]\ndevcontainer = \"off\"\n").unwrap();
+    assert_eq!(cfg.sandbox.devcontainer, DevcontainerMode::Off);
+    assert_eq!(
+        DevcontainerMode::from_str_validated("auto").unwrap(),
+        DevcontainerMode::Auto
+    );
+
+    let base = SandboxConfig::default();
+    let granted = crate::config_resolve::classify_repo_overlay(
+        SandboxOverlay {
+            devcontainer: Some(DevcontainerMode::Off),
+            ..Default::default()
+        },
+        &base,
+        &crate::config_resolve::Approvals::deny_all(),
+    );
+    assert_eq!(granted.sanctioned.devcontainer, Some(DevcontainerMode::Off));
+}
+
 // The same overlay expressed in each format must produce identical results,
 // and only the present keys override the global defaults.
 #[test]
