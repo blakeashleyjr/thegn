@@ -16,6 +16,8 @@ use thegn_core::seam::Kind as _;
 use thegn_core::store::HostStore;
 use thegn_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
 
+use super::config_health::ConfigHealth;
+
 fn color_str(d: ColorDepth) -> &'static str {
     match d {
         ColorDepth::Truecolor => "truecolor (24-bit)",
@@ -326,6 +328,48 @@ fn providers_report(cfg: &Config) {
         for n in &r.notes {
             outln!("  {:<9} {:<24}   {n}", "", "");
         }
+    }
+    let sound = crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound);
+    let provider = &sound["provider"];
+    let availability = provider["availability"]["state"]
+        .as_str()
+        .unwrap_or("unknown");
+    outln!(
+        "  {:<9} {:<24} {availability}{}",
+        "sound",
+        provider["id"].as_str().unwrap_or("none"),
+        provider["availability"]["reason"]
+            .as_str()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default(),
+    );
+    outln!(
+        "  {:<9} {:<24} formats: {}; volume: {}",
+        "",
+        "",
+        provider["caps"]["formats"]
+            .as_array()
+            .map(|formats| {
+                formats
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        provider["caps"]["volume"].as_bool().map_or("unknown", |v| {
+            if v { "supported" } else { "unsupported" }
+        }),
+    );
+    outln!(
+        "  {:<9} {:<24} pack: {}; entries: {}",
+        "",
+        "",
+        sound["pack"].as_str().unwrap_or("(none)"),
+        sound["pack_entries"].as_u64().unwrap_or(0),
+    );
+    if let Some(reason) = sound["fallback"].as_str() {
+        outln!("  {:<9} {:<24} fallback: {reason}", "", "");
     }
 }
 
@@ -1063,8 +1107,16 @@ fn identification_json(cfg: &Config) -> serde_json::Value {
 }
 
 /// The full `doctor --json` report, reused by `thegn doctor bundle`. Recomputes
-/// terminal detection so it is standalone.
+/// terminal detection so it is standalone. This compatibility wrapper keeps
+/// the existing bundle/tests API for callers that use the default path.
+#[cfg(test)]
 pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
+    let path = thegn_core::config::Config::path();
+    let health = super::config_health::collect(&path, None);
+    doctor_json_with_health(cfg, &health)
+}
+
+pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
     let resolved = crate::run::resolve_termcaps(cfg);
@@ -1094,6 +1146,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
             "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
             "undercurl": cfg.theme.undercurl.as_str(),
         },
+        "config_health": health.json(),
         "detected": caps_json(&detected),
         "resolved": caps_json(&resolved),
         "probe": probe.as_ref().map(|p| serde_json::json!({
@@ -1116,6 +1169,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
         "providers": providers_json(cfg),
+        "sound": crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound),
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
@@ -1246,9 +1300,18 @@ fn model_proxy_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
-pub fn run(cfg: &Config, json: bool) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    json: bool,
+    config_path: std::path::PathBuf,
+    repo_context: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let health = super::config_health::collect(&config_path, repo_context.as_deref());
     if json {
-        outln!("{}", serde_json::to_string_pretty(&doctor_json(cfg))?);
+        outln!(
+            "{}",
+            serde_json::to_string_pretty(&doctor_json_with_health(cfg, &health))?
+        );
         return Ok(());
     }
 
@@ -1265,6 +1328,20 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     identification_report(cfg);
+    outln!(
+        "Config health: {} problem(s), {} warning(s); main {}; profile {}; repo {}; detail: `thegn config validate`",
+        health.problems(),
+        health.warnings,
+        health.main_path.display(),
+        health
+            .profile_path
+            .as_deref()
+            .map_or("(none)".to_string(), |path| path.display().to_string()),
+        health
+            .repo_path
+            .as_deref()
+            .map_or("(none)".to_string(), |path| path.display().to_string()),
+    );
     outln!("");
     channel_report();
     outln!("");
@@ -2027,7 +2104,6 @@ fn macos_report(env: &thegn_core::termcaps::TermEnv) {
     outln!("  integrations");
     for (bin, what) in [
         ("osascript", "desktop notifications"),
-        ("afplay", "chime"),
         ("pbcopy", "clipboard copy"),
         ("pbpaste", "clipboard paste"),
         (
@@ -3011,8 +3087,8 @@ mod tests {
     #[test]
     fn run_does_not_panic_on_default_config() {
         let cfg = Config::default();
-        assert!(run(&cfg, false).is_ok());
-        assert!(run(&cfg, true).is_ok());
+        assert!(run(&cfg, false, Config::path(), None).is_ok());
+        assert!(run(&cfg, true, Config::path(), None).is_ok());
     }
 
     /// THE-70. The three states must read differently — "unknown" in
