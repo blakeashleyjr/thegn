@@ -442,12 +442,41 @@ const THREAD_REPLY_MUTATION: &str = "mutation($threadId:ID!,$body:String!){\
 addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){\
 comment{id}}}";
 
+const THREAD_REPLY_RESOLVE_MUTATION: &str = "mutation($threadId:ID!,$body:String!){\
+reply:addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){\
+comment{id}} resolve:resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}";
+const MAX_REVIEW_RESOLVE_REPLY_CHARS: usize = 4 * 1024;
+
 /// Reply to an existing review thread via the GraphQL mutation (the CLI has no
 /// thread-reply verb). `thread_id` is the review-thread node id.
 pub fn reply_to_thread(loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), GhError> {
     let query_arg = format!("query={THREAD_REPLY_MUTATION}");
     let id_arg = format!("threadId={thread_id}");
     let body_arg = format!("body={body}");
+    gh_run(
+        loc,
+        &[
+            "api", "graphql", "-f", &query_arg, "-f", &id_arg, "-f", &body_arg,
+        ],
+    )
+}
+
+/// Reply to and resolve one GitHub review thread in a single GraphQL request.
+/// GraphQL mutation fields execute serially, so a reply failure prevents the
+/// resolve field from running. The reply is bounded again at the provider edge.
+pub fn resolve_review_thread(
+    loc: &GitLoc,
+    thread_id: &str,
+    bounded_reply: &str,
+) -> Result<(), GhError> {
+    let reply: String = bounded_reply
+        .chars()
+        .filter(|character| !matches!(*character as u32, 0x00..=0x08 | 0x0b..=0x1f | 0x7f..=0x9f))
+        .take(MAX_REVIEW_RESOLVE_REPLY_CHARS)
+        .collect();
+    let query_arg = format!("query={THREAD_REPLY_RESOLVE_MUTATION}");
+    let id_arg = format!("threadId={thread_id}");
+    let body_arg = format!("body={reply}");
     gh_run(
         loc,
         &[
@@ -744,6 +773,14 @@ impl Forge for GithubCli {
     }
     fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), GhError> {
         reply_to_thread(loc, thread_id, body)
+    }
+    fn resolve_review_thread(
+        &self,
+        loc: &GitLoc,
+        thread_id: &str,
+        bounded_reply: &str,
+    ) -> Result<(), GhError> {
+        resolve_review_thread(loc, thread_id, bounded_reply)
     }
     fn add_line_comment(&self, loc: &GitLoc, c: LineComment<'_>) -> Result<(), GhError> {
         add_line_comment(

@@ -141,7 +141,13 @@ use std::path::PathBuf;
 /// worktree key. It is a best-effort cache; the branch, PR number, and head OID
 /// are retained beside the JSON so stale feedback cannot silently attach to a
 /// different PR.
-pub const SCHEMA_VERSION: i64 = 63;
+///
+/// v64: adds nullable review-task identity/revision/prompt metadata and durable
+/// forge-action retry bookkeeping to `agent_dispatches`. A partial unique
+/// index makes `(task_kind, source_key)` one durable task even under concurrent
+/// refreshes. v63 was already occupied when THE-27 landed, so THE-22 takes the
+/// next additive version.
+pub const SCHEMA_VERSION: i64 = 64;
 
 pub struct Db {
     conn: Connection,
@@ -803,7 +809,14 @@ impl Db {
               agent_name       TEXT    NOT NULL,
               dispatched_at_ms INTEGER NOT NULL,
               status           TEXT    NOT NULL DEFAULT 'queued',
-              report           TEXT
+              report           TEXT,
+              task_kind        TEXT,
+              source_key       TEXT,
+              source_revision  TEXT,
+              prompt           TEXT,
+              expected_head_oid TEXT,
+              forge_action_attempts INTEGER NOT NULL DEFAULT 0,
+              next_forge_action_at_ms INTEGER
             );
             -- v61: per-row progress queue — a worker or monitor appends short
             -- notes (≤4 KiB), read newest-last by dispatch status.
@@ -1021,7 +1034,7 @@ impl Db {
         crate::db_model_proxy::migrate_v54(&conn)?;
         crate::db_migrate::migrate_v62(&conn)?;
         if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v63_schema(&conn)?;
+            crate::db_migrate::verify_v64_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

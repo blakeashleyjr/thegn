@@ -494,6 +494,41 @@ impl NotificationStore for Db {
     }
 }
 
+impl Db {
+    /// Once-keyed notification for one create/revision event. The revision is
+    /// included in the bounded message, so the same revision is idempotent and
+    /// a later comment re-arms the audit row.
+    pub fn put_review_task_queued_notification(
+        &self,
+        event: &crate::pr_review_tasks::ReviewTaskEvent,
+        revised: bool,
+    ) -> Result<bool> {
+        let message = crate::notification::review_task_queued_message(event, revised);
+        self.put_notification_once(
+            crate::notification::NotificationKind::PrReviewTaskQueued.as_str(),
+            &event.source_key,
+            &message,
+            &event.worktree_path,
+        )
+    }
+
+    /// Once-keyed resolution audit. Provider success can be observed more than
+    /// once during refresh; only one durable inbox row is retained per source
+    /// and resolved head/message.
+    pub fn put_review_thread_resolved_notification(
+        &self,
+        transition: &crate::pr_review_tasks::ReviewTaskResolution,
+    ) -> Result<bool> {
+        let message = crate::notification::review_thread_resolved_message(transition);
+        self.put_notification_once(
+            crate::notification::NotificationKind::PrReviewThreadResolved.as_str(),
+            &transition.source_key,
+            &message,
+            &transition.worktree_path,
+        )
+    }
+}
+
 /// The explicit column list every `AgentDispatch` read selects, paired with
 /// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
 /// apart when the roster gains a column (v56 added four at once; v59 added
