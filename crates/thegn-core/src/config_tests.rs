@@ -1515,6 +1515,9 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
         ("THEGN_WEATHER_ENABLED", "yes"),
         ("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "true"),
+        ("THEGN_SKILLS_ENABLED", "false"),
+        ("THEGN_SKILLS_USER_DIRS", "/one, ~/.skills"),
+        ("THEGN_SKILLS_EXCLUDE", "mq, pipeline"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1595,6 +1598,60 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.disk.shared_target_dir, "/tgt");
     assert!(c.weather.enabled);
     assert!(c.notifications.agent_attention_inbox);
+    assert!(!c.skills.enabled);
+    assert_eq!(c.skills.user_dirs, vec!["/one", "~/.skills"]);
+    assert_eq!(c.skills.exclude, vec!["mq", "pipeline"]);
+}
+
+#[test]
+fn skills_config_defaults_parse_overlay_and_validate_syntax() {
+    let defaults: Config = toml::from_str("").unwrap();
+    assert!(defaults.skills.enabled);
+    assert!(defaults.skills.user_dirs.is_empty());
+    assert!(defaults.skills.exclude.is_empty());
+
+    let body = r#"
+[skills]
+enabled = false
+user_dirs = ["~/.skills", "./project-skills"]
+exclude = ["mq", "pipeline"]
+"#;
+    let cfg: Config = toml::from_str(body).unwrap();
+    assert!(!cfg.skills.enabled);
+    assert_eq!(cfg.skills.user_dirs, vec!["~/.skills", "./project-skills"]);
+    assert_eq!(cfg.skills.exclude, vec!["mq", "pipeline"]);
+    assert!(crate::config_validate::validate_str(body).is_empty());
+
+    let invalid = r#"
+[skills]
+user_dirs = ["", "bad,dir"]
+exclude = ["../escape", "mq", "mq"]
+"#;
+    let errors = crate::config_validate::validate_str(invalid);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.user_dirs[0]") && e.contains("empty")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.user_dirs[1]") && e.contains("separator")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.exclude[0]") && e.contains("path-safe")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.exclude[2]") && e.contains("duplicate")),
+        "{errors:?}"
+    );
 }
 
 #[test]
