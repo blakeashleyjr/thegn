@@ -191,10 +191,51 @@ fn diagnostics(include: bool, diagnostic: Option<String>) -> (Vec<String>, Strin
 }
 
 fn redact_line(line: &str) -> String {
-    let mut tokens = vec!["diagnostic".to_string()];
-    tokens.extend(line.split_whitespace().map(str::to_string));
-    let redacted = thegn_core::log_redact::redact_argv(&tokens);
-    bounded_text(&redacted[1..].join(" "), MAX_CONSOLE_LINE_BYTES)
+    let mut redacted = Vec::new();
+    let mut redact_next = false;
+    for token in line.split_whitespace() {
+        if redact_next {
+            redacted.push(thegn_core::log_redact::REDACTED.to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if token.eq_ignore_ascii_case("bearer") {
+            redacted.push(token.to_string());
+            redact_next = true;
+            continue;
+        }
+
+        let separator = token.find('=').or_else(|| token.find(':'));
+        if let Some(index) = separator {
+            let (lhs, rhs_with_separator) = token.split_at(index);
+            let key =
+                lhs.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+            if thegn_core::log_redact::is_sensitive_key(key) {
+                let separator = &rhs_with_separator[..1];
+                redacted.push(format!(
+                    "{lhs}{separator}{}",
+                    thegn_core::log_redact::REDACTED
+                ));
+                // A key-only `Authorization:` / `password:` shape carries its
+                // value in the remaining tokens. Dropping the remainder is the
+                // only safe treatment for arbitrary diagnostic prose.
+                if rhs_with_separator.len() == 1 {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        let flag_key = token.trim_start_matches('-');
+        if token.starts_with('-') && thegn_core::log_redact::is_sensitive_key(flag_key) {
+            redacted.push(token.to_string());
+            redact_next = true;
+            continue;
+        }
+        redacted.push(token.to_string());
+    }
+    bounded_text(&redacted.join(" "), MAX_CONSOLE_LINE_BYTES)
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {
@@ -332,12 +373,26 @@ mod tests {
         let reply = fetch(
             &PreviewConfig::default(),
             req,
-            Some("info ready\nERROR API_TOKEN=sekrit failed\n".into()),
+            Some(
+                "info ready\nERROR API_TOKEN=sekrit failed\n\
+                 ERROR Authorization: Bearer topsecret\n\
+                 exception password: hunter2\n\
+                 failed Bearer oauth-secret\n"
+                    .into(),
+            ),
         )
         .unwrap();
         assert_eq!(reply.diagnostics_source, "dev-server-pane");
-        assert_eq!(reply.console_errors.len(), 1);
-        assert!(reply.console_errors[0].contains(thegn_core::log_redact::REDACTED));
-        assert!(!reply.console_errors[0].contains("sekrit"));
+        assert_eq!(reply.console_errors.len(), 4);
+        assert!(
+            reply
+                .console_errors
+                .iter()
+                .all(|line| line.contains(thegn_core::log_redact::REDACTED))
+        );
+        let rendered = reply.console_errors.join(" ");
+        for secret in ["sekrit", "topsecret", "hunter2", "oauth-secret"] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
     }
 }

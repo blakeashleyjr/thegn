@@ -91,6 +91,7 @@ pub(crate) struct PreviewSupervisor {
     enabled: bool,
     candidates: BTreeMap<(String, u16), Candidate>,
     pane_tails: HashMap<u32, Vec<u8>>,
+    pane_strippers: HashMap<u32, thegn_core::history::AnsiStripper>,
     pane_worktrees: HashMap<u32, String>,
     latest_scan_generation: u64,
     diagnostics: HashMap<String, String>,
@@ -106,6 +107,7 @@ impl PreviewSupervisor {
         if !enabled {
             self.candidates.clear();
             self.pane_tails.clear();
+            self.pane_strippers.clear();
             self.pane_worktrees.clear();
             self.diagnostics.clear();
             if let Some(snapshots) = DIAGNOSTIC_SNAPSHOTS.get()
@@ -172,8 +174,17 @@ impl PreviewSupervisor {
             return false;
         }
         let before = self.view(worktree);
+        // Strip incrementally before retaining the bounded tail. Keeping the
+        // stripper state per pane matters when an OSC/DCS sequence spans chunks
+        // or exceeds the tail bound: once the opener is evicted, hidden payload
+        // bytes must not become parser-visible plain text.
+        let mut visible = Vec::with_capacity(bytes.len());
+        self.pane_strippers
+            .entry(pane_id)
+            .or_default()
+            .strip_into(bytes, &mut visible);
         let tail = self.pane_tails.entry(pane_id).or_default();
-        tail.extend_from_slice(bytes);
+        tail.extend_from_slice(&visible);
         if tail.len() > DIAGNOSTIC_TAIL_BYTES {
             tail.drain(..tail.len() - DIAGNOSTIC_TAIL_BYTES);
         }
@@ -202,6 +213,7 @@ impl PreviewSupervisor {
         };
         let before = self.view(&worktree);
         self.pane_tails.remove(&pane_id);
+        self.pane_strippers.remove(&pane_id);
         for ((candidate_worktree, _), candidate) in &mut self.candidates {
             if candidate_worktree == &worktree
                 && let Some(fact) = candidate.panes.remove(&pane_id)
@@ -326,6 +338,20 @@ mod tests {
 
         assert!(sup.pane_exit(7));
         assert_eq!(sup.view("/repo").unwrap().status, PreviewStatus::Down);
+    }
+
+    #[test]
+    fn hidden_terminal_payload_cannot_become_a_port_hint_after_tail_truncation() {
+        let mut sup = PreviewSupervisor::new();
+        sup.set_enabled(true);
+        let mut hidden = b"\x1b]0;".to_vec();
+        hidden.extend(std::iter::repeat_n(b'x', DIAGNOSTIC_TAIL_BYTES + 32));
+        hidden.extend_from_slice(b" http://localhost:6666");
+        assert!(!sup.pane_output(7, "/repo", None, &hidden));
+        assert!(sup.view("/repo").is_none());
+
+        assert!(sup.pane_output(7, "/repo", None, b"\x07ready http://localhost:5173"));
+        assert_eq!(sup.view("/repo").unwrap().port, 5173);
     }
 
     #[test]

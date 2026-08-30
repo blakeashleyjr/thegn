@@ -392,10 +392,6 @@ fn captured_port(captures: &regex::Captures<'_>, input: &str) -> Option<u16> {
     parsed_port(capture.as_str())
 }
 
-static ANSI_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)")
-        .expect("valid ANSI regex")
-});
 static LOOPBACK_PORT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)(?:^|[^A-Za-z0-9_.-])(?:https?://)?(?P<host>localhost|127\.0\.0\.1|\[::1\]):(?P<port>[0-9]{1,6})",
@@ -414,7 +410,10 @@ static ENV_PORT_RE: Lazy<Regex> = Lazy::new(|| {
 /// Strip terminal escape/control sequences and bound parser work.
 pub fn sanitize_port_hint_text(input: &str) -> String {
     let bounded: String = input.chars().take(MAX_PORT_HINT_CHARS).collect();
-    let no_ansi = ANSI_RE.replace_all(&bounded, "");
+    // Use the shared terminal state machine rather than a regex: OSC/DCS
+    // payloads can be unterminated or truncated at the parser bound, and their
+    // hidden text must never be mistaken for a visible preview hint.
+    let no_ansi = crate::history::AnsiStripper::strip_str(&bounded);
     no_ansi
         .chars()
         .filter_map(|ch| match ch {
@@ -939,6 +938,16 @@ mod tests {
             hints.iter().map(|hint| hint.port).collect::<Vec<_>>(),
             vec![5173, 42]
         );
+    }
+
+    #[test]
+    fn port_hints_ignore_unterminated_terminal_control_payloads() {
+        for hidden in [
+            "\u{1b}]0;http://localhost:6666",
+            "\u{1b}Phttp://localhost:7777",
+        ] {
+            assert!(parse_port_hints(hidden).is_empty(), "{hidden:?}");
+        }
     }
 
     #[test]
