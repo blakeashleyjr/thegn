@@ -194,6 +194,11 @@ pub struct OpenSpec {
     /// leaves this `false` and gets the cap applied for them.
     #[serde(default)]
     pub already_capped: bool,
+    /// Automation ancestry for sessions opened by a rule. Daemons preserve
+    /// this on activity/exit facts so generated sessions cannot re-trigger
+    /// their own rule chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_origin: Option<AutomationOrigin>,
 }
 
 /// Launch a configured agent in a worktree.
@@ -527,6 +532,59 @@ pub struct PushedNote {
     /// Opaque source reference stored on the row; defaults to `"api"`.
     #[serde(default)]
     pub source: Option<String>,
+    /// Automation ancestry for loop prevention; absent for human/API pushes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_origin: Option<AutomationOrigin>,
+}
+
+/// Wire-safe automation ancestry shared by generated sessions and notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationOrigin {
+    pub root_event_id: String,
+    pub rule_id: String,
+    pub run_id: String,
+}
+
+/// One trusted automation rule projected for control clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationRuleInfo {
+    pub name: String,
+    pub enabled: bool,
+    pub trusted_layer: String,
+    pub event: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inert_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_outcome: Option<String>,
+}
+
+/// Pure `automations.test` input. `event` is decoded as the core normalized
+/// event by the implementation so the transport schema stays substrate-free.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationTestRequest {
+    pub rule: String,
+    pub event: serde_json::Value,
+    #[serde(default)]
+    pub at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationTestReply {
+    pub rule: String,
+    pub decisions: serde_json::Value,
+    pub executed: bool,
+}
+
+/// Name-only configured-tool request. The daemon resolves the command,
+/// sandbox, environment, and resource limits from its trusted config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolRunRequest {
+    pub name: String,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_origin: Option<AutomationOrigin>,
 }
 
 /// One upstream instance in the mcp-proxy hub, as `mcp_proxy.status` reports.
@@ -919,6 +977,21 @@ pub trait ControlApi: Send + Sync + 'static {
     /// Push a notification into the tray (the `notify.push` verb). Returns
     /// the stored notification's row id.
     fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
+
+    fn automations_list(&self) -> BoxFuture<'_, ControlResult<Vec<AutomationRuleInfo>>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.list")) })
+    }
+
+    fn automations_test(
+        &self,
+        _request: AutomationTestRequest,
+    ) -> BoxFuture<'_, ControlResult<AutomationTestReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.test")) })
+    }
+
+    fn tools_run(&self, _request: ToolRunRequest) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async { Err(ControlError::Unimplemented("tools.run")) })
+    }
 
     // --- agent orchestration (THE-57) ---------------------------------------
     // The supervisor's hands. Defaulted to `Unimplemented` so transport-only

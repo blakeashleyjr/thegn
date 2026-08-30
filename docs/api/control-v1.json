@@ -71,6 +71,105 @@
       ],
       "type": "string"
     },
+    "AutomationOrigin": {
+      "description": "Wire-safe automation ancestry shared by generated sessions and notes.",
+      "properties": {
+        "root_event_id": {
+          "type": "string"
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root_event_id",
+        "rule_id",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "AutomationRuleInfo": {
+      "description": "One trusted automation rule projected for control clients.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "event": {
+          "type": "string"
+        },
+        "inert_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "recent_outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trusted_layer": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "enabled",
+        "event",
+        "name",
+        "trusted_layer"
+      ],
+      "type": "object"
+    },
+    "AutomationTestReply": {
+      "properties": {
+        "decisions": true,
+        "executed": {
+          "type": "boolean"
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "decisions",
+        "executed",
+        "rule"
+      ],
+      "type": "object"
+    },
+    "AutomationTestRequest": {
+      "description": "Pure `automations.test` input. `event` is decoded as the core normalized event by the implementation so the transport schema stays substrate-free.",
+      "properties": {
+        "at": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "event": true,
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "rule"
+      ],
+      "type": "object"
+    },
     "BrowserAction": {
       "oneOf": [
         {
@@ -316,6 +415,17 @@
           },
           "type": "array"
         },
+        "automation_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutomationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automation ancestry for sessions opened by a rule. Daemons preserve this on activity/exit facts so generated sessions cannot re-trigger their own rule chain."
+        },
         "cols": {
           "format": "uint16",
           "minimum": 0.0,
@@ -488,6 +598,17 @@
     "PushedNote": {
       "description": "The `notify.push` verb payload — a desktop-notification-shaped note pushed into the tray over the API (the wire mirror of `thegn notify push`).",
       "properties": {
+        "automation_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutomationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automation ancestry for loop prevention; absent for human/API pushes."
+        },
         "body": {
           "default": "",
           "description": "Longer detail, appended to the inbox message when non-empty.",
@@ -879,6 +1000,35 @@
         }
       ]
     },
+    "ToolRunRequest": {
+      "description": "Name-only configured-tool request. The daemon resolves the command, sandbox, environment, and resource limits from its trusted config.",
+      "properties": {
+        "automation_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutomationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "worktree": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
     "WaitCondition": {
       "description": "A condition for the agent-driving `wait` verb: block until a session reaches a state instead of polling it.\n\nThe activity-derived conditions (`Idle`/`Blocked`/`Done`) are the pane daemon's per-session observer of the activity FSM, projected through `thegn_core::attention::pane_agent_state`; `OutputMatches` scans the session's ANSI-stripped scrollback. **A session that has exited resolves every condition** as `exited` with its code rather than hanging or 404ing — nothing ever waits on a corpse (see the daemon's tombstones).",
       "oneOf": [
@@ -1243,6 +1393,21 @@
       "path": "/v1/notify"
     },
     {
+      "cap": "automations.list",
+      "method": "GET",
+      "path": "/v1/automations"
+    },
+    {
+      "cap": "automations.test",
+      "method": "POST",
+      "path": "/v1/automations/test"
+    },
+    {
+      "cap": "tools.run",
+      "method": "POST",
+      "path": "/v1/tools/run"
+    },
+    {
       "cap": "mcp_proxy.status",
       "method": "GET",
       "path": "/v1/mcp_proxy/status"
@@ -1297,6 +1462,18 @@
     "AttachKind": {
       "$ref": "#/definitions/AttachKind"
     },
+    "AutomationOrigin": {
+      "$ref": "#/definitions/AutomationOrigin"
+    },
+    "AutomationRuleInfo": {
+      "$ref": "#/definitions/AutomationRuleInfo"
+    },
+    "AutomationTestReply": {
+      "$ref": "#/definitions/AutomationTestReply"
+    },
+    "AutomationTestRequest": {
+      "$ref": "#/definitions/AutomationTestRequest"
+    },
     "BrowserAction": {
       "$ref": "#/definitions/BrowserAction"
     },
@@ -1350,6 +1527,9 @@
     },
     "SplitDir": {
       "$ref": "#/definitions/SplitDir"
+    },
+    "ToolRunRequest": {
+      "$ref": "#/definitions/ToolRunRequest"
     },
     "WaitCondition": {
       "$ref": "#/definitions/WaitCondition"

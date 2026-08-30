@@ -393,6 +393,12 @@ pub enum Verb {
     /// pipeline stage (harness, model, env keys, permissions) — config-derived
     /// (read), no process is started.
     AgentList,
+    /// List trusted global/profile automation rules and recent outcomes.
+    AutomationsList,
+    /// Purely evaluate one named rule against a supplied event fixture.
+    AutomationsTest,
+    /// Execute one trusted, configured `[[tools]]` entry by name.
+    ToolsRun,
     /// List embedded and configured skill metadata without touching targets.
     SkillsList,
     /// Seed skills into a local worktree through the host adapter.
@@ -488,6 +494,9 @@ impl Verb {
         Verb::SemanticBlastRadius,
         Verb::AgentSessions,
         Verb::AgentList,
+        Verb::AutomationsList,
+        Verb::AutomationsTest,
+        Verb::ToolsRun,
         Verb::SkillsList,
         Verb::SkillsSeed,
         Verb::ModelProxyStatus,
@@ -538,6 +547,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
         | Verb::AgentList
+        | Verb::AutomationsList
+        | Verb::AutomationsTest
         | Verb::SkillsList
         | Verb::PreviewFetch
         // Model-proxy status/stats are read-only introspection.
@@ -582,7 +593,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::WorktreeCreate => Scope::Git,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
-        Verb::LaunchPreset => Scope::Exec,
+        Verb::LaunchPreset | Verb::ToolsRun => Scope::Exec,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing
@@ -878,6 +889,8 @@ mod tests {
             SemanticBlastRadius,
             AgentSessions,
             AgentList,
+            AutomationsList,
+            AutomationsTest,
             SkillsList,
             PreviewFetch,
             ModelProxyStatus,
@@ -915,7 +928,7 @@ mod tests {
             SkillsSeed,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
-        let exec = [LaunchPreset];
+        let exec = [LaunchPreset, ToolsRun];
         let admin = [
             MigrateSession,
             IssuePairing,

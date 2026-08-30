@@ -44,6 +44,14 @@ agents.permissions
 agents.provider
 agents.resume
 agents.route_via_proxy
+# automations.* — trusted global/profile automation policy is intentionally
+# file-scoped; exposing it through process environment would make automation
+# behavior depend on unreviewed launcher state.
+automations.action_timeout_secs
+automations.audit_retention_per_rule
+automations.enabled
+automations.max_concurrent
+automations.queue_capacity
 bars.bottom_left
 bars.bottom_right
 bars.clock_format

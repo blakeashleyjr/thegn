@@ -1830,6 +1830,108 @@ command = "git diff"
 #                               # agent CLI names recognized on top of [[agents]] entries and
 #                               #   each worktree's own bound agent
 
+# Trusted event → catalog-action automations. Rules are disabled by default and
+# are accepted only from this global file or a trusted profile config. A repo's
+# checked-in `.thegn.toml/.yaml/.json` can never install them and is warned.
+[automations]
+enabled = false
+max_concurrent = 2          # bounded off-loop actions (1..16)
+queue_capacity = 64         # pending action plans before overflow drops (1..1024)
+action_timeout_secs = 300   # per-action deadline (1..3600)
+audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
+
+# One rule is exactly one normalized event (`when`) and one catalog action
+# (`then.cap`). Rules run in file order. Unknown events/caps/params, duplicate or
+# empty names, invalid globs/regexes/templates, and out-of-range limits are
+# rejected by `thegn config validate`.
+# [[automations.rules]]
+# name = "tell-me-when-a-coder-is-blocked" # unique, non-empty, <=128 bytes
+# enabled = true
+# when = "agent_needs_you" # notification | agent_needs_you | agent_finished |
+#                          # agent_failed | pr_checks | pr_review_requested |
+#                          # merge_landed | worktree_idle | disk_low
+# debounce_secs = 60       # minimum seconds between plans for this rule (0..86400)
+# idle_secs = 300          # required only for worktree_idle (60..86400)
+# once_per_key = true      # fire once for the producer's stable event/entity key
+# max_per_hour = 30        # per-rule sliding-window bound (1..1000)
+# max_action_per_hour = 30 # action-wide bound shared by every rule using this cap
+#
+# Every present selector below is ANDed; a missing event field never matches.
+# Glob fields support only `*` (any run) and `?` (one character).
+# [automations.rules.if]
+# workspace = "product*"
+# repo = "thegn"
+# worktree = "*/thegn"
+# branch = "tg/*"
+# agent_role = "coder"
+# notification_kind = "test_failed" # exact built-in kind; notification events only
+# priority = "alert"       # minimum: info | notice | alert
+# source_prefix = "session:"
+# message_regex = "needs (review|input)$"
+# session_id = "daemon-session-1"
+# pr_checks_passed = true
+# pr_review_requested = false
+# pr_merged = false
+#
+# Action ids are typed strings validated against the v1 catalog set. Parameter
+# templates may use: {event_id}, {event_key}, {event_kind}, {event_time},
+# {workspace}, {repo}, {worktree}, {branch}, {agent_role}, {notification_kind}, {priority},
+# {source_ref}, {message}, {session_id}, {pr_checks_passed},
+# {pr_review_requested}, and {pr_merged}. Values are prose/data substitution,
+# never shell expansion. `agent` and tool `name` must be literal configured names.
+# [automations.rules.then]
+# cap = "notify.push"       # notify.push: body required; title/urgency optional
+# title = "Coder needs attention"
+# body = "{message} on {branch}"
+# urgency = "alert"         # info | notice | alert
+#
+# Other supported action shapes (one `then` table per rule):
+# cap = "sessions.open"     # agent required; prompt optional
+# agent = "claude"
+# prompt = "Handle {source_ref}: {message}"
+# cap = "merge.add"         # no parameters; worktree comes from the event
+# cap = "tools.run"         # name required; resolves trusted global/profile [[tools]]
+# name = "release-check"
+#
+# A named profile may refine the settings and replace the rule list:
+# [profiles.work.automations]
+# enabled = false
+# max_concurrent = 4
+# queue_capacity = 64
+# action_timeout_secs = 300
+# audit_retention_per_rule = 200
+# [[profiles.work.automations.rules]]
+# name = "profile-rule"
+# enabled = true
+# when = "agent_needs_you"
+# debounce_secs = 60
+# idle_secs = 300
+# once_per_key = true
+# max_per_hour = 30
+# max_action_per_hour = 30
+# [profiles.work.automations.rules.if]
+# workspace = "product*"
+# repo = "thegn"
+# worktree = "*/thegn"
+# branch = "tg/*"
+# agent_role = "coder"
+# notification_kind = "test_failed"
+# priority = "alert"
+# source_prefix = "session:"
+# message_regex = "needs (review|input)$"
+# session_id = "daemon-session-1"
+# pr_checks_passed = true
+# pr_review_requested = false
+# pr_merged = false
+# [profiles.work.automations.rules.then]
+# cap = "notify.push"
+# title = "Profile rule"
+# body = "{message}"
+# urgency = "alert"
+# agent = "claude"
+# prompt = "Handle {source_ref}: {message}"
+# name = "release-check"
+
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
 # in-app inbox, and optionally as OS desktop notifications.
@@ -1882,12 +1984,12 @@ active_mode = ""
 # same list, generated from the enum):
 #   "alert"  — agent_failed, agent_attention, test_failed, process_failed,
 #              queue_needs_human, pr_queue_needs_human, resource_alert,
-#              usage_limit
+#              usage_limit, automation_failed
 #   "info"   — log_error, worktree_created, process_exited, queue_landed,
 #              calendar_changed, pr_queue_merged
 #   "notice" — assigned, mentioned, status_changed, blocker_resolved,
 #              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
-#              pr_queue_ready, calendar_reminder, upstream_behind
+#              pr_queue_ready, calendar_reminder, upstream_behind, automation
 # Override any kind below (keys are the snake_case kind names). Unknown
 # keys/values are ignored. The queue_* kinds are the merge queue's settled
 # transitions ([merge_queue]); pr_queue_* are the PR queue's ([pr_queue]).

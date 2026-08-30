@@ -488,6 +488,7 @@ async fn notify_target(
         body: format!("{worktree}: {source_profile} → {target_profile}"),
         urgency: None,
         source: Some("session_migration".to_string()),
+        automation_origin: None,
     };
     notify_with_control(client.as_ref(), note).await
 }
@@ -929,6 +930,7 @@ mod tests {
             body: "body".into(),
             urgency: None,
             source: Some("session_migration".into()),
+            automation_origin: None,
         };
 
         let notification = futures::executor::block_on(notify_with_control(&control, note));

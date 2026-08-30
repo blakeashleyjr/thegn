@@ -240,6 +240,7 @@ pub(crate) fn run<'a>(
                     }),
                     adopt: false,
                     already_capped: false,
+                    automation_origin: None,
                 };
                 let snapshot = service.config.clone();
                 let launch = open.agent.as_ref().expect("fork agent").clone();

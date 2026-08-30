@@ -1415,6 +1415,47 @@ pub(super) async fn notify_push(
     }
 }
 
+pub(super) async fn automations_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AutomationsList) {
+        return r;
+    }
+    match state.api.automations_list().await {
+        Ok(rules) => axum::Json(json!({ "rules": rules })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn automations_test(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::AutomationTestRequest>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AutomationsTest) {
+        return r;
+    }
+    match state.api.automations_test(body.0).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn tools_run(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::ToolRunRequest>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::ToolsRun) {
+        return r;
+    }
+    match state.api.tools_run(body.0).await {
+        Ok(session) => axum::Json(session).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── mcp proxy hub ────────────────────────────────────────────────────────────
 
 pub(super) async fn mcp_proxy_status(

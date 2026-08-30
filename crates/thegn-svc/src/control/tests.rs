@@ -245,6 +245,48 @@ impl ControlApi for FakeApi {
         self.record("notify_push");
         Box::pin(async { Ok(7) })
     }
+    fn automations_list(&self) -> BoxFuture<'_, ControlResult<Vec<super::AutomationRuleInfo>>> {
+        self.record("automations_list");
+        Box::pin(async {
+            Ok(vec![super::AutomationRuleInfo {
+                name: "green".into(),
+                enabled: true,
+                trusted_layer: "user".into(),
+                event: "notification".into(),
+                action: "notify.push".into(),
+                inert_reason: None,
+                recent_outcome: Some("succeeded".into()),
+            }])
+        })
+    }
+    fn automations_test(
+        &self,
+        request: super::AutomationTestRequest,
+    ) -> BoxFuture<'_, ControlResult<super::AutomationTestReply>> {
+        self.record("automations_test");
+        Box::pin(async move {
+            Ok(super::AutomationTestReply {
+                rule: request.rule,
+                decisions: serde_json::json!([{"outcome": "matched"}]),
+                executed: false,
+            })
+        })
+    }
+    fn tools_run(
+        &self,
+        _request: super::ToolRunRequest,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.record("tools_run");
+        Box::pin(async {
+            Ok(SessionInfo {
+                id: "tool-session".into(),
+                program: "trusted-tool".into(),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+        })
+    }
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         self.record("lease_status");
         Box::pin(async { Ok(vec![]) })
@@ -801,6 +843,82 @@ async fn pr_status_and_notify_push_route_to_the_api() {
     );
 }
 
+#[tokio::test]
+async fn automation_and_tool_verbs_have_catalog_routes_and_exact_scopes() {
+    for (capability, path) in [
+        ("automations.list", "/v1/automations"),
+        ("automations.test", "/v1/automations/test"),
+        ("tools.run", "/v1/tools/run"),
+    ] {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps.contains(&capability)),
+            "missing route/catalog projection for {capability}"
+        );
+        assert!(
+            thegn_core::capability::CATALOG
+                .iter()
+                .any(|entry| entry.id.as_str() == capability),
+            "missing capability catalog row for {capability}"
+        );
+    }
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let exec = token(&r, "exec");
+
+    assert_eq!(
+        call(&r, "GET", "/v1/automations", Some(&read)).await,
+        StatusCode::OK
+    );
+    let test_request = Request::builder()
+        .method("POST")
+        .uri("/v1/automations/test")
+        .header("authorization", format!("Bearer {read}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"rule":"green","event":{}}"#))
+        .unwrap();
+    assert_eq!(
+        router(r.state.clone())
+            .oneshot(test_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let tool_request = |bearer: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/tools/run")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"trusted-tool","worktree":"/w"}"#))
+            .unwrap()
+    };
+    assert_eq!(
+        router(r.state.clone())
+            .oneshot(tool_request(&read))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        router(r.state.clone())
+            .oneshot(tool_request(&exec))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.api.calls(),
+        ["automations_list", "automations_test", "tools_run"]
+    );
+}
+
 /// The new wire types survive a serde round-trip, and `PushedNote`'s optional
 /// fields default when absent (the minimal `{"title": …}` push is valid).
 #[test]
@@ -824,6 +942,7 @@ fn pr_status_row_and_pushed_note_serde_round_trip() {
         body: "there".into(),
         urgency: Some("alert".into()),
         source: Some("ci".into()),
+        automation_origin: None,
     };
     let back: super::PushedNote =
         serde_json::from_str(&serde_json::to_string(&note).unwrap()).unwrap();
@@ -834,6 +953,7 @@ fn pr_status_row_and_pushed_note_serde_round_trip() {
     assert!(minimal.body.is_empty());
     assert_eq!(minimal.urgency, None);
     assert_eq!(minimal.source, None);
+    assert_eq!(minimal.automation_origin, None);
 }
 
 #[tokio::test]

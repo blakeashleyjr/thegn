@@ -90,6 +90,20 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[notifications]` live-agent signatures must be non-empty and
             // bounded; otherwise an empty substring would match every line.
             errs.extend(cfg.notifications.validate());
+            errs.extend(cfg.automations.validate());
+            for (name, profile) in &cfg.profiles {
+                if profile.automations.is_empty() {
+                    continue;
+                }
+                let mut effective = cfg.automations.clone();
+                profile.automations.clone().apply(&mut effective);
+                errs.extend(
+                    effective
+                        .validate()
+                        .into_iter()
+                        .map(|error| format!("profiles.{name}: {error}")),
+                );
+            }
             // Sound references and kind selectors use a free-form map, so the
             // schema walker cannot validate their keys or values.
             errs.extend(cfg.notifications.validate_sound());

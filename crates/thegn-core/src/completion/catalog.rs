@@ -35,6 +35,8 @@ pub enum SourceKind {
     Agent,
     /// `[[tools]]` names.
     Tool,
+    /// Trusted `[[automations.rules]]` names.
+    Automation,
     /// `[[plugins]]` ids.
     Plugin,
     /// `[[pipeline.stages]]` names.
@@ -138,6 +140,7 @@ impl SourceKind {
         SourceKind::Theme,
         SourceKind::Agent,
         SourceKind::Tool,
+        SourceKind::Automation,
         SourceKind::Plugin,
         SourceKind::Stage,
         SourceKind::McpServer,
@@ -165,6 +168,7 @@ impl SourceKind {
             SourceKind::Theme => "theme",
             SourceKind::Agent => "agent",
             SourceKind::Tool => "tool",
+            SourceKind::Automation => "automation",
             SourceKind::Plugin => "plugin",
             SourceKind::Stage => "stage",
             SourceKind::McpServer => "mcp-server",
@@ -209,6 +213,7 @@ impl SourceKind {
                 | SourceKind::Profile
                 | SourceKind::Agent
                 | SourceKind::Tool
+                | SourceKind::Automation
                 | SourceKind::Plugin
                 | SourceKind::Stage
                 | SourceKind::McpServer
@@ -390,6 +395,8 @@ pub const CATALOG: &[Slot] = &[
     // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
     slot("dispatch put", "stage", SourceKind::Stage),
     slot("session open", "stage", SourceKind::Stage),
+    // --- automation (`[[automations.rules]]`) -----------------------------
+    slot("automations test", "rule", SourceKind::Automation),
     // A cwd is a filesystem path; clap's structural/path completer owns it.
     slot("session fork", "cwd", SourceKind::Structural),
     // --- pipeline run-completion (THE-76) -----------------------------------
@@ -491,6 +498,7 @@ pub const CATALOG: &[Slot] = &[
     // `config validate --repo <PATH>`: clap owns filesystem path completion.
     slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("automations test", "fixture", SourceKind::Structural),
     slot("skills seed", "worktree", SourceKind::Structural),
     slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
@@ -501,6 +509,16 @@ pub const CATALOG: &[Slot] = &[
     slot("pr create", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt diff", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt new", "base", SourceKind::Reserved(Reserved::Branch)),
+    slot(
+        "automations test",
+        "event",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "automations test",
+        "at",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("pr queue add", "pr", SourceKind::Reserved(Reserved::Pr)),
     slot("pr queue rm", "number", SourceKind::Reserved(Reserved::Pr)),
     slot(

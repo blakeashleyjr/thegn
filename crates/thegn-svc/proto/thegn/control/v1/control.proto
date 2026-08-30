@@ -51,6 +51,9 @@ service Control {
   rpc PrStatus(PrStatusRequest) returns (PrStatusReply);
   // Push a notification into the tray; returns the stored row id.
   rpc NotifyPush(NotifyPushRequest) returns (NotifyPushReply);
+  rpc AutomationsList(AutomationsListRequest) returns (AutomationsListReply);
+  rpc AutomationsTest(AutomationsTestRequest) returns (AutomationsTestReply);
+  rpc ToolsRun(ToolsRunRequest) returns (SessionInfo);
 }
 
 message Empty {}
@@ -263,8 +266,33 @@ message NotifyPushRequest {
   string body = 2;           // empty = title only
   string urgency = 3;        // empty = default; "alert"/"critical" = red flag
   string source = 4;         // empty = "api"
+  AutomationOrigin automation_origin = 5;
 }
 message NotifyPushReply { int64 id = 1; }
+
+message AutomationOrigin {
+  string root_event_id = 1;
+  string rule_id = 2;
+  string run_id = 3;
+}
+
+message AutomationsListRequest {}
+message AutomationsListReply { string rules_json = 1; }
+message AutomationsTestRequest {
+  string rule = 1;
+  string event_json = 2;
+  optional int64 at = 3;
+}
+message AutomationsTestReply {
+  string rule = 1;
+  string decisions_json = 2;
+  bool executed = 3;
+}
+message ToolsRunRequest {
+  string name = 1;
+  string worktree = 2;
+  AutomationOrigin automation_origin = 3;
+}
 
 message MeRequest {}
 message MeReply {

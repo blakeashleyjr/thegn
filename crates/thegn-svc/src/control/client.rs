@@ -322,6 +322,41 @@ impl ControlClient {
             .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
     }
 
+    pub async fn automations_list(&self) -> Result<Vec<super::AutomationRuleInfo>> {
+        let value = self.request("GET", "/v1/automations", None).await?;
+        Ok(serde_json::from_value(
+            value
+                .get("rules")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new())),
+        )?)
+    }
+
+    pub async fn automations_test(
+        &self,
+        request: &super::AutomationTestRequest,
+    ) -> Result<super::AutomationTestReply> {
+        let value = self
+            .request(
+                "POST",
+                "/v1/automations/test",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn tools_run(&self, request: &super::ToolRunRequest) -> Result<SessionInfo> {
+        let value = self
+            .request(
+                "POST",
+                "/v1/tools/run",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     /// `GET /v1/mcp_proxy/status` — the mcp-proxy hub's per-upstream state.
     pub async fn mcp_proxy_status(&self) -> Result<super::McpProxyStatus> {
         let v = self.request("GET", "/v1/mcp_proxy/status", None).await?;
