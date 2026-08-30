@@ -232,7 +232,7 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 /// queued chunk, so a congestion drop ([`crate::pane_writer::StdinSendError::Full`]) can never
 /// leave the app inside an open paste bracket, and no keystroke can land
 /// between the markers.
-fn paste_text_into_pane(
+pub(crate) fn paste_text_into_pane(
     pane: &mut crate::pane::PtyPane,
     text: &str,
 ) -> Result<(), crate::pane_writer::StdinSendError> {
@@ -578,6 +578,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         thegn_core::log_trace::reload_level(cfg.log.level);
     }
     crate::e2e_freeze::apply_to_config(&mut cfg);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(thegn_core::config::Config::path);
+    // Start the bounded catalog scan as soon as config identifies the selected
+    // preset. It overlaps the remaining startup work and is awaited only at
+    // the palette chokepoint, so filesystem I/O never runs on this thread.
+    let mut theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), config_path.clone());
     crate::forge_handle::install(&cfg);
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
@@ -715,8 +723,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         }
     }
     // Resolve the configurable chrome palette ([theme] / [theme.colors]) before
-    // the first frame; the config fs-watch re-resolves it live.
-    crate::chrome::set_palette(cfg.palette());
+    // the first frame, including a configured user theme from the off-loop scan.
+    let (theme_users, theme_warnings) = theme_store.initial_catalog().await;
+    for warning in theme_warnings {
+        tracing::warn!(target: "thegn::theme", "{warning}");
+    }
+    crate::chrome::set_palette(cfg.palette_with_user_themes(&cfg.theme.preset, &theme_users));
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
     crate::caps::install_themed(&cfg, resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
@@ -824,7 +836,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (config_tx, config_rx) =
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
-    let config_path = thegn_core::config::Config::path();
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
@@ -1073,6 +1084,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         pane_pids,
         daemon_pid_atomic,
         waker,
+        theme_store,
+        theme_users,
         start,
         shutdown,
         event_bus,
@@ -5740,6 +5753,8 @@ async fn event_loop<T: Terminal>(
     pane_pids: crate::hydrate::PanePids,
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
+    mut theme_store: crate::theme_store::ThemeStore,
+    mut theme_users: Vec<thegn_core::theme_user::UserTheme>,
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: thegn_core::event_bus::EventBus,
@@ -6310,7 +6325,8 @@ async fn event_loop<T: Terminal>(
     // The toast deadline a one-shot wake is already armed for (see the prune
     // block), so repeated frames don't spawn duplicate sleepers.
     let mut toast_wake_armed: Option<std::time::Instant> = None;
-    // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
+    // Live theme-cycle position within the merged built-in/user catalog
+    // (Ctrl+Alt+t).
     let mut theme_idx: usize = thegn_core::theme::PRESETS
         .iter()
         .position(|p| *p == keymap.config().theme.preset)
@@ -6648,6 +6664,7 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    let mut theme_builder: Option<crate::theme_builder::ThemeBuilder> = None;
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
     // subprocesses — is spawned only AFTER the first frame flushes (see the
@@ -7530,6 +7547,28 @@ async fn event_loop<T: Terminal>(
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
             crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
+        }
+        if let Some(builder) = theme_builder.as_mut() {
+            let result = crate::handlers::theme_builder::drain(
+                builder,
+                &mut theme_store,
+                &current_config,
+                &mut theme_users,
+            );
+            if result.close {
+                theme_builder = None;
+            }
+            if result.dirty {
+                dirty = true;
+            }
+        } else {
+            if crate::handlers::theme_builder::drain_catalog(&mut theme_store, &mut theme_users) {
+                crate::chrome::set_palette(
+                    current_config
+                        .palette_with_user_themes(&current_config.theme.preset, &theme_users),
+                );
+                dirty = true;
+            }
         }
         // Writer-thread health: a transient write failure means the terminal's
         // actual content is unknown — resync with a full repaint (the async
@@ -9174,6 +9213,12 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            // A review snapshot may be fetched after the Changes modal opens.
+            // Deliver the accepted model's compatible snapshot directly to
+            // that view; its worktree diff must remain intact while only the
+            // review source is updated.
+            let review_for_diff_view = next_model.panel.review_snapshot.clone();
+            let review_status_for_diff_view = next_model.panel.review_snapshot_status.clone();
             // `thegn open` intents ride the hydration result (claimed from
             // the DB mailbox off-loop); take them out before the model swap —
             // last one wins, applied after the drain below.
@@ -9379,6 +9424,14 @@ async fn event_loop<T: Terminal>(
             model.status = prev_status;
             model.masthead_sel = prev_masthead_sel;
             model.statusbar_sel = prev_statusbar_sel;
+            if let Some(view) = diff_view.as_mut() {
+                let review = review_for_diff_view.filter(|review| {
+                    crate::actions::review_snapshot_matches_panel(&model.panel, review)
+                });
+                if view.set_review(review, review_status_for_diff_view) {
+                    dirty = true;
+                }
+            }
             // Seed the stale-while-revalidate cache with this worktree's fresh
             // slice (pre LSP-merge: LSP diags live in their own per-root store
             // and are re-merged on every paint) so a later switch back paints
@@ -10487,7 +10540,13 @@ async fn event_loop<T: Terminal>(
                     model.status = keybind_conflict_summary(&new_cfg)
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
-                    crate::chrome::set_palette(new_cfg.palette());
+                    crate::chrome::set_palette(
+                        new_cfg.palette_with_user_themes(&new_cfg.theme.preset, &theme_users),
+                    );
+                    if let Some(builder) = theme_builder.as_mut() {
+                        builder.config_reloaded(&new_cfg);
+                        crate::chrome::set_palette(builder.candidate().clone());
+                    }
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
                     crate::caps::install_themed(&new_cfg, resolve_termcaps(&new_cfg));
                     wire_renderer.set_depth(crate::caps::color_depth());
@@ -11035,6 +11094,7 @@ async fn event_loop<T: Terminal>(
                 &mut pr_view_gen,
                 &pr_view_tx,
                 &waker,
+                &refresh_tx,
             );
         }
         if want_calendar_sync {
@@ -11755,6 +11815,7 @@ async fn event_loop<T: Terminal>(
                 && !app_tile_active
                 && mouse_sel.is_some()
                 && palette.is_none()
+                && theme_builder.is_none()
                 && monitor.is_none()
                 && board.is_none()
                 && active_menu.is_none()
@@ -11781,6 +11842,7 @@ async fn event_loop<T: Terminal>(
                 && drawer.is_none()
                 && mouse_sel.is_none()
                 && palette.is_none()
+                && theme_builder.is_none()
                 && monitor.is_none()
                 && board.is_none()
                 && active_menu.is_none()
@@ -12297,6 +12359,9 @@ async fn event_loop<T: Terminal>(
             if let Some(ov) = &media_overlay {
                 ov.render(&mut scratch, screen);
             }
+            if let Some(builder) = &theme_builder {
+                crate::handlers::theme_builder::render(builder, &mut scratch, screen);
+            }
             if let Some(h) = help_overlay.as_mut() {
                 h.render(&mut scratch, screen);
             }
@@ -12690,6 +12755,23 @@ async fn event_loop<T: Terminal>(
                 let mx = (m.x as usize).saturating_sub(1);
                 let my = (m.y as usize).saturating_sub(1);
                 let left = m.mouse_buttons.contains(MouseButtons::LEFT);
+                if let Some(builder) = theme_builder.as_mut() {
+                    let keep = crate::handlers::theme_builder::mouse(
+                        builder,
+                        &theme_store,
+                        &m,
+                        mx,
+                        my,
+                        Rect::full(cols, rows),
+                        current_config.ui.dismiss_overlay_on_click_outside,
+                        &mut mouse_left_down,
+                    );
+                    if !keep {
+                        theme_builder = None;
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Front-matter: modal detail-popup capture (outside-click
                 // dismiss), hit-test, and forward into a mouse-reporting pane
                 // app. Consumes the event or hands back the resolved pane.
@@ -13895,6 +13977,21 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if let Some(builder) = theme_builder.as_mut() {
+                    let keep = crate::handlers::theme_builder::key(
+                        builder,
+                        &theme_store,
+                        &k.key,
+                        k.modifiers,
+                    );
+                    if !keep {
+                        theme_builder = None;
+                    } else {
+                        crate::chrome::set_palette(builder.candidate().clone());
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Register paste is armed (PasteRegister): the next key names the
                 // register (`a`–`z`/`0`–`9`, `"` default, `+` clipboard). It's a
                 // top-priority mini-modal so the char never leaks to the pane.
@@ -14227,15 +14324,19 @@ async fn event_loop<T: Terminal>(
                 // The full-screen PR view is a top-priority modal (like the
                 // detail overlay): it owns every key while open. Actions run off
                 // the loop and the view stays open (only Close dismisses it).
-                if pr_view.is_some() {
+                if pr_view.is_some() && active_menu.is_none() {
                     crate::actions::dispatch_pr_view_key(
                         &mut pr_view,
                         &k.key,
                         k.modifiers,
-                        &session,
+                        &mut session,
+                        &mut panes,
+                        &mut focus,
+                        keymap.config(),
                         &refresh_tx,
                         &waker,
                         &mut model,
+                        &mut active_menu,
                     );
                     dirty = true;
                     continue;
@@ -14361,6 +14462,7 @@ async fn event_loop<T: Terminal>(
                 let no_modal_owns_esc = active_menu.is_none()
                     && palette.is_none()
                     && host_input.is_none()
+                    && theme_builder.is_none()
                     && git_input.is_none()
                     && rollback.is_none()
                     && wizard_ui.is_none()
@@ -14530,6 +14632,7 @@ async fn event_loop<T: Terminal>(
                         &mut onboarding,
                         &mut model,
                         &mut current_config,
+                        &theme_users,
                         &mut session,
                         &mut panes,
                         chrome.center,
@@ -15035,6 +15138,9 @@ async fn event_loop<T: Terminal>(
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
                             active_menu = None;
+                            if let Some(v) = pr_view.as_mut() {
+                                v.pending_handoff = None;
+                            }
                             pending_confirm_op = None;
                             pending_undo = None;
                             pending_delete_workspace = None;
@@ -15045,6 +15151,31 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
+                            if matches!(
+                                &choice,
+                                menu::MenuChoice::Confirm {
+                                    tag: "pr-review-handoff",
+                                    ..
+                                }
+                            ) {
+                                if let Some(selection) =
+                                    pr_view.as_mut().and_then(|v| v.pending_handoff.take())
+                                {
+                                    crate::actions::dispatch_pr_handoff(
+                                        &mut pr_view,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut focus,
+                                        keymap.config(),
+                                        &mut model,
+                                        &refresh_tx,
+                                        &waker,
+                                        selection,
+                                    );
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -15071,6 +15202,11 @@ async fn event_loop<T: Terminal>(
                                 && let Some(g) = session.worktrees.get(session.active)
                             {
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
+                            }
+                            if matches!(&choice, menu::MenuChoice::Dismiss)
+                                && let Some(v) = pr_view.as_mut()
+                            {
+                                v.pending_handoff = None;
                             }
                             if let menu::MenuChoice::ConfirmCloseWorktrees = choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
@@ -17151,6 +17287,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut pr_view_gen,
                                                 &pr_view_tx,
                                                 &waker,
+                                                &refresh_tx,
                                             ) {
                                                 Some(v) => pr_view = Some(v),
                                                 None => model.status = "No pull request".into(),
@@ -20394,18 +20531,34 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&new);
                                 }
                             }
-                            Action::CycleTheme => {
-                                // Live theme cycle: presets resolve through
-                                // the config so [theme.colors] customizations
-                                // ride along. Set `[theme] preset` to persist.
-                                let presets = thegn_core::theme::PRESETS;
-                                theme_idx = (theme_idx + 1) % presets.len();
-                                let name = presets[theme_idx];
-                                crate::chrome::set_palette(
-                                    current_config.palette_with_preset(name),
+                            Action::ForkSession => {
+                                model.status = crate::handlers::session_fork::request(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                    &waker,
                                 );
-                                model.status =
-                                    format!("Theme: {name} (set [theme] preset to keep)");
+                            }
+                            Action::CycleTheme => {
+                                let themes = crate::theme_builder::cycle_catalog(
+                                    &current_config,
+                                    &theme_users,
+                                );
+                                if !themes.is_empty() {
+                                    theme_idx = (theme_idx + 1) % themes.len();
+                                    let (name, palette) = &themes[theme_idx];
+                                    crate::chrome::set_palette(palette.clone());
+                                    model.status = format!("Theme: {name}");
+                                }
+                            }
+                            Action::ThemeBuilderOpen => {
+                                let builder = crate::handlers::theme_builder::open(
+                                    &current_config,
+                                    &theme_users,
+                                    &theme_store,
+                                );
+                                crate::chrome::set_palette(builder.candidate().clone());
+                                theme_builder = Some(builder);
                             }
                             Action::ToggleZoom => {
                                 // On the center, cycle tiled → maximize-in-chrome
@@ -21421,6 +21574,7 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     diff_view = Some(crate::actions::open_diff_view(
                                         cfg,
+                                        &model,
                                         &session,
                                         &mut diff_view_gen,
                                         &diff_view_tx,
@@ -21980,6 +22134,11 @@ async fn event_loop<T: Terminal>(
             }
             Ok(Some(InputEvent::Paste(s))) => {
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
+                if let Some(builder) = theme_builder.as_mut() {
+                    builder.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
                 // A modal that collects text owns the paste — inject it into
                 // the field (workspace picker, new-worktree wizard) rather than
                 // leaking it into the pane behind the overlay.

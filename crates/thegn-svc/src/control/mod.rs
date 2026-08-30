@@ -98,6 +98,10 @@ pub struct SessionInfo {
     /// contents. `None` when nothing is being recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<String>,
+    /// Stable display form of the source session when this session was forked.
+    /// This is lineage metadata only; no launch recipe is included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -184,6 +188,48 @@ pub struct AgentLaunch {
     /// Unknown stage ⇒ error. See `thegn_core::agent_task::effective_agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// Ask the selected harness to create a native child session rather than
+    /// resume the source in place. The daemon validates and resolves this
+    /// operation through the harness seam.
+    #[serde(default)]
+    pub fork: bool,
+    /// Native session id passed to the harness fork operation. It is kept
+    /// separate from `resume` so a fork cannot silently become an in-place
+    /// resume when the two launch forms are composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+}
+
+/// Intent for creating a new session from a live daemon or recorded harness
+/// session. `harness` discriminates the source: absent means `session` is a
+/// live daemon id; present means it is a native id discovered from
+/// `agent.sessions`. No process recipe, environment, prompt, or transcript
+/// data crosses the control boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ForkSpec {
+    /// Live daemon id, or native harness id when `harness` is set.
+    pub session: String,
+    /// Harness id for a recorded native session source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Configured agent name used to resolve the child launch context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Optional child working-directory override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Optional child worktree override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Request a bounded plain-text scrollback handoff file.
+    #[serde(default)]
+    pub scrollback: bool,
+    /// Ask a connected compositor to adopt the child.
+    #[serde(default)]
+    pub adopt: bool,
+    /// Adopt the child in a new tab instead of beside the source.
+    #[serde(default)]
+    pub tab: bool,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
@@ -561,6 +607,12 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
+
+    /// Fork a live daemon or recorded harness session. The default keeps
+    /// transport-only adapters honest until they implement the spawn owner.
+    fn fork(&self, _spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async { Err(ControlError::Unimplemented("session fork is not available")) })
+    }
 
     /// Warm-attach: registers `client_id` as a subscriber and returns the
     /// current screen snapshot + live stream. An `Interactive` attach cancels

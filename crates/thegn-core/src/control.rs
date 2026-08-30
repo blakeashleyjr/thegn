@@ -245,6 +245,8 @@ pub enum Verb {
     MigrateSession,
     ListWorktrees,
     OpenSession,
+    /// Fork a live daemon or recorded harness session into a new process.
+    ForkSession,
     Attach,
     Detach,
     SendInput,
@@ -405,6 +407,7 @@ impl Verb {
         Verb::MigrateSession,
         Verb::ListWorktrees,
         Verb::OpenSession,
+        Verb::ForkSession,
         Verb::Attach,
         Verb::Detach,
         Verb::SendInput,
@@ -529,6 +532,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
         Verb::OpenSession
+        | Verb::ForkSession
         | Verb::Attach
         | Verb::Detach
         | Verb::SendInput
@@ -862,6 +866,7 @@ mod tests {
         ];
         let write = [
             OpenSession,
+            ForkSession,
             Attach,
             Detach,
             SendInput,

@@ -36,7 +36,8 @@
       is ever targeted.
 - [ ] 3.2 Headless fallback: confirm-gated single-thread `PrReview` dispatch
       via `agent_task` + `agent_run` off-loop (waker pulse on completion);
-      forced-headless chord; no-agent path reports via `model.status`.
+      `p`/`P` use the selected/all-unresolved contract; no-agent path reports
+      via `model.status`.
 
 ## 4. Help + docs
 

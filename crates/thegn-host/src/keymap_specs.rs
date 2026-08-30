@@ -174,6 +174,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "fork-session",
+        label: "Fork live session",
+        hint: "fork session",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "fork",
+            "session",
+            "conversation",
+            "native session",
+            "new session",
+        ],
+    },
+    ActionSpec {
         id: "paste-register",
         label: "Paste from register",
         hint: "paste reg",
@@ -497,6 +511,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "appearance",
             "dark mode",
             "light mode",
+        ],
+    },
+    ActionSpec {
+        id: "theme-builder-open",
+        label: "Open theme builder",
+        hint: "theme builder",
+        default_chords: &["Ctrl Alt Shift t"],
+        palette: true,
+        keywords: &[
+            "theme",
+            "builder",
+            "appearance",
+            "colors",
+            "palette",
+            "preview",
+            "customize",
         ],
     },
     ActionSpec {

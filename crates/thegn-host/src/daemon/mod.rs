@@ -16,6 +16,7 @@
 pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
 pub(crate) mod client;
+pub(crate) mod fork;
 pub(crate) mod inbox;
 pub(crate) mod pipeline_retry;
 pub(crate) mod record;

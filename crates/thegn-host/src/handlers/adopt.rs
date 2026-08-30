@@ -57,6 +57,7 @@ pub(crate) enum AdoptPlan {
         session: String,
         group: usize,
         focus: bool,
+        tab: bool,
     },
     /// Claimed and dropped, with the reason for the log/status line.
     Drop(DropReason),
@@ -123,6 +124,7 @@ pub(crate) fn plan(
         session: intent.session,
         group,
         focus: intent.focus,
+        tab: intent.tab,
     }
 }
 
@@ -188,20 +190,17 @@ pub(crate) fn apply(
                 session: sid,
                 group,
                 focus,
+                tab,
             } => {
                 // The intent names no tab (the CLI has no tab notion), so it
                 // lands in the group's ACTIVE tab; `graft` itself now takes
                 // `(gi, ti)` so the attach-on-open drain can target any tab.
-                if graft(
-                    &sid,
-                    group,
-                    session.worktrees[group].active_tab,
-                    session,
-                    panes,
-                    cfg,
-                    center,
-                    None,
-                ) {
+                let tab_index = if tab {
+                    session.worktrees[group].add_tab()
+                } else {
+                    session.worktrees[group].active_tab
+                };
+                if graft(&sid, group, tab_index, session, panes, cfg, center, None) {
                     adopted += 1;
                     changed = true;
                     *need_relayout = true;
@@ -323,7 +322,8 @@ mod tests {
             AdoptPlan::Graft {
                 session: "s1".into(),
                 group: 1,
-                focus: true
+                focus: true,
+                tab: false
             }
         );
     }
@@ -336,7 +336,8 @@ mod tests {
             AdoptPlan::Graft {
                 session: "s1".into(),
                 group: 1,
-                focus: false
+                focus: false,
+                tab: false
             },
             "focus defaults false so a fan-out never yanks the user away"
         );

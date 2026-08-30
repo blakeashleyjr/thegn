@@ -18,7 +18,10 @@ use termwiz::surface::Surface;
 use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
-use crate::pr_view::{diff_line, file_stat, sel_marker, trunc};
+use crate::review_rows::{
+    ReviewRow, expanded_file_rows, feedback_rows, file_stat, render_review_row, sel_marker,
+    top_level_feedback_lines,
+};
 use crate::seg::{Line, Tok, Under, seg};
 use thegn_core::ansi_cells::StyledLine;
 use thegn_core::forge::model::{DiffLine, PrDiff};
@@ -37,6 +40,8 @@ pub struct DiffViewData {
     /// `Some(Ok(lines))` renders structurally, `Some(Err(notice))` falls back to
     /// the internal view with the notice, `None` = structural was not attempted.
     pub structural: Option<StructuralResult>,
+    pub review: Option<thegn_core::review::PrReviewSnapshot>,
+    pub review_status: Option<String>,
 }
 
 /// What a key delivered to the view meant.
@@ -68,6 +73,15 @@ pub struct DiffView {
     show_structural: bool,
     /// Independent scroll for the flat structural pane.
     structural_scroll: std::cell::Cell<usize>,
+    review: Option<thegn_core::review::PrReviewSnapshot>,
+    review_status: Option<String>,
+    source: DiffSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffSource {
+    Worktree,
+    PrReview,
 }
 
 impl DiffView {
@@ -84,9 +98,12 @@ impl DiffView {
             open_file: None,
             want_structural,
             structural: None,
+            review: None,
+            review_status: None,
             // Prefer structural when it was requested; a failure flips this off.
             show_structural: want_structural,
             structural_scroll: std::cell::Cell::new(0),
+            source: DiffSource::Worktree,
         }
     }
 
@@ -101,10 +118,32 @@ impl DiffView {
             }
             self.structural = Some(structural);
         }
+        if let Some(review) = data.review {
+            self.set_review(Some(review), data.review_status.clone());
+        }
+        self.review_status = data.review_status;
         let n = self.row_count();
         if self.sel >= n {
             self.sel = n.saturating_sub(1);
         }
+    }
+
+    pub fn set_review(
+        &mut self,
+        review: Option<thegn_core::review::PrReviewSnapshot>,
+        status: Option<String>,
+    ) -> bool {
+        let source_changed = review.is_none() && self.source == DiffSource::PrReview;
+        let changed = self.review != review || self.review_status != status || source_changed;
+        if source_changed {
+            self.source = DiffSource::Worktree;
+            self.open_file = None;
+            self.sel = 0;
+            self.scroll.set(0);
+        }
+        self.review = review;
+        self.review_status = status;
+        changed
     }
 
     /// Whether the structural pane is currently the active render.
@@ -116,15 +155,46 @@ impl DiffView {
 
     fn row_count(&self) -> usize {
         match self.open_file {
-            None => self.diff.as_ref().map_or(0, |d| d.files.len()),
-            Some(i) => self.open_file_lines(i).len(),
+            None => {
+                self.active_diff().map_or(0, |d| d.files.len())
+                    + if self.source == DiffSource::PrReview {
+                        self.anchored_review()
+                            .map_or(0, |review| feedback_rows(&review, false).len())
+                    } else {
+                        0
+                    }
+            }
+            Some(i) => {
+                if self.source == DiffSource::PrReview {
+                    self.active_diff()
+                        .and_then(|d| d.files.get(i))
+                        .map(|file| {
+                            expanded_file_rows(file, self.anchored_review().as_ref(), false).len()
+                        })
+                        .unwrap_or(0)
+                } else {
+                    self.open_file_lines(i).len()
+                }
+            }
         }
+    }
+
+    fn active_diff(&self) -> Option<&PrDiff> {
+        match self.source {
+            DiffSource::Worktree => self.diff.as_ref(),
+            DiffSource::PrReview => self.review.as_ref().map(|r| &r.diff),
+        }
+    }
+
+    fn anchored_review(&self) -> Option<thegn_core::review::AnchoredReview> {
+        self.review.as_ref().map(|snapshot| {
+            thegn_core::review::anchor_threads(&snapshot.diff, &snapshot.conversation.threads)
+        })
     }
 
     /// The flattened diff lines of file `i` (the open-file selectable rows).
     fn open_file_lines(&self, i: usize) -> Vec<&DiffLine> {
-        self.diff
-            .as_ref()
+        self.active_diff()
             .and_then(|d| d.files.get(i))
             .map(|f| f.hunks.iter().flat_map(|h| &h.lines).collect())
             .unwrap_or_default()
@@ -157,6 +227,19 @@ impl DiffView {
         // unified view — live only when a structural render actually loaded.
         if matches!(key, KeyCode::Char('t' | 'T')) && matches!(self.structural, Some(Ok(_))) {
             self.show_structural = !self.show_structural;
+            return DiffViewOutcome::Pending;
+        }
+        // Structural output is a complete rendered view of the worktree. Do
+        // not let the source label switch underneath it; return to the
+        // internal view first, then Tab can select the PR projection.
+        if matches!(key, KeyCode::Tab) && self.review.is_some() && !self.structural_active() {
+            self.source = match self.source {
+                DiffSource::Worktree => DiffSource::PrReview,
+                DiffSource::PrReview => DiffSource::Worktree,
+            };
+            self.open_file = None;
+            self.sel = 0;
+            self.scroll.set(0);
             return DiffViewOutcome::Pending;
         }
         // The structural pane is a flat scrollable blob: movement scrolls it, and
@@ -214,7 +297,7 @@ impl DiffView {
             }
             KeyCode::Enter | KeyCode::RightArrow => {
                 if self.open_file.is_none()
-                    && self.diff.as_ref().is_some_and(|d| self.sel < d.files.len())
+                    && self.active_diff().is_some_and(|d| self.sel < d.files.len())
                 {
                     self.open_file = Some(self.sel);
                     self.sel = 0;
@@ -324,20 +407,53 @@ impl DiffView {
     fn footer(&self) -> Line {
         // Offer the toggle only when a structural render actually loaded.
         let toggle = matches!(self.structural, Some(Ok(_)));
+        let glyphs = crate::caps::active_glyphs();
+        let movement = format!("{}{}", glyphs.arrow_up, glyphs.arrow_down);
+        let separator = format!(" {} ", glyphs.middot);
         let hint = if self.structural_active() {
             if toggle {
-                "↑↓ scroll · t internal · q/esc close"
+                [
+                    format!("{movement} scroll"),
+                    "t internal".into(),
+                    "q/esc close".into(),
+                ]
+                .join(&separator)
             } else {
-                "↑↓ scroll · q/esc close"
+                [format!("{movement} scroll"), "q/esc close".into()].join(&separator)
             }
         } else if self.open_file.is_some() {
-            "↑↓ move · ← back · q/esc close"
-        } else if toggle {
-            "↑↓ move · Enter open · t structural · q/esc close"
+            [
+                format!("{movement} move"),
+                "Left back".into(),
+                "q/esc close".into(),
+            ]
+            .join(&separator)
         } else {
-            "↑↓ move · Enter open file · q/esc close"
+            let mut actions = vec![format!("{movement} move"), "Enter open file".into()];
+            if self.review.is_some() {
+                actions.push("Tab source".into());
+            }
+            if toggle {
+                actions.push("t structural".into());
+            }
+            actions.push("q/esc close".into());
+            actions.join(&separator)
         };
-        Line::segs(vec![seg(Tok::Slot(S::Dim), hint)])
+        let source = match self.source {
+            DiffSource::Worktree => "Worktree",
+            DiffSource::PrReview => "PR review",
+        };
+        let availability = self.review_status.as_deref().unwrap_or_else(|| {
+            if self.review.is_none() {
+                "PR review loading or unavailable"
+            } else {
+                ""
+            }
+        });
+        Line::segs(vec![seg(
+            Tok::Slot(S::Dim),
+            format!("{source}{separator}{hint} {availability}"),
+        )])
     }
 
     fn body_lines(&self, cols: usize) -> Vec<(Line, bool)> {
@@ -353,7 +469,7 @@ impl DiffView {
             ));
             out.push((Line::Blank, false));
         }
-        let Some(diff) = &self.diff else {
+        let Some(diff) = self.active_diff() else {
             let msg = if self.want_structural && self.structural.is_none() {
                 "Loading structural diff…"
             } else {
@@ -370,49 +486,93 @@ impl DiffView {
                 )]),
                 false,
             ));
-            return out;
-        }
-        match self.open_file {
-            None => {
-                for (i, f) in diff.files.iter().enumerate() {
-                    let selected = i == self.sel;
-                    let (adds, dels) = file_stat(f);
-                    out.push((
-                        Line::split(
-                            vec![
-                                seg(Tok::Slot(S::Faint), sel_marker(selected)),
-                                seg(Tok::Slot(S::Text), f.path.clone()),
-                            ],
-                            vec![
-                                seg(Tok::Hue(thegn_core::theme::Hue::Green), format!("+{adds} ")),
-                                seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
-                            ],
-                        ),
-                        selected,
-                    ));
-                }
+            if self.source == DiffSource::Worktree {
+                return out;
             }
-            Some(fi) => {
-                if let Some(f) = diff.files.get(fi) {
-                    out.push((
-                        Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
-                        false,
-                    ));
-                    let mut li = 0usize; // index into flattened selectable lines
-                    for h in &f.hunks {
+        } else {
+            match self.open_file {
+                None => {
+                    for (i, f) in diff.files.iter().enumerate() {
+                        let selected = i == self.sel;
+                        let (adds, dels) = file_stat(f);
                         out.push((
-                            Line::segs(vec![seg(
-                                Tok::Hue(thegn_core::theme::Hue::Teal),
-                                trunc(&h.header, cols),
-                            )]),
+                            Line::split(
+                                vec![
+                                    seg(Tok::Slot(S::Faint), sel_marker(selected)),
+                                    seg(Tok::Slot(S::Text), f.path.clone()),
+                                ],
+                                vec![
+                                    seg(
+                                        Tok::Hue(thegn_core::theme::Hue::Green),
+                                        format!("+{adds} "),
+                                    ),
+                                    seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
+                                ],
+                            ),
+                            selected,
+                        ));
+                    }
+                }
+                Some(fi) => {
+                    if let Some(f) = diff.files.get(fi) {
+                        out.push((
+                            Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
                             false,
                         ));
-                        for dl in &h.lines {
-                            let selected = li == self.sel;
-                            out.push((diff_line(dl, selected, cols), selected));
-                            li += 1;
+                        if self.source == DiffSource::PrReview {
+                            let review = self.anchored_review();
+                            for (ri, row) in expanded_file_rows(f, review.as_ref(), false)
+                                .into_iter()
+                                .enumerate()
+                            {
+                                let selected = ri == self.sel;
+                                out.extend(crate::review_rows::render_review_row(
+                                    &row, selected, cols,
+                                ));
+                            }
+                        } else {
+                            // Preserve the original Worktree selection model:
+                            // hunk headers render, but only diff lines consume
+                            // cursor indices. PR review rows use their separate
+                            // shared selectable projection above.
+                            let mut line_index = 0usize;
+                            for hunk in &f.hunks {
+                                out.extend(crate::review_rows::render_review_row(
+                                    &ReviewRow::Hunk(hunk.header.clone()),
+                                    false,
+                                    cols,
+                                ));
+                                for line in &hunk.lines {
+                                    let selected = line_index == self.sel;
+                                    out.extend(crate::review_rows::render_review_row(
+                                        &ReviewRow::Diff(line.clone()),
+                                        selected,
+                                        cols,
+                                    ));
+                                    line_index += 1;
+                                }
+                            }
                         }
                     }
+                }
+            }
+        }
+        if self.source == DiffSource::PrReview {
+            let snapshot = self.review.as_ref();
+            if let Some(snapshot) = snapshot {
+                out.extend(top_level_feedback_lines(&snapshot.conversation, cols));
+            }
+            if self.open_file.is_none() {
+                for (i, row) in self
+                    .anchored_review()
+                    .map_or_else(Vec::new, |review| feedback_rows(&review, false))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let selected = self
+                        .active_diff()
+                        .is_some_and(|diff| diff.files.len() + i == self.sel);
+                    out.extend(render_review_row(&row, selected, cols));
                 }
             }
         }
@@ -458,7 +618,9 @@ fn structural_line(styled: &StyledLine) -> Line {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::forge::model::{DiffFile, DiffHunk, DiffLineKind};
+    use thegn_core::forge::model::{
+        DiffFile, DiffHunk, DiffLineKind, PrComment, PrConversation, PrReview, ReviewThread,
+    };
 
     fn line(kind: DiffLineKind, text: &str) -> DiffLine {
         DiffLine {
@@ -499,6 +661,8 @@ mod tests {
             generation: 1,
             diff: Some(sample()),
             structural: None,
+            review: None,
+            review_status: None,
         });
         // File list: two files.
         assert_eq!(v.row_count(), 2);
@@ -519,6 +683,8 @@ mod tests {
             generation: 1,
             diff: Some(sample()),
             structural: None,
+            review: None,
+            review_status: None,
         });
         v.handle_key(&KeyCode::Enter, Modifiers::NONE);
         assert_eq!(v.open_file, Some(0));
@@ -553,6 +719,8 @@ mod tests {
             generation: 1,
             diff: Some(sample()),
             structural: Some(Ok(vec![styled("fn add"), styled("fn sub")])),
+            review: None,
+            review_status: None,
         });
         // Requested + loaded ⇒ structural is the active render.
         assert!(v.structural_active());
@@ -574,6 +742,8 @@ mod tests {
             generation: 1,
             diff: Some(sample()),
             structural: Some(Err("difft timed out".into())),
+            review: None,
+            review_status: None,
         });
         // A failure never leaves the view structural — the internal view renders.
         assert!(!v.structural_active());
@@ -586,5 +756,291 @@ mod tests {
         // The toggle is inert (no structural render to switch to).
         v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
         assert!(!v.structural_active());
+    }
+
+    #[test]
+    fn structural_mode_keeps_the_worktree_source_label_pair() {
+        let mut v = DiffView::with_structural("t".into(), 1, true);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: Some(Ok(vec![styled("fn add")])),
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: sample(),
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+
+        assert!(v.structural_active());
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.source, DiffSource::Worktree);
+        assert!(v.structural_active());
+        assert!(format!("{:?}", v.footer()).contains("Worktree"));
+
+        v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.source, DiffSource::PrReview);
+        assert!(!v.structural_active());
+        assert!(format!("{:?}", v.footer()).contains("PR review"));
+    }
+
+    #[test]
+    fn late_review_delivery_can_switch_an_already_open_view() {
+        let review_diff = sample();
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        assert_eq!(v.row_count(), 2, "the worktree diff is available first");
+        let unavailable = format!("{:?}", v.footer());
+        assert!(unavailable.contains("PR review loading or unavailable"));
+        assert!(!unavailable.contains("Tab source"));
+
+        assert!(v.set_review(
+            Some(thegn_core::review::PrReviewSnapshot {
+                diff: review_diff,
+                ..Default::default()
+            }),
+            None,
+        ));
+        assert!(format!("{:?}", v.footer()).contains("Tab source"));
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+
+        assert_eq!(v.source, DiffSource::PrReview);
+        assert_eq!(
+            v.row_count(),
+            2,
+            "the PR diff arrived without losing the view"
+        );
+    }
+
+    #[test]
+    fn stale_review_delivery_clears_the_pr_source_and_keeps_worktree_diff() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: sample(),
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.source, DiffSource::PrReview);
+
+        assert!(v.set_review(None, Some("stale PR review snapshot".into())));
+        assert_eq!(v.source, DiffSource::Worktree);
+        assert_eq!(v.row_count(), 2, "the local diff remains available");
+        assert!(format!("{:?}", v.footer()).contains("stale PR review snapshot"));
+    }
+
+    #[test]
+    fn worktree_rows_stay_file_only_and_pr_rows_have_no_invisible_feedback() {
+        let diff = sample();
+        let snapshot = thegn_core::review::PrReviewSnapshot {
+            diff: diff.clone(),
+            conversation: PrConversation {
+                threads: vec![ReviewThread {
+                    id: "general".into(),
+                    comments: vec![PrComment {
+                        author: "reviewer".into(),
+                        body: "general body".into(),
+                        ..PrComment::default()
+                    }],
+                    ..ReviewThread::default()
+                }],
+                ..PrConversation::default()
+            },
+            ..Default::default()
+        };
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(diff),
+            structural: None,
+            review: Some(snapshot),
+            review_status: None,
+        });
+
+        assert_eq!(v.row_count(), 2, "Worktree has only its two file rows");
+        let worktree_body = format!("{:?}", v.body_lines(80));
+        assert!(!worktree_body.contains("general body"));
+
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(
+            v.row_count(),
+            3,
+            "PR list has two files plus one feedback row"
+        );
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.open_file, Some(0));
+        assert_eq!(v.row_count(), 4, "expanded PR rows match their renderer");
+        let expanded_body = format!("{:?}", v.body_lines(80));
+        assert!(expanded_body.contains("general body"));
+    }
+
+    #[test]
+    fn worktree_hunk_headers_do_not_shift_the_diff_line_selection() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+
+        let first = format!(
+            "{:?}",
+            v.body_lines(80)
+                .into_iter()
+                .find(|(_, selected)| *selected)
+                .map(|(line, _)| line)
+        );
+        assert!(first.contains("ctx"));
+        assert!(!first.contains("@@"));
+
+        v.handle_key(&KeyCode::Char('G'), Modifiers::NONE);
+        let last = format!(
+            "{:?}",
+            v.body_lines(80)
+                .into_iter()
+                .find(|(_, selected)| *selected)
+                .map(|(line, _)| line)
+        );
+        assert!(last.contains("new"));
+    }
+
+    #[test]
+    fn empty_pr_diff_still_renders_top_level_and_general_feedback() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: PrDiff::default(),
+                conversation: PrConversation {
+                    comments: vec![PrComment {
+                        author: "commenter".into(),
+                        body: "top-level body".into(),
+                        ..PrComment::default()
+                    }],
+                    threads: vec![ReviewThread {
+                        id: "general".into(),
+                        comments: vec![PrComment {
+                            author: "reviewer".into(),
+                            body: "general body".into(),
+                            ..PrComment::default()
+                        }],
+                        ..ReviewThread::default()
+                    }],
+                    ..PrConversation::default()
+                },
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+
+        assert_eq!(v.row_count(), 1);
+        let body = format!("{:?}", v.body_lines(80));
+        assert!(body.contains("top-level body"));
+        assert!(body.contains("general body"));
+    }
+
+    #[test]
+    fn pr_review_diff_renders_comments_and_submitted_reviews() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff: sample(),
+                conversation: PrConversation {
+                    comments: vec![PrComment {
+                        author: "commenter".into(),
+                        body: "top-level comment".into(),
+                        ..PrComment::default()
+                    }],
+                    reviews: vec![PrReview {
+                        author: "approver".into(),
+                        state: "APPROVED".into(),
+                        body: "submitted review".into(),
+                        ..PrReview::default()
+                    }],
+                    ..PrConversation::default()
+                },
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+
+        let rendered = format!("{:?}", v.body_lines(80));
+        assert!(rendered.contains("top-level comment"));
+        assert!(rendered.contains("submitted review"));
+    }
+
+    #[test]
+    fn pr_review_projection_renders_every_comment_in_a_thread() {
+        let thread = ReviewThread {
+            id: "thread".into(),
+            path: "a.rs".into(),
+            line: Some(1),
+            comments: vec![
+                PrComment {
+                    author: "alice".into(),
+                    body: "first body".into(),
+                    ..PrComment::default()
+                },
+                PrComment {
+                    author: "bob".into(),
+                    body: "second body".into(),
+                    ..PrComment::default()
+                },
+            ],
+            ..ReviewThread::default()
+        };
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "a.rs".into(),
+                old_path: None,
+                hunks: vec![DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![line(DiffLineKind::Add, "new")],
+                }],
+            }],
+        };
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: None,
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff,
+                conversation: PrConversation {
+                    threads: vec![thread],
+                    ..PrConversation::default()
+                },
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+
+        let rendered = format!("{:?}", v.body_lines(80));
+        assert!(rendered.contains("first body"));
+        assert!(rendered.contains("second body"));
     }
 }
