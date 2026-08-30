@@ -93,26 +93,25 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
                 continue;
             }
         };
-        let mut packages = Vec::new();
-        for entry in entries {
-            match entry {
-                Ok(entry) => packages.push(entry),
-                Err(error) => {
-                    complete = false;
-                    diagnostics.push(format!("{}: {error}", dir.display()));
-                }
-            }
-        }
-        packages.sort_by_key(std::fs::DirEntry::file_name);
+        let mut packages: Vec<_> = entries.take(MAX_PACKAGES_PER_DIR + 1).collect();
         if packages.len() > MAX_PACKAGES_PER_DIR {
             complete = false;
             diagnostics.push(format!(
-                "{}: only the first {MAX_PACKAGES_PER_DIR} immediate packages are inspected",
+                "{}: more than {MAX_PACKAGES_PER_DIR} immediate packages; directory skipped",
                 dir.display()
             ));
-            packages.truncate(MAX_PACKAGES_PER_DIR);
+            continue;
         }
+        packages.sort_by_key(|entry| entry.as_ref().ok().map(std::fs::DirEntry::file_name));
         for entry in packages {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    complete = false;
+                    diagnostics.push(format!("{}: {error}", dir.display()));
+                    continue;
+                }
+            };
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
@@ -296,18 +295,23 @@ pub(crate) fn survey_skill_root(root: &Path) -> Result<SkillSurvey, String> {
         });
     }
     let entries = std::fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
-    let mut entries: Vec<_> = entries.collect();
-    entries.sort_by_key(|entry| entry.as_ref().ok().map(std::fs::DirEntry::file_name));
+    let mut entries: Vec<_> = entries.take(MAX_PACKAGES_PER_DIR + 1).collect();
     let mut files = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut complete = entries.len() <= MAX_PACKAGES_PER_DIR;
-    if !complete {
+    if entries.len() > MAX_PACKAGES_PER_DIR {
         diagnostics.push(format!(
-            "{}: only the first {MAX_PACKAGES_PER_DIR} immediate packages are surveyed",
+            "{}: more than {MAX_PACKAGES_PER_DIR} immediate packages; target preserved",
             root.display()
         ));
-        entries.truncate(MAX_PACKAGES_PER_DIR);
+        return Ok(SkillSurvey {
+            files,
+            diagnostics,
+            directory_found,
+            complete: false,
+        });
     }
+    entries.sort_by_key(|entry| entry.as_ref().ok().map(std::fs::DirEntry::file_name));
+    let mut complete = true;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -992,6 +996,23 @@ mod tests {
         let exclude = std::fs::read_to_string(wt.path().join(".git/info/exclude")).unwrap();
         assert!(!exclude.contains(".claude/skills/supervise/"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "user-owned skill\n");
+    }
+
+    #[test]
+    fn oversized_skill_root_is_bounded_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_PACKAGES_PER_DIR {
+            std::fs::write(root.path().join(format!("entry-{index:04}")), []).unwrap();
+        }
+        let survey = survey_skill_root(root.path()).unwrap();
+        assert!(!survey.complete);
+        assert!(survey.files.is_empty());
+        assert!(
+            survey
+                .diagnostics
+                .iter()
+                .any(|row| row.contains("target preserved"))
+        );
     }
 
     #[test]
