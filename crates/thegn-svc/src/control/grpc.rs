@@ -16,7 +16,7 @@ use tonic::{Request, Response, Status};
 
 use thegn_core::control::{Scope, Verb, required_scope};
 use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
-use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
+use thegn_core::control_wire::{EventFrame, FeedFilter, LeaseEventKind, PairingState};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
@@ -209,6 +209,7 @@ pub fn frame_to_proto(frame: &EventFrame) -> proto::Event {
             session: session.clone(),
             code: *code,
         }),
+        EventFrame::Lagged { missed } => Kind::Lagged(proto::Lagged { missed: *missed }),
     };
     proto::Event {
         seq: match frame {
@@ -714,6 +715,13 @@ impl Control for GrpcControl {
         req: Request<proto::EventsRequest>,
     ) -> Result<Response<Self::EventsStream>, Status> {
         let ctx = self.authed(&req, Verb::Events)?;
+        let request = req.into_inner();
+        let filter = FeedFilter::from_parts(
+            (!request.kinds.is_empty()).then_some(request.kinds),
+            (!request.session.is_empty()).then_some(request.session),
+            request.signal_lag,
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let hello = frame_to_proto(&EventFrame::Hello(thegn_core::control_wire::Hello {
             proto: thegn_core::control_wire::PROTO_VERSION,
             server: self.server_label.clone(),
@@ -728,12 +736,22 @@ impl Control for GrpcControl {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
-                        if tx.send(Ok(frame_to_proto(&frame))).await.is_err() {
+                        if filter.matches(&frame)
+                            && tx.send(Ok(frame_to_proto(&frame))).await.is_err()
+                        {
                             return;
                         }
                     }
-                    // A lagged monitor skips events; pane bytes ride Attach.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        if filter.signal_lag
+                            && tx
+                                .send(Ok(frame_to_proto(&EventFrame::Lagged { missed })))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -1005,6 +1023,7 @@ mod tests {
                 session: x.session.clone(),
                 code: x.code,
             },
+            Kind::Lagged(l) => EventFrame::Lagged { missed: l.missed },
         }
     }
 
@@ -1051,6 +1070,7 @@ mod tests {
                 session: "s".into(),
                 code: None,
             },
+            EventFrame::Lagged { missed: 4 },
         ];
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");
