@@ -380,9 +380,12 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             worktree.display()
         );
     }
-    if !worktree.join(".git").exists() {
+    let canonical_worktree = std::fs::canonicalize(worktree)?;
+    if thegn_core::repo::worktree_root_for_cwd(&canonical_worktree).as_deref()
+        != Some(canonical_worktree.as_path())
+    {
         bail!(
-            "skills seed target is not a git worktree: {}",
+            "skills seed target is not a git worktree root: {}",
             worktree.display()
         );
     }
@@ -390,6 +393,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
     let (harnesses, mut diagnostics) = configured_harnesses(cfg);
     diagnostics.extend(loaded.diagnostics);
     let mut files = Vec::new();
+    let mut access_failures = Vec::new();
     let excludes: BTreeSet<String> = cfg.skills.exclude.iter().cloned().collect();
 
     for harness_id in harnesses {
@@ -407,6 +411,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             Ok(root) => root,
             Err(error) => {
                 diagnostics.push(format!("{harness_id}: {error}"));
+                access_failures.push(format!("{harness_id}: {error}"));
                 continue;
             }
         };
@@ -414,6 +419,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             Ok(survey) => survey,
             Err(error) => {
                 diagnostics.push(format!("{harness_id}: {error}"));
+                access_failures.push(format!("{harness_id}: {error}"));
                 continue;
             }
         };
@@ -447,6 +453,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
                 .map(|d| format!("{harness_id}: {d}")),
         );
         let mut managed_patterns = BTreeSet::new();
+        let mut user_patterns = BTreeSet::new();
         for entry in plan.unchanged {
             managed_patterns.insert(skill_exclude_pattern(layout.project_root, &entry.relative));
             files.push(result_row(
@@ -457,6 +464,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             ));
         }
         for entry in plan.skipped_unmarked {
+            user_patterns.insert(skill_exclude_pattern(layout.project_root, &entry.relative));
             files.push(result_row(
                 &harness_id,
                 layout.project_root,
@@ -465,6 +473,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             ));
         }
         for entry in plan.skipped_adopted {
+            user_patterns.insert(skill_exclude_pattern(layout.project_root, &entry.relative));
             files.push(result_row(
                 &harness_id,
                 layout.project_root,
@@ -491,7 +500,11 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
                         status,
                     ));
                 }
-                Err(error) => diagnostics.push(format!("{}: {error}", dest.display())),
+                Err(error) => {
+                    let message = format!("{}: {error}", dest.display());
+                    diagnostics.push(message.clone());
+                    access_failures.push(message);
+                }
             }
         }
         for operation in plan.removed_managed {
@@ -511,15 +524,33 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
                         },
                     ));
                 }
-                Err(error) => diagnostics.push(format!("{}: {error}", dest.display())),
+                Err(error) => {
+                    let message = format!("{}: {error}", dest.display());
+                    diagnostics.push(message.clone());
+                    access_failures.push(message);
+                }
             }
         }
 
         if harness_id == "claude" {
-            seed_mq_commands(cfg, worktree, &excludes, &mut files, &mut diagnostics);
+            seed_mq_commands(
+                cfg,
+                worktree,
+                &excludes,
+                &mut files,
+                &mut diagnostics,
+                &mut access_failures,
+            );
         }
 
-        exclude_locally(worktree, managed_patterns, &mut diagnostics);
+        exclude_locally(worktree, managed_patterns, user_patterns, &mut diagnostics);
+    }
+
+    if !access_failures.is_empty() {
+        bail!(
+            "skills seed could not access target: {}",
+            access_failures.join("; ")
+        );
     }
 
     files.sort_by(|a, b| (&a.harness, &a.path, &a.status).cmp(&(&b.harness, &b.path, &b.status)));
@@ -553,6 +584,7 @@ fn seed_mq_commands(
     excludes: &BTreeSet<String>,
     files: &mut Vec<SeedFileResult>,
     diagnostics: &mut Vec<String>,
+    access_failures: &mut Vec<String>,
 ) {
     let mut managed_patterns = Vec::new();
     for command in MQ_COMMANDS {
@@ -563,13 +595,17 @@ fn seed_mq_commands(
             Ok(_) => match read_bounded(&dest) {
                 Ok(bytes) => Some(bytes),
                 Err(error) => {
-                    diagnostics.push(format!("{}: {error}", dest.display()));
+                    let message = format!("{}: {error}", dest.display());
+                    diagnostics.push(message.clone());
+                    access_failures.push(message);
                     Some(Vec::new())
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                diagnostics.push(format!("{}: {error}", dest.display()));
+                let message = format!("{}: {error}", dest.display());
+                diagnostics.push(message.clone());
+                access_failures.push(message);
                 Some(Vec::new())
             }
         };
@@ -585,7 +621,11 @@ fn seed_mq_commands(
                         path: command.relative.into(),
                         status: "removed_excluded".into(),
                     }),
-                    Err(error) => diagnostics.push(format!("{}: {error}", dest.display())),
+                    Err(error) => {
+                        let message = format!("{}: {error}", dest.display());
+                        diagnostics.push(message.clone());
+                        access_failures.push(message);
+                    }
                 }
             }
             continue;
@@ -637,14 +677,18 @@ fn seed_mq_commands(
                         status: status.into(),
                     });
                 }
-                Err(error) => diagnostics.push(format!("{}: {error}", dest.display())),
+                Err(error) => {
+                    let message = format!("{}: {error}", dest.display());
+                    diagnostics.push(message.clone());
+                    access_failures.push(message);
+                }
             }
         }
         if managed_path {
             managed_patterns.push(command.relative.to_string());
         }
     }
-    exclude_locally(worktree, managed_patterns, diagnostics);
+    exclude_locally(worktree, managed_patterns, std::iter::empty(), diagnostics);
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -678,14 +722,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         ".{name}.thegn-skill.{}.{nanos}.tmp",
         std::process::id()
     ));
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp); // best-effort: remove our incomplete temp file
+        return Err(error);
     }
+    drop(file);
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions()); // best-effort: preserve existing permissions where supported
     }
@@ -700,20 +746,42 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn exclude_locally(
     worktree: &Path,
-    patterns: impl IntoIterator<Item = String>,
+    add_patterns: impl IntoIterator<Item = String>,
+    remove_patterns: impl IntoIterator<Item = String>,
     diagnostics: &mut Vec<String>,
 ) {
     let exclude = thegn_core::util::git_common_dir(worktree)
         .join("info")
         .join("exclude");
-    let contents = std::fs::read_to_string(&exclude).unwrap_or_default();
-    let mut missing: Vec<String> = patterns
+    if std::fs::symlink_metadata(&exclude).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        diagnostics.push(format!(
+            "{}: is a symlink; local excludes skipped",
+            exclude.display()
+        ));
+        return;
+    }
+    let contents = match std::fs::read_to_string(&exclude) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            diagnostics.push(format!("{}: {error}", exclude.display()));
+            return;
+        }
+    };
+    let remove: BTreeSet<String> = remove_patterns.into_iter().collect();
+    let mut updated = String::with_capacity(contents.len());
+    for line in contents.split_inclusive('\n') {
+        if !remove.contains(line.trim()) {
+            updated.push_str(line);
+        }
+    }
+    let mut missing: Vec<String> = add_patterns
         .into_iter()
-        .filter(|pattern| !contents.lines().any(|line| line.trim() == pattern))
+        .filter(|pattern| !updated.lines().any(|line| line.trim() == pattern))
         .collect();
     missing.sort();
     missing.dedup();
-    if missing.is_empty() {
+    if missing.is_empty() && updated == contents {
         return;
     }
     if let Some(parent) = exclude.parent()
@@ -722,29 +790,15 @@ fn exclude_locally(
         diagnostics.push(format!("{}: {error}", parent.display()));
         return;
     }
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&exclude);
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(error) => {
-            diagnostics.push(format!("{}: {error}", exclude.display()));
-            return;
-        }
-    };
-    if !contents.is_empty()
-        && !contents.ends_with('\n')
-        && let Err(error) = writeln!(file)
-    {
-        diagnostics.push(format!("{}: {error}", exclude.display()));
-        return;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
     }
     for pattern in missing {
-        if let Err(error) = writeln!(file, "{pattern}") {
-            diagnostics.push(format!("{}: {error}", exclude.display()));
-            break;
-        }
+        updated.push_str(&pattern);
+        updated.push('\n');
+    }
+    if let Err(error) = atomic_write(&exclude, updated.as_bytes()) {
+        diagnostics.push(format!("{}: {error}", exclude.display()));
     }
 }
 
@@ -895,7 +949,12 @@ mod tests {
 
     fn worktree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
         std::fs::write(dir.path().join(".git/info/exclude"), "# local\n").unwrap();
         dir
     }
@@ -988,6 +1047,11 @@ mod tests {
         let path = wt.path().join(".claude/skills/supervise/SKILL.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "user-owned skill\n").unwrap();
+        std::fs::write(
+            wt.path().join(".git/info/exclude"),
+            "# local\n.claude/skills/supervise/\n",
+        )
+        .unwrap();
 
         let report = seed(&Config::default(), wt.path(), SeedPhase::Explicit).unwrap();
         assert!(report.files.iter().any(|row| {
@@ -1053,6 +1117,24 @@ mod tests {
         let error = seed(&Config::default(), directory.path(), SeedPhase::Explicit).unwrap_err();
         assert!(error.to_string().contains("not a git worktree"));
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn explicit_seed_rejects_a_fake_dot_git_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let error = seed(&Config::default(), directory.path(), SeedPhase::Explicit).unwrap_err();
+        assert!(error.to_string().contains("not a git worktree root"));
+        assert!(!directory.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn explicit_seed_propagates_an_inaccessible_layout_root() {
+        let wt = worktree();
+        std::fs::write(wt.path().join(".claude"), "blocks the skill directory").unwrap();
+        let error = seed(&Config::default(), wt.path(), SeedPhase::Explicit).unwrap_err();
+        assert!(error.to_string().contains("could not access target"));
+        assert!(error.to_string().contains("claude"));
     }
 
     /// Shipped prose is operational UI: every fenced command must continue to
