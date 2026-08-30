@@ -190,6 +190,34 @@
       ],
       "type": "object"
     },
+    "FeedFilter": {
+      "description": "Per-connection narrowing options for the control event feed.\n\nAn absent `kinds` or `session` field means no narrowing. The transport adapters parse their query/request representation through [`Self::parse`] or [`Self::from_parts`] before creating a subscription.",
+      "properties": {
+        "kinds": {
+          "description": "A subset of [`FEED_KINDS`]. `None` means every kind.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "session": {
+          "description": "Limit session-keyed frames to this session. Unkeyed frames still pass.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signal_lag": {
+          "default": false,
+          "description": "Emit [`EventFrame::Lagged`] when the bounded broadcast reports loss.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "GitFileStatus": {
       "description": "One changed file in a worktree (the mobile stage/commit contract).",
       "properties": {
@@ -1029,6 +1057,9 @@
     },
     "ErrorBody": {
       "$ref": "#/definitions/ErrorBody"
+    },
+    "FeedFilter": {
+      "$ref": "#/definitions/FeedFilter"
     },
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"

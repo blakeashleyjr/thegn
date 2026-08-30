@@ -33,6 +33,15 @@ const T_LEASE: u8 = 4;
 const T_PAIRING: u8 = 5;
 const T_SESSIONS: u8 = 6;
 const T_EXIT: u8 = 7;
+const T_LAGGED: u8 = 8;
+
+/// The maximum number of bytes accepted for a session filter.
+pub const MAX_FEED_SESSION_LEN: usize = 256;
+
+/// The stable names used by the control event feed.
+pub const FEED_KINDS: &[&str] = &[
+    "hello", "snapshot", "delta", "activity", "lease", "pairing", "sessions", "exit", "lagged",
+];
 
 /// Server greeting on a fresh event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +102,11 @@ struct ExitBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LaggedBody {
+    missed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PairingBody {
     pairing_id: String,
     label: String,
@@ -143,6 +157,159 @@ pub enum EventFrame {
         session: String,
         code: Option<i32>,
     },
+    /// A subscriber fell behind the bounded broadcast by `missed` frames.
+    /// This is emitted only when the subscription opts into lag signaling.
+    Lagged {
+        missed: u64,
+    },
+}
+
+/// Per-connection narrowing options for the control event feed.
+///
+/// An absent `kinds` or `session` field means no narrowing. The transport
+/// adapters parse their query/request representation through [`Self::parse`]
+/// or [`Self::from_parts`] before creating a subscription.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeedFilter {
+    /// A subset of [`FEED_KINDS`]. `None` means every kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    /// Limit session-keyed frames to this session. Unkeyed frames still pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Emit [`EventFrame::Lagged`] when the bounded broadcast reports loss.
+    #[serde(default)]
+    pub signal_lag: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedFilterError {
+    EmptyKind,
+    UnknownKind(String),
+    TooManyKinds,
+    EmptySession,
+    SessionTooLong,
+}
+
+impl std::fmt::Display for FeedFilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyKind => write!(f, "event kind must not be empty"),
+            Self::UnknownKind(kind) => write!(f, "unknown event kind {kind:?}"),
+            Self::TooManyKinds => write!(f, "too many event kinds"),
+            Self::EmptySession => write!(f, "session filter must not be empty"),
+            Self::SessionTooLong => write!(
+                f,
+                "session filter exceeds {MAX_FEED_SESSION_LEN}-byte limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FeedFilterError {}
+
+impl FeedFilter {
+    /// Parse HTTP-style comma-separated kinds and optional session id.
+    pub fn parse(
+        kinds: Option<&str>,
+        session: Option<&str>,
+        signal_lag: bool,
+    ) -> Result<Self, FeedFilterError> {
+        let kinds = kinds.map(Self::parse_kinds).transpose()?.flatten();
+        Self::from_parts(kinds, session.map(str::to_string), signal_lag)
+    }
+
+    /// Validate gRPC-style repeated kind names and an optional session id.
+    pub fn from_parts(
+        kinds: Option<Vec<String>>,
+        session: Option<String>,
+        signal_lag: bool,
+    ) -> Result<Self, FeedFilterError> {
+        let kinds = kinds.map(Self::validated_kinds).transpose()?.flatten();
+        if let Some(session) = &session {
+            if session.is_empty() {
+                return Err(FeedFilterError::EmptySession);
+            }
+            if session.len() > MAX_FEED_SESSION_LEN {
+                return Err(FeedFilterError::SessionTooLong);
+            }
+        }
+        Ok(Self {
+            kinds,
+            session,
+            signal_lag,
+        })
+    }
+
+    fn validated_kinds(kinds: Vec<String>) -> Result<Option<Vec<String>>, FeedFilterError> {
+        if kinds.is_empty() {
+            return Err(FeedFilterError::EmptyKind);
+        }
+        if kinds.len() > FEED_KINDS.len() {
+            return Err(FeedFilterError::TooManyKinds);
+        }
+        let mut validated = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            if kind.is_empty() {
+                return Err(FeedFilterError::EmptyKind);
+            }
+            if !FEED_KINDS.contains(&kind.as_str()) {
+                return Err(FeedFilterError::UnknownKind(kind));
+            }
+            if !validated.iter().any(|seen| seen == &kind) {
+                validated.push(kind);
+            }
+        }
+        Ok(Some(validated))
+    }
+
+    fn parse_kinds(kinds: &str) -> Result<Option<Vec<String>>, FeedFilterError> {
+        let mut parsed = Vec::new();
+        for kind in kinds.split(',').map(str::trim) {
+            if parsed.len() >= FEED_KINDS.len() {
+                return Err(FeedFilterError::TooManyKinds);
+            }
+            if kind.is_empty() {
+                return Err(FeedFilterError::EmptyKind);
+            }
+            if !FEED_KINDS.contains(&kind) {
+                return Err(FeedFilterError::UnknownKind(kind.to_string()));
+            }
+            if !parsed.iter().any(|seen| seen == kind) {
+                parsed.push(kind.to_string());
+            }
+        }
+        Ok(Some(parsed))
+    }
+
+    /// Whether a frame should be delivered to this subscription.
+    pub fn matches(&self, frame: &EventFrame) -> bool {
+        // Every subscription receives the greeting, including a narrowed one.
+        if frame.kind() == "hello" {
+            return true;
+        }
+        if let Some(kinds) = &self.kinds
+            && !kinds.iter().any(|kind| kind == frame.kind())
+        {
+            return false;
+        }
+        let Some(wanted) = &self.session else {
+            return true;
+        };
+        match frame.session_id() {
+            Some(session) => session == wanted,
+            None => match frame {
+                // Activity payloads are intentionally opaque on the core wire,
+                // but the current event contract carries their session id.
+                EventFrame::Activity { json } => serde_json::from_str::<serde_json::Value>(json)
+                    .ok()
+                    .and_then(|value| value.get("session")?.as_str().map(str::to_string))
+                    .is_none_or(|session| session == *wanted),
+                // Unkeyed event families pass a session narrowing filter.
+                _ => true,
+            },
+        }
+    }
 }
 
 /// Why the decoder rejected the stream — fatal; tear the connection down.
@@ -216,6 +383,32 @@ fn decode_pane_payload(tag: u8, payload: &[u8]) -> Result<(PaneHeader, Vec<u8>),
 }
 
 impl EventFrame {
+    /// Stable frame-kind name shared by filters and all transport formatters.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello(_) => "hello",
+            Self::PaneSnapshot { .. } => "snapshot",
+            Self::PaneDelta { .. } => "delta",
+            Self::Activity { .. } => "activity",
+            Self::Lease { .. } => "lease",
+            Self::Pairing { .. } => "pairing",
+            Self::Sessions => "sessions",
+            Self::SessionExit { .. } => "exit",
+            Self::Lagged { .. } => "lagged",
+        }
+    }
+
+    /// Return the explicit session key carried by a frame, if it has one.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::PaneSnapshot { session, .. }
+            | Self::PaneDelta { session, .. }
+            | Self::Lease { session, .. }
+            | Self::SessionExit { session, .. } => Some(session),
+            _ => None,
+        }
+    }
+
     /// Serialize a frame to its wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let (tag, payload): (u8, Vec<u8>) = match self {
@@ -291,6 +484,10 @@ impl EventFrame {
                     code: *code,
                 })
                 .expect("exit json"),
+            ),
+            EventFrame::Lagged { missed } => (
+                T_LAGGED,
+                serde_json::to_vec(&LaggedBody { missed: *missed }).expect("lagged json"),
             ),
         };
         let mut out = Vec::with_capacity(5 + payload.len());
@@ -390,6 +587,11 @@ impl EventDecoder {
                     code: b.code,
                 }
             }
+            T_LAGGED => {
+                let b: LaggedBody = serde_json::from_slice(&payload)
+                    .map_err(|_| WireError::BadPayload(T_LAGGED))?;
+                EventFrame::Lagged { missed: b.missed }
+            }
             other => return Err(WireError::UnknownTag(other)),
         };
         Ok(Some(frame))
@@ -464,6 +666,7 @@ mod tests {
             session: "sess-2".into(),
             code: None,
         });
+        roundtrip(EventFrame::Lagged { missed: 17 });
     }
 
     #[test]
@@ -618,5 +821,116 @@ mod tests {
             seq: 7,
             bytes: all,
         });
+    }
+
+    #[test]
+    fn frame_kinds_are_the_filter_vocabulary() {
+        let frames = [
+            EventFrame::Hello(Hello {
+                proto: PROTO_VERSION,
+                server: "s".into(),
+                scopes: vec![],
+            }),
+            EventFrame::PaneSnapshot {
+                session: "s".into(),
+                seq: 1,
+                cols: 80,
+                rows: 24,
+                bytes: vec![],
+            },
+            EventFrame::PaneDelta {
+                session: "s".into(),
+                seq: 2,
+                bytes: vec![],
+            },
+            EventFrame::Activity { json: "{}".into() },
+            EventFrame::Lease {
+                session: "s".into(),
+                kind: LeaseEventKind::Opened,
+                expires_at: None,
+            },
+            EventFrame::Pairing {
+                pairing_id: "p".into(),
+                label: "l".into(),
+                scope: "read".into(),
+                state: PairingState::Requested,
+            },
+            EventFrame::Sessions,
+            EventFrame::SessionExit {
+                session: "s".into(),
+                code: None,
+            },
+            EventFrame::Lagged { missed: 1 },
+        ];
+        for frame in frames {
+            assert!(FEED_KINDS.contains(&frame.kind()));
+        }
+    }
+
+    #[test]
+    fn feed_filter_defaults_to_every_frame() {
+        let filter = FeedFilter::default();
+        assert!(filter.matches(&EventFrame::Sessions));
+        assert!(filter.matches(&EventFrame::PaneDelta {
+            session: "s".into(),
+            seq: 1,
+            bytes: vec![],
+        }));
+    }
+
+    #[test]
+    fn feed_filter_narrows_kinds_and_sessions() {
+        let filter = FeedFilter::parse(Some("activity,exit"), Some("s1"), false).unwrap();
+        assert!(filter.matches(&EventFrame::Activity {
+            json: r#"{"session":"s1","state":"working"}"#.into(),
+        }));
+        assert!(filter.matches(&EventFrame::SessionExit {
+            session: "s1".into(),
+            code: Some(0),
+        }));
+        assert!(!filter.matches(&EventFrame::SessionExit {
+            session: "s2".into(),
+            code: Some(0),
+        }));
+        assert!(!filter.matches(&EventFrame::Lease {
+            session: "s1".into(),
+            kind: LeaseEventKind::Opened,
+            expires_at: None,
+        }));
+        // The greeting is part of every subscription, even when narrowed.
+        assert!(filter.matches(&EventFrame::Hello(Hello {
+            proto: PROTO_VERSION,
+            server: "s".into(),
+            scopes: vec![],
+        })));
+    }
+
+    #[test]
+    fn feed_filter_rejects_unknown_empty_and_oversized_inputs() {
+        assert_eq!(
+            FeedFilter::parse(Some("activty"), None, false),
+            Err(FeedFilterError::UnknownKind("activty".into()))
+        );
+        assert_eq!(
+            FeedFilter::parse(Some("activity,"), None, false),
+            Err(FeedFilterError::EmptyKind)
+        );
+        assert_eq!(
+            FeedFilter::parse(None, Some(""), false),
+            Err(FeedFilterError::EmptySession)
+        );
+        let long = "x".repeat(MAX_FEED_SESSION_LEN + 1);
+        assert_eq!(
+            FeedFilter::parse(None, Some(&long), false),
+            Err(FeedFilterError::SessionTooLong)
+        );
+    }
+
+    #[test]
+    fn feed_filter_handles_unkeyed_frames_and_lag_opt_in() {
+        let filter = FeedFilter::parse(Some("sessions"), Some("s"), true).unwrap();
+        assert!(filter.signal_lag);
+        assert!(filter.matches(&EventFrame::Sessions));
+        assert!(!filter.matches(&EventFrame::Lagged { missed: 3 }));
     }
 }
