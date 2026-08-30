@@ -17,14 +17,18 @@ changes made here.
 
 ## Substrate findings
 
-- `sessions.attach` is cataloged, routed, and protocol-versioned. Observer and
-  interactive attach kinds already permit multiple subscribers; only
-  interactive clients resize.
+- `sessions.attach` is cataloged, routed, protocol-versioned, and write-scoped.
+  Observer and interactive attach kinds already permit multiple subscribers.
+  Observer suppresses the attach-time resize and relay-lease hold, but the
+  WebSocket accepts later input/resize messages in either mode; observer is not
+  a read-only authorization boundary.
 - The stream supplies `Hello`, snapshot, and sequenced delta frames, and the
   bounded daemon subscriber recovers from lag by sending a fresh snapshot.
 - Control-v1 documents the route and JSON parameters, but not the complete
   binary frame variant/header/sequence contract. A stable GUI client still
-  needs a compatibility-tested fixture/schema and reconnect policy.
+  needs a compatibility-tested fixture/schema and reconnect policy, including
+  required-first-hello, surfaced decode/transport failures, identifier
+  encoding, and same-id reconnect/detach races.
 - Serve mode already supplies one-time pairing, scoped tokens, a pairing page,
   and configured exact-origin CORS. Plaintext TCP still requires a trusted
   network or tunnel, so public browser deployment remains separate work.
@@ -47,6 +51,10 @@ changes made here.
 - All actions project `thegn_core::capability::CATALOG` and existing scopes.
   There are no GUI-only verbs, routes, policies, token types, or direct DB/PTY
   handles.
+- Observer mode must not be presented as read-only while attach requires write
+  scope and accepts upstream mutation. A future read-only stream must reject
+  input/resize server-side and update its scope policy in the same reviewed
+  change.
 - Core and host remain independent of toolkit, GPU, font, window, and terminal
   emulator substrates. A future client owns those at a leaf boundary.
 - `[daemon] enabled = false`, TUI launch, detach, degradation, and CLI use work
@@ -60,10 +68,11 @@ changes made here.
 
 THE-40-F1 publishes the observer cell-client contract. It consumes
 `sessions.list` and `worktrees.list`, attaches one observer, decodes hello /
-snapshot / delta, renders one cell grid, and pins reconnect, sequence, lag,
-geometry, and version-skew fixtures. It uses THE-34 events only for resync
-hints. It adds no toolkit, chrome, config, capability, migration, or web
-surface.
+snapshot / delta, renders one cell grid, and pins fixtures for reconnect,
+sequence, lag, geometry, version skew, required scope, upstream mutation,
+first-frame/decode errors, identifier encoding/collision, and same-id detach
+races. It uses THE-34 events only for resync hints. It adds no toolkit, chrome,
+config, capability, migration, or web surface.
 
 Only after that spike, finalized interactive ownership semantics, a chrome
 view model, and a documented need unmet by terminal emulators should candidate
@@ -71,7 +80,8 @@ view model, and a documented need unmet by terminal emulators should candidate
 
 ## Validation and ratchets
 
-This decision has no render/event-loop effect and no security surface. It adds
-no dependency, route, config, capability, state, or code; consequently it
-changes no ratchet. Any future implementation introduces its frontend crate,
-dependency ownership, tests, and relevant ratchet updates together.
+This decision has no render/event-loop effect and adds no runtime security
+surface. It adds no dependency, route, config, capability, state, or code;
+consequently it changes no ratchet. Any future implementation introduces its
+frontend crate, dependency ownership, tests, and relevant ratchet updates
+together.

@@ -43,3 +43,26 @@ capability, config key, database change, test, or ratchet.
 - **THEN** it uses a catalog-projected control capability with the existing
   scope and token policy rather than direct PTY/database access or a GUI-only
   verb
+
+#### Scenario: The future client attaches as an observer
+
+- **WHEN** a frontend uses the current observer attach mode
+- **THEN** its contract identifies that attach requires write scope and that
+  observer is not a read-only authorization boundary
+- **AND** any future read-only attach design rejects input and resize
+  server-side and updates scope policy and tests in the same reviewed change
+
+#### Scenario: The future client opens or replaces an attach stream
+
+- **WHEN** a frontend constructs an attach URI or reconnects with a client id
+- **THEN** identifiers are encoded and validated rather than interpolated as
+  path/query syntax
+- **AND** a stale connection cannot detach a newer replacement that uses the
+  same logical client identity
+
+#### Scenario: The attach stream violates its frame contract
+
+- **WHEN** the first decoded frame is not `Hello`, a frame cannot be decoded,
+  or the transport fails
+- **THEN** the client reports a typed compatibility or transport failure rather
+  than treating it as an ordinary session exit

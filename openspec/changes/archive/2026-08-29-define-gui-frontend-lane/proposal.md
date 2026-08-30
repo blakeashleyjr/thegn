@@ -13,7 +13,11 @@ The existing substrate makes a separate cell client plausible: the daemon
 owns PTYs, attach supports observer and interactive subscribers, control-v1
 publishes catalog-backed operations, and serve mode has pairing and
 exact-origin CORS. It does not yet publish a complete client-facing binary
-frame compatibility contract or a serializable layout/chrome model.
+frame compatibility contract or a serializable layout/chrome model. Observer
+attach is currently write-scoped and accepts upstream input/resize messages,
+so the observer flag is a lifecycle hint rather than a read-only boundary.
+The client contract must also pin first-frame/error behavior, URI-safe
+identifiers, and same-id reconnect/detach races.
 
 ## What Changes
 
@@ -51,7 +55,9 @@ frame compatibility contract or a serializable layout/chrome model.
   vocabulary; does not introduce another `events.subscribe` protocol or a
   competing state frame.
 - **Follow-up:** THE-40-F1 publishes and fixture-tests the existing observer
-  pane stream before a toolkit or GUI product is chosen.
+  pane stream, including its required scope and upstream-mutation behavior,
+  first-frame/errors, identifier encoding, and reconnect/detach races before a
+  toolkit or GUI product is chosen.
 - **No implementation:** no code, crate, dependency, route, catalog row,
   schema, config, database, migration, roadmap, test, or ratchet changes.
 
