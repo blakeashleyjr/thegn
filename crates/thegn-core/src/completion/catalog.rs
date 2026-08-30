@@ -35,6 +35,8 @@ pub enum SourceKind {
     Agent,
     /// `[[tools]]` names.
     Tool,
+    /// Trusted `[[automations.rules]]` names.
+    Automation,
     /// `[[plugins]]` ids.
     Plugin,
     /// `[[pipeline.stages]]` names.
@@ -49,6 +51,9 @@ pub enum SourceKind {
     Capability,
     /// Bindable action ids from [`crate::keymap::BUILTINS`].
     Action,
+    /// Embedded skill package names. Configured user packages are discovered by
+    /// the host and deliberately not walked on the latency-sensitive TAB path.
+    Skill,
 
     /// clap already completes this slot from the tree itself — subcommand
     /// names, flags, and `ValueEnum` arguments such as `completions <shell>`.
@@ -135,12 +140,14 @@ impl SourceKind {
         SourceKind::Theme,
         SourceKind::Agent,
         SourceKind::Tool,
+        SourceKind::Automation,
         SourceKind::Plugin,
         SourceKind::Stage,
         SourceKind::McpServer,
         SourceKind::ConfigKey,
         SourceKind::Capability,
         SourceKind::Action,
+        SourceKind::Skill,
         SourceKind::Structural,
         SourceKind::Reserved(Reserved::Branch),
         SourceKind::Reserved(Reserved::Pr),
@@ -161,12 +168,14 @@ impl SourceKind {
             SourceKind::Theme => "theme",
             SourceKind::Agent => "agent",
             SourceKind::Tool => "tool",
+            SourceKind::Automation => "automation",
             SourceKind::Plugin => "plugin",
             SourceKind::Stage => "stage",
             SourceKind::McpServer => "mcp-server",
             SourceKind::ConfigKey => "config-key",
             SourceKind::Capability => "capability",
             SourceKind::Action => "action",
+            SourceKind::Skill => "skill",
             SourceKind::Structural => "structural",
             SourceKind::Reserved(r) => r.kind(),
         }
@@ -204,6 +213,7 @@ impl SourceKind {
                 | SourceKind::Profile
                 | SourceKind::Agent
                 | SourceKind::Tool
+                | SourceKind::Automation
                 | SourceKind::Plugin
                 | SourceKind::Stage
                 | SourceKind::McpServer
@@ -337,6 +347,7 @@ pub const CATALOG: &[Slot] = &[
     // --- session ----------------------------------------------------------
     slot("attach", "session", SourceKind::Session),
     slot("dispatch put", "session", SourceKind::Session),
+    slot("events tail", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
     slot("session browse", "session", SourceKind::Session),
     slot("session fork", "session", SourceKind::Session),
@@ -385,6 +396,8 @@ pub const CATALOG: &[Slot] = &[
     // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
     slot("dispatch put", "stage", SourceKind::Stage),
     slot("session open", "stage", SourceKind::Stage),
+    // --- automation (`[[automations.rules]]`) -----------------------------
+    slot("automations test", "rule", SourceKind::Automation),
     // A cwd is a filesystem path; clap's structural/path completer owns it.
     slot("session fork", "cwd", SourceKind::Structural),
     // --- pipeline run-completion (THE-76) -----------------------------------
@@ -473,6 +486,8 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // --- embedded skill ---------------------------------------------------
+    slot("skills show", "name", SourceKind::Skill),
     // Theme names are the merged built-in/local catalog. The import path is a
     // filesystem value and keeps clap's structural completion behavior.
     slot("theme set", "name", SourceKind::Theme),
@@ -484,6 +499,9 @@ pub const CATALOG: &[Slot] = &[
     // `config validate --repo <PATH>`: clap owns filesystem path completion.
     slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("automations test", "fixture", SourceKind::Structural),
+    slot("events tail", "kinds", SourceKind::Structural),
+    slot("skills seed", "worktree", SourceKind::Structural),
     slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
@@ -493,6 +511,16 @@ pub const CATALOG: &[Slot] = &[
     slot("pr create", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt diff", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt new", "base", SourceKind::Reserved(Reserved::Branch)),
+    slot(
+        "automations test",
+        "event",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "automations test",
+        "at",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("pr queue add", "pr", SourceKind::Reserved(Reserved::Pr)),
     slot("pr queue rm", "number", SourceKind::Reserved(Reserved::Pr)),
     slot(
@@ -586,7 +614,7 @@ mod tests {
             .filter(|k| k.is_implemented() && !k.reads_db() && !k.reads_config())
             .map(|k| k.kind())
             .collect();
-        assert_eq!(in_process, ["theme", "capability", "action"]);
+        assert_eq!(in_process, ["theme", "capability", "action", "skill"]);
     }
 
     #[test]

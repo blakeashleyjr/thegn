@@ -197,7 +197,9 @@ Thresholds are tunable — see [[config-reference]] `[activity]`, and
 - `d` / `Del` — close or delete… (deleting files from disk is always the
   explicit second choice, never the default)
 - `c` — copy the worktree path
-- `m` — the full row action menu
+- `m` — the full row action menu; on a worktree row choose **Open in IDE** to
+  hand that exact worktree over without first switching to it. Dormant rows are
+  valid for a windowed IDE; a terminal-only editor asks you to focus the row.
 
 ## View
 

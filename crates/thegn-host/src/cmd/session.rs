@@ -525,6 +525,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     .to_string_lossy()
                     .into_owned();
                 let spec = OpenSpec {
+                    automation_origin: None,
                     argv: Vec::new(),
                     cwd: None,
                     env: Vec::new(),
@@ -1006,6 +1007,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         );
         let prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
         let spec = OpenSpec {
+            automation_origin: None,
             argv: Vec::new(),
             cwd: None,
             env: Vec::new(),
@@ -1247,6 +1249,7 @@ async fn resume_work(
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
         let spec = OpenSpec {
+            automation_origin: None,
             argv: Vec::new(),
             cwd: None,
             env: Vec::new(),
@@ -1624,11 +1627,13 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    v.push("events.subscribe"); // thegn events tail
     v.push("launch.preset"); // thegn open --preset (intents mailbox, not a route)
     // Local operator verbs driven by a dedicated `thegn` subcommand (not the
     // generic control client): the debug bundle reads local files directly.
     v.push("doctor.bundle"); // thegn doctor bundle
     v.push("agent.list"); // thegn agent list (config-derived, no daemon)
+    v.push("skills.seed"); // thegn skills seed (local, marker-aware filesystem adapter)
     // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
     // subcommands (they touch local custody, not the daemon), so they cover the
     // CLI surface directly rather than via a control route.

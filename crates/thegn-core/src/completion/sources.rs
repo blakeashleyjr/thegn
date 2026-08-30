@@ -227,6 +227,12 @@ pub fn config_candidates(kind: SourceKind, cfg: &Config) -> Vec<Candidate> {
             .iter()
             .map(|t| Candidate::described(&t.name, &t.command))
             .collect(),
+        SourceKind::Automation => cfg
+            .effective_automations()
+            .rules
+            .iter()
+            .map(|rule| Candidate::described(&rule.name, &rule.when))
+            .collect(),
         SourceKind::Plugin => cfg
             .plugins
             .iter()
@@ -396,12 +402,26 @@ pub fn action_candidates() -> Vec<Candidate> {
         .collect()
 }
 
+/// Embedded skill package names. User directories remain host-owned and are
+/// not traversed by a shell keypress.
+pub fn skill_candidates() -> Vec<Candidate> {
+    crate::skills::SkillRegistry::embedded()
+        .map(|registry| {
+            registry
+                .iter()
+                .map(|(name, skill)| Candidate::described(name, &skill.description))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Candidates for a kind that needs neither the DB nor the config.
 pub fn in_process_candidates(kind: SourceKind) -> Vec<Candidate> {
     match kind {
         SourceKind::Theme => theme_candidates(),
         SourceKind::Capability => capability_candidates(),
         SourceKind::Action => action_candidates(),
+        SourceKind::Skill => skill_candidates(),
         _ => Vec::new(),
     }
 }
@@ -686,6 +706,13 @@ mod tests {
         };
         cfg.agents.push(named("claude", "claude --dangerously"));
         cfg.tools.push(named("lazygit", "lazygit"));
+        cfg.automations
+            .rules
+            .push(crate::config_automations::AutomationRuleConfig {
+                name: "notify-on-done".into(),
+                when: "agent_finished".into(),
+                ..Default::default()
+            });
 
         let names = |k| {
             config_candidates(k, &cfg)
@@ -699,6 +726,7 @@ mod tests {
         assert_eq!(names(SourceKind::McpServer), ["git"]);
         assert_eq!(names(SourceKind::Agent), ["claude"]);
         assert_eq!(names(SourceKind::Tool), ["lazygit"]);
+        assert_eq!(names(SourceKind::Automation), ["notify-on-done"]);
         assert_eq!(
             config_candidates(SourceKind::Agent, &cfg)[0]
                 .description
@@ -769,6 +797,13 @@ mod tests {
         let actions = action_candidates();
         assert_eq!(actions.len(), crate::keymap::BUILTINS.len());
         assert!(actions.iter().any(|c| c.value == "new-worktree"));
+
+        let skills = skill_candidates();
+        assert_eq!(
+            skills.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            ["mq", "pipeline", "supervise"]
+        );
+        assert!(skills.iter().all(|c| c.description.is_some()));
 
         assert_eq!(
             in_process_candidates(SourceKind::Theme)

@@ -51,6 +51,17 @@ impl NotificationStore for Db {
         Ok(n > 0)
     }
 
+    fn put_notification_once_id(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<Option<i64>> {
+        let inserted = self.put_notification_once(kind, issue_id, message, worktree_path)?;
+        Ok(inserted.then(|| self.conn().last_insert_rowid()))
+    }
+
     fn has_notification(&self, kind: &str, issue_id: &str) -> Result<bool> {
         let n: i64 = self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM notifications WHERE kind=?1 AND issue_id=?2)",

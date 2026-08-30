@@ -25,7 +25,7 @@ worktree):
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
 | Session       | `notify` · `logs` · `share` · `forward`                                                                        |
-| Control plane | `serve` · `session` · `attach` · `pair` · `api`                                                                |
+| Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                       |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                               |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
@@ -38,6 +38,30 @@ capability (scope, surfaces), `api schema` the control wire contract, and
 `api call <cap> --params '{…}'` performs any routed capability over the
 control socket — a newly routed verb is callable with no CLI change.
 `thegn plugin list|check` inspects the configured [[plugins]].
+
+### Tailing the event feed
+
+`thegn events tail` is a read-only thin client for the daemon's live control
+feed. It waits on the stream; it does not poll, open a session, or enable
+`--allow-session-input`:
+
+```sh
+thegn events tail
+thegn events tail --kinds activity,exit --session "$SESSION"
+thegn events tail --signal-lag --json | jq -c 'select(.kind == "activity")'
+```
+
+`--kinds` accepts the same comma-separated frame kinds as the control API and
+`--session` narrows session-keyed frames. `--signal-lag` opts into an explicit
+`lagged` frame when the bounded feed has dropped events. JSON mode emits one
+canonical frame per line, with the daemon `hello` frame first. The feed has no
+replay: after loss or reconnect, use `sessions.list` and `worktrees.list` to
+resynchronize state.
+
+The local Unix socket uses the current same-user policy. A TCP `serve` endpoint
+uses its existing bearer token and read scope; filters only narrow an already
+authorized subscription. A missing daemon returns the usual recoverable
+no-daemon error. There is no new config key.
 
 ## Which worktree am I acting on?
 
@@ -191,7 +215,7 @@ untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
 dispatch door (`session open --stage --issue`) that creates these rows.
 
 - `thegn doctor` — resolved terminal capabilities, release channel,
-  environment. See [[terminal-compatibility]].
+  environment. See [[terminal-compatibility]] and [[debugging]].
 - `thegn keys list` — every effective binding, from all three sources.
   The same set [[keybindings]] shows.
 - `thegn keys validate` — non-zero on a chord conflict, so it works in a

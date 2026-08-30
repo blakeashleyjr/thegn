@@ -60,6 +60,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // model must land on a harness with a model flag, env keys must be
             // exportable names.
             errs.extend(crate::agent_task::validate_agent_models(&cfg));
+            // Skill names and directory-list syntax are a config-boundary
+            // concern. Directory existence/discovery stays at the host edge.
+            errs.extend(cfg.skills.validate());
             errs.extend(crate::config_drawer::validate_drawer_config(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
@@ -87,6 +90,20 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[notifications]` live-agent signatures must be non-empty and
             // bounded; otherwise an empty substring would match every line.
             errs.extend(cfg.notifications.validate());
+            errs.extend(cfg.automations.validate());
+            for (name, profile) in &cfg.profiles {
+                if profile.automations.is_empty() {
+                    continue;
+                }
+                let mut effective = cfg.automations.clone();
+                profile.automations.clone().apply(&mut effective);
+                errs.extend(
+                    effective
+                        .validate()
+                        .into_iter()
+                        .map(|error| format!("profiles.{name}: {error}")),
+                );
+            }
             // Sound references and kind selectors use a free-form map, so the
             // schema walker cannot validate their keys or values.
             errs.extend(cfg.notifications.validate_sound());
@@ -848,9 +865,11 @@ mod tests {
         // (WeatherUnits).
         // 90 → 91 (THE-11): `[[tools]] drawer_scope` (DrawerScope) — which
         // eligible catalog entries can occupy the bottom drawer.
+        // 91 → 92 (THE-17): `[editor] provider` (EditorProvider) — the
+        // logical external-editor handoff implementation.
         assert_eq!(
             defs.len(),
-            91,
+            92,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

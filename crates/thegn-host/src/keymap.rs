@@ -228,6 +228,9 @@ pub enum Action {
     Help,
     Lazygit,
     Yazi,
+    /// Hand the focused worktree to the configured external IDE/editor seam.
+    /// Distinct from [`Action::Editor`], which remains the terminal editor tool.
+    OpenInIde,
     Editor,
     Diff,
     /// Push the current branch to its upstream — fast-path, no branches-panel
@@ -587,6 +590,7 @@ impl Action {
             Action::Help => "help",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
+            Action::OpenInIde => "open-in-ide",
             Action::Editor => "editor",
             Action::Diff => "show-diff",
             Action::Push => "git-push",
@@ -738,6 +742,7 @@ impl Action {
             "help" => Action::Help,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
+            "open-in-ide" | "ide" => Action::OpenInIde,
             "editor" | "tool-editor" => Action::Editor,
             "show-diff" | "diff" | "tool-diff" => Action::Diff,
             "git-push" | "push" => Action::Push,
@@ -2548,6 +2553,7 @@ mod tests {
                 notifications: Default::default(),
                 identity: Default::default(),
                 mcp_serve: Default::default(),
+                automations: Default::default(),
             },
         );
         let cfg = thegn_core::config::Config {

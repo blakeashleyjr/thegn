@@ -31,6 +31,48 @@ use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
+fn claimed_intents_are_drained_before_a_stale_hydration_is_rejected() {
+    let row = |id, kind: &str| thegn_core::store::IntentRow {
+        id,
+        kind: kind.into(),
+        payload: format!(r#"{{"id":{id}}}"#),
+        created_at: 1,
+    };
+    let mut model = FrameModel {
+        intents: vec![row(1, "focus_workspace"), row(2, "focus_workspace")],
+        preset_intents: vec![row(3, "launch_preset")],
+        adopt_intents: vec![row(4, "adopt_session")],
+        open_editor_intents: vec![row(5, "open_editor"), row(6, "open_editor")],
+        ..Default::default()
+    };
+    let (mut focus, mut preset) = (None, None);
+    let (mut adopts, mut editor_opens) = (Vec::new(), Vec::new());
+
+    // The event loop calls this before comparing the snapshot generation.
+    // Therefore the subsequent stale-model `continue` cannot lose rows that
+    // hydration already deleted from SQLite.
+    drain_hydration_intents(
+        &mut model,
+        &mut focus,
+        &mut preset,
+        &mut adopts,
+        &mut editor_opens,
+    );
+
+    assert_eq!(focus.as_ref().map(|row| row.id), Some(2));
+    assert_eq!(preset.as_ref().map(|row| row.id), Some(3));
+    assert_eq!(adopts.iter().map(|row| row.id).collect::<Vec<_>>(), [4]);
+    assert_eq!(
+        editor_opens.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [5, 6]
+    );
+    assert!(model.intents.is_empty());
+    assert!(model.preset_intents.is_empty());
+    assert!(model.adopt_intents.is_empty());
+    assert!(model.open_editor_intents.is_empty());
+}
+
+#[test]
 fn issue_branch_tail_prefers_hint_then_slugifies() {
     // A provider branch hint is used verbatim (trimmed).
     assert_eq!(

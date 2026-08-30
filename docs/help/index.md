@@ -52,5 +52,6 @@ list and the page; `↵` follows a link; `[` goes back.
 - [[configuration]] — config layers and the [[config-reference]]
 - [[terminal-compatibility]] — colors, glyphs, and `thegn doctor`
 - [[release-channels]] — stable vs dev, and what's gated
+- [[debugging]] — diagnose thegn and inspect its debugger limits
 - [[media]] — the now-playing controls
 - [[help]] — how this help system itself works

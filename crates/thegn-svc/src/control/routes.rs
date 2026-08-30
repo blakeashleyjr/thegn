@@ -76,8 +76,12 @@ pub static ROUTES: &[Route] = &[
         &["worktrees.list", "worktrees.create"],
         || get(http::list_worktrees).post(http::create_worktree),
     ),
+    route("/v1/skills", &["skills.list"], || get(http::list_skills)),
     route("/v1/worktrees/open", &["worktrees.open"], || {
         post(http::open_worktree)
+    }),
+    route("/v1/editor/open", &["editor.open"], || {
+        post(http::open_editor)
     }),
     // --- agent orchestration (THE-57) ---------------------------------------
     route("/v1/issues", &["issues.list"], || get(http::issues_list)),
@@ -98,6 +102,9 @@ pub static ROUTES: &[Route] = &[
         || post(http::dispatch_set_status),
     ),
     route("/v1/browser", &["browser.drive"], || post(http::browser)),
+    route("/v1/preview/fetch", &["preview.fetch"], || {
+        post(http::preview_fetch)
+    }),
     route("/v1/git/status", &["git.status"], || get(http::git_status)),
     route("/v1/git/stage", &["git.stage"], || post(http::git_stage)),
     route("/v1/git/commit", &["git.commit"], || post(http::git_commit)),
@@ -111,6 +118,13 @@ pub static ROUTES: &[Route] = &[
         get(http::agent_sessions)
     }),
     route("/v1/notify", &["notify.push"], || post(http::notify_push)),
+    route("/v1/automations", &["automations.list"], || {
+        get(http::automations_list)
+    }),
+    route("/v1/automations/test", &["automations.test"], || {
+        post(http::automations_test)
+    }),
+    route("/v1/tools/run", &["tools.run"], || post(http::tools_run)),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
     }),
@@ -167,6 +181,8 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("worktrees.list", "GET", "/v1/worktrees"),
     ("worktrees.create", "POST", "/v1/worktrees"),
     ("worktrees.open", "POST", "/v1/worktrees/open"),
+    ("skills.list", "GET", "/v1/skills"),
+    ("editor.open", "POST", "/v1/editor/open"),
     ("issues.list", "GET", "/v1/issues"),
     ("issues.get", "GET", "/v1/issues/{id}"),
     ("issues.update", "POST", "/v1/issues/{id}"),
@@ -179,6 +195,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
         "/v1/dispatches/{id}/status",
     ),
     ("browser.drive", "POST", "/v1/browser"),
+    ("preview.fetch", "POST", "/v1/preview/fetch"),
     ("git.status", "GET", "/v1/git/status"),
     ("git.stage", "POST", "/v1/git/stage"),
     ("git.commit", "POST", "/v1/git/commit"),
@@ -188,6 +205,9 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("pr.status", "GET", "/v1/pr/status"),
     ("agent.sessions", "GET", "/v1/agent/sessions"),
     ("notify.push", "POST", "/v1/notify"),
+    ("automations.list", "GET", "/v1/automations"),
+    ("automations.test", "POST", "/v1/automations/test"),
+    ("tools.run", "POST", "/v1/tools/run"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
     ("calendar.events", "GET", "/v1/calendar/events"),
