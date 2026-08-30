@@ -514,6 +514,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "theme-builder-open",
+        label: "Open theme builder",
+        hint: "theme builder",
+        default_chords: &["Ctrl Alt Shift t"],
+        palette: true,
+        keywords: &[
+            "theme",
+            "builder",
+            "appearance",
+            "colors",
+            "palette",
+            "preview",
+            "customize",
+        ],
+    },
+    ActionSpec {
         id: "switch-font",
         // Single chord `Alt f`; the old redundant `Alt F` alias was dropped so
         // Shift keeps its "up-a-level" meaning everywhere in the Alt layer.
@@ -1131,6 +1147,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "changed files",
             "drawer",
         ],
+    },
+    ActionSpec {
+        id: "drawer-cycle",
+        label: "Cycle drawer occupant",
+        hint: "drawer+",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "cycle drawer", "next drawer tool", "files drawer"],
+    },
+    ActionSpec {
+        id: "drawer-pick",
+        label: "Pick drawer occupant",
+        hint: "drawer?",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "pick drawer", "drawer tool", "choose drawer"],
     },
     ActionSpec {
         id: "toggle-corner",

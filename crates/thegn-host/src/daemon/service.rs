@@ -80,6 +80,8 @@ pub(crate) struct DaemonService {
     /// snapshot was already the wrong shape — it could not honor a
     /// `[workspace.<slug>]` refinement, or even a differing target branch).
     pub config: std::sync::Arc<thegn_core::config::Config>,
+    /// Profile root containing the cross-process session-migration gates.
+    pub profile_root: std::path::PathBuf,
     /// The control endpoint's stable string form (the socket path on unix),
     /// exported into every session's environment as `THEGN_CONTROL_SOCKET`
     /// so a program inside a pane can reach the daemon that owns it.
@@ -426,6 +428,17 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
+            // Hold the same per-worktree gate a migration owns exclusively.
+            // Keep it through registry insertion: an open is therefore either
+            // visible to migration's first listing or refused until cleanup is
+            // complete, never launched in the gap between those two events.
+            let fence_worktree = spec.worktree.as_deref().or(spec.cwd.as_deref());
+            let _migration_guard = thegn_core::profile::acquire_session_open_guard_at(
+                &self.profile_root,
+                fence_worktree,
+            )
+            .map_err(|error| ControlError::Conflict(error.to_string()))?;
+
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
@@ -1474,6 +1487,7 @@ mod tests {
         grace_ms: i64,
         config: thegn_core::config::Config,
     ) -> (DaemonService, broadcast::Receiver<Arc<EventFrame>>) {
+        static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (events, rx) = broadcast::channel(64);
         let (idle_tx, _idle_rx) = mpsc::unbounded_channel();
         let svc = DaemonService {
@@ -1489,6 +1503,11 @@ mod tests {
             idle_tx,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             config: Arc::new(config),
+            profile_root: std::env::temp_dir().join(format!(
+                "tg-daemon-service-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
@@ -1496,6 +1515,32 @@ mod tests {
 
     fn leases(svc: &DaemonService) -> Vec<LeaseRow> {
         svc.db.lock().unwrap().leases(&svc.daemon_id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_fence_refuses_matching_open_after_initial_listing() {
+        let (svc, _events) = service(0);
+        let paths = thegn_core::profile::ProfilePaths {
+            name: "default".into(),
+            root: svc.profile_root.clone(),
+        };
+        let migration = thegn_core::profile::acquire_session_migration(&paths, "/worktree")
+            .expect("migration takes the cold source fence");
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+
+        let error = svc
+            .open(OpenSpec {
+                argv: vec!["must-not-spawn".into()],
+                worktree: Some("/worktree".into()),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+            .await
+            .expect_err("open after migration listing must be refused");
+        assert!(error.to_string().contains("being migrated"));
+        drop(migration);
+        let _ = std::fs::remove_dir_all(&paths.root); // best-effort: test cleanup
     }
 
     /// Drain one Lease frame (skip any non-lease frames like `Sessions`).
@@ -2419,6 +2464,8 @@ mod tests {
         let mut boot = thegn_core::config::Config::default();
         boot.sandbox.enabled = false;
         boot.agents.push(thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
             name: "worker".into(),
             command: "sh".into(),
             hints: Vec::new(),

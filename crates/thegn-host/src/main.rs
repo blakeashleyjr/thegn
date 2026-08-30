@@ -181,6 +181,8 @@ mod render_plan;
 mod replay;
 mod replay_overlay;
 mod repo_index;
+mod review_handoff;
+mod review_rows;
 mod revtunnel;
 mod run;
 mod sandbox_events;
@@ -224,6 +226,8 @@ mod terminal_wizard;
 #[cfg(test)]
 mod testenv;
 mod testkit;
+mod theme_builder;
+mod theme_store;
 mod toast;
 mod vps_bridge;
 mod vps_reaper;
@@ -907,16 +911,24 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Per-profile advisory singleton (H): one interactive window per named
-    // profile. Advisory only — if the profile is already running we warn and
-    // continue (per-profile DBs are separate + WAL-safe; a hard refusal would
-    // break running thegn inside thegn). No-op for the default profile. The
-    // guard is held for the whole process (released on exit/death, never stale).
+    // Per-profile advisory singleton (H): one interactive window per profile.
+    // Advisory only — if the profile is already running we warn for named
+    // profiles and continue (per-profile DBs are separate + WAL-safe; a hard
+    // refusal would break running thegn inside thegn). The default profile is
+    // silent for compatibility. The guard is held for the whole process
+    // (released on exit/death, never stale).
     let _profile_lock = thegn_core::profile::acquire_singleton();
     if matches!(
         _profile_lock,
-        thegn_core::profile::Singleton::AlreadyRunning
+        thegn_core::profile::Singleton::MigrationInProgress
     ) {
+        anyhow::bail!("the active profile is migrating a session; retry after it completes");
+    }
+    if matches!(
+        _profile_lock,
+        thegn_core::profile::Singleton::AlreadyRunning(_)
+    ) && !thegn_core::profile::active().is_default()
+    {
         thegn_core::msg::warn(&format!(
             "profile {:?} appears to be already running in another window; \
              continuing (windows share the profile's WAL database)",

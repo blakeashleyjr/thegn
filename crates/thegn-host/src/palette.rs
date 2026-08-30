@@ -772,6 +772,43 @@ pub(crate) fn build_launch_palette(
     items
 }
 
+/// Build the dedicated bottom-drawer picker. Rows are stable selection keys,
+/// not command-palette actions: the loop's pending drawer gate consumes the
+/// `drawer:<occupant-id>` prefix before generic action dispatch.
+pub(crate) fn build_drawer_palette(
+    cfg: &thegn_core::config::Config,
+    _scope: thegn_core::config::DrawerScope,
+) -> Vec<crate::palette::PaletteItem> {
+    thegn_core::config_drawer::drawer_policy(cfg)
+        .occupants()
+        .iter()
+        .map(|occupant| {
+            let label = if occupant.id == thegn_core::config_drawer::FILES_OCCUPANT_ID {
+                "files (built-in)".to_string()
+            } else {
+                format!(
+                    "{}  ({})",
+                    occupant.name,
+                    occupant
+                        .scope
+                        .map(|scope| scope.as_str())
+                        .unwrap_or("scope")
+                )
+            };
+            crate::palette::PaletteItem::new(format!("drawer:{}", occupant.id), label)
+                .with_search(format!("drawer {}", occupant.name))
+        })
+        .collect()
+}
+
+/// Decode a dedicated drawer-picker row. Keeping this separate from
+/// `Action::from_key` prevents occupant IDs from becoming fake command
+/// actions, while still giving the loop a single pending-selection gate.
+pub(crate) fn drawer_picker_occupant(key: &str) -> Option<&str> {
+    key.strip_prefix("drawer:")
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// Build the account-switcher palette: every coding-agent account (config +
 /// managed) grouped by provider, plus an "Add account" row per provider.
 /// Selecting `account:<provider>:<name>` pins it as the focused repo's default
@@ -1332,6 +1369,47 @@ mod tests {
         ] {
             assert!(keys.contains(k), "{k} missing from the palette");
         }
+    }
+
+    #[test]
+    fn drawer_palette_keeps_files_first_and_uses_pending_keys() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.tools.push(thegn_core::config::NamedCommand {
+            name: "atac".into(),
+            command: "atac".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: Some(thegn_core::config::DrawerScope::Worktree),
+            drawer_cwd: None,
+        });
+        cfg.tools.push(thegn_core::config::NamedCommand {
+            name: "db".into(),
+            command: "psql".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: Some(thegn_core::config::DrawerScope::Global),
+            drawer_cwd: None,
+        });
+        let rows = build_drawer_palette(&cfg, thegn_core::config::DrawerScope::Worktree);
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec!["drawer:files", "drawer:tool:atac", "drawer:tool:db"]
+        );
+        assert!(rows.iter().all(|row| row.key.starts_with("drawer:")));
+        assert_eq!(drawer_picker_occupant(&rows[0].key), Some("files"));
+        assert_eq!(drawer_picker_occupant("files-drawer"), None);
     }
 
     #[test]

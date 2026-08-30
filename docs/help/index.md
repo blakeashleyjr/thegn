@@ -34,6 +34,7 @@ list and the page; `↵` follows a link; `[` goes back.
 ## Doing things
 
 - [[command-palette]] — fuzzy-run any action, open anything
+- [[theming]] — build, preview, save, and import color themes
 - [[search]] — the three search surfaces
 - [[copy-and-select]] — selections, scrollback, registers
 - [[git-and-diffs]] — the git tab, diffs, push/pull/rollback
