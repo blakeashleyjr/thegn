@@ -204,6 +204,15 @@ pub struct SessionRecord {
     pub unlinked: bool,
 }
 
+/// A harness's native project-local skill root, relative to the worktree.
+/// The host appends only a core-validated skill package name.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct SkillLayout {
+    pub project_root: &'static str,
+}
+
 // --- the seam ---------------------------------------------------------------
 
 /// One coding-agent CLI. Object-safe (`&dyn Harness`), no `async fn`. Required
@@ -237,6 +246,12 @@ pub trait Harness: Send + Sync {
     }
     /// The advertised optional-operation bits.
     fn caps(&self) -> HarnessCaps;
+
+    /// Native project-local skill layout. Vendor path literals belong only in
+    /// their harness implementation; unsupported harnesses return `None`.
+    fn skill_layout(&self) -> Option<SkillLayout> {
+        None
+    }
 
     // --- optional ops (present iff the cap bit is set) ---------------------
 
@@ -346,6 +361,11 @@ impl Harness for Codex {
             HarnessCaps::USAGE,
         ])
     }
+    fn skill_layout(&self) -> Option<SkillLayout> {
+        Some(SkillLayout {
+            project_root: ".agents/skills",
+        })
+    }
     fn session_layout(&self) -> Option<SessionLayout> {
         Some(SessionLayout {
             store_subdir: "sessions",
@@ -403,6 +423,11 @@ impl Harness for Claude {
             HarnessCaps::TOKENS,
             HarnessCaps::CONTINUE,
         ])
+    }
+    fn skill_layout(&self) -> Option<SkillLayout> {
+        Some(SkillLayout {
+            project_root: ".claude/skills",
+        })
     }
     fn session_layout(&self) -> Option<SessionLayout> {
         Some(SessionLayout {
@@ -505,6 +530,11 @@ impl Harness for Pi {
     }
     fn caps(&self) -> HarnessCaps {
         HarnessCaps::of(&[HarnessCaps::CONTINUE])
+    }
+    fn skill_layout(&self) -> Option<SkillLayout> {
+        Some(SkillLayout {
+            project_root: ".pi/skills",
+        })
     }
     fn continue_command(&self) -> Option<String> {
         // pi's first continue form (THE-86): `pi --continue` picks up the
@@ -709,6 +739,31 @@ mod tests {
             "unknown id is refused, not guessed"
         );
         assert!(harness("").is_none());
+    }
+
+    #[test]
+    fn skill_layouts_are_native_relative_roots() {
+        assert_eq!(
+            harness("claude").unwrap().skill_layout(),
+            Some(SkillLayout {
+                project_root: ".claude/skills"
+            })
+        );
+        assert_eq!(
+            harness("codex").unwrap().skill_layout(),
+            Some(SkillLayout {
+                project_root: ".agents/skills"
+            })
+        );
+        assert_eq!(
+            harness("pi").unwrap().skill_layout(),
+            Some(SkillLayout {
+                project_root: ".pi/skills"
+            })
+        );
+        for id in ["aider", "antigravity"] {
+            assert_eq!(harness(id).unwrap().skill_layout(), None, "{id}");
+        }
     }
 
     /// The caps⇔ops agreement, per impl. An optional op is present exactly when

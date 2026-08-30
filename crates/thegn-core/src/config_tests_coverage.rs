@@ -999,6 +999,9 @@ fn config_overlay_apply_sets_every_field() {
         loc_watch_invalidate_secs: Some(11),
         weather_enabled: Some(true),
         notifications_agent_attention_inbox: Some(true),
+        skills_enabled: Some(false),
+        skills_user_dirs: Some(vec!["/skills".into()]),
+        skills_exclude: Some(vec!["mq".into()]),
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -1061,6 +1064,9 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(cfg.weather.enabled);
     assert!(cfg.notifications.agent_attention_inbox);
+    assert!(!cfg.skills.enabled);
+    assert_eq!(cfg.skills.user_dirs, vec!["/skills"]);
+    assert_eq!(cfg.skills.exclude, vec!["mq"]);
     assert!(!cfg.sandbox.enabled);
 }
 
