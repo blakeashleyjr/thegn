@@ -26,8 +26,9 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    just release-verify   v<version>    # layout, runs, no quarantine
    ```
 
-   `release-artifacts` prints the `sha256` to paste into the Homebrew formula.
-   Note the archive is built for _this_ machine's target, so it rehearses the
+   The package renderer consumes the generated checksum; no release version or
+   digest is pasted into a formula or package manifest. Note the archive is
+   built for _this_ machine's target, so it rehearses the
    darwin leg on a Mac and the linux-gnu leg on Linux — not the musl one.
 
 6. **Tag + push.**
@@ -41,10 +42,30 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    binary for **x86_64 linux (gnu + musl)** and **aarch64-apple-darwin**, and
    attaches per-target archives + `.sha256` checksums (named
    `thegn-<tag>-<target>.sha256` — no `.tar.gz` infix) to a **draft** GitHub
-   Release. windows-msvc is still out: that CI job has never executed, and
+   Release. Each archive also receives keyless GitHub build-provenance
+   attestation; verify a downloaded archive with:
+
+   ```sh
+   gh attestation verify thegn-v<version>-<target>.tar.gz \
+     --repo blakeashleyjr/thegn
+   ```
+
+   After the complete archive matrix succeeds, the package job downloads only
+   that tag's draft assets, validates every active archive/checksum pair, and
+   renders the Homebrew formula, AUR `PKGBUILD`, and nfpm specs from
+   `packaging/release.json`. It then adds deterministic
+   `thegn_<version>_amd64.deb` and `thegn-<version>-1.x86_64.rpm` assets plus
+   the rendered metadata to the same draft. The `.deb` and `.rpm` are
+   **standalone release assets**; there is no hosted apt or rpm update
+   repository.
+
+   windows-msvc is still out: that CI job has never executed, and
    `fail-fast: false` means an unbuilt target silently produces a partial asset
-   set. Add a target only once its CI job is green. Write the release notes
-   (crib from the changelog) and publish.
+   set. Add a target only once its CI job is green. Check the package job's
+   summary for its exact outputs and target/checksum mapping. Only after every
+   archive, checksum, attestation, and generated package is present should the
+   install channel be advertised. Write the release notes (crib from the
+   changelog) and publish the draft.
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
@@ -56,24 +77,50 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    > `workflow_dispatch` for full from-scratch rebuilds where losing the
    > release is acceptable.
 
-7. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`): set `version`
-   and paste the `sha256` from the release's
-   `thegn-<tag>-aarch64-apple-darwin.sha256` asset. The formula is Apple-silicon
-   only, matching the matrix.
+7. **Publish generated external metadata only after the draft is published.**
+   In Actions, dispatch the `release` workflow from `main`, enter the already
+   published tag, and choose `publish-external`. This operation is isolated
+   from `create-release`, so it cannot trigger the destructive release-recreate
+   path described above or change any release asset. Approve the protected
+   `package-publication` environment when prompted.
 
-   The tap repo does not exist yet. Create it as a public repo named exactly
-   `homebrew-tap` under the same owner, with the formula at `Formula/thegn.rb`;
-   `brew install blakeashleyjr/tap/thegn` then resolves it. Keep this file as the
-   source of truth and copy it over on each release.
+   The job downloads the generated formula and `PKGBUILD` from the published
+   release. It pushes `Formula/thegn.rb` to the configured Homebrew tap, runs
+   `makepkg --printsrcinfo`, and pushes `PKGBUILD` plus `.SRCINFO` to the AUR
+   `thegn-bin` repository. Re-dispatching the same tag makes no commit when the
+   repositories already contain identical output.
+
+   Publication remains visibly pending until this one-time checklist is done:
+   - Create a public repository named `homebrew-tap`, initially with a `main`
+     branch, and create the AUR package repository named `thegn-bin`.
+   - Add separate write-enabled deploy keys scoped only to the tap and AUR
+     package repositories. They are not artifact-signing keys and have no write
+     access to this source repository.
+   - Create a protected GitHub environment named `package-publication`, add a
+     required reviewer, and store the keys as `HOMEBREW_TAP_DEPLOY_KEY` and
+     `AUR_DEPLOY_KEY` environment secrets.
+   - Set repository variable `HOMEBREW_TAP_REPOSITORY` to
+     `<owner>/homebrew-tap`, but leave `PACKAGE_PUBLICATION_ENABLED` unset.
+   - Rehearse both generated outputs locally: install from a disposable local
+     tap and run `makepkg --printsrcinfo` plus `makepkg` in a disposable AUR
+     checkout.
+   - Only after the rehearsal passes, set repository variable
+     `PACKAGE_PUBLICATION_ENABLED=true` and dispatch `publish-external`.
+
+   If any flag, repository, or credential is absent, the workflow emits an
+   explicit warning containing this setup checklist and pushes nothing. It
+   never reports Homebrew or AUR as live merely because package metadata was
+   rendered.
 
    Modern Homebrew **refuses to install a formula from a file path** ("Homebrew
    requires formulae to be in a tap"), so there is no `brew install --formula
-./packaging/homebrew/thegn.rb` shortcut. To try the formula before the tap
-   exists, make a local tap — this is also how to rehearse a release:
+./thegn.rb` shortcut. To rehearse before enabling publication, make a local
+   tap and copy the generated release asset into it:
 
    ```sh
    brew tap-new blakeashleyjr/tap                     # scaffolds Formula/
-   cp packaging/homebrew/thegn.rb "$(brew --repository blakeashleyjr/tap)/Formula/"
+   cp thegn-v<version>-homebrew.rb \
+     "$(brew --repository blakeashleyjr/tap)/Formula/thegn.rb"
    brew install blakeashleyjr/tap/thegn
    brew uninstall thegn && brew untap blakeashleyjr/tap   # when done
    ```
@@ -89,7 +136,8 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
   everyone but the maintainer.
 - **From source** — `./install.sh` (needs Rust/Cargo). On macOS it also generates
   the `thegn.app` launcher; `just macos-app` does the same for the other paths.
-- **Homebrew** — once the tap exists (step 6).
+- **Homebrew / AUR** — only after step 7's publication job has pushed and the
+  resulting repositories have been verified.
 
 ## macOS code signing and notarization — the decision
 
@@ -131,7 +179,17 @@ Revisit this when either becomes true: a macOS `.app` or `.pkg` is distributed
 directly (a Homebrew _Cask_ would need it), or enough users are hitting the
 quarantine prompt that the support cost exceeds the certificate's.
 
-## Not yet: crates.io / `cargo binstall`
+## Deferred release channels
+
+- **Scoop and winget** require a green Windows MSVC release archive before
+  their generated manifests can be enabled.
+- **Hosted apt/rpm repositories** require an owner for hosting, repository
+  metadata, and signing-key custody. The current `.deb` and `.rpm` assets do
+  not provide automatic updates.
+- **crates.io / plain `cargo install` / `cargo binstall`** require a deliberate
+  workspace publication decision.
+
+### crates.io detail
 
 `crates/thegn-host` is `publish = false` and the workspace uses path
 dependencies, so the crates cannot be published to crates.io as-is. Enabling

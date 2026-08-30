@@ -1093,6 +1093,45 @@ clean-aux:
 
 # --- release artifacts -------------------------------------------------------
 
+# Render every currently active package-manager input from synthetic, local
+# release archives. This is a pure rehearsal: no project binary, network,
+# credential, package manager, or live thegn state directory is touched.
+release-package-dry-run tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag_arg="{{tag}}"; tag="${tag_arg#tag=}"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    assets="$tmp/assets"; stage="$tmp/stage"; output="$tmp/output"
+    mkdir -p "$assets" "$stage"
+    cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
+    printf '#!/bin/sh\nexit 0\n' >"$stage/thegn"
+    chmod +x "$stage/thegn"
+    for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin; do
+      stem="thegn-$tag-$target"
+      (cd "$stage" && tar czf "$assets/$stem.tar.gz" thegn LICENSE-MIT LICENSE-APACHE README.md)
+      (cd "$assets" && shasum -a 256 "$stem.tar.gz" >"$stem.sha256")
+    done
+    python3 packaging/release.py validate --tag "$tag" --assets-dir "$assets"
+    python3 packaging/release.py render --tag "$tag" --assets-dir "$assets" --output-dir "$output"
+    for path in homebrew/thegn.rb aur/PKGBUILD nfpm/thegn-deb.yaml nfpm/thegn-rpm.yaml; do
+      test -s "$output/$path" || { echo "dry-run output is missing $path" >&2; exit 1; }
+    done
+    ! grep -R -E 'REPLACE_WITH_|@@[A-Z][A-Z0-9_]*@@|thegn-dev|\.SRCINFO' "$output"
+    echo "release-package-dry-run: ok ($tag)"
+
+# Validate and render a directory populated with real release archives and
+# their companion `<stem>.sha256` files. Output remains temporary; this recipe
+# is a rehearsal and never publishes or mutates the supplied assets.
+release-package-validate tag assets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag_arg="{{tag}}"; tag="${tag_arg#tag=}"
+    assets_arg="{{assets}}"; assets="${assets_arg#assets=}"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    python3 packaging/release.py validate --tag "$tag" --assets-dir "$assets"
+    python3 packaging/release.py render --tag "$tag" --assets-dir "$assets" --output-dir "$tmp/output"
+    echo "release-package-validate: ok ($tag)"
+
 # Build the release archive + checksum for THIS machine's target, byte-for-byte
 # the way `.github/workflows/release.yml` does (taiki-e/upload-rust-binary-action):
 # `cargo build --release --locked -p thegn-host --bin thegn --target <t>`, then a
