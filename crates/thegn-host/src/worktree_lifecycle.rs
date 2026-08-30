@@ -1028,6 +1028,17 @@ impl Drop for SessionEndGuard {
 static SESSION_RUNTIME: OnceLock<Mutex<SessionRuntime>> = OnceLock::new();
 static DESTROY_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
+/// Process-local ownership for a synchronous destroy transaction. Async UI
+/// workers keep their manual claim until the compositor consumes completion;
+/// synchronous callers use this guard so every return path releases ownership.
+pub(crate) struct ScopedDestroyClaim(PathBuf);
+
+impl Drop for ScopedDestroyClaim {
+    fn drop(&mut self) {
+        release_destroy_path(&self.0);
+    }
+}
+
 fn session_runtime() -> &'static Mutex<SessionRuntime> {
     SESSION_RUNTIME.get_or_init(|| Mutex::new(SessionRuntime::default()))
 }
@@ -1044,6 +1055,11 @@ pub(crate) fn try_claim_destroy_path(path: &Path) -> bool {
         .lock()
         .expect("destroy claim mutex poisoned")
         .insert(path.to_path_buf())
+}
+
+/// Claim a physical path for the duration of a synchronous destroy operation.
+pub(crate) fn try_scoped_destroy_path(path: &Path) -> Option<ScopedDestroyClaim> {
+    try_claim_destroy_path(path).then(|| ScopedDestroyClaim(path.to_path_buf()))
 }
 
 fn release_destroy_path(path: &Path) {
@@ -1355,6 +1371,19 @@ mod tests {
         release_destroy_path(&path);
         assert!(try_claim_destroy_path(&path));
         release_destroy_path(&path);
+    }
+
+    #[test]
+    fn scoped_destroy_claim_releases_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "tg-lifecycle-scoped-destroy-claim-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let claim = try_scoped_destroy_path(&path).expect("first claim should succeed");
+        assert!(try_scoped_destroy_path(&path).is_none());
+        drop(claim);
+        assert!(try_scoped_destroy_path(&path).is_some());
     }
 
     #[test]

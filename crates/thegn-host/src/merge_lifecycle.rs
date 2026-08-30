@@ -169,6 +169,18 @@ pub(crate) fn remove_landed(
     branch: &str,
     delete_branch: bool,
 ) {
+    // Merge reclaim shares the same process as interactive deletion in the TUI.
+    // Serialize it with sidebar/workspace destroy workers so hooks, provider
+    // teardown, and git removal cannot run twice for one physical path.
+    let Some(_destroy_claim) =
+        crate::worktree_lifecycle::try_scoped_destroy_path(Path::new(worktree))
+    else {
+        thegn_core::msg::warn(&format!(
+            "{branch} landed, but cleanup for {worktree} is already in progress"
+        ));
+        let _ = db.remove_merge_entry(worktree); // best-effort: landing still completes the queue transition
+        return;
+    };
     // `worktree::remove` escalates to `git worktree remove --force`, which
     // discards uncommitted work. That is fine for an explicit `wt rm`, but this
     // path is automatic — it fires on a clean land, with no prompt — so a
@@ -573,6 +585,45 @@ mod tests {
                 .all(|r| r.worktree != feat_s)
         );
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn landed_remove_does_not_overlap_an_existing_destroy() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-claimed");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat)
+            .expect("test should own the first destroy claim");
+
+        apply(
+            &cfg(OnLanded::Remove),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::Landed,
+        );
+
+        assert!(feat.is_dir(), "overlapping cleanup must not remove files");
+        assert!(
+            util::git_ok(
+                &root,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+            ),
+            "overlapping cleanup must not delete the branch"
+        );
+        assert!(
+            db.list_merge_queue()
+                .unwrap()
+                .iter()
+                .all(|row| row.worktree != feat_s),
+            "landing still completes the queue transition"
+        );
+
+        drop(claim);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // Regression: when the worktree can't be removed (read-only sandbox mount,
