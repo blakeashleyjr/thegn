@@ -29,8 +29,9 @@ pub(crate) fn warm_direnv(cfg: &Config, worktree: &Path) {
 /// Bounded, SYNCHRONOUS variant of [`warm_direnv`] for the off-loop
 /// pane-materialize path. Warms `worktree`'s `direnv` cache in-line (up to
 /// [`direnv::WARM_NOW_TIMEOUT`]) so the first launch of a cold flake worktree
-/// replays a warm cache instead of falling back. Returns whether the cache is
-/// warm now. **Never call on the event loop.**
+/// replays a warm cache instead of falling back. Returns whether the host-side
+/// warm completed successfully; some `.envrc` implementations do not produce
+/// a replayable `.direnv/*.rc`. **Never call on the event loop.**
 pub(crate) fn warm_direnv_now(cfg: &Config, worktree: &Path) -> bool {
     let Some(allow) = direnv::warm_now_plan(cfg.sandbox.warm_direnv) else {
         return false; // warming disabled — leave the pane on today's fallback
@@ -44,7 +45,7 @@ pub(crate) fn warm_direnv_now(cfg: &Config, worktree: &Path) -> bool {
         tracing::debug!(
             target: "thegn::direnv",
             worktree = %worktree.display(),
-            "direnv warm did not finish in time; pane may fall back this launch"
+            "direnv warm did not yield a replayable cache; pane may evaluate in-place"
         );
     }
     warmed
