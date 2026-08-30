@@ -51,6 +51,14 @@ pub enum DiffViewOutcome {
     Pending,
     /// Close the view.
     Close,
+    /// Open the selected file/new-side line through the host IDE seam.
+    OpenInIde {
+        path: Option<String>,
+        line: Option<usize>,
+        note: Option<String>,
+    },
+    /// A contextual action had no safe target (for example structural output).
+    Status(String),
 }
 
 /// The read-only worktree diff modal.
@@ -217,6 +225,64 @@ impl DiffView {
         DiffViewOutcome::Pending
     }
 
+    fn open_in_ide_outcome(&self) -> DiffViewOutcome {
+        if self.structural_active() {
+            return DiffViewOutcome::Status(
+                "Structural diff has no stable file selection; switch to the internal view first"
+                    .into(),
+            );
+        }
+        let Some(diff) = self.active_diff() else {
+            return DiffViewOutcome::Status("Diff is still loading; no IDE target yet".into());
+        };
+        match self.open_file {
+            None if self.sel < diff.files.len() => DiffViewOutcome::OpenInIde {
+                path: Some(diff.files[self.sel].path.clone()),
+                line: None,
+                note: None,
+            },
+            None if self.source == DiffSource::PrReview => {
+                let index = self.sel.saturating_sub(diff.files.len());
+                let row = self
+                    .anchored_review()
+                    .and_then(|review| feedback_rows(&review, false).get(index).cloned());
+                row.map_or_else(
+                    || DiffViewOutcome::Status("Selected review row has no IDE target".into()),
+                    |row| ide_outcome_for_review_row(&row, None),
+                )
+            }
+            None => DiffViewOutcome::Status("Select a diff file first".into()),
+            Some(file_index) => {
+                let Some(file) = diff.files.get(file_index) else {
+                    return DiffViewOutcome::Status("Selected diff file is stale".into());
+                };
+                if self.source == DiffSource::PrReview {
+                    let row = self.anchored_review().and_then(|review| {
+                        expanded_file_rows(file, Some(&review), false)
+                            .get(self.sel)
+                            .cloned()
+                    });
+                    row.map_or_else(
+                        || DiffViewOutcome::Status("Selected review row is stale".into()),
+                        |row| ide_outcome_for_review_row(&row, Some(&file.path)),
+                    )
+                } else {
+                    let lines = self.open_file_lines(file_index);
+                    let Some(line) = lines.get(self.sel) else {
+                        return DiffViewOutcome::Status("Selected diff line is stale".into());
+                    };
+                    DiffViewOutcome::OpenInIde {
+                        path: Some(file.path.clone()),
+                        line: line.new_lineno.and_then(|line| usize::try_from(line).ok()),
+                        note: line.new_lineno.is_none().then(|| {
+                            "Deleted line has no new-side location; opening the file".into()
+                        }),
+                    }
+                }
+            }
+        }
+    }
+
     // --- input -------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> DiffViewOutcome {
@@ -228,6 +294,9 @@ impl DiffView {
         if matches!(key, KeyCode::Char('t' | 'T')) && matches!(self.structural, Some(Ok(_))) {
             self.show_structural = !self.show_structural;
             return DiffViewOutcome::Pending;
+        }
+        if matches!(key, KeyCode::Char('e')) {
+            return self.open_in_ide_outcome();
         }
         // Structural output is a complete rendered view of the worktree. Do
         // not let the source label switch underneath it; return to the
@@ -424,12 +493,17 @@ impl DiffView {
         } else if self.open_file.is_some() {
             [
                 format!("{movement} move"),
+                "e IDE".into(),
                 "Left back".into(),
                 "q/esc close".into(),
             ]
             .join(&separator)
         } else {
-            let mut actions = vec![format!("{movement} move"), "Enter open file".into()];
+            let mut actions = vec![
+                format!("{movement} move"),
+                "Enter open file".into(),
+                "e IDE".into(),
+            ];
             if self.review.is_some() {
                 actions.push("Tab source".into());
             }
@@ -580,6 +654,41 @@ impl DiffView {
     }
 }
 
+fn ide_outcome_for_review_row(row: &ReviewRow, file_path: Option<&str>) -> DiffViewOutcome {
+    match row {
+        ReviewRow::Diff(line) => DiffViewOutcome::OpenInIde {
+            path: file_path.map(str::to_string),
+            line: line.new_lineno.and_then(|line| usize::try_from(line).ok()),
+            note: line
+                .new_lineno
+                .is_none()
+                .then(|| "Deleted line has no new-side location; opening the file".into()),
+        },
+        ReviewRow::Thread(thread) => DiffViewOutcome::OpenInIde {
+            path: (!thread.path.is_empty()).then(|| thread.path.clone()),
+            line: thread.line.and_then(|line| usize::try_from(line).ok()),
+            note: None,
+        },
+        ReviewRow::Outdated(thread) => DiffViewOutcome::OpenInIde {
+            path: (!thread.path.is_empty()).then(|| thread.path.clone()),
+            line: None,
+            note: Some(
+                "Outdated review thread has no exact new-side line; opening its file".into(),
+            ),
+        },
+        ReviewRow::General(_) => DiffViewOutcome::OpenInIde {
+            path: None,
+            line: None,
+            note: Some("Review item has no file anchor; opening the worktree".into()),
+        },
+        ReviewRow::Hunk(_) => DiffViewOutcome::OpenInIde {
+            path: file_path.map(str::to_string),
+            line: None,
+            note: Some("Hunk header has no exact new-side line; opening the file".into()),
+        },
+    }
+}
+
 /// Convert one parsed structural line (SGR runs resolved to RGB) into a
 /// compositor [`Line`]. Colours ride as `Tok::Rgb` — composed truecolor and
 /// quantized once at the `wire.rs` chokepoint, so no colour literal at a draw
@@ -674,6 +783,56 @@ mod tests {
         v.handle_key(&KeyCode::LeftArrow, Modifiers::NONE);
         assert_eq!(v.open_file, None);
         assert_eq!(v.row_count(), 2);
+    }
+
+    #[test]
+    fn ide_handoff_uses_new_side_line_and_degrades_deleted_lines() {
+        let mut diff = sample();
+        diff.files[0].hunks[0].lines[0].new_lineno = Some(9);
+        diff.files[0].hunks[0].lines[1].new_lineno = None;
+        diff.files[0].hunks[0].lines[1].kind = DiffLineKind::Del;
+        let mut view = DiffView::with_structural("t".into(), 1, false);
+        view.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(diff),
+            structural: None,
+            review: None,
+            review_status: None,
+        });
+        view.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(
+            view.handle_key(&KeyCode::Char('e'), Modifiers::NONE),
+            DiffViewOutcome::OpenInIde {
+                path: Some("a.rs".into()),
+                line: Some(9),
+                note: None,
+            }
+        );
+        view.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
+        assert!(matches!(
+            view.handle_key(&KeyCode::Char('e'), Modifiers::NONE),
+            DiffViewOutcome::OpenInIde {
+                path: Some(path),
+                line: None,
+                note: Some(_),
+            } if path == "a.rs"
+        ));
+    }
+
+    #[test]
+    fn structural_diff_refuses_to_invent_a_file_target() {
+        let mut view = DiffView::with_structural("t".into(), 1, true);
+        view.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: Some(Ok(vec![])),
+            review: None,
+            review_status: None,
+        });
+        assert!(matches!(
+            view.handle_key(&KeyCode::Char('e'), Modifiers::NONE),
+            DiffViewOutcome::Status(message) if message.contains("no stable file")
+        ));
     }
 
     #[test]

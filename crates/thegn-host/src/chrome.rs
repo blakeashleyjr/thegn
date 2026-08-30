@@ -449,6 +449,10 @@ pub struct FrameModel {
     /// Same loop-drain contract otherwise (never rendered, never part of
     /// `hydration_eq`).
     pub adopt_intents: Vec<thegn_core::store::IntentRow>,
+    /// Pending `editor.open` requests claimed from the control mailbox. All
+    /// rows are drained before model swap and revalidated by `ide_handoff`;
+    /// this carrier is never rendered or compared by `hydration_eq`.
+    pub open_editor_intents: Vec<thegn_core::store::IntentRow>,
     /// A cold worktree switch blanked the panel (switch-cache miss) and its
     /// hydration hasn't landed yet: the panel draws its skeleton placeholder
     /// instead of a void. Loop-transient (set by `WorktreeSlice::clear`,

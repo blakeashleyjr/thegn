@@ -33,6 +33,29 @@ pub(crate) fn open_command_tab(
     let _ = open_command_tab_id(session, panes, command, cwd, center);
 }
 
+/// Spawn structured argv into a brand-new tab in the active group.
+pub(crate) fn open_argv_tab(
+    session: &mut Session,
+    panes: &mut Panes,
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) -> bool {
+    let Ok(id) = panes.spawn_argv(argv, cwd, center) else {
+        return false;
+    };
+    if let Some(group) = session.active_group_mut() {
+        group.add_tab();
+        if let Some(tab) = group.active_tab_mut() {
+            tab.center = crate::center::CenterTree::Leaf(id);
+            tab.focused_pane = id;
+            return true;
+        }
+    }
+    panes.table.remove(&id);
+    false
+}
+
 /// [`open_command_tab`], returning the spawned pane's id (the onboarding
 /// wizard watches its login/agent tab for exit).
 pub(crate) fn open_command_tab_id(
@@ -78,6 +101,28 @@ pub(crate) fn open_command_pane(
         return;
     }
     panes.table.remove(&id);
+}
+
+/// Spawn structured argv into a split beside the focused center pane.
+pub(crate) fn open_argv_pane(
+    session: &mut Session,
+    panes: &mut Panes,
+    focused: u32,
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) -> bool {
+    let Ok(id) = panes.spawn_argv(argv, cwd, center) else {
+        return false;
+    };
+    if let Some(tab) = session.active_tab_mut()
+        && tab.center.split(focused, crate::center::Dir::Row, id)
+    {
+        tab.focused_pane = id;
+        return true;
+    }
+    panes.table.remove(&id);
+    false
 }
 
 /// Handle a private `OSC 5379` control message the drawer's file manager
@@ -939,6 +984,7 @@ pub(crate) fn dispatch_pr_view_key(
     waker: &TerminalWaker,
     model: &mut FrameModel,
     active_menu: &mut Option<crate::menu::MenuOverlay>,
+    ide_tx: &UnboundedSender<crate::ide_handoff::Outcome>,
 ) {
     let Some(v) = view.as_mut() else { return };
     match v.handle_key(key, mods) {
@@ -959,6 +1005,19 @@ pub(crate) fn dispatch_pr_view_key(
             }
         }
         PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+        PrViewOutcome::OpenInIde { path, line, note } => {
+            dispatch_ide_location(
+                session,
+                cfg,
+                model,
+                ide_tx,
+                waker,
+                path,
+                line,
+                note,
+                "PR review",
+            );
+        }
     }
 }
 
@@ -1103,11 +1162,62 @@ pub(crate) fn review_snapshot_matches_panel(
 }
 
 /// Route a key to the open diff viewer: close it, or consume it (read-only).
-pub(crate) fn dispatch_diff_view_key(view: &mut Option<DiffView>, key: &KeyCode, mods: Modifiers) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_diff_view_key(
+    view: &mut Option<DiffView>,
+    key: &KeyCode,
+    mods: Modifiers,
+    session: &Session,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    ide_tx: &UnboundedSender<crate::ide_handoff::Outcome>,
+    waker: &TerminalWaker,
+) {
     let Some(v) = view.as_mut() else { return };
     match v.handle_key(key, mods) {
         DiffViewOutcome::Close => *view = None,
         DiffViewOutcome::Pending => {}
+        DiffViewOutcome::Status(status) => model.status = status,
+        DiffViewOutcome::OpenInIde { path, line, note } => dispatch_ide_location(
+            session,
+            cfg,
+            model,
+            ide_tx,
+            waker,
+            path,
+            line,
+            note,
+            "diff view",
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_ide_location(
+    session: &Session,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    ide_tx: &UnboundedSender<crate::ide_handoff::Outcome>,
+    waker: &TerminalWaker,
+    path: Option<String>,
+    line: Option<usize>,
+    note: Option<String>,
+    source: &'static str,
+) {
+    match crate::ide_handoff::active_target(session, path.as_deref(), line, None) {
+        Ok((target, workspace_slug)) => {
+            crate::ide_handoff::dispatch(
+                target,
+                workspace_slug,
+                source,
+                crate::ide_handoff::PanePlacement::Tab,
+                cfg,
+                ide_tx,
+                waker,
+            );
+            model.status = note.unwrap_or_else(|| "Opening selection in IDE…".into());
+        }
+        Err(error) => model.status = error,
     }
 }
 

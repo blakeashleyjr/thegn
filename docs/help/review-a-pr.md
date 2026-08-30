@@ -42,6 +42,12 @@ explicit confirmation is required before the configured headless PR-review
 template runs off-loop. If neither exists, the handoff reports why and does
 nothing. Pasting never auto-submits, resolves, approves, merges, or closes a PR.
 
+Press **`e`** in the PR view to **Open in IDE**. A selected file or exact
+new-side review thread carries its path and line; an outdated/deleted anchor
+opens the file without guessing a line and explains the fallback. Top-level
+feedback has no file anchor, so it opens the review worktree itself. The PR
+view footer keeps this action visible beside the browser and review handoffs.
+
 ## Raising one
 
 Going the other way, **PR — create (web)** (`pr-create`) opens the

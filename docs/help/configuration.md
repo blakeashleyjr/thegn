@@ -51,11 +51,16 @@ The file is watched: edits apply live, no restart.
 - `[hooks]` — host-side commands at worktree and session boundaries. Entries
   accumulate across global, workspace, and trusted repo-local configuration;
   see **Worktree lifecycle hooks** below.
-- `[editor]` — how "open in editor" opens files: `command` is a template
-  (`{path}`, `{line}`, `{col}`); unset, thegn uses `[[tools]] editor`, then
-  `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
-  syntax. `open_in = "auto"|"pane"|"external"` decides center tab vs
-  detached window (auto: windowed editors detach).
+- `[editor]` — how editor/IDE handoff opens worktrees and files. `provider`
+  selects `auto`, `vscode`, `cursor`, `zed`, `jetbrains`, `nvim_remote`, or
+  `emacs`; `THEGN_EDITOR_PROVIDER` overrides the global choice for one run.
+  `auto` uses `[[tools]] editor`, then `$VISUAL`/`$EDITOR`, then `vi`.
+  A non-empty trusted `command` template (`{path}`, `{line}`, `{col}`) remains
+  highest priority. `open_in = "auto"|"pane"|"external"` decides center tab
+  vs detached window.
+- `[workspace.<slug>] editor = "cursor"` selects a logical provider for one
+  workspace and inherits `[editor] provider` when omitted. It is accepted only
+  in the trusted user config, never from a repo-local `.thegn.*` overlay.
 - `[lsp]` + `[[lsp.servers]]` — the language-server **registry**. The six
   built-ins (rust/typescript/tsx/javascript/python/go) are pre-registered;
   any other `lang` key with its `extensions` registers an arbitrary server
