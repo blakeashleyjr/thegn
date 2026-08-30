@@ -48,6 +48,7 @@ pub(crate) mod switch_cache;
 pub(crate) mod tab_keys;
 pub(crate) mod task_output;
 pub(crate) mod terminal;
+pub(crate) mod theme_builder;
 pub(crate) mod tracker;
 pub(crate) mod usage_alert;
 pub(crate) mod wizard;

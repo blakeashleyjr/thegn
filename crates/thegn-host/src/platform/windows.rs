@@ -150,6 +150,26 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
     std::fs::File::create(path)
 }
 
+/// Open an existing path without traversing a final-component reparse point.
+/// `FILE_FLAG_OPEN_REPARSE_POINT` is kept local to the platform seam rather
+/// than enabling another windows-sys feature for one constant.
+pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(test)]
+pub fn symlink_file_for_test(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}
+
 /// No-op on Windows (no unix mode bits to tighten).
 pub fn restrict_dir_owner_only(_path: &std::path::Path) {}
 

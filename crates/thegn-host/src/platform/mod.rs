@@ -43,6 +43,29 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+#[cfg(test)]
+pub(crate) fn test_fifo_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+pub(crate) fn test_fifo(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        Ok(mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR)?)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::other(
+            "FIFOs are not supported by this test",
+        ))
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

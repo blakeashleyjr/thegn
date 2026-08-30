@@ -29,7 +29,7 @@ pub enum SourceKind {
     Env,
     /// `[profiles.<name>]` keybind profiles.
     Profile,
-    /// Built-in theme presets.
+    /// Built-in and valid local user themes.
     Theme,
     /// `[[agents]]` names.
     Agent,
@@ -234,9 +234,9 @@ const fn slot(command_path: &'static str, arg_id: &'static str, source: SourceKi
 /// The catalog. Rows are grouped by source kind, and within a kind sorted by
 /// command path, so a new verb lands next to its neighbours.
 ///
-/// Not every implemented kind has a slot yet — `theme`, `tool`, `plugin` and
-/// `action` are served (and tested) but nothing in today's CLI grammar takes
-/// one, so they wait for a verb rather than being bound to an approximation.
+/// Not every implemented kind has a slot yet — `tool`, `plugin` and `action`
+/// are served (and tested) but nothing in today's CLI grammar takes one, so
+/// they wait for a verb rather than being bound to an approximation.
 /// Everything a slot could take and this does not classify is pinned in
 /// `test/completion-slot-ratchet.txt`, which only shrinks.
 pub const CATALOG: &[Slot] = &[
@@ -471,6 +471,10 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // Theme names are the merged built-in/local catalog. The import path is a
+    // filesystem value and keeps clap's structural completion behavior.
+    slot("theme set", "name", SourceKind::Theme),
+    slot("theme import", "name", SourceKind::Theme),
     // --- structural (clap completes these from the tree) -------------------
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
@@ -478,6 +482,7 @@ pub const CATALOG: &[Slot] = &[
     // `config validate --repo <PATH>`: clap owns filesystem path completion.
     slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------
