@@ -8,19 +8,24 @@ rely on.
 
 Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
-| Group         | Commands                                                                                                              |
-| ------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `map` · `land` · `integrate` · `merge`  |
-| Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                          |
-| Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) |
-| Environments  | `env` · `zone` · `host` · `placement` · `sandbox` · `debug` · `mcp` · `plugin`                                        |
-| Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                              |
-| Control plane | `serve` · `session` · `attach` · `pair`                                                                               |
-| Meta          | `config` · `theme` · `skills` · `doctor` · `setup` · `completions`                                                    |
+| Group         | Commands                                                                                                                           |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `map` · `land` · `integrate` · `merge`               |
+| Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                                       |
+| Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped)              |
+| Environments  | `env` · `zone` · `host` · `placement` · `sandbox` · `debug` · `mcp` · `plugin`                                                     |
+| Session       | `session list\|open\|fork\|close\|send\|snapshot\|attach\|wait\|record` · `notify` · `logs` · `share` · `forward` · `sandbox-argv` |
+| Control plane | `serve` · `session` · `attach` · `pair`                                                                                            |
+| Meta          | `config` · `theme` · `skills` · `doctor` · `setup` · `completions`                                                                 |
 
 `session open --resume-work <row>` resumes a failed pipeline row through the
 roster (THE-86): it re-renders the row's stage prompt, gathers the row's
 artifact/git/screen facts, and opens the finisher dispatch.
+
+`session fork <id>` asks the daemon to start a new PTY from a live session.
+Use `--scrollback` for a bounded handoff, `--tab` for a new tab, and
+`--fork-worktree` to create a separate worktree first. `--json` includes the
+child's `forked_from` lineage without exposing the launch recipe.
 
 `dispatch put --chunk <file>` / `session open --chunk <file>` (THE-86) record
 the chunk file a row dispatches under and run its scope gate before the row is

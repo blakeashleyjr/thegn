@@ -109,6 +109,32 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "preview.fetch",
+        description: "Fetch a preview URL through the daemon's bounded, credential-free HTTP \
+                      client. Loopback targets only unless the operator explicitly enables \
+                      external preview URLs. Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "url",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute http/https preview URL",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree used to select bounded dev-server pane diagnostics",
+            },
+            ArgSpec {
+                name: "include_console",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Include source-labelled dev-server error lines (default false)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "leases.list",
         description: "Relay lease state per session — which detached sessions are being \
                       kept warm, and until when. Requires a running daemon.",
@@ -251,6 +277,64 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "sessions.fork",
+        description: "Fork a live daemon or recorded harness session into a new process. \
+                      The source is never paused or cloned; a recorded source uses only \
+                      the harness's native fork operation. Write-scoped \
+                      (`--scopes write`). No argv, environment, prompt, transcript, or \
+                      vendor file data is accepted. Requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "session",
+                kind: ArgKind::String,
+                required: true,
+                description: "Live daemon session id, or native id from agent_sessions",
+            },
+            ArgSpec {
+                name: "harness",
+                kind: ArgKind::String,
+                required: false,
+                description: "Harness id when session is a recorded native session",
+            },
+            ArgSpec {
+                name: "agent",
+                kind: ArgKind::String,
+                required: false,
+                description: "Configured agent name for the fork launch context",
+            },
+            ArgSpec {
+                name: "cwd",
+                kind: ArgKind::String,
+                required: false,
+                description: "Working directory override",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree override",
+            },
+            ArgSpec {
+                name: "scrollback",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Request a bounded plain-text scrollback handoff file",
+            },
+            ArgSpec {
+                name: "tab",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Adopt the child in a new tab",
+            },
+            ArgSpec {
+                name: "adopt",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Ask a connected compositor to adopt the child",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "sessions.input",
         description: "Send terminal input to a live session — raw bytes to its stdin, \
                       exactly as if typed at its keyboard (control characters included). \
@@ -353,11 +437,13 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "preview.fetch",
     "leases.list",
     "me",
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
+    "sessions.fork",
     "sessions.input",
     "sessions.kill",
     "semantic.map",
@@ -734,6 +820,7 @@ mod tests {
         let read = [
             "sessions.list",
             "worktrees.list",
+            "preview.fetch",
             "leases.list",
             "me",
             "agent.sessions",
@@ -741,7 +828,12 @@ mod tests {
             "semantic.map",
             "semantic.blast_radius",
         ];
-        let write = ["sessions.open", "sessions.input", "sessions.kill"];
+        let write = [
+            "sessions.open",
+            "sessions.fork",
+            "sessions.input",
+            "sessions.kill",
+        ];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Read, "{cap}");

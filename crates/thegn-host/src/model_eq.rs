@@ -78,6 +78,13 @@ mod tests {
             forecast: Vec::new(),
         });
         other.app_tabs.push("chat".into());
+        other.preview = Some(crate::chrome::PreviewView {
+            worktree: "/repo".into(),
+            port: 5173,
+            url: "http://localhost:5173/".into(),
+            source: thegn_core::preview::PortHintSource::PaneOutput,
+            status: thegn_core::preview::PreviewStatus::Up,
+        });
         other.sidebar_selected = 3;
         other.center_focused = !base.center_focused;
         other.status = "Copied log line".into();

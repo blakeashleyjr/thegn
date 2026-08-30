@@ -1441,6 +1441,40 @@ fn metrics_env_overlay_clamps_runtime_bounds() {
     assert_eq!(c.metrics.max_body_bytes, 1);
 }
 
+#[test]
+fn preview_config_layering_and_cli_array_override() {
+    let dir = tmpdir("preview-config");
+    let file = dir.join("config.toml");
+    std::fs::write(
+        &file,
+        "[preview]\nenabled = true\nports = [1111]\nfetch_timeout_ms = 500\n\
+         max_body_bytes = 2048\nallow_external_urls = false\n",
+    )
+    .unwrap();
+    let env = map_env(&[
+        ("THEGN_PREVIEW_ENABLED", "false"),
+        ("THEGN_PREVIEW_PORTS", "2222"),
+        ("THEGN_PREVIEW_FETCH_TIMEOUT_MS", "600"),
+        ("THEGN_PREVIEW_MAX_BODY_BYTES", "4096"),
+        ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "true"),
+    ]);
+    let flags = vec![
+        "preview.enabled=true".into(),
+        "preview.ports=[4444, 3333, 4444]".into(),
+        "preview.fetch_timeout_ms=700".into(),
+        "preview.max_body_bytes=8192".into(),
+        "preview.allow_external_urls=false".into(),
+    ];
+    let config = Config::load_layered(&env, &flags, Some(file));
+    assert!(config.preview.enabled);
+    assert_eq!(config.preview.ports, vec![3333, 4444]);
+    assert_eq!(config.preview.fetch_timeout_ms, 700);
+    assert_eq!(config.preview.max_body_bytes, 8192);
+    assert!(!config.preview.allow_external_urls);
+    // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Exercise every env knob (and the canonical/deprecated/bad-value paths) so
 // the layering is covered, not just spot-checked.
 #[test]
@@ -1518,6 +1552,11 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SKILLS_ENABLED", "false"),
         ("THEGN_SKILLS_USER_DIRS", "/one, ~/.skills"),
         ("THEGN_SKILLS_EXCLUDE", "mq, pipeline"),
+        ("THEGN_PREVIEW_ENABLED", "no"),
+        ("THEGN_PREVIEW_PORTS", "5173,3000,5173"),
+        ("THEGN_PREVIEW_FETCH_TIMEOUT_MS", "850"),
+        ("THEGN_PREVIEW_MAX_BODY_BYTES", "8192"),
+        ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "yes"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1601,6 +1640,11 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.skills.enabled);
     assert_eq!(c.skills.user_dirs, vec!["/one", "~/.skills"]);
     assert_eq!(c.skills.exclude, vec!["mq", "pipeline"]);
+    assert!(!c.preview.enabled);
+    assert_eq!(c.preview.ports, vec![3000, 5173]);
+    assert_eq!(c.preview.fetch_timeout_ms, 850);
+    assert_eq!(c.preview.max_body_bytes, 8192);
+    assert!(c.preview.allow_external_urls);
 }
 
 #[test]
@@ -1830,6 +1874,8 @@ fn agent_command() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1851,6 +1897,8 @@ fn default_agent_name_skips_the_shell_fallback() {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         }],
         ..Default::default()
     };
@@ -1867,6 +1915,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
@@ -1879,6 +1929,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
@@ -1897,6 +1949,8 @@ fn tool_command() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);
@@ -2559,6 +2613,141 @@ fn surface_self_log_errors_defaults_off_and_overlay_applies() {
     assert!(!ov.is_empty());
 }
 
+#[test]
+fn sound_config_defaults_and_new_fields_round_trip() {
+    let defaults = SoundConfig::default();
+    assert_eq!(defaults.mode, SoundMode::Bell);
+    assert_eq!(defaults.volume, 1.0);
+    assert!(!defaults.mute);
+
+    let cfg: Config = toml::from_str(
+        r#"[notifications.sound]
+mute = true
+mode = "bell"
+pack = "/home/me/sounds"
+volume = 0.25
+per_kind = { agent_done = "pack:finished", test_failed = "/tmp/fail.wav" }
+"#,
+    )
+    .unwrap();
+    let sound = cfg.notifications.sound;
+    assert!(sound.mute);
+    assert_eq!(sound.pack, "/home/me/sounds");
+    assert_eq!(sound.clamped_volume(), 0.25);
+    assert_eq!(sound.per_kind["agent_done"], "pack:finished");
+}
+
+#[test]
+fn sound_config_validation_rejects_bad_bounds_and_kind_names() {
+    let mut sound = SoundConfig {
+        volume: 1.5,
+        pack: "relative/sounds".into(),
+        always_kinds: vec!["agent_dnoe".into()],
+        ..Default::default()
+    };
+    sound
+        .per_kind
+        .insert("test_fialed".into(), "paplay alert.wav".into());
+    let errors = sound.validate();
+    assert!(errors.iter().any(|e| e.contains("volume")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("pack")), "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("agent_done") && e.contains("did you mean")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("test_failed") && e.contains("did you mean")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("per_kind.test_fialed") && e.contains("unsupported")),
+        "{errors:?}"
+    );
+    let strict_errors = crate::config_validate::validate_str(
+        "[notifications.sound]\nvolume = 1.5\nper_kind = { agent_dnoe = \"bell\" }\n",
+    );
+    assert!(
+        strict_errors.iter().any(|e| e.contains("volume")),
+        "{strict_errors:?}"
+    );
+    assert!(
+        strict_errors
+            .iter()
+            .any(|e| e.contains("agent_done") && e.contains("did you mean")),
+        "{strict_errors:?}"
+    );
+    sound.volume = f32::NAN;
+    assert_eq!(sound.clamped_volume(), 1.0);
+}
+
+#[test]
+fn strict_validation_checks_profile_sound_maps() {
+    let errors = crate::config_validate::validate_str(
+        "[profiles.work.notifications.sound]\nper_kind = { agent_dnoe = \"bell\" }\n",
+    );
+    assert!(
+        errors.iter().any(
+            |error| error.contains("profiles.work.notifications.sound.per_kind")
+                && error.contains("agent_done")
+        ),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn repo_notification_overlay_cannot_supply_sound_paths_or_commands() {
+    let dir = tmpdir("notification-sound-trust");
+    std::fs::write(
+        dir.join(".thegn.toml"),
+        r#"[notifications.sound]
+mode = "command"
+pack = "/tmp/untrusted-pack"
+chime_file = "/tmp/untrusted.wav"
+command = "touch /tmp/pwned"
+per_priority = { alert = "touch /tmp/pwned2" }
+per_kind = { agent_done = "/tmp/untrusted-kind.wav" }
+"#,
+    )
+    .unwrap();
+    let effective = Config::default().effective_notifications(Some(&dir));
+    assert_eq!(effective.sound.mode, SoundMode::Bell);
+    assert!(effective.sound.pack.is_empty());
+    assert!(effective.sound.chime_file.is_empty());
+    assert!(effective.sound.command.is_empty());
+    assert!(effective.sound.per_priority.is_empty());
+    assert!(effective.sound.per_kind.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repo_notification_overlay_cannot_supply_rule_sound_commands() {
+    let dir = tmpdir("notification-rule-sound-trust");
+    std::fs::write(
+        dir.join(".thegn.toml"),
+        r#"[[notifications.rules]]
+kind = "agent_done"
+sound = "touch /tmp/pwned"
+
+[[notifications.rules]]
+kind = "agent_failed"
+sound = "off"
+"#,
+    )
+    .unwrap();
+
+    let effective = Config::default().effective_notifications(Some(&dir));
+    assert_eq!(effective.rules.len(), 2);
+    assert!(effective.rules[0].sound.is_none());
+    assert_eq!(effective.rules[1].sound.as_deref(), Some("off"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// THE-68: an OSC raised hand is live state, so it is NOT recorded in the inbox
 /// unless the user opts in — the default that stops one row per agent turn.
 #[test]
@@ -2751,6 +2940,11 @@ fn validate_str_catches_wholesale_type_error() {
     assert!(
         !errs.is_empty(),
         "type mismatch that breaks load must be reported: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|error| error.contains("sandbox.enabled: expected boolean, got string")),
+        "type mismatch should identify its dotted key and types: {errs:?}"
     );
 
     // A clean config still validates.

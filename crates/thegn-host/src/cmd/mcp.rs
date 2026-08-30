@@ -444,6 +444,19 @@ async fn fetch_state(
             let sessions = c.sessions().await.map_err(|e| e.to_string())?;
             Ok(json!({ "sessions": sessions }))
         }
+        "preview.fetch" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::PreviewFetchRequest {
+                url: str_arg(args, "url").ok_or("missing `url`")?.to_string(),
+                worktree: str_arg(args, "worktree").map(str::to_string),
+                include_console: args
+                    .get("include_console")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let reply = c.preview_fetch(&request).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
         "leases.list" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             c.leases().await.map_err(|e| e.to_string())
@@ -485,6 +498,32 @@ async fn fetch_state(
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let spec = open_spec_from_args(args)?;
             let info = c.open(&spec).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(&info).map_err(|e| e.to_string())
+        }
+        "sessions.fork" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let spec = thegn_svc::control::ForkSpec {
+                session: str_arg(args, "session")
+                    .ok_or("missing session")?
+                    .to_string(),
+                harness: str_arg(args, "harness").map(str::to_string),
+                agent: str_arg(args, "agent").map(str::to_string),
+                cwd: str_arg(args, "cwd").map(str::to_string),
+                worktree: str_arg(args, "worktree").map(str::to_string),
+                scrollback: args
+                    .get("scrollback")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                tab: args
+                    .get("tab")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                adopt: args
+                    .get("adopt")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let info = c.fork(&spec).await.map_err(|e| e.to_string())?;
             serde_json::to_value(&info).map_err(|e| e.to_string())
         }
         "sessions.input" => {
@@ -644,6 +683,8 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
         // the MCP tool surface stays resume/cold.
         continue_last: false,
         stage: str_arg(args, "stage").map(str::to_string),
+        fork: false,
+        native_session_id: None,
     });
 
     Ok(OpenSpec {
@@ -757,6 +798,7 @@ mod tests {
     const READ_CAPS: &[&str] = &[
         "sessions.list",
         "worktrees.list",
+        "preview.fetch",
         "leases.list",
         "me",
         "agent.sessions",

@@ -23,6 +23,25 @@ use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SessionAction {
+    /// Move one persisted worktree presentation and dispatch ledger to an
+    /// existing profile. This is deliberately a host operation: it crosses
+    /// two profile databases and is not a daemon control verb.
+    Move {
+        /// Exact stored worktree path to migrate.
+        worktree: String,
+        /// Existing target profile name.
+        #[arg(long)]
+        to_profile: String,
+        /// Kill live source daemon sessions after listing them, before import.
+        #[arg(long)]
+        kill: bool,
+        /// Print the complete migration plan without killing or writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit one redacted audit JSON document instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the daemon's sessions — including recently exited ones (the
     /// daemon's tombstones), each marked with a liveness token.
     List {
@@ -128,6 +147,35 @@ pub enum SessionAction {
             ]
         )]
         resume_work: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fork a live daemon or recorded native harness session into a new
+    /// process. A harness id selects a native session from agent sessions.
+    Fork {
+        /// Live daemon id, or native id when --harness is present.
+        session: String,
+        /// Harness id for a recorded native session.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Configured agent name for the child launch context.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Child working-directory override.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Child worktree override.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Include a bounded plain-text history handoff.
+        #[arg(long)]
+        scrollback: bool,
+        /// Create a new worktree first, then fork into it.
+        #[arg(long)]
+        fork_worktree: bool,
+        /// Adopt the child in a new tab.
+        #[arg(long)]
+        tab: bool,
         #[arg(long)]
         json: bool,
     },
@@ -253,8 +301,13 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
         .lease_expires_at
         .map(|at| format!("  lease→{at}"))
         .unwrap_or_default();
+    let lineage = s
+        .forked_from
+        .as_deref()
+        .map(|source| format!("  ← forked from {source}"))
+        .unwrap_or_default();
     format!(
-        "{}  {}  {}x{}  {} client(s)  {}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}{}",
         s.id,
         state,
         s.cols,
@@ -265,7 +318,8 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
             .as_deref()
             .map(|w| format!("  [{w}]"))
             .unwrap_or_default(),
-        lease
+        lease,
+        lineage
     )
 }
 
@@ -327,8 +381,10 @@ pub fn run(cfg: &Config, action: SessionAction) -> Result<()> {
 async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     let json_mode = matches!(
         &action,
-        SessionAction::List { json: true, .. }
+        SessionAction::Move { json: true, .. }
+            | SessionAction::List { json: true, .. }
             | SessionAction::Open { json: true, .. }
+            | SessionAction::Fork { json: true, .. }
             | SessionAction::Close { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
             | SessionAction::Wait { json: true, .. }
@@ -341,6 +397,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     // offline row checks (unknown row, non-pipeline row, unknown stage) in
     // `resume_preflight`, the same pre-`connect` slot.
     match &action {
+        SessionAction::Move { .. } => {
+            // Migration is dispatched before `connect`: a cold source daemon
+            // is a supported case, and the target is never loaded in-process.
+            return crate::cmd::session_move::run(cfg, action).await;
+        }
         SessionAction::Open {
             stage,
             issue,
@@ -370,6 +431,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
     };
     match action {
+        SessionAction::Move { .. } => unreachable!("session move was dispatched before connect"),
         SessionAction::List { json, live } => {
             let mut sessions = client.sessions().await?;
             if live {
@@ -484,6 +546,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         // model/env/permissions over the agent; None on a
                         // plain open.
                         stage,
+                        fork: false,
+                        native_session_id: None,
                     }),
                     // Default false: a fan-out that spawns eight agents should not
                     // yank eight panes into the user's session unasked. `--adopt`
@@ -498,6 +562,31 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     outln!("{}", info.id);
                 }
             }
+        }
+        SessionAction::Fork {
+            session,
+            harness,
+            agent,
+            cwd,
+            worktree,
+            scrollback,
+            fork_worktree,
+            tab,
+            json,
+        } => {
+            crate::cmd::session_fork::run(
+                &client,
+                session,
+                harness,
+                agent,
+                cwd,
+                worktree,
+                scrollback,
+                fork_worktree,
+                tab,
+                json,
+            )
+            .await?;
         }
         SessionAction::Close { session, json } => {
             client.kill(&session).await?;
@@ -937,6 +1026,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                 // `model`/`env`/`permissions` over the resolved agent and
                 // seeds the effective allow-list (THE-83's launch path).
                 stage: Some(stage.name.clone()),
+                fork: false,
+                native_session_id: None,
             }),
             adopt: d.adopt,
             already_capped: false,
@@ -1178,6 +1269,8 @@ async fn resume_work(
                 // `model`/`env`/`permissions` over the resolved agent exactly
                 // as for a fresh dispatch.
                 stage: Some(stage.name.clone()),
+                fork: false,
+                native_session_id: None,
             }),
             adopt,
             already_capped: false,
@@ -1578,6 +1671,9 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "model_proxy.start",
         "model_proxy.stop",
     ]);
+    // Cross-profile migration is a local, admin-scoped CLI operation rather
+    // than a control route, but it is still a catalog-owned CLI surface.
+    v.push("sessions.migrate");
     // Pipeline run-completion verbs (THE-76/THE-88): local `thegn dispatch
     // verify|wait|report|note|status`
     // — the first reads the worktree + roster directly, the second composes the

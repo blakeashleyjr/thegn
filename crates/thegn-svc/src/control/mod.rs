@@ -117,6 +117,10 @@ pub struct SessionInfo {
     /// contents. `None` when nothing is being recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<String>,
+    /// Stable display form of the source session when this session was forked.
+    /// This is lineage metadata only; no launch recipe is included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -203,6 +207,48 @@ pub struct AgentLaunch {
     /// Unknown stage ⇒ error. See `thegn_core::agent_task::effective_agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// Ask the selected harness to create a native child session rather than
+    /// resume the source in place. The daemon validates and resolves this
+    /// operation through the harness seam.
+    #[serde(default)]
+    pub fork: bool,
+    /// Native session id passed to the harness fork operation. It is kept
+    /// separate from `resume` so a fork cannot silently become an in-place
+    /// resume when the two launch forms are composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+}
+
+/// Intent for creating a new session from a live daemon or recorded harness
+/// session. `harness` discriminates the source: absent means `session` is a
+/// live daemon id; present means it is a native id discovered from
+/// `agent.sessions`. No process recipe, environment, prompt, or transcript
+/// data crosses the control boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ForkSpec {
+    /// Live daemon id, or native harness id when `harness` is set.
+    pub session: String,
+    /// Harness id for a recorded native session source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Configured agent name used to resolve the child launch context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Optional child working-directory override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Optional child worktree override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Request a bounded plain-text scrollback handoff file.
+    #[serde(default)]
+    pub scrollback: bool,
+    /// Ask a connected compositor to adopt the child.
+    #[serde(default)]
+    pub adopt: bool,
+    /// Adopt the child in a new tab instead of beside the source.
+    #[serde(default)]
+    pub tab: bool,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
@@ -240,6 +286,41 @@ pub enum BrowserAction {
     Navigate { url: String },
     Reload,
     Back,
+}
+
+/// A bounded, credential-free preview fetch request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreviewFetchRequest {
+    /// Absolute `http`/`https` URL. The host applies its loopback policy before
+    /// connecting and again after every redirect.
+    pub url: String,
+    /// Optional worktree identity used only to select pane diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Include bounded, redacted dev-server pane error lines. This is not a
+    /// browser JavaScript-console claim.
+    #[serde(default)]
+    pub include_console: bool,
+}
+
+/// The bounded, JSON-safe result of [`PreviewFetchRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreviewFetchReply {
+    /// Final URL after validated redirects.
+    pub url: String,
+    /// Origin server HTTP status, preserved as data (including non-2xx).
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Lossy UTF-8 rendering of at most `[preview] max_body_bytes` bytes.
+    pub body: String,
+    pub truncated: bool,
+    /// Bounded, redacted error-shaped lines from the associated dev-server pane.
+    #[serde(default)]
+    pub console_errors: Vec<String>,
+    /// `dev-server-pane` when those diagnostics were available, otherwise
+    /// `unavailable`.
+    pub diagnostics_source: String,
 }
 
 /// The payload of an [`EventFrame::Activity`] frame: one session's agent state
@@ -526,12 +607,16 @@ pub struct DispatchPutReq {
 #[derive(Debug)]
 pub enum ControlError {
     NotFound(String),
+    InvalidArgument(String),
     /// The caller's token lacks the required scope. Produced by adapters (the
     /// trait impl never sees an under-scoped call).
     NoScope {
         need: Scope,
     },
     Conflict(String),
+    FailedPrecondition(String),
+    ResourceExhausted(String),
+    Unavailable(String),
     Unimplemented(&'static str),
     Internal(anyhow::Error),
 }
@@ -540,10 +625,18 @@ impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ControlError::NotFound(what) => write!(f, "not found: {what}"),
+            ControlError::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             ControlError::NoScope { need } => {
                 write!(f, "missing required scope: {}", need.as_str())
             }
             ControlError::Conflict(what) => write!(f, "conflict: {what}"),
+            ControlError::FailedPrecondition(what) => {
+                write!(f, "failed precondition: {what}")
+            }
+            ControlError::ResourceExhausted(what) => {
+                write!(f, "resource exhausted: {what}")
+            }
+            ControlError::Unavailable(what) => write!(f, "unavailable: {what}"),
             ControlError::Unimplemented(what) => write!(f, "not implemented: {what}"),
             ControlError::Internal(e) => write!(f, "{e:#}"),
         }
@@ -590,6 +683,12 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
+
+    /// Fork a live daemon or recorded harness session. The default keeps
+    /// transport-only adapters honest until they implement the spawn owner.
+    fn fork(&self, _spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async { Err(ControlError::Unimplemented("session fork is not available")) })
+    }
 
     /// Warm-attach: registers `client_id` as a subscriber and returns the
     /// current screen snapshot + live stream. An `Interactive` attach cancels
@@ -643,6 +742,14 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Command the preview browser. v1: always `Err(Unimplemented)`.
     fn drive_browser(&self, cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>>;
+
+    /// Perform one bounded, credential-free HTTP GET for `preview.fetch`.
+    fn preview_fetch(
+        &self,
+        _req: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("preview_fetch")) })
+    }
 
     /// Block until `session` reaches `cond` (or `timeout_ms` elapses). The
     /// default answers `Unimplemented`; the daemon overrides it to implement the
