@@ -1053,15 +1053,18 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn discovery_rejects_a_symlinked_skill_document() {
-        use std::os::unix::fs::symlink;
-
         let user = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         std::fs::create_dir(user.path().join("linked")).unwrap();
-        symlink(outside.path(), user.path().join("linked/SKILL.md")).unwrap();
+        if crate::platform::symlink_file(outside.path(), &user.path().join("linked/SKILL.md"))
+            .is_err()
+        {
+            // Windows may not grant the process symlink privileges. The
+            // platform seam is exercised where the OS permits creating one.
+            return;
+        }
         let mut cfg = Config::default();
         cfg.skills.user_dirs = vec![user.path().display().to_string()];
 
