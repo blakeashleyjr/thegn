@@ -773,12 +773,13 @@ auto_fetch_colocated = false  # also run background auto_fetch in repos colocate
                               # thegn stays out of a colocated repo's way. Read
                               # operations and the jj badge are unaffected.
 
-# How thegn opens a file (files tree, diff hunks, test failures, problems,
-# search hits, `thegn config edit`). Resolution: `command` here → the
-# [[tools]] entry named "editor" → $VISUAL / $EDITOR → vi. The program's
-# basename picks the line-jump syntax (vim +N, code -g file:N, hx file:N, …)
-# and whether it is a windowed editor to spawn detached.
+# How thegn opens a worktree or one of its files. A non-empty `command` wins;
+# otherwise an explicit logical provider wins. `auto` keeps the existing
+# [[tools]] editor → $VISUAL → $EDITOR → vi ladder. Logical providers
+# produce argv directly and never scan PATH during a UI action.
 [editor]
+provider = "auto"      # auto | vscode | cursor | zed | jetbrains |
+                       # nvim_remote | emacs. Also THEGN_EDITOR_PROVIDER.
 command = ""           # template with {path} (shell-quoted for you), {line}, {col};
                        # e.g. "myed --file {path} --at {line}:{col}". "" = resolve
 open_in = "auto"       # auto | pane | external — where the launch runs
@@ -3849,6 +3850,13 @@ cors_origins = []
 #   auto_fetch      = false                   # and no background fetch here
 #   override_gpg    = true                    # snapshots never wait on pinentry
 #   # (sign_commits lives under [workspace.acme.merge_queue], not [git].)
+#
+# A workspace can also choose a logical editor provider without changing
+# other repos. This trusted user-config key is intentionally unavailable to a
+# repo-local `.thegn.*`; omit it to inherit `[editor] provider`:
+#
+#   [workspace.acme]
+#   editor = "cursor"
 #
 # (Only the TRUSTED user-config `[workspace.<slug>]` layer may set `[git]` /
 # `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
