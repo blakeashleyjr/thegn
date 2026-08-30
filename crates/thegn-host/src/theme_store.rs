@@ -1,6 +1,9 @@
 //! Off-loop provider for user themes.
 
+use std::collections::BinaryHeap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -109,6 +112,23 @@ impl ThemeStore {
 
     pub(crate) fn try_recv(&mut self) -> Option<ThemeStoreResult> {
         self.results.try_recv().ok()
+    }
+
+    /// Await the worker's first off-loop scan before composing the first frame.
+    /// The directory I/O remains on the background thread; startup merely
+    /// yields until the configured user preset can be resolved correctly.
+    pub(crate) async fn initial_catalog(&mut self) -> (Vec<UserTheme>, Vec<String>) {
+        match self.results.recv().await {
+            Some(ThemeStoreResult::Catalog { themes, warnings }) => (themes, warnings),
+            Some(_) => (
+                Vec::new(),
+                vec!["theme store returned an unexpected startup result".into()],
+            ),
+            None => (
+                Vec::new(),
+                vec!["theme store stopped before its startup scan completed".into()],
+            ),
+        }
     }
 }
 
@@ -233,26 +253,15 @@ fn publish(
     }
 }
 
-fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
+pub(crate) fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
     let mut themes = Vec::new();
     let mut warnings = Vec::new();
     if let Err(e) = std::fs::create_dir_all(dir) {
         warnings.push(format!("theme directory unavailable: {e}"));
         return (themes, warnings);
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        warnings.push("theme directory could not be read".into());
-        return (themes, warnings);
-    };
-    let mut entries = entries.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries.into_iter().take(MAX_THEME_FILES) {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("toml")
-            || !entry.file_type().is_ok_and(|kind| kind.is_file())
-        {
-            continue;
-        }
+    let paths = bounded_theme_paths(dir, &mut warnings);
+    for path in paths {
         match read_bounded(&path).and_then(|bytes| {
             let text = std::str::from_utf8(&bytes).map_err(|_| "not UTF-8".to_string())?;
             UserTheme::from_toml(text).map_err(|e| e.to_string())
@@ -274,8 +283,63 @@ fn scan_dir(dir: &Path) -> (Vec<UserTheme>, Vec<String>) {
     (themes, warnings)
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+fn bounded_theme_paths(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!("theme directory could not be read: {error}"));
+            return Vec::new();
+        }
+    };
+    // Keep only the lexically first bounded set of actual theme files. A
+    // bounded max-heap avoids collecting/sorting an untrusted directory, while
+    // examining every name makes the result independent of filesystem order
+    // and prevents unrelated junk from consuming the theme-file allowance.
+    let mut paths = BinaryHeap::with_capacity(MAX_THEME_FILES + 1);
+    let mut theme_file_count = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(format!("theme directory entry could not be read: {error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                warnings.push(format!("{}: metadata unavailable: {error}", path.display()));
+                continue;
+            }
+        };
+        if !kind.is_file() {
+            continue;
+        }
+        theme_file_count += 1;
+        if paths.len() < MAX_THEME_FILES {
+            paths.push(path);
+        } else if paths.peek().is_some_and(|largest| path < *largest) {
+            paths.pop();
+            paths.push(path);
+        }
+    }
+    if theme_file_count > MAX_THEME_FILES {
+        warnings.push(format!(
+            "theme directory contains {theme_file_count} theme files; loading the first {MAX_THEME_FILES} by name"
+        ));
+    }
+    let mut paths = paths.into_vec();
+    paths.sort();
+    paths
+}
+
+pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = crate::platform::open_nofollow(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.file_type().is_file() {
         return Err("theme source is not a regular file".into());
     }
@@ -285,7 +349,17 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
             "theme file is {size} bytes; maximum is {MAX_THEME_FILE_BYTES}"
         ));
     }
-    std::fs::read(path).map_err(|e| e.to_string())
+    let mut bytes = Vec::with_capacity(size.min(MAX_THEME_FILE_BYTES + 1));
+    Read::by_ref(&mut file)
+        .take((MAX_THEME_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_THEME_FILE_BYTES {
+        return Err(format!(
+            "theme file exceeds {MAX_THEME_FILE_BYTES} bytes while reading"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn valid_slug(name: &str) -> Result<String, String> {
@@ -296,15 +370,13 @@ fn valid_slug(name: &str) -> Result<String, String> {
     Ok(slug)
 }
 
-fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
+pub(crate) fn write_theme(dir: &Path, theme: &UserTheme) -> Result<(), String> {
     theme.validate().map_err(|e| e.to_string())?;
     let slug = valid_slug(&theme.meta.name)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let destination = dir.join(format!("{slug}.toml"));
-    let temporary = destination.with_extension("toml.tmp");
     let text = theme.to_toml().map_err(|e| e.to_string())?;
-    std::fs::write(&temporary, text).map_err(|e| e.to_string())?;
-    std::fs::rename(&temporary, &destination).map_err(|e| e.to_string())
+    atomic_write(&destination, text.as_bytes(), None)
 }
 
 pub(crate) fn write_theme_selection(
@@ -399,18 +471,72 @@ pub(crate) fn write_theme_selection(
 }
 
 fn write_config_document(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    atomic_write(path, doc.to_string().as_bytes(), permissions)
+}
+
+struct PendingTemp(Option<PathBuf>);
+
+impl Drop for PendingTemp {
+    fn drop(&mut self) {
+        // best-effort: a failed atomic write must not strand its private temp.
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
     }
-    let temporary = path.with_extension("toml.tmp");
-    std::fs::write(&temporary, doc.to_string()).map_err(|e| e.to_string())?;
-    std::fs::rename(&temporary, path).map_err(|e| e.to_string())
+}
+
+fn atomic_write(
+    destination: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(), String> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let base = destination
+        .file_name()
+        .ok_or_else(|| "write destination has no file name".to_string())?;
+    let mut opened = None;
+    for _ in 0..128 {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let mut name = base.to_os_string();
+        name.push(format!(".tmp.{}.{sequence}", std::process::id()));
+        let path = parent.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                opened = Some((path, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let (temporary, mut file) = opened
+        .ok_or_else(|| "could not allocate a unique temporary file for atomic write".to_string())?;
+    let mut pending = PendingTemp(Some(temporary));
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)
+            .map_err(|e| e.to_string())?;
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(pending.0.as_ref().expect("temporary path"), destination)
+        .map_err(|e| e.to_string())?;
+    pending.0 = None;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_dir(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -533,6 +659,87 @@ mod tests {
             warning.contains(path.to_string_lossy().as_ref())
                 && warning.contains(thegn_core::theme::PRESETS[0])
         }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_filters_junk_before_applying_the_theme_file_cap() {
+        let dir = temp_dir("bounded-catalog");
+        for index in 0..300 {
+            std::fs::write(dir.join(format!("{index:03}-junk.txt")), b"junk").unwrap();
+        }
+        std::fs::write(
+            dir.join("zzz-theme.toml"),
+            theme("still-visible").to_toml().unwrap(),
+        )
+        .unwrap();
+
+        let (themes, warnings) = scan_dir(&dir);
+        assert_eq!(
+            themes
+                .iter()
+                .map(|theme| theme.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            ["still-visible"]
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn atomic_theme_and_config_writes_ignore_predictable_temp_symlinks() {
+        let dir = temp_dir("temp-symlinks");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"do not replace").unwrap();
+
+        let saved = theme("paper");
+        let old_theme_temp = dir.join("paper.toml.tmp");
+        if crate::platform::symlink_file_for_test(&victim, &old_theme_temp).is_err() {
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        write_theme(&dir, &saved).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not replace");
+        assert!(
+            std::fs::symlink_metadata(&old_theme_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "[theme]\npreset = \"prism\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&config).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&config, permissions).unwrap();
+        let old_config_temp = config.with_extension("toml.tmp");
+        crate::platform::symlink_file_for_test(&victim, &old_config_temp).unwrap();
+        write_theme_selection(&config, "storm", None).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not replace");
+        assert!(
+            std::fs::symlink_metadata(&old_config_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::metadata(&config).unwrap().permissions().readonly());
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("preset = \"storm\"")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_a_final_component_symlink() {
+        let dir = temp_dir("read-symlink");
+        let target = dir.join("target.toml");
+        let link = dir.join("link.toml");
+        std::fs::write(&target, theme("target").to_toml().unwrap()).unwrap();
+        if crate::platform::symlink_file_for_test(&target, &link).is_ok() {
+            assert!(read_bounded(&link).is_err());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

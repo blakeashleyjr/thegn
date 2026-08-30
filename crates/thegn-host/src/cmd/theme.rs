@@ -9,8 +9,6 @@ use thegn_core::theme_contrast::{self, Bar};
 use thegn_core::theme_user::UserTheme;
 use thegn_core::{msg, outln, util};
 
-const MAX_THEME_FILES: usize = 256;
-
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
     /// List all available built-in and valid local themes.
@@ -83,14 +81,14 @@ fn set(name: &str, config_path: &Path) -> Result<()> {
 }
 
 fn import(path: &Path, name: Option<&str>) -> Result<()> {
-    let bytes = read_bounded(path)?;
+    let bytes = crate::theme_store::read_bounded(path).map_err(anyhow::Error::msg)?;
     let mut theme = thegn_core::theme_import::import_gogh(&bytes)?;
     if let Some(name) = name {
         theme.meta.name = name.to_owned();
     }
     theme.validate()?;
     let dir = util::xdg_config_home().join("thegn/themes");
-    write_user_theme(&dir, &theme)?;
+    crate::theme_store::write_theme(&dir, &theme).map_err(anyhow::Error::msg)?;
     report_contrast_warnings(&theme);
     msg::info(&format!("theme imported as `{}`", theme.meta.name));
     Ok(())
@@ -110,72 +108,11 @@ fn report_contrast_warnings(theme: &UserTheme) {
 
 fn read_user_themes() -> Vec<UserTheme> {
     let dir = util::xdg_config_home().join("thegn/themes");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut entries = entries.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
-    let mut themes = Vec::new();
-    for entry in entries.into_iter().take(MAX_THEME_FILES) {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
-            || !entry.file_type().is_ok_and(|kind| kind.is_file())
-        {
-            continue;
-        }
-        let Ok(bytes) = read_bounded(&path) else {
-            continue;
-        };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        if let Ok(theme) = UserTheme::from_toml(text) {
-            if PRESETS.contains(&theme.meta.name.as_str()) {
-                msg::warn(&format!(
-                    "{}: user theme `{}` is shadowed by built-in preset",
-                    path.display(),
-                    theme.meta.name
-                ));
-            }
-            themes.push(theme);
-        }
+    let (themes, warnings) = crate::theme_store::scan_dir(&dir);
+    for warning in warnings {
+        msg::warn(&warning);
     }
-    themes.sort_by(|left, right| left.meta.name.cmp(&right.meta.name));
     themes
-}
-
-fn read_bounded(path: &Path) -> Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!("theme source is not a regular file: {}", path.display());
-    }
-    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    if size > crate::theme_store::MAX_THEME_FILE_BYTES {
-        anyhow::bail!(
-            "theme file is {size} bytes; maximum is {}",
-            crate::theme_store::MAX_THEME_FILE_BYTES
-        );
-    }
-    Ok(std::fs::read(path)?)
-}
-
-fn valid_slug(name: &str) -> Result<String> {
-    let slug = util::slugify(name);
-    if slug.is_empty() || slug.len() > 80 {
-        anyhow::bail!("theme name must produce a non-empty slug of at most 80 characters");
-    }
-    Ok(slug)
-}
-
-fn write_user_theme(dir: &Path, theme: &UserTheme) -> Result<()> {
-    theme.validate()?;
-    std::fs::create_dir_all(dir)?;
-    let slug = valid_slug(&theme.meta.name)?;
-    let destination = dir.join(format!("{slug}.toml"));
-    let temporary = destination.with_extension("toml.tmp");
-    std::fs::write(&temporary, theme.to_toml()?)?;
-    std::fs::rename(temporary, destination)?;
-    Ok(())
 }
 
 fn write_selection(path: &Path, preset: &str) -> Result<()> {
