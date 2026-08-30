@@ -311,7 +311,7 @@ impl ThemeBuilder {
                         self.status = Some("Use #rgb or #rrggbb".into());
                     }
                 }
-                KeyCode::Char(c) if !c.is_control() => {
+                KeyCode::Char(c) if is_hex_input(*c) => {
                     let mut value = role_value(&self.draft, *role);
                     value.insert(*cursor, *c);
                     *cursor += 1;
@@ -714,6 +714,10 @@ fn sanitize_field(value: &str) -> String {
         .collect::<String>()
         .trim()
         .into()
+}
+
+fn is_hex_input(character: char) -> bool {
+    character == '#' || character.is_ascii_hexdigit()
 }
 
 fn layer_spec() -> LayerSpec {
@@ -1160,6 +1164,29 @@ mod tests {
         assert!(overrides.colors.text.is_none());
         assert!(overrides.hues.teal.is_none());
         assert!(overrides.accent.is_none());
+    }
+
+    #[test]
+    fn token_editor_ignores_non_hex_unicode_without_corrupting_its_byte_cursor() {
+        let mut b = builder();
+        let original = b.draft.colors.bg0.clone();
+        b.focus = 0;
+        assert_eq!(
+            b.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            BuilderEvent::None
+        );
+
+        // A multi-byte character used to advance the cursor by one byte and
+        // leave it inside the code point, so the following insertion panicked.
+        assert_eq!(
+            b.handle_key(&KeyCode::Char('é'), Modifiers::NONE),
+            BuilderEvent::None
+        );
+        assert_eq!(
+            b.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+            BuilderEvent::None
+        );
+        assert_eq!(b.draft.colors.bg0, format!("{original}f"));
     }
 
     impl ThemeBuilder {

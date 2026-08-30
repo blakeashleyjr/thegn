@@ -17,8 +17,11 @@ pub(crate) fn open(
     users: &[thegn_core::theme_user::UserTheme],
     store: &ThemeStore,
 ) -> ThemeBuilder {
-    store.scan();
-    ThemeBuilder::open(cfg, users)
+    let mut builder = ThemeBuilder::open(cfg, users);
+    if let Err(error) = store.scan() {
+        builder.set_status(error);
+    }
+    builder
 }
 
 pub(crate) fn key(
@@ -34,11 +37,15 @@ pub(crate) fn key(
             false
         }
         BuilderEvent::Import(path) => {
-            store.import(path);
+            if let Err(error) = store.import(path) {
+                builder.import_completed(Err(error));
+            }
             true
         }
         BuilderEvent::Save(theme) => {
-            store.save(theme);
+            if let Err(error) = store.save(theme) {
+                builder.saved(Err(error));
+            }
             true
         }
         BuilderEvent::Apply {
@@ -46,7 +53,9 @@ pub(crate) fn key(
             theme,
             overrides,
         } => {
-            store.apply(preset, theme, overrides);
+            if let Err(error) = store.apply(preset, theme, overrides) {
+                builder.apply_completed(Err(error));
+            }
             true
         }
     }
@@ -70,11 +79,15 @@ pub(crate) fn mouse(
             false
         }
         BuilderEvent::Import(path) => {
-            store.import(path);
+            if let Err(error) = store.import(path) {
+                builder.import_completed(Err(error));
+            }
             true
         }
         BuilderEvent::Save(theme) => {
-            store.save(theme);
+            if let Err(error) = store.save(theme) {
+                builder.saved(Err(error));
+            }
             true
         }
         BuilderEvent::Apply {
@@ -82,7 +95,9 @@ pub(crate) fn mouse(
             theme,
             overrides,
         } => {
-            store.apply(preset, theme, overrides);
+            if let Err(error) = store.apply(preset, theme, overrides) {
+                builder.apply_completed(Err(error));
+            }
             true
         }
     }
@@ -111,7 +126,9 @@ pub(crate) fn drain(
             ThemeStoreResult::Imported(result) => builder.import_completed(result),
             ThemeStoreResult::Saved(result) => {
                 builder.saved(result);
-                store.scan();
+                if let Err(error) = store.scan() {
+                    builder.set_status(error);
+                }
             }
             ThemeStoreResult::Applied(result) => {
                 builder.apply_completed(result);

@@ -81,20 +81,16 @@ impl ThemeStore {
         Self { request, results }
     }
 
-    pub(crate) fn scan(&self) {
-        let _ = self.request.send(Work::Request(Box::new(Request::Scan)));
+    pub(crate) fn scan(&self) -> Result<(), String> {
+        self.send(Request::Scan)
     }
 
-    pub(crate) fn import(&self, path: PathBuf) {
-        let _ = self
-            .request
-            .send(Work::Request(Box::new(Request::Import(path))));
+    pub(crate) fn import(&self, path: PathBuf) -> Result<(), String> {
+        self.send(Request::Import(path))
     }
 
-    pub(crate) fn save(&self, theme: UserTheme) {
-        let _ = self
-            .request
-            .send(Work::Request(Box::new(Request::Save(theme))));
+    pub(crate) fn save(&self, theme: UserTheme) -> Result<(), String> {
+        self.send(Request::Save(theme))
     }
 
     pub(crate) fn apply(
@@ -102,12 +98,12 @@ impl ThemeStore {
         preset: String,
         theme: UserTheme,
         overrides: Option<Box<ThemeOverrides>>,
-    ) {
-        let _ = self.request.send(Work::Request(Box::new(Request::Apply {
+    ) -> Result<(), String> {
+        self.send(Request::Apply {
             preset,
             theme,
             overrides,
-        })));
+        })
     }
 
     pub(crate) fn try_recv(&mut self) -> Option<ThemeStoreResult> {
@@ -129,6 +125,12 @@ impl ThemeStore {
                 vec!["theme store stopped before its startup scan completed".into()],
             ),
         }
+    }
+
+    fn send(&self, request: Request) -> Result<(), String> {
+        self.request
+            .send(Work::Request(Box::new(request)))
+            .map_err(|_| "theme store worker is unavailable".to_string())
     }
 }
 
@@ -741,5 +743,32 @@ mod tests {
             assert!(read_bounded(&link).is_err());
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_a_fifo_without_blocking() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = temp_dir("read-fifo");
+        let fifo = dir.join("blocking.toml");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        assert!(read_bounded(&fifo).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disconnected_worker_requests_return_an_error() {
+        let (request, request_rx) = mpsc::channel();
+        drop(request_rx);
+        let (_result_tx, results) = tokio_mpsc::unbounded_channel();
+        let store = ThemeStore { request, results };
+
+        assert_eq!(
+            store.save(theme("unavailable")).unwrap_err(),
+            "theme store worker is unavailable"
+        );
     }
 }
