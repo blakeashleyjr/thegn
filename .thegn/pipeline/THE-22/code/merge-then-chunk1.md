@@ -1,7 +1,8 @@
 # THE-22 — merge main (brings THE-27), then implement chunk 1 (Lead work order)
 
 files:
-  - .thegn/pipeline/THE-22/code/chunk-1.md   (the real spec — follow it)
+
+- .thegn/pipeline/THE-22/code/chunk-1.md (the real spec — follow it)
 
 ## Why this exists
 
