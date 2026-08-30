@@ -20,8 +20,8 @@ use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult, ForkSpec,
-    GitFileStatus, OpenSpec, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
-    WaitCondition, WaitOutcome,
+    GitFileStatus, OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
+    SessionActivityEvent, SessionInfo, WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
@@ -753,6 +753,47 @@ impl ControlApi for DaemonService {
 
     fn drive_browser(&self, _cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move { Err(ControlError::Unimplemented("drive-browser")) })
+    }
+
+    fn preview_fetch(
+        &self,
+        request: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        Box::pin(async move {
+            let diagnostic = if request.include_console {
+                request
+                    .worktree
+                    .as_deref()
+                    .and_then(crate::preview::diagnostic_snapshot)
+            } else {
+                None
+            };
+            let config = self.config.preview.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::preview_fetch::fetch(&config, request, diagnostic)
+            })
+            .await
+            .map_err(|error| {
+                ControlError::Internal(anyhow::anyhow!("preview fetch task join: {error}"))
+            })?
+            .map_err(|error| match error {
+                crate::preview_fetch::FetchError::Invalid(message) => {
+                    ControlError::InvalidArgument(message)
+                }
+                crate::preview_fetch::FetchError::Precondition(message) => {
+                    ControlError::FailedPrecondition(message)
+                }
+                crate::preview_fetch::FetchError::Limit(message) => {
+                    ControlError::ResourceExhausted(message)
+                }
+                crate::preview_fetch::FetchError::Timeout => {
+                    ControlError::Unavailable("preview fetch timed out".into())
+                }
+                crate::preview_fetch::FetchError::Transport(message) => {
+                    ControlError::Unavailable(message)
+                }
+            })
+        })
     }
 
     fn wait<'a>(

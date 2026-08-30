@@ -31,8 +31,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec, RecordSpec, SplitDir,
-    WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec, PreviewFetchRequest,
+    RecordSpec, SplitDir, WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -165,8 +165,12 @@ impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let status = match &self {
             ControlError::NotFound(_) => StatusCode::NOT_FOUND,
+            ControlError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             ControlError::NoScope { .. } => StatusCode::FORBIDDEN,
             ControlError::Conflict(_) => StatusCode::CONFLICT,
+            ControlError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
+            ControlError::ResourceExhausted(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ControlError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ControlError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ControlError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -958,6 +962,36 @@ pub(super) async fn browser(
     }
     match state.api.drive_browser(body.0).await {
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn preview_fetch(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::PreviewFetch) {
+        return r;
+    }
+    const REQUEST_LIMIT: usize = 32 * 1024;
+    if body.len() > REQUEST_LIMIT {
+        return ControlError::ResourceExhausted(format!(
+            "preview fetch request exceeds {REQUEST_LIMIT} bytes"
+        ))
+        .into_response();
+    }
+    let request: PreviewFetchRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ControlError::InvalidArgument(format!(
+                "invalid preview fetch request: {error}"
+            ))
+            .into_response();
+        }
+    };
+    match state.api.preview_fetch(request).await {
+        Ok(reply) => axum::Json(reply).into_response(),
         Err(e) => e.into_response(),
     }
 }

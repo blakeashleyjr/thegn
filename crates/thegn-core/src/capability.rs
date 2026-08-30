@@ -283,6 +283,12 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
     ),
+    cap(
+        "preview.fetch",
+        Verb::PreviewFetch,
+        SurfaceSet::ALL,
+        "Fetch a preview URL with bounded, credential-free HTTP",
+    ),
     stub_cap(
         "browser.drive",
         Verb::DriveBrowser,

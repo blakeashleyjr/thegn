@@ -359,6 +359,18 @@ pub struct DaemonStatus {
     pub remote: bool,
 }
 
+/// Renderer-neutral projection of the selected live frontend preview target.
+/// The host supervisor owns lifecycle; chrome and panel code only paint this
+/// memory-only snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewView {
+    pub worktree: String,
+    pub port: u16,
+    pub url: String,
+    pub source: thegn_core::preview::PortHintSource,
+    pub status: thegn_core::preview::PreviewStatus,
+}
+
 /// What the chrome needs to paint a frame. Populated from session state + DB +
 /// git by the host; kept renderer-agnostic so it's unit-testable.
 #[derive(Debug, Clone, Default)]
@@ -614,6 +626,9 @@ pub struct FrameModel {
     /// the System ▸ Forward panel section + the `o` open-in-browser action.
     /// Synced from the `ForwardSupervisor` (loop-local), not from hydration.
     pub forwards: Vec<crate::forward::ForwardView>,
+    /// Selected frontend preview for the active worktree. Loop-owned and
+    /// re-applied after hydration, like shares and forwards.
+    pub preview: Option<PreviewView>,
     /// Deterministic container name for the active worktree path. The sandbox
     /// panel uses this to show the sandbox for the selected worktree instead of
     /// the first thegn-owned container on the machine.
