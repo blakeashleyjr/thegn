@@ -33,6 +33,8 @@
 //! moved — yields an **empty vector**, never an error. The shell then falls
 //! back to filename completion, which is exactly today's behaviour.
 
+use std::collections::BinaryHeap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::Deadline;
@@ -305,34 +307,67 @@ impl CompletionSource for ConfigSource<'_> {
 
 /// The selectable merged built-in and local theme catalog.
 pub fn theme_candidates() -> Vec<Candidate> {
+    theme_candidates_from_dir(&crate::util::xdg_config_home().join("thegn/themes"))
+}
+
+fn theme_candidates_from_dir(dir: &Path) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = crate::theme::PRESETS
         .iter()
         .map(|p| Candidate::new(*p))
         .collect();
     let builtins: std::collections::HashSet<&str> = crate::theme::PRESETS.iter().copied().collect();
-    let dir = crate::util::xdg_config_home().join("thegn/themes");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
-    let mut users = Vec::new();
-    for entry in entries.flatten().take(MAX_THEME_FILES) {
+    let mut paths = BinaryHeap::with_capacity(MAX_THEME_FILES + 1);
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
             || !entry.file_type().is_ok_and(|kind| kind.is_file())
         {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else {
+        if paths.len() < MAX_THEME_FILES {
+            paths.push(path);
+        } else if paths
+            .peek()
+            .is_some_and(|largest| path.as_path() < largest.as_path())
+        {
+            paths.pop();
+            paths.push(path);
+        }
+    }
+    let mut paths = paths.into_vec();
+    paths.sort();
+    let mut users = Vec::new();
+    for path in paths {
+        let Ok(mut file) = std::fs::File::open(&path) else {
             continue;
         };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
         let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         if size > MAX_THEME_FILE_BYTES {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let mut bytes = Vec::with_capacity(size.min(MAX_THEME_FILE_BYTES + 1));
+        if file
+            .by_ref()
+            .take((MAX_THEME_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() > MAX_THEME_FILE_BYTES
+        {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        let Ok(theme) = crate::theme_user::UserTheme::from_toml(&text) else {
+        let Ok(theme) = crate::theme_user::UserTheme::from_toml(text) else {
             continue;
         };
         if !builtins.contains(theme.meta.name.as_str()) {
@@ -583,6 +618,35 @@ mod tests {
                 .candidates("", &expired())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn theme_completion_filters_junk_before_a_deterministic_file_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..300 {
+            std::fs::write(dir.path().join(format!("{index:03}-junk.txt")), b"junk").unwrap();
+        }
+        let cfg = Config::default();
+        for index in 0..=MAX_THEME_FILES {
+            let name = format!("user-{index:03}");
+            let theme = crate::theme_user::UserTheme::from_palette(&name, &cfg.palette());
+            std::fs::write(
+                dir.path().join(format!("{index:03}.toml")),
+                theme.to_toml().unwrap(),
+            )
+            .unwrap();
+        }
+
+        let candidates = theme_candidates_from_dir(dir.path());
+        let users = candidates
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .filter(|name| name.starts_with("user-"))
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), MAX_THEME_FILES);
+        assert_eq!(users.first().map(String::as_str), Some("user-000"));
+        assert_eq!(users.last().map(String::as_str), Some("user-255"));
+        assert!(!users.iter().any(|name| name == "user-256"));
     }
 
     #[test]

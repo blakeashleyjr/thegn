@@ -164,6 +164,24 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
         .open(path)
 }
 
+/// Open an existing path without following a symlink in its final component.
+/// Callers must validate the returned handle's metadata before consuming it.
+pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(test)]
+pub fn symlink_file_for_test(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
 /// Restrict a directory to owner-only access (mode `0700`). Best-effort — a
 /// failure hardens less but must not stop recording.
 pub fn restrict_dir_owner_only(path: &std::path::Path) {

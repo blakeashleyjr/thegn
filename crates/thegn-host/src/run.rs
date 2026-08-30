@@ -578,6 +578,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         thegn_core::log_trace::reload_level(cfg.log.level);
     }
     crate::e2e_freeze::apply_to_config(&mut cfg);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(thegn_core::config::Config::path);
+    // Start the bounded catalog scan as soon as config identifies the selected
+    // preset. It overlaps the remaining startup work and is awaited only at
+    // the palette chokepoint, so filesystem I/O never runs on this thread.
+    let mut theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), config_path.clone());
     crate::forge_handle::install(&cfg);
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
@@ -715,8 +723,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         }
     }
     // Resolve the configurable chrome palette ([theme] / [theme.colors]) before
-    // the first frame; the config fs-watch re-resolves it live.
-    crate::chrome::set_palette(cfg.palette());
+    // the first frame, including a configured user theme from the off-loop scan.
+    let (theme_users, theme_warnings) = theme_store.initial_catalog().await;
+    for warning in theme_warnings {
+        tracing::warn!(target: "thegn::theme", "{warning}");
+    }
+    crate::chrome::set_palette(cfg.palette_with_user_themes(&cfg.theme.preset, &theme_users));
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
     crate::caps::install_themed(&cfg, resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
@@ -824,11 +836,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (config_tx, config_rx) =
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
-    let config_path = cli
-        .config
-        .clone()
-        .unwrap_or_else(thegn_core::config::Config::path);
-    let theme_config_path = config_path.clone();
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
@@ -1044,7 +1051,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         );
     }
 
-    let theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), theme_config_path);
     let result = event_loop(
         &mut buf,
         session,
@@ -1079,6 +1085,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         daemon_pid_atomic,
         waker,
         theme_store,
+        theme_users,
         start,
         shutdown,
         event_bus,
@@ -5747,6 +5754,7 @@ async fn event_loop<T: Terminal>(
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
     mut theme_store: crate::theme_store::ThemeStore,
+    mut theme_users: Vec<thegn_core::theme_user::UserTheme>,
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: thegn_core::event_bus::EventBus,
@@ -6656,7 +6664,6 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
-    let mut theme_users: Vec<thegn_core::theme_user::UserTheme> = Vec::new();
     let mut theme_builder: Option<crate::theme_builder::ThemeBuilder> = None;
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
@@ -14606,6 +14613,7 @@ async fn event_loop<T: Terminal>(
                         &mut onboarding,
                         &mut model,
                         &mut current_config,
+                        &theme_users,
                         &mut session,
                         &mut panes,
                         chrome.center,

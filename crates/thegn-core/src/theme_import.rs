@@ -62,18 +62,32 @@ pub struct GoghScheme {
 /// Structured errors for malformed or unsafe import input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeImportError {
-    Oversized { size: usize, max: usize },
+    Oversized {
+        size: usize,
+        max: usize,
+    },
     InvalidUtf8,
     InvalidJson(String),
-    InvalidYaml { line: usize, message: String },
+    InvalidYaml {
+        line: usize,
+        message: String,
+    },
     NotAnObject,
     UnknownField(String),
     DuplicateField(String),
     MissingField(String),
     NonStringField(String),
     InvalidVariant(String),
+    VariantMismatch {
+        variant: String,
+        background: String,
+        foreground: String,
+    },
     UnsafeName,
-    InvalidHex { field: String, value: String },
+    InvalidHex {
+        field: String,
+        value: String,
+    },
 }
 
 impl std::fmt::Display for ThemeImportError {
@@ -93,6 +107,14 @@ impl std::fmt::Display for ThemeImportError {
             Self::MissingField(field) => write!(f, "missing Gogh field: {field}"),
             Self::NonStringField(field) => write!(f, "Gogh field must be a scalar string: {field}"),
             Self::InvalidVariant(value) => write!(f, "unsupported Gogh variant: {value}"),
+            Self::VariantMismatch {
+                variant,
+                background,
+                foreground,
+            } => write!(
+                f,
+                "Gogh {variant} variant conflicts with background {background} and foreground {foreground}"
+            ),
             Self::UnsafeName => {
                 f.write_str("Gogh theme name contains control or non-printing data")
             }
@@ -129,11 +151,18 @@ pub fn parse(input: &[u8]) -> Result<GoghScheme, ThemeImportError> {
 /// Parse and convert a Gogh document to a validated user theme.
 pub fn import_gogh(input: &[u8]) -> Result<UserTheme, ThemeImportError> {
     let scheme = parse_gogh(input)?;
-    Ok(convert_gogh(&scheme))
+    convert_gogh(&scheme)
 }
 
-/// Convert a parsed Gogh scheme using the fixed ANSI role table.
-pub fn convert_gogh(scheme: &GoghScheme) -> UserTheme {
+/// Convert a parsed Gogh scheme using the fixed ANSI role table. Contradictory
+/// variant metadata is rejected even for callers that construct a scheme
+/// directly rather than going through [`parse_gogh`].
+pub fn convert_gogh(scheme: &GoghScheme) -> Result<UserTheme, ThemeImportError> {
+    validate_variant_contrast(
+        scheme.variant.as_deref(),
+        &scheme.background,
+        &scheme.foreground,
+    )?;
     let background = rgb(scheme.background.as_str());
     let foreground = rgb(scheme.foreground.as_str());
     let cursor = rgb(scheme.cursor.as_str());
@@ -220,7 +249,7 @@ pub fn convert_gogh(scheme: &GoghScheme) -> UserTheme {
 
     let mut theme = UserTheme::from_palette(&scheme.name, &palette);
     theme.meta.variant = scheme.variant.clone();
-    theme
+    Ok(theme)
 }
 
 fn parse_json(text: &str) -> Result<GoghScheme, ThemeImportError> {
@@ -344,14 +373,43 @@ fn from_fields(fields: BTreeMap<String, Option<String>>) -> Result<GoghScheme, T
     for (index, slot) in colors.iter_mut().enumerate() {
         *slot = color(&format!("color_{:02}", index + 1))?;
     }
+    let background = color("background")?;
+    let foreground = color("foreground")?;
+    validate_variant_contrast(variant.as_deref(), &background, &foreground)?;
     Ok(GoghScheme {
         name,
         variant,
-        background: color("background")?,
-        foreground: color("foreground")?,
+        background,
+        foreground,
         cursor: color("cursor")?,
         ansi: Ansi16 { colors },
     })
+}
+
+fn validate_variant_contrast(
+    variant: Option<&str>,
+    background: &str,
+    foreground: &str,
+) -> Result<(), ThemeImportError> {
+    let Some(variant) = variant else {
+        return Ok(());
+    };
+    let background_luma = crate::theme::relative_luminance(&rgb(background));
+    let foreground_luma = crate::theme::relative_luminance(&rgb(foreground));
+    let consistent = match variant {
+        "light" => background_luma > foreground_luma,
+        "dark" => background_luma < foreground_luma,
+        _ => return Err(ThemeImportError::InvalidVariant(variant.into())),
+    };
+    if consistent {
+        Ok(())
+    } else {
+        Err(ThemeImportError::VariantMismatch {
+            variant: variant.into(),
+            background: background.into(),
+            foreground: foreground.into(),
+        })
+    }
 }
 
 fn yaml_error(line: usize, message: impl Into<String>) -> ThemeImportError {
@@ -413,7 +471,7 @@ mod tests {
         assert_eq!(scheme.background, "#101820");
         assert_eq!(scheme.foreground, "#f0f0f0");
         assert_eq!(scheme.cursor, "#00ffcc");
-        let theme = convert_gogh(&scheme);
+        let theme = convert_gogh(&scheme).unwrap();
         let palette = crate::theme_resolve::palette_from_user_theme(&theme).unwrap();
         assert_eq!(palette.bg0, "16;24;32");
         assert_eq!(palette.text, "240;240;240");
@@ -447,6 +505,32 @@ mod tests {
     }
 
     #[test]
+    fn contradictory_light_and_dark_variants_are_rejected() {
+        let mut direct = parse_gogh(yaml().as_bytes()).unwrap();
+        direct.variant = Some("light".into());
+        assert!(matches!(
+            convert_gogh(&direct),
+            Err(ThemeImportError::VariantMismatch { variant, .. }) if variant == "light"
+        ));
+
+        let light_with_dark_surface = yaml()
+            .replacen("variant: dark", "variant: light", 1)
+            .replacen("background: \"#101820\"", "background: \"#101010\"", 1);
+        assert!(matches!(
+            parse_gogh(light_with_dark_surface.as_bytes()),
+            Err(ThemeImportError::VariantMismatch { variant, .. }) if variant == "light"
+        ));
+
+        let dark_with_light_surface = yaml()
+            .replacen("background: \"#101820\"", "background: \"#f8f8f8\"", 1)
+            .replacen("foreground: \"#f0f0f0\"", "foreground: \"#202020\"", 1);
+        assert!(matches!(
+            parse_gogh(dark_with_light_surface.as_bytes()),
+            Err(ThemeImportError::VariantMismatch { variant, .. }) if variant == "dark"
+        ));
+    }
+
+    #[test]
     fn malformed_missing_and_oversized_input_is_rejected() {
         assert!(matches!(
             parse_gogh(b"name: x\n"),
@@ -477,7 +561,7 @@ mod tests {
             parse_gogh(input.as_bytes()),
             Err(ThemeImportError::UnsafeName)
         ));
-        let mut theme = convert_gogh(&parse_gogh(yaml().as_bytes()).unwrap());
+        let mut theme = convert_gogh(&parse_gogh(yaml().as_bytes()).unwrap()).unwrap();
         theme.meta.name = "bad\u{1b}name".into();
         assert!(matches!(
             theme.validate(),

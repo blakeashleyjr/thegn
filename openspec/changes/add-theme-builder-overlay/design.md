@@ -123,7 +123,10 @@ Mapping (pure, unit-tested):
 - **Gogh**: `background`→bg0; bg1/panel/panel2/raise derived by blending
   background toward foreground in fixed steps (the same
   relative-to-own-surfaces philosophy as `extend_palette`, so light schemes
-  stay light — `variant: light` only tunes the step sizes); `foreground`→text;
+  stay light). `variant` is a checked contract: `light` requires background to
+  be lighter than foreground and `dark` requires the inverse; contradictory
+  documents are rejected rather than silently violating the declared variant.
+  `foreground`→text;
   dim/faint/ghost blended between fg and bg; hues from color_02..07 (or the
   bright row when the normal row is too close to the background); accent =
   the highest-contrast non-grey hue; focus = accent.
