@@ -93,6 +93,31 @@ gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
 
 ## Serving thin clients
 
+### Watching the event feed
+
+`thegn events tail` is the CLI reference client for the daemon's live event
+feed. It waits on the existing subscription stream rather than polling:
+
+```sh
+thegn events tail --kinds activity,exit
+thegn events tail --session "$SESSION" --signal-lag --json
+```
+
+`--kinds` and `--session` use the control API's bounded narrowing vocabulary.
+The greeting is always the first frame. `--signal-lag` makes dropped frames
+visible as a `lagged` frame with a count; without it, legacy consumers retain
+silent skip behavior. JSON output is NDJSON, one canonical frame per line.
+
+This feed is ephemeral and has no replay or journal. After a lag or reconnect,
+re-list with `sessions.list` and `worktrees.list` (or their CLI equivalents)
+before relying on cached state. The command is read-only and never interacts
+with `--allow-session-input`.
+
+The local Unix socket keeps same-user authentication. A remote TCP client must
+present the existing bearer token with read scope; filters cannot broaden that
+authorization. If no daemon is running, the command reports the concise
+recoverable no-daemon error.
+
 `thegn serve` puts the same control API on TCP so a client on another
 machine (or another window) can attach.
 

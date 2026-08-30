@@ -101,6 +101,7 @@ fn cli_control_caps() -> Vec<&'static str> {
         .map(|(cap, _, _)| *cap)
         .collect();
     v.push("sessions.attach");
+    v.push("events.subscribe"); // thegn events tail
     v.extend(["dispatches.report", "dispatches.note", "dispatches.status"]);
     v.sort_unstable();
     v.dedup();
@@ -270,5 +271,10 @@ mod tests {
                 assert!(matches!(method, "GET" | "POST" | "DELETE" | "WS"));
             }
         }
+    }
+
+    #[test]
+    fn cli_ledger_includes_the_event_tail_projection() {
+        assert!(cli_control_caps().contains(&"events.subscribe"));
     }
 }

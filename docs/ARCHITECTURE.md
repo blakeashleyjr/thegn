@@ -179,6 +179,15 @@ Every mutating control call and every auth/scope rejection emits a structured
 record on the `thegn::control::audit` tracing target (`thegn_core::control_audit`;
 never a token secret).
 
+The CLI's `thegn events tail` is the reference thin client for the streaming
+`events.subscribe` projection. It uses the existing discovered Unix socket or
+the existing bearer-authenticated TCP endpoint, and accepts only narrowing
+filters (`--kinds`, `--session`) plus opt-in bounded-loss signaling
+(`--signal-lag`). It has no replay journal: a `lagged` frame or reconnect tells
+the consumer to resynchronize through `sessions.list` and `worktrees.list`.
+The command is read-only and does not enable the `sessions.input` interlock
+(`--allow-session-input`).
+
 **Plugins** speak the NDJSON wire in `thegn_core::plugin_api`, versioned by
 `API_VERSION` and pinned by `docs/api/plugin-api-<v>.json`, and are _run_ by
 the plugin runtime (`openspec/specs/plugin-runtime`): loader (`[[plugins]]`

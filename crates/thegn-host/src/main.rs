@@ -578,6 +578,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::session::SessionAction,
     },
+    /// Stream the daemon's filtered live event feed (`events tail`).
+    Events {
+        #[command(subcommand)]
+        action: cmd::events::Action,
+    },
     /// Attach to a running local session over the pane daemon's unix socket —
     /// the local thin client. With no argument, lists live sessions to pick
     /// from; with a session id, grabs it interactively (raw keystrokes in, PTY
@@ -1173,6 +1178,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             daemon::serve_blocking(&cfg, daemon::ServeOpts { bind, no_pair_url })
         }
         Command::Session { action } => cmd::session::run(&cfg, action),
+        Command::Events { action } => cmd::events::run(&cfg, action),
         Command::Attach { session } => cmd::attach::run(&cfg, session),
         Command::Pair { action } => cmd::pair::run(&cfg, action),
         Command::Daemon { socket, action } => match action {
