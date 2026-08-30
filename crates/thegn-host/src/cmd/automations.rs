@@ -47,7 +47,7 @@ struct RuleRow {
     trusted_layer: &'static str,
     event: String,
     action: String,
-    inert_reason: Option<&'static str>,
+    inert_reason: Option<String>,
     recent_outcome: Option<String>,
 }
 
@@ -70,6 +70,14 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         .compiled_rules()
         .map_err(|errors| anyhow::anyhow!(errors.join("\n")))?;
     let db = thegn_core::db::Db::open().ok();
+    let daemon_available = db.as_ref().is_some_and(|db| {
+        thegn_svc::control::client::discover(
+            db,
+            &crate::daemon::scope_key(),
+            thegn_core::util::now().saturating_mul(1_000),
+        )
+        .is_some()
+    });
     let rows: Vec<RuleRow> = compiled
         .into_iter()
         .map(|rule| {
@@ -87,14 +95,15 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
                     "global"
                 },
                 event: rule.event.as_str().to_string(),
-                action: rule.action.cap,
-                inert_reason: if !effective.enabled {
-                    Some("automations disabled")
-                } else if !rule.enabled {
-                    Some("rule disabled")
-                } else {
-                    None
-                },
+                action: rule.action.cap.clone(),
+                inert_reason: inert_reason(
+                    effective.enabled,
+                    rule.enabled,
+                    rule.event,
+                    &rule.action.cap,
+                    cfg.daemon.enabled,
+                    daemon_available,
+                ),
                 recent_outcome,
             }
         })
@@ -107,7 +116,7 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         return Ok(());
     }
     for row in rows {
-        let status = row.inert_reason.unwrap_or("active");
+        let status = row.inert_reason.as_deref().unwrap_or("active");
         let recent = row.recent_outcome.as_deref().unwrap_or("never");
         thegn_core::outln!(
             "{:<24} {:<20} -> {:<16}  {} · recent: {}",
@@ -119,6 +128,50 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn inert_reason(
+    automations_enabled: bool,
+    rule_enabled: bool,
+    event: thegn_core::automation::AutomationEventKind,
+    action: &str,
+    daemon_enabled: bool,
+    daemon_available: bool,
+) -> Option<String> {
+    if !automations_enabled {
+        return Some("automations disabled".into());
+    }
+    if !rule_enabled {
+        return Some("rule disabled".into());
+    }
+    let daemon_trigger = matches!(
+        event,
+        thegn_core::automation::AutomationEventKind::AgentNeedsYou
+            | thegn_core::automation::AutomationEventKind::AgentFinished
+            | thegn_core::automation::AutomationEventKind::AgentFailed
+            | thegn_core::automation::AutomationEventKind::WorktreeIdle
+    );
+    if !daemon_enabled {
+        return Some(if daemon_trigger {
+            format!(
+                "daemon disabled: {} trigger and {action} action are inert",
+                event.as_str()
+            )
+        } else {
+            format!("daemon disabled: {action} action is inert")
+        });
+    }
+    if !daemon_available {
+        return Some(if daemon_trigger {
+            format!(
+                "daemon unavailable: {} trigger and {action} action are inert",
+                event.as_str()
+            )
+        } else {
+            format!("daemon unavailable: {action} action is inert")
+        });
+    }
+    None
 }
 
 fn test(
@@ -137,6 +190,9 @@ fn test(
     };
     let event: AutomationEvent =
         serde_json::from_str(&raw).context("parse automation event fixture")?;
+    event
+        .validate_required_facts()
+        .map_err(anyhow::Error::msg)?;
     let effective = cfg.effective_automations();
     let rules = effective
         .compiled_rules()

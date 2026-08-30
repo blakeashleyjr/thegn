@@ -29,7 +29,7 @@ pub enum SourceKind {
     Env,
     /// `[profiles.<name>]` keybind profiles.
     Profile,
-    /// Built-in theme presets.
+    /// Built-in and valid local user themes.
     Theme,
     /// `[[agents]]` names.
     Agent,
@@ -239,9 +239,9 @@ const fn slot(command_path: &'static str, arg_id: &'static str, source: SourceKi
 /// The catalog. Rows are grouped by source kind, and within a kind sorted by
 /// command path, so a new verb lands next to its neighbours.
 ///
-/// Not every implemented kind has a slot yet — `theme`, `tool`, `plugin` and
-/// `action` are served (and tested) but nothing in today's CLI grammar takes
-/// one, so they wait for a verb rather than being bound to an approximation.
+/// Not every implemented kind has a slot yet — `tool`, `plugin` and `action`
+/// are served (and tested) but nothing in today's CLI grammar takes one, so
+/// they wait for a verb rather than being bound to an approximation.
 /// Everything a slot could take and this does not classify is pinned in
 /// `test/completion-slot-ratchet.txt`, which only shrinks.
 pub const CATALOG: &[Slot] = &[
@@ -320,6 +320,8 @@ pub const CATALOG: &[Slot] = &[
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
     slot("session open", "worktree", SourceKind::Worktree),
+    slot("session fork", "worktree", SourceKind::Worktree),
+    slot("session move", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
     slot("share stop", "worktree", SourceKind::Worktree),
     slot("sprite-proxy", "worktree", SourceKind::Worktree),
@@ -342,6 +344,15 @@ pub const CATALOG: &[Slot] = &[
     slot("dispatch put", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
     slot("session browse", "session", SourceKind::Session),
+    slot("session fork", "session", SourceKind::Session),
+    // A native harness id is not enumerable through the daemon session source;
+    // recorded rows are selected through `agent.sessions` and the remaining
+    // provider-specific value is deliberately free-form.
+    slot(
+        "session fork",
+        "harness",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("session record", "session", SourceKind::Session),
     slot("session send", "session", SourceKind::Session),
     slot("session snapshot", "session", SourceKind::Session),
@@ -369,16 +380,20 @@ pub const CATALOG: &[Slot] = &[
     // A `global = true` arg: classified once at the root, and clap propagates
     // the binding into every subcommand with the arg itself.
     slot("", "profile", SourceKind::Profile),
+    slot("session move", "to_profile", SourceKind::Profile),
     // --- agent (`[[agents]]`) ----------------------------------------------
     // Both slots also accept an `[[tools]]` name or a bare provider id; the
     // configured agents are the useful majority and the arg stays free-form.
     slot("dispatch put", "agent_name", SourceKind::Agent),
     slot("session open", "agent", SourceKind::Agent),
+    slot("session fork", "agent", SourceKind::Agent),
     // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
     slot("dispatch put", "stage", SourceKind::Stage),
     slot("session open", "stage", SourceKind::Stage),
     // --- automation (`[[automations.rules]]`) -----------------------------
     slot("automations test", "rule", SourceKind::Automation),
+    // A cwd is a filesystem path; clap's structural/path completer owns it.
+    slot("session fork", "cwd", SourceKind::Structural),
     // --- pipeline run-completion (THE-76) -----------------------------------
     // Roster row ids: local SQLite, so a real source is implementable — but
     // nothing serves them yet (see `Reserved::DispatchRow`).
@@ -465,12 +480,19 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // Theme names are the merged built-in/local catalog. The import path is a
+    // filesystem value and keeps clap's structural completion behavior.
+    slot("theme set", "name", SourceKind::Theme),
+    slot("theme import", "name", SourceKind::Theme),
     // --- structural (clap completes these from the tree) -------------------
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
     slot("", "config", SourceKind::Structural),
+    // `config validate --repo <PATH>`: clap owns filesystem path completion.
+    slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
     slot("automations test", "fixture", SourceKind::Structural),
+    slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------

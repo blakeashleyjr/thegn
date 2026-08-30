@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 
 use crate::automation::EventKey;
+use crate::automation::{AutomationEvent, AutomationRule, PlannedAction};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AutomationStateRow {
@@ -48,10 +49,31 @@ pub struct AutomationRunRow {
     pub finished_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutomationAdmission {
+    Planned {
+        action: Box<PlannedAction>,
+        run_id: i64,
+    },
+    Skipped {
+        run_id: i64,
+    },
+}
+
 /// Object-safe synchronous store. Callers keep SQLite work off the render loop.
 pub trait AutomationStore {
     fn automation_state(&self, rule_id: &str) -> Result<Option<AutomationStateRow>>;
     fn put_automation_state(&self, state: &AutomationStateRow) -> Result<()>;
+
+    /// Cross-process admission boundary. Evaluation, every accepted state
+    /// transition, and its pre-dispatch audit row commit in one write
+    /// transaction before any action is launched.
+    fn admit_automation_event(
+        &self,
+        rules: &[AutomationRule],
+        event: &AutomationEvent,
+        now: i64,
+    ) -> Result<Vec<AutomationAdmission>>;
 
     /// Insert the pre-dispatch audit row and return its run id.
     fn start_automation_run(&self, run: &NewAutomationRun) -> Result<i64>;

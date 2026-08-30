@@ -10,11 +10,23 @@ use thegn_svc::control::{
     AgentLaunch, AutomationOrigin as WireOrigin, OpenSpec, PushedNote, ToolRunRequest,
 };
 
+#[derive(Debug)]
+pub struct ActionTimedOut(pub String);
+
+impl std::fmt::Display for ActionTimedOut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ActionTimedOut {}
+
 pub async fn execute(
     cfg: Arc<Config>,
     event: AutomationEvent,
     action: PlannedAction,
     run_id: i64,
+    timeout_secs: u64,
 ) -> Result<()> {
     anyhow::ensure!(
         thegn_core::capability::lookup(&action.cap).is_some(),
@@ -38,7 +50,12 @@ pub async fn execute(
         "sessions.open" => {
             let agent = required(&action, "agent")?;
             let prompt = action.params.get("prompt").cloned().unwrap_or_default();
-            client()?
+            anyhow::ensure!(
+                cfg.agent_command(&agent).is_some(),
+                "configured agent {agent:?} not found"
+            );
+            client()
+                .await?
                 .open(&OpenSpec {
                     rows: 24,
                     cols: 80,
@@ -51,6 +68,8 @@ pub async fn execute(
                         resume: None,
                         continue_last: false,
                         stage: None,
+                        fork: false,
+                        native_session_id: None,
                     }),
                     automation_origin: Some(wire_origin),
                     ..Default::default()
@@ -63,7 +82,16 @@ pub async fn execute(
                 .worktree
                 .as_deref()
                 .context("merge.add requires event.worktree")?;
-            client()?.merge_add(worktree).await?;
+            let origin_json = serde_json::to_string(&origin)?;
+            let worktree_owned = worktree.to_string();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use thegn_core::store::WorkspaceStore;
+                let db = thegn_core::db::Db::open()?;
+                db.set_ui_state("automation_merge_origin", &worktree_owned, &origin_json)?;
+                Ok(())
+            })
+            .await??;
+            client().await?.merge_add(worktree).await?;
             Ok(())
         }
         "notify.push" => {
@@ -74,7 +102,8 @@ pub async fn execute(
                 .cloned()
                 .unwrap_or_else(|| "Automation".into());
             let urgency = action.params.get("urgency").cloned();
-            client()?
+            client()
+                .await?
                 .notify_push(&PushedNote {
                     title,
                     body,
@@ -91,16 +120,29 @@ pub async fn execute(
                 cfg.tool_command(&name).is_some(),
                 "configured tool {name:?} not found"
             );
-            let opened = client()?
+            let client = client().await?;
+            let opened = client
                 .tools_run(&ToolRunRequest {
                     name,
                     worktree: event.worktree.clone(),
                     automation_origin: Some(wire_origin),
                 })
                 .await?;
-            let outcome = client()?
-                .wait(&opened.id, serde_json::json!({"kind": "exited"}), None)
-                .await?;
+            let outcome = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                client.wait(&opened.id, serde_json::json!({"kind": "exited"}), None),
+            )
+            .await
+            {
+                Ok(outcome) => outcome?,
+                Err(_) => {
+                    let _ = client.kill(&opened.id).await;
+                    return Err(anyhow::Error::new(ActionTimedOut(format!(
+                        "tools.run deadline {timeout_secs}s; session {} terminated",
+                        opened.id
+                    ))));
+                }
+            };
             anyhow::ensure!(
                 outcome
                     .get("exit_code")
@@ -124,14 +166,17 @@ fn required(action: &PlannedAction, name: &str) -> Result<String> {
         .with_context(|| format!("{}.{} is required", action.cap, name))
 }
 
-fn client() -> Result<ControlClient> {
-    let db = thegn_core::db::Db::open()?;
-    let addr = thegn_svc::control::client::discover(
-        &db,
-        &crate::daemon::scope_key(),
-        thegn_core::util::now().saturating_mul(1_000),
-    )
-    .context("no live daemon for automation action")?;
+async fn client() -> Result<ControlClient> {
+    let addr = tokio::task::spawn_blocking(|| -> Result<ControlAddr> {
+        let db = thegn_core::db::Db::open()?;
+        thegn_svc::control::client::discover(
+            &db,
+            &crate::daemon::scope_key(),
+            thegn_core::util::now().saturating_mul(1_000),
+        )
+        .context("no live daemon for automation action")
+    })
+    .await??;
     match addr {
         ControlAddr::Unix(_) | ControlAddr::Tcp { .. } => Ok(ControlClient::new(addr)),
     }

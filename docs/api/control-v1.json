@@ -18,11 +18,23 @@
           "description": "Continue the harness's own most recent session in the worktree — the id-free relaunch form the transport-retry observer uses (THE-86). Resolved through [`thegn_core::harness::Harness::continue_command`]; a harness without a continue form refuses, exactly like an unsupported `resume`. Wire-additive with a `false` default: older clients are unaffected.",
           "type": "boolean"
         },
+        "fork": {
+          "default": false,
+          "description": "Ask the selected harness to create a native child session rather than resume the source in place. The daemon validates and resolves this operation through the harness seam.",
+          "type": "boolean"
+        },
         "headless": {
           "default": null,
           "description": "Run headlessly (`claude -p …`) rather than as an interactive TUI. Defaults to headless exactly when a prompt is given.",
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "native_session_id": {
+          "description": "Native session id passed to the harness fork operation. It is kept separate from `resume` so a fork cannot silently become an in-place resume when the two launch forms are composed.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -260,6 +272,101 @@
       ],
       "type": "object"
     },
+    "EditorOpenRequest": {
+      "additionalProperties": false,
+      "description": "A safe editor-handoff request (`editor.open`).\n\nThe caller selects only a worktree and an optional relative file location; provider choice, executable argv and environment stay local to the owning compositor. [`EditorOpenRequest::target`] applies the core target policy at every transport boundary before the request reaches [`ControlApi`].",
+      "properties": {
+        "col": {
+          "description": "1-based column number; requires `path` and `line`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based line number; requires `path`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "File path relative to `worktree`; omitted to open the project itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "Absolute worktree path on the daemon/compositor host.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "ForkSpec": {
+      "description": "Intent for creating a new session from a live daemon or recorded harness session. `harness` discriminates the source: absent means `session` is a live daemon id; present means it is a native id discovered from `agent.sessions`. No process recipe, environment, prompt, or transcript data crosses the control boundary.",
+      "properties": {
+        "adopt": {
+          "default": false,
+          "description": "Ask a connected compositor to adopt the child.",
+          "type": "boolean"
+        },
+        "agent": {
+          "description": "Configured agent name used to resolve the child launch context.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Optional child working-directory override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harness": {
+          "description": "Harness id for a recorded native session source.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scrollback": {
+          "default": false,
+          "description": "Request a bounded plain-text scrollback handoff file.",
+          "type": "boolean"
+        },
+        "session": {
+          "description": "Live daemon id, or native harness id when `harness` is set.",
+          "type": "string"
+        },
+        "tab": {
+          "default": false,
+          "description": "Adopt the child in a new tab instead of beside the source.",
+          "type": "boolean"
+        },
+        "worktree": {
+          "description": "Optional child worktree override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
     "GitFileStatus": {
       "description": "One changed file in a worktree (the mobile stage/commit contract).",
       "properties": {
@@ -412,6 +519,79 @@
         "title",
         "url",
         "worktree"
+      ],
+      "type": "object"
+    },
+    "PreviewFetchReply": {
+      "description": "The bounded, JSON-safe result of [`PreviewFetchRequest`].",
+      "properties": {
+        "body": {
+          "description": "Lossy UTF-8 rendering of at most `[preview] max_body_bytes` bytes.",
+          "type": "string"
+        },
+        "console_errors": {
+          "default": [],
+          "description": "Bounded, redacted error-shaped lines from the associated dev-server pane.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostics_source": {
+          "description": "`dev-server-pane` when those diagnostics were available, otherwise `unavailable`.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Origin server HTTP status, preserved as data (including non-2xx).",
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "url": {
+          "description": "Final URL after validated redirects.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "body",
+        "diagnostics_source",
+        "status",
+        "truncated",
+        "url"
+      ],
+      "type": "object"
+    },
+    "PreviewFetchRequest": {
+      "description": "A bounded, credential-free preview fetch request.",
+      "properties": {
+        "include_console": {
+          "default": false,
+          "description": "Include bounded, redacted dev-server pane error lines. This is not a browser JavaScript-console claim.",
+          "type": "boolean"
+        },
+        "url": {
+          "description": "Absolute `http`/`https` URL. The host applies its loopback policy before connecting and again after every redirect.",
+          "type": "string"
+        },
+        "worktree": {
+          "description": "Optional worktree identity used only to select pane diagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "url"
       ],
       "type": "object"
     },
@@ -595,6 +775,13 @@
         },
         "final_state": {
           "description": "The agent state this session held at the moment it finished (`blocked` · `working` · `done` · `idle`). `None` for a live session — ask `wait`, or read the `Activity` feed, for that.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "forked_from": {
+          "description": "Stable display form of the source session when this session was forked. This is lineage metadata only; no launch recipe is included.",
           "type": [
             "string",
             "null"
@@ -930,6 +1117,11 @@
       "path": "/v1/sessions"
     },
     {
+      "cap": "sessions.fork",
+      "method": "POST",
+      "path": "/v1/sessions/fork"
+    },
+    {
       "cap": "sessions.snapshot",
       "method": "GET",
       "path": "/v1/sessions/{s}/snapshot"
@@ -1000,6 +1192,11 @@
       "path": "/v1/worktrees/open"
     },
     {
+      "cap": "editor.open",
+      "method": "POST",
+      "path": "/v1/editor/open"
+    },
+    {
       "cap": "issues.list",
       "method": "GET",
       "path": "/v1/issues"
@@ -1038,6 +1235,11 @@
       "cap": "browser.drive",
       "method": "POST",
       "path": "/v1/browser"
+    },
+    {
+      "cap": "preview.fetch",
+      "method": "POST",
+      "path": "/v1/preview/fetch"
     },
     {
       "cap": "git.status",
@@ -1175,6 +1377,12 @@
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"
     },
+    "EditorOpenRequest": {
+      "$ref": "#/definitions/EditorOpenRequest"
+    },
+    "ForkSpec": {
+      "$ref": "#/definitions/ForkSpec"
+    },
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"
     },
@@ -1183,6 +1391,12 @@
     },
     "PrStatusRow": {
       "$ref": "#/definitions/PrStatusRow"
+    },
+    "PreviewFetchReply": {
+      "$ref": "#/definitions/PreviewFetchReply"
+    },
+    "PreviewFetchRequest": {
+      "$ref": "#/definitions/PreviewFetchRequest"
     },
     "PushedNote": {
       "$ref": "#/definitions/PushedNote"

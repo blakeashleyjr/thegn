@@ -10,7 +10,7 @@ use crate::automation::{
     ActionTemplate, AutomationEventKind, AutomationPredicate, AutomationRule, EVENT_TEMPLATE_VARS,
     SUPPORTED_ACTION_CAPS,
 };
-use crate::notification::Priority;
+use crate::notification::{NotificationKind, Priority};
 
 const MAX_RULES: usize = 256;
 const MAX_NAME_LEN: usize = 128;
@@ -131,6 +131,8 @@ pub struct AutomationRuleConfig {
     pub then: AutomationActionConfig,
     #[serde(default = "default_debounce_secs")]
     pub debounce_secs: u64,
+    /// Required only for `when = "worktree_idle"`; independent of debounce.
+    pub idle_secs: Option<u64>,
     pub once_per_key: bool,
     #[serde(default = "default_max_per_hour")]
     pub max_per_hour: u16,
@@ -147,6 +149,7 @@ impl Default for AutomationRuleConfig {
             predicate: AutomationPredicateConfig::default(),
             then: AutomationActionConfig::default(),
             debounce_secs: default_debounce_secs(),
+            idle_secs: None,
             once_per_key: false,
             max_per_hour: default_max_per_hour(),
             max_action_per_hour: default_max_per_hour(),
@@ -162,6 +165,7 @@ pub struct AutomationPredicateConfig {
     pub worktree: Option<String>,
     pub branch: Option<String>,
     pub agent_role: Option<String>,
+    pub notification_kind: Option<String>,
     pub priority: Option<String>,
     pub source_prefix: Option<String>,
     pub message_regex: Option<String>,
@@ -302,6 +306,19 @@ fn validate_rule(rule: &AutomationRuleConfig, key: &str, errors: &mut Vec<String
         0,
         86_400,
     );
+    let event = AutomationEventKind::parse(rule.when.trim());
+    match (event, rule.idle_secs) {
+        (Some(AutomationEventKind::WorktreeIdle), Some(value)) => {
+            bounded(errors, &format!("{key}.idle_secs"), value, 60, 86_400)
+        }
+        (Some(AutomationEventKind::WorktreeIdle), None) => errors.push(format!(
+            "{key}.idle_secs: required for worktree_idle (60..86400)"
+        )),
+        (_, Some(_)) => errors.push(format!(
+            "{key}.idle_secs: valid only when when = \"worktree_idle\""
+        )),
+        _ => {}
+    }
     bounded(
         errors,
         &format!("{key}.max_per_hour"),
@@ -338,6 +355,15 @@ fn validate_predicate(predicate: &AutomationPredicateConfig, key: &str, errors: 
     {
         errors.push(format!(
             "{key}.if.priority: expected info, notice, or alert"
+        ));
+    }
+    if let Some(kind) = &predicate.notification_kind
+        && !NotificationKind::ALL
+            .into_iter()
+            .any(|candidate| candidate.as_str() == kind)
+    {
+        errors.push(format!(
+            "{key}.if.notification_kind: unknown notification kind {kind:?}"
         ));
     }
     if let Some(pattern) = &predicate.message_regex
@@ -466,6 +492,15 @@ fn compile_rule(rule: &AutomationRuleConfig) -> AutomationRule {
             worktree: rule.predicate.worktree.clone(),
             branch: rule.predicate.branch.clone(),
             agent_role: rule.predicate.agent_role.clone(),
+            notification_kind: rule
+                .predicate
+                .notification_kind
+                .as_deref()
+                .and_then(|value| {
+                    NotificationKind::ALL
+                        .into_iter()
+                        .find(|kind| kind.as_str() == value)
+                }),
             min_priority: rule.predicate.priority.as_deref().and_then(Priority::parse),
             source_prefix: rule.predicate.source_prefix.clone(),
             message_regex: rule.predicate.message_regex.clone(),
@@ -479,6 +514,7 @@ fn compile_rule(rule: &AutomationRuleConfig) -> AutomationRule {
             params: rule.then.params(),
         },
         debounce_secs: rule.debounce_secs,
+        idle_secs: rule.idle_secs,
         once_per_key: rule.once_per_key,
         max_per_hour: rule.max_per_hour,
         max_action_per_hour: rule.max_action_per_hour,

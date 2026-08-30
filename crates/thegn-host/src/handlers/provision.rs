@@ -173,15 +173,22 @@ pub(crate) fn note_provider_degraded(
     let msg = spec
         .warning_summary()
         .unwrap_or_else(|| format!("{branch} running on host"));
-    let dec = notify.decide("provider_degraded", path, &msg, path);
-    notify.emit_sound(&dec);
-    notify.emit_push(&dec, "provider_degraded", &msg, "", path);
+    let dec = crate::notify::route(notify, "provider_degraded", path, &msg, path);
     if dec.record {
         let path = path.to_string();
+        let routed = dec.clone();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ =
-                    crate::automation_events::emit(&db, "provider_degraded", &path, &msg, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ = crate::automation_events::insert_routed(
+                    &db,
+                    "provider_degraded",
+                    &path,
+                    &msg,
+                    &path,
+                    Default::default(),
+                    &routed,
+                    false,
+                ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         });
     }

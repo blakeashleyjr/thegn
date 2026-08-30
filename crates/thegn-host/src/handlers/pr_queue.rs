@@ -60,9 +60,7 @@ fn notify_prq(
     worktree: &str,
     message: String,
 ) {
-    let dec = ctx
-        .notify_state
-        .decide(kind.as_str(), key, &message, worktree);
+    let dec = crate::notify::route(ctx.notify_state, kind.as_str(), key, &message, worktree);
     if dec.desktop {
         let n = thegn_core::notification::Notification {
             id: 0,
@@ -77,9 +75,6 @@ fn notify_prq(
             &thegn_core::event_bus::Event::NotificationReceived { notification: n },
         );
     }
-    ctx.notify_state.emit_sound(&dec);
-    ctx.notify_state
-        .emit_push(&dec, kind.as_str(), &message, "", worktree);
     if dec.record {
         let (k, src, wt, msg) = (
             kind.as_str(),
@@ -87,11 +82,22 @@ fn notify_prq(
             worktree.to_string(),
             message,
         );
+        let routed = dec.clone();
         tokio::task::spawn_blocking(move || {
             let Ok(db) = Db::open() else { return };
             // best-effort: the inbox is a cache; the queue row is the record.
-            let _ = crate::automation_events::emit(&db, k, &src, &msg, &wt);
+            let _ = crate::automation_events::insert_routed(
+                &db,
+                k,
+                &src,
+                &msg,
+                &wt,
+                Default::default(),
+                &routed,
+                false,
+            );
             if k == "pr_queue_merged" {
+                let origin = crate::automation_events::take_merge_origin(&db, &wt);
                 crate::automation_events::submit_fact(
                     thegn_core::automation::AutomationEventKind::MergeLanded,
                     format!("{src}:merged"),
@@ -99,6 +105,7 @@ fn notify_prq(
                     Some(msg),
                     crate::automation_events::EventFacts {
                         pr_merged: Some(true),
+                        origin,
                         ..Default::default()
                     },
                 );

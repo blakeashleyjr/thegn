@@ -21,8 +21,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir,
-    WaitCondition,
+    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, EditorOpenRequest,
+    ForkSpec, OpenSpec, PreviewFetchRequest, SplitDir, WaitCondition,
 };
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
@@ -54,8 +54,12 @@ impl From<ControlError> for Status {
     fn from(e: ControlError) -> Status {
         match &e {
             ControlError::NotFound(_) => Status::not_found(e.to_string()),
+            ControlError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
             ControlError::NoScope { .. } => Status::permission_denied(e.to_string()),
             ControlError::Conflict(_) => Status::aborted(e.to_string()),
+            ControlError::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
+            ControlError::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            ControlError::Unavailable(_) => Status::unavailable(e.to_string()),
             ControlError::Unimplemented(_) => Status::unimplemented(e.to_string()),
             ControlError::Internal(_) => Status::internal(e.to_string()),
         }
@@ -227,6 +231,7 @@ fn info_to_proto(i: &super::SessionInfo) -> proto::SessionInfo {
         attached_clients: i.attached_clients,
         lease_expires_at: i.lease_expires_at,
         error_active: i.error_active,
+        forked_from: i.forked_from.clone(),
     }
 }
 
@@ -320,6 +325,29 @@ impl Control for GrpcControl {
         Ok(Response::new(info_to_proto(&info)))
     }
 
+    async fn fork_session(
+        &self,
+        req: Request<proto::ForkSessionRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::ForkSession)?;
+        let r = req.into_inner();
+        let info = self
+            .api
+            .fork(ForkSpec {
+                session: r.session,
+                harness: (!r.harness.is_empty()).then_some(r.harness),
+                agent: (!r.agent.is_empty()).then_some(r.agent),
+                cwd: (!r.cwd.is_empty()).then_some(r.cwd),
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                scrollback: r.scrollback,
+                adopt: r.adopt,
+                tab: r.tab,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&info)))
+    }
+
     async fn send_input(
         &self,
         req: Request<proto::SendInputRequest>,
@@ -381,6 +409,35 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn open_editor(
+        &self,
+        req: Request<proto::OpenEditorRequest>,
+    ) -> Result<Response<proto::OpenEditorReply>, Status> {
+        self.authed(&req, Verb::OpenEditor)?;
+        let r = req.into_inner();
+        let line = r
+            .line
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("line is too large"))?;
+        let col = r
+            .col
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("col is too large"))?;
+        let request = EditorOpenRequest {
+            worktree: r.worktree,
+            path: (!r.path.is_empty()).then_some(r.path),
+            line,
+            col,
+        };
+        let target = request
+            .target()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.api.open_editor(target).await.map_err(Status::from)?;
+        Ok(Response::new(proto::OpenEditorReply { queued: true }))
     }
 
     async fn list_worktrees(
@@ -482,6 +539,32 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn preview_fetch(
+        &self,
+        req: Request<proto::PreviewFetchRequest>,
+    ) -> Result<Response<proto::PreviewFetchReply>, Status> {
+        self.authed(&req, Verb::PreviewFetch)?;
+        let r = req.into_inner();
+        let reply = self
+            .api
+            .preview_fetch(PreviewFetchRequest {
+                url: r.url,
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                include_console: r.include_console,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::PreviewFetchReply {
+            url: reply.url,
+            status: u32::from(reply.status),
+            content_type: reply.content_type.unwrap_or_default(),
+            body: reply.body,
+            truncated: reply.truncated,
+            console_errors: reply.console_errors,
+            diagnostics_source: reply.diagnostics_source,
+        }))
     }
 
     async fn git_status(
@@ -816,6 +899,7 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.attach",
     "sessions.detach",
     "sessions.open",
+    "sessions.fork",
     "sessions.input",
     "sessions.resize",
     "sessions.snapshot",
@@ -824,7 +908,9 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.split",
     "worktrees.list",
     "worktrees.open",
+    "editor.open",
     "browser.drive",
+    "preview.fetch",
     "git.status",
     "git.stage",
     "git.commit",
@@ -969,5 +1055,19 @@ mod tests {
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");
         }
+    }
+
+    #[test]
+    fn session_info_lineage_is_additive_on_the_grpc_wire() {
+        let info = crate::control::SessionInfo {
+            id: "child".into(),
+            forked_from: Some("parent".into()),
+            ..Default::default()
+        };
+        let wire = super::info_to_proto(&info);
+        assert_eq!(wire.forked_from.as_deref(), Some("parent"));
+
+        let legacy = crate::control::SessionInfo::default();
+        assert_eq!(super::info_to_proto(&legacy).forked_from, None);
     }
 }
