@@ -14,7 +14,7 @@ use std::path::Path;
 use thegn_core::config::{Config, SandboxConfig};
 use thegn_core::config_resolve::{Approvals, ClampEvent, GatedRequest, summarize_events};
 use thegn_core::db::Db;
-use thegn_core::devcontainer::{self, DevContainer, ImageSource, SubstCtx};
+use thegn_core::devcontainer::{self, ImageSource, SubstCtx};
 use thegn_core::devcontainer_overlay;
 use thegn_core::devcontainer_select;
 use thegn_core::env::Environment;
@@ -32,11 +32,8 @@ pub(crate) struct TrustedEnvironment {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrustedDevcontainer {
-    pub config: DevContainer,
     pub config_path: std::path::PathBuf,
-    pub source_approved: bool,
     pub provider_eligible: bool,
-    pub status: crate::devcontainer_provider::DevcontainerStatus,
 }
 
 /// The approvals a repo currently has (from the `repo_trust` table). Empty
@@ -147,7 +144,7 @@ fn overlay_devcontainer(
     let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
     let ctx = subst_ctx(worktree, &local_env);
     let outcome = devcontainer_overlay::apply_gated_with_policy(
-        &dc,
+        dc,
         sb,
         &ctx,
         worktree,
@@ -168,7 +165,7 @@ fn overlay_devcontainer(
         ImageSource::Image(image) => !image.is_empty(),
         ImageSource::Build(_) | ImageSource::Compose(_) => true,
     };
-    let inventory = devcontainer::recognized_unapplied(&dc);
+    let inventory = devcontainer::recognized_unapplied(dc);
     // The CLI consumes the original repo file, so it is only safe when every
     // execution-affecting key is in the applied subset. Otherwise refused,
     // reserved, or unknown keys could reach the vendor process despite the
@@ -178,21 +175,9 @@ fn overlay_devcontainer(
         && inventory.refused.is_empty()
         && inventory.reserved.is_empty()
         && inventory.unknown.is_empty();
-    let provider_probe = crate::devcontainer_provider::probe();
-    let status = crate::devcontainer_provider::status_for_selected(
-        dc,
-        &selected,
-        Path::new(worktree),
-        sb,
-        &approvals,
-        &provider_probe,
-    );
     Some(TrustedDevcontainer {
-        config: dc.clone(),
         config_path: selected.selected.unwrap_or_default(),
-        source_approved: outcome.pending.is_empty(),
         provider_eligible,
-        status,
     })
 }
 
