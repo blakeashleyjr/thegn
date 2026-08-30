@@ -141,6 +141,22 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
                 continue;
             }
             let path = entry.path().join("SKILL.md");
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+                    complete = false;
+                    diagnostics.push(format!(
+                        "{}: SKILL.md must be a regular, non-symlink file",
+                        path.display()
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    complete = false;
+                    diagnostics.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            }
             let bytes = match read_bounded(&path) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -193,10 +209,12 @@ fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
 pub(crate) fn configured_harnesses(cfg: &Config) -> (Vec<String>, Vec<String>) {
     let mut ids = BTreeSet::new();
     let mut diagnostics = Vec::new();
+    let mut configured_target_seen = false;
     for entry in &cfg.agents {
         if entry.name == "shell" || entry.command.trim() == "__shell__" {
             continue;
         }
+        configured_target_seen = true;
         let id = thegn_core::agent_task::provider_id(entry);
         if thegn_core::harness::harness(&id).is_some() {
             ids.insert(id);
@@ -208,6 +226,7 @@ pub(crate) fn configured_harnesses(cfg: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
     for stage in &cfg.pipeline.stages {
+        configured_target_seen = true;
         let id = stage
             .harness
             .as_deref()
@@ -238,7 +257,7 @@ pub(crate) fn configured_harnesses(cfg: &Config) -> (Vec<String>, Vec<String>) {
             )),
         }
     }
-    if ids.is_empty() {
+    if ids.is_empty() && !configured_target_seen {
         ids.insert("claude".to_string());
     }
     (ids.into_iter().collect(), diagnostics)
@@ -453,7 +472,14 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
                 .map(|d| format!("{harness_id}: {d}")),
         );
         let mut managed_patterns = BTreeSet::new();
-        let mut user_patterns = BTreeSet::new();
+        let mut user_patterns: BTreeSet<String> = excludes
+            .iter()
+            .filter_map(|name| {
+                thegn_core::skills::skill_relative(name)
+                    .ok()
+                    .map(|relative| skill_exclude_pattern(layout.project_root, &relative))
+            })
+            .collect();
         for entry in plan.unchanged {
             managed_patterns.insert(skill_exclude_pattern(layout.project_root, &entry.relative));
             files.push(result_row(
@@ -461,6 +487,15 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
                 layout.project_root,
                 &entry.relative,
                 "current",
+            ));
+        }
+        for entry in plan.inactive_managed {
+            managed_patterns.insert(skill_exclude_pattern(layout.project_root, &entry.relative));
+            files.push(result_row(
+                &harness_id,
+                layout.project_root,
+                &entry.relative,
+                "managed_inactive",
             ));
         }
         for entry in plan.skipped_unmarked {
@@ -511,6 +546,10 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             let dest = root.join(&operation.relative);
             match std::fs::remove_file(&dest) {
                 Ok(()) => {
+                    user_patterns.insert(skill_exclude_pattern(
+                        layout.project_root,
+                        &operation.relative,
+                    ));
                     if let Some(parent) = dest.parent() {
                         let _ = std::fs::remove_dir(parent); // best-effort: cleanup: only an empty package directory is removed
                     }
@@ -543,7 +582,10 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             );
         }
 
-        exclude_locally(worktree, managed_patterns, user_patterns, &mut diagnostics);
+        if let Err(error) = exclude_locally(worktree, managed_patterns, user_patterns) {
+            diagnostics.push(error.clone());
+            access_failures.push(error);
+        }
     }
 
     if !access_failures.is_empty() {
@@ -587,6 +629,7 @@ fn seed_mq_commands(
     access_failures: &mut Vec<String>,
 ) {
     let mut managed_patterns = Vec::new();
+    let mut user_patterns = Vec::new();
     for command in MQ_COMMANDS {
         let mut managed_path = false;
         let dest = worktree.join(command.relative);
@@ -610,6 +653,7 @@ fn seed_mq_commands(
             }
         };
         if excludes.contains("mq") {
+            user_patterns.push(command.relative.to_string());
             if existing
                 .as_deref()
                 .and_then(inspect_managed)
@@ -631,6 +675,32 @@ fn seed_mq_commands(
             continue;
         }
         if !cfg.merge_queue.enabled {
+            match existing.as_deref() {
+                None => {}
+                Some(bytes) if bytes == command.body.as_bytes() => managed_path = true,
+                Some(bytes) => match inspect_managed(bytes) {
+                    None => {
+                        user_patterns.push(command.relative.to_string());
+                        files.push(SeedFileResult {
+                            harness: "claude".into(),
+                            path: command.relative.into(),
+                            status: "preserved_unmarked".into(),
+                        });
+                    }
+                    Some(managed) if managed.is_user_modified() => {
+                        user_patterns.push(command.relative.to_string());
+                        files.push(SeedFileResult {
+                            harness: "claude".into(),
+                            path: command.relative.into(),
+                            status: "preserved_modified".into(),
+                        });
+                    }
+                    Some(_) => managed_path = true,
+                },
+            }
+            if managed_path {
+                managed_patterns.push(command.relative.to_string());
+            }
             continue;
         }
         let desired = render_managed_legacy(command.body);
@@ -688,7 +758,10 @@ fn seed_mq_commands(
             managed_patterns.push(command.relative.to_string());
         }
     }
-    exclude_locally(worktree, managed_patterns, std::iter::empty(), diagnostics);
+    if let Err(error) = exclude_locally(worktree, managed_patterns, user_patterns) {
+        diagnostics.push(error.clone());
+        access_failures.push(error);
+    }
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -748,25 +821,20 @@ fn exclude_locally(
     worktree: &Path,
     add_patterns: impl IntoIterator<Item = String>,
     remove_patterns: impl IntoIterator<Item = String>,
-    diagnostics: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     let exclude = thegn_core::util::git_common_dir(worktree)
         .join("info")
         .join("exclude");
     if std::fs::symlink_metadata(&exclude).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        diagnostics.push(format!(
+        return Err(format!(
             "{}: is a symlink; local excludes skipped",
             exclude.display()
         ));
-        return;
     }
     let contents = match std::fs::read_to_string(&exclude) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            diagnostics.push(format!("{}: {error}", exclude.display()));
-            return;
-        }
+        Err(error) => return Err(format!("{}: {error}", exclude.display())),
     };
     let remove: BTreeSet<String> = remove_patterns.into_iter().collect();
     let mut updated = String::with_capacity(contents.len());
@@ -782,13 +850,12 @@ fn exclude_locally(
     missing.sort();
     missing.dedup();
     if missing.is_empty() && updated == contents {
-        return;
+        return Ok(());
     }
     if let Some(parent) = exclude.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
-        diagnostics.push(format!("{}: {error}", parent.display()));
-        return;
+        return Err(format!("{}: {error}", parent.display()));
     }
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
@@ -797,9 +864,8 @@ fn exclude_locally(
         updated.push_str(&pattern);
         updated.push('\n');
     }
-    if let Err(error) = atomic_write(&exclude, updated.as_bytes()) {
-        diagnostics.push(format!("{}: {error}", exclude.display()));
-    }
+    atomic_write(&exclude, updated.as_bytes())
+        .map_err(|error| format!("{}: {error}", exclude.display()))
 }
 
 /// Best-effort worktree-creation hook.
@@ -987,6 +1053,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_a_symlinked_skill_document() {
+        use std::os::unix::fs::symlink;
+
+        let user = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::create_dir(user.path().join("linked")).unwrap();
+        symlink(outside.path(), user.path().join("linked/SKILL.md")).unwrap();
+        let mut cfg = Config::default();
+        cfg.skills.user_dirs = vec![user.path().display().to_string()];
+
+        let loaded = load_registry(&cfg);
+        assert!(!loaded.complete);
+        assert!(loaded.registry.get("linked").is_none());
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|row| row.contains("non-symlink"))
+        );
+    }
+
+    #[test]
+    fn unknown_configured_harness_does_not_fall_back_to_claude() {
+        let mut cfg = Config::default();
+        cfg.agents = vec![named("custom", "missing-harness")];
+        let (harnesses, diagnostics) = configured_harnesses(&cfg);
+        assert!(harnesses.is_empty(), "{harnesses:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|row| row.contains("unknown harness"))
+        );
+    }
+
     #[test]
     fn seeds_each_configured_harness_in_its_native_layout() {
         let wt = worktree();
@@ -1060,6 +1162,68 @@ mod tests {
         let exclude = std::fs::read_to_string(wt.path().join(".git/info/exclude")).unwrap();
         assert!(!exclude.contains(".claude/skills/supervise/"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "user-owned skill\n");
+    }
+
+    #[test]
+    fn gate_inactive_user_edits_are_not_hidden_from_git_status() {
+        let wt = worktree();
+        let mut cfg = Config::default();
+        cfg.merge_queue.enabled = true;
+        seed(&cfg, wt.path(), SeedPhase::Explicit).unwrap();
+
+        let skill = wt.path().join(".claude/skills/mq/SKILL.md");
+        let command = wt.path().join(".claude/commands/mq-add.md");
+        let mut skill_edit = std::fs::read_to_string(&skill).unwrap();
+        skill_edit.push_str("\nUser skill edit.\n");
+        std::fs::write(&skill, skill_edit).unwrap();
+        let mut command_edit = std::fs::read_to_string(&command).unwrap();
+        command_edit.push_str("\nUser command edit.\n");
+        std::fs::write(&command, command_edit).unwrap();
+        cfg.merge_queue.enabled = false;
+
+        let report = seed(&cfg, wt.path(), SeedPhase::Explicit).unwrap();
+        assert!(report.files.iter().any(|row| {
+            row.path.ends_with("mq/SKILL.md") && row.status == "preserved_modified"
+        }));
+        assert!(
+            report.files.iter().any(|row| {
+                row.path.ends_with("mq-add.md") && row.status == "preserved_modified"
+            })
+        );
+        let exclude = std::fs::read_to_string(wt.path().join(".git/info/exclude")).unwrap();
+        assert!(!exclude.contains(".claude/skills/mq/"), "{exclude}");
+        assert!(!exclude.contains(".claude/commands/mq-add.md"), "{exclude}");
+    }
+
+    #[test]
+    fn excluded_assets_remove_stale_local_ignore_entries() {
+        let wt = worktree();
+        let mut cfg = Config::default();
+        cfg.merge_queue.enabled = true;
+        seed(&cfg, wt.path(), SeedPhase::Explicit).unwrap();
+        cfg.skills.exclude = vec!["mq".into()];
+
+        seed(&cfg, wt.path(), SeedPhase::Explicit).unwrap();
+        assert!(!wt.path().join(".claude/skills/mq/SKILL.md").exists());
+        assert!(!wt.path().join(".claude/commands/mq-add.md").exists());
+        let exclude = std::fs::read_to_string(wt.path().join(".git/info/exclude")).unwrap();
+        assert!(!exclude.contains(".claude/skills/mq/"), "{exclude}");
+        assert!(!exclude.contains(".claude/commands/mq-add.md"), "{exclude}");
+        assert!(
+            !exclude.contains(".claude/commands/mq-drain.md"),
+            "{exclude}"
+        );
+    }
+
+    #[test]
+    fn explicit_seed_propagates_local_exclude_access_failures() {
+        let wt = worktree();
+        std::fs::remove_file(wt.path().join(".git/info/exclude")).unwrap();
+        std::fs::create_dir(wt.path().join(".git/info/exclude")).unwrap();
+
+        let error = seed(&Config::default(), wt.path(), SeedPhase::Explicit).unwrap_err();
+        assert!(error.to_string().contains("could not access target"));
+        assert!(error.to_string().contains("info/exclude"));
     }
 
     #[test]

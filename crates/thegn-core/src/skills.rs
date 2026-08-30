@@ -752,6 +752,10 @@ pub struct PlanEntry {
 pub struct SeedPlan {
     pub writes: Vec<WriteOperation>,
     pub unchanged: Vec<PlanEntry>,
+    /// Intact managed files retained while their harness/gate/phase is
+    /// inactive. Hosts still need this ownership state to keep only pristine
+    /// generated files in their local ignore bookkeeping.
+    pub inactive_managed: Vec<PlanEntry>,
     pub skipped_unmarked: Vec<PlanEntry>,
     pub skipped_adopted: Vec<PlanEntry>,
     pub removed_managed: Vec<RemoveOperation>,
@@ -824,6 +828,15 @@ pub fn plan_seed(
             || !skill.gate.is_open(gates)
             || !skill.when.contains(&target.phase)
         {
+            if let Some(file) = file {
+                match inspect_managed(&file.bytes) {
+                    None => plan.skipped_unmarked.push(PlanEntry { relative }),
+                    Some(managed) if managed.is_user_modified() => {
+                        plan.skipped_adopted.push(PlanEntry { relative });
+                    }
+                    Some(_) => plan.inactive_managed.push(PlanEntry { relative }),
+                }
+            }
             continue;
         }
         let desired = render_managed(skill);
@@ -1073,6 +1086,26 @@ mod tests {
         let mut codex = target(&[]);
         codex.harness = "aider".into();
         assert!(plan_seed(&registry, &codex, &[], GateState::default()).is_empty());
+    }
+
+    #[test]
+    fn inactive_skills_retain_ownership_state_without_hiding_user_edits() {
+        let skill = doc("mq", "merge_queue", "explicit");
+        let registry = registry(vec![skill.clone()]);
+
+        let pristine = ExistingFile::new("mq/SKILL.md", render_managed(&skill));
+        let plan = plan_seed(&registry, &target(&[]), &[pristine], GateState::default());
+        assert!(plan.is_empty());
+        assert_eq!(plan.inactive_managed.len(), 1);
+
+        let edited = ExistingFile::new(
+            "mq/SKILL.md",
+            render_managed(&skill).replace("# mq", "# user edit"),
+        );
+        let plan = plan_seed(&registry, &target(&[]), &[edited], GateState::default());
+        assert!(plan.is_empty());
+        assert!(plan.inactive_managed.is_empty());
+        assert_eq!(plan.skipped_adopted.len(), 1);
     }
 
     #[test]
