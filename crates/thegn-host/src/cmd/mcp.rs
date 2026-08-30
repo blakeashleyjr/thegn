@@ -410,7 +410,7 @@ const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`"
 /// arguments object (`StateRouter::call` runs `validate_args` before this is
 /// ever invoked — see `thegn_core::mcp::state`). `worktrees.list` degrades to
 /// the DB cache when no daemon answers; every other tool has no offline
-/// truth and errors instead — including the four mutating tools, which by
+/// truth and errors instead — including the mutating tools, which by
 /// construction need a live daemon to act on.
 async fn fetch_state(
     cfg: &Config,
@@ -513,6 +513,22 @@ async fn fetch_state(
             let info = c.fork(&spec).await.map_err(|e| e.to_string())?;
             serde_json::to_value(&info).map_err(|e| e.to_string())
         }
+        "editor.open" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::EditorOpenRequest {
+                worktree: str_arg(args, "worktree")
+                    .ok_or("missing `worktree`")?
+                    .to_string(),
+                path: str_arg(args, "path").map(str::to_string),
+                line: optional_usize_arg(args, "line")?,
+                col: optional_usize_arg(args, "col")?,
+            };
+            // Apply semantic target policy at the MCP boundary as well as at
+            // the HTTP server: malformed paths never make a daemon round-trip.
+            request.target().map_err(|e| e.to_string())?;
+            c.open_editor(&request).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "queued": true }))
+        }
         "sessions.input" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let session = str_arg(args, "session").ok_or("missing `session`")?;
@@ -552,6 +568,18 @@ async fn fetch_state(
 /// already validated against the tool's schema — this just extracts).
 fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn optional_usize_arg(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let n = value
+        .as_u64()
+        .ok_or_else(|| format!("`{key}` must be a non-negative integer"))?;
+    usize::try_from(n)
+        .map(Some)
+        .map_err(|_| format!("`{key}` is too large"))
 }
 
 /// The worktree a semantic tool targets: the `worktree` argument, else the
@@ -818,6 +846,7 @@ mod tests {
         let allowed = allowed_state_caps(ScopeSet::parse("write"), false);
         assert!(allowed.contains(&"sessions.open"), "{allowed:?}");
         assert!(allowed.contains(&"sessions.kill"), "{allowed:?}");
+        assert!(allowed.contains(&"editor.open"), "{allowed:?}");
         assert!(!allowed.contains(&"sessions.input"), "{allowed:?}");
         // read-scope tools are still covered (write implies read).
         for cap in READ_CAPS {

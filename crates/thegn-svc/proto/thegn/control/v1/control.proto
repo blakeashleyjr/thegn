@@ -18,6 +18,8 @@ service Control {
   rpc Snapshot(SnapshotRequest) returns (Event);
   rpc KillSession(KillSessionRequest) returns (Empty);
   rpc OpenWorktree(OpenWorktreeRequest) returns (Empty);
+  // Queue a safe target for the owning compositor's locally configured editor.
+  rpc OpenEditor(OpenEditorRequest) returns (OpenEditorReply);
   // Worktrees registered with thegn (path, branch, repo root, location).
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesReply);
   // v1: always UNIMPLEMENTED (the contract slot for the preview browser).
@@ -124,6 +126,14 @@ message OpenWorktreeRequest {
   string repo = 1;
   string branch = 2;          // empty = none
 }
+
+message OpenEditorRequest {
+  string worktree = 1;        // required absolute host path
+  string path = 2;            // empty = project; otherwise worktree-relative
+  optional uint64 line = 3;   // 1-based; requires path
+  optional uint64 col = 4;    // 1-based; requires path + line
+}
+message OpenEditorReply { bool queued = 1; }
 
 message ListWorktreesRequest {}
 message ListWorktreesReply { repeated WorktreeInfo worktrees = 1; }
