@@ -681,6 +681,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         };
         cfg.agents.push(named("claude", "claude --dangerously"));
         cfg.tools.push(named("lazygit", "lazygit"));

@@ -171,6 +171,10 @@ pub enum Action {
     /// only — the clipboard is never watched. See `[clipboard]`.
     PasteImage,
     ToggleDrawer,
+    /// Cycle the active drawer through files and eligible configured tools.
+    DrawerCycle,
+    /// Open the dedicated drawer occupant picker.
+    DrawerPick,
     /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
     /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
     ToggleCorner,
@@ -555,6 +559,8 @@ impl Action {
             Action::PasteRegister => "paste-register",
             Action::PasteImage => "paste-image",
             Action::ToggleDrawer => "files-drawer",
+            Action::DrawerCycle => "drawer-cycle",
+            Action::DrawerPick => "drawer-pick",
             Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
@@ -703,6 +709,8 @@ impl Action {
             "paste-register" => Action::PasteRegister,
             "paste-image" => Action::PasteImage,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
+            "drawer-cycle" | "cycle-drawer" => Action::DrawerCycle,
+            "drawer-pick" | "pick-drawer" => Action::DrawerPick,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
@@ -2091,6 +2099,10 @@ mod tests {
         assert_eq!(Action::NewWorktree.key(), "new-worktree");
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
+        assert_eq!(Action::DrawerCycle.key(), "drawer-cycle");
+        assert_eq!(Action::DrawerPick.key(), "drawer-pick");
+        assert_eq!(Action::from_key("cycle-drawer"), Some(Action::DrawerCycle));
+        assert_eq!(Action::from_key("pick-drawer"), Some(Action::DrawerPick));
         assert_eq!(Action::SwitchFont.key(), "switch-font");
     }
 

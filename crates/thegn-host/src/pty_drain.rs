@@ -40,7 +40,7 @@ use crate::pane::PaneEvent;
 use crate::panes::Panes;
 use crate::pins::pin_cwd;
 use crate::run::{
-    DrawerPool, SidebarState, active_cwd, persist_pin_state, prospective_corner_rect,
+    DrawerRuntime, SidebarState, active_cwd, persist_pin_state, prospective_corner_rect,
     update_crash_count,
 };
 
@@ -229,8 +229,7 @@ pub(crate) struct DrainCtx<'a> {
     pub dirty: &'a mut bool,
     pub need_relayout: &'a mut bool,
     pub drawer: &'a mut Option<u32>,
-    pub drawer_pool: &'a mut DrawerPool,
-    pub drawer_home: &'a mut Option<std::path::PathBuf>,
+    pub drawer_runtime: &'a mut DrawerRuntime,
     pub corner: &'a mut Option<u32>,
     pub corner_name: &'a mut Option<String>,
     pub corner_kitty: bool,
@@ -561,9 +560,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
             cmd,
             ctx.session,
             ctx.panes,
-            ctx.drawer,
-            ctx.drawer_pool,
-            ctx.drawer_home,
+            ctx.drawer_runtime,
             ctx.focus,
             ctx.model,
             ctx.sb,
@@ -657,17 +654,28 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .table
         .get(&id)
         .is_some_and(|p| is_daemon_agent_exit(p.is_daemon_backed(), p.program()));
+    let visible_drawer = ctx
+        .drawer_runtime
+        .visible
+        .as_ref()
+        .is_some_and(|visible| visible.pane_id == id);
+    let pooled_drawer = ctx.drawer_runtime.pool.key_for_id(id).is_some();
+    let was_drawer = visible_drawer || pooled_drawer;
     ctx.panes.table.remove(&id);
     // Set only in the sole-pane leave-for-materialize branch below.
     let mut left_for_materialize = false;
     // The visible drawer manager's process ended. Clear it, mark the worktree's
     // drawer closed, hand focus back to the center, and relayout to reclaim
     // the bottom slice.
-    if *ctx.drawer == Some(id) {
-        *ctx.drawer = None;
-        if let Some(dir) = ctx.drawer_home.take().or_else(|| active_cwd(ctx.session)) {
-            crate::drawer_state::set_flag(&dir, false);
+    if was_drawer {
+        ctx.drawer_runtime.on_exit(id, ctx.panes);
+        // A prewarmed occupant can exit while another occupant remains
+        // visible. Removing that hidden pane must not steal focus or reclaim
+        // the visible drawer's geometry.
+        if !visible_drawer {
+            return false;
         }
+        *ctx.drawer = None;
         // A clean exit is the normal `q`-quit path — stay quiet. Only an
         // abnormal exit (e.g. the contained scope hit the drawer memory
         // limit) gets a hint.
@@ -680,11 +688,6 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
             ctx.focus.zone = crate::focus::Zone::Center;
         }
         *ctx.need_relayout = true;
-        *ctx.dirty = true;
-        return false;
-    }
-    // A pooled (hidden) drawer manager exited; just forget it.
-    if ctx.drawer_pool.remove_id(id) {
         *ctx.dirty = true;
         return false;
     }
