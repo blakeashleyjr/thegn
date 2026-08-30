@@ -31,8 +31,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, RecordSpec, SplitDir,
-    WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, ControlErrorCode, OpenSpec, RecordSpec,
+    SplitDir, WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -102,8 +102,15 @@ fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
-fn error_json(status: StatusCode, message: &str) -> Response {
-    (status, axum::Json(json!({ "error": message }))).into_response()
+fn error_json(status: StatusCode, code: ControlErrorCode, message: &str) -> Response {
+    (
+        status,
+        axum::Json(super::ErrorBody {
+            error: message.to_string(),
+            code,
+        }),
+    )
+        .into_response()
 }
 
 /// Maximum bytes read back from an in-process dispatch response body — the same
@@ -139,7 +146,11 @@ pub async fn dispatch_local(
     let Ok(request) = request else {
         return (
             StatusCode::BAD_REQUEST,
-            json!({ "error": "could not build request" }),
+            serde_json::to_value(super::ErrorBody {
+                error: "could not build request".into(),
+                code: ControlErrorCode::BadRequest,
+            })
+            .expect("ErrorBody serialization is infallible"),
         );
     };
     let response = match router(state).oneshot(request).await {
@@ -149,7 +160,11 @@ pub async fn dispatch_local(
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": "dispatch failed" }),
+                serde_json::to_value(super::ErrorBody {
+                    error: "dispatch failed".into(),
+                    code: ControlErrorCode::Internal,
+                })
+                .expect("ErrorBody serialization is infallible"),
             );
         }
     };
@@ -170,7 +185,7 @@ impl IntoResponse for ControlError {
             ControlError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ControlError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        error_json(status, &self.to_string())
+        error_json(status, self.code(), &self.to_string())
     }
 }
 
@@ -216,7 +231,11 @@ fn authed_target(
     } else {
         let Some(token) = bearer(headers) else {
             audit_anon(verb, target, AuditOutcome::Unauthorized);
-            return Err(error_json(StatusCode::UNAUTHORIZED, "missing bearer token"));
+            return Err(error_json(
+                StatusCode::UNAUTHORIZED,
+                ControlErrorCode::Unauthorized,
+                "missing bearer token",
+            ));
         };
         let store = state.store.lock().expect("control store lock");
         match auth::verify(&*store, &token, now_ms()) {
@@ -226,6 +245,7 @@ fn authed_target(
                 audit_anon(verb, target, AuditOutcome::Unauthorized);
                 return Err(error_json(
                     StatusCode::UNAUTHORIZED,
+                    ControlErrorCode::Unauthorized,
                     "invalid or revoked token",
                 ));
             }
@@ -434,6 +454,7 @@ pub(super) async fn pair(
         }
         Ok(None) => error_json(
             StatusCode::UNAUTHORIZED,
+            ControlErrorCode::Unauthorized,
             "invalid, expired, or already-redeemed pairing code",
         ),
         Err(e) => ControlError::Internal(e).into_response(),
@@ -723,12 +744,19 @@ pub(super) async fn send_input(
     let mut bytes = match (&body.b64, &body.text) {
         (Some(b64), None) => match base64::engine::general_purpose::STANDARD.decode(b64) {
             Ok(b) => b,
-            Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid base64"),
+            Err(_) => {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    ControlErrorCode::BadRequest,
+                    "invalid base64",
+                );
+            }
         },
         (None, Some(text)) => text.clone().into_bytes(),
         _ => {
             return error_json(
                 StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
                 "exactly one of `b64` or `text` is required",
             );
         }
@@ -1525,6 +1553,85 @@ pub fn frame_json(frame: &EventFrame) -> serde_json::Value {
 
 fn default_history() -> bool {
     true
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn control_error_http_envelope_preserves_status_message_and_code() {
+        let cases = [
+            (
+                ControlError::NotFound("session s1".into()),
+                StatusCode::NOT_FOUND,
+                ControlErrorCode::NotFound,
+                "not found: session s1",
+            ),
+            (
+                ControlError::NoScope {
+                    need: thegn_core::control::Scope::Read,
+                },
+                StatusCode::FORBIDDEN,
+                ControlErrorCode::NoScope,
+                "missing required scope: read",
+            ),
+            (
+                ControlError::Conflict("session s1".into()),
+                StatusCode::CONFLICT,
+                ControlErrorCode::Conflict,
+                "conflict: session s1",
+            ),
+            (
+                ControlError::Unimplemented("wait"),
+                StatusCode::NOT_IMPLEMENTED,
+                ControlErrorCode::Unimplemented,
+                "not implemented: wait",
+            ),
+            (
+                ControlError::Internal(anyhow::anyhow!("database failed")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ControlErrorCode::Internal,
+                "database failed",
+            ),
+        ];
+
+        for (error, status, code, message) in cases {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: super::super::ErrorBody = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.error, message);
+            assert_eq!(body.code, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_error_codes_are_structured() {
+        for (status, code, message) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                ControlErrorCode::Unauthorized,
+                "missing bearer token",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                "invalid base64",
+            ),
+        ] {
+            let response = error_json(status, code, message);
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: super::super::ErrorBody = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.error, message);
+            assert_eq!(body.code, code);
+        }
+    }
 }
 
 #[derive(Deserialize)]

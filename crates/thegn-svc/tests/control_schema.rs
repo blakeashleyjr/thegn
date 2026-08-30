@@ -43,6 +43,7 @@ fn wire_schema() -> serde_json::Value {
         WorktreeCreateReq,
         DispatchPutReq,
         SessionRecord,
+        ErrorBody,
     );
     let routes: Vec<serde_json::Value> = routes::API_CALLS
         .iter()

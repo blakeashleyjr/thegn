@@ -113,3 +113,13 @@ reflects the presented token. Push: reserved (`/v1/push/register`), not in v1.
 The scope-enforcement guarantees are pinned by
 `crates/thegn-svc/src/control/tests.rs` (router-level, with a recording
 fake proving rejected requests perform zero actions).
+
+## Error responses
+
+HTTP errors use the additive envelope `{ "error": "<message>", "code":
+"<code>" }`. The `error` message and HTTP status retain their existing
+behavior; `code` is a stable identifier from the closed vocabulary
+`not_found`, `no_scope`, `conflict`, `unimplemented`, `internal`,
+`unauthorized`, or `bad_request`. Clients should branch on `code` rather than
+human-readable prose. Older servers that omit `code` remain readable by
+clients, which treat it as absent.
