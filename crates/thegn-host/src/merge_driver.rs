@@ -774,6 +774,8 @@ mod tests {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 }],
                 ..Config::default()
             };

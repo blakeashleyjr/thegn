@@ -60,9 +60,7 @@ fn notify_prq(
     worktree: &str,
     message: String,
 ) {
-    let dec = ctx
-        .notify_state
-        .decide(kind.as_str(), key, &message, worktree);
+    let dec = crate::notify::route(ctx.notify_state, kind.as_str(), key, &message, worktree);
     if dec.desktop {
         let n = thegn_core::notification::Notification {
             id: 0,
@@ -77,9 +75,6 @@ fn notify_prq(
             &thegn_core::event_bus::Event::NotificationReceived { notification: n },
         );
     }
-    ctx.notify_state.emit_sound(&dec);
-    ctx.notify_state
-        .emit_push(&dec, kind.as_str(), &message, "", worktree);
     if dec.record {
         let (k, src, wt, msg) = (
             kind.as_str(),
