@@ -448,6 +448,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         let e = editor_with_env(&cfg, |_| Some("nano".into()));
         assert_eq!(e.id(), "tool");

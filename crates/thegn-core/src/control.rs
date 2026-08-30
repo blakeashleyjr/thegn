@@ -240,8 +240,13 @@ pub fn resolve_serve_scopes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verb {
     ListSessions,
+    /// Move one persisted worktree presentation between profile stores. This
+    /// is deliberately a CLI-only admin operation, not a daemon route.
+    MigrateSession,
     ListWorktrees,
     OpenSession,
+    /// Fork a live daemon or recorded harness session into a new process.
+    ForkSession,
     Attach,
     Detach,
     SendInput,
@@ -401,8 +406,10 @@ impl Verb {
     /// against the enum.
     pub const ALL: &'static [Verb] = &[
         Verb::ListSessions,
+        Verb::MigrateSession,
         Verb::ListWorktrees,
         Verb::OpenSession,
+        Verb::ForkSession,
         Verb::Attach,
         Verb::Detach,
         Verb::SendInput,
@@ -529,6 +536,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
         Verb::OpenSession
+        | Verb::ForkSession
         | Verb::Attach
         | Verb::Detach
         | Verb::SendInput
@@ -578,6 +586,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SecretMigrate
         | Verb::SecretAudit
         | Verb::SecretSshRotate
+        | Verb::MigrateSession
         // Starting/stopping a spend-capable daemon is an admin action; the
         // OPERATOR surfaces + Admin scope keep it off any tool-calling door.
         | Verb::ModelProxyStart
@@ -862,6 +871,7 @@ mod tests {
         ];
         let write = [
             OpenSession,
+            ForkSession,
             Attach,
             Detach,
             SendInput,
@@ -891,6 +901,7 @@ mod tests {
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];
         let admin = [
+            MigrateSession,
             IssuePairing,
             ListPairings,
             RevokePairing,

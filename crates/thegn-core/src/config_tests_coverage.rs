@@ -17,6 +17,7 @@ fn config_enum_defaults_and_displays() {
     assert_eq!(LogFormat::default(), LogFormat::Text);
     assert_eq!(PinLocation::default(), PinLocation::Tab);
     assert_eq!(PinScope::default(), PinScope::Global);
+    assert_eq!(DrawerScope::default(), DrawerScope::Worktree);
     assert_eq!(GitCmdOutput::default(), GitCmdOutput::Popup);
     assert_eq!(IssueProviderKind::default(), IssueProviderKind::None);
 
@@ -229,8 +230,8 @@ mode = "bogus"
 "#,
     )
     .expect("parses");
-    // Unknown enum value warns and falls back to the default (Chime).
-    assert_eq!(cfg.notifications.sound.mode, SoundMode::Chime);
+    // Unknown enum value warns and falls back to the default (Bell).
+    assert_eq!(cfg.notifications.sound.mode, SoundMode::Bell);
 }
 
 #[test]
@@ -644,7 +645,7 @@ fn bars_config_defaults() {
         ]
     );
     // "help" is the clickable `?` chip, first so it is never trimmed away.
-    assert_eq!(b.bottom_left, vec!["help", "keyhints"]);
+    assert_eq!(b.bottom_left, vec!["help", "drawer", "keyhints"]);
     assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
     assert_eq!(b.date_format, "%a %b %-d");
     assert_eq!(b.clock_format, "%H:%M");
@@ -1743,6 +1744,24 @@ hints = [{ key = "q", label = "quit" }]
     assert_eq!(cfg.tools[0].hints.len(), 1);
     assert_eq!(cfg.tools[0].hints[0].key, "q");
     assert_eq!(cfg.tools[0].hints[0].label, "quit");
+}
+
+#[test]
+fn named_command_drawer_metadata_parses_and_defaults() {
+    let legacy: Config =
+        toml::from_str("[[tools]]\nname = 'legacy'\ncommand = 'legacy'\n").unwrap();
+    assert_eq!(legacy.tools[0].drawer_scope, None);
+    assert_eq!(legacy.tools[0].drawer_cwd, None);
+
+    let configured: Config = toml::from_str(
+        "[[tools]]\nname = 'atac'\ncommand = 'atac'\ndrawer_scope = 'worktree'\ndrawer_cwd = '.atac'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        configured.tools[0].drawer_scope,
+        Some(DrawerScope::Worktree)
+    );
+    assert_eq!(configured.tools[0].drawer_cwd.as_deref(), Some(".atac"));
 }
 
 #[test]

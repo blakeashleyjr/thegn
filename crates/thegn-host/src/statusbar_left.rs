@@ -17,6 +17,9 @@ use crate::seg::{Seg, Tok, seg, seg_width};
 /// `bottom_left` to hide the button; no separate config key.
 pub const HELP_ID: &str = "help";
 
+/// The removable bottom drawer presence widget.
+pub const DRAWER_ID: &str = "drawer";
+
 /// The chip's text. ASCII by construction, so it needs no `GlyphSet` entry and
 /// survives `[theme] glyphs = "ascii"` unchanged.
 const HELP_CHIP: &str = " ? ";
@@ -47,6 +50,20 @@ pub fn left_layout(
             l.push(Seg::chip(Tok::Slot(S::Accent), HELP_CHIP.to_string()));
             l.push(seg(Tok::Slot(S::Text), " "));
             spans.push((BarItemId::Help, off, HELP_CHIP.width()));
+            continue;
+        }
+        if id == DRAWER_ID {
+            let Some(wd) = bottombar_widget(id, model) else {
+                continue;
+            };
+            if !first {
+                l.push(seg(Tok::Slot(S::Ghost3), " \u{00b7} "));
+            }
+            first = false;
+            let off = seg_width(&l);
+            let w = wd.text.width();
+            l.push(seg(Tok::Attr(wd.fg), wd.text));
+            spans.push((BarItemId::Widget(id.clone()), off, w));
             continue;
         }
         if id == "keyhints" {
@@ -210,10 +227,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translated_mode_label_respects_cells_and_keyhints_stay_atomic() {
+        let mut m = model_with(&["help", "keyhints"]);
+        m.mode_chip =
+            crate::i18n_surface::test_catalog_value("ja-JP", "statusbar-mode-vim-insert-full");
+        let translated_mode = m.mode_chip.clone();
+        let budget = 34;
+        let (segs, _) = left_layout(&m, budget);
+        let text: String = segs.iter().map(|seg| seg.text.as_str()).collect();
+        assert!(
+            text.contains(&translated_mode),
+            "translated mode is painted: {text:?}"
+        );
+        assert!(
+            seg_width(&segs) <= budget,
+            "{text:?} exceeds {budget} cells"
+        );
+        for (chord, label) in &m.keyhints {
+            assert_eq!(
+                text.contains(chord),
+                text.contains(label),
+                "binding must be wholly present or wholly absent: {text:?}"
+            );
+        }
+    }
+
     /// `Help` opens the overlay, not a bar detail popup.
     #[test]
     fn help_item_has_no_detail_popup() {
         assert!(!BarItemId::Help.has_detail());
         assert!(BarItemId::Widget("cpu".into()).has_detail());
+    }
+
+    #[test]
+    fn drawer_widget_is_atomic_and_hit_tests_where_painted() {
+        let mut m = model_with(&["drawer", "keyhints"]);
+        m.drawer_bar.occupant_count = 2;
+        let (segs, _) = left_layout(&m, 80);
+        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("drawer (2)"), "closed indicator: {text:?}");
+
+        let spans = left_item_spans(&m, rect(120));
+        let (_, drawer_rect) = spans
+            .iter()
+            .find(|(id, _)| *id == BarItemId::Widget(DRAWER_ID.into()))
+            .expect("drawer span present");
+        let start = text.find("drawer").expect("drawer label painted");
+        let start = text[..start].width();
+        assert!(
+            drawer_rect.x <= start && start < drawer_rect.x + drawer_rect.cols,
+            "span {drawer_rect:?} covers drawer label at {start} in {text:?}"
+        );
+
+        m.drawer_bar.open = true;
+        m.drawer_bar.occupant = "atac".into();
+        let (segs, _) = left_layout(&m, 80);
+        let text: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("atac (2)"), "open indicator: {text:?}");
+    }
+
+    #[test]
+    fn dropping_drawer_id_removes_indicator_and_span() {
+        let m = model_with(&["keyhints"]);
+        assert!(
+            !left_layout(&m, 80)
+                .0
+                .iter()
+                .any(|s| s.text.contains("drawer"))
+        );
+        assert!(
+            !left_item_spans(&m, rect(120))
+                .iter()
+                .any(|(id, _)| *id == BarItemId::Widget(DRAWER_ID.into()))
+        );
     }
 }

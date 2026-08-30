@@ -89,6 +89,32 @@ pub fn slugify(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Build an ASCII SQLite URI without letting path `?`, `#`, or `%` bytes turn
+/// into URI syntax. Unix paths retain non-UTF-8 bytes; Windows paths use `/`
+/// separators, which SQLite accepts in file URIs.
+pub(crate) fn immutable_sqlite_uri(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
+
+    let mut uri = String::with_capacity(bytes.len() + 24);
+    uri.push_str("file:");
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(uri, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
 /// A short, STABLE alphanumeric digest of a string — deterministic across runs,
 /// processes, platforms, and Rust versions (unlike `DefaultHasher`, whose output
 /// is explicitly not stable). Used to give per-worktree sandbox names a

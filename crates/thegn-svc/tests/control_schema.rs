@@ -29,6 +29,7 @@ fn wire_schema() -> serde_json::Value {
         WorktreeInfo,
         SessionInfo,
         OpenSpec,
+        ForkSpec,
         AttachKind,
         BrowserCommand,
         BrowserAction,

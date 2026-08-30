@@ -307,6 +307,8 @@ async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<Se
             resume: None,
             continue_last,
             stage: row.stage.clone(),
+            fork: false,
+            native_session_id: None,
         }),
         adopt: false,
         already_capped: false,

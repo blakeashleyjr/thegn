@@ -15,7 +15,11 @@ retain spawn recipes in memory only for the lifetime of the live session —
 never persisted to the database or tombstones and never returned over the
 API — so forking a dead session fails with a clear error naming
 `sessions.open` as the alternative. Resource-cap wrapping MUST be re-applied
-to the fork by the daemon regardless of how the source was capped.
+to the fork by the daemon regardless of how the source was capped, and the
+forked PTY SHALL inherit the source's current rows and columns. When `harness`
+is supplied, `session` is a native id from `agent.sessions`; the selected
+harness's `FORK` operation is authoritative. If an `agent` is supplied, its
+configured provider MUST match that harness, otherwise the request is refused.
 
 #### Scenario: Fork re-runs the recipe
 
@@ -44,6 +48,21 @@ to the fork by the daemon regardless of how the source was capped.
   fork result)
 - **THEN** it never includes the retained env pairs, and the state database
   contains no spawn environment for any session
+
+#### Scenario: Fork preserves a live resize
+
+- **WHEN** a client resizes a live source to 41 rows by 137 columns and forks
+  it
+- **THEN** the new PTY starts at 41 rows by 137 columns and the source remains
+  at its existing size
+
+#### Scenario: Recorded harness selection is authoritative
+
+- **WHEN** a client forks native id `native-1` with `harness=claude` and a
+  configured agent whose provider is `codex`
+- **THEN** the request is rejected without spawning; with a Claude-configured
+  agent, the Claude harness fork command is used while the agent's current
+  credentials and sandbox are composed
 
 ### Requirement: Forks carry lineage and optional scrollback context
 
@@ -104,3 +123,21 @@ MUST degrade with a clear message that it requires the daemon.
 - **WHEN** `[daemon] enabled = false` and the user invokes fork
 - **THEN** the action fails with a message naming the daemon requirement, and
   nothing spawns
+
+### Requirement: Fork is projected by the complete control catalog
+
+The `sessions.fork` capability SHALL be mapped to `Verb::ForkSession`, use the
+same write scope as `sessions.open`, be non-streaming, and have
+`SurfaceSet::ALL`. HTTP, gRPC, CLI, MCP, and plugin generic calls SHALL project
+the same catalog row. MCP SHALL expose flat scope-checked arguments for
+`session`, optional `harness`, `agent`, `cwd`, and `worktree`, and boolean
+`scrollback`, `adopt`, and `tab`; it SHALL NOT accept raw argv or arbitrary env.
+The wire request and response SHALL use those fields plus additive optional
+`SessionInfo.forked_from`.
+
+#### Scenario: MCP exposes the catalog fork operation
+
+- **WHEN** a caller has the `sessions.open` write scope and lists or invokes
+  the MCP state tools
+- **THEN** `sessions_fork` is advertised and dispatches the same scope-checked
+  operation as the control API
