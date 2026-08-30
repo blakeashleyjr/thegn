@@ -16,6 +16,7 @@ use thegn_core::attention::PaneAgentState;
 use thegn_core::control::relay_expiry;
 use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::db::Db;
+use thegn_core::editor::EditorTarget;
 use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
@@ -745,6 +746,31 @@ impl ControlApi for DaemonService {
             self.with_db(move |db| {
                 let payload = serde_json::to_string(&thegn_core::models::FocusIntent { repo })?;
                 db.put_intent("focus_workspace", &payload)?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn open_editor(&self, target: EditorTarget) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async move {
+            // The daemon only relays a validated target to the compositor. In
+            // particular, provider selection and every executable detail stay
+            // out of this mailbox and are resolved from trusted local config
+            // when the compositor claims the intent.
+            let worktree = target.worktree().to_string_lossy().into_owned();
+            let path = target
+                .relative_file()
+                .map(|p| p.to_string_lossy().into_owned());
+            let payload = serde_json::json!({
+                "worktree": worktree,
+                "path": path,
+                "line": target.line(),
+                "col": target.col(),
+                "source": "control_api",
+            });
+            self.with_db(move |db| {
+                db.put_intent("open_editor", &serde_json::to_string(&payload)?)?;
                 Ok(())
             })
             .await
@@ -1625,6 +1651,27 @@ mod tests {
             row.exited_at_ms.is_some(),
             "and marked finished, so a caller can tell it from a live session"
         );
+    }
+
+    #[tokio::test]
+    async fn open_editor_only_queues_a_safe_target_intent() {
+        let (svc, _rx) = service(0);
+        let target = EditorTarget::file("/w/project", "src/lib.rs", Some(12), Some(4))
+            .expect("valid target");
+
+        svc.open_editor(target).await.expect("queue editor intent");
+
+        let rows = svc.db.lock().unwrap().take_intents("open_editor").unwrap();
+        assert_eq!(rows.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&rows[0].payload).unwrap();
+        assert_eq!(payload["worktree"], "/w/project");
+        assert_eq!(payload["path"], "src/lib.rs");
+        assert_eq!(payload["line"], 12);
+        assert_eq!(payload["col"], 4);
+        assert_eq!(payload["source"], "control_api");
+        for forbidden in ["argv", "executable", "provider", "environment", "env"] {
+            assert!(payload.get(forbidden).is_none(), "leaked {forbidden}");
+        }
     }
 
     /// A supervisor waiting for a line the agent never printed still has to

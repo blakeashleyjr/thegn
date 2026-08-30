@@ -31,8 +31,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec, PreviewFetchRequest,
-    RecordSpec, SplitDir, WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, EditorOpenRequest, ForkSpec, OpenSpec,
+    PreviewFetchRequest, RecordSpec, SplitDir, WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -948,6 +948,24 @@ pub(super) async fn open_worktree(
         .await
     {
         Ok(()) => axum::Json(json!({ "opened": body.repo })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn open_editor(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<EditorOpenRequest>,
+) -> Response {
+    if let Err(r) = authed_target(&state, &headers, Verb::OpenEditor, &body.worktree) {
+        return r;
+    }
+    let target = match body.target() {
+        Ok(target) => target,
+        Err(e) => return error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    match state.api.open_editor(target).await {
+        Ok(()) => axum::Json(json!({ "queued": true })).into_response(),
         Err(e) => e.into_response(),
     }
 }

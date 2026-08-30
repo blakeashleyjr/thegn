@@ -254,6 +254,9 @@ pub enum Verb {
     Snapshot,
     KillSession,
     OpenWorktree,
+    /// Queue a validated worktree/file target for the owning compositor to
+    /// hand off to its locally configured editor.
+    OpenEditor,
     /// Fetch one preview URL with the bounded, credential-free host executor.
     PreviewFetch,
     DriveBrowser,
@@ -417,6 +420,7 @@ impl Verb {
         Verb::Snapshot,
         Verb::KillSession,
         Verb::OpenWorktree,
+        Verb::OpenEditor,
         Verb::PreviewFetch,
         Verb::DriveBrowser,
         Verb::Wait,
@@ -543,6 +547,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Resize
         | Verb::KillSession
         | Verb::OpenWorktree
+        | Verb::OpenEditor
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
@@ -878,6 +883,7 @@ mod tests {
             Resize,
             KillSession,
             OpenWorktree,
+            OpenEditor,
             DriveBrowser,
             Split,
             RecordSession,

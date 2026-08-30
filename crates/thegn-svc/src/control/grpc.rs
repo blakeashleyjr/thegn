@@ -21,8 +21,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec,
-    PreviewFetchRequest, SplitDir, WaitCondition,
+    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, EditorOpenRequest,
+    ForkSpec, OpenSpec, PreviewFetchRequest, SplitDir, WaitCondition,
 };
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
@@ -409,6 +409,35 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn open_editor(
+        &self,
+        req: Request<proto::OpenEditorRequest>,
+    ) -> Result<Response<proto::OpenEditorReply>, Status> {
+        self.authed(&req, Verb::OpenEditor)?;
+        let r = req.into_inner();
+        let line = r
+            .line
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("line is too large"))?;
+        let col = r
+            .col
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("col is too large"))?;
+        let request = EditorOpenRequest {
+            worktree: r.worktree,
+            path: (!r.path.is_empty()).then_some(r.path),
+            line,
+            col,
+        };
+        let target = request
+            .target()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.api.open_editor(target).await.map_err(Status::from)?;
+        Ok(Response::new(proto::OpenEditorReply { queued: true }))
     }
 
     async fn list_worktrees(
@@ -815,6 +844,7 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.split",
     "worktrees.list",
     "worktrees.open",
+    "editor.open",
     "browser.drive",
     "preview.fetch",
     "git.status",

@@ -79,6 +79,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/worktrees/open", &["worktrees.open"], || {
         post(http::open_worktree)
     }),
+    route("/v1/editor/open", &["editor.open"], || {
+        post(http::open_editor)
+    }),
     // --- agent orchestration (THE-57) ---------------------------------------
     route("/v1/issues", &["issues.list"], || get(http::issues_list)),
     route("/v1/issues/{id}", &["issues.get", "issues.update"], || {
@@ -170,6 +173,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("worktrees.list", "GET", "/v1/worktrees"),
     ("worktrees.create", "POST", "/v1/worktrees"),
     ("worktrees.open", "POST", "/v1/worktrees/open"),
+    ("editor.open", "POST", "/v1/editor/open"),
     ("issues.list", "GET", "/v1/issues"),
     ("issues.get", "GET", "/v1/issues/{id}"),
     ("issues.update", "POST", "/v1/issues/{id}"),

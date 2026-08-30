@@ -137,6 +137,12 @@ pub enum PrViewOutcome {
     Close,
     /// Run this action off the loop (the view stays open).
     Act(PrViewAction),
+    /// Open the selected review/file anchor through the host IDE seam.
+    OpenInIde {
+        path: Option<String>,
+        line: Option<usize>,
+        note: Option<String>,
+    },
 }
 
 /// A side effect the loop runs off-thread (via `spawn_pr_action`) and then
@@ -464,6 +470,7 @@ impl PrView {
             KeyCode::Char('P') => {
                 return PrViewOutcome::Act(PrViewAction::Handoff(ReviewSelection::AllUnresolved));
             }
+            KeyCode::Char('e') => return self.open_in_ide_outcome(),
             _ => {}
         }
         // Global write/action keys (available from any tab where the PR exists).
@@ -564,6 +571,77 @@ impl PrView {
             return PrViewOutcome::Pending;
         };
         PrViewOutcome::Act(PrViewAction::Handoff(ReviewSelection::Selected(thread_id)))
+    }
+
+    fn open_in_ide_outcome(&self) -> PrViewOutcome {
+        let project = |note: &str| PrViewOutcome::OpenInIde {
+            path: None,
+            line: None,
+            note: Some(note.into()),
+        };
+        match self.tab {
+            PrTab::Overview | PrTab::Checks => {
+                project("This PR row has no file anchor; opening the worktree")
+            }
+            PrTab::Conversation => match self.conv_rows().get(self.sel).copied() {
+                Some(ConvRow::Thread(index)) => self
+                    .conversation
+                    .as_ref()
+                    .and_then(|conversation| conversation.threads.get(index))
+                    .map_or_else(
+                        || project("Selected review thread is stale; opening the worktree"),
+                        |thread| {
+                            let anchored = self.anchored_review().is_some_and(|review| {
+                                review.files.iter().any(|file| {
+                                    file.threads.iter().any(|row| row.thread.id == thread.id)
+                                })
+                            });
+                            PrViewOutcome::OpenInIde {
+                                path: (!thread.path.is_empty()).then(|| thread.path.clone()),
+                                line: anchored
+                                    .then_some(thread.line)
+                                    .flatten()
+                                    .and_then(|line| usize::try_from(line).ok()),
+                                note: (!anchored).then(|| {
+                                    if thread.path.is_empty() {
+                                        "Review thread has no file anchor; opening the worktree"
+                                    } else {
+                                        "Outdated review thread has no exact new-side line; opening its file"
+                                    }
+                                    .into()
+                                }),
+                            }
+                        },
+                    ),
+                _ => project("Selected conversation item has no file anchor; opening the worktree"),
+            },
+            PrTab::Files => match self.open_file {
+                None if self
+                    .diff
+                    .as_ref()
+                    .is_some_and(|diff| self.sel < diff.files.len()) =>
+                {
+                    PrViewOutcome::OpenInIde {
+                        path: self
+                            .diff
+                            .as_ref()
+                            .and_then(|diff| diff.files.get(self.sel))
+                            .map(|file| file.path.clone()),
+                        line: None,
+                        note: None,
+                    }
+                }
+                _ => self.selected_files_row().map_or_else(
+                    || project("Selected PR row has no file anchor; opening the worktree"),
+                    |row| pr_ide_outcome_for_row(&row, self.open_file.and_then(|index| {
+                        self.diff
+                            .as_ref()
+                            .and_then(|diff| diff.files.get(index))
+                            .map(|file| file.path.as_str())
+                    })),
+                ),
+            },
+        }
     }
 
     fn checks_key(&mut self, key: &KeyCode) -> PrViewOutcome {
@@ -943,14 +1021,16 @@ impl PrView {
                 "C review",
                 "c comment",
                 "o browser",
+                "e IDE",
             ],
-            PrTab::Checks => &["Enter open", "r re-run failed", "c comment"],
+            PrTab::Checks => &["Enter open", "r re-run failed", "c comment", "e IDE"],
             PrTab::Conversation => &[
                 "n/N thread",
                 "Enter jump",
                 "r reply",
                 "p/P pass",
                 "v resolved",
+                "e IDE",
             ],
             PrTab::Files => &[
                 "n/N thread",
@@ -958,6 +1038,7 @@ impl PrView {
                 "p/P pass",
                 "v resolved",
                 "c comment line",
+                "e IDE",
             ],
         };
         let separator = format!(" {} ", glyphs.middot);
@@ -1311,6 +1392,41 @@ impl PrView {
 
 // --- free helpers ----------------------------------------------------------
 
+fn pr_ide_outcome_for_row(row: &ReviewRow, file_path: Option<&str>) -> PrViewOutcome {
+    match row {
+        ReviewRow::Diff(line) => PrViewOutcome::OpenInIde {
+            path: file_path.map(str::to_string),
+            line: line.new_lineno.and_then(|line| usize::try_from(line).ok()),
+            note: line
+                .new_lineno
+                .is_none()
+                .then(|| "Deleted line has no new-side location; opening the file".into()),
+        },
+        ReviewRow::Thread(thread) => PrViewOutcome::OpenInIde {
+            path: (!thread.path.is_empty()).then(|| thread.path.clone()),
+            line: thread.line.and_then(|line| usize::try_from(line).ok()),
+            note: None,
+        },
+        ReviewRow::Outdated(thread) => PrViewOutcome::OpenInIde {
+            path: (!thread.path.is_empty()).then(|| thread.path.clone()),
+            line: None,
+            note: Some(
+                "Outdated review thread has no exact new-side line; opening its file".into(),
+            ),
+        },
+        ReviewRow::General(_) => PrViewOutcome::OpenInIde {
+            path: None,
+            line: None,
+            note: Some("Review item has no file anchor; opening the worktree".into()),
+        },
+        ReviewRow::Hunk(_) => PrViewOutcome::OpenInIde {
+            path: file_path.map(str::to_string),
+            line: None,
+            note: Some("Hunk header has no exact new-side line; opening the file".into()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,6 +1505,56 @@ mod tests {
         // Digit jump.
         v.handle_key(&KeyCode::Char('4'), Modifiers::NONE);
         assert_eq!(v.tab, PrTab::Files);
+    }
+
+    #[test]
+    fn ide_handoff_uses_the_existing_anchored_review_line() {
+        let mut view = sample();
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                hunks: vec![thegn_core::forge::model::DiffHunk {
+                    header: "@@ -1 +12 @@".into(),
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Add,
+                        text: "new".into(),
+                        old_lineno: None,
+                        new_lineno: Some(12),
+                    }],
+                }],
+            }],
+        };
+        let thread = ReviewThread {
+            id: "thread-1".into(),
+            path: "src/lib.rs".into(),
+            line: Some(12),
+            ..ReviewThread::default()
+        };
+        let conversation = PrConversation {
+            threads: vec![thread],
+            ..PrConversation::default()
+        };
+        view.apply_data(PrViewData {
+            generation: 1,
+            conversation: Some(conversation.clone()),
+            diff: Some(diff.clone()),
+            review: Some(PrReviewSnapshot {
+                diff,
+                conversation,
+                ..PrReviewSnapshot::default()
+            }),
+            review_status: None,
+        });
+        view.switch_tab(PrTab::Conversation);
+        assert_eq!(
+            view.handle_key(&KeyCode::Char('e'), Modifiers::NONE),
+            PrViewOutcome::OpenInIde {
+                path: Some("src/lib.rs".into()),
+                line: Some(12),
+                note: None,
+            }
+        );
     }
 
     #[test]
