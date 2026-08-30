@@ -4,7 +4,7 @@
 //! not accidentally grow when unrelated cache tables are added.
 
 use crate::db::Db;
-use crate::issue::{AgentDispatchStatus, DispatchNote};
+use crate::issue::DispatchNote;
 use crate::models::{GroupTabRow, TabGroupRow};
 use crate::session_migration::{
     MigrationBundle, MigrationCleanupResult, MigrationCounts, MigrationDispatch, MigrationGroup,
@@ -149,11 +149,14 @@ impl SessionMigrationStore for Db {
             let current_plan =
                 crate::session_migration::plan_migration(bundle.clone(), current_target)?;
             // The fingerprint deliberately excludes target-owned worktree
-            // metadata. Therefore an empty target can otherwise look confirmed
-            // for a bundle whose only transferable row is the registration.
+            // metadata. An otherwise resumed import may therefore still need
+            // to restore a missing registration before source cleanup.
             let worktree_ready =
                 bundle.worktree.is_none() || current_plan.target.worktree.is_some();
-            if current_plan.resumed || (worktree_ready && db.confirm_migration(&current_plan)?) {
+            if current_plan.resumed {
+                if !worktree_ready && let Some(worktree) = &bundle.worktree {
+                    result.counts.worktrees = insert_worktree(db, worktree)?;
+                }
                 for (source, target) in bundle
                     .dispatches
                     .iter()
@@ -165,30 +168,11 @@ impl SessionMigrationStore for Db {
                 }
                 return Ok(());
             }
+            if worktree_ready && db.confirm_migration(&current_plan)? {
+                return Ok(());
+            }
             if let Some(worktree) = &bundle.worktree {
-                let changed = db.conn().execute(
-                    "INSERT OR IGNORE INTO worktrees
-                       (worktree, session_name, tab_name, repo_path, branch, agent,
-                        created_at, location, position, sandbox_backend, observed_backend,
-                        folder_id, env_name)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                    params![
-                        worktree.worktree,
-                        worktree.session_name,
-                        worktree.tab_name,
-                        worktree.repo_root,
-                        worktree.branch,
-                        worktree.agent,
-                        worktree.created_at,
-                        worktree.location,
-                        worktree.position,
-                        worktree.sandbox_backend,
-                        worktree.observed_backend,
-                        worktree.folder_id,
-                        worktree.env_name,
-                    ],
-                )?;
-                result.counts.worktrees = changed;
+                result.counts.worktrees = insert_worktree(db, worktree)?;
             }
             for group in &bundle.groups {
                 let row = persisted_group(group);
@@ -252,7 +236,7 @@ impl SessionMigrationStore for Db {
                         dispatch.worktree_path,
                         dispatch.agent_name,
                         dispatch.dispatched_at_ms,
-                        dispatch.status.as_str(),
+                        dispatch.status,
                         dispatch.stage,
                         dispatch.artifact_path,
                         dispatch.note,
@@ -454,7 +438,7 @@ fn dispatches_for_worktree(db: &Db, worktree: &str) -> Result<Vec<MigrationDispa
                 worktree_path: row.get(2)?,
                 agent_name: row.get(3)?,
                 dispatched_at_ms: row.get(4)?,
-                status: AgentDispatchStatus::parse(&row.get::<_, String>(5)?),
+                status: row.get(5)?,
                 stage: row.get(6)?,
                 parent_id: row.get(7)?,
                 session_id: row.get(8)?,
@@ -465,6 +449,31 @@ fn dispatches_for_worktree(db: &Db, worktree: &str) -> Result<Vec<MigrationDispa
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn insert_worktree(db: &Db, worktree: &MigrationWorktree) -> Result<usize> {
+    Ok(db.conn().execute(
+        "INSERT OR IGNORE INTO worktrees
+           (worktree, session_name, tab_name, repo_path, branch, agent,
+            created_at, location, position, sandbox_backend, observed_backend,
+            folder_id, env_name)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            worktree.worktree,
+            worktree.session_name,
+            worktree.tab_name,
+            worktree.repo_root,
+            worktree.branch,
+            worktree.agent,
+            worktree.created_at,
+            worktree.location,
+            worktree.position,
+            worktree.sandbox_backend,
+            worktree.observed_backend,
+            worktree.folder_id,
+            worktree.env_name,
+        ],
+    )?)
 }
 
 fn notes_for_dispatches(db: &Db, dispatch_ids: &[i64]) -> Result<Vec<MigrationNote>> {
@@ -678,6 +687,94 @@ mod tests {
                 .worktree
                 .is_some()
         );
+    }
+
+    #[test]
+    fn resumed_import_restores_a_missing_worktree_registration() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute_batch(
+                "INSERT INTO worktrees
+                   (worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+                 VALUES('/resume','default','tab','/repo','feature','agent',1,'',3);
+                 INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','resume','worktree','/resume',0,0);",
+            )
+            .unwrap();
+        target
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','resume','worktree','/resume',0,0)",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/resume")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/resume")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(plan.resumed, "matching presentation rows form a resume");
+
+        let imported = target.import_migration(&plan).unwrap();
+        assert_eq!(imported.counts.worktrees, 1);
+        let target_state = target
+            .migration_target_snapshot("default", "/resume")
+            .unwrap();
+        assert!(target_state.worktree.is_some());
+        assert_eq!(
+            target_state.groups.len(),
+            1,
+            "resume must not duplicate groups"
+        );
+        assert!(target.confirm_migration(&plan).unwrap());
+    }
+
+    #[test]
+    fn migration_preserves_unrecognized_dispatch_status_verbatim() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status)
+                 VALUES('THE-55','/future','agent',1,'future_state')",
+                [],
+            )
+            .unwrap();
+
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/future")
+            .unwrap();
+        assert_eq!(bundle.dispatches[0].status, "future_state");
+        let plan = plan_migration(
+            bundle,
+            target
+                .migration_target_snapshot("default", "/future")
+                .unwrap(),
+        )
+        .unwrap();
+        target.import_migration(&plan).unwrap();
+
+        let status: String = target
+            .conn()
+            .query_row(
+                "SELECT status FROM agent_dispatches WHERE worktree_path='/future'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "future_state");
+        assert!(target.confirm_migration(&plan).unwrap());
     }
 
     #[test]
