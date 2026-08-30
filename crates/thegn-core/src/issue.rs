@@ -297,8 +297,18 @@ pub struct ReviewTaskRecord {
     pub task_kind: String,
     pub source_key: String,
     pub source_revision: String,
+    /// Feedback identity for the active revision, excluding the PR head.
+    pub content_revision: String,
     pub prompt: String,
     pub expected_head_oid: String,
+    /// A newer snapshot observed while the task was active. It remains on the
+    /// same unique row until the active handoff can safely finish or promote it.
+    pub pending_source_revision: Option<String>,
+    pub pending_content_revision: Option<String>,
+    pub pending_prompt: Option<String>,
+    pub pending_expected_head_oid: Option<String>,
+    pub pending_role: Option<String>,
+    pub pending_worktree_path: Option<String>,
     pub forge_action_attempts: u32,
     pub next_forge_action_at_ms: Option<i64>,
 }

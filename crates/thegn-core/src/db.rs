@@ -147,7 +147,10 @@ use std::path::PathBuf;
 /// index makes `(task_kind, source_key)` one durable task even under concurrent
 /// refreshes. v63 was already occupied when THE-27 landed, so THE-22 takes the
 /// next additive version.
-pub const SCHEMA_VERSION: i64 = 64;
+///
+/// v65: freezes active review-task inputs and retains one newer snapshot on the
+/// same row until the active handoff can safely finish or promote it.
+pub const SCHEMA_VERSION: i64 = 65;
 
 pub struct Db {
     conn: Connection,
@@ -813,8 +816,15 @@ impl Db {
               task_kind        TEXT,
               source_key       TEXT,
               source_revision  TEXT,
+              content_revision TEXT,
               prompt           TEXT,
               expected_head_oid TEXT,
+              pending_source_revision TEXT,
+              pending_content_revision TEXT,
+              pending_prompt TEXT,
+              pending_expected_head_oid TEXT,
+              pending_role TEXT,
+              pending_worktree_path TEXT,
               forge_action_attempts INTEGER NOT NULL DEFAULT 0,
               next_forge_action_at_ms INTEGER
             );
@@ -1034,7 +1044,7 @@ impl Db {
         crate::db_model_proxy::migrate_v54(&conn)?;
         crate::db_migrate::migrate_v62(&conn)?;
         if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v64_schema(&conn)?;
+            crate::db_migrate::verify_v65_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

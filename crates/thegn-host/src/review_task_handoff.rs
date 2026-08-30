@@ -56,6 +56,13 @@ pub(crate) fn handle(cfg: &Config, context: &HandleContext) -> String {
         Ok(None) => return "review task no longer exists".into(),
         Err(error) => return format!("review task could not be loaded: {error}"),
     };
+    // A by-number queue row is intentionally human-only. Check this before
+    // deriving a checkout, resolving a forge, or doing any other handoff work:
+    // the repository root is a read-only query location, never a task
+    // worktree.
+    if task.worktree_path.trim().is_empty() {
+        return park(&db, &task, "review task has no worktree to handle");
+    }
     let root = crate::integrate::main_checkout(Path::new(&task.worktree_path))
         .unwrap_or_else(|| Path::new(&task.worktree_path).to_path_buf());
     let queue = cfg.repo_pr_queue(&root);
@@ -162,6 +169,8 @@ fn handle_loaded(
         }
         return "review task changed while running; latest revision requeued".into();
     }
+    let pending_feedback = current.pending_source_revision.is_some()
+        && current.pending_content_revision.as_deref() != Some(current.content_revision.as_str());
 
     let local_head = loc.git_out(&["rev-parse", "HEAD"]);
     let after = match forge.pr_status(loc, PrRef::Number(context.pr_number)) {
@@ -180,6 +189,17 @@ fn handle_loaded(
         }
         HeadVerdict::Foreign(detail) => return park(db, &task, &detail),
     };
+
+    // A refresh that observed this exact verified push changes only the
+    // head-sensitive revision. It is safe to finish the active task. A changed
+    // content revision is new feedback: promote it on the same unique row and
+    // never resolve the old prompt/thread against it.
+    if pending_feedback {
+        if let Err(error) = db.promote_review_task_pending(task.id) {
+            return format!("review task was revised but could not be requeued: {error}");
+        }
+        return "review task changed while running; latest revision requeued".into();
+    }
 
     let Some((owner, repo)) = context.repository.split_once('/') else {
         return park(db, &task, "review task repository identity is invalid");
@@ -398,10 +418,11 @@ mod tests {
             status: AgentDispatchStatus::Queued,
             source_key: "review_thread:sha256:test".into(),
             source_revision: "sha256:revision".into(),
+            content_revision: "sha256:content".into(),
             prompt: "fix the selected review thread".into(),
             expected_head_oid: "old-head".into(),
             event: ReviewTaskEvent {
-                event: thegn_core::pr_review_tasks::REVIEW_THREAD_EVENT,
+                event: thegn_core::pr_review_tasks::REVIEW_THREAD_EVENT.into(),
                 source_key: "review_thread:sha256:test".into(),
                 source_revision: "sha256:revision".into(),
                 forge: "fake".into(),

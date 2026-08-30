@@ -39,6 +39,9 @@ pub struct ExistingReviewTask {
     pub id: i64,
     pub source_key: String,
     pub source_revision: String,
+    pub content_revision: String,
+    pub pending_source_revision: Option<String>,
+    pub pending_content_revision: Option<String>,
     pub status: AgentDispatchStatus,
 }
 
@@ -48,15 +51,18 @@ impl From<&ReviewTaskRecord> for ExistingReviewTask {
             id: row.id,
             source_key: row.source_key.clone(),
             source_revision: row.source_revision.clone(),
+            content_revision: row.content_revision.clone(),
+            pending_source_revision: row.pending_source_revision.clone(),
+            pending_content_revision: row.pending_content_revision.clone(),
             status: row.status,
         }
     }
 }
 
 /// Bounded wire event emitted only after a create/revision is durably applied.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReviewTaskEvent {
-    pub event: &'static str,
+    pub event: String,
     pub source_key: String,
     pub source_revision: String,
     pub forge: String,
@@ -85,6 +91,7 @@ pub struct ReviewTaskUpsert {
     pub status: AgentDispatchStatus,
     pub source_key: String,
     pub source_revision: String,
+    pub content_revision: String,
     pub prompt: String,
     pub expected_head_oid: String,
     pub event: ReviewTaskEvent,
@@ -116,6 +123,7 @@ struct TaskDerivation<'a> {
     prior: Option<&'a ExistingReviewTask>,
     source_key: String,
     source_revision: String,
+    content_revision: String,
     thread_id: &'a str,
     path: &'a str,
     line: Option<u64>,
@@ -162,7 +170,14 @@ pub fn reconcile_review_tasks(
         }
         has_unresolved_thread = true;
         let source_revision = thread_revision(snapshot, thread);
-        if prior.is_some_and(|task| task.source_revision == source_revision) {
+        let content_revision = thread_content_revision(thread);
+        if prior.is_some_and(|task| {
+            task.source_revision == source_revision
+                || (matches!(
+                    task.status,
+                    AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+                ) && task.pending_source_revision.as_deref() == Some(source_revision.as_str()))
+        }) {
             continue;
         }
         let feedback = format_review_feedback(snapshot, Some(thread));
@@ -174,6 +189,7 @@ pub fn reconcile_review_tasks(
                 prior,
                 source_key,
                 source_revision,
+                content_revision,
                 thread_id: &thread.id,
                 path: &thread.path,
                 line: thread.line,
@@ -191,7 +207,14 @@ pub fn reconcile_review_tasks(
         .flatten();
     if !has_unresolved_thread && let Some(review) = decision {
         let source_revision = decision_revision(snapshot, review);
-        if prior_decision.is_none_or(|task| task.source_revision != source_revision) {
+        let content_revision = decision_content_revision(review);
+        if prior_decision.is_none_or(|task| {
+            task.source_revision != source_revision
+                && !(matches!(
+                    task.status,
+                    AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+                ) && task.pending_source_revision.as_deref() == Some(source_revision.as_str()))
+        }) {
             let feedback = decision_feedback(snapshot, review);
             plan.upserts.push(build_upsert(
                 snapshot,
@@ -201,6 +224,7 @@ pub fn reconcile_review_tasks(
                     prior: prior_decision,
                     source_key: decision_key,
                     source_revision,
+                    content_revision,
                     thread_id: "review_decision",
                     path: "PR-level",
                     line: None,
@@ -251,7 +275,7 @@ fn build_upsert(
             _ => AgentDispatchStatus::Queued,
         });
     let event = ReviewTaskEvent {
-        event: REVIEW_THREAD_EVENT,
+        event: REVIEW_THREAD_EVENT.to_string(),
         source_key: derived.source_key.clone(),
         source_revision: derived.source_revision.clone(),
         forge: clean(context.forge),
@@ -282,6 +306,7 @@ fn build_upsert(
         status,
         source_key: derived.source_key,
         source_revision: derived.source_revision,
+        content_revision: derived.content_revision,
         prompt,
         expected_head_oid: clean(&snapshot.head_oid),
         event,
@@ -339,6 +364,24 @@ fn source_key(
 }
 
 fn thread_revision(snapshot: &PrReviewSnapshot, thread: &ReviewThread) -> String {
+    let mut canonical = thread_revision_prefix(thread);
+    push_canonical(
+        &mut canonical,
+        "head",
+        &snapshot.head_oid,
+        MAX_IDENTITY_FIELD_CHARS,
+    );
+    digest(&canonical)
+}
+
+/// Revision of review feedback independent of the PR head. An active handoff
+/// can therefore accept a refresh that observed its own verified push while
+/// still rejecting a genuinely new comment or anchor change.
+pub fn thread_content_revision(thread: &ReviewThread) -> String {
+    digest(&thread_revision_prefix(thread))
+}
+
+fn thread_revision_prefix(thread: &ReviewThread) -> String {
     let mut canonical = String::new();
     push_canonical(
         &mut canonical,
@@ -374,12 +417,6 @@ fn thread_revision(snapshot: &PrReviewSnapshot, thread: &ReviewThread) -> String
     );
     push_canonical(
         &mut canonical,
-        "head",
-        &snapshot.head_oid,
-        MAX_IDENTITY_FIELD_CHARS,
-    );
-    push_canonical(
-        &mut canonical,
         "comment_count",
         &thread.comments.len().to_string(),
         32,
@@ -399,6 +436,26 @@ fn decision_revision(snapshot: &PrReviewSnapshot, review: &PrReview) -> String {
         &snapshot.head_oid,
         MAX_IDENTITY_FIELD_CHARS,
     );
+    push_canonical(&mut canonical, "author", &review.author, 256);
+    push_canonical(&mut canonical, "state", &review.state, 64);
+    push_canonical(
+        &mut canonical,
+        "submitted",
+        &review.submitted_at,
+        MAX_IDENTITY_FIELD_CHARS,
+    );
+    push_canonical(
+        &mut canonical,
+        "body",
+        &review.body,
+        MAX_REVIEW_EVENT_FIELD_CHARS,
+    );
+    digest(&canonical)
+}
+
+fn decision_content_revision(review: &PrReview) -> String {
+    let mut canonical = String::new();
+    push_canonical(&mut canonical, "kind", "review_decision", 32);
     push_canonical(&mut canonical, "author", &review.author, 256);
     push_canonical(&mut canonical, "state", &review.state, 64);
     push_canonical(
@@ -535,6 +592,9 @@ mod tests {
             id: 7,
             source_key: upsert.source_key.clone(),
             source_revision: upsert.source_revision.clone(),
+            content_revision: upsert.content_revision.clone(),
+            pending_source_revision: None,
+            pending_content_revision: None,
             status,
         }
     }
@@ -567,6 +627,60 @@ mod tests {
         assert_ne!(
             revised.upserts[0].source_revision,
             first.upserts[0].source_revision
+        );
+    }
+
+    #[test]
+    fn active_refresh_emits_each_pending_revision_only_once() {
+        let before = snapshot(thread(false, "first"));
+        let first = reconcile_review_tasks(&before, context(), &[]).unwrap();
+        let mut after = before.clone();
+        after.head_oid = "new-head".into();
+        let pending = reconcile_review_tasks(
+            &after,
+            context(),
+            &[ExistingReviewTask {
+                id: 7,
+                source_key: first.upserts[0].source_key.clone(),
+                source_revision: first.upserts[0].source_revision.clone(),
+                content_revision: first.upserts[0].content_revision.clone(),
+                pending_source_revision: None,
+                pending_content_revision: None,
+                status: AgentDispatchStatus::Running,
+            }],
+        )
+        .unwrap();
+        assert_eq!(pending.upserts.len(), 1);
+        let unchanged = reconcile_review_tasks(
+            &after,
+            context(),
+            &[ExistingReviewTask {
+                id: 7,
+                source_key: pending.upserts[0].source_key.clone(),
+                source_revision: first.upserts[0].source_revision.clone(),
+                content_revision: first.upserts[0].content_revision.clone(),
+                pending_source_revision: Some(pending.upserts[0].source_revision.clone()),
+                pending_content_revision: Some(pending.upserts[0].content_revision.clone()),
+                status: AgentDispatchStatus::Running,
+            }],
+        )
+        .unwrap();
+        assert!(unchanged.upserts.is_empty());
+    }
+
+    #[test]
+    fn content_revision_ignores_head_but_changes_for_feedback() {
+        let first = snapshot(thread(false, "first"));
+        let mut moved = first.clone();
+        moved.head_oid = "other-head".into();
+        assert_eq!(
+            thread_content_revision(&first.conversation.threads[0]),
+            thread_content_revision(&moved.conversation.threads[0])
+        );
+        moved.conversation.threads[0].comments[0].body = "new comment".into();
+        assert_ne!(
+            thread_content_revision(&first.conversation.threads[0]),
+            thread_content_revision(&moved.conversation.threads[0])
         );
     }
 
