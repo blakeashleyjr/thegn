@@ -1179,6 +1179,7 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
         "agents": agents_json(cfg),
+        "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
@@ -1490,6 +1491,12 @@ pub fn run(
 
     outln!("");
     harness_report(cfg);
+
+    outln!("");
+    super::skills_doctor::print(&super::skills_doctor::inspect(
+        cfg,
+        &super::resolve_worktree(None),
+    ));
 
     outln!("");
 

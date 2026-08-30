@@ -402,12 +402,26 @@ pub fn action_candidates() -> Vec<Candidate> {
         .collect()
 }
 
+/// Embedded skill package names. User directories remain host-owned and are
+/// not traversed by a shell keypress.
+pub fn skill_candidates() -> Vec<Candidate> {
+    crate::skills::SkillRegistry::embedded()
+        .map(|registry| {
+            registry
+                .iter()
+                .map(|(name, skill)| Candidate::described(name, &skill.description))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Candidates for a kind that needs neither the DB nor the config.
 pub fn in_process_candidates(kind: SourceKind) -> Vec<Candidate> {
     match kind {
         SourceKind::Theme => theme_candidates(),
         SourceKind::Capability => capability_candidates(),
         SourceKind::Action => action_candidates(),
+        SourceKind::Skill => skill_candidates(),
         _ => Vec::new(),
     }
 }
@@ -783,6 +797,13 @@ mod tests {
         let actions = action_candidates();
         assert_eq!(actions.len(), crate::keymap::BUILTINS.len());
         assert!(actions.iter().any(|c| c.value == "new-worktree"));
+
+        let skills = skill_candidates();
+        assert_eq!(
+            skills.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            ["mq", "pipeline", "supervise"]
+        );
+        assert!(skills.iter().all(|c| c.description.is_some()));
 
         assert_eq!(
             in_process_candidates(SourceKind::Theme)

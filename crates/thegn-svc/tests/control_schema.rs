@@ -27,6 +27,8 @@ fn wire_schema() -> serde_json::Value {
     }
     add!(
         WorktreeInfo,
+        SkillInfo,
+        SkillsList,
         EditorOpenRequest,
         SessionInfo,
         OpenSpec,

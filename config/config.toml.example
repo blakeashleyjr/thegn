@@ -3986,6 +3986,16 @@ cors_origins = []
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
 # which layer won.
+
+# Embedded and user-authored agent skills. thegn seeds these into each
+# configured harness's native project-local skill directory; it never writes
+# harness home directories. User directories are syntax-checked here and read
+# only by the host edge. Each immediate child must be `<name>/SKILL.md`.
+[skills]
+enabled = true      # preserve automatic seeding on worktree create/startup
+user_dirs = []      # e.g. ["~/.config/thegn/skills", "./team-skills"]
+exclude = []        # path-safe skill names to withhold, e.g. ["mq"]
+
 [merge_queue]
 enabled = true
 remote_mode = "route_to_host" # how a REMOTE-host (sprite) worktree lands onto the target;

@@ -631,6 +631,16 @@ pub(super) async fn list_worktrees(
     }
 }
 
+pub(super) async fn list_skills(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authed(&state, &headers, Verb::SkillsList) {
+        return response;
+    }
+    match state.api.list_skills().await {
+        Ok(skills) => axum::Json(skills).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 pub(super) async fn leases(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::LeaseStatus) {
         return r;
