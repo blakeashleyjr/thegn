@@ -159,6 +159,47 @@ class ReleaseRendererTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "missing root file.*LICENSE-APACHE"):
             release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
 
+    def test_rejects_archive_link_used_as_required_file(self) -> None:
+        target = "aarch64-apple-darwin"
+        archive_name, checksum_name = release._asset_names(self.manifest, self.tag, target)
+        archive_path = self.assets / archive_name
+        with tarfile.open(archive_path, "w:gz") as output:
+            for name in self.manifest["archive"]["root_files"]:
+                info = tarfile.TarInfo(name)
+                if name == "thegn":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = "/etc/passwd"
+                    output.addfile(info)
+                else:
+                    content = f"fixture:{name}\n".encode()
+                    info.size = len(content)
+                    output.addfile(info, io.BytesIO(content))
+        checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        (self.assets / checksum_name).write_text(
+            f"{checksum}  {archive_name}\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(release.ReleaseError, "non-regular member.*thegn"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
+    def test_rejects_duplicate_archive_paths(self) -> None:
+        target = "aarch64-apple-darwin"
+        archive_name, checksum_name = release._asset_names(self.manifest, self.tag, target)
+        archive_path = self.assets / archive_name
+        with tarfile.open(archive_path, "w:gz") as output:
+            for name in [*self.manifest["archive"]["root_files"], "thegn"]:
+                content = f"fixture:{name}\n".encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                output.addfile(info, io.BytesIO(content))
+        checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        (self.assets / checksum_name).write_text(
+            f"{checksum}  {archive_name}\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(release.ReleaseError, "duplicate path 'thegn'"):
+            release.validate_assets(self.manifest, self.tag, self.assets, ["homebrew"])
+
     def test_inactive_windows_managers_fail_clearly(self) -> None:
         for manager in ("scoop", "winget"):
             with self.subTest(manager=manager), self.assertRaisesRegex(
@@ -211,6 +252,20 @@ class ReleaseRendererTests(unittest.TestCase):
         self.render(output)
         self.assertFalse((output / "stale").exists())
         self.assertTrue((output / "homebrew/thegn.rb").is_file())
+
+    def test_rejects_symlink_output_without_replacing_target(self) -> None:
+        target = self.temp / "caller-owned"
+        target.mkdir()
+        marker = target / "marker"
+        marker.write_text("keep\n", encoding="utf-8")
+        output = self.temp / "rendered"
+        output.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaisesRegex(release.ReleaseError, "must not be a symlink"):
+            release.atomic_write_output(output, {Path("ok.txt"): "ok\n"})
+
+        self.assertTrue(output.is_symlink())
+        self.assertEqual("keep\n", marker.read_text(encoding="utf-8"))
 
     def test_template_rejects_unknown_placeholder(self) -> None:
         template = self.temp / "bad.tmpl"
