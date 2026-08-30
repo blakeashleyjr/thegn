@@ -296,6 +296,10 @@ pub(crate) enum RefreshKind {
     /// Boxed: the payload is a whole table, and every other `RefreshKind`
     /// variant stays one word.
     Dispatches(Box<crate::monitor_pipeline::DispatchRoster>),
+    /// A background reconciliation found local worktree paths that vanished
+    /// outside the host. The loop only prunes the already-identified groups;
+    /// probing and cache/session persistence stay off-loop.
+    VanishedTabs(Box<crate::merge_lifecycle::VanishedTabs>),
     /// The pane daemon's live session list, fetched over the control socket when
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.

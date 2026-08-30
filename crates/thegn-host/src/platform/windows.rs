@@ -150,6 +150,20 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
     std::fs::File::create(path)
 }
 
+/// The state directory is under the user's profile; Windows ACLs are inherited
+/// from that directory, so use the same append semantics as the Unix seam.
+pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Windows ACLs are inherited from the per-profile state directory.
+pub fn restrict_dir_owner_only_checked(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Open an existing path without traversing a final-component reparse point.
 /// `FILE_FLAG_OPEN_REPARSE_POINT` is kept local to the platform seam rather
 /// than enabling another windows-sys feature for one constant.
@@ -222,6 +236,11 @@ impl GroupHandle {
             },
             None => terminate_pid(self.pid),
         }
+    }
+
+    /// Forcefully terminate the whole Job Object.
+    pub fn kill(&self) {
+        self.terminate();
     }
 }
 

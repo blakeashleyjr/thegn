@@ -136,6 +136,7 @@ pub mod harness;
 pub mod heal;
 pub mod help;
 pub mod history;
+pub mod hooks;
 pub mod host;
 pub mod host_config;
 pub mod host_db;

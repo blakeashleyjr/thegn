@@ -67,9 +67,12 @@ thegn wt rm fix-parser --force                    # teardown + git + DB
 
 `wt new` reuses the TUI wizard's pipeline — branch-name templates, base
 resolution, the git-mutation lock, DB registration — but never provisions
-a sandbox; the compositor prepares that lazily on first open. `wt rm`
-tears down the sandbox, runs `git worktree remove`, and cleans every DB
-row, so a removed worktree is never resurrected at the next launch.
+a sandbox; the compositor prepares that lazily on first open. It runs
+`pre_create` before git and waits for post-create hooks before printing the
+new path. `wt rm` runs `pre_destroy` before teardown, then `git worktree
+remove`, `post_destroy`, and DB cleanup. A failed blocking destroy hook leaves
+the worktree in place and names `--force`; that existing flag is also the
+explicit confirmation and skips the veto. Repo hooks are still warn-only.
 
 To put an agent in it without a pane on screen:
 
@@ -84,6 +87,11 @@ thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
 layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
 over the agent — see [[configuration]]. The daemon composes the same
 sandbox, credentials, model flag and env overlay an interactive pane gets.
+
+`wt new --from-issue` and batched project creation use the same lifecycle
+seam. The pipeline board itself is structure-only: an external supervisor
+that creates a worktree should use `wt new` or the existing
+`worktrees.create` control operation, both of which run the shared hooks.
 
 To move a persisted session presentation between profiles, use the
 admin-only, two-store operation:

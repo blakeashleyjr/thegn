@@ -592,7 +592,7 @@ fn forgetting_closed_worktree_registry_prevents_restart_readoption() {
     assert_eq!(db.list_merge_queue().unwrap().len(), 1);
 
     let closing = session.worktrees[1].clone();
-    forget_worktree_group(&db, &session.id, &closing);
+    forget_worktree_group(&db, &session.id, &closing, true);
     assert!(
         db.list_merge_queue().unwrap().is_empty(),
         "closing a worktree should drop its merge-queue row"

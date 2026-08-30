@@ -259,6 +259,7 @@ pub(crate) struct DrainCtx<'a> {
     /// All stdout bytes route through the writer thread — a direct write here
     /// could interleave with an in-flight frame.
     pub writer: &'a crate::frame_writer::FrameWriter,
+    pub waker: &'a termwiz::terminal::TerminalWaker,
 }
 
 /// One budgeted drain pass. See the module docs for the shape.
@@ -797,6 +798,13 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
         .map(|(gi, ti, t)| (gi, ti, t.center.pane_ids().len() == 1));
     if let Some((gi, ti, sole)) = owner {
+        crate::worktree_lifecycle::session_end_after_pane_exit(
+            ctx.current_config,
+            ctx.session,
+            ctx.panes,
+            id,
+            Some(ctx.waker.clone()),
+        );
         // A standalone terminal's sole shell exited: close the terminal rather
         // than respawning a fresh shell (a terminal's whole purpose IS that one
         // shell). Worktrees keep respawning below; terminals divert here (before
