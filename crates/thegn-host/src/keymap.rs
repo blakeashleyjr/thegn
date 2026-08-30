@@ -192,6 +192,7 @@ pub enum Action {
     OpenPrQueue,
     PrQueueAdd,
     PrQueueRefresh,
+    PrReviewTaskHandle,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
     /// Open the tabbed system monitor.
@@ -569,6 +570,7 @@ impl Action {
             Action::OpenPrQueue => "open-pr-queue",
             Action::PrQueueAdd => "pr-queue-add",
             Action::PrQueueRefresh => "pr-queue-refresh",
+            Action::PrReviewTaskHandle => "pr-review-task-handle",
             Action::OpenUsage => "open-usage",
             Action::OpenMonitor => "open-monitor",
             Action::OpenPipelineBoard => "open-pipeline-board",
@@ -719,6 +721,7 @@ impl Action {
             "open-pr-queue" => Action::OpenPrQueue,
             "pr-queue-add" => Action::PrQueueAdd,
             "pr-queue-refresh" => Action::PrQueueRefresh,
+            "pr-review-task-handle" | "review-task-handle" => Action::PrReviewTaskHandle,
             "open-usage" => Action::OpenUsage,
             "open-monitor" => Action::OpenMonitor,
             "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,

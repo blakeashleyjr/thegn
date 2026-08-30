@@ -184,6 +184,7 @@ mod replay_overlay;
 mod repo_index;
 mod review_handoff;
 mod review_rows;
+mod review_task_handoff;
 mod revtunnel;
 mod run;
 mod sandbox_events;

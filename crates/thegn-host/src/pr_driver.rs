@@ -16,13 +16,17 @@
 use std::path::Path;
 
 use thegn_core::agent_task::{TaskKind, TaskVars};
-use thegn_core::config::{Config, PrMergeMethod, PrQueueConfig};
+use thegn_core::config::{Config, PrMergeMethod, PrQueueConfig, PrWatchKind};
 use thegn_core::db::{Db, PrQueueRow};
-use thegn_core::forge::model::{MergeMethod, ReviewThreadRow};
-use thegn_core::forge::{FetchedPr, Forge, ForgeError, PrRef};
+use thegn_core::forge::model::{MergeMethod, ReviewThreadRow, owner_repo_from_url};
+use thegn_core::forge::{FetchedPr, Forge, ForgeError, PrRef, RepoRef};
+use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::pr_queue::{self, Blocker, PrQueueFacts, PrqStatus, QueueAction};
+use thegn_core::pr_review_tasks::{
+    ExistingReviewTask, PrReviewTaskContext, ReviewTaskEvent, reconcile_review_tasks,
+};
 use thegn_core::remote::GitLoc;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::store::{CacheStore, WorktreeAuxStore};
 
 /// One queued pull request to process.
 #[derive(Debug, Clone)]
@@ -77,6 +81,25 @@ pub(crate) struct PrOutcome {
     /// was configured but could not be resolved. Reported rather than swallowed:
     /// "couldn't look" must never read as "nothing to do".
     pub warnings: Vec<String>,
+    /// Durable create/revision events for the TUI drain. The worker fills this
+    /// only after the roster upsert succeeds; a future automation consumer can
+    /// observe the same deduped event without starting a second agent here.
+    pub review_events: Vec<(ReviewTaskEvent, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewRefresh {
+    NotWatched,
+    /// Deep provider data was transiently unavailable. Existing tasks remain
+    /// untouched and aggregate review dispatch stays paused for this pass.
+    Stale,
+    /// A complete snapshot was reconciled. `actionable` distinguishes an empty
+    /// provider aggregate from a persistence failure; `has_task` is read back
+    /// from the durable roster rather than inferred from a proposed upsert.
+    Reconciled {
+        actionable: bool,
+        has_task: bool,
+    },
 }
 
 /// Queue rows belonging to one repo, oldest first.
@@ -228,6 +251,8 @@ pub(crate) fn drive_queue(
         record_success(&item.key);
         let head = fetched.pr.head_ref_oid.clone();
         let blocker = pr_queue::classify(&fetched.pr, cfg);
+        let review_refresh =
+            refresh_review_tasks(cfg, forge, repo_root, db, &item, &fetched, &mut out);
 
         // A head thegn didn't produce means a teammate pushed. Two consequences,
         // both deliberate: the attempt budget refills (a long-lived PR must not
@@ -248,7 +273,11 @@ pub(crate) fn drive_queue(
             agent_available: agent_cmd.is_some(),
         };
 
-        let action = pr_queue::decide(&blocker, &facts, cfg);
+        let action = suppress_aggregate_review_dispatch(
+            pr_queue::decide(&blocker, &facts, cfg),
+            &blocker,
+            review_refresh,
+        );
 
         // The foreign-push guard applies only where it means something: we are
         // about to *write*. Merging a PR someone else advanced is fine (it is
@@ -481,6 +510,197 @@ pub(crate) fn drive_queue(
         }
     }
     out
+}
+
+/// Reconcile the complete THE-27 review snapshot for one explicitly watched
+/// queue row. Every call is made by the existing blocking queue worker.
+/// Transient provider failures return `Stale` without touching roster rows.
+fn refresh_review_tasks(
+    cfg: &PrQueueConfig,
+    forge: &dyn Forge,
+    repo_root: &Path,
+    db: &Db,
+    item: &PrItem,
+    fetched: &FetchedPr,
+    out: &mut PrOutcome,
+) -> ReviewRefresh {
+    if !cfg.watches(PrWatchKind::Review) {
+        return ReviewRefresh::NotWatched;
+    }
+
+    let Some((owner, repo)) = owner_repo_from_url(&fetched.pr.url) else {
+        out.warnings.push(format!(
+            "PR #{}: review refresh could not identify the repository",
+            item.number
+        ));
+        return ReviewRefresh::Stale;
+    };
+    let repository = format!("{owner}/{repo}");
+    let repo_ref = RepoRef { owner, repo };
+    let worktree = item
+        .worktree
+        .as_deref()
+        .unwrap_or_else(|| repo_root.to_str().unwrap_or_default());
+    let loc = GitLoc::from_db(worktree, None);
+    let conversation = match forge.conversation(&loc, &repo_ref, item.number) {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            out.warnings.push(format!(
+                "PR #{} review is stale: {}",
+                item.number,
+                error.describe()
+            ));
+            return ReviewRefresh::Stale;
+        }
+    };
+    let diff = match forge.pr_diff(&loc, PrRef::Number(item.number)) {
+        Ok(diff) => diff,
+        Err(error) => {
+            out.warnings.push(format!(
+                "PR #{} review is stale: {}",
+                item.number,
+                error.describe()
+            ));
+            return ReviewRefresh::Stale;
+        }
+    };
+    let snapshot = thegn_core::review::PrReviewSnapshot {
+        worktree_key: worktree.to_string(),
+        branch: item.branch.clone(),
+        pr_number: item.number,
+        head_oid: fetched.pr.head_ref_oid.clone(),
+        fetched_at: thegn_core::util::now(),
+        conversation,
+        diff,
+    };
+    // Complete payload only. This is the same cache consumed by THE-27's
+    // panel/diff projection; a DB miss merely makes the next hydrate stale.
+    if let Err(error) = db.put_pr_review_cache(&snapshot) {
+        tracing::warn!(target: "thegn::prq", %error, number = item.number, "review cache write failed");
+    }
+
+    let existing_rows = match db.list_review_tasks() {
+        Ok(rows) => rows,
+        Err(error) => {
+            out.warnings.push(format!(
+                "PR #{} review roster is unavailable: {error}",
+                item.number
+            ));
+            return ReviewRefresh::Stale;
+        }
+    };
+    let existing: Vec<ExistingReviewTask> =
+        existing_rows.iter().map(ExistingReviewTask::from).collect();
+    let context = PrReviewTaskContext {
+        forge: item.forge.as_str(),
+        repository: repository.as_str(),
+        pr_url: fetched.pr.url.as_str(),
+        pr_title: fetched.pr.title.as_str(),
+        base: fetched.pr.base_ref_name.as_str(),
+        worktree_path: worktree,
+        role: cfg.agent.as_str(),
+        prompt_template: cfg.prompts.resolve(TaskKind::PrReview),
+    };
+    let plan = match reconcile_review_tasks(&snapshot, context, &existing) {
+        Ok(plan) => plan,
+        Err(error) => {
+            out.warnings.push(format!(
+                "PR #{} review task template is invalid: {error}",
+                item.number
+            ));
+            return ReviewRefresh::Stale;
+        }
+    };
+
+    for resolution in plan.resolutions {
+        match db.resolve_review_task(&resolution) {
+            Ok(true) => {
+                if let Err(error) = db.put_review_thread_resolved_notification(&resolution) {
+                    tracing::warn!(target: "thegn::prq", %error, task = resolution.dispatch_id, "review resolution notification failed");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => out.warnings.push(format!(
+                "PR #{} review resolution could not be persisted: {error}",
+                item.number
+            )),
+        }
+    }
+    for upsert in plan.upserts {
+        let revised = upsert.existing_id.is_some();
+        match db.upsert_review_task(&upsert) {
+            Ok(_) => {
+                if let Err(error) = db.put_review_task_queued_notification(&upsert.event, revised) {
+                    tracing::warn!(target: "thegn::prq", %error, source = %upsert.source_key, "review task notification failed");
+                }
+                tracing::info!(
+                    target: "thegn::prq",
+                    event = upsert.event.event,
+                    source_key = %upsert.event.source_key,
+                    source_revision = %upsert.event.source_revision,
+                    "review task event"
+                );
+                out.review_events.push((upsert.event, revised));
+            }
+            Err(error) => out.warnings.push(format!(
+                "PR #{} review task could not be persisted: {error}",
+                item.number
+            )),
+        }
+    }
+
+    let issue_id = format!("pr:{}:{}#{}", item.forge, repository, item.number);
+    let has_task = db.list_review_tasks().is_ok_and(|rows| {
+        rows.into_iter()
+            .any(|row| row.issue_id == issue_id && row.status != AgentDispatchStatus::Done)
+    });
+    let actionable = snapshot
+        .conversation
+        .threads
+        .iter()
+        .any(|thread| !thread.resolved && !thread.id.trim().is_empty())
+        || (snapshot.conversation.threads.is_empty()
+            && snapshot.conversation.reviews.iter().rev().any(|review| {
+                review.state.eq_ignore_ascii_case("CHANGES_REQUESTED")
+                    && !review.body.trim().is_empty()
+            }));
+    ReviewRefresh::Reconciled {
+        actionable,
+        has_task,
+    }
+}
+
+/// Per-thread reconciliation owns watched review work. The aggregate queue
+/// classifier remains visible, but it must never start a competing PR-wide
+/// `PrReview` run. A provider that supplies no actionable body/thread is
+/// explicitly parked for a human instead of receiving an empty prompt.
+fn suppress_aggregate_review_dispatch(
+    action: QueueAction,
+    blocker: &Blocker,
+    refresh: ReviewRefresh,
+) -> QueueAction {
+    if !matches!(blocker, Blocker::ChangesRequested)
+        || !matches!(action, QueueAction::DispatchAgent(TaskKind::PrReview))
+    {
+        return action;
+    }
+    match refresh {
+        ReviewRefresh::Reconciled {
+            actionable: false, ..
+        } => QueueAction::NeedsHuman(
+            "changes requested, but the forge supplied no actionable review thread or body".into(),
+        ),
+        ReviewRefresh::Reconciled {
+            actionable: true,
+            has_task: false,
+        } => QueueAction::NeedsHuman(
+            "review feedback was found, but its durable task could not be queued".into(),
+        ),
+        ReviewRefresh::Reconciled { has_task: true, .. } | ReviewRefresh::Stale => {
+            QueueAction::Wait
+        }
+        ReviewRefresh::NotWatched => action,
+    }
 }
 
 /// The row's current status word, for a refresh that failed and must not change it.
@@ -847,6 +1067,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_or_stale_aggregate_review_never_launches_a_generic_agent() {
+        let dispatch = QueueAction::DispatchAgent(TaskKind::PrReview);
+        assert!(matches!(
+            suppress_aggregate_review_dispatch(
+                dispatch.clone(),
+                &Blocker::ChangesRequested,
+                ReviewRefresh::Reconciled {
+                    actionable: false,
+                    has_task: false,
+                },
+            ),
+            QueueAction::NeedsHuman(reason) if reason.contains("no actionable")
+        ));
+        assert_eq!(
+            suppress_aggregate_review_dispatch(
+                dispatch,
+                &Blocker::ChangesRequested,
+                ReviewRefresh::Stale,
+            ),
+            QueueAction::Wait
+        );
+    }
+
+    #[test]
     fn authorship_is_unknown_unless_the_viewer_is_known() {
         let f = fetched(vec![]);
         // Unknown viewer ⇒ not ours, so `own_prs_only` errs toward NOT writing.
@@ -928,14 +1172,24 @@ mod tests {
     /// Records every call; answers `fetch` with a configurable PR.
     struct FakeForge {
         pr: std::sync::Mutex<Option<PrStatus>>,
+        conversation: std::sync::Mutex<Option<thegn_core::forge::model::PrConversation>>,
         calls: std::sync::Mutex<Vec<String>>,
     }
     impl FakeForge {
         fn new(pr: Option<PrStatus>) -> Self {
             FakeForge {
                 pr: std::sync::Mutex::new(pr),
+                conversation: std::sync::Mutex::new(Some(Default::default())),
                 calls: Default::default(),
             }
+        }
+        fn with_conversation(self, conversation: thegn_core::forge::model::PrConversation) -> Self {
+            *self.conversation.lock().unwrap() = Some(conversation);
+            self
+        }
+        fn fail_conversation(self) -> Self {
+            *self.conversation.lock().unwrap() = None;
+            self
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
@@ -995,12 +1249,58 @@ mod tests {
             self.record("whoami");
             Ok("me".into())
         }
+        fn conversation(
+            &self,
+            _: &GitLoc,
+            _: &thegn_core::forge::RepoRef,
+            _: u64,
+        ) -> Result<thegn_core::forge::model::PrConversation, ForgeError> {
+            self.record("conversation");
+            self.conversation
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(ForgeError::Offline)
+        }
+        fn pr_diff(
+            &self,
+            _: &GitLoc,
+            _: PrRef,
+        ) -> Result<thegn_core::forge::model::PrDiff, ForgeError> {
+            self.record("pr_diff");
+            Ok(Default::default())
+        }
     }
 
     fn green_pr() -> PrStatus {
         let mut pr = fetched(vec![]).pr;
         pr.review_decision = Some("APPROVED".into());
         pr
+    }
+
+    fn requested_pr() -> PrStatus {
+        let mut pr = fetched(vec![]).pr;
+        pr.review_decision = Some("CHANGES_REQUESTED".into());
+        pr
+    }
+
+    fn review_conversation(body: &str) -> thegn_core::forge::model::PrConversation {
+        use thegn_core::forge::model::{PrComment, PrConversation, ReviewThread};
+        PrConversation {
+            threads: vec![ReviewThread {
+                id: "thread-7".into(),
+                path: "src/lib.rs".into(),
+                line: Some(42),
+                comments: vec![PrComment {
+                    id: "comment-1".into(),
+                    author: "reviewer".into(),
+                    body: body.into(),
+                    created_at: "2026-08-30T00:00:00Z".into(),
+                }],
+                ..ReviewThread::default()
+            }],
+            ..PrConversation::default()
+        }
     }
 
     fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
@@ -1083,5 +1383,86 @@ mod tests {
             "never merges what it could not fetch: {:?}",
             forge.calls()
         );
+    }
+
+    #[test]
+    fn explicit_review_watch_is_required_for_deep_fetch() {
+        let (_dir, db) = temp_db("prq-review-filter");
+        let forge = FakeForge::new(Some(requested_pr()))
+            .with_conversation(review_conversation("rename this"));
+        let mut cfg = cfg();
+        cfg.watch = vec![PrWatchKind::Ci];
+        drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert!(
+            !forge.calls().iter().any(|call| call == "conversation"),
+            "unwatched review data must not be fetched: {:?}",
+            forge.calls()
+        );
+        assert!(db.list_review_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_thread_task_suppresses_the_generic_review_agent() {
+        let (_dir, db) = temp_db("prq-review-dedupe");
+        let forge = FakeForge::new(Some(requested_pr()))
+            .with_conversation(review_conversation("rename this"));
+        let mut cfg = cfg();
+        cfg.agent_command = "true {prompt}".into();
+        let mut statuses = Vec::new();
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |step| statuses.push(step.status.to_string()),
+        );
+        assert_eq!(db.list_review_tasks().unwrap().len(), 1);
+        assert_eq!(out.review_events.len(), 1);
+        assert_eq!(statuses, vec![PrqStatus::BlockedReview.as_str()]);
+        assert!(
+            !statuses.contains(&PrqStatus::AgentRunning.as_str().to_string()),
+            "aggregate PrReview must not launch beside a thread task"
+        );
+    }
+
+    #[test]
+    fn transient_review_failure_keeps_the_durable_task_stale() {
+        let (_dir, db) = temp_db("prq-review-stale");
+        let first = FakeForge::new(Some(requested_pr()))
+            .with_conversation(review_conversation("first revision"));
+        drive_queue(
+            &cfg(),
+            &Config::default(),
+            &first,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        let before = db.list_review_tasks().unwrap();
+        assert_eq!(before.len(), 1);
+
+        let failed = FakeForge::new(Some(requested_pr())).fail_conversation();
+        let out = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &failed,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(db.list_review_tasks().unwrap(), before);
+        assert!(out.warnings.iter().any(|warning| warning.contains("stale")));
     }
 }
