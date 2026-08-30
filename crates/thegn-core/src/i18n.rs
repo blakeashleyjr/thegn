@@ -151,6 +151,8 @@ macro_rules! t {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -171,5 +173,18 @@ mod tests {
         assert!(std::ptr::eq(first, second));
         assert_eq!(second.language.to_string(), "ja-JP");
         assert!(!second.pseudolocale);
+    }
+
+    #[test]
+    fn parity_registry_covers_every_embedded_locale() {
+        let embedded = LOCALES
+            .locales()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let registered = crate::i18n_parity::SHIPPED_LOCALES
+            .iter()
+            .map(|source| source.locale.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(registered, embedded);
     }
 }
