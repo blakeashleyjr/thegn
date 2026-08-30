@@ -13,10 +13,16 @@ pub struct LocaleSource {
 
 /// The one registry of locales shipped in the binary. Adding a source here
 /// automatically enrolls it in strict parity testing.
-pub const SHIPPED_LOCALES: &[LocaleSource] = &[LocaleSource {
-    locale: DEFAULT_LOCALE,
-    source: DEFAULT_SOURCE,
-}];
+pub const SHIPPED_LOCALES: &[LocaleSource] = &[
+    LocaleSource {
+        locale: DEFAULT_LOCALE,
+        source: DEFAULT_SOURCE,
+    },
+    LocaleSource {
+        locale: "ja-JP",
+        source: include_str!("../locales/ja-JP/main.ftl"),
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParityIssue {
