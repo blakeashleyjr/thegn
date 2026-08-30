@@ -303,10 +303,15 @@ pub fn name() -> String {
 
 /// Holds the profile's advisory singleton lock for the process lifetime. The
 /// `flock` is tied to the open fd, so it auto-releases on `Drop` and on process
-/// death (incl. SIGKILL) — never a stale lock. `None` when the lock could not
-/// be taken because of a permissions quirk or platform error.
+/// death (incl. SIGKILL) — never a stale lock. An optional field is `None` when
+/// its lock could not be taken because of contention or a platform quirk.
 #[must_use = "the lock releases as soon as the guard is dropped"]
-pub struct SingletonGuard(#[allow(dead_code)] Option<std::fs::File>);
+pub struct SingletonGuard {
+    #[allow(dead_code)]
+    singleton: Option<std::fs::File>,
+    #[allow(dead_code)]
+    migration_owner: Option<std::fs::File>,
+}
 
 /// Result of the startup singleton check.
 pub enum Singleton {
@@ -316,8 +321,33 @@ pub enum Singleton {
     /// caller warns but continues (per-profile DBs are separate files and
     /// SQLite WAL handles concurrent access; a hard refusal would break the
     /// nested-thegn dev workflow).
-    AlreadyRunning,
+    AlreadyRunning(SingletonGuard),
+    /// A session migration owns the profile startup gate. Unlike an ordinary
+    /// second compositor, startup must stop here: continuing would let the new
+    /// owner recreate source presentation rows after migration cleanup.
+    MigrationInProgress,
 }
+
+/// Holds every source fence for a session migration. Lock ordering is fixed:
+/// profile owner, legacy compositor singleton, then the per-worktree daemon
+/// open gate. Keeping this value alive prevents both a compositor startup and
+/// a matching daemon session open through source cleanup.
+#[must_use = "the migration fences release as soon as the guard is dropped"]
+pub struct SessionMigrationGuard {
+    #[allow(dead_code)]
+    owner: std::fs::File,
+    #[allow(dead_code)]
+    singleton: std::fs::File,
+    #[allow(dead_code)]
+    worktree: std::fs::File,
+}
+
+/// Short-lived daemon-side guard around a matching session open. Migration
+/// takes the same lock for its full lifetime, so either the open completes and
+/// becomes visible before migration preflight, or it is refused while cleanup
+/// is possible; there is no list-then-open gap.
+#[must_use = "the session-open fence releases as soon as the guard is dropped"]
+pub struct SessionOpenGuard(#[allow(dead_code)] Option<std::fs::File>);
 
 /// Try to take the exclusive, non-blocking file lock at `path` (`flock` on
 /// unix, `LockFileEx` on Windows — std's cross-platform `File::try_lock`).
@@ -331,6 +361,23 @@ fn try_lock_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>>
         .truncate(false)
         .open(path)?;
     match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Shared half of the migration owner lock. Every compositor holds one for its
+/// lifetime, including advisory duplicate instances; migration takes the
+/// exclusive half, so neither side can pass the other between a probe and use.
+fn try_lock_shared_nb(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_shared() {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e),
@@ -357,50 +404,147 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-/// The active profile's singleton lock file (`<root>/run/thegn.lock`),
-/// creating the `run/` dir best-effort.
-fn singleton_lock_path() -> std::path::PathBuf {
-    singleton_lock_path_for(&active().root)
-}
-
 fn singleton_lock_path_for(root: &std::path::Path) -> std::path::PathBuf {
     let run = root.join("run");
     let _ = std::fs::create_dir_all(&run); // best-effort: dir prep: a later write reports the real failure
     run.join("thegn.lock")
 }
 
-/// Acquire the active profile's advisory singleton lock at
-/// `<root>/run/thegn.lock`. One-shot non-blocking (never a poll loop — the
-/// 0%-idle contract). Every profile (incl. default) takes the lock so
-/// [`instance_running`] can detect a live compositor. Contention remains
-/// advisory at the host boundary: the interactive caller warns for named
-/// profiles and continues, while the default profile remains silent so nested
-/// thegn launches keep working exactly as before.
-pub fn acquire_singleton() -> Singleton {
-    match try_lock_nb(&singleton_lock_path()) {
+fn owner_gate_path_for(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("run/session-migration-owner.lock")
+}
+
+fn worktree_gate_path_for(root: &std::path::Path, worktree: &str) -> std::path::PathBuf {
+    root.join("run").join(format!(
+        "session-migration-{}.lock",
+        util::short_hash(worktree, 16)
+    ))
+}
+
+fn acquire_required_lock(path: &std::path::Path, busy: &str) -> anyhow::Result<std::fs::File> {
+    match try_lock_nb(path) {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => anyhow::bail!("{busy}"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn acquire_required_shared_lock(
+    path: &std::path::Path,
+    busy: &str,
+) -> anyhow::Result<std::fs::File> {
+    match try_lock_shared_nb(path) {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => anyhow::bail!("{busy}"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn acquire_singleton_at(root: &std::path::Path) -> Singleton {
+    let run = root.join("run");
+    let migration_owner = match std::fs::create_dir_all(&run)
+        .and_then(|()| try_lock_shared_nb(&owner_gate_path_for(root)))
+    {
+        Ok(Some(file)) => Some(file),
+        Ok(None) => return Singleton::MigrationInProgress,
+        // If this process cannot open the owner lock, a migration running with the
+        // same identity cannot acquire it either. Preserve the singleton's
+        // existing best-effort degradation for unusual permissions.
+        Err(_) => None,
+    };
+    match try_lock_nb(&singleton_lock_path_for(root)) {
         Ok(Some(file)) => {
             // Best-effort pid marker for a future focus path; failure is fine.
             use std::io::Write;
             let _ = file.set_len(0);
             let _ = writeln!(&file, "{}", std::process::id());
-            Singleton::Acquired(SingletonGuard(Some(file)))
+            Singleton::Acquired(SingletonGuard {
+                singleton: Some(file),
+                migration_owner,
+            })
         }
-        Ok(None) => Singleton::AlreadyRunning,
+        Ok(None) => Singleton::AlreadyRunning(SingletonGuard {
+            singleton: None,
+            migration_owner,
+        }),
         // A permissions quirk must never wedge the user out — degrade to running.
-        Err(_) => Singleton::Acquired(SingletonGuard(None)),
+        Err(_) => Singleton::Acquired(SingletonGuard {
+            singleton: None,
+            migration_owner,
+        }),
     }
+}
+
+/// Acquire the active profile's advisory singleton lock at
+/// `<root>/run/thegn.lock`. One-shot non-blocking (never a poll loop — the
+/// 0%-idle contract). Every profile (incl. default) takes the lock so
+/// [`instance_running`] can detect a live compositor. Singleton contention
+/// remains advisory at the host boundary; migration-gate contention is a hard
+/// refusal because the migration owns the source profile exclusively.
+pub fn acquire_singleton() -> Singleton {
+    acquire_singleton_at(&active().root)
+}
+
+/// Acquire the source profile's migration-exclusive fences. The owner gate
+/// takes the exclusive half of the lock every compositor holds shared. The
+/// legacy singleton also catches a compositor from before this protocol. The
+/// worktree gate is the daemon-side fence respected by every matching open.
+pub fn acquire_session_migration(
+    paths: &ProfilePaths,
+    worktree: &str,
+) -> anyhow::Result<SessionMigrationGuard> {
+    let run = paths.root.join("run");
+    std::fs::create_dir_all(&run)?;
+    let owner = acquire_required_lock(
+        &owner_gate_path_for(&paths.root),
+        "the source profile has another interactive instance or migration running",
+    )?;
+    let singleton = acquire_required_lock(
+        &singleton_lock_path_for(&paths.root),
+        "the source profile has another interactive instance running",
+    )?;
+    let worktree = acquire_required_lock(
+        &worktree_gate_path_for(&paths.root, worktree),
+        "a matching source daemon session is opening; retry the migration",
+    )?;
+    Ok(SessionMigrationGuard {
+        owner,
+        singleton,
+        worktree,
+    })
+}
+
+/// Enter the daemon half of the migration protocol for one session open.
+/// `None` is an unscoped session and cannot recreate a moved worktree's
+/// presentation. Errors fail closed at the daemon boundary.
+pub fn acquire_session_open_guard_at(
+    root: &std::path::Path,
+    worktree: Option<&str>,
+) -> anyhow::Result<SessionOpenGuard> {
+    let Some(worktree) = worktree.filter(|value| !value.is_empty()) else {
+        return Ok(SessionOpenGuard(None));
+    };
+    let run = root.join("run");
+    std::fs::create_dir_all(&run)?;
+    let file = acquire_required_shared_lock(
+        &worktree_gate_path_for(root, worktree),
+        "session open refused: the worktree is being migrated to another profile",
+    )?;
+    Ok(SessionOpenGuard(Some(file)))
 }
 
 /// Is another thegn process holding `paths`' singleton lock (i.e. a live
 /// interactive compositor)? Probes the existing profile lock without keeping
-/// it. Errors fail closed because a migration must not delete source rows
-/// while an owner cannot safely be disproved.
+/// it. Errors fail closed because even a dry-run migration must not describe a
+/// source presentation whose owner can be changing it concurrently. Real
+/// migrations use [`acquire_session_migration`] instead and retain its guard.
 pub fn instance_running_at(paths: &ProfilePaths) -> bool {
-    lock_held(&paths.root.join("run/thegn.lock")).unwrap_or(true)
+    lock_held(&owner_gate_path_for(&paths.root)).unwrap_or(true)
+        || lock_held(&paths.root.join("run/thegn.lock")).unwrap_or(true)
 }
 
 /// Best-effort: is another thegn process holding this profile's singleton
-/// lock? The migration caller uses the same probe in fail-closed mode through
+/// lock? Dry-run migration uses the same probe in fail-closed mode through
 /// [`instance_running_at`].
 pub fn instance_running() -> bool {
     instance_running_at(&active())
@@ -790,6 +934,103 @@ mod tests {
         };
         assert!(!instance_running_at(&paths));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn migration_guard_blocks_late_compositor_and_matching_session_open() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-profile-migration-fence-{}-{}",
+            std::process::id(),
+            util::now()
+        ));
+        let paths = ProfilePaths {
+            name: "default".into(),
+            root: root.clone(),
+        };
+        let guard = acquire_session_migration(&paths, "/worktree").unwrap();
+
+        // These attempts model the deterministic race point immediately after
+        // migration's initial owner/session listings: both fences remain held.
+        assert!(matches!(
+            acquire_singleton_at(&root),
+            Singleton::MigrationInProgress
+        ));
+        assert!(
+            acquire_session_open_guard_at(&root, Some("/worktree")).is_err(),
+            "matching daemon opens must be refused after the initial listing"
+        );
+        assert!(
+            acquire_session_open_guard_at(&root, Some("/other")).is_ok(),
+            "unrelated worktrees are not fenced"
+        );
+
+        drop(guard);
+        assert!(matches!(
+            acquire_singleton_at(&root),
+            Singleton::Acquired(_)
+        ));
+        let first_open = acquire_session_open_guard_at(&root, Some("/worktree")).unwrap();
+        assert!(
+            acquire_session_open_guard_at(&root, Some("/worktree")).is_ok(),
+            "ordinary concurrent opens share the daemon-side fence"
+        );
+        drop(first_open);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
+    }
+
+    #[test]
+    fn existing_compositor_blocks_migration_after_owner_lock_handoff() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-profile-owner-fence-{}-{}",
+            std::process::id(),
+            util::now()
+        ));
+        let paths = ProfilePaths {
+            name: "default".into(),
+            root: root.clone(),
+        };
+        let owner = match acquire_singleton_at(&root) {
+            Singleton::Acquired(guard) => guard,
+            _ => panic!("fresh compositor must acquire the singleton"),
+        };
+        let error = acquire_session_migration(&paths, "/worktree")
+            .err()
+            .expect("live compositor must block migration");
+        assert!(error.to_string().contains("interactive instance"));
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
+    }
+
+    #[test]
+    fn advisory_duplicate_keeps_shared_owner_fence_after_first_owner_exits() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-profile-duplicate-fence-{}-{}",
+            std::process::id(),
+            util::now()
+        ));
+        let paths = ProfilePaths {
+            name: "default".into(),
+            root: root.clone(),
+        };
+        let first = match acquire_singleton_at(&root) {
+            Singleton::Acquired(guard) => guard,
+            _ => panic!("first compositor must acquire the singleton"),
+        };
+        let duplicate = match acquire_singleton_at(&root) {
+            Singleton::AlreadyRunning(guard) => guard,
+            _ => panic!("duplicate compositor must retain a shared owner fence"),
+        };
+        drop(first);
+        assert!(
+            instance_running_at(&paths),
+            "dry-run owner probes see the surviving advisory duplicate"
+        );
+        assert!(
+            acquire_session_migration(&paths, "/worktree").is_err(),
+            "the surviving advisory duplicate still blocks migration"
+        );
+        drop(duplicate);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
     }
 
     #[test]

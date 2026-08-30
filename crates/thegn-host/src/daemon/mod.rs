@@ -293,6 +293,7 @@ async fn run(
         idle_tx,
         shutdown: shutdown.clone(),
         config: std::sync::Arc::new(cfg.clone()),
+        profile_root: thegn_core::profile::active().root,
         endpoint: ep.display(),
     });
 
