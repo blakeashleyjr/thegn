@@ -40,6 +40,8 @@ The file is watched: edits apply live, no restart.
   agent, prompt, concurrency, `next`), with per-stage `model` / `env` /
   `permissions` overrides. Structure only: thegn validates and displays it,
   the Lead executes it. See [[system-monitor]] for the board.
+- `[skills]` — embedded and user-authored prose recipes seeded into each
+  configured harness's native project directory. See [[skills]].
 - `[editor]` — how "open in editor" opens files: `command` is a template
   (`{path}`, `{line}`, `{col}`); unset, thegn uses `[[tools]] editor`, then
   `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
@@ -120,6 +122,32 @@ thegn config validate   # a model on a flagless harness, a bad env key, a
 
 Edits to `[[agents]]` take effect on the next launch — the daemon re-reads
 its config per agent launch, so no restart is needed.
+
+## Skills
+
+```toml
+[skills]
+enabled = true
+user_dirs = ["~/.config/thegn/skills", "./team-skills"]
+exclude = ["mq"]
+```
+
+- **`enabled`** controls automatic seeding during worktree creation and
+  startup reconciliation. It defaults to `true`; `thegn skills seed` remains
+  an available explicit operation when it is `false`.
+- **`user_dirs`** names additional package roots. Each immediate,
+  non-symlink child directory may contribute `<name>/SKILL.md`; discovery is
+  bounded and non-recursive, and embedded entries win duplicate names. The
+  list defaults empty. Invalid or unreadable entries produce diagnostics and
+  do not prevent other packages from loading.
+- **`exclude`** is a duplicate-free list of path-safe skill names withheld
+  from every harness. A previously seeded file is removed only while its
+  managed marker and hash prove that it has not been edited.
+
+Skills go into the selected worktree's native Claude, Codex, or Pi project
+layout, never into a harness home. Harness targeting, feature gates, package
+frontmatter, and conflict rules are detailed on [[skills]]. The generated
+[[config-reference]] carries the same defaults and inline key documentation.
 
 ## Inspecting
 
