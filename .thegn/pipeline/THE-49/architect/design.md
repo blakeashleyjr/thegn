@@ -42,6 +42,12 @@ roster, reads the report/notes, follows an artifact pointer into the worker's
 git worktree, and optionally asks `issues.get` or `agent.sessions` for tracker
 or session context. That is useful memory without pretending all of those
 sources have the same authority, freshness, privacy, or partition key.
+Every text-bearing source is untrusted operator-, provider-, or agent-authored
+content: control-character stripping on reports/notes prevents terminal
+injection, not semantic prompt injection. A reader must preserve attribution,
+present retrieved prose as quoted data rather than instructions, and never
+execute commands, links, or tool requests merely because retrieved content
+asks it to.
 
 ## Prior-art evaluation
 
@@ -125,6 +131,12 @@ non-negotiable shape is:
    index remains disposable. In either case, document every config key in
    `config/config.toml.example` and cover env overlays; prefer no new config
    key until a real user workflow requires one.
+7. Treat every indexed byte as untrusted content. Preserve source plus
+   commit/row attribution, keep content structurally separate from instruction
+   channels in every projection, never auto-execute embedded commands, links,
+   or tool calls, and never inject a result as system/developer authority.
+   Test that adversarial prompt-like text remains inert and attributed;
+   control-character filtering alone is not this defense.
 
 This contract is a gate for a future implementation, not a design license for
 this docs-only issue. The conclusion for THE-49 is: **no new system**.
