@@ -322,8 +322,68 @@ impl Db {
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        Self::init(Self::open_connection(path)?)
+        let db = Self::init(Self::open_connection(path)?)?;
+        let _ = crate::fsperm::restrict_to_owner(path);
+        Ok(db)
+    }
+
+    /// Open an existing DB read-only while participating in its WAL locking.
+    ///
+    /// Unlike [`Self::open_read_only_at`], this may use existing WAL/SHM
+    /// sidecars so a real migration preflight sees the latest target rows. It
+    /// still performs no schema initialization, migration, or startup prune.
+    pub fn open_read_only_wal_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Open an existing state DB without creating, migrating, pruning, or
+    /// changing its journal mode. This is the only safe opener for commands
+    /// whose dry-run contract is strictly read-only. An absent file is
+    /// represented as `None` so callers can inspect an empty, not-yet-created
+    /// target without manufacturing a database.
+    pub fn open_read_only_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        // A plain read-only open of a WAL-mode database is still allowed to
+        // create `-wal`/`-shm` sidecars. `immutable=1` is SQLite's explicit
+        // no-write/no-lock URI mode, which is required by dry-run callers.
+        let uri = util::immutable_sqlite_uri(&path.canonicalize()?);
+        let conn = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Read-only counterpart to [`Db::open`] for dry-run command paths.
+    pub fn open_read_only() -> Result<Option<Db>> {
+        Self::open_read_only_at(&db_path())
     }
 
     /// Open a state DB read-only when it was written by a newer build. The

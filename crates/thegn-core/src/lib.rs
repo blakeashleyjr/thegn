@@ -88,6 +88,7 @@ pub mod db_placement;
 mod db_pool;
 mod db_projects;
 mod db_semantic;
+mod db_session_migration;
 mod db_trust;
 mod db_usage;
 mod db_workspace;
@@ -237,6 +238,7 @@ pub mod scheduler;
 pub mod seam;
 pub mod search;
 pub mod session_fork;
+pub mod session_migration;
 // The value-free secret audit trail (target `thegn::secret::audit`).
 pub mod secret_audit;
 // Enumerate every configured secret reference in a Config (one source for the
