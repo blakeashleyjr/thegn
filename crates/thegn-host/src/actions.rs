@@ -377,12 +377,67 @@ fn proxy_spend_rollup() -> Option<thegn_core::proxy::stats::Rollup> {
     Some(thegn_core::proxy::stats::rollup(&rows))
 }
 
+/// Project configured model-proxy cap breaches into the common notification
+/// route. This runs only from the usage worker, never from the event loop.
+fn notify_proxy_budget_breaches(budget: &thegn_core::config::BudgetConfig) {
+    use thegn_core::store::ModelProxyStore;
+
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::usage",
+                %error,
+                "model-proxy budget alerts unavailable: database open failed"
+            );
+            return;
+        }
+    };
+    let rows = match db.model_proxy_budget_states() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::usage",
+                %error,
+                "model-proxy budget alerts unavailable: state read failed"
+            );
+            return;
+        }
+    };
+    let facts =
+        thegn_core::budget_alert::classify_breaches(budget, &rows, thegn_core::util::now_ms());
+    for fact in &facts {
+        let alert = crate::usage_budget::notification(fact);
+        if !crate::notify::record_global_once(
+            &db,
+            alert.kind,
+            &alert.source_ref,
+            &alert.message,
+            &alert.worktree,
+        ) && let Err(error) = db.put_notification_once(
+            alert.kind,
+            &alert.source_ref,
+            &alert.message,
+            &alert.worktree,
+        ) {
+            tracing::debug!(
+                target: "thegn::usage",
+                %error,
+                scope = %fact.scope,
+                dimension = fact.dimension.as_str(),
+                "model-proxy budget notification cache write failed"
+            );
+        }
+    }
+}
+
 pub(crate) fn spawn_usage(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
     interactive: bool,
     proxy_enabled: bool,
+    proxy_budget: thegn_core::config::BudgetConfig,
 ) {
     let tx = refresh_tx.clone();
     let cfg_for_rollup = cfg.clone();
@@ -422,6 +477,9 @@ pub(crate) fn spawn_usage(
             "usage gather"
         );
         let history = record_usage_history(&cfg, &accounts);
+        if proxy_enabled && proxy_budget.enabled {
+            notify_proxy_budget_breaches(&proxy_budget);
+        }
         // Proxy spend rolls up from the audit tables off-loop, on this same
         // cadence. Best-effort: a DB error just yields no block, never a stall.
         let proxy_spend = proxy_enabled.then(proxy_spend_rollup).flatten();
