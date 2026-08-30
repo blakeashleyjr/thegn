@@ -6,6 +6,7 @@
 //! never a second preview source of truth.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 use thegn_core::preview::{
     PortHint, PreviewStatus, PreviewTarget, parse_pane_port_hints, select_target,
@@ -16,6 +17,16 @@ use crate::chrome::PreviewView;
 /// Pane diagnostic bytes retained per pane. This matches the pure parser's
 /// maximum input so repeated output can never grow host memory without bound.
 const DIAGNOSTIC_TAIL_BYTES: usize = thegn_core::preview::MAX_PORT_HINT_CHARS;
+
+/// Same-process response snapshot. A detached daemon legitimately has no
+/// compositor-side pane diagnostics and therefore leaves this empty.
+static DIAGNOSTIC_SNAPSHOTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+pub(crate) fn diagnostic_snapshot(worktree: &str) -> Option<String> {
+    DIAGNOSTIC_SNAPSHOTS
+        .get()
+        .and_then(|snapshots| snapshots.lock().ok()?.get(worktree).cloned())
+}
 
 #[derive(Debug, Default)]
 struct Candidate {
@@ -97,6 +108,11 @@ impl PreviewSupervisor {
             self.pane_tails.clear();
             self.pane_worktrees.clear();
             self.diagnostics.clear();
+            if let Some(snapshots) = DIAGNOSTIC_SNAPSHOTS.get()
+                && let Ok(mut snapshots) = snapshots.lock()
+            {
+                snapshots.clear();
+            }
         }
     }
 
@@ -139,6 +155,7 @@ impl PreviewSupervisor {
         } else {
             self.diagnostics.remove(&scan.worktree);
         }
+        self.publish_diagnostic(&scan.worktree);
         before != self.view(&scan.worktree)
     }
 
@@ -172,6 +189,7 @@ impl PreviewSupervisor {
             candidate.ended_panes.clear();
             candidate.panes.insert(pane_id, (hint, session.clone()));
         }
+        self.publish_diagnostic(worktree);
         before != self.view(worktree)
     }
 
@@ -191,6 +209,7 @@ impl PreviewSupervisor {
                 candidate.ended_panes.insert(pane_id, fact);
             }
         }
+        self.publish_diagnostic(&worktree);
         before != self.view(&worktree)
     }
 
@@ -254,6 +273,21 @@ impl PreviewSupervisor {
                 .map(|tail| String::from_utf8_lossy(tail).into_owned())
         });
         pane_tail.or_else(|| self.diagnostics.get(worktree).cloned())
+    }
+
+    fn publish_diagnostic(&self, worktree: &str) {
+        let snapshots = DIAGNOSTIC_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let Ok(mut snapshots) = snapshots.lock() else {
+            return;
+        };
+        match self.diagnostic(worktree) {
+            Some(diagnostic) => {
+                snapshots.insert(worktree.to_string(), diagnostic);
+            }
+            None => {
+                snapshots.remove(worktree);
+            }
+        }
     }
 }
 

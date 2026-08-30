@@ -249,6 +249,8 @@ pub enum Verb {
     Snapshot,
     KillSession,
     OpenWorktree,
+    /// Fetch one preview URL with the bounded, credential-free host executor.
+    PreviewFetch,
     DriveBrowser,
     /// Block until a session reaches a state — observes only.
     Wait,
@@ -408,6 +410,7 @@ impl Verb {
         Verb::Snapshot,
         Verb::KillSession,
         Verb::OpenWorktree,
+        Verb::PreviewFetch,
         Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
@@ -518,6 +521,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
         | Verb::AgentList
+        | Verb::PreviewFetch
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -852,6 +856,7 @@ mod tests {
             SemanticBlastRadius,
             AgentSessions,
             AgentList,
+            PreviewFetch,
             ModelProxyStatus,
             ModelProxyStats,
         ];

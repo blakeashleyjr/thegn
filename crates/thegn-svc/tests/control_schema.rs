@@ -32,6 +32,8 @@ fn wire_schema() -> serde_json::Value {
         AttachKind,
         BrowserCommand,
         BrowserAction,
+        PreviewFetchRequest,
+        PreviewFetchReply,
         WaitCondition,
         WaitOutcome,
         SplitDir,
