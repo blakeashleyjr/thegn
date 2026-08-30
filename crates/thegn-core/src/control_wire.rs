@@ -265,8 +265,8 @@ impl FeedFilter {
 
     fn parse_kinds(kinds: &str) -> Result<Option<Vec<String>>, FeedFilterError> {
         let mut parsed = Vec::new();
-        for kind in kinds.split(',').map(str::trim) {
-            if parsed.len() >= FEED_KINDS.len() {
+        for (index, kind) in kinds.split(',').map(str::trim).enumerate() {
+            if index >= FEED_KINDS.len() {
                 return Err(FeedFilterError::TooManyKinds);
             }
             if kind.is_empty() {
@@ -914,6 +914,16 @@ mod tests {
         assert_eq!(
             FeedFilter::parse(Some("activity,"), None, false),
             Err(FeedFilterError::EmptyKind)
+        );
+        assert_eq!(
+            FeedFilter::parse(
+                Some(
+                    "activity,activity,activity,activity,activity,activity,activity,activity,activity,activity",
+                ),
+                None,
+                false
+            ),
+            Err(FeedFilterError::TooManyKinds)
         );
         assert_eq!(
             FeedFilter::parse(None, Some(""), false),
