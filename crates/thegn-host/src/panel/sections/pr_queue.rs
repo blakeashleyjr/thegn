@@ -44,7 +44,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ];
     }
     let mut out: Vec<PanelRow> = Vec::new();
-    for (i, r) in rows.iter().enumerate() {
+    let mut display_index = 0;
+    for r in rows {
         let mut left = vec![
             status_glyph(&r.status),
             seg(d(), format!(" #{} ", r.number)),
@@ -67,15 +68,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
         out.push(
             PanelRow::plain(Line::split(left, vec![seg(g2(), r.status.clone())]))
-                .with_hit(PanelHit::Row(Section::PrQueue, i)),
+                .with_hit(PanelHit::Row(Section::PrQueue, display_index)),
         );
-        for (task_index, task) in ctx
+        display_index += 1;
+        for task in ctx
             .model
             .panel
             .review_tasks
             .iter()
-            .enumerate()
-            .filter(|(_, task)| task.pr_number == r.number)
+            .filter(|task| task.pr_number == r.number)
         {
             let location = match task.line {
                 Some(line) if !task.path.is_empty() => format!("{}:{line}", task.path),
@@ -108,8 +109,9 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             )];
             out.push(
                 PanelRow::plain(Line::split(left, right))
-                    .with_hit(PanelHit::Row(Section::PrQueue, rows.len() + task_index)),
+                    .with_hit(PanelHit::Row(Section::PrQueue, display_index)),
             );
+            display_index += 1;
         }
     }
     out.push(prq_hint_row());
