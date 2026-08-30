@@ -122,7 +122,8 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     let target = profile::resolve_active_target(&to_profile)?;
     let mut audit = MigrationAudit::new(&source.name, &target.name, &worktree, dry_run);
 
-    let (source_db, target_db_path, target_db) = with_source_instance_guard(&source, || {
+    let target_db_path = profile_db_path(&target, &profile::default_state_home());
+    let (source_db, target_db) = with_source_instance_guard(&source, || {
         let source_db = if dry_run {
             Db::open_read_only()
                 .context("open source profile database read-only")?
@@ -130,7 +131,6 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         } else {
             Db::open().context("open source profile database")?
         };
-        let target_db_path = profile_db_path(&target, &profile::default_state_home());
         let target_db = if dry_run {
             Db::open_read_only_at(&target_db_path).with_context(|| {
                 format!(
@@ -139,18 +139,26 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
                 )
             })?
         } else {
-            Some(Db::open_at(&target_db_path).with_context(|| {
+            Db::open_read_only_wal_at(&target_db_path).with_context(|| {
                 format!(
-                    "open target profile database at {}",
+                    "open target profile database for preflight at {}",
                     target_db_path.display()
                 )
-            })?)
+            })?
         };
-        Ok((source_db, target_db_path, target_db))
+        Ok((source_db, target_db))
     })?;
     let session = thegn_core::db::session();
     let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
     fill_bundle_audit(&mut audit, &bundle);
+    if bundle.worktree.is_none() && bundle.groups.is_empty() && bundle.dispatches.is_empty() {
+        return fail(
+            &mut audit,
+            json,
+            "worktree path is not registered and has no session groups or dispatches",
+            false,
+        );
+    }
 
     let target_state = target_db
         .as_ref()
@@ -200,17 +208,24 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         }
     }
 
-    let target_db = target_db
-        .as_ref()
-        .expect("real migration always opens a writable target database");
-    if let Err(error) = commit_target_then_cleanup(&source_db, target_db, &plan, &mut audit) {
+    // No writable target handle exists until every conflict/liveness check and
+    // requested kill has completed. In particular, a refused live move cannot
+    // create or migrate the target database.
+    drop(target_db);
+    let target_db = Db::open_at(&target_db_path).with_context(|| {
+        format!(
+            "open target profile database at {}",
+            target_db_path.display()
+        )
+    })?;
+    if let Err(error) = commit_target_then_cleanup(&source_db, &target_db, &plan, &mut audit) {
         let retryable = audit.target_committed;
         return fail(&mut audit, json, &error.to_string(), retryable);
     }
 
     audit.notification = notify_target(
         &target_db_path,
-        target_db,
+        &target_db,
         &source.name,
         &target.name,
         &worktree,

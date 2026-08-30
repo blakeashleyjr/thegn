@@ -101,6 +101,9 @@ pub fn resolve_existing_target(
 ) -> anyhow::Result<ProfilePaths> {
     let source = normalize_name(source_name);
     let requested = normalize_name(raw_target);
+    if requested.is_empty() {
+        anyhow::bail!("target profile name must contain at least one letter or number");
+    }
     let target_name = on_disk_name(base, &requested);
     if source == target_name {
         anyhow::bail!("source and target profiles are the same: {target_name}");
@@ -672,6 +675,7 @@ mod tests {
         assert_eq!(target.root, base.join("profiles/work"));
         assert!(resolve_existing_target(&base, "default", "missing").is_err());
         assert!(resolve_existing_target(&base, "default", "default").is_err());
+        assert!(resolve_existing_target(&base, "default", "!!!").is_err());
         let _ = std::fs::remove_dir_all(&base); // best-effort: test cleanup: scratch removal must never fail the test
     }
 

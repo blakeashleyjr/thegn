@@ -133,17 +133,6 @@ impl SessionMigrationStore for Db {
     }
 
     fn import_migration(&self, plan: &MigrationPlan) -> Result<MigrationImportResult> {
-        // The fingerprint deliberately excludes target-owned worktree metadata.
-        // Therefore an empty target can otherwise look confirmed for a bundle
-        // whose only transferable row is the worktree registration.
-        let worktree_ready = plan.bundle.worktree.is_none() || plan.target.worktree.is_some();
-        if plan.resumed || (worktree_ready && self.confirm_migration(plan)?) {
-            return Ok(MigrationImportResult {
-                counts: MigrationCounts::default(),
-                dispatch_id_map: BTreeMap::new(),
-                fingerprint: plan.fingerprint.clone(),
-            });
-        }
         let bundle = &plan.bundle;
         let mut result = MigrationImportResult {
             counts: MigrationCounts::default(),
@@ -151,6 +140,31 @@ impl SessionMigrationStore for Db {
             fingerprint: plan.fingerprint.clone(),
         };
         self.transaction(|db| {
+            // Re-run conflict/resume planning under the target write
+            // transaction. The target may have changed after the read-only
+            // preflight; never let INSERT OR IGNORE silently turn that race
+            // into a partial import.
+            let current_target =
+                db.migration_target_snapshot(&bundle.session_name, &bundle.worktree_path)?;
+            let current_plan =
+                crate::session_migration::plan_migration(bundle.clone(), current_target)?;
+            // The fingerprint deliberately excludes target-owned worktree
+            // metadata. Therefore an empty target can otherwise look confirmed
+            // for a bundle whose only transferable row is the registration.
+            let worktree_ready =
+                bundle.worktree.is_none() || current_plan.target.worktree.is_some();
+            if current_plan.resumed || (worktree_ready && db.confirm_migration(&current_plan)?) {
+                for (source, target) in bundle
+                    .dispatches
+                    .iter()
+                    .zip(current_plan.target.dispatches.iter())
+                {
+                    result
+                        .dispatch_id_map
+                        .insert(source.source_id, target.source_id);
+                }
+                return Ok(());
+            }
             if let Some(worktree) = &bundle.worktree {
                 let changed = db.conn().execute(
                     "INSERT OR IGNORE INTO worktrees
@@ -289,6 +303,15 @@ impl SessionMigrationStore for Db {
     fn cleanup_migration(&self, bundle: &MigrationBundle) -> Result<MigrationCleanupResult> {
         let mut result = MigrationCleanupResult::default();
         self.transaction(|db| {
+            let current = db.migration_snapshot(
+                &bundle.source_profile,
+                &bundle.target_profile,
+                &bundle.session_name,
+                &bundle.worktree_path,
+            )?;
+            if current != *bundle {
+                anyhow::bail!("source migration state changed after preflight; refusing cleanup");
+            }
             let group_names: Vec<&str> = bundle
                 .groups
                 .iter()
@@ -693,5 +716,85 @@ mod tests {
             plan_migration(bundle, target_state),
             Err(MigrationConflict::UiState("pin:stale".into()))
         );
+    }
+
+    #[test]
+    fn cleanup_refuses_source_rows_changed_after_snapshot() {
+        let source = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+                 VALUES('/w','default','tab','/repo','feature','agent',1,'',0)",
+                [],
+            )
+            .unwrap();
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/w")
+            .unwrap();
+        source
+            .conn()
+            .execute(
+                "UPDATE worktrees SET branch='newer' WHERE worktree='/w'",
+                [],
+            )
+            .unwrap();
+
+        let error = source.cleanup_migration(&bundle).unwrap_err();
+        assert!(error.to_string().contains("changed after preflight"));
+        let remaining: i64 = source
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM worktrees WHERE worktree='/w'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn import_rechecks_target_conflicts_inside_write_transaction() {
+        let source = Db::open_memory().unwrap();
+        let target = Db::open_memory().unwrap();
+        source
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','g','worktree','/w',0,0)",
+                [],
+            )
+            .unwrap();
+        let bundle = source
+            .migration_snapshot("default", "target", "default", "/w")
+            .unwrap();
+        let plan = plan_migration(
+            bundle,
+            target.migration_target_snapshot("default", "/w").unwrap(),
+        )
+        .unwrap();
+
+        // Simulate a target writer winning after read-only preflight but
+        // before this command obtains the target write transaction.
+        target
+            .conn()
+            .execute(
+                "INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+                 VALUES('default','g','worktree','/other',9,0)",
+                [],
+            )
+            .unwrap();
+
+        let error = target.import_migration(&plan).unwrap_err();
+        assert!(error.to_string().contains("target group conflicts"));
+        let existing: String = target
+            .conn()
+            .query_row(
+                "SELECT worktree FROM tab_groups WHERE session_name='default' AND name='g'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing, "/other");
     }
 }
