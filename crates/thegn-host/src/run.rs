@@ -1597,6 +1597,53 @@ fn current_forward_views(
         .unwrap_or_default()
 }
 
+/// URL ordering shared by the Forward section renderer and its Enter/`o`
+/// affordances: selected preview first, then existing sandbox forwards.
+fn forward_url_at(model: &FrameModel, index: usize) -> Option<&str> {
+    match (&model.preview, index) {
+        (Some(preview), 0) => Some(preview.url.as_str()),
+        (Some(_), index) => model
+            .forwards
+            .get(index - 1)
+            .map(|forward| forward.url.as_str()),
+        (None, index) => model
+            .forwards
+            .get(index)
+            .map(|forward| forward.url.as_str()),
+    }
+}
+
+/// Kick one event-driven preview discovery pass for the active branch
+/// worktree. The worker reads `package.json` once and reports by channel+waker;
+/// no timer or idle probe is installed.
+fn request_preview_scan(
+    supervisor: &mut crate::preview::PreviewSupervisor,
+    session: &crate::session::Session,
+    cfg: &thegn_core::config::Config,
+    tx: &tokio_mpsc::UnboundedSender<crate::preview_watch::ScanResult>,
+    waker: &TerminalWaker,
+) {
+    use crate::session::GroupKind;
+    if !cfg.preview.enabled {
+        return;
+    }
+    let Some(worktree) = session
+        .active_group()
+        .filter(|group| group.kind == GroupKind::Branch && !group.path.is_empty())
+        .map(|group| std::path::PathBuf::from(&group.path))
+    else {
+        return;
+    };
+    let generation = supervisor.next_scan_generation();
+    crate::preview_watch::spawn_scan(
+        generation,
+        worktree,
+        cfg.preview.ports.clone(),
+        tx.clone(),
+        waker.clone(),
+    );
+}
+
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     use crate::share::ShareEvent;
@@ -6193,6 +6240,17 @@ async fn event_loop<T: Terminal>(
     // container netns. `forward_target` is the worktree the detector watches; the
     // loop updates it as the active worktree changes.
     let mut forward_supervisor = crate::forward::ForwardSupervisor::new();
+    let mut preview_supervisor = crate::preview::PreviewSupervisor::new();
+    preview_supervisor.set_enabled(keymap.config().preview.enabled);
+    let (preview_tx, mut preview_rx) =
+        tokio_mpsc::unbounded_channel::<crate::preview_watch::ScanResult>();
+    request_preview_scan(
+        &mut preview_supervisor,
+        &session,
+        keymap.config(),
+        &preview_tx,
+        &waker,
+    );
     // Reverse host→sandbox tunnels (P0b model-proxy-by-default, P1 host services):
     // per-worktree, started in `connect_worktree_bridge`, stopped on close.
     let reverse_tunnel_supervisor = crate::revtunnel::ReverseTunnelSupervisor::new();
@@ -7724,6 +7782,16 @@ async fn event_loop<T: Terminal>(
             // (and `stop share` never cleans up against a stale list) while
             // the coalesced hydration is still pending.
             model.shares = current_share_views(&share_supervisor, &session);
+            model.preview = session
+                .active_group()
+                .and_then(|group| preview_supervisor.view(&group.path));
+            request_preview_scan(
+                &mut preview_supervisor,
+                &session,
+                &current_config,
+                &preview_tx,
+                &waker,
+            );
             sync_panel_docs(&mut panel_ui, &session, docs_gen, &docs_tx, &waker);
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
@@ -8312,6 +8380,7 @@ async fn event_loop<T: Terminal>(
                 shutdown: &shutdown,
                 event_bus: &event_bus,
                 notify_state: &notify_state,
+                preview: &mut preview_supervisor,
                 writer: &writer,
             };
             crate::pty_drain::drain(
@@ -8333,6 +8402,13 @@ async fn event_loop<T: Terminal>(
         }
         if drain_summary.preempted {
             loop_perf.input_preempt();
+        }
+        let next_preview = session
+            .active_group()
+            .and_then(|group| preview_supervisor.view(&group.path));
+        if model.preview != next_preview {
+            model.preview = next_preview;
+            dirty = true;
         }
         // The onboarding wizard's login/agent tab closed: resume + re-probe.
         dirty |= crate::handlers::onboarding::on_pane_exit(
@@ -9377,6 +9453,9 @@ async fn event_loop<T: Terminal>(
             model.shares = current_share_views(&share_supervisor, &session);
             // Forwards likewise live on their supervisor — re-apply per worktree.
             model.forwards = current_forward_views(&forward_supervisor, &session);
+            model.preview = session
+                .active_group()
+                .and_then(|group| preview_supervisor.view(&group.path));
             // Plugin statusbar segments are loop-owned (handlers::plugins), not
             // hydrated — re-stamp them so a model swap doesn't blank the bar.
             model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
@@ -10502,6 +10581,17 @@ async fn event_loop<T: Terminal>(
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
                     current_config = new_cfg;
+                    preview_supervisor.set_enabled(current_config.preview.enabled);
+                    request_preview_scan(
+                        &mut preview_supervisor,
+                        &session,
+                        &current_config,
+                        &preview_tx,
+                        &waker,
+                    );
+                    model.preview = session
+                        .active_group()
+                        .and_then(|group| preview_supervisor.view(&group.path));
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded
@@ -11438,6 +11528,7 @@ async fn event_loop<T: Terminal>(
                 // resurrection rows); they re-detect if we switch back.
                 if let Some(prev) = &last_forward_target {
                     for port in forward_supervisor.stop_all_on(prev) {
+                        let _ = preview_supervisor.provider_down(prev, port);
                         if let Ok(db) = thegn_core::db::Db::open() {
                             let _ = db.delete_forward(prev, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
@@ -11445,6 +11536,9 @@ async fn event_loop<T: Terminal>(
                     // Tear down the reverse model-proxy/host tunnels too.
                     reverse_tunnel_supervisor.stop_worktree(prev);
                     model.forwards = current_forward_views(&forward_supervisor, &session);
+                    model.preview = session
+                        .active_group()
+                        .and_then(|group| preview_supervisor.view(&group.path));
                     dirty = true;
                 }
                 last_forward_target = target.clone();
@@ -11476,6 +11570,11 @@ async fn event_loop<T: Terminal>(
                             &runtime,
                         ) {
                             Ok(started) => {
+                                let preview_changed = preview_supervisor.provider_up(
+                                    &worktree,
+                                    container_port,
+                                    started.url.clone(),
+                                );
                                 if let Ok(db) = thegn_core::db::Db::open() {
                                     let _ = db.upsert_forward(
                                         // best-effort: cache write: the forward state row feeds the UI/`share list`; the forward itself is already up
@@ -11498,6 +11597,11 @@ async fn event_loop<T: Terminal>(
                                 }
                                 model.forwards =
                                     current_forward_views(&forward_supervisor, &session);
+                                if preview_changed {
+                                    model.preview = session
+                                        .active_group()
+                                        .and_then(|group| preview_supervisor.view(&group.path));
+                                }
                                 dirty = true;
                             }
                             Err(e) => {
@@ -11512,13 +11616,34 @@ async fn event_loop<T: Terminal>(
                     container_port,
                 } => {
                     if forward_supervisor.stop(&worktree, container_port) {
+                        let preview_changed =
+                            preview_supervisor.provider_down(&worktree, container_port);
                         if let Ok(db) = thegn_core::db::Db::open() {
                             let _ = db.delete_forward(&worktree, container_port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
                         model.forwards = current_forward_views(&forward_supervisor, &session);
+                        if preview_changed {
+                            model.preview = session
+                                .active_group()
+                                .and_then(|group| preview_supervisor.view(&group.path));
+                        }
                         dirty = true;
                     }
                 }
+            }
+        }
+
+        // One-shot package/config discovery results. Stale generations (rapid
+        // switch/reload) are rejected by the supervisor.
+        while let Ok(scan) = preview_rx.try_recv() {
+            let worktree = scan.worktree.clone();
+            if preview_supervisor.apply_scan(scan)
+                && session
+                    .active_group()
+                    .is_some_and(|group| group.path == worktree)
+            {
+                model.preview = preview_supervisor.view(&worktree);
+                dirty = true;
             }
         }
 
@@ -17354,11 +17479,10 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Forward => {
-                                            // Enter copies the focused forward's preview URL.
-                                            if let Some(url) = model
-                                                .forwards
-                                                .get(panel_ui.cursor)
-                                                .map(|f| f.url.clone())
+                                            // Enter copies the focused preview/forward URL.
+                                            if let Some(url) =
+                                                forward_url_at(&model, panel_ui.cursor)
+                                                    .map(str::to_owned)
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
                                                 crate::clipboard::copy(&url);
@@ -18067,21 +18191,23 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- forward: open the focused preview in the browser --
                         (Section::Forward, KeyCode::Char('o')) => {
-                            if let Some(f) = model.forwards.get(panel_ui.cursor) {
+                            if let Some(url) =
+                                forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
+                            {
                                 let cmd = current_config.forward.browser.trim();
                                 if cmd.is_empty() {
-                                    open_url_detached(&f.url);
+                                    open_url_detached(&url);
                                 } else {
                                     let mut c = std::process::Command::new(cmd);
-                                    c.arg(&f.url)
+                                    c.arg(&url)
                                         .stdin(std::process::Stdio::null())
                                         .stdout(std::process::Stdio::null())
                                         .stderr(std::process::Stdio::null());
                                     crate::actions::spawn_detached_reaped(c);
                                 }
-                                model.status = format!("Opened {} in browser", f.url);
+                                model.status = format!("Opened {url} in browser");
                             } else {
-                                model.status = "No forward selected".into();
+                                model.status = "No preview selected".into();
                             }
                             true
                         }

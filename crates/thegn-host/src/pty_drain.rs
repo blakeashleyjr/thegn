@@ -257,6 +257,9 @@ pub(crate) struct DrainCtx<'a> {
     pub shutdown: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub event_bus: &'a thegn_core::event_bus::EventBus,
     pub notify_state: &'a std::sync::Arc<crate::notify::NotifyState>,
+    /// Live browser-preview lifecycle. Pane bytes are inspected only after
+    /// normal receipt and remain pane-only damage unless the projection changes.
+    pub preview: &'a mut crate::preview::PreviewSupervisor,
     /// All stdout bytes route through the writer thread — a direct write here
     /// could interleave with an in-flight frame.
     pub writer: &'a crate::frame_writer::FrameWriter,
@@ -323,6 +326,9 @@ pub(crate) fn drain<T: Terminal>(
         let tail = backlog.drain_pane(id);
         if !tail.is_empty() {
             handle_output(ctx, id, &tail);
+        }
+        if ctx.preview.pane_exit(id) {
+            *ctx.dirty = true;
         }
         // A degraded pane that exited needs no watchdog entry. (A missed prune
         // is harmless memory — pane ids are monotonic and never reused.)
@@ -409,6 +415,24 @@ pub(crate) fn prune_output_degraded(
 /// channel, and mark pane damage. Moved verbatim from the run.rs drain
 /// (adapted to `ctx` borrows; per-chunk work now runs once per merged buffer).
 fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
+    // Associate output with the session tree before borrowing the pane mutably.
+    // Parsing this bounded tail is pure CPU; a full chrome repaint is raised
+    // only when discovery/status changes, never for unrelated PTY bytes.
+    let preview_meta = ctx
+        .session
+        .iter_tabs()
+        .find(|(_, _, tab)| tab.center.pane_ids().contains(&id))
+        .map(|(gi, _, _)| {
+            let worktree = ctx.session.worktrees[gi].path.clone();
+            let session = ctx.panes.table.get(&id).and_then(|pane| pane.session_id());
+            (worktree, session)
+        });
+    if let Some((worktree, session)) = preview_meta
+        && !worktree.is_empty()
+        && ctx.preview.pane_output(id, &worktree, session, b)
+    {
+        *ctx.dirty = true;
+    }
     if let Some(p) = ctx.panes.table.get_mut(&id) {
         // First real output ⇒ this worktree's shell is live; drop its loading
         // splash (by owner, so a background worktree that finished while away
