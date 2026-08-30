@@ -9199,6 +9199,17 @@ async fn event_loop<T: Terminal>(
                 // two carry the same gen) is free again either way.
                 switch_hydration_gen = None;
             }
+            // Intent rows are claim-and-delete carriers, not part of the model
+            // snapshot. A hydration can claim them and then become stale when
+            // the user switches worktrees before it lands; drain them before
+            // rejecting that snapshot or the acknowledged request is lost.
+            drain_hydration_intents(
+                &mut next_model,
+                &mut pending_focus,
+                &mut pending_preset,
+                &mut pending_adopts,
+                &mut pending_editor_opens,
+            );
             if generation != hydration_gen {
                 continue;
             }
@@ -9208,17 +9219,6 @@ async fn event_loop<T: Terminal>(
             // review source is updated.
             let review_for_diff_view = next_model.panel.review_snapshot.clone();
             let review_status_for_diff_view = next_model.panel.review_snapshot_status.clone();
-            // `thegn open` intents ride the hydration result (claimed from
-            // the DB mailbox off-loop); take them out before the model swap —
-            // last one wins, applied after the drain below.
-            if let Some(row) = next_model.intents.drain(..).next_back() {
-                pending_focus = Some(row);
-            }
-            if let Some(row) = next_model.preset_intents.drain(..).next_back() {
-                pending_preset = Some(row);
-            }
-            pending_adopts.append(&mut next_model.adopt_intents);
-            pending_editor_opens.append(&mut next_model.open_editor_intents);
             // Now-playing is loop-owned (the media watcher pushes it); hydration
             // never carries it. Seed it across the swap BEFORE the equality
             // checks below, or every hydration wipes the badge (it flashes back
@@ -22362,6 +22362,29 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         tab.focused_pane = *map.values().next().unwrap_or(&0);
     }
     true
+}
+
+/// Preserve claim-and-delete mailbox rows independently of model freshness.
+///
+/// Hydration snapshots are generation-scoped, but intents are global transient
+/// deliveries. Once `build_model` has claimed a row, even a stale snapshot must
+/// hand it to the loop or the row has already been deleted with no consumer.
+fn drain_hydration_intents(
+    model: &mut crate::chrome::FrameModel,
+    pending_focus: &mut Option<thegn_core::store::IntentRow>,
+    pending_preset: &mut Option<thegn_core::store::IntentRow>,
+    pending_adopts: &mut Vec<thegn_core::store::IntentRow>,
+    pending_editor_opens: &mut Vec<thegn_core::store::IntentRow>,
+) {
+    // Focus and preset are last-wins; adopt and editor-open are drain-all.
+    if let Some(row) = model.intents.drain(..).next_back() {
+        *pending_focus = Some(row);
+    }
+    if let Some(row) = model.preset_intents.drain(..).next_back() {
+        *pending_preset = Some(row);
+    }
+    pending_adopts.append(&mut model.adopt_intents);
+    pending_editor_opens.append(&mut model.open_editor_intents);
 }
 
 #[cfg(test)]

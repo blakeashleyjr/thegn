@@ -39,7 +39,9 @@ impl Editor for Emacs {
         let mut argv = vec![EXECUTABLE.into(), "-n".into()];
         if let Some(line) = target.line() {
             argv.push(match target.col() {
-                Some(col) => format!("+{line}:{col}"),
+                // The handoff seam is 1-based, while Emacs action-argument
+                // columns are zero-based (column 0 is the leftmost column).
+                Some(col) => format!("+{line}:{}", col.saturating_sub(1)),
                 None => format!("+{line}"),
             });
         }
