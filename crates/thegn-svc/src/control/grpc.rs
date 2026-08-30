@@ -22,7 +22,7 @@ use thegn_core::store::ControlStore;
 use super::auth::{self, AuthCtx};
 use super::{
     AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec,
-    SplitDir, WaitCondition,
+    PreviewFetchRequest, SplitDir, WaitCondition,
 };
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
@@ -54,8 +54,12 @@ impl From<ControlError> for Status {
     fn from(e: ControlError) -> Status {
         match &e {
             ControlError::NotFound(_) => Status::not_found(e.to_string()),
+            ControlError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
             ControlError::NoScope { .. } => Status::permission_denied(e.to_string()),
             ControlError::Conflict(_) => Status::aborted(e.to_string()),
+            ControlError::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
+            ControlError::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            ControlError::Unavailable(_) => Status::unavailable(e.to_string()),
             ControlError::Unimplemented(_) => Status::unimplemented(e.to_string()),
             ControlError::Internal(_) => Status::internal(e.to_string()),
         }
@@ -508,6 +512,32 @@ impl Control for GrpcControl {
         Ok(Response::new(proto::Empty {}))
     }
 
+    async fn preview_fetch(
+        &self,
+        req: Request<proto::PreviewFetchRequest>,
+    ) -> Result<Response<proto::PreviewFetchReply>, Status> {
+        self.authed(&req, Verb::PreviewFetch)?;
+        let r = req.into_inner();
+        let reply = self
+            .api
+            .preview_fetch(PreviewFetchRequest {
+                url: r.url,
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                include_console: r.include_console,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::PreviewFetchReply {
+            url: reply.url,
+            status: u32::from(reply.status),
+            content_type: reply.content_type.unwrap_or_default(),
+            body: reply.body,
+            truncated: reply.truncated,
+            console_errors: reply.console_errors,
+            diagnostics_source: reply.diagnostics_source,
+        }))
+    }
+
     async fn git_status(
         &self,
         req: Request<proto::GitStatusRequest>,
@@ -786,6 +816,7 @@ pub const GRPC_CAPS: &[&str] = &[
     "worktrees.list",
     "worktrees.open",
     "browser.drive",
+    "preview.fetch",
     "git.status",
     "git.stage",
     "git.commit",

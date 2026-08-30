@@ -1000,6 +1000,13 @@ fn config_overlay_apply_sets_every_field() {
         loc_watch_invalidate_secs: Some(11),
         weather_enabled: Some(true),
         notifications_agent_attention_inbox: Some(true),
+        preview: crate::config_preview::PreviewOverlay {
+            enabled: Some(false),
+            ports: Some(vec![3000, 5173]),
+            fetch_timeout_ms: Some(850),
+            max_body_bytes: Some(8192),
+            allow_external_urls: Some(true),
+        },
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -1062,6 +1069,11 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(cfg.weather.enabled);
     assert!(cfg.notifications.agent_attention_inbox);
+    assert!(!cfg.preview.enabled);
+    assert_eq!(cfg.preview.ports, vec![3000, 5173]);
+    assert_eq!(cfg.preview.fetch_timeout_ms, 850);
+    assert_eq!(cfg.preview.max_body_bytes, 8192);
+    assert!(cfg.preview.allow_external_urls);
     assert!(!cfg.sandbox.enabled);
 }
 

@@ -22,6 +22,8 @@ service Control {
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesReply);
   // v1: always UNIMPLEMENTED (the contract slot for the preview browser).
   rpc DriveBrowser(DriveBrowserRequest) returns (Empty);
+  // Bounded, credential-free preview HTTP GET.
+  rpc PreviewFetch(PreviewFetchRequest) returns (PreviewFetchReply);
   // Block until a session reaches a state (idle, exit, pattern) — observes only.
   rpc Wait(WaitRequest) returns (WaitReply);
   // Create a sibling pane/session next to an existing one.
@@ -185,6 +187,22 @@ message DriveBrowserRequest {
     Empty reload = 3;
     Empty back = 4;
   }
+}
+
+message PreviewFetchRequest {
+  string url = 1;
+  string worktree = 2;        // empty = none
+  bool include_console = 3;
+}
+
+message PreviewFetchReply {
+  string url = 1;             // final URL after validated redirects
+  uint32 status = 2;
+  string content_type = 3;    // empty = absent
+  string body = 4;            // bounded, lossy UTF-8
+  bool truncated = 5;
+  repeated string console_errors = 6;
+  string diagnostics_source = 7;
 }
 
 message GitStatusRequest { string worktree = 1; }

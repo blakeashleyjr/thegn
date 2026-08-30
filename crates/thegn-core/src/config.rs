@@ -4710,6 +4710,7 @@ pub use crate::config_pr_queue::{
     PrAutoEnqueue, PrMergeMethod, PrMergeMode, PrQueueConfig, PrQueueOverlay, PrQueuePrompts,
     PrQueuePromptsOverlay, PrWatchKind,
 };
+pub use crate::config_preview::PreviewConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -4871,6 +4872,8 @@ pub struct Config {
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
     /// loopback for browser preview. On by default (loopback-only ⇒ safe).
     pub forward: ForwardConfig,
+    /// `[preview]` — pure frontend target discovery and bounded-fetch policy.
+    pub preview: PreviewConfig,
     /// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
     /// sandboxes (keep recently-used ones warm for fast resume; let idle ones
     /// suspend; provision ahead of focus). Budget-safe defaults.
@@ -5042,6 +5045,7 @@ impl Default for Config {
             host_discovery: crate::config_host_discovery::HostDiscoveryConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
+            preview: PreviewConfig::default(),
             lifecycle: LifecycleConfig::default(),
             placement: PlacementConfig::default(),
             keybinds: KeybindConfig::default(),
@@ -5155,6 +5159,7 @@ pub struct ConfigOverlay {
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
+    pub preview: crate::config_preview::PreviewOverlay,
     pub sandbox: SandboxOverlay,
 }
 
@@ -5241,6 +5246,7 @@ impl ConfigOverlay {
             base.notifications.agent_attention_inbox,
             self.notifications_agent_attention_inbox
         );
+        self.preview.apply(&mut base.preview);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -5503,6 +5509,27 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX") {
         o.notifications_agent_attention_inbox =
             parse_bool(&v, "THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX");
+    }
+
+    // [preview] — all five keys are trusted launch-time knobs.
+    if let Some(v) = env.get("THEGN_PREVIEW_ENABLED") {
+        o.preview.enabled = parse_bool(&v, "THEGN_PREVIEW_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_PORTS") {
+        match crate::config_preview::parse_ports_env(&v) {
+            Ok(ports) => o.preview.ports = Some(ports),
+            Err(error) => config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring")),
+        }
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_FETCH_TIMEOUT_MS") {
+        o.preview.fetch_timeout_ms = parse_num(v, "THEGN_PREVIEW_FETCH_TIMEOUT_MS");
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_MAX_BODY_BYTES") {
+        o.preview.max_body_bytes = parse_num(v, "THEGN_PREVIEW_MAX_BODY_BYTES")
+            .and_then(|value| usize::try_from(value).ok());
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS") {
+        o.preview.allow_external_urls = parse_bool(&v, "THEGN_PREVIEW_ALLOW_EXTERNAL_URLS");
     }
 
     // [sandbox]
@@ -5929,6 +5956,7 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        self.preview.normalize();
         // Drop unusable command collectors up front so the supervisor never has
         // to guess: a `kind = "command"` target with an empty/blank argv can
         // never run, and a `kind = "prometheus"` target with no URL can never be
