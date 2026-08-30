@@ -180,7 +180,8 @@ because each carries its own session.
 ## 3. Dispatch — one call: row + session + stage overrides
 
 ```bash
-thegn session open --stage <stage.name> --issue <issue-id> --adopt --json
+thegn session open --stage <stage.name> --issue <issue-id> \
+  --worktree <path> --adopt --json
 ```
 
 This is the whole dispatch: it renders the stage's prompt template (an explicit
@@ -194,7 +195,8 @@ config). `--adopt` asks a running compositor to graft the session into a pane;
 **For a coder chunk, pass the chunk file** so the row records its scope:
 
 ```bash
-thegn session open --stage code --issue linear:ABC-123 --adopt --json \
+thegn session open --stage code --issue linear:ABC-123 \
+  --worktree <path> --adopt --json \
     --chunk .thegn/pipeline/ABC-123/code/chunk-2.md
 ```
 
