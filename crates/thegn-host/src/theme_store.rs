@@ -745,15 +745,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn bounded_reader_rejects_a_fifo_without_blocking() {
-        use nix::sys::stat::Mode;
-        use nix::unistd::mkfifo;
-
         let dir = temp_dir("read-fifo");
         let fifo = dir.join("blocking.toml");
-        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        if !crate::platform::test_fifo_supported() {
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        crate::platform::test_fifo(&fifo).unwrap();
 
         assert!(read_bounded(&fifo).is_err());
         let _ = std::fs::remove_dir_all(dir);
