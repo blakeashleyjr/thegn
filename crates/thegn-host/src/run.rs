@@ -2112,8 +2112,7 @@ pub(crate) fn switch_workspace(
 }
 
 use crate::panel_util::{
-    editor_open_command, file_entry_at, open_editor, parse_file_line, persist_panel_state,
-    toggle_files_collapse,
+    file_entry_at, open_editor, parse_file_line, persist_panel_state, toggle_files_collapse,
 };
 
 /// The docs-fetch wiring a panel transition needs: generation + channel +
@@ -6528,6 +6527,11 @@ async fn event_loop<T: Terminal>(
     // The in-app diff viewer's async git-diff feed.
     let (diff_view_tx, mut diff_view_rx) =
         tokio_mpsc::unbounded_channel::<crate::diff_view::DiffViewData>();
+    // Editor/IDE plans and detached-launch results return here. Planning,
+    // environment lookup, filesystem checks, cap probing, and external spawn
+    // all stay on the worker side of this channel.
+    let (ide_handoff_tx, mut ide_handoff_rx) =
+        tokio_mpsc::unbounded_channel::<crate::ide_handoff::Outcome>();
     // Media (optional [media] feature): the watcher / control ops push now-playing
     // snapshots; the picker tasks push playlist/player lists. The watcher runs
     // only while `[media] enabled`; `restart_media_watch` (re)spawns it on config
@@ -7309,6 +7313,23 @@ async fn event_loop<T: Terminal>(
                     // OSC-52 to the outer terminal's clipboard (item 27).
                     writer.submit_oob(crate::copymode::osc52(&text));
                     model.status = format!("Copied: {text}");
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::OpenInIde {
+                    target,
+                    workspace_slug,
+                } => {
+                    crate::ide_handoff::dispatch(
+                        target,
+                        workspace_slug,
+                        "sidebar",
+                        crate::ide_handoff::PanePlacement::Tab,
+                        &current_config,
+                        &ide_handoff_tx,
+                        &waker,
+                    );
+                    model.status = "Opening selected worktree in IDE…".into();
                     dirty = true;
                     continue;
                 }
@@ -8444,6 +8465,21 @@ async fn event_loop<T: Terminal>(
         // dropped — a fresh hydration is always in flight for the current one.
         // Discovery results: seed newly-found tests as Unknown (merge, not
         // replace). Stale generations / other worktrees are dropped.
+        while let Ok(outcome) = ide_handoff_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if crate::ide_handoff::apply(
+                outcome,
+                &mut session,
+                &mut panes,
+                &mut focus,
+                &mut model,
+                &mut sb,
+                chrome.center,
+            ) {
+                need_relayout = true;
+            }
+            dirty = true;
+        }
         while let Ok(d) = test_discovery_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
             if d.generation == test_generation && d.worktree == loaded_tests_worktree {
@@ -9150,6 +9186,9 @@ async fn event_loop<T: Terminal>(
         // ALL applied (a fan-out expects one pane per row), unlike the two
         // last-wins intents above.
         let mut pending_adopts: Vec<thegn_core::store::IntentRow> = Vec::new();
+        // `editor.open` is drain-all: separate control callers may intentionally
+        // queue several files, unlike focus/preset's last-wins semantics.
+        let mut pending_editor_opens: Vec<thegn_core::store::IntentRow> = Vec::new();
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
             // In-flight hydration landed — clear the gate (before the stale-check so
@@ -9179,6 +9218,7 @@ async fn event_loop<T: Terminal>(
                 pending_preset = Some(row);
             }
             pending_adopts.append(&mut next_model.adopt_intents);
+            pending_editor_opens.append(&mut next_model.open_editor_intents);
             // Now-playing is loop-owned (the media watcher pushes it); hydration
             // never carries it. Seed it across the swap BEFORE the equality
             // checks below, or every hydration wipes the badge (it flashes back
@@ -9566,6 +9606,31 @@ async fn event_loop<T: Terminal>(
                 }
                 (_, None) => {
                     model.status = format!("unknown preset '{}'", pi.name);
+                }
+            }
+            dirty = true;
+        }
+
+        // Claimed control handoffs carry targets, never commands. Revalidate
+        // each one against this compositor's fresh known-worktree projection,
+        // then resolve and launch through the same worker as every UI surface.
+        if !pending_editor_opens.is_empty() {
+            let known = crate::ide_handoff::known_worktrees(&model, &session);
+            for row in std::mem::take(&mut pending_editor_opens) {
+                match crate::ide_handoff::target_from_intent(&row, known.clone()) {
+                    Ok((target, workspace_slug, source)) => crate::ide_handoff::dispatch(
+                        target,
+                        workspace_slug,
+                        format!("editor.open ({source})"),
+                        crate::ide_handoff::PanePlacement::Tab,
+                        &current_config,
+                        &ide_handoff_tx,
+                        &waker,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(target: "thegn::editor", "{error}");
+                        model.status = error;
+                    }
                 }
             }
             dirty = true;
@@ -14317,6 +14382,7 @@ async fn event_loop<T: Terminal>(
                         &waker,
                         &mut model,
                         &mut active_menu,
+                        &ide_handoff_tx,
                     );
                     dirty = true;
                     continue;
@@ -14324,7 +14390,16 @@ async fn event_loop<T: Terminal>(
                 // The in-app diff viewer is a top-priority read-only modal: it
                 // owns every key while open (Esc/q dismiss).
                 if diff_view.is_some() {
-                    crate::actions::dispatch_diff_view_key(&mut diff_view, &k.key, k.modifiers);
+                    crate::actions::dispatch_diff_view_key(
+                        &mut diff_view,
+                        &k.key,
+                        k.modifiers,
+                        &session,
+                        keymap.config(),
+                        &mut model,
+                        &ide_handoff_tx,
+                        &waker,
+                    );
                     dirty = true;
                     continue;
                 }
@@ -15862,24 +15937,23 @@ async fn event_loop<T: Terminal>(
                         }
                         crate::search_overlay::Outcome::OpenEditor => {
                             if let Some((rel_path, line_no)) = o.selected_location() {
-                                let worktree_root = active_tab_path(&session);
-                                let abs_path = worktree_root.join(&rel_path);
-                                let editor = std::env::var("EDITOR")
-                                    .or_else(|_| std::env::var("VISUAL"))
-                                    .unwrap_or_else(|_| "vi".into());
-                                let queued = if let Some(fp) = panes.table.get_mut(&focused) {
-                                    let cmd = format!(
-                                        "{editor} +{line_no} {}\n",
-                                        thegn_core::util::sh_quote(&abs_path.display().to_string())
-                                    );
-                                    fp.write_input(cmd.as_bytes()).is_ok()
-                                } else {
-                                    false
-                                };
-                                model.status = injected_command_status(
-                                    queued,
-                                    format!("Opening {rel_path}:{line_no}"),
-                                );
+                                match crate::ide_handoff::dispatch_active(
+                                    &session,
+                                    Some(&rel_path),
+                                    Some(line_no),
+                                    None,
+                                    "search and replace",
+                                    crate::ide_handoff::PanePlacement::Split(focused),
+                                    &current_config,
+                                    &ide_handoff_tx,
+                                    &waker,
+                                ) {
+                                    Ok(()) => {
+                                        model.status =
+                                            format!("Opening {rel_path}:{line_no} in IDE…")
+                                    }
+                                    Err(error) => model.status = error,
+                                }
                             }
                         }
                         crate::search_overlay::Outcome::Search
@@ -15998,32 +16072,23 @@ async fn event_loop<T: Terminal>(
                                                 rel_path,
                                             );
                                         }
-                                        let abs_path = worktree_root.join(rel_path);
-                                        let editor = std::env::var("EDITOR")
-                                            .or_else(|_| std::env::var("VISUAL"))
-                                            .unwrap_or_else(|_| "vi".into());
-                                        let line_arg = format!("+{line_no}");
-                                        let queued = if let Some(focused_pane) =
-                                            panes.table.get_mut(&focused)
-                                        {
-                                            // Shell-quote the path: it's written into
-                                            // the pane's live shell, and a filename
-                                            // with a space or metacharacter would
-                                            // otherwise break the command or inject.
-                                            let cmd = format!(
-                                                "{editor} {line_arg} {}\n",
-                                                thegn_core::util::sh_quote(
-                                                    &abs_path.display().to_string()
-                                                )
-                                            );
-                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
-                                        } else {
-                                            false
-                                        };
-                                        model.status = injected_command_status(
-                                            queued,
-                                            format!("Opening {}:{line_no}", rel_path),
-                                        );
+                                        match crate::ide_handoff::dispatch_active(
+                                            &session,
+                                            Some(rel_path),
+                                            Some(line_no as usize),
+                                            None,
+                                            "search palette",
+                                            crate::ide_handoff::PanePlacement::Split(focused),
+                                            &current_config,
+                                            &ide_handoff_tx,
+                                            &waker,
+                                        ) {
+                                            Ok(()) => {
+                                                model.status =
+                                                    format!("Opening {rel_path}:{line_no} in IDE…")
+                                            }
+                                            Err(error) => model.status = error,
+                                        }
                                     }
                                     palette = None;
                                     dirty = true;
@@ -18176,14 +18241,20 @@ async fn event_loop<T: Terminal>(
                                     .map(|c| c.path.clone())
                             };
                             if let Some(path) = path {
-                                let wt = active_tab_path(&session);
-                                let abs_path = wt.join(path);
-                                let cmd = editor_open_command(
-                                    keymap.config(),
-                                    &abs_path.to_string_lossy(),
+                                match crate::ide_handoff::dispatch_active(
+                                    &session,
+                                    Some(&path),
                                     None,
-                                );
-                                crate::panel_util::spawn_editor_detached(&cmd, None);
+                                    None,
+                                    "panel Ctrl-O",
+                                    crate::ide_handoff::PanePlacement::Tab,
+                                    &current_config,
+                                    &ide_handoff_tx,
+                                    &waker,
+                                ) {
+                                    Ok(()) => model.status = format!("Opening {path} in IDE…"),
+                                    Err(error) => model.status = error,
+                                }
                             }
                             true
                         }
@@ -21530,6 +21601,24 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
+                                }
+                            }
+                            Action::OpenInIde => {
+                                match crate::ide_handoff::dispatch_active(
+                                    &session,
+                                    None,
+                                    None,
+                                    None,
+                                    "command palette",
+                                    crate::ide_handoff::PanePlacement::Tab,
+                                    &current_config,
+                                    &ide_handoff_tx,
+                                    &waker,
+                                ) {
+                                    Ok(()) => {
+                                        model.status = "Opening focused worktree in IDE…".into()
+                                    }
+                                    Err(error) => model.status = error,
                                 }
                             }
                             Action::Diff => {
