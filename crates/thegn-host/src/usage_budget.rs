@@ -13,24 +13,41 @@ pub(crate) struct BudgetNotification {
     pub worktree: String,
 }
 
+/// Notification strings eventually reach termwiz `Change::Text`, where CR/LF
+/// are cursor movement rather than inert glyphs. Scope names are configured
+/// text (and worktree paths are valid Unix strings), so make controls visible
+/// instead of letting them escape the notification's clip rectangle.
+fn safe_scope_text(scope: &str) -> String {
+    let mut safe = String::with_capacity(scope.len());
+    for c in scope.chars() {
+        if c.is_control() {
+            safe.extend(c.escape_default());
+        } else {
+            safe.push(c);
+        }
+    }
+    safe
+}
+
 pub(crate) fn notification(fact: &BudgetBreachFact) -> BudgetNotification {
     let dimension = fact.dimension.as_str();
-    let scope = if fact.scope.is_empty() {
-        "unknown scope"
+    let safe_scope = safe_scope_text(&fact.scope);
+    let scope = if safe_scope.is_empty() {
+        "unknown scope".to_string()
     } else {
-        fact.scope.as_str()
+        safe_scope
     };
     BudgetNotification {
         kind: NotificationKind::UsageLimit.as_str(),
         source_ref: format!(
-            "model-proxy-budget:{}:{}:{dimension}",
-            fact.scope, fact.window_start_ms
+            "model-proxy-budget:{scope}:{}:{dimension}",
+            fact.window_start_ms
         ),
         message: format!("Model-proxy {dimension} budget reached for {scope}"),
         worktree: fact
             .scope
             .strip_prefix("worktree:")
-            .filter(|path| !path.is_empty())
+            .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
             .unwrap_or("")
             .to_string(),
     }
@@ -112,5 +129,24 @@ mod tests {
             "Model-proxy tokens budget reached for custom"
         );
         assert!(unknown.worktree.is_empty());
+    }
+
+    #[test]
+    fn control_characters_cannot_escape_notification_rendering() {
+        let alert = notification(&fact(
+            "worktree:/repo/evil\r\nname",
+            BudgetDimension::Tokens,
+        ));
+        assert_eq!(
+            alert.source_ref,
+            "model-proxy-budget:worktree:/repo/evil\\r\\nname:1234:tokens"
+        );
+        assert_eq!(
+            alert.message,
+            "Model-proxy tokens budget reached for worktree:/repo/evil\\r\\nname"
+        );
+        assert!(!alert.source_ref.chars().any(char::is_control));
+        assert!(!alert.message.chars().any(char::is_control));
+        assert!(alert.worktree.is_empty());
     }
 }
