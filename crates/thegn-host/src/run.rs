@@ -10753,6 +10753,7 @@ async fn event_loop<T: Terminal>(
                     current_config.usage.clone(),
                     false,
                     current_config.model_proxy.enabled,
+                    current_config.model_proxy.budget.clone(),
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -18782,6 +18783,7 @@ async fn event_loop<T: Terminal>(
                                     current_config.usage.clone(),
                                     true,
                                     current_config.model_proxy.enabled,
+                                    current_config.model_proxy.budget.clone(),
                                 );
                                 model.status = "Refreshing AI account usage\u{2026}".into();
                             } else {
@@ -19837,6 +19839,7 @@ async fn event_loop<T: Terminal>(
                                     current_config.usage.clone(),
                                     true,
                                     current_config.model_proxy.enabled,
+                                    current_config.model_proxy.budget.clone(),
                                 );
                             }
                             Action::OpenShares => {
