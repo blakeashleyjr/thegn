@@ -22,10 +22,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) use crate::config_repo::lenient_env_selector;
+pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
+pub use crate::hooks::HooksConfig;
 fn is_false(value: &bool) -> bool {
     !*value
 }
-
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
 pub fn config_warn(msg: &str) {
@@ -276,6 +279,7 @@ pub use crate::file_manager::DrawerKind;
 pub use crate::account::Account;
 pub use crate::config_activity::ActivityConfig;
 pub use crate::config_daemon::{DaemonConfig, ServeConfig};
+pub use crate::config_drawer::{DrawerOccupant, DrawerPolicy, DrawerScope};
 pub use crate::config_notifications::{
     DndConfig, NotificationMode, NotificationRule, NotificationsConfig, NotificationsOverlay,
     SoundConfig, SoundMode,
@@ -1752,6 +1756,17 @@ pub struct NamedCommand {
     /// Off by default. See [`crate::config_model_proxy`].
     #[serde(default)]
     pub route_via_proxy: bool,
+    /// Opt this tool into the bottom drawer as a worktree- or process-global
+    /// occupant. Absent keeps the existing picker-only behavior.
+    #[serde(
+        default,
+        deserialize_with = "crate::config_drawer::deserialize_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drawer_scope: Option<DrawerScope>,
+    /// Optional scope-relative working directory for a drawer occupant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawer_cwd: Option<String>,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -2269,6 +2284,9 @@ pub struct WorkspaceConfig {
     /// global active account. See [`crate::account`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// Lifecycle hooks for worktrees in this workspace. Entries accumulate
+    /// after global hooks and before a repo overlay's hooks.
+    pub hooks: HooksConfig,
     /// Extra sandbox bind mounts for this workspace, same format as
     /// `[sandbox] mounts` (`"host"`, `"host:dest"`, `"host:dest:ro|rw|cache"`;
     /// `~` is expanded). These **extend** the global `[sandbox] mounts` (plus
@@ -2669,13 +2687,6 @@ impl Default for ThemeConfig {
     }
 }
 
-/// Accent/focus values treated as "not customized" when deciding whether the
-/// user's `[theme]` should clobber a preset's own accent: the current default
-/// plus the pre-prism defaults (a config that pinned the old default keeps
-/// preset-cycling behavior).
-const DEFAULTISH_ACCENTS: &[&str] = &["#6ee7d8", "#76eede"];
-const DEFAULTISH_FOCUS: &[&str] = &["#6ee7d8", "#9bd1ff"];
-
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
 /// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
@@ -3019,7 +3030,7 @@ impl Default for BarsConfig {
             ],
             // `help` is the clickable `?` chip — the one always-visible pointer
             // at the help system. Drop it from the list to hide it.
-            bottom_left: vec!["help".into(), "keyhints".into()],
+            bottom_left: vec!["help".into(), "drawer".into(), "keyhints".into()],
             bottom_right: vec![
                 "pr".into(),
                 "tests".into(),
@@ -4367,61 +4378,6 @@ impl RemoteOverlay {
     }
 }
 
-/// The shape of a repo-root `.thegn.*` file: a `[sandbox]` table overlay
-/// plus an optional `[keybinds]` table (the most-specific keybind layer).
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
-pub(crate) struct RepoConfigFile {
-    pub(crate) sandbox: SandboxOverlay,
-    keybinds: KeybindConfig,
-    /// Per-repo notification routing overlay, applied on top of global +
-    /// profile (see [`Config::effective_notifications`]).
-    #[serde(default)]
-    notifications: NotificationsOverlay,
-    /// Per-repo issue-tracker overlay (Linear team / Jira project) that scopes
-    /// this repo's "My Work" feed (see [`Config::repo_issues`]).
-    #[serde(default)]
-    issues: crate::config_issues::IssuesOverlay,
-    /// Selects a named `[env.<name>]` for every worktree of this repo (the
-    /// repo-level layer of env selection). Empty ⇒ inherit the global default.
-    #[serde(default)]
-    env: String,
-    /// A repo overlay's `[metrics]` table exists ONLY so a `kind = "command"`
-    /// collector defined here can be *detected and refused* — its targets are
-    /// never merged into the running scraper (metrics are global config only).
-    /// See [`Config::repo_command_collector_warnings`].
-    #[serde(default)]
-    metrics: RepoMetricsOverlay,
-}
-
-/// The `[metrics]` shape a repo-root `.thegn.*` might carry. Deliberately
-/// minimal: only the target list, and only so command collectors can be
-/// rejected with a warning. Nothing here reaches the live scraper.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
-pub(crate) struct RepoMetricsOverlay {
-    pub(crate) targets: Vec<MetricsTarget>,
-}
-/// Warnings for command collectors declared in an untrusted (repo/workspace)
-/// metrics overlay. A command collector is a config-driven code-execution door,
-/// so it is global config only; a repo overlay attempting one is refused here.
-/// Prometheus targets from an overlay are simply not merged (no warning) — a
-/// command target gets a loud, named warning because running it would be RCE on
-/// opening the repo.
-pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Vec<String> {
-    targets
-        .iter()
-        .filter(|t| t.kind == MetricsTargetKind::Command)
-        .map(|t| {
-            format!(
-                "ignoring metrics target '{}': command collectors are global config only \
-                 (a repo .thegn.* overlay cannot run commands)",
-                t.name
-            )
-        })
-        .collect()
-}
-
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
 /// Ctrl+Alt+f). Runs yazi by default, with its config kept separate from the
 /// system under a private `config_home`.
@@ -4828,6 +4784,9 @@ pub struct Config {
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
+    /// `[hooks]` lifecycle commands. Workspace and trusted repo layers add to
+    /// these lists; repo entries are trust-gated before execution.
+    pub hooks: HooksConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
     pub toolchain: crate::toolchain::ToolchainConfig,
@@ -5052,6 +5011,7 @@ impl Default for Config {
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
+            hooks: HooksConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
@@ -5852,6 +5812,8 @@ impl Config {
     }
 
     pub(crate) fn post_process(&mut self) {
+        crate::config_drawer::warn_policy_issues(self);
+        crate::config_drawer::strip_agent_metadata(&mut self.agents);
         // Install the resolved [remote] tuning into the process-global holders
         // (ssh keepalives / control-plane retry / heal cadence); first set wins.
         self.remote.install();
@@ -5869,6 +5831,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "shell".into(),
@@ -5881,6 +5845,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -5897,6 +5863,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "yazi".into(),
@@ -5909,6 +5877,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "editor".into(),
@@ -5921,6 +5891,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "diff".into(),
@@ -5933,6 +5905,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -6348,51 +6322,24 @@ impl Config {
     /// uses this. Extension tokens a legacy preset leaves empty are derived
     /// last, so derivations follow any user-overridden base colors.
     pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
-        let mut p = crate::theme::preset(preset).unwrap_or_default();
-        let set = |slot: &mut String, hex: &Option<String>| {
-            if let Some(rgb) = hex.as_deref().and_then(parse_hex_rgb) {
-                *slot = rgb;
-            }
-        };
-        let c = &self.theme.colors;
-        set(&mut p.bg0, &c.bg0);
-        set(&mut p.bg1, &c.bg1);
-        set(&mut p.panel, &c.panel);
-        set(&mut p.panel2, &c.panel2);
-        set(&mut p.raise, &c.raise);
-        set(&mut p.border, &c.border);
-        set(&mut p.text, &c.text);
-        set(&mut p.dim, &c.dim);
-        set(&mut p.faint, &c.faint);
-        set(&mut p.ghost, &c.ghost);
-        set(&mut p.ghost2, &c.ghost2);
-        set(&mut p.ghost3, &c.ghost3);
-        set(&mut p.shadow_bg, &c.shadow_bg);
-        set(&mut p.shadow_fg, &c.shadow_fg);
-        set(&mut p.chip_fg, &c.chip_fg);
-        set(&mut p.activity_active, &c.activity_active);
-        set(&mut p.activity_waiting, &c.activity_waiting);
-        set(&mut p.activity_done, &c.activity_done);
-        let h = &self.theme.hues;
-        set(&mut p.hues.teal, &h.teal);
-        set(&mut p.hues.magenta, &h.magenta);
-        set(&mut p.hues.purple, &h.purple);
-        set(&mut p.hues.green, &h.green);
-        set(&mut p.hues.amber, &h.amber);
-        set(&mut p.hues.red, &h.red);
-        set(&mut p.hues.blue, &h.blue);
-        set(&mut p.hues.orange, &h.orange);
-        // Only override the preset's focus/accent when the user actually
-        // customized them (a default — current or pre-prism — would clobber
-        // presets).
-        if !DEFAULTISH_FOCUS.contains(&self.theme.focus_border.as_str()) {
-            set(&mut p.focus, &Some(self.theme.focus_border.clone()));
-        }
-        if !DEFAULTISH_ACCENTS.contains(&self.theme.accent.as_str()) {
-            p.accent = self.accent_rgb();
-        }
-        crate::theme::extend_palette(&mut p);
-        p
+        self.palette_with_user_themes(preset, &[])
+    }
+
+    /// Resolve a named built-in or loaded user theme, then apply this config's
+    /// overrides. Built-in names take precedence over user-theme collisions.
+    pub fn palette_with_user_themes(
+        &self,
+        preset: &str,
+        user_themes: &[crate::theme_user::UserTheme],
+    ) -> crate::theme::Palette {
+        crate::theme_resolve::palette_with_catalog(
+            preset,
+            user_themes,
+            &self.theme.colors,
+            &self.theme.hues,
+            &self.theme.accent,
+            &self.theme.focus_border,
+        )
     }
 
     /// Look up a dotted config key as a bare string (for `config get` and the
@@ -6514,36 +6461,26 @@ fn render_scalar(v: serde_json::Value) -> String {
 // Strict `config validate` lives in the sibling `config_validate` module
 // (schema-driven: every `config_enum!` reachable from `Config` is checked).
 // Re-exported here so callers keep the historical `config::validate_str` path.
+pub use crate::config_repo::{
+    OverlayFormat, RepoOverlayCandidate, RepoOverlayDiagnostic, RepoOverlayDiscovery,
+    RepoOverlayUnreadableCandidate, discover_repo_overlay, parse_overlay_value,
+    repo_command_collector_warnings_for_overlay, validate_repo_overlay,
+};
 pub use crate::config_validate::validate_str;
 
 /// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
 /// YAML, then JSON (first existing file wins); parse errors warn and are ignored
 /// so a malformed repo file never blocks opening a worktree.
 pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
-    for (ext, kind) in [
-        ("toml", "toml"),
-        ("yaml", "yaml"),
-        ("yml", "yaml"),
-        ("json", "json"),
-    ] {
-        let path = repo_root.join(format!(".thegn.{ext}"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let parsed: Result<RepoConfigFile, String> = match kind {
-            "toml" => toml::from_str(&text).map_err(|e| e.to_string()),
-            "yaml" => serde_yaml::from_str(&text).map_err(|e| e.to_string()),
-            _ => serde_json::from_str(&text).map_err(|e| e.to_string()),
-        };
-        return match parsed {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                config_warn(&format!("{}: parse error: {e}; ignoring", path.display()));
-                None
-            }
-        };
-    }
-    None
+    crate::config_repo::load_repo_overlay(repo_root)
+}
+
+/// Load only the lifecycle-hook portion of a repo overlay for the host
+/// orchestration boundary. The policy resolver in `hooks.rs` remains pure: it
+/// receives these typed values rather than discovering files itself.
+pub fn load_repo_hooks(repo_root: &std::path::Path) -> Option<(HooksConfig, Vec<String>)> {
+    load_repo_overlay(repo_root)
+        .map(|overlay| (overlay.hooks, overlay.sandbox.prepare.unwrap_or_default()))
 }
 
 /// A repo-root `.thegn.*` overlay that EXISTS but failed to parse. Returned by
@@ -6551,14 +6488,7 @@ pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfi
 /// dropped overlay can change placement (e.g. a malformed file that was selecting
 /// `env = "sprites"` → falls back to local/host), which is exactly the silent
 /// degradation a failover-off env forbids.
-#[derive(Debug, Clone)]
-pub struct RepoOverlayParseError {
-    pub path: PathBuf,
-    pub error: String,
-    /// Best-effort lenient read of the `env = "…"` selector (empty if absent), so
-    /// a parse failure elsewhere in the file doesn't hide which env it requested.
-    pub selected_env: String,
-}
+pub use crate::config_repo::RepoOverlayParseError;
 
 /// If a repo-root `.thegn.*` file exists but fails to parse, return the error
 /// (+ a lenient `env =` read). `None` when there's no file or it parses cleanly.
@@ -6567,72 +6497,13 @@ pub struct RepoOverlayParseError {
 /// the caller surface it (a visible halt/warning) so a dropped overlay that
 /// changes placement is never silent.
 pub fn repo_overlay_parse_error(repo_root: &Path) -> Option<RepoOverlayParseError> {
-    for (ext, kind) in [
-        ("toml", "toml"),
-        ("yaml", "yaml"),
-        ("yml", "yaml"),
-        ("json", "json"),
-    ] {
-        let path = repo_root.join(format!(".thegn.{ext}"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let err = match kind {
-            "toml" => toml::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-            "yaml" => serde_yaml::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-            _ => serde_json::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-        };
-        return err.map(|error| RepoOverlayParseError {
-            path,
-            error,
-            selected_env: lenient_env_selector(&text),
-        });
-    }
-    None
+    crate::config_repo::repo_overlay_parse_error(repo_root)
 }
 
-/// Best-effort extraction of a top-level `env = "VALUE"` (TOML/JSON-ish) or
-/// `env: VALUE` (YAML) selector from a repo overlay's raw text, so a parse failure
-/// elsewhere doesn't hide which env it was selecting. Empty when absent.
-fn lenient_env_selector(text: &str) -> String {
-    for line in text.lines() {
-        let t = line.trim();
-        let Some(rest) = t.strip_prefix("env") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':')) else {
-            continue; // `environment = …`, `env_name = …`, `[env.x]` — not the selector
-        };
-        let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
-        if !v.is_empty() && !v.starts_with('{') && !v.starts_with('[') {
-            return v.to_string();
-        }
-    }
-    String::new()
-}
-
-/// "#rrggbb" / "#rgb" -> "R;G;B".
+// Compatibility shim for the config unit tests and existing private callers;
+// color parsing itself lives in the shared theme resolver.
 fn parse_hex_rgb(hex: &str) -> Option<String> {
-    let h = hex.trim().strip_prefix('#')?;
-    let h = match h.len() {
-        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
-        6 => h.to_string(),
-        _ => return None,
-    };
-    let n = u32::from_str_radix(&h, 16).ok()?;
-    Some(format!(
-        "{};{};{}",
-        (n >> 16) & 255,
-        (n >> 8) & 255,
-        n & 255
-    ))
+    crate::theme_resolve::parse_hex_rgb(hex)
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
 use thegn_core::config::{Config, SandboxProfile};
+use thegn_core::db::Db;
+use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
 use thegn_core::outln;
 use thegn_core::placement::{Placement, RuntimeProbe};
@@ -15,6 +17,8 @@ use thegn_core::sandbox::Backend;
 use thegn_core::seam::Kind as _;
 use thegn_core::store::HostStore;
 use thegn_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
+
+use super::config_health::ConfigHealth;
 
 fn color_str(d: ColorDepth) -> &'static str {
     match d {
@@ -1105,8 +1109,16 @@ fn identification_json(cfg: &Config) -> serde_json::Value {
 }
 
 /// The full `doctor --json` report, reused by `thegn doctor bundle`. Recomputes
-/// terminal detection so it is standalone.
+/// terminal detection so it is standalone. This compatibility wrapper keeps
+/// the existing bundle/tests API for callers that use the default path.
+#[cfg(test)]
 pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
+    let path = thegn_core::config::Config::path();
+    let health = super::config_health::collect(&path, None);
+    doctor_json_with_health(cfg, &health)
+}
+
+pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
     let resolved = crate::run::resolve_termcaps(cfg);
@@ -1136,6 +1148,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
             "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
             "undercurl": cfg.theme.undercurl.as_str(),
         },
+        "config_health": health.json(),
         "detected": caps_json(&detected),
         "resolved": caps_json(&resolved),
         "probe": probe.as_ref().map(|p| serde_json::json!({
@@ -1168,7 +1181,84 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "agents": agents_json(cfg),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
+        "lifecycle_hooks": lifecycle_hooks_json(cfg),
     })
+}
+
+/// Report lifecycle-hook sources without exposing command text. Repo hooks are
+/// read only for the diagnostic surface; execution still goes through the
+/// normal trust-gated resolver.
+fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
+    let repo_root = current_repo_root();
+    let repo_hooks = repo_root
+        .as_deref()
+        .and_then(thegn_core::config::load_repo_hooks)
+        .map(|(hooks, _)| hooks)
+        .unwrap_or_default();
+    let db = Db::open().ok();
+    let resolved = repo_root
+        .as_deref()
+        .map(|root| crate::worktree_lifecycle::resolve(cfg, root, db.as_ref()));
+
+    let events = HookEvent::ALL
+        .into_iter()
+        .map(|event| {
+            let global = cfg.hooks.entries(event).len();
+            let workspace = cfg
+                .workspace
+                .values()
+                .map(|w| w.hooks.entries(event).len())
+                .sum::<usize>();
+            let repo = repo_hooks.entries(event).len();
+            let trust = if repo == 0 {
+                "none"
+            } else if db.is_none() {
+                "unknown (state DB unavailable)"
+            } else if resolved.as_ref().is_some_and(|r| {
+                r.pending
+                    .iter()
+                    .any(|request| request.key == format!("hooks.{}", event.as_str()))
+            }) {
+                "pending"
+            } else {
+                "approved"
+            };
+            (
+                event.as_str().to_string(),
+                serde_json::json!({
+                    "global": global,
+                    "workspace": workspace,
+                    "repo": repo,
+                    "repo_trust": trust,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "repo": repo_root.map(|root| root.display().to_string()),
+        "events": events,
+    })
+}
+
+fn lifecycle_hooks_report(cfg: &Config) {
+    let report = lifecycle_hooks_json(cfg);
+    outln!("Lifecycle hooks ([hooks])");
+    if let Some(repo) = report["repo"].as_str() {
+        outln!("  repo          {repo}");
+    } else {
+        outln!("  repo          (not inside a repository)");
+    }
+    for event in HookEvent::ALL {
+        let row = &report["events"][event.as_str()];
+        outln!(
+            "  {:<13} global={} workspace={} repo={} trust={}",
+            event.as_str(),
+            row["global"],
+            row["workspace"],
+            row["repo"],
+            row["repo_trust"].as_str().unwrap_or("unknown"),
+        );
+    }
 }
 
 /// Reports the model proxy: a single quiet line when disabled, else enabled
@@ -1289,9 +1379,18 @@ fn model_proxy_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
-pub fn run(cfg: &Config, json: bool) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    json: bool,
+    config_path: std::path::PathBuf,
+    repo_context: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let health = super::config_health::collect(&config_path, repo_context.as_deref());
     if json {
-        outln!("{}", serde_json::to_string_pretty(&doctor_json(cfg))?);
+        outln!(
+            "{}",
+            serde_json::to_string_pretty(&doctor_json_with_health(cfg, &health))?
+        );
         return Ok(());
     }
 
@@ -1308,6 +1407,20 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     identification_report(cfg);
+    outln!(
+        "Config health: {} problem(s), {} warning(s); main {}; profile {}; repo {}; detail: `thegn config validate`",
+        health.problems(),
+        health.warnings,
+        health.main_path.display(),
+        health
+            .profile_path
+            .as_deref()
+            .map_or("(none)".to_string(), |path| path.display().to_string()),
+        health
+            .repo_path
+            .as_deref()
+            .map_or("(none)".to_string(), |path| path.display().to_string()),
+    );
     outln!("");
     channel_report();
     outln!("");
@@ -1414,6 +1527,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     model_proxy_report(cfg);
+
+    outln!("");
+    lifecycle_hooks_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
@@ -3053,8 +3169,8 @@ mod tests {
     #[test]
     fn run_does_not_panic_on_default_config() {
         let cfg = Config::default();
-        assert!(run(&cfg, false).is_ok());
-        assert!(run(&cfg, true).is_ok());
+        assert!(run(&cfg, false, Config::path(), None).is_ok());
+        assert!(run(&cfg, true, Config::path(), None).is_ok());
     }
 
     /// THE-70. The three states must read differently — "unknown" in
@@ -3116,6 +3232,19 @@ mod tests {
         // Tests never own a tty, so the probe is skipped and every field is
         // null — which is exactly the "unknown ⇒ assume it works" state.
         assert!(kb["ctrl_digits_reportable"].is_null());
+    }
+
+    #[test]
+    fn doctor_json_exposes_lifecycle_hook_sources() {
+        let hooks = doctor_json(&Config::default())["lifecycle_hooks"].clone();
+        assert!(hooks["events"].is_object());
+        for event in HookEvent::ALL {
+            let row = &hooks["events"][event.as_str()];
+            assert!(row["global"].is_u64());
+            assert!(row["workspace"].is_u64());
+            assert!(row["repo"].is_u64());
+            assert!(row["repo_trust"].is_string());
+        }
     }
 
     #[test]

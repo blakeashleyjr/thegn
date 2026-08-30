@@ -42,6 +42,8 @@ mod placement;
 mod pool;
 mod project;
 mod semantic;
+mod session_fork;
+mod session_migration;
 mod trust;
 mod usage;
 mod workspace;
@@ -69,6 +71,8 @@ pub use placement::{
 pub use pool::PoolStore;
 pub use project::{ProjectDeleteOutcome, ProjectRow, ProjectStore};
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
+pub use session_fork::SessionForkStore;
+pub use session_migration::SessionMigrationStore;
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use usage::{UsageSample, UsageStore};
 pub use workspace::WorkspaceStore;

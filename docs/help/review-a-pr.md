@@ -16,13 +16,31 @@ actions: [pr-open, pr-create]
    worktree is isolated — your own work stays untouched.
 3. The right [[panel]]'s **work** tab tracks the branch's PR: state, CI
    check rollup, review decision. The **git** tab's _changes_ section is
-   the diff; `e` widens it to full-screen, side by side.
+   the diff; `e` widens it to full-screen, side by side. The full-screen diff
+   defaults to **Worktree** and keeps local/staging semantics. Press `Tab` to
+   switch to **PR review** when a matching snapshot is available; this source
+   shows the PR head diff, inline threads, outdated feedback, and top-level
+   comments. Stale, loading, unsupported, and absent snapshots are labeled
+   rather than attached to local lines.
 4. Act from the panel's _pr_ section: `A` approve, `c` comment, `M`
    merge, `r` rerun failed checks, `o` open in the browser — or run `gh`
    in the pane, or open the PR view for the conversation feed. The
    palette's **PR — open in browser** action (`pr-open`) does the same
    from anywhere, when the conversation outgrows a pane.
 5. Done? `Alt-X` removes the review worktree; the branch stays.
+
+## Review feedback
+
+In the PR view's **Files** and **Conversation** tabs, `n`/`N` selects the next
+or previous thread (unresolved first), and `Enter` jumps to an exact
+`path:line` anchor. Outdated and top-level items stay in Conversation and
+report that they have no diff anchor. `v` toggles the view-local resolved
+threads display. `p` passes the selected thread and `P` passes all unresolved
+threads to the configured agent. A live agent pane in this worktree receives
+a non-submitting bracketed paste with no trailing newline; otherwise an
+explicit confirmation is required before the configured headless PR-review
+template runs off-loop. If neither exists, the handoff reports why and does
+nothing. Pasting never auto-submits, resolves, approves, merges, or closes a PR.
 
 ## Raising one
 

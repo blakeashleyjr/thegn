@@ -66,11 +66,9 @@ pub(crate) struct DrainCtx<'a> {
     pub dirty: &'a mut bool,
     pub loop_perf: &'a mut crate::perf::LoopPerf,
     // For the sidebar-folder lifecycle's `on_landed = remove/detach`: after a
-    // land removes a worktree dir off-loop, reap the now-orphaned tab (panes +
-    // session + focus) via `delete_groups`, exactly as a manual close does.
-    pub session: &'a mut crate::session::Session,
-    pub panes: &'a mut crate::panes::Panes,
-    pub need_relayout: &'a mut bool,
+    // land removes a worktree dir off-loop, probe for the orphaned tab on a
+    // worker and deliver a typed completion to the compositor.
+    pub session: &'a crate::session::Session,
     pub waker: &'a TerminalWaker,
 }
 
@@ -78,10 +76,10 @@ impl DrainCtx<'_> {
     /// Reap any tab whose worktree dir vanished (an `on_landed = remove/detach`
     /// land). No-op when nothing was removed. Kept here so both drains share it.
     fn reap_removed_tabs(&mut self) {
-        if crate::merge_lifecycle::reconcile_removed_tabs(self.session, self.panes, self.waker) {
-            *self.need_relayout = true;
-            *self.want_model_refresh = true;
-        }
+        crate::merge_lifecycle::spawn_reconcile_removed_tabs(
+            self.session,
+            Some(self.waker.clone()),
+        );
     }
 }
 
