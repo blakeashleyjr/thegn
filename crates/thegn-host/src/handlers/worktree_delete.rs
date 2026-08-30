@@ -38,9 +38,7 @@ pub(crate) struct DeleteCtx<'a> {
     pub panes: &'a mut crate::panes::Panes,
     pub model: &'a mut crate::chrome::FrameModel,
     pub sb: &'a mut crate::run::SidebarState,
-    pub drawer: &'a mut Option<u32>,
-    pub drawer_pool: &'a mut crate::run::DrawerPool,
-    pub drawer_home: &'a mut Option<std::path::PathBuf>,
+    pub drawer_runtime: &'a mut crate::run::DrawerRuntime,
     pub active_menu: &'a mut Option<MenuOverlay>,
     /// Targets stashed across the confirm modal as **stable group names**, not
     /// indices: a background reap/prune can shift `session.worktrees` indices
@@ -153,15 +151,10 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
     cx.sb.focus_active_row(cx.model);
     *cx.need_relayout = true;
-    crate::run::sync_drawer_persistence(
-        cx.session,
-        cx.panes,
-        cx.drawer,
-        cx.drawer_pool,
-        cx.drawer_home,
-        cx.cfg,
-        cx.center,
-    );
+    if let Some(dir) = crate::run::active_cwd(cx.session) {
+        cx.drawer_runtime
+            .reconcile(cx.cfg, &dir, cx.panes, cx.center);
+    }
 }
 
 /// Names for the menu body + the dirty subset, from the cached sidebar status
@@ -342,15 +335,10 @@ pub(crate) fn confirm_delete_worktrees(
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
     cx.sb.focus_active_row(cx.model);
     *cx.need_relayout = true;
-    crate::run::sync_drawer_persistence(
-        cx.session,
-        cx.panes,
-        cx.drawer,
-        cx.drawer_pool,
-        cx.drawer_home,
-        cx.cfg,
-        cx.center,
-    );
+    if let Some(dir) = crate::run::active_cwd(cx.session) {
+        cx.drawer_runtime
+            .reconcile(cx.cfg, &dir, cx.panes, cx.center);
+    }
 }
 
 /// Given worktree group indices in sidebar-visual order (`order`), the position

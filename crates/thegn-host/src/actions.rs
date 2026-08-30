@@ -90,9 +90,7 @@ pub(crate) fn dispatch_drawer_command(
     cmd: thegn_core::file_manager::DrawerCmd,
     session: &mut Session,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut crate::run::DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut crate::run::DrawerRuntime,
     focus: &mut FocusState,
     model: &mut FrameModel,
     sb: &mut SidebarState,
@@ -103,14 +101,9 @@ pub(crate) fn dispatch_drawer_command(
         thegn_core::file_manager::DrawerCmd::Close => {
             // Hide to the keep-alive pool (position survives reopen); hand the
             // keyboard back to the center.
-            crate::escape::close_drawer_to_pool(
-                drawer,
-                drawer_pool,
-                drawer_home,
-                session,
-                panes,
-                cfg,
-            );
+            if let Some(dir) = crate::run::active_cwd(session) {
+                drawer_runtime.close_visible(cfg, &dir, panes, center);
+            }
             if focus.drawer() {
                 focus.zone = Zone::Center;
             }

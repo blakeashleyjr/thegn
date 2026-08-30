@@ -295,6 +295,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         cfg.tools.push(thegn_core::config::NamedCommand {
             name: "lazygit".into(),
@@ -307,6 +309,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         // tool first, then agent → the agent is claimed, not the tool.
         let preset = Preset {

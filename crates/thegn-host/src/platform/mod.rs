@@ -43,6 +43,87 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+/// Persist a small recoverable cache value without following an attacker-created
+/// state-file symlink. Unix publishes a same-directory temp file atomically;
+/// other platforms reject non-regular existing targets before using their
+/// native overwrite path.
+pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(parent_metadata) = std::fs::symlink_metadata(parent) else {
+        return;
+    };
+    if !parent_metadata.file_type().is_dir() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("drawer-state"));
+        let tmp = parent.join(format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&tmp) else {
+            return;
+        };
+        if file.write_all(value.as_bytes()).is_err() {
+            drop(std::fs::remove_file(&tmp));
+            return;
+        }
+        drop(file);
+        if std::fs::rename(&tmp, path).is_err() {
+            drop(std::fs::remove_file(&tmp));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_file() => return,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return,
+            _ => {}
+        }
+        drop(std::fs::write(path, value));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_symlink_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+pub(crate) fn test_symlink(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(original, link)
+    }
+    #[cfg(not(unix))]
+    {
+        drop((original, link));
+        Err(std::io::Error::other(
+            "symlinks are not supported by this test",
+        ))
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_fifo_supported() -> bool {
     cfg!(unix)
@@ -65,7 +146,6 @@ pub(crate) fn test_fifo(path: &std::path::Path) -> std::io::Result<()> {
         ))
     }
 }
-
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
