@@ -1508,7 +1508,7 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
         "loc" => model
             .loc
             .as_ref()
-            .map(|r| w(format!("{} LOC", r.compact_total()), col(S::Dim))),
+            .map(|r| w(crate::i18n_surface::loc(&r.compact_total()), col(S::Dim))),
         // Active worktree's disk usage (size of its checkout incl. target/),
         // from the off-loop scan; sits next to LOC. Hidden until first scanned.
         "disk" => model
@@ -1637,7 +1637,11 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
                 BarItemId::Badge(BarBadge::DiskWarn),
                 vec![Seg::chip(
                     Tok::Hue(hue),
-                    format!(" {} {free}% free ", ic.disk_icon),
+                    format!(
+                        " {} {} ",
+                        ic.disk_icon,
+                        crate::i18n_surface::disk_free(free)
+                    ),
                 )],
             ));
         }
@@ -1705,40 +1709,44 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         ));
     }
     if model.zoomed {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Zoom);
         items.push((
             BarItemId::Badge(BarBadge::Zoom),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Purple),
-                " \u{26f6} ZOOM ",
+                format!(" \u{26f6} {label} "),
             )],
         ));
     }
     // Maximize-in-chrome (mutually exclusive with `zoomed`): a framed square
     // reads as "pane filling its region", distinct from the fullscreen chip.
     if model.maximized {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Maximized);
         items.push((
             BarItemId::Badge(BarBadge::Maximized),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Teal),
-                " \u{25a3} MAX ",
+                format!(" \u{25a3} {label} "),
             )],
         ));
     }
     if model.key_locked {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Locked);
         items.push((
             BarItemId::Badge(BarBadge::Lock),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Amber),
-                " \u{2301} LOCKED ",
+                format!(" \u{2301} {label} "),
             )],
         ));
     }
     if model.sync_panes {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Sync);
         items.push((
             BarItemId::Badge(BarBadge::Sync),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Red),
-                " \u{29c9} SYNC ",
+                format!(" \u{29c9} {label} "),
             )],
         ));
     }

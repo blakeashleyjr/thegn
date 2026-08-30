@@ -2,6 +2,8 @@
 # shrink-only: route matches through the embedded catalog, then remove the file.
 # Catalog keys, comments, and user-provided data are intentionally outside the
 # narrow audited pattern; this ratchet prevents new prose at these draw sites.
+# Remaining pins include Rust `matches!` syntax and `ActionSpec`'s deliberately
+# canonical English labels for generated help; neither is a catalog bypass.
 
 crates/thegn-host/src/chrome.rs
 crates/thegn-host/src/keymap_specs.rs
