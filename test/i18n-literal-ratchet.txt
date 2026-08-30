@@ -1,0 +1,10 @@
+# Raw user-facing i18n proof-surface literals. This file-level debt ledger is
+# shrink-only: route matches through the embedded catalog, then remove the file.
+# Catalog keys, comments, and user-provided data are intentionally outside the
+# narrow audited pattern; this ratchet prevents new prose at these draw sites.
+
+crates/thegn-host/src/chrome.rs
+crates/thegn-host/src/keymap_specs.rs
+crates/thegn-host/src/palette.rs
+crates/thegn-host/src/run.rs
+crates/thegn-host/src/statusbar_badges.rs

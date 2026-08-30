@@ -634,7 +634,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `cfg` was loaded above (before the session reconcile); augment it with
     // DB-stored hosts now that we're past session load.
     thegn_core::host_config::merge_db_hosts(&mut cfg);
-    thegn_core::i18n::init(&cfg.ui.language);
+    crate::e2e_freeze::pin_locale(&mut cfg.ui.language);
+    let lc_all = std::env::var("LC_ALL").ok();
+    let lang = std::env::var("LANG").ok();
+    let pseudolocale_requested = cfg!(debug_assertions)
+        && std::env::var_os("THEGN_PSEUDOLOCALE")
+            .is_some_and(|value| !value.is_empty() && value != "0");
+    thegn_core::i18n::init(
+        &cfg.ui.language,
+        lc_all.as_deref(),
+        lang.as_deref(),
+        crate::e2e_freeze::active(),
+        pseudolocale_requested,
+    );
 
     tracing::info!(
         target: "thegn::startup",
