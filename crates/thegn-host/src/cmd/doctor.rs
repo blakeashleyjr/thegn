@@ -1123,6 +1123,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
         "agents": agents_json(cfg),
+        "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
     })
@@ -1334,6 +1335,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     harness_report(cfg);
+
+    outln!("");
+    super::skills_doctor::print(&super::skills_doctor::inspect(
+        cfg,
+        &super::resolve_worktree(None),
+    ));
 
     outln!("");
 

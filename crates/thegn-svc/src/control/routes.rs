@@ -73,6 +73,7 @@ pub static ROUTES: &[Route] = &[
         &["worktrees.list", "worktrees.create"],
         || get(http::list_worktrees).post(http::create_worktree),
     ),
+    route("/v1/skills", &["skills.list"], || get(http::list_skills)),
     route("/v1/worktrees/open", &["worktrees.open"], || {
         post(http::open_worktree)
     }),
@@ -163,6 +164,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("worktrees.list", "GET", "/v1/worktrees"),
     ("worktrees.create", "POST", "/v1/worktrees"),
     ("worktrees.open", "POST", "/v1/worktrees/open"),
+    ("skills.list", "GET", "/v1/skills"),
     ("issues.list", "GET", "/v1/issues"),
     ("issues.get", "GET", "/v1/issues/{id}"),
     ("issues.update", "POST", "/v1/issues/{id}"),
