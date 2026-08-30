@@ -2,7 +2,8 @@
 //!
 //! Contents: the extended `doctor --json`, the effective config with secret
 //! values redacted, bounded tails of every log sink (compositor, daemon, stderr
-//! capture, audit), and all retained crash reports — plus a printed `MANIFEST`
+//! capture, audit), the current-process WARN ring, and all retained crash
+//! reports — plus a printed `MANIFEST`
 //! of exactly what was included, so the user can see what they are about to
 //! share before they share it.
 //!
@@ -71,18 +72,35 @@ pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
         );
     }
 
-    // 4. all retained crash reports (already secret-free by construction).
+    // 4. The WARN ring from this bundle process. This is not a live snapshot
+    // of another host or daemon process.
+    let ring = current_process_ring_log(&thegn_core::diagnostics::ring_snapshot());
+    add(
+        &mut tar,
+        &mut manifest,
+        "diagnostics/ring.log",
+        ring.into_bytes(),
+    );
+
+    // 5. all retained crash reports. Re-redact historical files in case they
+    // predate the serialization boundary or were written by another source.
     for report in thegn_core::diagnostics::list_reports() {
         if let Ok(body) = std::fs::read(&report) {
             let name = report
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "report.txt".into());
-            add(&mut tar, &mut manifest, &format!("crash/{name}"), body);
+            let body = redacted_report_text(&body);
+            add(
+                &mut tar,
+                &mut manifest,
+                &format!("crash/{name}"),
+                body.into_bytes(),
+            );
         }
     }
 
-    // 5. the manifest itself (also printed below).
+    // 6. the manifest itself (also printed below).
     manifest.push_str(&format!("\nwritten: {}\n", out.display()));
     tar.append("MANIFEST", manifest.as_bytes());
 
@@ -129,9 +147,9 @@ fn redact_toml(v: &mut toml::Value) {
     }
 }
 
-/// Read the last `n` lines of a log file, running each through the redactor as a
-/// belt-and-braces pass (lines are already redacted at emit time). Missing file
-/// ⇒ empty.
+/// Read the last `n` lines of a log file, running each through the text redactor
+/// as a belt-and-braces pass (lines are already redacted at emit time). Missing
+/// file ⇒ empty.
 fn redacted_tail(path: &std::path::Path, n: usize) -> String {
     let Ok(content) = std::fs::read_to_string(path) else {
         return String::new();
@@ -140,14 +158,37 @@ fn redacted_tail(path: &std::path::Path, n: usize) -> String {
     let start = lines.len().saturating_sub(n);
     lines[start..]
         .iter()
-        .map(|line| {
-            // Re-run the argv/env redactor over the line's tokens to catch any
-            // `--token X` / `FOO_TOKEN=x` shape a caller logged un-chokepointed.
-            let toks: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-            thegn_core::log_redact::redact_argv(&toks).join(" ")
-        })
+        .map(|line| thegn_core::log_redact::redact_text_line(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render the WARN ring captured by this bundle process. A bundle command is a
+/// separate process from a host or daemon, so this must never imply that it is
+/// a live cross-process snapshot.
+fn current_process_ring_log(lines: &[String]) -> String {
+    let mut out = String::from(
+        "thegn current-process WARN ring\n================================\nThis is the ring from the current bundle process; it does not include a separate host or daemon process.\n",
+    );
+    if lines.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for line in lines {
+            out.push_str(&thegn_core::log_redact::redact_text_line(line));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Sanitize a retained crash report before copying it into a bundle. Invalid
+/// UTF-8 is replaced rather than copied verbatim: crash reports are text and
+/// no report bytes should bypass the final redaction boundary.
+fn redacted_report_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .split_inclusive('\n')
+        .map(thegn_core::log_redact::redact_text_line)
+        .collect()
 }
 
 /// gzip `data` with flate2 (pure-Rust miniz_oxide backend).
@@ -268,5 +309,26 @@ mod tests {
         assert!(!s.contains("sk-secret"));
         assert!(!s.contains("\"k\""));
         assert!(s.contains("ok")); // non-secret survives
+    }
+
+    #[test]
+    fn current_process_ring_entry_is_explicit_for_empty_and_non_empty_rings() {
+        let empty = current_process_ring_log(&[]);
+        assert!(empty.contains("current-process WARN ring"));
+        assert!(empty.contains("(none)"));
+
+        let non_empty = current_process_ring_log(&["WARN --token ring-secret safe".into()]);
+        assert!(non_empty.contains("current-process WARN ring"));
+        assert!(non_empty.contains("--token ***redacted*** safe"));
+        assert!(!non_empty.contains("ring-secret"));
+    }
+
+    #[test]
+    fn historical_crash_report_is_redacted_before_bundle_copy() {
+        let old = b"panic: --token old-secret\nTOKEN=older-secret safe\n";
+        let sanitized = redacted_report_text(old);
+        assert!(!sanitized.contains("old-secret"));
+        assert!(!sanitized.contains("older-secret"));
+        assert!(sanitized.contains("safe"));
     }
 }

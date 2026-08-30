@@ -99,6 +99,52 @@ pub fn redact_argv(argv: &[String]) -> Vec<String> {
     out
 }
 
+/// Redact supported secret-bearing shapes in a text line while preserving all
+/// non-sensitive text, including its whitespace. This is intentionally
+/// best-effort: an arbitrary bare positional secret cannot be recognized by
+/// shape, so callers must not log positional secrets.
+pub fn redact_text_line(line: &str) -> String {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = start.take() {
+                ranges.push((start, idx));
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(start) = start {
+        ranges.push((start, line.len()));
+    }
+
+    if ranges.is_empty() {
+        return line.to_string();
+    }
+
+    // Give the first real token a synthetic argv[0], so a KEY=value at the
+    // beginning of the line is treated like every other inline assignment.
+    let mut argv = Vec::with_capacity(ranges.len() + 1);
+    argv.push("<line>".to_string());
+    argv.extend(
+        ranges
+            .iter()
+            .map(|&(start, end)| line[start..end].to_string()),
+    );
+    let redacted = redact_argv(&argv);
+
+    let mut out = String::with_capacity(line.len());
+    let mut cursor = 0;
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        out.push_str(&line[cursor..start]);
+        out.push_str(&redacted[i + 1]);
+        cursor = end;
+    }
+    out.push_str(&line[cursor..]);
+    out
+}
+
 /// A one-line, secret-free summary of a spawned command: the program's base
 /// name and the number of arguments — the shape logged at DEBUG. Never renders
 /// argument values.
@@ -205,6 +251,21 @@ mod tests {
         let argv = vec!["/opt/token=x".to_string(), "run".to_string()];
         let out = redact_argv(&argv);
         assert_eq!(out[0], "/opt/token=x");
+    }
+
+    #[test]
+    fn text_line_redacts_supported_shapes_and_preserves_safe_text() {
+        let line = "WARN   keep this  --token sk-secret  TOKEN=inline-secret";
+        assert_eq!(
+            redact_text_line(line),
+            "WARN   keep this  --token ***redacted***  TOKEN=***redacted***"
+        );
+    }
+
+    #[test]
+    fn text_line_leaves_unstructured_positional_secret_unchanged() {
+        let line = "mytool sk-positional-secret safe text";
+        assert_eq!(redact_text_line(line), line);
     }
 
     #[test]
