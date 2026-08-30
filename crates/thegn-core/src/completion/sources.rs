@@ -222,6 +222,12 @@ pub fn config_candidates(kind: SourceKind, cfg: &Config) -> Vec<Candidate> {
             .iter()
             .map(|t| Candidate::described(&t.name, &t.command))
             .collect(),
+        SourceKind::Automation => cfg
+            .effective_automations()
+            .rules
+            .iter()
+            .map(|rule| Candidate::described(&rule.name, &rule.when))
+            .collect(),
         SourceKind::Plugin => cfg
             .plugins
             .iter()
@@ -584,6 +590,13 @@ mod tests {
         };
         cfg.agents.push(named("claude", "claude --dangerously"));
         cfg.tools.push(named("lazygit", "lazygit"));
+        cfg.automations
+            .rules
+            .push(crate::config_automations::AutomationRuleConfig {
+                name: "notify-on-done".into(),
+                when: "agent_finished".into(),
+                ..Default::default()
+            });
 
         let names = |k| {
             config_candidates(k, &cfg)
@@ -597,6 +610,7 @@ mod tests {
         assert_eq!(names(SourceKind::McpServer), ["git"]);
         assert_eq!(names(SourceKind::Agent), ["claude"]);
         assert_eq!(names(SourceKind::Tool), ["lazygit"]);
+        assert_eq!(names(SourceKind::Automation), ["notify-on-done"]);
         assert_eq!(
             config_candidates(SourceKind::Agent, &cfg)[0]
                 .description

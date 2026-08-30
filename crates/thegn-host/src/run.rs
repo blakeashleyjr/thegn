@@ -557,6 +557,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
+    crate::automation_runtime::install(&cfg);
     // Register the installation identity (version/channel/build/OS) and the
     // crash-report policy now that the channel + `[diagnostics]` config are
     // known — a crash after this point stamps the resolved channel. Reconcile
@@ -8600,7 +8601,8 @@ async fn event_loop<T: Terminal>(
                             let Ok(db) = thegn_core::db::Db::open() else {
                                 return;
                             };
-                            let _ = db.put_notification("test_failed", &wt, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            let _ =
+                                crate::automation_events::emit(&db, "test_failed", &wt, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         });
                     }
                 }
@@ -9685,6 +9687,21 @@ async fn event_loop<T: Terminal>(
                         "",
                     );
                 }
+                if ev.level != thegn_core::resource_alert::AlertLevel::Ok
+                    && matches!(
+                        ev.metric,
+                        thegn_core::resource_alert::AlertMetric::DiskFree
+                            | thegn_core::resource_alert::AlertMetric::DiskEta
+                    )
+                {
+                    crate::automation_events::submit_fact(
+                        thegn_core::automation::AutomationEventKind::DiskLow,
+                        format!("disk:{}", ev.metric.key()),
+                        None,
+                        Some(msg),
+                        Default::default(),
+                    );
+                }
             }
         }
 
@@ -10140,8 +10157,13 @@ async fn event_loop<T: Terminal>(
                                         return;
                                     };
                                     // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                                    let _ =
-                                        db.put_notification("worktree_created", &path, &msg, &path);
+                                    let _ = crate::automation_events::emit(
+                                        &db,
+                                        "worktree_created",
+                                        &path,
+                                        &msg,
+                                        &path,
+                                    );
                                 });
                             }
                         } else {
@@ -10502,6 +10524,7 @@ async fn event_loop<T: Terminal>(
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
                     current_config = new_cfg;
+                    crate::automation_runtime::install(&current_config);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded

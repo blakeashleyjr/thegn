@@ -19,7 +19,6 @@ use termwiz::terminal::TerminalWaker;
 use thegn_core::config::NotificationsConfig;
 use thegn_core::notification::NotificationKind;
 use thegn_core::notification_route::{RouteCtx, RouteDecision, SoundEmit, decide};
-use thegn_core::store::NotificationStore;
 
 /// Shared, thread-safe notification runtime. Cloned (as `Arc`) into the
 /// background dispatch closures and read by the event loop.
@@ -313,8 +312,7 @@ pub fn record(
     }
     let decision = state.decide(kind, source_ref, message, worktree);
     let id = if decision.record {
-        db.put_notification(kind, source_ref, message, worktree)
-            .ok()
+        crate::automation_events::emit(db, kind, source_ref, message, worktree).ok()
     } else {
         None
     };

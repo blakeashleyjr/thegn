@@ -3553,7 +3553,32 @@ pub(crate) fn spawn_pr_cache_refresh(
             let pr_ref = format!("pr:{}", pr.number);
             let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
             let wt = cwd.to_string_lossy();
-            let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let merged = pr.state == "MERGED";
+            let _ = crate::automation_events::emit_with_facts(
+                &db,
+                "pr_state_changed",
+                &pr_ref,
+                &msg,
+                &wt,
+                crate::automation_events::EventFacts {
+                    branch: Some(panel.branch.clone()),
+                    pr_merged: Some(merged),
+                    ..Default::default()
+                },
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if merged {
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::MergeLanded,
+                    format!("{pr_ref}:merged"),
+                    Some(wt.to_string()),
+                    Some(msg.clone()),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_merged: Some(true),
+                        ..Default::default()
+                    },
+                );
+            }
 
             // Lifecycle automation: on merge, move this worktree's linked
             // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
@@ -3675,7 +3700,8 @@ pub(crate) fn spawn_pr_cache_refresh(
                 }
                 for (source_ref, msg, wt) in pr_linked_notifications(&old_open, &prs, &wts, &hints)
                 {
-                    let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                    let _ =
+                        crate::automation_events::emit(&db, "pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
             }
 
@@ -3707,8 +3733,13 @@ pub(crate) fn spawn_pr_cache_refresh(
                 if let Ok(mentions) = forge.mentions(&loc, &repo) {
                     for (source_ref, msg) in mentions {
                         // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        let _ =
-                            db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
+                        let _ = crate::automation_events::emit_once(
+                            &db,
+                            "mentioned",
+                            &source_ref,
+                            &msg,
+                            &repo_root,
+                        );
                     }
                 }
             }
@@ -3864,7 +3895,13 @@ fn maybe_clean_merged_worktrees(
                 verb,
                 thegn_core::disk::human(reclaimed)
             );
-            let _ = db.put_notification("disk_cleaned", &row.branch, &msg, &row.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let _ = crate::automation_events::emit(
+                db,
+                "disk_cleaned",
+                &row.branch,
+                &msg,
+                &row.worktree,
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }

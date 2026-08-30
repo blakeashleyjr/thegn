@@ -342,6 +342,53 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             description: "Worktree path (default: the server's working directory)",
         }],
     },
+    StateToolSpec {
+        cap: "automations.list",
+        description: "List trusted global/profile automation rules, inert reasons, and recent audited outcomes. Read-only.",
+        args: &[],
+    },
+    StateToolSpec {
+        cap: "automations.test",
+        description: "Purely evaluate one named automation rule against a normalized event fixture. Never executes or writes state.",
+        args: &[
+            ArgSpec {
+                name: "rule",
+                kind: ArgKind::String,
+                required: true,
+                description: "Stable automation rule name",
+            },
+            ArgSpec {
+                name: "event",
+                kind: ArgKind::Object,
+                required: true,
+                description: "Normalized AutomationEvent JSON object",
+            },
+            ArgSpec {
+                name: "at",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Evaluation clock in Unix seconds (defaults to event.occurred_at)",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "tools.run",
+        description: "Run one trusted configured [[tools]] entry by name in an optional worktree. Exec-scoped; command and sandbox resolve on the daemon.",
+        args: &[
+            ArgSpec {
+                name: "name",
+                kind: ArgKind::String,
+                required: true,
+                description: "Configured [[tools]] name",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree in which to run the tool",
+            },
+        ],
+    },
 ];
 
 /// Host capabilities the MCP server exposes as state tools, by catalog id.
@@ -362,6 +409,9 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.kill",
     "semantic.map",
     "semantic.blast_radius",
+    "automations.list",
+    "automations.test",
+    "tools.run",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.

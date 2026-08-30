@@ -8,7 +8,7 @@ use crate::compositor::Rect;
 use crate::handlers::worktree_attach::{self, AttachTarget};
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
-use thegn_core::store::{NotificationStore, PoolStore, WorkspaceStore};
+use thegn_core::store::{PoolStore, WorkspaceStore};
 
 /// Resolved launch specs routed back to the requesting group by its unique
 /// NAME (a path can be shared by two groups); the batch also carries the path
@@ -180,7 +180,8 @@ pub(crate) fn note_provider_degraded(
         let path = path.to_string();
         tokio::task::spawn_blocking(move || {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.put_notification("provider_degraded", &path, &msg, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ =
+                    crate::automation_events::emit(&db, "provider_degraded", &path, &msg, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         });
     }

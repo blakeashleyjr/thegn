@@ -450,6 +450,7 @@ mod tests {
             agent: None,
             adopt: false,
             already_capped: false,
+            automation_origin: None,
         };
         let launch = AgentLaunch {
             agent: "claude".into(),

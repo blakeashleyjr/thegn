@@ -909,8 +909,13 @@ impl SessionActor {
                         tracing::warn!(target: "thegn::daemon", "attention row retire failed: {e}");
                     }
                 }
-                if let Err(e) = db.put_notification("agent_attention", &source, &message, &worktree)
-                {
+                if let Err(e) = crate::automation_events::emit(
+                    &db,
+                    "agent_attention",
+                    &source,
+                    &message,
+                    &worktree,
+                ) {
                     tracing::warn!(target: "thegn::daemon", "attention notification failed: {e}");
                 }
             }

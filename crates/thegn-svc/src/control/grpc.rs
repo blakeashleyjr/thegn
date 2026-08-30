@@ -714,10 +714,74 @@ impl Control for GrpcControl {
                 body: r.body,
                 urgency: (!r.urgency.is_empty()).then_some(r.urgency),
                 source: (!r.source.is_empty()).then_some(r.source),
+                automation_origin: r.automation_origin.map(|origin| super::AutomationOrigin {
+                    root_event_id: origin.root_event_id,
+                    rule_id: origin.rule_id,
+                    run_id: origin.run_id,
+                }),
             })
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::NotifyPushReply { id }))
+    }
+
+    async fn automations_list(
+        &self,
+        req: Request<proto::AutomationsListRequest>,
+    ) -> Result<Response<proto::AutomationsListReply>, Status> {
+        self.authed(&req, Verb::AutomationsList)?;
+        let rules = self.api.automations_list().await.map_err(Status::from)?;
+        let rules_json =
+            serde_json::to_string(&rules).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::AutomationsListReply { rules_json }))
+    }
+
+    async fn automations_test(
+        &self,
+        req: Request<proto::AutomationsTestRequest>,
+    ) -> Result<Response<proto::AutomationsTestReply>, Status> {
+        self.authed(&req, Verb::AutomationsTest)?;
+        let request = req.into_inner();
+        let event = serde_json::from_str(&request.event_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let reply = self
+            .api
+            .automations_test(super::AutomationTestRequest {
+                rule: request.rule,
+                event,
+                at: request.at,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::AutomationsTestReply {
+            rule: reply.rule,
+            decisions_json: reply.decisions.to_string(),
+            executed: reply.executed,
+        }))
+    }
+
+    async fn tools_run(
+        &self,
+        req: Request<proto::ToolsRunRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::ToolsRun)?;
+        let request = req.into_inner();
+        let session = self
+            .api
+            .tools_run(super::ToolRunRequest {
+                name: request.name,
+                worktree: (!request.worktree.is_empty()).then_some(request.worktree),
+                automation_origin: request.automation_origin.map(|origin| {
+                    super::AutomationOrigin {
+                        root_event_id: origin.root_event_id,
+                        rule_id: origin.rule_id,
+                        run_id: origin.run_id,
+                    }
+                }),
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&session)))
     }
 
     async fn me(&self, req: Request<proto::MeRequest>) -> Result<Response<proto::MeReply>, Status> {
@@ -775,6 +839,9 @@ pub const GRPC_CAPS: &[&str] = &[
     "me",
     "pr.status",
     "notify.push",
+    "automations.list",
+    "automations.test",
+    "tools.run",
 ];
 
 #[cfg(test)]

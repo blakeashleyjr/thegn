@@ -340,6 +340,7 @@ async fn run(
     // workers killed by a transport failure. Event-driven; zero timers while
     // idle.
     pipeline_retry::spawn(svc.clone(), svc.events.subscribe());
+    crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
 
     let state = thegn_svc::control::http::ControlState {
         api: svc.clone(),

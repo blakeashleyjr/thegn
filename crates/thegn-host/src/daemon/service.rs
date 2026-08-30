@@ -562,6 +562,16 @@ impl ControlApi for DaemonService {
                 .lock()
                 .await
                 .insert(id.clone(), SessionEntry { msg_tx, meta, live });
+            if let Some(origin) = spec.automation_origin {
+                crate::automation_runtime::register_session_origin(
+                    &id,
+                    thegn_core::automation::AutomationOrigin {
+                        root_event_id: origin.root_event_id,
+                        rule_id: origin.rule_id,
+                        run_id: origin.run_id,
+                    },
+                );
+            }
             tokio::spawn(actor.run(pane_rx, msg_rx));
             self.emit(EventFrame::Sessions);
 
@@ -1127,10 +1137,13 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'_, ControlResult<i64>> {
         Box::pin(async move {
             self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                let kind = match note.urgency.as_deref() {
-                    Some("alert") | Some("critical") => "agent_attention",
-                    _ => "agent_done",
+                let kind = if note.automation_origin.is_some() {
+                    "automation"
+                } else {
+                    match note.urgency.as_deref() {
+                        Some("alert") | Some("critical") => "agent_attention",
+                        _ => "agent_done",
+                    }
                 };
                 let source = note.source.as_deref().unwrap_or("api");
                 let message = if note.body.is_empty() {
@@ -1138,9 +1151,98 @@ impl ControlApi for DaemonService {
                 } else {
                     format!("{} — {}", note.title, note.body)
                 };
-                db.put_notification(kind, source, &message, "")
+                crate::automation_events::emit_with_facts(
+                    db,
+                    kind,
+                    source,
+                    &message,
+                    "",
+                    crate::automation_events::EventFacts {
+                        origin: note.automation_origin.map(|origin| {
+                            thegn_core::automation::AutomationOrigin {
+                                root_event_id: origin.root_event_id,
+                                rule_id: origin.rule_id,
+                                run_id: origin.run_id,
+                            }
+                        }),
+                        ..Default::default()
+                    },
+                )
             })
             .await
+        })
+    }
+
+    fn automations_list(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_svc::control::AutomationRuleInfo>>> {
+        let cfg = Arc::clone(&self.config);
+        Box::pin(async move {
+            let effective = cfg.effective_automations();
+            let rules = effective
+                .compiled_rules()
+                .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
+            let profile = cfg.active_profile().is_some();
+            self.with_db(move |db| {
+                use thegn_core::store::AutomationStore;
+                Ok(rules
+                    .into_iter()
+                    .map(|rule| thegn_svc::control::AutomationRuleInfo {
+                        recent_outcome: db
+                            .automation_runs(Some(&rule.id), 1)
+                            .ok()
+                            .and_then(|rows| rows.into_iter().next())
+                            .map(|row| row.outcome),
+                        name: rule.id,
+                        enabled: rule.enabled,
+                        trusted_layer: if profile { "global+profile" } else { "global" }.into(),
+                        event: rule.event.as_str().into(),
+                        action: rule.action.cap,
+                        inert_reason: if !effective.enabled {
+                            Some("automations disabled".into())
+                        } else if !rule.enabled {
+                            Some("rule disabled".into())
+                        } else {
+                            None
+                        },
+                    })
+                    .collect())
+            })
+            .await
+        })
+    }
+
+    fn automations_test(
+        &self,
+        request: thegn_svc::control::AutomationTestRequest,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::AutomationTestReply>> {
+        let cfg = Arc::clone(&self.config);
+        Box::pin(async move {
+            let event: thegn_core::automation::AutomationEvent =
+                serde_json::from_value(request.event).map_err(|error| {
+                    ControlError::Conflict(format!("invalid event fixture: {error}"))
+                })?;
+            let rules = cfg
+                .effective_automations()
+                .compiled_rules()
+                .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
+            let rule = rules
+                .into_iter()
+                .find(|rule| rule.id == request.rule)
+                .ok_or_else(|| {
+                    ControlError::NotFound(format!("automation rule {}", request.rule))
+                })?;
+            let decisions = thegn_core::automation::evaluate(
+                std::slice::from_ref(&rule),
+                &event,
+                &thegn_core::automation::EvaluationState::new(),
+                request.at.unwrap_or(event.occurred_at),
+            );
+            Ok(thegn_svc::control::AutomationTestReply {
+                rule: rule.id,
+                decisions: serde_json::to_value(decisions).map_err(anyhow::Error::from)?,
+                executed: false,
+            })
         })
     }
 
@@ -1840,6 +1942,7 @@ mod tests {
                 body: "all green".into(),
                 urgency: None,
                 source: None,
+                automation_origin: None,
             })
             .await
             .unwrap();
@@ -1849,6 +1952,7 @@ mod tests {
                 body: String::new(),
                 urgency: Some("alert".into()),
                 source: Some("ci".into()),
+                automation_origin: None,
             })
             .await
             .unwrap();
