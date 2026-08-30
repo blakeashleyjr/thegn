@@ -383,6 +383,19 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Cli]),
         "Effective harness/model/env/permissions of every agent entry and pipeline stage",
     ),
+    // --- skills --------------------------------------------------------------
+    cap(
+        "skills.list",
+        Verb::SkillsList,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "List embedded and configured skill metadata",
+    ),
+    cap(
+        "skills.seed",
+        Verb::SkillsSeed,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Seed skills into a worktree for every configured harness",
+    ),
     // --- feed / leases / identity -------------------------------------------
     cap(
         "events.subscribe",

@@ -4720,6 +4720,7 @@ pub use crate::config_pr_queue::{
     PrQueuePromptsOverlay, PrWatchKind,
 };
 pub use crate::config_preview::PreviewConfig;
+pub use crate::config_skills::SkillsConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -4847,6 +4848,9 @@ pub struct Config {
     /// displays it and never advances a stage itself. Empty by default.
     /// See [`crate::config_pipeline`].
     pub pipeline: Pipeline,
+    /// `[skills]` — embedded and configured agent recipes seeded into native
+    /// per-project harness layouts. Discovery and path access are host-owned.
+    pub skills: SkillsConfig,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
@@ -5043,6 +5047,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             pipeline: Pipeline::default(),
+            skills: SkillsConfig::default(),
             replay: ReplayConfig::default(),
             recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
@@ -5169,6 +5174,9 @@ pub struct ConfigOverlay {
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
+    pub skills_enabled: Option<bool>,
+    pub skills_user_dirs: Option<Vec<String>>,
+    pub skills_exclude: Option<Vec<String>>,
     pub preview: crate::config_preview::PreviewOverlay,
     pub sandbox: SandboxOverlay,
 }
@@ -5257,6 +5265,9 @@ impl ConfigOverlay {
             base.notifications.agent_attention_inbox,
             self.notifications_agent_attention_inbox
         );
+        set!(base.skills.enabled, self.skills_enabled);
+        set!(base.skills.user_dirs, self.skills_user_dirs);
+        set!(base.skills.exclude, self.skills_exclude);
         self.preview.apply(&mut base.preview);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
@@ -5527,6 +5538,18 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX") {
         o.notifications_agent_attention_inbox =
             parse_bool(&v, "THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX");
+    }
+
+    // [skills] — all three values are shallow, useful for isolated launches,
+    // and therefore deliberately participate in the env layer.
+    if let Some(v) = env.get("THEGN_SKILLS_ENABLED") {
+        o.skills_enabled = parse_bool(&v, "THEGN_SKILLS_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_SKILLS_USER_DIRS") {
+        o.skills_user_dirs = Some(parse_list(v));
+    }
+    if let Some(v) = env.get("THEGN_SKILLS_EXCLUDE") {
+        o.skills_exclude = Some(parse_list(v));
     }
 
     // [preview] — all five keys are trusted launch-time knobs.

@@ -60,6 +60,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // model must land on a harness with a model flag, env keys must be
             // exportable names.
             errs.extend(crate::agent_task::validate_agent_models(&cfg));
+            // Skill names and directory-list syntax are a config-boundary
+            // concern. Directory existence/discovery stays at the host edge.
+            errs.extend(cfg.skills.validate());
             errs.extend(crate::config_drawer::validate_drawer_config(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
