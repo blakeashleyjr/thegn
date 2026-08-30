@@ -759,6 +759,107 @@
       ],
       "type": "object"
     },
+    "SkillInfo": {
+      "description": "Metadata-only description of one embedded or configured skill. The control API never returns target paths and never exposes a seed operation.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "gate": {
+          "type": "string"
+        },
+        "harnesses": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/SkillSource"
+        },
+        "when": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "description",
+        "gate",
+        "harnesses",
+        "name",
+        "source",
+        "when"
+      ],
+      "type": "object"
+    },
+    "SkillSource": {
+      "description": "Where a parsed skill came from. The origin is diagnostic metadata only and is never interpreted as a filesystem path by core.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "embedded"
+              ],
+              "type": "string"
+            },
+            "origin": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "origin"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "user"
+              ],
+              "type": "string"
+            },
+            "origin": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "origin"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SkillsList": {
+      "description": "The bounded registry projection returned by `GET /v1/skills`.",
+      "properties": {
+        "diagnostics": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/definitions/SkillInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "diagnostics",
+        "skills"
+      ],
+      "type": "object"
+    },
     "SplitDir": {
       "description": "Where a `split` places the new pane relative to the target session. Mirrors the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does not depend on `thegn-host`.",
       "oneOf": [
@@ -1042,6 +1143,11 @@
       "path": "/v1/worktrees/open"
     },
     {
+      "cap": "skills.list",
+      "method": "GET",
+      "path": "/v1/skills"
+    },
+    {
       "cap": "editor.open",
       "method": "POST",
       "path": "/v1/editor/open"
@@ -1235,6 +1341,12 @@
     },
     "SessionRecord": {
       "$ref": "#/definitions/SessionRecord"
+    },
+    "SkillInfo": {
+      "$ref": "#/definitions/SkillInfo"
+    },
+    "SkillsList": {
+      "$ref": "#/definitions/SkillsList"
     },
     "SplitDir": {
       "$ref": "#/definitions/SplitDir"

@@ -132,7 +132,6 @@ mod monitor;
 mod monitor_action;
 mod monitor_pipeline;
 mod mousefilter;
-mod mq_assets;
 mod naming;
 mod nav;
 mod nixcache;
@@ -213,6 +212,7 @@ mod sidebar_mq;
 mod sidebar_order;
 mod sidebar_pipeline;
 mod sidebar_view;
+mod skill_seed;
 mod snapshot;
 mod sprite_bridge;
 mod ssh_shim;
@@ -506,6 +506,11 @@ pub enum Command {
     Agent {
         #[command(subcommand)]
         action: cmd::agent::Action,
+    },
+    /// Embedded and configured agent skills: list, show, and seed worktrees.
+    Skills {
+        #[command(subcommand)]
+        action: cmd::skills::Action,
     },
     /// The capability catalog as a generic client: `list`, `schema`,
     /// `call <cap>` (catalog-driven HTTP over the control socket).
@@ -1153,6 +1158,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
+        Command::Skills { action } => cmd::skills::run(&cfg, action),
         Command::Api { action } => cmd::api::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),

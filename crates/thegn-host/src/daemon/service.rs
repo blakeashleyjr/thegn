@@ -1517,6 +1517,27 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn list_skills(&self) -> BoxFuture<'_, ControlResult<thegn_svc::control::SkillsList>> {
+        Box::pin(async move {
+            let cfg = self.config.clone();
+            tokio::task::spawn_blocking(move || {
+                let loaded = crate::skill_seed::load_registry(&cfg);
+                thegn_svc::control::SkillsList {
+                    skills: loaded
+                        .registry
+                        .iter()
+                        .map(|(_, skill)| crate::skill_seed::metadata(skill))
+                        .collect(),
+                    diagnostics: loaded.diagnostics,
+                }
+            })
+            .await
+            .map_err(|error| {
+                ControlError::Internal(anyhow::anyhow!("skill registry join: {error}"))
+            })
+        })
+    }
+
     fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
         self.emit(EventFrame::Pairing {
             pairing_id: pairing_id.to_string(),

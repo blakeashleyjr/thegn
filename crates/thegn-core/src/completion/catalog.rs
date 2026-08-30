@@ -49,6 +49,9 @@ pub enum SourceKind {
     Capability,
     /// Bindable action ids from [`crate::keymap::BUILTINS`].
     Action,
+    /// Embedded skill package names. Configured user packages are discovered by
+    /// the host and deliberately not walked on the latency-sensitive TAB path.
+    Skill,
 
     /// clap already completes this slot from the tree itself — subcommand
     /// names, flags, and `ValueEnum` arguments such as `completions <shell>`.
@@ -141,6 +144,7 @@ impl SourceKind {
         SourceKind::ConfigKey,
         SourceKind::Capability,
         SourceKind::Action,
+        SourceKind::Skill,
         SourceKind::Structural,
         SourceKind::Reserved(Reserved::Branch),
         SourceKind::Reserved(Reserved::Pr),
@@ -167,6 +171,7 @@ impl SourceKind {
             SourceKind::ConfigKey => "config-key",
             SourceKind::Capability => "capability",
             SourceKind::Action => "action",
+            SourceKind::Skill => "skill",
             SourceKind::Structural => "structural",
             SourceKind::Reserved(r) => r.kind(),
         }
@@ -473,6 +478,8 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // --- embedded skill ---------------------------------------------------
+    slot("skills show", "name", SourceKind::Skill),
     // Theme names are the merged built-in/local catalog. The import path is a
     // filesystem value and keeps clap's structural completion behavior.
     slot("theme set", "name", SourceKind::Theme),
@@ -484,6 +491,7 @@ pub const CATALOG: &[Slot] = &[
     // `config validate --repo <PATH>`: clap owns filesystem path completion.
     slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("skills seed", "worktree", SourceKind::Structural),
     slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
@@ -586,7 +594,7 @@ mod tests {
             .filter(|k| k.is_implemented() && !k.reads_db() && !k.reads_config())
             .map(|k| k.kind())
             .collect();
-        assert_eq!(in_process, ["theme", "capability", "action"]);
+        assert_eq!(in_process, ["theme", "capability", "action", "skill"]);
     }
 
     #[test]
