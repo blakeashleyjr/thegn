@@ -49,9 +49,9 @@ renders after the last hunk under an "outdated feedback" rule.
 
 ## The handoff key
 
-On a thread row (Files or Conversation tab), one key (proposed `g`, "give to
-agent"; the view's hint line and `docs/help/review-a-pr.md` document it)
-resolves in order:
+On a thread row (Files or Conversation tab), `p` passes the selected thread and
+`P` passes all unresolved threads; the view's hint line and
+`docs/help/review-a-pr.md` document the contract. Each key resolves in order:
 
 1. The worktree's remembered agent pane is running ⇒ **paste**: format via
    `thread_prompt`, sanitize (below), bracketed-paste into that pane through
@@ -66,20 +66,19 @@ resolves in order:
    `[pr_queue] agent` configured") and nothing happens. The shell never
    hard-depends on an agent.
 
-An explicit second chord (`G`) forces the headless variant when a pane is
-also running.
-
 ## Event loop, rendering, help
 
 - **Damage:** the PR view is a full-screen modal — all its repaints are the
   master `dirty` ⇒ `Full`, unchanged. The paste path writes to a PTY (pane
   damage arrives as normal pane output ⇒ `Panes`). No new wake source; the
   headless dispatch reuses `agent_run`'s off-thread run + waker pulse.
-- **No new fetching:** threads and diff already load off-loop over
-  `pr_view_tx`. Anchoring runs at render-data assembly (on the loop, pure,
-  linear in diff size — the diff is already being composed).
+- **Fetch/cache:** the existing off-loop review refresh reads and writes the
+  complete per-worktree review snapshot, preserving the last complete cache
+  entry across transient forge failures. It delivers the generation-tagged
+  snapshot over `pr_view_tx`; anchoring runs at render-data assembly (on the
+  loop, pure, linear in diff size — the diff is already being composed).
 - **Help context:** `panel:pr` → `docs/help/review-a-pr.md` gains the new
-  chords (`g`/`G`, resolved-toggle); the prose ratchet requires the page to
+  chords (`p`/`P`, resolved-toggle); the prose ratchet requires the page to
   actually mention them. No new `ACTION_SPECS` id — PR-view keys are
   view-internal like the existing composer keys — so no help-ratchet claim
   beyond the prose.

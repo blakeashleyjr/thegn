@@ -202,6 +202,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Open a session: argv, cwd, env, rows/cols, optional worktree",
     ),
     cap(
+        "sessions.fork",
+        Verb::ForkSession,
+        SurfaceSet::ALL,
+        "Fork a live daemon or recorded harness session",
+    ),
+    cap(
         "sessions.attach",
         Verb::Attach,
         SurfaceSet::STREAMING,

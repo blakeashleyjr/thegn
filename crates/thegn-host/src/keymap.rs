@@ -68,6 +68,8 @@ pub enum Action {
     NewWorktreeFromTemplate,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
+    /// Open the boxed theme builder with live previews.
+    ThemeBuilderOpen,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
     SwitchFont,
     /// Close the active tab within the worktree. The final tab is kept; use
@@ -152,6 +154,8 @@ pub enum Action {
     PoolDecrement,
     TogglePanel,
     ToggleRecorder,
+    /// Fork the focused live daemon session into a fresh process.
+    ForkSession,
     /// Open time-travel replay for the focused pane — scrub its recorded byte
     /// stream (play/pause, seek, search across time). See `[replay]`.
     EnterReplay,
@@ -499,6 +503,7 @@ impl Action {
             Action::ImportLayout => "import-layout",
             Action::NewWorktreeFromTemplate => "new-worktree-from-template",
             Action::CycleTheme => "cycle-theme",
+            Action::ThemeBuilderOpen => "theme-builder-open",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
@@ -544,6 +549,7 @@ impl Action {
             Action::PoolDecrement => "warm-pool-decrement",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
+            Action::ForkSession => "fork-session",
             Action::EnterReplay => "enter-replay",
             Action::ExportCast => "export-cast",
             Action::PasteRegister => "paste-register",
@@ -645,6 +651,7 @@ impl Action {
             "import-layout" => Action::ImportLayout,
             "new-worktree-from-template" | "worktree-template" => Action::NewWorktreeFromTemplate,
             "cycle-theme" | "theme" => Action::CycleTheme,
+            "theme-builder-open" | "theme-builder" => Action::ThemeBuilderOpen,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
@@ -690,6 +697,7 @@ impl Action {
             "warm-pool-decrement" => Action::PoolDecrement,
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
+            "fork-session" => Action::ForkSession,
             "enter-replay" | "replay" => Action::EnterReplay,
             "export-cast" => Action::ExportCast,
             "paste-register" => Action::PasteRegister,
@@ -1306,6 +1314,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
+    map.insert_all("Ctrl Alt Shift t", Action::ThemeBuilderOpen)
+        .unwrap();
     // Bind every `ACTION_SPECS` default chord for real: these six were
     // DECLARED (so the palette + `thegn keys list` advertised them) but never
     // registered here — pressing the shown chord did nothing.

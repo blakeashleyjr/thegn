@@ -2,7 +2,7 @@
 id: daemon-and-sessions
 title: Daemon & sessions
 order: 13
-actions: [detach, quit, quit-kill]
+actions: [detach, quit, quit-kill, fork-session]
 ---
 
 # Daemon & sessions
@@ -37,6 +37,7 @@ the other verbs take:
 | `thegn session snapshot --session <id>`    | dump its current screen (`--text` for plain rows, `--json` for geometry + ANSI) |
 | `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                                 |
 | `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>`        |
+| `thegn session fork <id>`                  | start a new daemon session from a live session; `--tab` places it in a new tab  |
 | `thegn session record <id>`                | record its output to a `.cast` file; `--stop` finalizes, `--status` reports     |
 
 ## Recording a session
@@ -66,6 +67,14 @@ local-only — it speaks the unix socket and never dials the TCP listener.
 `session wait` is the one built for scripting: it exits 0 on match, 2 on
 timeout, and 1 if there is no daemon, so a shell script can drive a long
 build and block on it.
+
+`session fork` starts a fresh PTY from a live daemon session. It preserves the
+launch recipe and reports the parent in `forked_from`; it never clones the
+source process or screen. `--scrollback` gives the child a bounded,
+owner-only handoff file, `--tab` adopts it in a new tab, and
+`--fork-worktree` creates a separate worktree before launching. Exited sessions
+must be reopened with `session open`; native agent conversations can also be
+forked by supplying their recorded harness id.
 
 ## Moving a session to another profile
 
