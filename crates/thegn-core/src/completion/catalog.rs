@@ -335,6 +335,7 @@ pub const CATALOG: &[Slot] = &[
     // --- session ----------------------------------------------------------
     slot("attach", "session", SourceKind::Session),
     slot("dispatch put", "session", SourceKind::Session),
+    slot("events tail", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
     slot("session browse", "session", SourceKind::Session),
     slot("session record", "session", SourceKind::Session),
@@ -463,6 +464,7 @@ pub const CATALOG: &[Slot] = &[
     // A `global = true` arg, so it is classified once at the root.
     slot("", "config", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("events tail", "kinds", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------
