@@ -18,10 +18,14 @@ service Control {
   rpc Snapshot(SnapshotRequest) returns (Event);
   rpc KillSession(KillSessionRequest) returns (Empty);
   rpc OpenWorktree(OpenWorktreeRequest) returns (Empty);
+  // Queue a safe target for the owning compositor's locally configured editor.
+  rpc OpenEditor(OpenEditorRequest) returns (OpenEditorReply);
   // Worktrees registered with thegn (path, branch, repo root, location).
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesReply);
   // v1: always UNIMPLEMENTED (the contract slot for the preview browser).
   rpc DriveBrowser(DriveBrowserRequest) returns (Empty);
+  // Bounded, credential-free preview HTTP GET.
+  rpc PreviewFetch(PreviewFetchRequest) returns (PreviewFetchReply);
   // Block until a session reaches a state (idle, exit, pattern) — observes only.
   rpc Wait(WaitRequest) returns (WaitReply);
   // Create a sibling pane/session next to an existing one.
@@ -47,6 +51,9 @@ service Control {
   rpc PrStatus(PrStatusRequest) returns (PrStatusReply);
   // Push a notification into the tray; returns the stored row id.
   rpc NotifyPush(NotifyPushRequest) returns (NotifyPushReply);
+  rpc AutomationsList(AutomationsListRequest) returns (AutomationsListReply);
+  rpc AutomationsTest(AutomationsTestRequest) returns (AutomationsTestReply);
+  rpc ToolsRun(ToolsRunRequest) returns (SessionInfo);
 }
 
 message Empty {}
@@ -125,6 +132,14 @@ message OpenWorktreeRequest {
   string branch = 2;          // empty = none
 }
 
+message OpenEditorRequest {
+  string worktree = 1;        // required absolute host path
+  string path = 2;            // empty = project; otherwise worktree-relative
+  optional uint64 line = 3;   // 1-based; requires path
+  optional uint64 col = 4;    // 1-based; requires path + line
+}
+message OpenEditorReply { bool queued = 1; }
+
 message ListWorktreesRequest {}
 message ListWorktreesReply { repeated WorktreeInfo worktrees = 1; }
 message WorktreeInfo {
@@ -187,6 +202,22 @@ message DriveBrowserRequest {
   }
 }
 
+message PreviewFetchRequest {
+  string url = 1;
+  string worktree = 2;        // empty = none
+  bool include_console = 3;
+}
+
+message PreviewFetchReply {
+  string url = 1;             // final URL after validated redirects
+  uint32 status = 2;
+  string content_type = 3;    // empty = absent
+  string body = 4;            // bounded, lossy UTF-8
+  bool truncated = 5;
+  repeated string console_errors = 6;
+  string diagnostics_source = 7;
+}
+
 message GitStatusRequest { string worktree = 1; }
 message GitStatusReply { repeated GitFileStatus files = 1; }
 message GitFileStatus {
@@ -205,7 +236,12 @@ message GitCommitRequest {
 }
 message GitCommitReply { string commit = 1; }
 
-message EventsRequest {}
+message EventsRequest {
+  // Optional narrowing filters; empty means the legacy full feed.
+  repeated string kinds = 1;
+  string session = 2;
+  bool signal_lag = 3;
+}
 
 message LeaseStatusRequest {}
 message LeaseStatusReply { repeated Lease leases = 1; }
@@ -235,8 +271,33 @@ message NotifyPushRequest {
   string body = 2;           // empty = title only
   string urgency = 3;        // empty = default; "alert"/"critical" = red flag
   string source = 4;         // empty = "api"
+  AutomationOrigin automation_origin = 5;
 }
 message NotifyPushReply { int64 id = 1; }
+
+message AutomationOrigin {
+  string root_event_id = 1;
+  string rule_id = 2;
+  string run_id = 3;
+}
+
+message AutomationsListRequest {}
+message AutomationsListReply { string rules_json = 1; }
+message AutomationsTestRequest {
+  string rule = 1;
+  string event_json = 2;
+  optional int64 at = 3;
+}
+message AutomationsTestReply {
+  string rule = 1;
+  string decisions_json = 2;
+  bool executed = 3;
+}
+message ToolsRunRequest {
+  string name = 1;
+  string worktree = 2;
+  AutomationOrigin automation_origin = 3;
+}
 
 message MeRequest {}
 message MeReply {
@@ -257,6 +318,7 @@ message Event {
     PairingEvent pairing = 7;
     Empty sessions = 8;
     SessionExit exit = 9;
+    Lagged lagged = 10;
   }
 }
 
@@ -298,4 +360,8 @@ message PairingEvent {
 message SessionExit {
   string session = 1;
   optional int32 code = 2;
+}
+
+message Lagged {
+  uint64 missed = 1;
 }

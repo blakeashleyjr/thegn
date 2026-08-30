@@ -134,10 +134,10 @@ fn notification_priority_defaults_and_overrides() {
     // deliberately absent: a PR waiting on a colleague is the normal resting
     // state, and a permanently red badge teaches people to ignore it.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 8);
+    assert_eq!(alerts.len(), 9);
     let want = "agent_failed agent_attention test_failed \
                     process_failed queue_needs_human pr_queue_needs_human \
-                    resource_alert usage_limit";
+                    resource_alert usage_limit automation_failed";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }
@@ -951,6 +951,7 @@ fn config_overlay_apply_sets_every_field() {
         picker: Some(Picker::Fzf),
         git_backend: Some(GitBackendKind::Cli),
         git_structural_diff: Some(StructuralDiff::Difft),
+        editor_provider: Some(EditorProvider::Zed),
         editor_command: Some("hx {path}".into()),
         editor_open_in: Some(EditorOpenIn::External),
         worktree_mode: Some(WorktreeMode::InRepo),
@@ -1000,6 +1001,16 @@ fn config_overlay_apply_sets_every_field() {
         loc_watch_invalidate_secs: Some(11),
         weather_enabled: Some(true),
         notifications_agent_attention_inbox: Some(true),
+        skills_enabled: Some(false),
+        skills_user_dirs: Some(vec!["/skills".into()]),
+        skills_exclude: Some(vec!["mq".into()]),
+        preview: crate::config_preview::PreviewOverlay {
+            enabled: Some(false),
+            ports: Some(vec![3000, 5173]),
+            fetch_timeout_ms: Some(850),
+            max_body_bytes: Some(8192),
+            allow_external_urls: Some(true),
+        },
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -1015,6 +1026,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.picker, Picker::Fzf);
     assert_eq!(cfg.git.backend, GitBackendKind::Cli);
     assert_eq!(cfg.git.structural_diff, StructuralDiff::Difft);
+    assert_eq!(cfg.editor.provider, EditorProvider::Zed);
     assert_eq!(cfg.editor.command, "hx {path}");
     assert_eq!(cfg.editor.open_in, EditorOpenIn::External);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
@@ -1062,6 +1074,14 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(cfg.weather.enabled);
     assert!(cfg.notifications.agent_attention_inbox);
+    assert!(!cfg.skills.enabled);
+    assert_eq!(cfg.skills.user_dirs, vec!["/skills"]);
+    assert_eq!(cfg.skills.exclude, vec!["mq"]);
+    assert!(!cfg.preview.enabled);
+    assert_eq!(cfg.preview.ports, vec![3000, 5173]);
+    assert_eq!(cfg.preview.fetch_timeout_ms, 850);
+    assert_eq!(cfg.preview.max_body_bytes, 8192);
+    assert!(cfg.preview.allow_external_urls);
     assert!(!cfg.sandbox.enabled);
 }
 
@@ -1188,6 +1208,7 @@ fn env_overlay_metrics_rejects_non_finite_floats() {
 #[test]
 fn env_overlay_bad_enum_values_yield_none() {
     let env = map_env(&[
+        ("THEGN_EDITOR_PROVIDER", "bogus"),
         ("THEGN_WORKTREE_MODE", "bogus"),
         ("THEGN_NAME_SCHEME", "bogus"),
         ("THEGN_LOG_LEVEL", "bogus"),
@@ -1197,6 +1218,7 @@ fn env_overlay_bad_enum_values_yield_none() {
         ("THEGN_SANDBOX_ON_MISSING", "bogus"),
     ]);
     let o = env_overlay(&env);
+    assert_eq!(o.editor_provider, None);
     assert_eq!(o.worktree_mode, None);
     assert_eq!(o.name_scheme, None);
     assert_eq!(o.log_level, None);

@@ -134,6 +134,7 @@ action-help = Help — built-in docs
 action-lazygit = Open lazygit
 action-yazi = Open yazi drawer
 action-editor = Open editor
+action-open-in-ide = Open focused worktree in IDE
 action-show-diff = Open git diff
 action-git-push = Git push (current branch)
 action-git-pull = Git pull (current branch)

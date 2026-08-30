@@ -16,7 +16,7 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Environments  | `env` · `zone` · `host` · `placement` · `sandbox` · `debug` · `mcp` · `plugin`                                                     |
 | Session       | `session list\|open\|fork\|close\|send\|snapshot\|attach\|wait\|record` · `notify` · `logs` · `share` · `forward` · `sandbox-argv` |
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                                            |
-| Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                                            |
+| Meta          | `config` · `theme` · `skills` · `doctor` · `setup` · `completions`                                                                 |
 
 `session open --resume-work <row>` resumes a failed pipeline row through the
 roster (THE-86): it re-renders the row's stage prompt, gathers the row's
@@ -90,6 +90,53 @@ provisions a sandbox — the compositor prepares lazily on first open.
 `wt rm` runs provider/sandbox teardown synchronously, then
 `git worktree remove`, then cleans every DB row (including tab groups, so a
 removed worktree is never resurrected at the next launch).
+
+## Embedded and configured skills (`skills`)
+
+```text
+thegn skills list [--json]
+thegn skills show <name> [--json]
+thegn skills seed [--worktree <path>] [--json]
+```
+
+`list` prints deterministic metadata for the merged skill registry; `show`
+prints one canonical, unmarked `SKILL.md` without writing anything. The three
+shipped skills are compiled into the binary, so both commands work without a
+network, a state database, or prior setup. Directories in `[skills].user_dirs`
+extend that set from immediate `<name>/SKILL.md` packages. Discovery is
+bounded and non-recursive, and the shipped entry wins if a configured package
+reuses its name; unreadable or invalid packages are reported as diagnostics
+without hiding the rest of the registry.
+
+`seed` applies the explicit phase to one worktree, using the normal
+`--worktree` resolution above. It selects the distinct harnesses referenced by
+configured agents and pipeline stages (Claude when none are configured), and
+writes only their native project layouts:
+
+- Claude: `.claude/skills/<name>/SKILL.md`
+- Codex: `.agents/skills/<name>/SKILL.md`
+- Pi: `.pi/skills/<name>/SKILL.md`
+
+A configured harness without a project skill layout is diagnosed and skipped.
+Selection also respects each skill's harness list, lifecycle `when`, and
+feature `gate`: the bundled `supervise` entry is always eligible, `mq` requires
+the merge queue, and `pipeline` requires at least one configured pipeline
+stage. All three permit create, startup, and explicit seeding. `[skills]
+enabled = false` disables automatic create/startup seeding; it does not disable
+an explicit `skills seed` command.
+
+Every file thegn writes carries `thegn_managed`, the shipping version, and a
+SHA-256 hash of the canonical unmarked document. A current managed file is a
+no-op; an unmodified older managed file is updated. An unmarked file is
+user-owned, and a managed file whose recorded hash no longer matches its
+contents is treated as user-adopted: both are preserved and reported. An entry
+named in `[skills].exclude`, or one no longer present in the registry, is
+removed only when that same marker/hash proof says it is still unmodified.
+Seeded paths are also added to the worktree's repository-local git exclude.
+
+This is per-worktree provisioning, not synchronization of `~/.claude`,
+`~/.codex`, `~/.pi`, or any other harness home. See the in-app `skills` page
+for the package format.
 
 ## Machine-readable output (`--json`)
 

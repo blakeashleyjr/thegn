@@ -29,6 +29,7 @@
 //! [`PoolStore`] (warm-spare pool), and [`HostStore`] (host state machine).
 
 mod account;
+mod automation;
 mod cache;
 mod calendar;
 mod compute;
@@ -55,6 +56,9 @@ mod worktree_aux;
 mod zone;
 
 pub use account::AccountStore;
+pub use automation::{
+    AutomationAdmission, AutomationRunRow, AutomationStateRow, AutomationStore, NewAutomationRun,
+};
 pub use cache::CacheStore;
 pub use calendar::{CalendarRow, CalendarStore, CalendarSyncRow};
 pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};

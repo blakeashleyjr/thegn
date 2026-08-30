@@ -54,9 +54,7 @@ pub(crate) fn maybe_emit_log_error(
             error_count,
             if error_count == 1 { "" } else { "s" }
         );
-        if !crate::notify::record_global(db, "log_error", "log:thegn", &msg, "") {
-            let _ = db.put_notification("log_error", "log:thegn", &msg, ""); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-        }
+        let _ = crate::automation_events::emit(db, "log_error", "log:thegn", &msg, ""); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 

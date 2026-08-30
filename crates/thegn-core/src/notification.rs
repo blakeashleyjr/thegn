@@ -95,6 +95,10 @@ pub enum NotificationKind {
     /// An AI account is approaching (or past) a rate-limit threshold
     /// (`[usage.alerts]`).
     UsageLimit,
+    /// A trusted automation action completed or emitted an informational result.
+    Automation,
+    /// A trusted automation action failed or timed out.
+    AutomationFailed,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -191,6 +195,8 @@ impl NotificationKind {
         Self::UpstreamBehind,
         Self::ResourceAlert,
         Self::UsageLimit,
+        Self::Automation,
+        Self::AutomationFailed,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -226,6 +232,8 @@ impl NotificationKind {
             Self::UpstreamBehind => "upstream_behind",
             Self::ResourceAlert => "resource_alert",
             Self::UsageLimit => "usage_limit",
+            Self::Automation => "automation",
+            Self::AutomationFailed => "automation_failed",
         }
     }
 
@@ -248,6 +256,7 @@ impl NotificationKind {
             // exhausted quota reaching here is real, ongoing, and about to
             // stop the user working.
             | Self::UsageLimit => Priority::Alert,
+            Self::AutomationFailed => Priority::Alert,
             // LogError is thegn's own diagnostics — informational, never a red
             // alert (and off by default, see `surface_self_log_errors`). It shows
             // in the Logs group as a quiet entry point, not the Alerts group.
@@ -275,6 +284,7 @@ impl NotificationKind {
             // the default threshold without claiming the red Alert group.
             | Self::CalendarReminder
             | Self::UpstreamBehind => Priority::Notice,
+            Self::Automation => Priority::Notice,
         }
     }
 
@@ -289,6 +299,8 @@ impl NotificationKind {
             Self::PrStateChanged => "⑂",
             Self::ResourceAlert => "▲",
             Self::UsageLimit => "▲",
+            Self::Automation => "◆",
+            Self::AutomationFailed => "✗",
             Self::AgentDone => "◉",
             Self::AgentFailed => "◎",
             Self::AgentAttention => "⚠",
@@ -352,6 +364,8 @@ impl NotificationKind {
             Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
             Self::ResourceAlert => (gl.warn, Hue::Amber),
             Self::UsageLimit => (gl.warn, Hue::Amber),
+            Self::Automation => (gl.diamond_filled, Hue::Blue),
+            Self::AutomationFailed => (gl.cross, Hue::Red),
         }
     }
 
@@ -385,6 +399,8 @@ impl NotificationKind {
             Self::UpstreamBehind => "upstream updates",
             Self::ResourceAlert => "resource alert",
             Self::UsageLimit => "ai usage limit",
+            Self::Automation => "automation",
+            Self::AutomationFailed => "automation failed",
         }
     }
 }
@@ -443,6 +459,7 @@ mod tests {
                     // hysteresis, so it is real and ongoing by construction.
                     | NotificationKind::ResourceAlert
                     | NotificationKind::UsageLimit
+                    | NotificationKind::AutomationFailed
             );
             let expect_info = matches!(
                 kind,
@@ -497,6 +514,7 @@ mod tests {
             NotificationKind::TestFailed,
             NotificationKind::ProcessFailed,
             NotificationKind::LogError,
+            NotificationKind::AutomationFailed,
         ] {
             let (glyph, hue) = kind.hued_glyph(&UNICODE);
             assert_eq!(glyph, UNICODE.cross, "{kind:?}");

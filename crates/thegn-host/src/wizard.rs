@@ -1089,9 +1089,9 @@ pub fn run_worker(
         fail(CreateStep::CreateWorktree, error);
         return;
     }
-    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
-    // for agents in this worktree (best-effort, gated on [merge_queue] enabled).
-    crate::mq_assets::seed_if_enabled(cfg, &path);
+    // Seed configured skills while still on the wizard's blocking worker.
+    // Conflicts and discovery failures stay best-effort diagnostics.
+    crate::skill_seed::seed_if_enabled(cfg, &path, thegn_core::skills::SeedPhase::Create);
     step(CreateStep::CreateWorktree, StepState::Done, None);
 
     // --- command loop: the wizard drives the rest.

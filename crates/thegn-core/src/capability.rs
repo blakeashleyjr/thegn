@@ -278,10 +278,22 @@ pub const CATALOG: &[HostCapability] = &[
         "Open/focus a worktree in the owning instance",
     ),
     cap(
+        "editor.open",
+        Verb::OpenEditor,
+        SurfaceSet::ALL,
+        "Queue a worktree or worktree-relative file for local editor handoff",
+    ),
+    cap(
         "launch.preset",
         Verb::LaunchPreset,
         SurfaceSet::ALL,
         "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
+    ),
+    cap(
+        "preview.fetch",
+        Verb::PreviewFetch,
+        SurfaceSet::ALL,
+        "Fetch a preview URL with bounded, credential-free HTTP",
     ),
     stub_cap(
         "browser.drive",
@@ -358,6 +370,25 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Push a notification into the tray",
     ),
+    // --- trusted automation -------------------------------------------------
+    cap(
+        "automations.list",
+        Verb::AutomationsList,
+        SurfaceSet::ALL,
+        "List trusted automation rules and recent audited outcomes",
+    ),
+    cap(
+        "automations.test",
+        Verb::AutomationsTest,
+        SurfaceSet::ALL,
+        "Purely evaluate one automation rule against an event fixture",
+    ),
+    cap(
+        "tools.run",
+        Verb::ToolsRun,
+        SurfaceSet::ALL,
+        "Run one trusted configured tool by name in a worktree",
+    ),
     // --- agents --------------------------------------------------------------
     cap(
         "agent.sessions",
@@ -371,11 +402,24 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Cli]),
         "Effective harness/model/env/permissions of every agent entry and pipeline stage",
     ),
+    // --- skills --------------------------------------------------------------
+    cap(
+        "skills.list",
+        Verb::SkillsList,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "List embedded and configured skill metadata",
+    ),
+    cap(
+        "skills.seed",
+        Verb::SkillsSeed,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Seed skills into a worktree for every configured harness",
+    ),
     // --- feed / leases / identity -------------------------------------------
     cap(
         "events.subscribe",
         Verb::Events,
-        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Plugin]),
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Plugin]),
         "The live event feed",
     ),
     cap(

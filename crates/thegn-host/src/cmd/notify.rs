@@ -62,7 +62,7 @@ pub fn run(action: Action) -> anyhow::Result<()> {
             message,
             worktree,
         } => {
-            let id = db.put_notification(&kind, &source, &message, &worktree)?;
+            let id = crate::automation_events::emit(&db, &kind, &source, &message, &worktree)?;
             println!("{id}");
         }
         Action::List { all, json, limit } => {

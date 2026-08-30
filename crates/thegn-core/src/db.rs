@@ -142,14 +142,21 @@ use std::path::PathBuf;
 /// are retained beside the JSON so stale feedback cannot silently attach to a
 /// different PR.
 ///
-/// v64: adds nullable review-task identity/revision/prompt metadata and durable
-/// forge-action retry bookkeeping to `agent_dispatches`. A partial unique
-/// index makes `(task_kind, source_key)` one durable task even under concurrent
-/// refreshes. v63 was already occupied when THE-27 landed, so THE-22 takes the
-/// next additive version.
+/// v64: adds trusted automation throttle/override state and a bounded audit
+/// log (THE-21). Both are cache/audit data; action truth remains in catalog
+/// providers.
 ///
-/// v65: freezes active review-task inputs and retains one newer snapshot on the
-/// same row until the active handoff can safely finish or promote it.
+/// v65: adds nullable review-task identity/revision/prompt metadata and durable
+/// forge-action retry bookkeeping to `agent_dispatches`, and freezes active
+/// review-task inputs so one newer snapshot is retained on the same row until
+/// the active handoff can safely finish or promote it (THE-22). A partial
+/// unique index makes `(task_kind, source_key)` one durable task even under
+/// concurrent refreshes.
+///
+/// THE-21 and THE-22 both originally claimed v64 while in flight; THE-22 takes
+/// 65 because its columns are additive on top of THE-21's tables. A single
+/// racing integer is the wrong allocation mechanism — see the pipeline
+/// follow-ups.
 pub const SCHEMA_VERSION: i64 = 65;
 
 pub struct Db {
@@ -1028,6 +1035,39 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_session_attention_wt
               ON session_attention (worktree_path);
+            -- v64: trusted automation throttle/override state. JSON columns
+            -- hold bounded pure-engine ledgers; losing them only resets
+            -- throttles and never disables configured rules.
+            CREATE TABLE IF NOT EXISTS automation_state (
+              rule_id           TEXT PRIMARY KEY,
+              enabled_override  INTEGER,
+              last_fired_at     INTEGER,
+              recent_fires_json TEXT NOT NULL DEFAULT '[]',
+              action_fires_json TEXT NOT NULL DEFAULT '{}',
+              once_keys_json    TEXT NOT NULL DEFAULT '[]',
+              updated_at        INTEGER NOT NULL
+            );
+            -- v64: metadata-only action audit. Summaries are bounded by the
+            -- runtime; full prompts, event bodies, and secrets never land here.
+            CREATE TABLE IF NOT EXISTS automation_runs (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              rule_id        TEXT NOT NULL,
+              event_id       TEXT NOT NULL,
+              event_key      TEXT NOT NULL,
+              trigger_kind   TEXT NOT NULL,
+              event_summary  TEXT NOT NULL DEFAULT '',
+              action_cap     TEXT NOT NULL,
+              action_summary TEXT NOT NULL DEFAULT '',
+              outcome        TEXT NOT NULL,
+              skip_reason    TEXT,
+              error          TEXT,
+              started_at     INTEGER NOT NULL,
+              finished_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_time
+              ON automation_runs (rule_id, started_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
+              ON automation_runs (outcome, started_at DESC);
             COMMIT;
             "#,
         )?;
@@ -1043,7 +1083,9 @@ impl Db {
         crate::db_calendar::migrate_v52(&conn)?;
         crate::db_model_proxy::migrate_v54(&conn)?;
         crate::db_migrate::migrate_v62(&conn)?;
+        crate::db_migrate::migrate_v64(&conn)?;
         if ver < SCHEMA_VERSION {
+            crate::db_migrate::verify_v64_schema(&conn)?;
             crate::db_migrate::verify_v65_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification

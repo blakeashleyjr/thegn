@@ -16,6 +16,9 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod automation_events;
+mod automation_executor;
+mod automation_runtime;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
@@ -89,6 +92,7 @@ mod hydrate_tracker;
 mod hydrate_tuning;
 mod hydrate_weather;
 mod i18n_surface;
+mod ide_handoff;
 mod idle_poll;
 mod input;
 mod integrate;
@@ -131,7 +135,6 @@ mod monitor;
 mod monitor_action;
 mod monitor_pipeline;
 mod mousefilter;
-mod mq_assets;
 mod naming;
 mod nav;
 mod nixcache;
@@ -162,9 +165,12 @@ mod plugins;
 mod pr_driver;
 mod pr_view;
 mod predict;
+mod preview;
+mod preview_fetch;
 mod preview_gfx;
 mod preview_pane;
 mod preview_render;
+mod preview_watch;
 mod probe;
 mod profile;
 mod provider_factory;
@@ -210,6 +216,7 @@ mod sidebar_mq;
 mod sidebar_order;
 mod sidebar_pipeline;
 mod sidebar_view;
+mod skill_seed;
 mod snapshot;
 mod sprite_bridge;
 mod ssh_shim;
@@ -277,6 +284,11 @@ pub struct Cli {
 /// `thegn` (no subcommand) launches the interactive compositor.
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Inspect trusted automation rules or dry-run an event fixture.
+    Automations {
+        #[command(subcommand)]
+        action: cmd::automations::Action,
+    },
     /// GitHub PR data + actions for a worktree.
     Pr {
         #[command(subcommand)]
@@ -504,6 +516,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::agent::Action,
     },
+    /// Embedded and configured agent skills: list, show, and seed worktrees.
+    Skills {
+        #[command(subcommand)]
+        action: cmd::skills::Action,
+    },
     /// The capability catalog as a generic client: `list`, `schema`,
     /// `call <cap>` (catalog-driven HTTP over the control socket).
     Api {
@@ -587,6 +604,11 @@ pub enum Command {
     Session {
         #[command(subcommand)]
         action: cmd::session::SessionAction,
+    },
+    /// Stream the daemon's filtered live event feed (`events tail`).
+    Events {
+        #[command(subcommand)]
+        action: cmd::events::Action,
     },
     /// Attach to a running local session over the pane daemon's unix socket —
     /// the local thin client. With no argument, lists live sessions to pick
@@ -1047,6 +1069,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // The dry-run is store-free by contract: dispatch it before host merging,
+    // diagnostics, provider installation, and the automation runtime. Config
+    // loading itself reads only the caller-selected files.
+    if let Command::Automations {
+        action: cmd::automations::Action::Test { .. },
+    } = &command
+    {
+        return cmd::automations::run(
+            &cfg,
+            match &command {
+                Command::Automations { action } => action.clone(),
+                _ => unreachable!(),
+            },
+        );
+    }
     // Remember where it came from: a long-lived process (the daemon) re-reads
     // the same source per agent launch instead of serving a startup snapshot.
     crate::config_source::install(cli.overrides.clone(), cli.config.clone());
@@ -1088,12 +1125,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
+    crate::automation_runtime::install(&cfg);
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
     let repo_context = std::env::current_dir().ok();
-    match command {
+    let transient_notification = matches!(
+        &command,
+        Command::Notify {
+            action: cmd::notify::Action::Push { .. }
+        }
+    );
+    let result = match command {
+        Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
@@ -1150,6 +1195,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
+        Command::Skills { action } => cmd::skills::run(&cfg, action),
         Command::Api { action } => cmd::api::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
@@ -1196,6 +1242,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             daemon::serve_blocking(&cfg, daemon::ServeOpts { bind, no_pair_url })
         }
         Command::Session { action } => cmd::session::run(&cfg, action),
+        Command::Events { action } => cmd::events::run(&cfg, action),
         Command::Attach { session } => cmd::attach::run(&cfg, session),
         Command::Pair { action } => cmd::pair::run(&cfg, action),
         Command::Daemon { socket, action } => match action {
@@ -1269,7 +1316,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    };
+    if result.is_ok()
+        && transient_notification
+        && !crate::automation_runtime::drain(std::time::Duration::from_secs(
+            cfg.automations.action_timeout_secs.saturating_add(10),
+        ))
+    {
+        anyhow::bail!("timed out draining accepted automation events");
     }
+    result
 }
 
 // cache probe

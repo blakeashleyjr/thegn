@@ -381,3 +381,14 @@ pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
 pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }
+
+/// Open a regular-file candidate without following a final reparse point.
+/// `FILE_FLAG_OPEN_REPARSE_POINT` is the Windows equivalent of Unix
+/// `O_NOFOLLOW`; callers still validate the opened descriptor's metadata.
+pub fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0020_0000)
+        .open(path)
+}

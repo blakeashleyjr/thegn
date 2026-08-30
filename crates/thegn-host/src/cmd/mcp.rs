@@ -410,7 +410,7 @@ const NO_DAEMON: &str = "daemon not reachable — start thegn or `thegn daemon`"
 /// arguments object (`StateRouter::call` runs `validate_args` before this is
 /// ever invoked — see `thegn_core::mcp::state`). `worktrees.list` degrades to
 /// the DB cache when no daemon answers; every other tool has no offline
-/// truth and errors instead — including the four mutating tools, which by
+/// truth and errors instead — including the mutating tools, which by
 /// construction need a live daemon to act on.
 async fn fetch_state(
     cfg: &Config,
@@ -443,6 +443,19 @@ async fn fetch_state(
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let sessions = c.sessions().await.map_err(|e| e.to_string())?;
             Ok(json!({ "sessions": sessions }))
+        }
+        "preview.fetch" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::PreviewFetchRequest {
+                url: str_arg(args, "url").ok_or("missing `url`")?.to_string(),
+                worktree: str_arg(args, "worktree").map(str::to_string),
+                include_console: args
+                    .get("include_console")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let reply = c.preview_fetch(&request).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(reply).map_err(|e| e.to_string())
         }
         "leases.list" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
@@ -513,6 +526,22 @@ async fn fetch_state(
             let info = c.fork(&spec).await.map_err(|e| e.to_string())?;
             serde_json::to_value(&info).map_err(|e| e.to_string())
         }
+        "editor.open" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::EditorOpenRequest {
+                worktree: str_arg(args, "worktree")
+                    .ok_or("missing `worktree`")?
+                    .to_string(),
+                path: str_arg(args, "path").map(str::to_string),
+                line: optional_usize_arg(args, "line")?,
+                col: optional_usize_arg(args, "col")?,
+            };
+            // Apply semantic target policy at the MCP boundary as well as at
+            // the HTTP server: malformed paths never make a daemon round-trip.
+            request.target().map_err(|e| e.to_string())?;
+            c.open_editor(&request).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "queued": true }))
+        }
         "sessions.input" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let session = str_arg(args, "session").ok_or("missing `session`")?;
@@ -544,6 +573,35 @@ async fn fetch_state(
             c.kill(session).await.map_err(|e| e.to_string())?;
             Ok(json!({ "killed": session }))
         }
+        "automations.list" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let rules = c.automations_list().await.map_err(|e| e.to_string())?;
+            Ok(json!({ "rules": rules }))
+        }
+        "automations.test" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::AutomationTestRequest {
+                rule: str_arg(args, "rule").ok_or("missing `rule`")?.to_string(),
+                event: args.get("event").cloned().ok_or("missing `event`")?,
+                at: args.get("at").and_then(serde_json::Value::as_i64),
+            };
+            serde_json::to_value(
+                c.automations_test(&request)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())
+        }
+        "tools.run" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::ToolRunRequest {
+                name: str_arg(args, "name").ok_or("missing `name`")?.to_string(),
+                worktree: str_arg(args, "worktree").map(str::to_string),
+                automation_origin: None,
+            };
+            serde_json::to_value(c.tools_run(&request).await.map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        }
         other => Err(format!("unknown state capability `{other}`")),
     }
 }
@@ -552,6 +610,18 @@ async fn fetch_state(
 /// already validated against the tool's schema — this just extracts).
 fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn optional_usize_arg(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let n = value
+        .as_u64()
+        .ok_or_else(|| format!("`{key}` must be a non-negative integer"))?;
+    usize::try_from(n)
+        .map(Some)
+        .map_err(|_| format!("`{key}` is too large"))
 }
 
 /// The worktree a semantic tool targets: the `worktree` argument, else the
@@ -684,6 +754,7 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
         agent,
         adopt: false,
         already_capped: false,
+        automation_origin: None,
     })
 }
 
@@ -785,12 +856,15 @@ mod tests {
     const READ_CAPS: &[&str] = &[
         "sessions.list",
         "worktrees.list",
+        "preview.fetch",
         "leases.list",
         "me",
         "agent.sessions",
         "sessions.wait",
         "semantic.map",
         "semantic.blast_radius",
+        "automations.list",
+        "automations.test",
     ];
 
     fn sorted(mut v: Vec<&'static str>) -> Vec<&'static str> {
@@ -818,7 +892,9 @@ mod tests {
         let allowed = allowed_state_caps(ScopeSet::parse("write"), false);
         assert!(allowed.contains(&"sessions.open"), "{allowed:?}");
         assert!(allowed.contains(&"sessions.kill"), "{allowed:?}");
+        assert!(allowed.contains(&"editor.open"), "{allowed:?}");
         assert!(!allowed.contains(&"sessions.input"), "{allowed:?}");
+        assert!(!allowed.contains(&"tools.run"), "{allowed:?}");
         // read-scope tools are still covered (write implies read).
         for cap in READ_CAPS {
             assert!(allowed.contains(cap), "{allowed:?} missing {cap}");
@@ -848,7 +924,7 @@ mod tests {
     #[test]
     fn mcp_scope_mapping_write_and_flag_covers_every_implemented_cap() {
         assert_eq!(
-            sorted(allowed_state_caps(ScopeSet::parse("write"), true)),
+            sorted(allowed_state_caps(ScopeSet::parse("write,exec"), true)),
             sorted(thegn_core::mcp::state::MCP_STATE_CAPS.to_vec()),
         );
     }
