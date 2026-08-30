@@ -2944,13 +2944,21 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
         .map(|tool| {
             let over = cfg.managed_tools.get(&tool.name);
             let res = tool.resolve(over, thegn_core::util::which_path);
-            serde_json::json!({
+            let is_bugstalker = tool.name == "bugstalker";
+            let mut report = serde_json::json!({
                 "name": tool.name,
                 "tier": res.tier(),
                 "path": res.path(),
                 "pinned": tool.version,
                 "current": matches!(res, Resolution::Managed { current: true, .. }),
-            })
+            });
+            if is_bugstalker {
+                report["platform_supported"] =
+                    serde_json::json!(thegn_core::debug::platform_supported());
+                report["platform_note"] =
+                    serde_json::json!(thegn_core::debug::unsupported_reason());
+            }
+            report
         })
         .collect();
     serde_json::Value::Array(tools)
@@ -3424,6 +3432,24 @@ mod tests {
             .find(|t| t["name"] == "bugstalker")
             .expect("bugstalker reported");
         assert_eq!(bs["pinned"], thegn_core::debug::bs_tool().version);
+        assert_eq!(
+            bs["platform_supported"],
+            thegn_core::debug::platform_supported()
+        );
+        assert_eq!(
+            bs["platform_note"],
+            serde_json::to_value(thegn_core::debug::unsupported_reason()).unwrap()
+        );
+        // The JSON formatter consumes the same pure gate used by the core
+        // debugger policy; exercise both sides without changing the host.
+        assert!(thegn_core::debug::bs_supported(
+            thegn_core::managed_tool::Os::Linux,
+            thegn_core::managed_tool::Arch::X64,
+        ));
+        assert!(!thegn_core::debug::bs_supported(
+            thegn_core::managed_tool::Os::Macos,
+            thegn_core::managed_tool::Arch::X64,
+        ));
 
         // A user override (as parsed from `[managed_tools.bugstalker]`) wins
         // the tier.

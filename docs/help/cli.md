@@ -215,7 +215,7 @@ untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
 dispatch door (`session open --stage --issue`) that creates these rows.
 
 - `thegn doctor` — resolved terminal capabilities, release channel,
-  environment. See [[terminal-compatibility]].
+  environment. See [[terminal-compatibility]] and [[debugging]].
 - `thegn keys list` — every effective binding, from all three sources.
   The same set [[keybindings]] shows.
 - `thegn keys validate` — non-zero on a chord conflict, so it works in a
