@@ -60,6 +60,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // model must land on a harness with a model flag, env keys must be
             // exportable names.
             errs.extend(crate::agent_task::validate_agent_models(&cfg));
+            errs.extend(crate::config_drawer::validate_drawer_config(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
@@ -845,9 +846,11 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
+        // 90 → 91 (THE-11): `[[tools]] drawer_scope` (DrawerScope) — which
+        // eligible catalog entries can occupy the bottom drawer.
         assert_eq!(
             defs.len(),
-            90,
+            91,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

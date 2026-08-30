@@ -20,7 +20,7 @@ use crate::hydrate::{RefreshKind, active_tab_path};
 use crate::panes::{Panes, tool_drawer_argv};
 use crate::run::SidebarState;
 use crate::session::Session;
-use thegn_core::store::NotificationStore;
+use thegn_core::store::{CacheStore, NotificationStore};
 
 /// Spawn `command` into a brand-new tab in the active group.
 pub(crate) fn open_command_tab(
@@ -90,9 +90,7 @@ pub(crate) fn dispatch_drawer_command(
     cmd: thegn_core::file_manager::DrawerCmd,
     session: &mut Session,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut crate::run::DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut crate::run::DrawerRuntime,
     focus: &mut FocusState,
     model: &mut FrameModel,
     sb: &mut SidebarState,
@@ -103,14 +101,9 @@ pub(crate) fn dispatch_drawer_command(
         thegn_core::file_manager::DrawerCmd::Close => {
             // Hide to the keep-alive pool (position survives reopen); hand the
             // keyboard back to the center.
-            crate::escape::close_drawer_to_pool(
-                drawer,
-                drawer_pool,
-                drawer_home,
-                session,
-                panes,
-                cfg,
-            );
+            if let Some(dir) = crate::run::active_cwd(session) {
+                drawer_runtime.close_visible(cfg, &dir, panes, center);
+            }
             if focus.drawer() {
                 focus.zone = Zone::Center;
             }
@@ -590,6 +583,7 @@ pub(crate) fn run_pr_view_action(
         A::Review { .. } => ("pr review", "Submitting review…"),
         A::Reply { .. } => ("pr reply", "Posting reply…"),
         A::LineComment { .. } => ("pr line-comment", "Posting line comment…"),
+        A::Handoff(_) => ("pr review handoff", "Passing review feedback…"),
         A::OpenUrl(_) => unreachable!("handled above"),
     };
     model.status = status.into();
@@ -632,6 +626,7 @@ pub(crate) fn run_pr_view_action(
                     body: &body,
                 },
             ),
+            A::Handoff(_) => Ok(()),
             A::OpenUrl(_) => Ok(()),
         };
         if let Err(e) = res {
@@ -705,20 +700,34 @@ pub(crate) fn panel_pr_action_key(
 /// loop and deliver it over `tx`. Single-flight via `generation` — the loop
 /// drops deliveries from a stale generation. Best-effort: a failed fetch leaves
 /// that half `None` (the view shows "loading" / degrades) and logs the reason.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pr_view_fetch(
     session: Session,
     owner: String,
     repo: String,
     number: u64,
+    branch: String,
+    head_oid: String,
     generation: u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) {
     let tx = tx.clone();
     let waker = waker.clone();
+    let refresh_tx = refresh_tx.clone();
     tokio::task::spawn_blocking(move || {
         let wt = active_tab_path(&session);
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
+        let cached = thegn_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.get_pr_review_cache(&cache_key).ok().flatten())
+            .filter(|snapshot| {
+                snapshot.branch == branch
+                    && snapshot.pr_number == number
+                    && snapshot.head_oid == head_oid
+            });
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let repo_ref = thegn_core::forge::RepoRef { owner, repo };
@@ -736,11 +745,53 @@ pub(crate) fn spawn_pr_view_fetch(
                 None
             }
         };
+        let live_complete = conversation.is_some() && diff.is_some();
+        let review = match (conversation, diff) {
+            (Some(conversation), Some(diff)) => {
+                let snapshot = thegn_core::review::PrReviewSnapshot {
+                    worktree_key: cache_key,
+                    branch,
+                    pr_number: number,
+                    head_oid,
+                    fetched_at: thegn_core::util::now(),
+                    conversation,
+                    diff,
+                };
+                // Branch/head are filled by the panel identity in the loop;
+                // an incomplete identity is intentionally not cached or
+                // presented as a current snapshot.
+                Some(snapshot)
+            }
+            _ => cached.clone(),
+        };
         let data = PrViewData {
             generation,
-            conversation,
-            diff,
+            conversation: review.as_ref().map(|r| r.conversation.clone()),
+            diff: review.as_ref().map(|r| r.diff.clone()),
+            review,
+            review_status: if live_complete {
+                None
+            } else if cached.is_some() {
+                Some("showing cached PR review".into())
+            } else {
+                Some("PR review unavailable or unsupported".into())
+            },
         };
+        // A complete remote result is delivered to the modal. The identity
+        // fields are stamped by the caller's current PR facts before the
+        // cache write, so a transient/partial fetch leaves the old row intact.
+        if live_complete
+            && let Some(snapshot) = data
+                .review
+                .clone()
+                .filter(|s| !s.branch.is_empty() && !s.head_oid.is_empty())
+            && let Ok(db) = thegn_core::db::Db::open()
+        {
+            let _ = db.put_pr_review_cache(&snapshot);
+            if refresh_tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        }
         if tx.send(data).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -756,6 +807,7 @@ pub(crate) fn open_pr_view(
     gen_ctr: &mut u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) -> Option<PrView> {
     let pr = model.panel.pr.as_ref()?;
     *gen_ctr += 1;
@@ -775,9 +827,12 @@ pub(crate) fn open_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.branch.clone(),
+            v.head_sha.clone(),
             *gen_ctr,
             tx,
             waker,
+            refresh_tx,
         );
     }
     Some(v)
@@ -790,6 +845,7 @@ pub(crate) fn refetch_pr_view(
     gen_ctr: &mut u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) {
     if let Some(v) = view
         && !v.owner.is_empty()
@@ -801,9 +857,12 @@ pub(crate) fn refetch_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.branch.clone(),
+            v.head_sha.clone(),
             *gen_ctr,
             tx,
             waker,
+            refresh_tx,
         );
     }
 }
@@ -814,16 +873,68 @@ pub(crate) fn dispatch_pr_view_key(
     view: &mut Option<PrView>,
     key: &KeyCode,
     mods: Modifiers,
-    session: &Session,
+    session: &mut Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    cfg: &thegn_core::config::Config,
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     model: &mut FrameModel,
+    active_menu: &mut Option<crate::menu::MenuOverlay>,
 ) {
     let Some(v) = view.as_mut() else { return };
     match v.handle_key(key, mods) {
         PrViewOutcome::Close => *view = None,
         PrViewOutcome::Pending => {}
+        PrViewOutcome::Act(crate::pr_view::PrViewAction::Handoff(selection)) => {
+            if matches!(
+                crate::review_handoff::target(session, panes, cfg),
+                crate::review_handoff::PaneTarget::Headless { .. }
+            ) {
+                v.pending_handoff = Some(selection);
+                *active_menu = Some(headless_handoff_confirm_menu());
+                model.status = "confirm headless review handoff".into();
+            } else {
+                dispatch_pr_handoff(
+                    view, session, panes, focus, cfg, model, refresh_tx, waker, selection,
+                );
+            }
+        }
         PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+    }
+}
+
+fn headless_handoff_confirm_menu() -> crate::menu::MenuOverlay {
+    crate::menu::confirm_menu(
+        "send review to headless agent?",
+        "Remote review text will be sent to the configured agent.",
+        "pr-review-handoff",
+        String::new(),
+        true,
+    )
+}
+
+/// Dispatch a handoff that has already passed any required confirmation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_pr_handoff(
+    view: &mut Option<PrView>,
+    session: &mut Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    selection: crate::review_handoff::ReviewSelection,
+) {
+    let Some(v) = view.as_mut() else { return };
+    if let Some(snapshot) = v.review.clone() {
+        crate::review_handoff::dispatch(
+            session, panes, focus, cfg, model, refresh_tx, waker, snapshot, selection, &v.title,
+            &v.url, &v.base,
+        );
+    } else {
+        v.status = Some("review feedback is still loading".into());
     }
 }
 
@@ -871,6 +982,8 @@ pub(crate) fn spawn_diff_view_fetch(
             generation,
             diff: Some(diff),
             structural,
+            review: None,
+            review_status: None,
         };
         if tx.send(data).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -883,6 +996,7 @@ pub(crate) fn spawn_diff_view_fetch(
 /// requests a structural render (delivered alongside the internal diff).
 pub(crate) fn open_diff_view(
     cfg: &thegn_core::config::Config,
+    model: &FrameModel,
     session: &Session,
     gen_ctr: &mut u64,
     tx: &UnboundedSender<DiffViewData>,
@@ -906,7 +1020,28 @@ pub(crate) fn open_diff_view(
     });
     let want_structural = structural.is_some();
     spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker, structural);
-    DiffView::with_structural(title, *gen_ctr, want_structural)
+    let mut view = DiffView::with_structural(title, *gen_ctr, want_structural);
+    let review = model
+        .panel
+        .review_snapshot
+        .clone()
+        .filter(|snapshot| review_snapshot_matches_panel(&model.panel, snapshot));
+    view.set_review(review, model.panel.review_snapshot_status.clone());
+    view
+}
+
+/// Check that a cached deep review belongs to the panel's current PR identity.
+/// The worktree's checked-out branch is the canonical cache branch identity;
+/// the PR's remote head ref is provider metadata and may differ for forks.
+pub(crate) fn review_snapshot_matches_panel(
+    panel: &crate::panel::PanelData,
+    snapshot: &thegn_core::review::PrReviewSnapshot,
+) -> bool {
+    panel.pr.as_ref().is_some_and(|pr| {
+        snapshot.branch == panel.branch
+            && snapshot.pr_number == pr.number
+            && snapshot.head_oid == panel.pr_head_oid
+    })
 }
 
 /// Route a key to the open diff viewer: close it, or consume it (read-only).
@@ -1342,5 +1477,60 @@ mod tests {
         );
         // A non-mutation action has no transient status.
         assert_eq!(status_for(&DetailAction::CiRefresh), "");
+    }
+
+    #[test]
+    fn headless_handoff_menu_requires_an_explicit_confirmation() {
+        let mut menu = headless_handoff_confirm_menu();
+        assert_eq!(menu.tag, crate::menu::MenuKindTag::Confirm);
+        assert!(matches!(
+            menu.handle_key(&KeyCode::Char('y'), Modifiers::NONE),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Confirm {
+                tag: "pr-review-handoff",
+                ..
+            })
+        ));
+
+        let mut cancelled = headless_handoff_confirm_menu();
+        assert_eq!(
+            cancelled.handle_key(&KeyCode::Char('n'), Modifiers::NONE),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Dismiss)
+        );
+    }
+
+    #[test]
+    fn review_identity_uses_local_branch_when_remote_head_name_differs() {
+        let mut panel = crate::panel::PanelData {
+            branch: "local/topic".into(),
+            pr: Some(crate::panel::PrSummary {
+                number: 27,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/widget/pull/27".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            pr_head_oid: "head-27".into(),
+            ..Default::default()
+        };
+        let local_snapshot = thegn_core::review::PrReviewSnapshot {
+            branch: "local/topic".into(),
+            pr_number: 27,
+            head_oid: "head-27".into(),
+            ..Default::default()
+        };
+        assert!(review_snapshot_matches_panel(&panel, &local_snapshot));
+
+        // A provider's remote head ref is not the local cache identity and is
+        // rejected rather than being silently attached to this checkout.
+        panel.branch = "local/topic".into();
+        let remote_named_snapshot = thegn_core::review::PrReviewSnapshot {
+            branch: "fork/topic".into(),
+            ..local_snapshot
+        };
+        assert!(!review_snapshot_matches_panel(
+            &panel,
+            &remote_named_snapshot
+        ));
     }
 }

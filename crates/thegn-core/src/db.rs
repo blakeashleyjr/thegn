@@ -136,7 +136,12 @@ use std::path::PathBuf;
 ///
 /// v62: adds `session_forks`, a credential-free lineage cache. Live fork
 /// recipes remain daemon memory only; the cache cannot resurrect a process.
-pub const SCHEMA_VERSION: i64 = 62;
+///
+/// v63: adds `pr_review_cache`, one complete PR review snapshot per canonical
+/// worktree key. It is a best-effort cache; the branch, PR number, and head OID
+/// are retained beside the JSON so stale feedback cannot silently attach to a
+/// different PR.
+pub const SCHEMA_VERSION: i64 = 63;
 
 pub struct Db {
     conn: Connection,
@@ -317,8 +322,68 @@ impl Db {
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        Self::init(Self::open_connection(path)?)
+        let db = Self::init(Self::open_connection(path)?)?;
+        let _ = crate::fsperm::restrict_to_owner(path);
+        Ok(db)
+    }
+
+    /// Open an existing DB read-only while participating in its WAL locking.
+    ///
+    /// Unlike [`Self::open_read_only_at`], this may use existing WAL/SHM
+    /// sidecars so a real migration preflight sees the latest target rows. It
+    /// still performs no schema initialization, migration, or startup prune.
+    pub fn open_read_only_wal_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Open an existing state DB without creating, migrating, pruning, or
+    /// changing its journal mode. This is the only safe opener for commands
+    /// whose dry-run contract is strictly read-only. An absent file is
+    /// represented as `None` so callers can inspect an empty, not-yet-created
+    /// target without manufacturing a database.
+    pub fn open_read_only_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        // A plain read-only open of a WAL-mode database is still allowed to
+        // create `-wal`/`-shm` sidecars. `immutable=1` is SQLite's explicit
+        // no-write/no-lock URI mode, which is required by dry-run callers.
+        let uri = util::immutable_sqlite_uri(&path.canonicalize()?);
+        let conn = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Read-only counterpart to [`Db::open`] for dry-run command paths.
+    pub fn open_read_only() -> Result<Option<Db>> {
+        Self::open_read_only_at(&db_path())
     }
 
     /// Open a state DB read-only when it was written by a newer build. The
@@ -478,6 +543,17 @@ impl Db {
               branch     TEXT,
               json       TEXT,
               fetched_at INTEGER
+            );
+            -- v63: complete PR review conversation + PR-head diff snapshot.
+            -- Identity columns make stale cache validation possible without
+            -- parsing the payload and the JSON is replaced atomically.
+            CREATE TABLE IF NOT EXISTS pr_review_cache (
+              worktree   TEXT PRIMARY KEY,
+              branch     TEXT NOT NULL,
+              pr_number  INTEGER NOT NULL,
+              head_oid   TEXT NOT NULL,
+              json       TEXT NOT NULL,
+              fetched_at INTEGER NOT NULL
             );
             -- CI run-history cache per worktree (TTL'd JSON `Vec<ci::CiRun>`),
             -- so the CI panel/view paint instantly from cache then hydrate live
@@ -933,9 +1009,6 @@ impl Db {
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
-        if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v61_schema(&conn)?;
-        }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
@@ -948,7 +1021,7 @@ impl Db {
         crate::db_model_proxy::migrate_v54(&conn)?;
         crate::db_migrate::migrate_v62(&conn)?;
         if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v62_schema(&conn)?;
+            crate::db_migrate::verify_v63_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
