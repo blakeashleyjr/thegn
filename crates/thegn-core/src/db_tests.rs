@@ -72,6 +72,44 @@ fn read_only_open_does_not_create_or_migrate_state_files() {
 }
 
 #[test]
+fn wal_aware_read_only_open_sees_uncheckpointed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.db");
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE marker(value TEXT NOT NULL);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO marker(value) VALUES ('in-wal');",
+        )
+        .unwrap();
+
+    let reader = Db::open_read_only_wal_at(&path).unwrap().unwrap();
+    let value: String = reader
+        .conn
+        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "in-wal");
+}
+
+#[test]
+fn explicit_db_open_restricts_created_state_to_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("profile/state/thegn");
+    let path = state.join("thegn.db");
+    drop(Db::open_at(&path).unwrap());
+
+    if let Some(mode) = crate::fsperm::mode_bits(&state).unwrap() {
+        assert_eq!(mode, 0o700);
+    }
+    if let Some(mode) = crate::fsperm::mode_bits(&path).unwrap() {
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[test]
 fn pool_spare_lifecycle_claim_and_target() {
     let db = db();
     assert!(db.pool_spares_for("/repo", "sprites").unwrap().is_empty());

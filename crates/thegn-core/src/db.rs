@@ -240,32 +240,6 @@ fn db_path() -> PathBuf {
     util::xdg_state_home().join("thegn/thegn.db")
 }
 
-/// Build an ASCII SQLite URI without letting path `?`, `#`, or `%` bytes turn
-/// into URI syntax. Unix paths retain non-UTF-8 bytes; Windows paths use `/`
-/// separators, which SQLite accepts in file URIs.
-fn immutable_sqlite_uri(path: &std::path::Path) -> String {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(not(unix))]
-    let bytes = path.to_string_lossy().replace('\\', "/").into_bytes();
-
-    let mut uri = String::with_capacity(bytes.len() + 24);
-    uri.push_str("file:");
-    for byte in bytes {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
-            uri.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(uri, "%{byte:02X}").expect("writing to a String cannot fail");
-        }
-    }
-    uri.push_str("?immutable=1");
-    uri
-}
-
 /// How [`Db::init`] treats a connection, decided from the on-disk
 /// `user_version`. `Fast` (on-disk >= [`SCHEMA_VERSION`]) skips the
 /// schema batch, migrations, and startup prunes entirely — safe because
@@ -340,8 +314,34 @@ impl Db {
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        Self::init(Self::open_connection(path)?)
+        let db = Self::init(Self::open_connection(path)?)?;
+        let _ = crate::fsperm::restrict_to_owner(path);
+        Ok(db)
+    }
+
+    /// Open an existing DB read-only while participating in its WAL locking.
+    ///
+    /// Unlike [`Self::open_read_only_at`], this may use existing WAL/SHM
+    /// sidecars so a real migration preflight sees the latest target rows. It
+    /// still performs no schema initialization, migration, or startup prune.
+    pub fn open_read_only_wal_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
     }
 
     /// Open an existing state DB without creating, migrating, pruning, or
@@ -356,7 +356,7 @@ impl Db {
         // A plain read-only open of a WAL-mode database is still allowed to
         // create `-wal`/`-shm` sidecars. `immutable=1` is SQLite's explicit
         // no-write/no-lock URI mode, which is required by dry-run callers.
-        let uri = immutable_sqlite_uri(&path.canonicalize()?);
+        let uri = util::immutable_sqlite_uri(&path.canonicalize()?);
         let conn = Connection::open_with_flags(
             uri,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY

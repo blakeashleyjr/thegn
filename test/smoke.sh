@@ -1167,6 +1167,15 @@ SQL
       seed_move_rows "$KILL" "$KILL_WT" move-kill \
         "{\"0\":{\"provider\":\"daemon\",\"session\":\"$KILL_ID\"}}"
       set +e
+      # A refusal is a true preflight: it must not initialize the absent
+      # target DB merely to discover the already-known live-session blocker.
+      # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+      live_refuse_out="$(move_cli "$KILL" session move "$KILL_WT" --to-profile target 2>&1)"
+      live_refuse_rc=$?
+      set -e
+      check "session move live refusal leaves both profile stores unchanged" \
+        "[[ $live_refuse_rc -ne 0 ]] && grep -q '$KILL_ID' <<<\"\$live_refuse_out\" && [[ ! -e '$KILL_TARGET_DB' ]] && [[ \$(sqlite3 '$KILL_DB' \"SELECT count(*) FROM tab_groups WHERE worktree='$KILL_WT';\") == 1 ]]"
+      set +e
       # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
       kill_out="$(move_cli "$KILL" session move "$KILL_WT" --to-profile target --kill --json 2>&1)"
       kill_rc=$?
