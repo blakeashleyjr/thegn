@@ -1146,6 +1146,10 @@ command = "claude"
 #                       #   launch (claude: .claude/settings.local.json →
 #                       #   permissions.allow; other keys in that file survive).
 #                       #   Empty = leave the file alone.
+# Add this agent to the drawer at worktree or process-global scope; unset by default.
+# drawer_scope = "worktree"
+# Start its drawer pane relative to the scope root (or absolute/~); unset uses the root.
+# drawer_cwd = "."
 
 [[agents]]
 name = "aider"
