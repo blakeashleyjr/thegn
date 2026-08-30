@@ -20,7 +20,7 @@ pub const REDACTED: &str = crate::redact::PLACEHOLDER;
 /// Log/argv-domain sensitive keywords *in addition to* the canonical config-key
 /// list ([`crate::redact::SENSITIVE`]): auth-header shapes that ride on command
 /// lines and environment variables but are not themselves config-key names.
-const LOG_EXTRA_SENSITIVE: &[&str] = &["bearer", "auth"];
+const LOG_EXTRA_SENSITIVE: &[&str] = &["bearer", "auth", "cookie"];
 
 /// Does this key name look like it holds a secret value? Delegates to the
 /// canonical [`crate::redact::is_sensitive`] (the shared config-key list plus
@@ -142,7 +142,127 @@ pub fn redact_text_line(line: &str) -> String {
         cursor = end;
     }
     out.push_str(&line[cursor..]);
-    out
+    redact_delimited_fields(&out)
+}
+
+/// Redact sensitive values in the colon-delimited forms commonly found in
+/// headers and structured log fields. This runs after [`redact_argv`] because
+/// a header value can be split across several whitespace-delimited tokens:
+/// `Authorization: Bearer <token>`.
+fn redact_delimited_fields(line: &str) -> String {
+    let mut replacements = Vec::new();
+    let mut search_from = 0;
+
+    while let Some((relative, delimiter)) = line[search_from..]
+        .char_indices()
+        .find(|(_, ch)| *ch == ':' || *ch == '=')
+    {
+        let delimiter_start = search_from + relative;
+        let delimiter_len = delimiter.len_utf8();
+        let before = &line[..delimiter_start];
+        let field_start = before
+            .rfind(|ch: char| ch.is_whitespace() || "{[(,".contains(ch))
+            .map_or(0, |idx| idx + 1);
+        let raw_key = before[field_start..].trim();
+        let key = raw_key.trim_matches(|ch: char| ch == '"' || ch == '\'');
+        if !is_sensitive_key(key) {
+            search_from = delimiter_start + delimiter_len;
+            continue;
+        }
+
+        let mut value_start = delimiter_start + delimiter_len;
+        while line[value_start..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            value_start += line[value_start..].chars().next().unwrap().len_utf8();
+        }
+        if value_start == line.len() {
+            search_from = value_start;
+            continue;
+        }
+
+        let value_range = if line[value_start..].starts_with('"') {
+            // JSON/string field: keep the delimiters and redact only the
+            // string contents, stopping at an escaped or closing quote.
+            let content_start = value_start + 1;
+            let content_end = line[content_start..]
+                .char_indices()
+                .scan(false, |escaped, (idx, ch)| {
+                    if *escaped {
+                        *escaped = false;
+                        return Some(None);
+                    }
+                    if ch == '\\' {
+                        *escaped = true;
+                        return Some(None);
+                    }
+                    if ch == '"' {
+                        return Some(Some(idx));
+                    }
+                    Some(None)
+                })
+                .flatten()
+                .next()
+                .map_or(line.len(), |idx| content_start + idx);
+            (content_start, content_end)
+        } else if key.to_ascii_lowercase().contains("cookie") {
+            // A raw Cookie/Set-Cookie header is an opaque collection of
+            // credentials. Redact the whole payload, but preserve trailing
+            // whitespace/newlines belonging to the log line.
+            let value_end = line.trim_end().len();
+            (value_start, value_end)
+        } else {
+            let first = value_token(line, value_start);
+            if first.0 == first.1 {
+                search_from = value_start;
+                continue;
+            }
+            let first_text = &line[first.0..first.1];
+            if matches!(first_text.to_ascii_lowercase().as_str(), "bearer" | "basic") {
+                let second_start = skip_whitespace(line, first.1);
+                let second = value_token(line, second_start);
+                if second.0 != second.1 { second } else { first }
+            } else {
+                first
+            }
+        };
+
+        if value_range.0 != value_range.1 {
+            replacements.push(value_range);
+            search_from = value_range.1;
+        } else {
+            search_from = delimiter_start + delimiter_len;
+        }
+    }
+
+    let mut redacted = line.to_string();
+    // Rebuilding from the previous result would make later byte ranges stale;
+    // apply all replacements in reverse order instead.
+    for (start, end) in replacements.into_iter().rev() {
+        redacted.replace_range(start..end, REDACTED);
+    }
+    redacted
+}
+
+fn skip_whitespace(line: &str, mut start: usize) -> usize {
+    while line[start..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        start += line[start..].chars().next().unwrap().len_utf8();
+    }
+    start
+}
+
+fn value_token(line: &str, start: usize) -> (usize, usize) {
+    let end = line[start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || ",}]".contains(*ch))
+        .map_or(line.len(), |(idx, _)| start + idx);
+    (start, end)
 }
 
 /// A one-line, secret-free summary of a spawned command: the program's base
@@ -266,6 +386,30 @@ mod tests {
     fn text_line_leaves_unstructured_positional_secret_unchanged() {
         let line = "mytool sk-positional-secret safe text";
         assert_eq!(redact_text_line(line), line);
+    }
+
+    #[test]
+    fn text_line_redacts_header_cookie_json_and_colon_fields() {
+        assert_eq!(
+            redact_text_line("curl --header Authorization: Bearer live-token"),
+            "curl --header Authorization: Bearer ***redacted***"
+        );
+        assert_eq!(
+            redact_text_line("Proxy-Authorization: Basic live-credentials"),
+            "Proxy-Authorization: Basic ***redacted***"
+        );
+        assert_eq!(
+            redact_text_line("Cookie: session=live-cookie; theme=dark"),
+            "Cookie: ***redacted***"
+        );
+        assert_eq!(
+            redact_text_line(r#"{"authorization":"Bearer json-secret","name":"safe"}"#),
+            r#"{"authorization":"***redacted***","name":"safe"}"#
+        );
+        assert_eq!(
+            redact_text_line("token: colon-secret safe"),
+            "token: ***redacted*** safe"
+        );
     }
 
     #[test]

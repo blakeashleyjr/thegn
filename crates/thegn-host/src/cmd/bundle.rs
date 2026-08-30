@@ -85,19 +85,7 @@ pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
     // 5. all retained crash reports. Re-redact historical files in case they
     // predate the serialization boundary or were written by another source.
     for report in thegn_core::diagnostics::list_reports() {
-        if let Ok(body) = std::fs::read(&report) {
-            let name = report
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "report.txt".into());
-            let body = redacted_report_text(&body);
-            add(
-                &mut tar,
-                &mut manifest,
-                &format!("crash/{name}"),
-                body.into_bytes(),
-            );
-        }
+        append_retained_report(&mut tar, &mut manifest, &report, &add);
     }
 
     // 6. the manifest itself (also printed below).
@@ -189,6 +177,39 @@ fn redacted_report_text(bytes: &[u8]) -> String {
         .split_inclusive('\n')
         .map(thegn_core::log_redact::redact_text_line)
         .collect()
+}
+
+/// Read a retained report only while it is still a regular file. The metadata
+/// check closes the symlink inclusion boundary at the bundle read site too,
+/// covering a report replaced between enumeration and reading.
+fn read_retained_report(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retained report is not a regular file",
+        ));
+    }
+    std::fs::read(path)
+}
+
+fn append_retained_report(
+    tar: &mut TarBuilder,
+    manifest: &mut String,
+    report: &std::path::Path,
+    add: &impl Fn(&mut TarBuilder, &mut String, &str, Vec<u8>),
+) {
+    let name = report
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "report.txt".into());
+    match read_retained_report(report) {
+        Ok(body) => {
+            let body = redacted_report_text(&body);
+            add(tar, manifest, &format!("crash/{name}"), body.into_bytes());
+        }
+        Err(e) => manifest.push_str(&format!("  crash/{name:<28} omitted: {e}\n")),
+    }
 }
 
 /// gzip `data` with flate2 (pure-Rust miniz_oxide backend).
@@ -330,5 +351,31 @@ mod tests {
         assert!(!sanitized.contains("old-secret"));
         assert!(!sanitized.contains("older-secret"));
         assert!(sanitized.contains("safe"));
+    }
+
+    #[test]
+    fn retained_report_read_failure_is_available_to_manifest() {
+        let path = std::env::temp_dir().join(format!(
+            "tg-missing-report-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut tar = TarBuilder::new();
+        let mut manifest = String::new();
+        let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
+            manifest.push_str(&format!("  {name} {} bytes\n", data.len()));
+            tar.append(name, &data);
+        };
+        append_retained_report(&mut tar, &mut manifest, &path, &add);
+        assert!(manifest.contains("crash/"));
+        assert!(manifest.contains("omitted: "));
+        assert_eq!(
+            tar.finish().len(),
+            1024,
+            "an omitted report is not archived"
+        );
     }
 }
