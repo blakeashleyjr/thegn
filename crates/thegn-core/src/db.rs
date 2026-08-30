@@ -133,7 +133,10 @@ use std::path::PathBuf;
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-pub const SCHEMA_VERSION: i64 = 61;
+///
+/// v62: adds trusted automation throttle/override state and a bounded audit
+/// log. Both are cache/audit data; action truth remains in catalog providers.
+pub const SCHEMA_VERSION: i64 = 62;
 
 pub struct Db {
     conn: Connection,
@@ -926,12 +929,46 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_session_attention_wt
               ON session_attention (worktree_path);
+            -- v62: trusted automation throttle/override state. JSON columns
+            -- hold bounded pure-engine ledgers; losing them only resets
+            -- throttles and never disables configured rules.
+            CREATE TABLE IF NOT EXISTS automation_state (
+              rule_id           TEXT PRIMARY KEY,
+              enabled_override  INTEGER,
+              last_fired_at     INTEGER,
+              recent_fires_json TEXT NOT NULL DEFAULT '[]',
+              action_fires_json TEXT NOT NULL DEFAULT '{}',
+              once_keys_json    TEXT NOT NULL DEFAULT '[]',
+              updated_at        INTEGER NOT NULL
+            );
+            -- v62: metadata-only action audit. Summaries are bounded by the
+            -- runtime; full prompts, event bodies, and secrets never land here.
+            CREATE TABLE IF NOT EXISTS automation_runs (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              rule_id        TEXT NOT NULL,
+              event_id       TEXT NOT NULL,
+              event_key      TEXT NOT NULL,
+              trigger_kind   TEXT NOT NULL,
+              event_summary  TEXT NOT NULL DEFAULT '',
+              action_cap     TEXT NOT NULL,
+              action_summary TEXT NOT NULL DEFAULT '',
+              outcome        TEXT NOT NULL,
+              skip_reason    TEXT,
+              error          TEXT,
+              started_at     INTEGER NOT NULL,
+              finished_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_time
+              ON automation_runs (rule_id, started_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
+              ON automation_runs (outcome, started_at DESC);
             COMMIT;
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v61_schema(&conn)?;
+            crate::db_migrate::verify_v62_schema(&conn)?;
         }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);

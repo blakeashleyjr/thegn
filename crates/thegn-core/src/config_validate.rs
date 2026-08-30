@@ -86,6 +86,20 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[notifications]` live-agent signatures must be non-empty and
             // bounded; otherwise an empty substring would match every line.
             errs.extend(cfg.notifications.validate());
+            errs.extend(cfg.automations.validate());
+            for (name, profile) in &cfg.profiles {
+                if profile.automations.is_empty() {
+                    continue;
+                }
+                let mut effective = cfg.automations.clone();
+                profile.automations.clone().apply(&mut effective);
+                errs.extend(
+                    effective
+                        .validate()
+                        .into_iter()
+                        .map(|error| format!("profiles.{name}: {error}")),
+                );
+            }
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());
