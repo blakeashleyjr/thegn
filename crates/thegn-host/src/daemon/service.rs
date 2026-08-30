@@ -1353,16 +1353,56 @@ impl ControlApi for DaemonService {
                 let taken = wt::BranchSet::load(&root);
                 let branch = wt::dedupe(&seed, &taken);
                 let path = wt::worktree_path(&root, &branch, &cfg);
-                wt::add_checked(&root, &branch, &base, &path, &cfg)
-                    .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
+                let slug = repo::repo_slug(&root);
+                let pre = crate::worktree_lifecycle::run_event_with_db(
+                    &cfg,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    thegn_core::hooks::HookEvent::PreCreate,
+                    thegn_core::hooks::HookExecutionMode::User,
+                    Some(db),
+                );
+                if pre.blocked() {
+                    anyhow::bail!("worktrees.create: {}", pre.message());
+                }
+                wt::add_checked_with_state(&root, &branch, &base, &path, &cfg).map_err(|e| {
+                    anyhow::anyhow!(crate::worktree_lifecycle::create_failure_with_add_state(
+                        e.message,
+                        &cfg,
+                        &root,
+                        &path,
+                        &branch,
+                        e.branch_created,
+                    ))
+                })?;
 
                 let wt_str = path.to_string_lossy().into_owned();
-                let slug = repo::repo_slug(&root);
                 let tab = repo::branch_tab(&slug, &branch);
                 let root_s = root.to_string_lossy().into_owned();
                 let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Some(id) = &issue {
                     let _ = db.link_issue(&wt_str, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                }
+                if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
+                    &cfg,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    Some(db),
+                    None,
+                ) {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("post_create: {}", report.message()),
+                        &cfg,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    let _ = db.del_worktree(&wt_str);
+                    anyhow::bail!("worktrees.create: {message}");
                 }
                 Ok(thegn_svc::control::WorktreeInfo {
                     path: wt_str,

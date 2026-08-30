@@ -25,11 +25,10 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub(crate) use crate::config_repo::lenient_env_selector;
 pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
-
+pub use crate::hooks::HooksConfig;
 fn is_false(value: &bool) -> bool {
     !*value
 }
-
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
 pub fn config_warn(msg: &str) {
@@ -2285,6 +2284,9 @@ pub struct WorkspaceConfig {
     /// global active account. See [`crate::account`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// Lifecycle hooks for worktrees in this workspace. Entries accumulate
+    /// after global hooks and before a repo overlay's hooks.
+    pub hooks: HooksConfig,
     /// Extra sandbox bind mounts for this workspace, same format as
     /// `[sandbox] mounts` (`"host"`, `"host:dest"`, `"host:dest:ro|rw|cache"`;
     /// `~` is expanded). These **extend** the global `[sandbox] mounts` (plus
@@ -4782,6 +4784,9 @@ pub struct Config {
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
+    /// `[hooks]` lifecycle commands. Workspace and trusted repo layers add to
+    /// these lists; repo entries are trust-gated before execution.
+    pub hooks: HooksConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
     pub toolchain: crate::toolchain::ToolchainConfig,
@@ -5006,6 +5011,7 @@ impl Default for Config {
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
+            hooks: HooksConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
@@ -6467,6 +6473,14 @@ pub use crate::config_validate::validate_str;
 /// so a malformed repo file never blocks opening a worktree.
 pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
     crate::config_repo::load_repo_overlay(repo_root)
+}
+
+/// Load only the lifecycle-hook portion of a repo overlay for the host
+/// orchestration boundary. The policy resolver in `hooks.rs` remains pure: it
+/// receives these typed values rather than discovering files itself.
+pub fn load_repo_hooks(repo_root: &std::path::Path) -> Option<(HooksConfig, Vec<String>)> {
+    load_repo_overlay(repo_root)
+        .map(|overlay| (overlay.hooks, overlay.sandbox.prepare.unwrap_or_default()))
 }
 
 /// A repo-root `.thegn.*` overlay that EXISTS but failed to parse. Returned by

@@ -75,6 +75,7 @@ mod graphics;
 mod handlers;
 mod help;
 mod hibernator;
+mod hook_run;
 mod host_flow;
 mod host_provision;
 mod host_ui;
@@ -236,6 +237,7 @@ mod wizard;
 mod workspace_create;
 mod workspace_picker;
 mod workspace_pool;
+mod worktree_lifecycle;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

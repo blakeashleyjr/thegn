@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::caps::Capabilities;
@@ -1741,6 +1741,7 @@ pub(crate) fn forget_worktree_group(
     db: &thegn_core::db::Db,
     session_id: &str,
     group: &crate::session::WorktreeGroup,
+    cleanup_runtime: bool,
 ) {
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
@@ -1762,6 +1763,13 @@ pub(crate) fn forget_worktree_group(
     // everything under `pin:{name}/`, NOT the bare `pin:{name}` prefix — a raw
     // `LIKE 'pin:myrepo/fix%'` also wipes an unrelated sibling `myrepo/fixup`.
     crate::handlers::workspace_remove::del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", &group.name);
+    // A lifecycle destroy transaction already performed runtime teardown before
+    // it called this cache-prune helper. Only the non-destructive close path
+    // needs the legacy background cleanup here; never run it twice after a
+    // successful physical removal.
+    if !cleanup_runtime {
+        return;
+    }
     // Tear down any sandbox container for this worktree in the background
     // (best-effort: we fire-and-forget on a dedicated thread so the event loop
     // is never blocked by a slow container runtime).
@@ -1883,30 +1891,18 @@ fn connect_worktree_bridge(
     });
 }
 
-pub(crate) fn delete_groups(
+pub(crate) fn delete_groups_with_mode(
     session: &mut crate::session::Session,
-    panes: &mut Panes,
+    _panes: &mut Panes,
     mut targets: Vec<usize>,
     keep_files: bool,
+    mode: thegn_core::hooks::HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
-    let db = match thegn_core::db::Db::open() {
-        Ok(db) => Some(db),
-        Err(e) => {
-            tracing::warn!(target: "thegn::worktree", error = %e, "DB unavailable while resolving delete targets; sandbox teardown may be degraded");
-            None
-        }
-    };
-    // by the SAME precedence launch uses (DB selection → repo `.thegn.toml`
-    // `env=` → global default), not just the DB — a repo-selected provider env
-    // (e.g. thegn's `env = "sprites"`) isn't stored in the DB, so a DB-only
-    // lookup returned None and LEAKED the sprite on delete.
-    let mut del_cfg =
-        thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-    thegn_core::host_config::merge_db_hosts(&mut del_cfg);
-    let (mut deleted, mut skipped) = (0usize, 0usize);
+    let (mut deleted, mut skipped, mut already_deleting) = (0usize, 0usize, 0usize);
+    let mut spawn_errors = Vec::new();
     for gi in targets {
         if gi >= session.worktrees.len() {
             continue;
@@ -1917,112 +1913,36 @@ pub(crate) fn delete_groups(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
-            // Tear down the per-worktree provider sandbox (sprite/…) if this env
-            // has one. Resolve the env name from the DB NOW (before
-            // `forget_worktree_group` below removes the worktree's rows), then
-            // destroy off-thread (a network DELETE; idempotent on 404). No-op for
-            // local/ssh/k8s envs or an unconfigured/tokenless provider.
-            if let Some(db) = &db {
-                // repo_root by the same fallback launch uses (DB → climb from path).
-                let repo_root = db
-                    .repo_root_for(&path)
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        thegn_core::repo::main_worktree(Path::new(&path))
-                            .map(|p| p.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_else(|| path.clone());
-                // Resolve the env NOW (path still on disk; the git-remove thread runs
-                // below) by full precedence, so a repo-selected provider env is found.
-                let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(&path));
-                let selected = db.effective_env(&path, &repo_root);
-                let env = del_cfg.resolve_env(
-                    Path::new(&repo_root),
-                    &loc,
-                    Path::new(&path),
-                    selected.as_deref(),
-                );
-                // Only provider placements have a sandbox to destroy (no-op for
-                // local/ssh/k8s — destroy_provider_sandbox also guards internally).
-                if !env.placement.is_local() {
-                    let (p, env_name) = (path.clone(), env.name.clone());
-                    std::thread::spawn(move || {
-                        crate::agent::destroy_provider_sandbox(&p, &env_name);
-                    });
-                }
-                // A deleted worktree frees its placement-engine slot (own
-                // thread: keep DB writes off the loop).
-                let freed = path.clone();
-                std::thread::spawn(move || crate::placement_flow::release(&freed));
+            if !crate::worktree_lifecycle::try_claim_destroy_path(Path::new(&path)) {
+                already_deleting += 1;
+                continue;
             }
-            if let Some(waker) = waker.clone() {
-                let path_clone = path.clone();
-                std::thread::spawn(move || {
-                    if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path_clone)) {
-                        // Remove from git, keeping files if requested.
-                        // git worktree remove does both.
-                        if keep_files {
-                            // git does not have a "keep files" flag for `worktree remove`.
-                            // We must delete the files ourselves if we don't want them, but if we DO want them,
-                            // we cannot run `git worktree remove` as it destroys the files.
-                            // Instead, we just delete the .git file so it becomes a plain directory.
-                            // We will need to run `git worktree prune` in the main repo to clean up the metadata.
-                            let _ = std::fs::remove_file(Path::new(&path_clone).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                            thegn_core::util::git_ok(&root, &["worktree", "prune"]);
-                        } else {
-                            thegn_core::worktree::remove(&root, Path::new(&path_clone), "", false);
-                        }
-                    }
-                    if !keep_files {
-                        // git is the source of truth, but `git worktree remove` leaves the
-                        // dir behind if it ever fails (locked, detached, prune races); a
-                        // lingering dir is re-adopted on the next launch and looks like a
-                        // failed delete. Purge it — locally AND on the remote box.
-                        thegn_core::worktree::purge_worktree_files(Path::new(&path_clone));
-                    }
-                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                });
-            } else {
-                if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path)) {
-                    // Remove from git, keeping files if requested.
-                    // git worktree remove does both.
-                    if keep_files {
-                        let _ = std::fs::remove_file(Path::new(&path).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                        thegn_core::util::git_ok(&root, &["worktree", "prune"]);
-                    } else {
-                        thegn_core::worktree::remove(&root, Path::new(&path), "", false);
-                    }
-                }
-                if !keep_files {
-                    thegn_core::worktree::purge_worktree_files(Path::new(&path));
-                }
+            let group_name = session.worktrees[gi].name.clone();
+            if let Err(error) = crate::worktree_lifecycle::spawn_worktree_destroy(
+                PathBuf::from(&path),
+                group_name,
+                session.id.clone(),
+                keep_files,
+                mode,
+                waker.clone(),
+            ) {
+                spawn_errors.push(format!("{path}: {error}"));
+                continue;
             }
         }
-        if let Some(db) = &db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
-        }
-        for tab in &session.worktrees[gi].tabs {
-            for id in tab.center.pane_ids() {
-                panes.table.remove(&id);
-            }
-        }
-        session.switch_to(gi);
-        session.close_active_group();
+        // The group and its cache rows remain available until the worker reports
+        // that pre_destroy and the requested disk operation both succeeded.
         deleted += 1;
     }
-    // Persist the trimmed layout: without this the closed groups survive in the
-    // `tab_groups` table and `Session::resurrect` brings the "deleted" worktrees
-    // back on the next launch.
-    if deleted > 0
-        && let Some(db) = &db
-    {
-        let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the DB is a cache; the session rows are resurrection state
-    }
-    let mut status = format!("Deleted {deleted} worktree(s) from disk");
+    let mut status = format!("Deleting {deleted} worktree(s) from disk…");
     if skipped > 0 {
         status.push_str(" (home checkout skipped)");
+    }
+    if already_deleting > 0 {
+        status.push_str(&format!(" ({already_deleting} already deleting)"));
+    }
+    if !spawn_errors.is_empty() {
+        status.push_str(&format!(" (failed to start: {})", spawn_errors.join("; ")));
     }
     status
 }
@@ -2031,7 +1951,7 @@ pub(crate) fn delete_groups(
 /// externally); returns its pane ids for the caller to reap. Lands the user
 /// on the workspace's home group. Pure w.r.t. disk/DB so it's unit-testable;
 /// the caller handles the registry row + persist.
-fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec<u32> {
+pub(crate) fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec<u32> {
     if gi >= session.worktrees.len() {
         return Vec::new();
     }
@@ -5140,54 +5060,61 @@ pub(crate) fn spawn_worktree_shell_pane(
     if let Some(dir) = dir
         && dir.is_dir()
     {
-        let wt = dir.to_string_lossy().into_owned();
-        // Failover off + a non-local env that's known-down (token unset / native
-        // exec in failure cooldown): refuse to open a host-degraded pane. The
-        // `SandboxHalt` error is caught at the call site, which raises a warning
-        // modal instead of degrading silently.
-        if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
-            return Err(halt.into());
+        let session_start_claimed = crate::worktree_lifecycle::session_start_once(cfg, dir, None)?;
+        let result = (|| {
+            let wt = dir.to_string_lossy().into_owned();
+            // Failover off + a non-local env that's known-down (token unset / native
+            // exec in failure cooldown): refuse to open a host-degraded pane. The
+            // `SandboxHalt` error is caught at the call site, which raises a warning
+            // modal instead of degrading silently.
+            if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
+                return Err(halt.into());
+            }
+            // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
+            // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
+            // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
+            // relay). A normal local PTY pane.
+            if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .unwrap_or_else(|| "thegn".to_string());
+                let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
+                return panes.spawn_argv_env(&argv, Some(dir), &[], center);
+            }
+            // Native provider exec (CLI-free): when the worktree's env is a managed
+            // provider with a native exec API and `exec != cli`, attach the pane over
+            // the provider's WSS exec instead of wrapping its vendor CLI.
+            if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
+                return panes.spawn_native_shell(n, None, "sh".into(), center);
+            }
+            // `launch_spec_center_with`, not `launch_spec`: this pane goes through
+            // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
+            // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+            // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+            // not a choice of agent — recording it would clobber the wizard- /
+            // `--bind`-owned `worktrees.agent` row on every pane open.
+            let spec = crate::agent::launch_spec_center_with(
+                cfg,
+                &wt,
+                None,
+                "shell",
+                crate::agent::LaunchExtras {
+                    suppress_agent_record: true,
+                    ..Default::default()
+                },
+            )?;
+            panes.spawn_argv_env(
+                &spec.argv,
+                spec.cwd.as_deref().or(Some(dir)),
+                &spec.env,
+                center,
+            )
+        })();
+        if result.is_err() && session_start_claimed {
+            crate::worktree_lifecycle::release_session_start(dir);
         }
-        // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
-        // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
-        // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
-        // relay). A normal local PTY pane.
-        if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
-            let exe = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
-                .unwrap_or_else(|| "thegn".to_string());
-            let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
-            return panes.spawn_argv_env(&argv, Some(dir), &[], center);
-        }
-        // Native provider exec (CLI-free): when the worktree's env is a managed
-        // provider with a native exec API and `exec != cli`, attach the pane over
-        // the provider's WSS exec instead of wrapping its vendor CLI.
-        if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
-            return panes.spawn_native_shell(n, None, "sh".into(), center);
-        }
-        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
-        // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
-        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
-        // not a choice of agent — recording it would clobber the wizard- /
-        // `--bind`-owned `worktrees.agent` row on every pane open.
-        let spec = crate::agent::launch_spec_center_with(
-            cfg,
-            &wt,
-            None,
-            "shell",
-            crate::agent::LaunchExtras {
-                suppress_agent_record: true,
-                ..Default::default()
-            },
-        )?;
-        return panes.spawn_argv_env(
-            &spec.argv,
-            spec.cwd.as_deref().or(Some(dir)),
-            &spec.env,
-            center,
-        );
+        return result;
     }
     panes.spawn(cfg, dir, center)
 }
@@ -5671,6 +5598,16 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     });
 }
 
+/// Persist a layout from a loop-side reconciliation without probing live pane
+/// state. Close/delete handlers must not perform even `/proc` reads; the
+/// cached pane hints are sufficient for this best-effort cache write.
+pub(crate) fn persist_session_layout_cached(session: &crate::session::Session) {
+    let snap = session.layout_snapshot(&session.id, now_secs());
+    crate::db_task::persist(move |db| {
+        let _ = crate::session::Session::write_layout(db, &snap);
+    });
+}
+
 /// Status line for a palette command injected into the focused pane's shell:
 /// the optimistic `ok` message when the bytes queued, or a "not reading" note
 /// when the pane's bounded stdin queue was Full (a wedged / flow-stopped child)
@@ -5820,6 +5757,7 @@ async fn event_loop<T: Terminal>(
     // each provider worktree's reverse tunnel forwards to it.
     host_cache_port: Option<u16>,
 ) -> Result<()> {
+    crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
     let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -6746,6 +6684,7 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
+    crate::worktree_lifecycle::install_notify_state(notify_state.clone());
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
@@ -7191,6 +7130,7 @@ async fn event_loop<T: Terminal>(
                             &slug,
                             &display,
                             true,
+                            &current_config,
                             Some(waker.clone()),
                         );
                         crate::handlers::workspace_remove::forget_workspace_in_model(
@@ -8223,81 +8163,52 @@ async fn event_loop<T: Terminal>(
                     g.kind == crate::session::GroupKind::Terminal,
                 )
             };
-            // A worktree whose dir vanished (deleted externally) must never
-            // crash the loop: prune it from the session + registry, land on
-            // home, and tell the user. The stat is cheap (`active_tab_path`
-            // precedent); the DB remote-exemption check runs only on a miss.
-            let dir_missing = !path.is_empty() && !Path::new(&path).is_dir();
-            let remote = dir_missing
-                && thegn_core::db::Db::open()
-                    .and_then(|db| db.worktrees())
-                    .map(|rows| {
-                        rows.iter()
-                            .any(|w| w.worktree == path && !w.location.is_empty())
-                    })
-                    .unwrap_or(false);
-            if dir_missing && !remote && session.worktrees.len() > 1 {
-                let gi = session.active;
-                let ids = prune_vanished_group(&mut session, gi);
-                for id in ids {
-                    panes.table.remove(&id);
-                }
-                if let Ok(db) = thegn_core::db::Db::open() {
-                    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                    let _ = session.persist(&db, &session.id, now_secs());
-                }
-                model.status = format!("Worktree dir gone: {path} — removed from session");
-                refresh_tab_model(&mut model, &session, &mut sb);
-                need_relayout = true;
-                dirty = true;
-                // The landing group materializes on the next loop turn.
+            // Two-phase materialize: request launch specs off-thread (the
+            // sandbox ensure inside `launch_spec` can block on podman for
+            // seconds to minutes), spawn when they land. Extracted to
+            // `handlers::materialize` (which also streams the core's
+            // sandbox bring-up phases into the splash). Out-of-band vanished
+            // worktrees are reconciled by the worker-backed refresh path below.
+            let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
+            let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
+            // Seed the splash for THIS worktree's effective backend, not the
+            // global default: `path`/`name` are the active group, so
+            // `model.active_sandbox_backend` (hydrated for it) is the saved
+            // per-worktree `sandbox_backend` — no DB read on the loop. A
+            // session "run on host" pin overrides both.
+            let sandbox_override = if crate::agent::force_host_requested(&path) {
+                Some("none")
+            } else if !model.active_sandbox_backend.is_empty() {
+                Some(model.active_sandbox_backend.as_str())
             } else {
-                // Two-phase materialize: request launch specs off-thread (the
-                // sandbox ensure inside `launch_spec` can block on podman for
-                // seconds to minutes), spawn when they land. Extracted to
-                // `handlers::materialize` (which also streams the core's
-                // sandbox bring-up phases into the splash).
-                let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
-                let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
-                // Seed the splash for THIS worktree's effective backend, not the
-                // global default: `path`/`name` are the active group, so
-                // `model.active_sandbox_backend` (hydrated for it) is the saved
-                // per-worktree `sandbox_backend` — no DB read on the loop. A
-                // session "run on host" pin overrides both.
-                let sandbox_override = if crate::agent::force_host_requested(&path) {
-                    Some("none")
-                } else if !model.active_sandbox_backend.is_empty() {
-                    Some(model.active_sandbox_backend.as_str())
-                } else {
-                    None
-                };
-                crate::handlers::materialize::maybe_materialize(
-                    &mut crate::handlers::materialize::MaterializeCtx {
-                        materialize_inflight: &mut materialize_inflight,
-                        materialize_failed: &materialize_failed,
-                        creating_tabs: &creating_tabs,
-                        loading_retired: &mut loading_retired,
-                        loading_remote: &mut loading_remote,
-                        loading_state: &mut loading_state,
-                        dirty: &mut dirty,
-                    },
-                    keymap.config(),
-                    &crate::handlers::materialize::MaterializeTx {
-                        spec_tx: spec_tx.clone(),
-                        provision_tx: provision_tx.clone(),
-                        waker: waker.clone(),
-                        host_ui: host_ui.clone(),
-                        rt: tokio::runtime::Handle::current(),
-                    },
-                    missing,
-                    &name,
-                    &path,
-                    ti,
-                    is_terminal,
-                    quiet,
-                    sandbox_override,
-                );
-            }
+                None
+            };
+            crate::handlers::materialize::maybe_materialize(
+                &mut crate::handlers::materialize::MaterializeCtx {
+                    materialize_inflight: &mut materialize_inflight,
+                    materialize_failed: &materialize_failed,
+                    creating_tabs: &creating_tabs,
+                    loading_retired: &mut loading_retired,
+                    loading_remote: &mut loading_remote,
+                    loading_state: &mut loading_state,
+                    dirty: &mut dirty,
+                },
+                keymap.config(),
+                &crate::handlers::materialize::MaterializeTx {
+                    spec_tx: spec_tx.clone(),
+                    provision_tx: provision_tx.clone(),
+                    waker: waker.clone(),
+                    host_ui: host_ui.clone(),
+                    rt: tokio::runtime::Handle::current(),
+                },
+                missing,
+                &name,
+                &path,
+                ti,
+                is_terminal,
+                quiet,
+                sandbox_override,
+            );
         }
         // The accordion's width (Normal → Half → Full) drives the chrome
         // geometry. Keep this before the relayout gate so the resized center
@@ -8457,6 +8368,7 @@ async fn event_loop<T: Terminal>(
                 event_bus: &event_bus,
                 notify_state: &notify_state,
                 writer: &writer,
+                waker: &waker,
             };
             crate::pty_drain::drain(
                 &mut dctx,
@@ -10711,10 +10623,9 @@ async fn event_loop<T: Terminal>(
                 want_model_refresh: &mut want_model_refresh,
                 dirty: &mut dirty,
                 loop_perf: &mut loop_perf,
-                // Reap a tab whose worktree an `on_landed = remove/detach` land deleted.
-                session: &mut session,
-                panes: &mut panes,
-                need_relayout: &mut need_relayout,
+                // Probe a tab whose worktree an `on_landed = remove/detach`
+                // land deleted; the typed result returns through refresh_rx.
+                session: &session,
                 waker: &waker,
             };
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
@@ -10747,6 +10658,12 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
+        dirty |= crate::worktree_lifecycle::apply_completions(
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        );
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             // While offline, skip the network-backed refresh backstops (the
@@ -10837,6 +10754,22 @@ async fn event_loop<T: Terminal>(
                                 ),
                             );
                         }
+                    }
+                }
+                RefreshKind::VanishedTabs(result) => {
+                    if crate::merge_lifecycle::apply_vanished_tabs(
+                        &mut session,
+                        &mut panes,
+                        &result.paths,
+                    ) {
+                        model.status = format!(
+                            "Worktree dir gone: {} — removed from session",
+                            result.paths.join(", ")
+                        );
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                        dirty = true;
+                        want_model_refresh = true;
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
@@ -11078,12 +11011,8 @@ async fn event_loop<T: Terminal>(
             // speculative-create window), and reaping on a missing dir would kill
             // the pane mid-create. Creations are short-lived, so a ghost simply
             // waits for the next tick after they settle.
-            if creating_tabs.is_empty()
-                && crate::merge_lifecycle::reconcile_removed_tabs(&mut session, &mut panes, &waker)
-            {
-                refresh_tab_model(&mut model, &session, &mut sb);
-                need_relayout = true;
-                dirty = true;
+            if creating_tabs.is_empty() {
+                crate::merge_lifecycle::spawn_reconcile_removed_tabs(&session, Some(waker.clone()));
             }
             crate::agent_output::publish(
                 &session,
@@ -15350,7 +15279,8 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
+                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files, force } =
+                                choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
                             {
                                 // Re-resolve the stashed names to current indices so a
@@ -15379,6 +15309,7 @@ async fn event_loop<T: Terminal>(
                                     },
                                     targets,
                                     keep_files,
+                                    force,
                                 );
                                 dirty = true;
                                 continue;
@@ -15467,11 +15398,14 @@ async fn event_loop<T: Terminal>(
                                     &slug,
                                     &display,
                                     keep_files,
+                                    &current_config,
                                     Some(waker.clone()),
                                 );
-                                crate::handlers::workspace_remove::forget_workspace_in_model(
-                                    &mut model, &slug, &repo_path,
-                                );
+                                if keep_files {
+                                    crate::handlers::workspace_remove::forget_workspace_in_model(
+                                        &mut model, &slug, &repo_path,
+                                    );
+                                }
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
@@ -21230,11 +21164,9 @@ async fn event_loop<T: Terminal>(
                                             &slug,
                                             &display,
                                             false,
+                                            &current_config,
                                             Some(waker.clone()),
                                         );
-                                    crate::handlers::workspace_remove::forget_workspace_in_model(
-                                        &mut model, &slug, &repo_path,
-                                    );
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);
@@ -21389,6 +21321,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                 );
                             }
@@ -21401,6 +21335,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                     &mut crate::handlers::tab_keys::TabScopedState {
                                         loading_state: &mut loading_state,
@@ -21432,6 +21368,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                     &mut crate::handlers::tab_keys::TabScopedState {
                                         loading_state: &mut loading_state,
