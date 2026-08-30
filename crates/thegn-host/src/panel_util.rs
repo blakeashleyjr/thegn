@@ -38,16 +38,6 @@ pub(crate) fn spawn_editor_detached(command: &str, cwd: Option<&std::path::Path>
     crate::actions::spawn_detached_reaped(c);
 }
 
-/// The shell line that opens `path` (at `line`) in the user's editor. See
-/// [`editor_launch`]; callers that can honour placement use [`open_editor`].
-pub(crate) fn editor_open_command(
-    cfg: &thegn_core::config::Config,
-    path: &str,
-    line: Option<usize>,
-) -> String {
-    editor_launch(cfg, path, line).command
-}
-
 /// Open `path` in the editor the way its placement wants: terminal editors
 /// get a center tab (or, with `in_pane`, a split next to `focused`); windowed
 /// editors are spawned detached so no dead pane is left behind. Returns
@@ -169,16 +159,16 @@ mod tests {
         let mut cfg = thegn_core::config::Config::default();
         cfg.editor.command = "ed {path} +{line}".into();
         assert_eq!(
-            editor_open_command(&cfg, "src/main.rs", None),
+            editor_launch(&cfg, "src/main.rs", None).command,
             "ed src/main.rs +"
         );
         assert_eq!(
-            editor_open_command(&cfg, "src/main.rs", Some(42)),
+            editor_launch(&cfg, "src/main.rs", Some(42)).command,
             "ed src/main.rs +42"
         );
         // Quoting: a single quote in the path is shell-escaped as '\''.
         assert_eq!(
-            editor_open_command(&cfg, "a'b.rs", None),
+            editor_launch(&cfg, "a'b.rs", None).command,
             r"ed 'a'\''b.rs' +"
         );
     }

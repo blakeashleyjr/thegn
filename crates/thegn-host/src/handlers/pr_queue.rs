@@ -60,9 +60,7 @@ fn notify_prq(
     worktree: &str,
     message: String,
 ) {
-    let dec = ctx
-        .notify_state
-        .decide(kind.as_str(), key, &message, worktree);
+    let dec = crate::notify::route(ctx.notify_state, kind.as_str(), key, &message, worktree);
     if dec.desktop {
         let n = thegn_core::notification::Notification {
             id: 0,
@@ -77,23 +75,45 @@ fn notify_prq(
             &thegn_core::event_bus::Event::NotificationReceived { notification: n },
         );
     }
-    ctx.notify_state.emit_sound(&dec);
-    ctx.notify_state
-        .emit_push(&dec, kind.as_str(), &message, "", worktree);
-    if dec.record {
-        let (k, src, wt, msg) = (
-            kind.as_str(),
-            key.to_string(),
-            worktree.to_string(),
-            message,
-        );
-        tokio::task::spawn_blocking(move || {
-            use thegn_core::store::NotificationStore;
-            let Ok(db) = Db::open() else { return };
+    let (k, src, wt, msg) = (
+        kind.as_str(),
+        key.to_string(),
+        worktree.to_string(),
+        message,
+    );
+    let routed = dec.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(db) = Db::open() else { return };
+        if routed.record {
             // best-effort: the inbox is a cache; the queue row is the record.
-            let _ = db.put_notification(k, &src, &msg, &wt);
-        });
-    }
+            let _ = crate::automation_events::insert_routed(
+                &db,
+                k,
+                &src,
+                &msg,
+                &wt,
+                Default::default(),
+                &routed,
+                false,
+            );
+        }
+        // This is a typed queue fact, not a consequence of inbox visibility.
+        // A notification drop must not hide a real merge edge.
+        if k == "pr_queue_merged" {
+            let origin = crate::automation_events::take_merge_origin(&db, &wt);
+            crate::automation_events::submit_fact(
+                thegn_core::automation::AutomationEventKind::MergeLanded,
+                format!("{src}:merged"),
+                Some(wt),
+                Some(msg),
+                crate::automation_events::EventFacts {
+                    pr_merged: Some(true),
+                    origin,
+                    ..Default::default()
+                },
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
