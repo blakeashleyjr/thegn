@@ -254,6 +254,9 @@ pub enum Verb {
     Snapshot,
     KillSession,
     OpenWorktree,
+    /// Queue a validated worktree/file target for the owning compositor to
+    /// hand off to its locally configured editor.
+    OpenEditor,
     DriveBrowser,
     /// Block until a session reaches a state — observes only.
     Wait,
@@ -415,6 +418,7 @@ impl Verb {
         Verb::Snapshot,
         Verb::KillSession,
         Verb::OpenWorktree,
+        Verb::OpenEditor,
         Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
@@ -539,6 +543,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Resize
         | Verb::KillSession
         | Verb::OpenWorktree
+        | Verb::OpenEditor
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
@@ -873,6 +878,7 @@ mod tests {
             Resize,
             KillSession,
             OpenWorktree,
+            OpenEditor,
             DriveBrowser,
             Split,
             RecordSession,

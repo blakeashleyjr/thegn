@@ -278,6 +278,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Open/focus a worktree in the owning instance",
     ),
     cap(
+        "editor.open",
+        Verb::OpenEditor,
+        SurfaceSet::ALL,
+        "Queue a worktree or worktree-relative file for local editor handoff",
+    ),
+    cap(
         "launch.preset",
         Verb::LaunchPreset,
         SurfaceSet::ALL,

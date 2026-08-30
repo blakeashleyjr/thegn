@@ -173,6 +173,45 @@
       ],
       "type": "object"
     },
+    "EditorOpenRequest": {
+      "additionalProperties": false,
+      "description": "A safe editor-handoff request (`editor.open`).\n\nThe caller selects only a worktree and an optional relative file location; provider choice, executable argv and environment stay local to the owning compositor. [`EditorOpenRequest::target`] applies the core target policy at every transport boundary before the request reaches [`ControlApi`].",
+      "properties": {
+        "col": {
+          "description": "1-based column number; requires `path` and `line`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based line number; requires `path`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "File path relative to `worktree`; omitted to open the project itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "Absolute worktree path on the daemon/compositor host.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
     "ForkSpec": {
       "description": "Intent for creating a new session from a live daemon or recorded harness session. `harness` discriminates the source: absent means `session` is a live daemon id; present means it is a native id discovered from `agent.sessions`. No process recipe, environment, prompt, or transcript data crosses the control boundary.",
       "properties": {
@@ -930,6 +969,11 @@
       "path": "/v1/worktrees/open"
     },
     {
+      "cap": "editor.open",
+      "method": "POST",
+      "path": "/v1/editor/open"
+    },
+    {
       "cap": "issues.list",
       "method": "GET",
       "path": "/v1/issues"
@@ -1077,6 +1121,9 @@
     },
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"
+    },
+    "EditorOpenRequest": {
+      "$ref": "#/definitions/EditorOpenRequest"
     },
     "ForkSpec": {
       "$ref": "#/definitions/ForkSpec"
