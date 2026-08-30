@@ -67,6 +67,42 @@ pub struct SkillsList {
     pub diagnostics: Vec<String>,
 }
 
+/// A safe editor-handoff request (`editor.open`).
+///
+/// The caller selects only a worktree and an optional relative file location;
+/// provider choice, executable argv and environment stay local to the owning
+/// compositor. [`EditorOpenRequest::target`] applies the core target policy at
+/// every transport boundary before the request reaches [`ControlApi`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditorOpenRequest {
+    /// Absolute worktree path on the daemon/compositor host.
+    pub worktree: String,
+    /// File path relative to `worktree`; omitted to open the project itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 1-based line number; requires `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// 1-based column number; requires `path` and `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub col: Option<usize>,
+}
+
+impl EditorOpenRequest {
+    /// Validate this wire request through the core editor target policy.
+    pub fn target(
+        &self,
+    ) -> Result<thegn_core::editor::EditorTarget, thegn_core::editor::EditorError> {
+        thegn_core::editor::EditorTarget::new(
+            &self.worktree,
+            self.path.as_deref(),
+            self.line,
+            self.col,
+        )
+    }
+}
+
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
 /// layout stays client-side; the daemon's registry is flat.
 ///
@@ -740,6 +776,16 @@ pub trait ControlApi: Send + Sync + 'static {
         branch: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>>;
 
+    /// Queue a validated editor target for the owning compositor. The daemon
+    /// acknowledges the mailbox write only; it never resolves or launches an
+    /// editor itself.
+    fn open_editor(
+        &self,
+        _target: thegn_core::editor::EditorTarget,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async { Err(ControlError::Unimplemented("open_editor")) })
+    }
+
     /// Command the preview browser. v1: always `Err(Unimplemented)`.
     fn drive_browser(&self, cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>>;
 
@@ -1006,4 +1052,46 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Graceful daemon shutdown (admin).
     fn shutdown(&self) -> BoxFuture<'_, ()>;
+}
+
+#[cfg(test)]
+mod editor_open_request_tests {
+    use super::EditorOpenRequest;
+
+    #[test]
+    fn wire_shape_rejects_unknown_fields() {
+        let err =
+            serde_json::from_str::<EditorOpenRequest>(r#"{"worktree":"/w","provider":"cursor"}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn target_policy_rejects_unsafe_shapes() {
+        for json in [
+            r#"{"worktree":"relative"}"#,
+            r#"{"worktree":"/w","path":"../escape"}"#,
+            r#"{"worktree":"/w","line":1}"#,
+            r#"{"worktree":"/w","path":"src/lib.rs","col":1}"#,
+            r#"{"worktree":"/w","path":"src/lib.rs","line":0}"#,
+        ] {
+            let request: EditorOpenRequest = serde_json::from_str(json).unwrap();
+            assert!(request.target().is_err(), "accepted unsafe shape: {json}");
+        }
+    }
+
+    #[test]
+    fn valid_wire_shape_builds_the_core_target() {
+        let request: EditorOpenRequest =
+            serde_json::from_str(r#"{"worktree":"/w","path":"src/./lib.rs","line":12,"col":4}"#)
+                .unwrap();
+        let target = request.target().unwrap();
+        assert_eq!(target.worktree(), std::path::Path::new("/w"));
+        assert_eq!(
+            target.relative_file(),
+            Some(std::path::Path::new("src/lib.rs"))
+        );
+        assert_eq!(target.line(), Some(12));
+        assert_eq!(target.col(), Some(4));
+    }
 }

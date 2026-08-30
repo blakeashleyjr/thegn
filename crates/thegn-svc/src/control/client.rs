@@ -19,7 +19,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
-use super::{ForkSpec, OpenSpec, RecordStatus, SessionInfo};
+use super::{EditorOpenRequest, ForkSpec, OpenSpec, RecordStatus, SessionInfo};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
@@ -342,6 +342,23 @@ impl ControlClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Queue a safe editor handoff through `POST /v1/editor/open`.
+    pub async fn open_editor(&self, request: &EditorOpenRequest) -> Result<()> {
+        request.target()?;
+        let value = self
+            .request(
+                "POST",
+                "/v1/editor/open",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        if value.get("queued").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(anyhow!("malformed editor-open reply: {value}"))
+        }
     }
 
     /// `POST /v1/preview/fetch` — one bounded, credential-free preview GET.

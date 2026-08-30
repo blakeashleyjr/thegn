@@ -109,6 +109,39 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "editor.open",
+        description: "Queue a worktree or one of its relative files for handoff to the owning \
+                      compositor's locally configured editor. The request never selects an \
+                      executable, provider, argv or environment. Write-scoped (`--scopes \
+                      write`). Requires a running daemon and compositor.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute path of the worktree to open",
+            },
+            ArgSpec {
+                name: "path",
+                kind: ArgKind::String,
+                required: false,
+                description: "File path relative to the worktree",
+            },
+            ArgSpec {
+                name: "line",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "1-based line number (requires path)",
+            },
+            ArgSpec {
+                name: "col",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "1-based column number (requires path and line)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "preview.fetch",
         description: "Fetch a preview URL through the daemon's bounded, credential-free HTTP \
                       client. Loopback targets only unless the operator explicitly enables \
@@ -437,6 +470,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "editor.open",
     "preview.fetch",
     "leases.list",
     "me",
@@ -709,6 +743,19 @@ mod tests {
     }
 
     #[test]
+    fn editor_open_schema_has_only_the_safe_target_arguments() {
+        let r = StateRouter::new(vec!["editor.open"], |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        let schema = &entries[0]["inputSchema"];
+        let properties = schema["properties"].as_object().unwrap();
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["col", "line", "path", "worktree"]);
+        assert_eq!(schema["required"], json!(["worktree"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -749,6 +796,13 @@ mod tests {
         let r = StateRouter::new(vec![], |_, _| Ok(json!(null)));
         let (code, msg) = r
             .call("sessions_kill", &json!({"session":"s1"}))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(code, -32001);
+        assert!(msg.contains("scope `write`"), "{msg}");
+
+        let (code, msg) = r
+            .call("editor_open", &json!({"worktree":"/w"}))
             .unwrap()
             .unwrap_err();
         assert_eq!(code, -32001);
@@ -829,6 +883,7 @@ mod tests {
             "semantic.blast_radius",
         ];
         let write = [
+            "editor.open",
             "sessions.open",
             "sessions.fork",
             "sessions.input",

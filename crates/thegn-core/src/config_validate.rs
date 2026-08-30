@@ -851,9 +851,11 @@ mod tests {
         // (WeatherUnits).
         // 90 → 91 (THE-11): `[[tools]] drawer_scope` (DrawerScope) — which
         // eligible catalog entries can occupy the bottom drawer.
+        // 91 → 92 (THE-17): `[editor] provider` (EditorProvider) — the
+        // logical external-editor handoff implementation.
         assert_eq!(
             defs.len(),
-            91,
+            92,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
