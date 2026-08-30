@@ -2246,7 +2246,9 @@ max_results = 1000
 # run as the head of global post_create (and repo sandbox.prepare as the head
 # of repo post_create), with warn/no-wait semantics.
 [hooks]
+# String shorthand:
 pre_create = ["./.thegn/pre-create.sh"]
+# Object form with explicit policy:
 post_create = [
   { command = "pnpm install --frozen-lockfile", wait = false, timeout_secs = 120, on_failure = "warn" },
 ]
