@@ -152,6 +152,25 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// Claim the exact queued revision selected by the user. A refresh may
+    /// revise the row between panel hydration and the handle worker starting;
+    /// in that case the stale prompt must not be launched.
+    pub fn claim_review_task(&self, id: i64, source_revision: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1 \
+             WHERE id=?2 AND task_kind=?3 AND source_key IS NOT NULL \
+               AND status=?4 AND source_revision=?5",
+            params![
+                AgentDispatchStatus::Running.as_str(),
+                id,
+                REVIEW_TASK_KIND,
+                AgentDispatchStatus::Queued.as_str(),
+                source_revision,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Promote the newest snapshot retained while an active handoff was
     /// running. The conditional update makes this safe against a concurrent
     /// refresh and preserves the one-row `(task_kind, source_key)` identity.
@@ -355,6 +374,19 @@ mod tests {
         assert_eq!(queued.role, "new-role");
         assert!(queued.pending_source_revision.is_none());
         assert_eq!(queued.next_forge_action_at_ms, None);
+    }
+
+    #[test]
+    fn claim_review_task_requires_the_selected_queued_revision() {
+        let db = Db::open_memory().unwrap();
+        let id = db.upsert_review_task(&task("r1", "first")).unwrap();
+        assert!(!db.claim_review_task(id, "r2").unwrap());
+        assert_eq!(
+            db.get_review_task(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Queued
+        );
+        assert!(db.claim_review_task(id, "r1").unwrap());
+        assert!(!db.claim_review_task(id, "r1").unwrap());
     }
 
     #[test]

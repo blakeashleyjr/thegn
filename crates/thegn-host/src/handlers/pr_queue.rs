@@ -543,12 +543,7 @@ pub(crate) struct PrqKeyCtx<'a> {
 /// Handle one of the section's action keys on the row under the cursor. Returns
 /// whether the key was consumed.
 pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
-    let queue_len = ctx.model.panel.pr_queue.len();
-    let row: Option<PrQueueRow> = ctx.model.panel.pr_queue.get(cursor).cloned();
-    let task = cursor
-        .checked_sub(queue_len)
-        .and_then(|index| ctx.model.panel.review_tasks.get(index))
-        .cloned();
+    let (row, task) = selection_at_cursor(&ctx.model.panel, cursor);
     let action = match row_action_for(
         key,
         row.as_ref().map(|r| r.status.as_str()),
@@ -634,6 +629,32 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
     }
     let _ = ctx.refresh_tx;
     true
+}
+
+/// Resolve the cursor in the same interleaved order used by the PR-queue
+/// renderer: each PR row is followed by its review-task rows.
+fn selection_at_cursor(
+    panel: &crate::panel::PanelData,
+    cursor: usize,
+) -> (Option<PrQueueRow>, Option<crate::panel::ReviewTaskRow>) {
+    let mut display_index = 0;
+    for row in &panel.pr_queue {
+        if display_index == cursor {
+            return (Some(row.clone()), None);
+        }
+        display_index += 1;
+        for task in panel
+            .review_tasks
+            .iter()
+            .filter(|task| task.pr_number == row.number)
+        {
+            if display_index == cursor {
+                return (None, Some(task.clone()));
+            }
+            display_index += 1;
+        }
+    }
+    (None, None)
 }
 
 #[cfg(test)]
@@ -739,5 +760,28 @@ mod tests {
         // An unknown key is a no-op, not a panic.
         apply_step(&mut panel, "/repo#99", "merged", "x");
         assert_eq!(panel.pr_queue.len(), 2);
+    }
+
+    #[test]
+    fn cursor_selection_matches_interleaved_review_rows() {
+        let panel = crate::panel::PanelData {
+            pr_queue: vec![row("/repo#1", 1, "watching"), row("/repo#2", 2, "watching")],
+            review_tasks: vec![crate::panel::ReviewTaskRow {
+                id: 9,
+                pr_number: 1,
+                repository: "acme/widget".into(),
+                thread_id: "thread-1".into(),
+                path: "src/lib.rs".into(),
+                line: Some(3),
+                role: "coder".into(),
+                status: thegn_core::issue::AgentDispatchStatus::Queued,
+                source_revision: "revision".into(),
+                worktree_path: "/w".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(selection_at_cursor(&panel, 0).0.is_some());
+        assert_eq!(selection_at_cursor(&panel, 1).1.unwrap().id, 9);
+        assert_eq!(selection_at_cursor(&panel, 2).0.unwrap().number, 2);
     }
 }

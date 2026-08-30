@@ -90,8 +90,12 @@ fn handle_loaded(
     if cooldown_active(&task, thegn_core::util::now_ms()) {
         return park(db, &task, "review thread resolution is still cooling down");
     }
-    if let Err(error) = db.update_review_task_status(task.id, AgentDispatchStatus::Running) {
-        return format!("review task could not start durably: {error}");
+    match db.claim_review_task(task.id, &task.source_revision) {
+        Ok(true) => {}
+        Ok(false) => {
+            return "review task changed before handling; refresh and retry".into();
+        }
+        Err(error) => return format!("review task could not start durably: {error}"),
     }
 
     // Exact configured role/command only. Unlike interactive review handoff,
@@ -185,6 +189,12 @@ fn handle_loaded(
     ) {
         HeadVerdict::Verified(head) => head,
         HeadVerdict::NoMovement => {
+            if pending_feedback {
+                if let Err(error) = db.promote_review_task_pending(task.id) {
+                    return format!("review task was revised but could not be requeued: {error}");
+                }
+                return "review task changed while running; latest revision requeued".into();
+            }
             return park(db, &task, "agent exited without a verified PR head change");
         }
         HeadVerdict::Foreign(detail) => return park(db, &task, &detail),
