@@ -39,6 +39,9 @@ struct LegacyCommand {
 pub(crate) struct RegistryLoad {
     pub registry: SkillRegistry,
     pub diagnostics: Vec<String>,
+    /// False when configured discovery could not prove that the returned
+    /// registry is exhaustive. Deprecated-file removal is unsafe in that case.
+    pub complete: bool,
 }
 
 /// One deterministic result row from an explicit or automatic seed.
@@ -62,15 +65,19 @@ pub(crate) struct SkillSurvey {
     pub files: Vec<ExistingFile>,
     pub diagnostics: Vec<String>,
     pub directory_found: bool,
+    /// False when an entry could have been omitted by the package bound.
+    pub complete: bool,
 }
 
 /// Build the trusted-first registry. Each configured directory contributes
 /// only immediate `<package>/SKILL.md` children; built-ins always win names.
 pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
     let mut diagnostics = Vec::new();
+    let mut complete = true;
     let mut registry = match SkillRegistry::embedded() {
         Ok(registry) => registry,
         Err(error) => {
+            complete = false;
             diagnostics.push(format!("embedded skill registry: {error}"));
             SkillRegistry::new()
         }
@@ -81,6 +88,7 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
+                complete = false;
                 diagnostics.push(format!("{}: {error}", dir.display()));
                 continue;
             }
@@ -89,11 +97,15 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
         for entry in entries {
             match entry {
                 Ok(entry) => packages.push(entry),
-                Err(error) => diagnostics.push(format!("{}: {error}", dir.display())),
+                Err(error) => {
+                    complete = false;
+                    diagnostics.push(format!("{}: {error}", dir.display()));
+                }
             }
         }
         packages.sort_by_key(std::fs::DirEntry::file_name);
         if packages.len() > MAX_PACKAGES_PER_DIR {
+            complete = false;
             diagnostics.push(format!(
                 "{}: only the first {MAX_PACKAGES_PER_DIR} immediate packages are inspected",
                 dir.display()
@@ -104,6 +116,7 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
+                    complete = false;
                     diagnostics.push(format!("{}: {error}", entry.path().display()));
                     continue;
                 }
@@ -114,6 +127,7 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
                 continue;
             }
             let Some(package_name) = entry.file_name().to_str().map(str::to_string) else {
+                complete = false;
                 diagnostics.push(format!(
                     "{}: package name is not UTF-8",
                     entry.path().display()
@@ -123,6 +137,7 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
             // Validate the observed directory segment before using it to build
             // the document path. Frontmatter is never trusted as a path input.
             if let Err(error) = validate_name(&package_name) {
+                complete = false;
                 diagnostics.push(format!("{}: {error}", entry.path().display()));
                 continue;
             }
@@ -130,6 +145,7 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
             let bytes = match read_bounded(&path) {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    complete = false;
                     diagnostics.push(format!("{}: {error}", path.display()));
                     continue;
                 }
@@ -141,13 +157,17 @@ pub(crate) fn load_registry(cfg: &Config) -> RegistryLoad {
                         diagnostics.push(format!("{}: {error}", path.display()));
                     }
                 }
-                Err(error) => diagnostics.push(error.to_string()),
+                Err(error) => {
+                    complete = false;
+                    diagnostics.push(error.to_string());
+                }
             }
         }
     }
     RegistryLoad {
         registry,
         diagnostics,
+        complete,
     }
 }
 
@@ -272,6 +292,7 @@ pub(crate) fn survey_skill_root(root: &Path) -> Result<SkillSurvey, String> {
             files: Vec::new(),
             diagnostics: Vec::new(),
             directory_found: false,
+            complete: true,
         });
     }
     let entries = std::fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
@@ -279,7 +300,8 @@ pub(crate) fn survey_skill_root(root: &Path) -> Result<SkillSurvey, String> {
     entries.sort_by_key(|entry| entry.as_ref().ok().map(std::fs::DirEntry::file_name));
     let mut files = Vec::new();
     let mut diagnostics = Vec::new();
-    if entries.len() > MAX_PACKAGES_PER_DIR {
+    let mut complete = entries.len() <= MAX_PACKAGES_PER_DIR;
+    if !complete {
         diagnostics.push(format!(
             "{}: only the first {MAX_PACKAGES_PER_DIR} immediate packages are surveyed",
             root.display()
@@ -290,6 +312,7 @@ pub(crate) fn survey_skill_root(root: &Path) -> Result<SkillSurvey, String> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
+                complete = false;
                 diagnostics.push(format!("{}: {error}", root.display()));
                 continue;
             }
@@ -341,6 +364,7 @@ pub(crate) fn survey_skill_root(root: &Path) -> Result<SkillSurvey, String> {
         files,
         diagnostics,
         directory_found,
+        complete,
     })
 }
 
@@ -349,6 +373,12 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
     if !worktree.is_dir() {
         bail!(
             "skills seed target is not a directory: {}",
+            worktree.display()
+        );
+    }
+    if !worktree.join(".git").exists() {
+        bail!(
+            "skills seed target is not a git worktree: {}",
             worktree.display()
         );
     }
@@ -389,15 +419,32 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
                 .into_iter()
                 .map(|d| format!("{harness_id}: {d}")),
         );
+        if !survey.complete {
+            diagnostics.push(format!(
+                "{harness_id}: skill-root survey was incomplete; target preserved"
+            ));
+            continue;
+        }
         let target =
             thegn_core::skills::SeedTarget::new(&harness_id, phase, excludes.iter().cloned());
-        let plan = plan_seed(&loaded.registry, &target, &survey.files, gate_state(cfg));
+        let mut plan = plan_seed(&loaded.registry, &target, &survey.files, gate_state(cfg));
+        if !loaded.complete {
+            plan.removed_managed.retain(|operation| {
+                operation.reason != thegn_core::skills::RemoveReason::Deprecated
+            });
+            diagnostics.push(
+                "skill registry discovery was incomplete; deprecated managed entries preserved"
+                    .to_string(),
+            );
+        }
         diagnostics.extend(
             plan.diagnostics
                 .into_iter()
                 .map(|d| format!("{harness_id}: {d}")),
         );
+        let mut managed_patterns = BTreeSet::new();
         for entry in plan.unchanged {
+            managed_patterns.insert(skill_exclude_pattern(layout.project_root, &entry.relative));
             files.push(result_row(
                 &harness_id,
                 layout.project_root,
@@ -428,12 +475,18 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             };
             let dest = root.join(&operation.relative);
             match atomic_write(&dest, &operation.contents) {
-                Ok(()) => files.push(result_row(
-                    &harness_id,
-                    layout.project_root,
-                    &operation.relative,
-                    status,
-                )),
+                Ok(()) => {
+                    managed_patterns.insert(skill_exclude_pattern(
+                        layout.project_root,
+                        &operation.relative,
+                    ));
+                    files.push(result_row(
+                        &harness_id,
+                        layout.project_root,
+                        &operation.relative,
+                        status,
+                    ));
+                }
                 Err(error) => diagnostics.push(format!("{}: {error}", dest.display())),
             }
         }
@@ -462,11 +515,7 @@ pub fn seed(cfg: &Config, worktree: &Path, phase: SeedPhase) -> Result<SeedRepor
             seed_mq_commands(cfg, worktree, &excludes, &mut files, &mut diagnostics);
         }
 
-        let patterns = loaded
-            .registry
-            .iter()
-            .map(|(name, _)| format!("{}/{name}/", layout.project_root.trim_end_matches('/')));
-        exclude_locally(worktree, patterns, &mut diagnostics);
+        exclude_locally(worktree, managed_patterns, &mut diagnostics);
     }
 
     files.sort_by(|a, b| (&a.harness, &a.path, &a.status).cmp(&(&b.harness, &b.path, &b.status)));
@@ -487,6 +536,13 @@ fn result_row(harness: &str, root: &str, relative: &str, status: &str) -> SeedFi
     }
 }
 
+fn skill_exclude_pattern(root: &str, relative: &str) -> String {
+    let package = relative
+        .strip_suffix("/SKILL.md")
+        .expect("seed plans contain canonical skill-relative paths");
+    format!("{}/{package}/", root.trim_end_matches('/'))
+}
+
 fn seed_mq_commands(
     cfg: &Config,
     worktree: &Path,
@@ -494,7 +550,9 @@ fn seed_mq_commands(
     files: &mut Vec<SeedFileResult>,
     diagnostics: &mut Vec<String>,
 ) {
+    let mut managed_patterns = Vec::new();
     for command in MQ_COMMANDS {
+        let mut managed_path = false;
         let dest = worktree.join(command.relative);
         let existing = match std::fs::symlink_metadata(&dest) {
             Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => Some(Vec::new()),
@@ -554,6 +612,7 @@ fn seed_mq_commands(
                     None
                 }
                 Some(managed) if managed.marker.recorded_hash == desired_hash => {
+                    managed_path = true;
                     files.push(SeedFileResult {
                         harness: "claude".into(),
                         path: command.relative.into(),
@@ -566,22 +625,22 @@ fn seed_mq_commands(
         };
         if let Some(status) = status {
             match atomic_write(&dest, desired.as_bytes()) {
-                Ok(()) => files.push(SeedFileResult {
-                    harness: "claude".into(),
-                    path: command.relative.into(),
-                    status: status.into(),
-                }),
+                Ok(()) => {
+                    managed_path = true;
+                    files.push(SeedFileResult {
+                        harness: "claude".into(),
+                        path: command.relative.into(),
+                        status: status.into(),
+                    });
+                }
                 Err(error) => diagnostics.push(format!("{}: {error}", dest.display())),
             }
         }
+        if managed_path {
+            managed_patterns.push(command.relative.to_string());
+        }
     }
-    exclude_locally(
-        worktree,
-        MQ_COMMANDS
-            .iter()
-            .map(|command| command.relative.to_string()),
-        diagnostics,
-    );
+    exclude_locally(worktree, managed_patterns, diagnostics);
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -616,7 +675,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::process::id()
     ));
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -736,6 +798,82 @@ pub(crate) fn shown_document(skill: &SkillDocument) -> String {
 mod tests {
     use super::*;
 
+    /// Extract literal `thegn ...` command lines from fenced blocks. This is a
+    /// deliberately small shell lexer: it keeps quoted flag values together,
+    /// joins `\` continuations, and stops before comments/pipelines/pseudocode.
+    fn fenced_thegn_argv(document: &str) -> Result<Vec<Vec<String>>, String> {
+        let mut commands = Vec::new();
+        let mut in_fence = false;
+        let mut logical = String::new();
+        for line in document.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if !in_fence {
+                continue;
+            }
+            let trimmed = line.trim();
+            if logical.is_empty() && !trimmed.starts_with("thegn ") {
+                continue;
+            }
+            let continued = trimmed.ends_with('\\');
+            if !logical.is_empty() {
+                logical.push(' ');
+            }
+            logical.push_str(trimmed.trim_end_matches('\\').trim_end());
+            if continued {
+                continue;
+            }
+            commands.push(shell_argv(&logical)?);
+            logical.clear();
+        }
+        if !logical.is_empty() {
+            return Err(format!("unterminated command continuation: {logical}"));
+        }
+        Ok(commands)
+    }
+
+    fn shell_argv(line: &str) -> Result<Vec<String>, String> {
+        let mut argv = Vec::new();
+        let mut token = String::new();
+        let mut quote = None;
+        let mut escaped = false;
+        for ch in line.chars() {
+            if escaped {
+                token.push(ch);
+                escaped = false;
+                continue;
+            }
+            match quote {
+                Some(end) if ch == end => quote = None,
+                Some(_) if ch == '\\' => escaped = true,
+                Some(_) => token.push(ch),
+                None if matches!(ch, '\'' | '"') => quote = Some(ch),
+                None if ch == '#' => break,
+                None if ch.is_whitespace() => {
+                    if !token.is_empty() {
+                        argv.push(std::mem::take(&mut token));
+                    }
+                }
+                None => token.push(ch),
+            }
+        }
+        if let Some(end) = quote {
+            return Err(format!("unterminated {end} quote in {line:?}"));
+        }
+        if !token.is_empty() {
+            argv.push(token);
+        }
+        if let Some(stop) = argv
+            .iter()
+            .position(|arg| matches!(arg.as_str(), "|" | "||" | "&&" | ";" | "->"))
+        {
+            argv.truncate(stop);
+        }
+        Ok(argv)
+    }
+
     fn named(name: &str, command: &str) -> thegn_core::config::NamedCommand {
         thegn_core::config::NamedCommand {
             name: name.into(),
@@ -841,19 +979,94 @@ mod tests {
     }
 
     #[test]
+    fn preserved_unmarked_skill_is_not_hidden_from_git_status() {
+        let wt = worktree();
+        let path = wt.path().join(".claude/skills/supervise/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "user-owned skill\n").unwrap();
+
+        let report = seed(&Config::default(), wt.path(), SeedPhase::Explicit).unwrap();
+        assert!(report.files.iter().any(|row| {
+            row.path.ends_with("supervise/SKILL.md") && row.status == "preserved_unmarked"
+        }));
+        let exclude = std::fs::read_to_string(wt.path().join(".git/info/exclude")).unwrap();
+        assert!(!exclude.contains(".claude/skills/supervise/"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user-owned skill\n");
+    }
+
+    #[test]
     fn malformed_user_package_is_diagnostic_and_does_not_block_builtins() {
         let user = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(user.path().join("bad")).unwrap();
         std::fs::write(user.path().join("bad/SKILL.md"), "not frontmatter").unwrap();
         let wt = worktree();
+        let prior = parse_document(
+            b"---\nname: bad\ndescription: prior valid package\nharnesses: claude\ngate: always\nwhen: explicit\n---\nbody\n",
+            "bad",
+            SkillSource::user("prior/bad/SKILL.md"),
+        )
+        .unwrap();
+        let installed = thegn_core::skills::render_managed(&prior);
+        let installed_path = wt.path().join(".claude/skills/bad/SKILL.md");
+        std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        std::fs::write(&installed_path, &installed).unwrap();
         let mut cfg = Config::default();
         cfg.skills.user_dirs = vec![user.path().display().to_string()];
         let report = seed(&cfg, wt.path(), SeedPhase::Explicit).unwrap();
         assert!(report.diagnostics.iter().any(|d| d.contains("frontmatter")));
+        assert_eq!(
+            std::fs::read_to_string(installed_path).unwrap(),
+            installed,
+            "an invalid package must not be mistaken for a retired package"
+        );
         assert!(
             wt.path()
                 .join(".claude/skills/supervise/SKILL.md")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn explicit_seed_rejects_an_ordinary_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = seed(&Config::default(), directory.path(), SeedPhase::Explicit).unwrap_err();
+        assert!(error.to_string().contains("not a git worktree"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    /// Shipped prose is operational UI: every fenced command must continue to
+    /// parse after CLI renames, including its documented flags and arguments.
+    #[test]
+    fn embedded_skill_commands_parse_against_the_live_cli() {
+        use clap::Parser as _;
+
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for entry in thegn_core::skills::EMBEDDED_MANIFEST {
+            let commands = fenced_thegn_argv(entry.document)
+                .unwrap_or_else(|error| panic!("{}: {error}", entry.origin));
+            for mut argv in commands {
+                checked += 1;
+                for arg in &mut argv {
+                    if matches!(arg.as_str(), "{row}" | "row" | "<row-id>" | "<dispatch-id>") {
+                        *arg = "1".to_string();
+                    }
+                }
+                if let Err(error) = crate::Cli::try_parse_from(&argv) {
+                    failures.push(format!(
+                        "{}: `{}`: {}",
+                        entry.origin,
+                        argv.join(" "),
+                        error.render().ansi().to_string().trim()
+                    ));
+                }
+            }
+        }
+        assert!(checked > 0, "embedded registry contains no fenced commands");
+        assert!(
+            failures.is_empty(),
+            "embedded skill commands drifted from the live CLI:\n{}",
+            failures.join("\n")
         );
     }
 }
