@@ -180,6 +180,8 @@ mod render_plan;
 mod replay;
 mod replay_overlay;
 mod repo_index;
+mod review_handoff;
+mod review_rows;
 mod revtunnel;
 mod run;
 mod sandbox_events;
@@ -223,6 +225,8 @@ mod terminal_wizard;
 #[cfg(test)]
 mod testenv;
 mod testkit;
+mod theme_builder;
+mod theme_store;
 mod toast;
 mod vps_bridge;
 mod vps_reaper;
