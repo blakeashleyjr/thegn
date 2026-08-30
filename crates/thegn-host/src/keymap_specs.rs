@@ -185,6 +185,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "fork-session",
+        label: "Fork live session",
+        hint: "fork session",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "fork",
+            "session",
+            "conversation",
+            "native session",
+            "new session",
+        ],
+    },
+    ActionSpec {
         id: "paste-register",
         label: "Paste from register",
         message_key: "action-paste-register",
@@ -530,6 +544,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "appearance",
             "dark mode",
             "light mode",
+        ],
+    },
+    ActionSpec {
+        id: "theme-builder-open",
+        label: "Open theme builder",
+        hint: "theme builder",
+        default_chords: &["Ctrl Alt Shift t"],
+        palette: true,
+        keywords: &[
+            "theme",
+            "builder",
+            "appearance",
+            "colors",
+            "palette",
+            "preview",
+            "customize",
         ],
     },
     ActionSpec {
@@ -1192,6 +1222,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "changed files",
             "drawer",
         ],
+    },
+    ActionSpec {
+        id: "drawer-cycle",
+        label: "Cycle drawer occupant",
+        hint: "drawer+",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "cycle drawer", "next drawer tool", "files drawer"],
+    },
+    ActionSpec {
+        id: "drawer-pick",
+        label: "Pick drawer occupant",
+        hint: "drawer?",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "pick drawer", "drawer tool", "choose drawer"],
     },
     ActionSpec {
         id: "toggle-corner",

@@ -190,10 +190,22 @@ pub const CATALOG: &[HostCapability] = &[
         "List daemon sessions (worktree hints, geometry, lease state)",
     ),
     cap(
+        "sessions.migrate",
+        Verb::MigrateSession,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Move a persisted worktree session presentation to an existing profile",
+    ),
+    cap(
         "sessions.open",
         Verb::OpenSession,
         SurfaceSet::ALL,
         "Open a session: argv, cwd, env, rows/cols, optional worktree",
+    ),
+    cap(
+        "sessions.fork",
+        Verb::ForkSession,
+        SurfaceSet::ALL,
+        "Fork a live daemon or recorded harness session",
     ),
     cap(
         "sessions.attach",

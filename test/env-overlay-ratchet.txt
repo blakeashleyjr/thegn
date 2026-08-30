@@ -33,6 +33,10 @@ activity.unsolicited_gap_secs
 # agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
 # list item, like `provider`; an env knob cannot address one entry of a list.
 agents.command
+# agents.drawer_* — structured per-entry drawer metadata; list entries have no
+# stable index-addressable THEGN_* environment override.
+agents.drawer_cwd
+agents.drawer_scope
 agents.harness
 agents.model
 agents.name
@@ -117,6 +121,12 @@ git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+hooks.pre_create
+hooks.post_create
+hooks.pre_destroy
+hooks.post_destroy
+hooks.session_start
+hooks.session_end
 host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
@@ -417,6 +427,10 @@ toolchain.node
 toolchain.python
 toolchain.ruby
 tools.command
+# tools.drawer_* — structured per-entry drawer metadata; list entries have no
+# stable index-addressable THEGN_* environment override.
+tools.drawer_cwd
+tools.drawer_scope
 tools.harness
 tools.model
 tools.name

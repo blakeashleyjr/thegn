@@ -31,7 +31,7 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, RecordSpec, SplitDir,
+    AttachKind, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec, RecordSpec, SplitDir,
     WaitCondition,
 };
 
@@ -667,6 +667,20 @@ pub(super) async fn open_session(
         return r;
     }
     match state.api.open(body.0).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn fork_session(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<ForkSpec>,
+) -> Response {
+    if let Err(r) = authed_target(&state, &headers, Verb::ForkSession, &body.session) {
+        return r;
+    }
+    match state.api.fork(body.0).await {
         Ok(info) => axum::Json(info).into_response(),
         Err(e) => e.into_response(),
     }

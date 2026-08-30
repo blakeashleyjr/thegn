@@ -296,6 +296,10 @@ pub(crate) enum RefreshKind {
     /// Boxed: the payload is a whole table, and every other `RefreshKind`
     /// variant stays one word.
     Dispatches(Box<crate::monitor_pipeline::DispatchRoster>),
+    /// A background reconciliation found local worktree paths that vanished
+    /// outside the host. The loop only prunes the already-identified groups;
+    /// probing and cache/session persistence stay off-loop.
+    VanishedTabs(Box<crate::merge_lifecycle::VanishedTabs>),
     /// The pane daemon's live session list, fetched over the control socket when
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.
@@ -2920,6 +2924,24 @@ pub(crate) fn build_panel(
         }
     }
 
+    // The deep review cache is identity-checked before it reaches either
+    // renderer. A branch/head switch must never make old comments look
+    // anchored to the current PR; keep the row visible only as an explicit
+    // stale status until the off-loop refresh replaces it.
+    if let Ok(Some(snapshot)) = db.get_pr_review_cache(&cache_key) {
+        let matches_current = panel.pr.as_ref().is_some_and(|pr| {
+            snapshot.worktree_key == cache_key
+                && snapshot.branch == panel.branch
+                && snapshot.pr_number == pr.number
+                && snapshot.head_oid == panel.pr_head_oid
+        });
+        if matches_current {
+            panel.review_snapshot = Some(snapshot);
+        } else {
+            panel.review_snapshot_status = Some("stale PR review snapshot".into());
+        }
+    }
+
     // The CI run-history cache feeds the `Ci` section rollup (AV group), with
     // its fetch age (the summary's "Ns ago" stamp) and any fetch-health note.
     if let Ok(Some((json, fetched_at))) = db.get_ci_cache(&cache_key)
@@ -3541,6 +3563,39 @@ pub(crate) fn spawn_pr_cache_refresh(
         // data may still be shown").
         if pr_state_is_definitive(&panel.state) {
             let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        }
+
+        // Deep review data is a separate complete snapshot. Fetching either
+        // half failing leaves the previous snapshot untouched, so an outage
+        // cannot turn a useful cached conversation into a partial one.
+        if let thegn_core::forge::model::PanelState::Pr(pr) = &panel.state
+            && let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&pr.url)
+        {
+            let deep_forge = forges.for_loc(&loc);
+            if let (Ok(conversation), Ok(diff)) = (
+                deep_forge.conversation(
+                    &loc,
+                    &thegn_core::forge::RepoRef { owner, repo },
+                    pr.number,
+                ),
+                deep_forge.pr_diff(&loc, thegn_core::forge::PrRef::Current),
+            ) {
+                let snapshot = thegn_core::review::PrReviewSnapshot {
+                    worktree_key: cache_key.clone(),
+                    // Review-cache identity follows the checked-out local
+                    // branch, just like pr_cache. The PR head ref may use a
+                    // different name for fork/remote workflows.
+                    branch: panel.branch.clone(),
+                    pr_number: pr.number,
+                    head_oid: pr.head_ref_oid.clone(),
+                    fetched_at: thegn_core::util::now(),
+                    conversation,
+                    diff,
+                };
+                // Complete payload only; DB failures are cache misses on the
+                // next hydrate and do not affect the primary PR refresh.
+                let _ = db.put_pr_review_cache(&snapshot);
+            }
         }
 
         // Emit a notification when the PR transitions between states

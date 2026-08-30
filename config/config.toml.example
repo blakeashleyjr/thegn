@@ -167,8 +167,8 @@ sidebar_icon_status = ""
 # focused chrome edge. Unfocused frames use `colors.border`.
 [theme]
 # Named palette preset: "prism" (default), "storm", "light", "abyss", "ember",
-# "aurora". Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues]
-# overrides apply on top.
+# "aurora", or a local theme name from $XDG_CONFIG_HOME/thegn/themes.
+# Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues] overrides apply on top.
 preset = "prism"
 accent = "#6ee7d8"
 focus_border = "#6ee7d8"
@@ -294,7 +294,7 @@ top_left = ["brand"]
 top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"]
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
-bottom_left = ["help", "keyhints"]
+bottom_left = ["help", "drawer", "keyhints"]
 bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets. Validated at load — an
 # invalid specifier warns and falls back to the default rather than panicking
@@ -1086,6 +1086,18 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # [workspace.my-repo.keybinds]
 # new-worktree = "Alt w"
 
+# Per-worktree lifecycle commands for this workspace. These lists accumulate
+# after the global [hooks] table and before a repo-root .thegn.* [hooks] table.
+# Repo-authored entries are trust-gated and can never block an operation.
+# [workspace.my-repo.hooks]
+# pre_create = ["./.thegn/pre-create.sh"]
+# post_create = [{ command = "pnpm install --frozen-lockfile", wait = true,
+#                  timeout_secs = 120, on_failure = "warn" }]
+# pre_destroy = ["docker compose down"]
+# post_destroy = []
+# session_start = []
+# session_end = []
+
 # Per-program host-action overlays, keyed by the focused pane's program name.
 # These intercept *before* the active mode — useful for binding a host action
 # while a TUI like lazygit is focused.
@@ -1149,6 +1161,10 @@ command = "claude"
 #                       #   launch (claude: .claude/settings.local.json →
 #                       #   permissions.allow; other keys in that file survive).
 #                       #   Empty = leave the file alone.
+# Add this agent to the drawer at worktree or process-global scope; unset by default.
+# drawer_scope = "worktree"
+# Start its drawer pane relative to the scope root (or absolute/~); unset uses the root.
+# drawer_cwd = "."
 
 [[agents]]
 name = "aider"
@@ -1296,6 +1312,24 @@ command = "lazygit"
 # permissions = []      # headless allow-list seeded into the worktree at launch
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
+# drawer_scope = "worktree"  # add this tool to the drawer: worktree | global
+# drawer_cwd = ".atac"       # optional; relative to worktree, or absolute/~ for global
+
+# Drawer occupants reuse this same [[tools]] catalog. The built-in files drawer
+# is always first; entries without drawer_scope remain picker-only.
+# Worktree ATAC keeps its state under each worktree. A global database tool uses
+# one process-local pane shared while switching worktrees.
+[[tools]]
+name = "atac"
+command = "atac"
+drawer_scope = "worktree"
+# drawer_cwd = ".atac"
+# env = { ATAC_MAIN_DIR = ".atac" }
+
+[[tools]]
+name = "db"
+command = "psql"
+drawer_scope = "global"
 
 [[tools]]
 name = "yazi"
@@ -2223,6 +2257,30 @@ max_results = 1000
 # go = ["go"]
 # ruby = ["ruby"]
 # extra = []      # nixpkgs packages appended for every language mix
+
+# ── Worktree lifecycle hooks ────────────────────────────────────────────────
+# Host-side commands run at worktree/session boundaries. Lists retain their
+# declaration order and accumulate global → [workspace.<slug>] → repo overlay.
+# A string is shorthand for an object with wait = false, timeout_secs = 120,
+# and the event default for on_failure (pre_create/pre_destroy = "block";
+# every other event = "warn"). `wait` is valid only for post_create.
+#
+# The repo .thegn.* [hooks] table is untrusted until approved through the
+# existing repo trust flow; its entries are omitted while pending and are
+# always warn-only after approval. The legacy [sandbox] prepare list is also
+# run as the head of global post_create (and repo sandbox.prepare as the head
+# of repo post_create), with warn/no-wait semantics.
+[hooks]
+# String shorthand:
+pre_create = ["./.thegn/pre-create.sh"]
+# Object form with explicit policy:
+post_create = [
+  { command = "pnpm install --frozen-lockfile", wait = false, timeout_secs = 120, on_failure = "warn" },
+]
+pre_destroy = ["docker compose down"]
+post_destroy = []
+session_start = []
+session_end = []
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a

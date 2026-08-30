@@ -82,6 +82,7 @@ pub enum MenuChoice {
     // delete worktree confirm: variant to capture "leave files" intent
     ConfirmDeleteWorktrees {
         keep_files: bool,
+        force: bool,
     },
     // the `[c]` arm of the close-or-delete chooser: close the pending worktree
     // groups (forget them in thegn) without touching branch or files.
@@ -379,7 +380,19 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             item(
                 Some('y'),
                 "delete from disk",
-                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: false,
+                },
+            )
+            .danger(),
+            item(
+                Some('a'),
+                "delete anyway (ignore blocking hooks)",
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: true,
+                },
             )
             .danger(),
             item(
@@ -388,7 +401,10 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
                 // stays happy.
                 Some('f'),
                 "keep files",
-                MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: true,
+                    force: false,
+                },
             ),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
         ],
@@ -419,7 +435,19 @@ pub fn close_or_delete_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             item(
                 Some('y'),
                 "delete branch + files from disk",
-                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: false,
+                },
+            )
+            .danger(),
+            item(
+                Some('a'),
+                "delete anyway (ignore blocking hooks)",
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: true,
+                },
             )
             .danger(),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
@@ -447,12 +475,24 @@ pub fn close_or_delete_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay 
             item(
                 Some('y'),
                 "delete from disk (discard changes)",
-                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: false,
+                },
+            )
+            .danger(),
+            item(
+                Some('a'),
+                "delete anyway (ignore blocking hooks)",
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: true,
+                },
             )
             .danger(),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
         ],
-        2,
+        3,
     )
     .with_body(format!("uncommitted work will be LOST in: {dirty_csv}"))
 }
@@ -508,12 +548,11 @@ pub fn sidebar_sort_menu(current: crate::sidebar::SortMode) -> MenuOverlay {
 /// The dirty-tree variant of [`delete_worktree_menu`], shown whenever one or
 /// more targets have uncommitted changes. It is raised EVEN when
 /// `confirm_delete` is off — a destructive delete of unsaved work must never be
-/// silent. Same three choices resolving to the same `ConfirmDeleteWorktrees` /
+/// silent. The choices resolve to the same `ConfirmDeleteWorktrees` /
 /// `Dismiss` as the clean menu (so the loop's Pick handler is reused untouched),
 /// but the title/body shout that uncommitted work will be LOST and name the
-/// dirty worktree(s), and the pre-selected default is the SAFE `cancel` (index
-/// 2) rather than the destructive row — a dirty delete is never a single-Enter
-/// mistake.
+/// dirty worktree(s), and the pre-selected default is the SAFE `cancel` rather
+/// than a destructive row — a dirty delete is never a single-Enter mistake.
 pub fn delete_worktree_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay {
     let title = format!("Delete {dirty} worktree(s) with UNCOMMITTED changes?");
     MenuOverlay::new_with_default(
@@ -523,7 +562,19 @@ pub fn delete_worktree_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay 
             item(
                 Some('y'),
                 "delete from disk (discard changes)",
-                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: false,
+                },
+            )
+            .danger(),
+            item(
+                Some('a'),
+                "delete anyway (ignore blocking hooks)",
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: false,
+                    force: true,
+                },
             )
             .danger(),
             item(
@@ -531,11 +582,14 @@ pub fn delete_worktree_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay 
                 // the clean menu and keeping new_with_default's debug-assert happy.
                 Some('f'),
                 "keep files (safe)",
-                MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
+                MenuChoice::ConfirmDeleteWorktrees {
+                    keep_files: true,
+                    force: false,
+                },
             ),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
         ],
-        2,
+        3,
     )
     .with_body(format!("uncommitted work will be LOST in: {dirty_csv}"))
 }
@@ -1558,13 +1612,16 @@ mod tests {
         let mut m = delete_worktree_menu_dirty(2, "alpha, beta");
         // The SAFE option (cancel) is pre-selected on a dirty tree — a
         // destructive delete of unsaved work is never a single-Enter mistake.
-        assert_eq!(m.selected(), 2);
+        assert_eq!(m.selected(), 3);
         // Same hotkeys + same choice types as the clean menu, so the loop's
         // Pick handler is reused untouched.
-        assert_eq!(hotkeys(&m), vec!['y', 'f', 'n']);
+        assert_eq!(hotkeys(&m), vec!['y', 'a', 'f', 'n']);
         assert_eq!(
             m.items()[0].choice,
-            MenuChoice::ConfirmDeleteWorktrees { keep_files: false }
+            MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: false,
+                force: false,
+            }
         );
         assert!(
             m.items()[0].danger,
@@ -1572,14 +1629,28 @@ mod tests {
         );
         assert_eq!(
             m.items()[1].choice,
-            MenuChoice::ConfirmDeleteWorktrees { keep_files: true }
+            MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: false,
+                force: true,
+            }
         );
-        assert!(!m.items()[1].danger, "keep-files row is not danger");
-        assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
+        assert!(m.items()[1].danger, "force row stays danger-marked");
+        assert_eq!(
+            m.items()[2].choice,
+            MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: true,
+                force: false,
+            }
+        );
+        assert!(!m.items()[2].danger, "keep-files row is not danger");
+        assert_eq!(m.items()[3].choice, MenuChoice::Dismiss);
         // Hotkey 'y' picks the destructive delete; 'n' dismisses.
         assert_eq!(
             m.handle_key(&KeyCode::Char('y'), NONE),
-            MenuOutcome::Pick(MenuChoice::ConfirmDeleteWorktrees { keep_files: false })
+            MenuOutcome::Pick(MenuChoice::ConfirmDeleteWorktrees {
+                keep_files: false,
+                force: false,
+            })
         );
         assert_eq!(
             delete_worktree_menu_dirty(1, "x").handle_key(&KeyCode::Char('n'), NONE),
