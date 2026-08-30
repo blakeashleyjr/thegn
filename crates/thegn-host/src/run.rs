@@ -9617,7 +9617,11 @@ async fn event_loop<T: Terminal>(
         if !pending_editor_opens.is_empty() {
             let known = crate::ide_handoff::known_worktrees(&model, &session);
             for row in std::mem::take(&mut pending_editor_opens) {
-                match crate::ide_handoff::target_from_intent(&row, known.clone()) {
+                match crate::ide_handoff::target_from_intent(
+                    &row,
+                    known.clone(),
+                    thegn_core::util::now(),
+                ) {
                     Ok((target, workspace_slug, source)) => crate::ide_handoff::dispatch(
                         target,
                         workspace_slug,

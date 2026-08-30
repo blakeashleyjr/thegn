@@ -15,6 +15,13 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use thegn_core::editor::{EditorLaunch, EditorTarget, Placement};
 
+/// How long a queued control handoff remains actionable (seconds).
+///
+/// The intent mailbox is asynchronous, but an editor launch must not survive a
+/// compositor outage and surprise the user on a much later restart. Keep this
+/// aligned with the existing `adopt_session` mailbox policy.
+const MAX_EDITOR_OPEN_AGE_SECS: i64 = 300;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PanePlacement {
     Tab,
@@ -64,7 +71,8 @@ pub(crate) fn dispatch(
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let outcome = plan_and_launch(target, &workspace_slug, source, placement, &cfg);
         if tx.send(outcome).is_ok() {
-            let _ = waker.wake(); // best-effort: the loop may already be shutting down
+            // Best-effort: the loop may already be shutting down.
+            drop(waker.wake());
         }
     });
 }
@@ -142,17 +150,32 @@ fn plan_with_fallback(
 }
 
 fn revalidate(target: &EditorTarget) -> Result<(), String> {
-    if !target.worktree().is_dir() {
+    let worktree = target.worktree().canonicalize().map_err(|_| {
+        format!(
+            "worktree is missing or unreadable: {}",
+            target.worktree().display()
+        )
+    })?;
+    if !worktree.is_dir() {
         return Err(format!(
             "worktree is missing or unreadable: {}",
             target.worktree().display()
         ));
     }
-    if target.relative_file().is_some() && !target.path().is_file() {
-        return Err(format!(
-            "file is missing or unreadable: {}",
-            target.path().display()
-        ));
+    if target.relative_file().is_some() {
+        let path = target.path();
+        let resolved = path
+            .canonicalize()
+            .map_err(|_| format!("file is missing or unreadable: {}", path.display()))?;
+        if !resolved.starts_with(&worktree) {
+            return Err(format!(
+                "file resolves outside the worktree: {}",
+                path.display()
+            ));
+        }
+        if !resolved.is_file() {
+            return Err(format!("file is missing or unreadable: {}", path.display()));
+        }
     }
     Ok(())
 }
@@ -229,7 +252,12 @@ pub(crate) fn dispatch_active(
 pub(crate) fn target_from_intent(
     row: &thegn_core::store::IntentRow,
     known: impl IntoIterator<Item = (PathBuf, String)>,
+    now_secs: i64,
 ) -> Result<(EditorTarget, String, String), String> {
+    // Future timestamps from clock skew are fresh; only positive age expires.
+    if now_secs.saturating_sub(row.created_at) > MAX_EDITOR_OPEN_AGE_SECS {
+        return Err("stale open_editor intent dropped: request expired".into());
+    }
     let payload: IntentPayload = serde_json::from_str(&row.payload)
         .map_err(|error| format!("malformed open_editor intent dropped: {error}"))?;
     let target = EditorTarget::new(
@@ -359,13 +387,17 @@ fn target_from_launch(launch: &EditorLaunch) -> String {
 mod tests {
     use super::*;
 
-    fn row(payload: &str) -> thegn_core::store::IntentRow {
+    fn row_at(payload: &str, created_at: i64) -> thegn_core::store::IntentRow {
         thegn_core::store::IntentRow {
             id: 1,
             kind: "open_editor".into(),
             payload: payload.into(),
-            created_at: 1,
+            created_at,
         }
+    }
+
+    fn row(payload: &str) -> thegn_core::store::IntentRow {
+        row_at(payload, 1)
     }
 
     #[test]
@@ -373,8 +405,12 @@ mod tests {
         let intent = row(
             r#"{"worktree":"/repo/wt","path":"src/lib.rs","line":7,"col":2,"source":"control_api"}"#,
         );
-        let (target, slug, source) =
-            target_from_intent(&intent, [(PathBuf::from("/repo/wt"), "repo".to_string())]).unwrap();
+        let (target, slug, source) = target_from_intent(
+            &intent,
+            [(PathBuf::from("/repo/wt"), "repo".to_string())],
+            1,
+        )
+        .unwrap();
         assert_eq!(target.relative_file(), Some(Path::new("src/lib.rs")));
         assert_eq!(target.line(), Some(7));
         assert_eq!(slug, "repo");
@@ -385,14 +421,14 @@ mod tests {
     fn malformed_escaping_and_stale_intents_are_dropped() {
         let escaping = row(r#"{"worktree":"/repo/wt","path":"../secret","source":"control_api"}"#);
         assert!(
-            target_from_intent(&escaping, [])
+            target_from_intent(&escaping, [], 1)
                 .unwrap_err()
                 .contains("invalid")
         );
 
         let stale = row(r#"{"worktree":"/repo/gone","source":"control_api"}"#);
         assert!(
-            target_from_intent(&stale, [(PathBuf::from("/repo/wt"), "repo".into())])
+            target_from_intent(&stale, [(PathBuf::from("/repo/wt"), "repo".into())], 1,)
                 .unwrap_err()
                 .contains("stale")
         );
@@ -402,10 +438,48 @@ mod tests {
     fn unknown_intent_fields_fail_closed() {
         let intent = row(r#"{"worktree":"/repo/wt","source":"control_api","argv":["bad"]}"#);
         assert!(
-            target_from_intent(&intent, [])
+            target_from_intent(&intent, [], 1)
                 .unwrap_err()
                 .contains("malformed")
         );
+    }
+
+    #[test]
+    fn expired_intents_are_dropped_but_boundary_and_future_rows_are_fresh() {
+        let payload = r#"{"worktree":"/repo/wt","source":"control_api"}"#;
+        let known = || [(PathBuf::from("/repo/wt"), "repo".to_string())];
+        assert!(
+            target_from_intent(&row_at(payload, 10), known(), 311)
+                .unwrap_err()
+                .contains("expired")
+        );
+        assert!(target_from_intent(&row_at(payload, 10), known(), 310).is_ok());
+        assert!(target_from_intent(&row_at(payload, 500), known(), 100).is_ok());
+    }
+
+    #[test]
+    fn filesystem_revalidation_rejects_symlink_escape() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        let outside = root.path().join("outside.rs");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        crate::platform::test_symlink(&outside, &worktree.join("linked.rs")).unwrap();
+
+        let escaped = EditorTarget::file(&worktree, "linked.rs", None, None).unwrap();
+        assert!(
+            revalidate(&escaped)
+                .unwrap_err()
+                .contains("outside the worktree")
+        );
+
+        std::fs::write(worktree.join("inside.rs"), "safe").unwrap();
+        let inside = EditorTarget::file(&worktree, "inside.rs", None, None).unwrap();
+        assert!(revalidate(&inside).is_ok());
     }
 
     #[test]
