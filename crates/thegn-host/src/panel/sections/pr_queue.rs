@@ -69,6 +69,48 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             PanelRow::plain(Line::split(left, vec![seg(g2(), r.status.clone())]))
                 .with_hit(PanelHit::Row(Section::PrQueue, i)),
         );
+        for (task_index, task) in ctx
+            .model
+            .panel
+            .review_tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.pr_number == r.number)
+        {
+            let location = match task.line {
+                Some(line) if !task.path.is_empty() => format!("{}:{line}", task.path),
+                _ if task.path.is_empty() => "unanchored".to_string(),
+                _ => task.path.clone(),
+            };
+            let role = if task.role.trim().is_empty() {
+                "explicit command"
+            } else {
+                task.role.as_str()
+            };
+            let task_hue = match task.status {
+                thegn_core::issue::AgentDispatchStatus::Queued => Hue::Blue,
+                thegn_core::issue::AgentDispatchStatus::Running
+                | thegn_core::issue::AgentDispatchStatus::Spawning => Hue::Amber,
+                thegn_core::issue::AgentDispatchStatus::WaitingHuman
+                | thegn_core::issue::AgentDispatchStatus::Failed => Hue::Red,
+                _ => Hue::Green,
+            };
+            let left = vec![
+                seg(g(), "   "),
+                seg(hue(task_hue), crate::caps::active_glyphs().diamond_hollow),
+                seg(d(), format!(" #{} / {} ", task.pr_number, task.thread_id)),
+                seg(g2(), location),
+                seg(g(), format!("  role {role}")),
+            ];
+            let right = vec![seg(
+                g2(),
+                format!("{} · rev {}", task.status.as_str(), task.source_revision),
+            )];
+            out.push(
+                PanelRow::plain(Line::split(left, right))
+                    .with_hit(PanelHit::Row(Section::PrQueue, rows.len() + task_index)),
+            );
+        }
     }
     out.push(prq_hint_row());
     out
@@ -84,5 +126,6 @@ fn prq_hint_row() -> PanelRow {
         ("c", "clear"),
         ("D", "refresh"),
         ("o", "browser"),
+        ("h", "handle"),
     ])
 }

@@ -557,6 +557,23 @@ pub struct StashRow {
 }
 
 /// The panel's data payload (git + GitHub), rebuilt on background refresh.
+/// TUI projection of one durable watched-review task. Provider identity and the
+/// exact anchor are recovered from the complete cached snapshot during
+/// hydration; lifecycle/prompt/head facts remain owned by the roster row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTaskRow {
+    pub id: i64,
+    pub pr_number: u64,
+    pub repository: String,
+    pub thread_id: String,
+    pub path: String,
+    pub line: Option<u64>,
+    pub role: String,
+    pub status: thegn_core::issue::AgentDispatchStatus,
+    pub source_revision: String,
+    pub worktree_path: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelData {
     pub branch: String,
@@ -586,6 +603,8 @@ pub struct PanelData {
     pub merge_queue: Vec<thegn_core::db::MergeQueueRow>,
     /// `PrQueue` section + statusbar badge. Empty when the queue is unused.
     pub pr_queue: Vec<thegn_core::db::PrQueueRow>,
+    /// Per-thread tasks derived only from the explicit rows above.
+    pub review_tasks: Vec<ReviewTaskRow>,
     /// Now-playing snapshot for the optional `[media]` feature (`Media` section +
     /// statusbar badge). `None` when media is disabled or no player is loaded.
     pub media: Option<thegn_core::media::MediaState>,

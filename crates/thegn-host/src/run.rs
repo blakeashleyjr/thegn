@@ -18826,11 +18826,12 @@ async fn event_loop<T: Terminal>(
                             },
                         ),
                         // -- PR queue: add (a), remove (x), re-watch (r), clear
-                        // (c), refresh (D), open in browser (o). Mutations run
+                        // (c), refresh (D), open in browser (o), handle a
+                        // selected review task (h). Mutations run
                         // off-loop; outcomes ride the prq channel as toasts.
                         (
                             Section::PrQueue,
-                            KeyCode::Char(c @ ('a' | 'x' | 'r' | 'c' | 'D' | 'o')),
+                            KeyCode::Char(c @ ('a' | 'x' | 'r' | 'c' | 'D' | 'o' | 'h')),
                         ) => crate::handlers::pr_queue::section_key(
                             c,
                             panel_ui.cursor,
@@ -19858,6 +19859,49 @@ async fn event_loop<T: Terminal>(
                                         &waker,
                                         current_config.clone(),
                                         active_tab_path(&session),
+                                    );
+                                }
+                            }
+                            Action::PrReviewTaskHandle => {
+                                let selected = (panel_ui.open
+                                    == crate::panel::Section::PrQueue)
+                                    .then(|| {
+                                        panel_ui
+                                            .cursor
+                                            .checked_sub(model.panel.pr_queue.len())
+                                            .and_then(|index| {
+                                                model.panel.review_tasks.get(index)
+                                            })
+                                    })
+                                    .flatten()
+                                    .filter(|task| {
+                                        task.status
+                                            == thegn_core::issue::AgentDispatchStatus::Queued
+                                    })
+                                    .cloned()
+                                    .or_else(|| {
+                                        model
+                                            .panel
+                                            .review_tasks
+                                            .iter()
+                                            .find(|task| {
+                                                task.status
+                                                    == thegn_core::issue::AgentDispatchStatus::Queued
+                                            })
+                                            .cloned()
+                                    });
+                                if let Some(task) = selected {
+                                    crate::handlers::pr_queue::spawn_handle(
+                                        &prq_tx,
+                                        &waker,
+                                        current_config.clone(),
+                                        task,
+                                    );
+                                } else {
+                                    toasts.info_ttl(
+                                        "No queued watched-review task to handle".to_string(),
+                                        std::time::Instant::now(),
+                                        std::time::Duration::from_secs(4),
                                     );
                                 }
                             }

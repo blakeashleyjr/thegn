@@ -1491,6 +1491,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         .as_slice(),
     },
     ActionSpec {
+        id: "pr-review-task-handle",
+        label: "PR review task: handle queued",
+        message_key: "action-pr-review-task-handle",
+        hint: "handle review",
+        // TUI-only: choose it from the command palette, or press `h` on an
+        // explicit per-thread task row in the PR queue panel.
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "handle review task",
+            "resolve review thread",
+            "watched pr comments",
+            "review agent",
+        ],
+    },
+    ActionSpec {
         id: "share-worktree-port",
         label: "Share worktree port",
         message_key: "action-share-worktree-port",
