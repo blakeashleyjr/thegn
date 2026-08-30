@@ -360,6 +360,11 @@ fn report_names(dir: &Path) -> Vec<String> {
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.ends_with(".txt"))
+        .filter(|n| {
+            std::fs::symlink_metadata(dir.join(n))
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false)
+        })
         .collect();
     names.sort();
     names
@@ -638,6 +643,33 @@ mod tests {
             .collect();
         assert_eq!(unacknowledged(&names, &acks).len(), 1);
 
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_names_skips_symlinks_and_non_regular_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tg-crash-types-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("regular.txt"), b"safe").unwrap();
+        std::fs::create_dir(dir.join("nested.txt")).unwrap();
+        let sentinel = dir.with_extension("sentinel");
+        std::fs::write(&sentinel, b"must not enter a bundle").unwrap();
+        symlink(&sentinel, dir.join("evil.txt")).unwrap();
+
+        assert_eq!(report_names(&dir), vec!["regular.txt"]);
+
+        let _ = std::fs::remove_file(&sentinel); // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }
