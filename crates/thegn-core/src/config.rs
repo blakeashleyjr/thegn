@@ -274,6 +274,9 @@ pub use crate::config_theme::{
 // The file-manager seam's `[drawer] kind` enum lives with the seam in
 // `file_manager`; re-exported so `config::DrawerKind` keeps working.
 pub use crate::file_manager::DrawerKind;
+// The editor seam owns its logical provider enum; re-export it beside the
+// other config-selected provider kinds.
+pub use crate::editor::EditorProvider;
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
@@ -299,13 +302,14 @@ config_enum! {
     } default = Auto;
 }
 
-/// `[editor]` — how thegn opens a file (from the files tree, a diff hunk, a
-/// test failure, a problem, a search hit, `config edit`). Resolution:
-/// `command` here → the `[[tools]]` entry named `editor` → `$VISUAL` /
-/// `$EDITOR` → `vi`; the program's basename picks the line-jump syntax.
+/// `[editor]` — how thegn opens a worktree or one of its files. A non-empty
+/// `command` wins; otherwise an explicit logical `provider` wins; `auto` keeps
+/// the `[[tools]] editor` → `$VISUAL` → `$EDITOR` → `vi` ladder.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EditorConfig {
+    /// Logical provider. `auto` preserves the custom-program ladder.
+    pub provider: EditorProvider,
     /// A command template with `{path}`, `{line}` and `{col}` placeholders
     /// (`{path}` is shell-quoted for you). Empty = resolve from tools/env.
     pub command: String,
@@ -2275,6 +2279,11 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkspaceConfig {
+    /// Trusted per-workspace logical editor provider. `None` inherits
+    /// `[editor] provider`; an explicit `auto` selects the custom-program
+    /// ladder for this workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<EditorProvider>,
     /// Keybind overrides applied when this workspace is focused.
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
@@ -5106,6 +5115,7 @@ pub struct ConfigOverlay {
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
     pub git_structural_diff: Option<StructuralDiff>,
+    pub editor_provider: Option<EditorProvider>,
     pub editor_command: Option<String>,
     pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -5175,6 +5185,7 @@ impl ConfigOverlay {
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
         set!(base.git.structural_diff, self.git_structural_diff);
+        set!(base.editor.provider, self.editor_provider);
         set!(base.editor.command, self.editor_command);
         set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
@@ -5325,6 +5336,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             v.trim(),
             "THEGN_GIT_STRUCTURAL_DIFF",
             StructuralDiff::from_str_validated,
+        );
+    }
+    if let Some(v) = env.get("THEGN_EDITOR_PROVIDER") {
+        o.editor_provider = parse_enum_env(
+            v.trim(),
+            "THEGN_EDITOR_PROVIDER",
+            EditorProvider::from_str_validated,
         );
     }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");
