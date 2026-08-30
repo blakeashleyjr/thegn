@@ -1,5 +1,7 @@
 //! Pure startup locale precedence.
 
+use std::borrow::Cow;
+
 use unic_langid::LanguageIdentifier;
 
 pub(crate) const DEFAULT_LOCALE: &str = "en-US";
@@ -60,7 +62,14 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 fn parse_or_default(value: &str, source: LocaleSource) -> LocaleResolution {
-    match value.parse::<LanguageIdentifier>() {
+    // Config is documented as BCP-47, while LC_ALL/LANG conventionally carry
+    // POSIX spellings such as `ja_JP.UTF-8`. The removed `sys-locale` adapter
+    // performed this conversion; keep it at the pure resolver boundary.
+    let parse_value = match source {
+        LocaleSource::LcAll | LocaleSource::Lang => normalize_posix_locale(value),
+        _ => Cow::Borrowed(value),
+    };
+    match parse_value.parse::<LanguageIdentifier>() {
         Ok(language) => LocaleResolution {
             language,
             source,
@@ -73,6 +82,17 @@ fn parse_or_default(value: &str, source: LocaleSource) -> LocaleResolution {
                 "i18n: invalid language '{value}', falling back to {DEFAULT_LOCALE}"
             )),
         ),
+    }
+}
+
+fn normalize_posix_locale(value: &str) -> Cow<'_, str> {
+    let base = value
+        .split_once(['.', '@'])
+        .map_or(value, |(base, _suffix)| base);
+    if base.contains('_') || base.len() != value.len() {
+        Cow::Owned(base.replace('_', "-"))
+    } else {
+        Cow::Borrowed(value)
     }
 }
 
@@ -116,6 +136,19 @@ mod tests {
         let lang = resolve(Some("auto"), Some("  "), Some("ja-JP"));
         assert_eq!(lang.language.to_string(), "ja-JP");
         assert_eq!(lang.source, LocaleSource::Lang);
+    }
+
+    #[test]
+    fn auto_normalizes_posix_environment_locales() {
+        let lc_all = resolve(Some("auto"), Some("ja_JP.UTF-8"), Some("en_US.UTF-8"));
+        assert_eq!(lc_all.language.to_string(), "ja-JP");
+        assert_eq!(lc_all.source, LocaleSource::LcAll);
+        assert!(lc_all.diagnostic.is_none());
+
+        let lang = resolve(Some("auto"), None, Some("ja_JP@calendar"));
+        assert_eq!(lang.language.to_string(), "ja-JP");
+        assert_eq!(lang.source, LocaleSource::Lang);
+        assert!(lang.diagnostic.is_none());
     }
 
     #[test]
