@@ -25,9 +25,16 @@ pub(crate) struct ScanResult {
 }
 
 fn read_package(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if !metadata.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     // Read one byte past the core parser's cap so oversized manifests are
@@ -95,6 +102,24 @@ mod tests {
         assert_eq!(
             read_package(&path).unwrap().unwrap().len(),
             MAX_PACKAGE_JSON_BYTES + 1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn package_reader_rejects_non_regular_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "thegn-preview-watch-special-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("package.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            read_package(&path)
+                .unwrap_err()
+                .contains("not a regular file")
         );
         let _ = std::fs::remove_dir_all(&root);
     }

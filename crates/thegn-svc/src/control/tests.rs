@@ -919,9 +919,10 @@ mod audit_capture {
     }
 }
 
-/// Every mutating control call and every scope rejection emits one structured
-/// audit record on `thegn::control::audit`, naming the caller, capability,
-/// resource and outcome — never a secret.
+/// Every mutating control call, the network-reaching read-scoped preview fetch,
+/// and every scope rejection emits one structured audit record on
+/// `thegn::control::audit`, naming the caller, capability, resource and outcome
+/// — never a secret.
 #[tokio::test]
 async fn mutating_calls_and_rejections_emit_audit_records() {
     let captured = audit_capture::Captured::default();
@@ -945,6 +946,10 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
         call(&r, "GET", "/v1/sessions", Some(&read)).await,
         StatusCode::OK
     );
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&read)).await,
+        StatusCode::OK
+    );
 
     let recs = captured.records();
     let ok = recs.iter().find(|m| {
@@ -957,6 +962,10 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
     assert!(recs.iter().any(|m| {
         m.get("capability").map(String::as_str) == Some("sessions.input")
             && m.get("outcome").map(String::as_str) == Some("no_scope")
+    }));
+    assert!(recs.iter().any(|m| {
+        m.get("capability").map(String::as_str) == Some("preview.fetch")
+            && m.get("outcome").map(String::as_str) == Some("ok")
     }));
     // A read GET produced no record.
     assert!(
