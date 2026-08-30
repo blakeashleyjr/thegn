@@ -1627,6 +1627,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    v.push("events.subscribe"); // thegn events tail
     v.push("launch.preset"); // thegn open --preset (intents mailbox, not a route)
     // Local operator verbs driven by a dedicated `thegn` subcommand (not the
     // generic control client): the debug bundle reads local files directly.

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use thegn_core::control::Scope;
+pub use thegn_core::control_error::ControlErrorCode;
 use thegn_core::control_wire::{EventFrame, PairingState};
 use thegn_core::store::LeaseRow;
 
@@ -713,6 +714,33 @@ pub enum ControlError {
     Unavailable(String),
     Unimplemented(&'static str),
     Internal(anyhow::Error),
+}
+
+impl ControlError {
+    /// The stable machine-readable code for this control error.
+    pub fn code(&self) -> ControlErrorCode {
+        match self {
+            Self::NotFound(_) => ControlErrorCode::NotFound,
+            // `InvalidArgument` reuses the existing `BadRequest` identifier
+            // rather than adding a synonym for the same condition.
+            Self::InvalidArgument(_) => ControlErrorCode::BadRequest,
+            Self::NoScope { .. } => ControlErrorCode::NoScope,
+            Self::Conflict(_) => ControlErrorCode::Conflict,
+            Self::FailedPrecondition(_) => ControlErrorCode::FailedPrecondition,
+            Self::ResourceExhausted(_) => ControlErrorCode::ResourceExhausted,
+            Self::Unavailable(_) => ControlErrorCode::Unavailable,
+            Self::Unimplemented(_) => ControlErrorCode::Unimplemented,
+            Self::Internal(_) => ControlErrorCode::Internal,
+        }
+    }
+}
+
+/// The additive HTTP error envelope. `error` retains the existing human
+/// message; `code` is stable for machine-readable branching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ErrorBody {
+    pub error: String,
+    pub code: ControlErrorCode,
 }
 
 impl std::fmt::Display for ControlError {

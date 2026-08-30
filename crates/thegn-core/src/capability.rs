@@ -419,7 +419,7 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "events.subscribe",
         Verb::Events,
-        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Plugin]),
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Plugin]),
         "The live event feed",
     ),
     cap(

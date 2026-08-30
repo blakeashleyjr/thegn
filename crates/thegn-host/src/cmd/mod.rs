@@ -25,6 +25,7 @@ pub mod dispatch;
 pub mod doctor;
 pub mod env;
 pub mod env_image;
+pub mod events;
 pub mod forward;
 pub mod host;
 pub mod integrate;

@@ -50,6 +50,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "share",
             "forward",
             "sandbox-argv",
+            "events",
         ],
     ),
     (

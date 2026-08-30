@@ -347,6 +347,7 @@ pub const CATALOG: &[Slot] = &[
     // --- session ----------------------------------------------------------
     slot("attach", "session", SourceKind::Session),
     slot("dispatch put", "session", SourceKind::Session),
+    slot("events tail", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
     slot("session browse", "session", SourceKind::Session),
     slot("session fork", "session", SourceKind::Session),
@@ -499,6 +500,7 @@ pub const CATALOG: &[Slot] = &[
     slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
     slot("automations test", "fixture", SourceKind::Structural),
+    slot("events tail", "kinds", SourceKind::Structural),
     slot("skills seed", "worktree", SourceKind::Structural),
     slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
