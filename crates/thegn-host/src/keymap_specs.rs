@@ -1542,6 +1542,23 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "open-in-ide",
+        label: "Open focused worktree in IDE",
+        hint: "open in IDE",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "ide",
+            "open in ide",
+            "external editor",
+            "project",
+            "worktree",
+            "vscode",
+            "cursor",
+            "zed",
+        ],
+    },
+    ActionSpec {
         id: "show-diff",
         label: "Open git diff",
         hint: "diff",
