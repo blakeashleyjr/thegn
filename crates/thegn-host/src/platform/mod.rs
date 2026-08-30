@@ -43,6 +43,30 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+#[cfg(test)]
+pub(crate) fn test_assert_owner_only_permissions(
+    file: &std::path::Path,
+    directory: &std::path::Path,
+) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, directory);
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
