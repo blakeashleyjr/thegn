@@ -108,6 +108,19 @@
       ],
       "type": "object"
     },
+    "ControlErrorCode": {
+      "description": "The closed set of machine-readable control-plane error identifiers.",
+      "enum": [
+        "not_found",
+        "no_scope",
+        "conflict",
+        "unimplemented",
+        "internal",
+        "unauthorized",
+        "bad_request"
+      ],
+      "type": "string"
+    },
     "DispatchPutReq": {
       "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.\n\nThe four pipeline fields (v56) are optional and default-absent, so a caller written against the three-string version keeps working unchanged. `put` carries them all: the roster gains columns, not verbs — there is deliberately no `dispatches.update`, because a mutable stage field invites thegn to become the thing that advances it.",
       "properties": {
@@ -158,6 +171,22 @@
         "agent_name",
         "issue_id",
         "worktree_path"
+      ],
+      "type": "object"
+    },
+    "ErrorBody": {
+      "description": "The additive HTTP error envelope. `error` retains the existing human message; `code` is stable for machine-readable branching.",
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/ControlErrorCode"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "error"
       ],
       "type": "object"
     },
@@ -997,6 +1026,9 @@
     },
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"
+    },
+    "ErrorBody": {
+      "$ref": "#/definitions/ErrorBody"
     },
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"

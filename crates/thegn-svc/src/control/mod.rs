@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use thegn_core::control::Scope;
+pub use thegn_core::control_error::ControlErrorCode;
 use thegn_core::control_wire::{EventFrame, PairingState};
 use thegn_core::store::LeaseRow;
 
@@ -515,6 +516,27 @@ pub enum ControlError {
     Conflict(String),
     Unimplemented(&'static str),
     Internal(anyhow::Error),
+}
+
+impl ControlError {
+    /// The stable machine-readable code for this control error.
+    pub fn code(&self) -> ControlErrorCode {
+        match self {
+            Self::NotFound(_) => ControlErrorCode::NotFound,
+            Self::NoScope { .. } => ControlErrorCode::NoScope,
+            Self::Conflict(_) => ControlErrorCode::Conflict,
+            Self::Unimplemented(_) => ControlErrorCode::Unimplemented,
+            Self::Internal(_) => ControlErrorCode::Internal,
+        }
+    }
+}
+
+/// The additive HTTP error envelope. `error` retains the existing human
+/// message; `code` is stable for machine-readable branching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ErrorBody {
+    pub error: String,
+    pub code: ControlErrorCode,
 }
 
 impl std::fmt::Display for ControlError {

@@ -19,6 +19,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
+use super::ControlErrorCode;
 use super::{OpenSpec, RecordStatus, SessionInfo};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
@@ -59,6 +60,7 @@ pub struct ControlClient {
 pub struct ControlRequestError {
     status: u16,
     message: String,
+    code: Option<ControlErrorCode>,
 }
 
 impl ControlRequestError {
@@ -66,11 +68,27 @@ impl ControlRequestError {
         Self {
             status,
             message: message.into(),
+            code: None,
+        }
+    }
+
+    fn with_code(status: u16, message: impl Into<String>, code: Option<ControlErrorCode>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            code,
         }
     }
 
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// The server's stable error code, when supplied by a current server.
+    /// `None` means the response came from an older server (or used an
+    /// unrecognized future code) and remains readable via status/message.
+    pub fn code(&self) -> Option<ControlErrorCode> {
+        self.code
     }
 }
 
@@ -81,6 +99,17 @@ impl std::fmt::Display for ControlRequestError {
 }
 
 impl std::error::Error for ControlRequestError {}
+
+fn request_error(status: u16, value: &Value) -> ControlRequestError {
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("control request failed");
+    let code = value
+        .get("code")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    ControlRequestError::with_code(status, message, code)
+}
 
 /// Control messages for an attached session stream.
 pub enum AttachControl {
@@ -132,11 +161,7 @@ impl ControlClient {
         if (200..300).contains(&status) {
             Ok(value)
         } else {
-            let msg = value
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("control request failed");
-            Err(anyhow::Error::new(ControlRequestError::new(status, msg)))
+            Err(anyhow::Error::new(request_error(status, &value)))
         }
     }
 
@@ -795,6 +820,24 @@ where
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    #[test]
+    fn control_error_request_code_is_optional_for_old_servers() {
+        let old = request_error(404, &serde_json::json!({ "error": "not found" }));
+        assert_eq!(old.code(), None);
+
+        let current = request_error(
+            404,
+            &serde_json::json!({ "error": "not found", "code": "not_found" }),
+        );
+        assert_eq!(current.code(), Some(ControlErrorCode::NotFound));
+
+        let future = request_error(
+            500,
+            &serde_json::json!({ "error": "failure", "code": "future_code" }),
+        );
+        assert_eq!(future.code(), None);
+    }
 
     fn daemon_row(id: &str, scope: &str, endpoint: &str, heartbeat_at: i64) -> DaemonRow {
         DaemonRow {
