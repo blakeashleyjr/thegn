@@ -116,6 +116,8 @@ pub struct ForgeCaps {
     pub checks_rerun: bool,
     pub reviews: bool,
     pub review_threads: bool,
+    /// Atomically reply to and resolve an existing review thread.
+    pub resolve_review_thread: bool,
     pub line_comments: bool,
     pub conversation: bool,
     pub pr_diff: bool,
@@ -138,6 +140,7 @@ impl ForgeCaps {
         checks_rerun: true,
         reviews: true,
         review_threads: true,
+        resolve_review_thread: true,
         line_comments: true,
         conversation: true,
         pr_diff: true,
@@ -365,6 +368,18 @@ pub trait Forge: Probe + Send + Sync {
         unsupported!("reply_thread")
     }
 
+    /// Post a bounded audit reply and resolve the thread as one semantic
+    /// provider action. Implementations may use a provider-specific combined
+    /// mutation; callers must never sequence vendor operations themselves.
+    fn resolve_review_thread(
+        &self,
+        _loc: &GitLoc,
+        _thread_id: &str,
+        _bounded_reply: &str,
+    ) -> Result<(), ForgeError> {
+        unsupported!("resolve_review_thread")
+    }
+
     fn add_line_comment(&self, _loc: &GitLoc, _c: LineComment<'_>) -> Result<(), ForgeError> {
         unsupported!("add_line_comment")
     }
@@ -569,10 +584,15 @@ mod tests {
             ),
             Err(ForgeError::Unsupported(_))
         ));
+        assert_eq!(
+            f.resolve_review_thread(&l, "thread", "reply"),
+            Err(ForgeError::Unsupported("resolve_review_thread"))
+        );
         // The object-safety contract: a `&dyn Forge` is usable.
         let d: &dyn Forge = &f;
         assert_eq!(d.id(), "bare");
         assert!(d.caps().pr_status && !d.caps().merge);
+        assert!(!d.caps().resolve_review_thread);
     }
 
     #[test]
@@ -646,7 +666,7 @@ mod tests {
         );
         let all = ForgeCaps::ALL;
         let none = ForgeCaps::default();
-        assert!(all.whoami && all.line_comments);
+        assert!(all.whoami && all.line_comments && all.resolve_review_thread);
         assert!(!none.pr_status);
         assert_ne!(all, none);
     }

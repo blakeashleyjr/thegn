@@ -638,6 +638,36 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+    // v64: nullable per-thread review-task metadata on the shared roster.
+    // Existing pipeline rows remain NULL and retain their old projection.
+    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN task_kind TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN source_key TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN source_revision TEXT",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN prompt TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN expected_head_oid TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN forge_action_attempts INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN next_forge_action_at_ms INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatch_review_source
+         ON agent_dispatches (task_kind, source_key)
+         WHERE task_kind IS NOT NULL AND source_key IS NOT NULL",
+        [],
+    );
 }
 
 /// v62: credential-free lineage for successful session forks. Recipes remain
@@ -767,6 +797,30 @@ pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Verify THE-22's additive roster columns and dedupe index before stamping
+/// schema v64. Preparing the typed projection catches a partial ALTER ladder.
+pub(crate) fn verify_v64_schema(conn: &Connection) -> Result<()> {
+    verify_v63_schema(conn)?;
+    conn.prepare(
+        "SELECT task_kind, source_key, source_revision, prompt,
+                expected_head_oid, forge_action_attempts,
+                next_forge_action_at_ms
+         FROM agent_dispatches LIMIT 0",
+    )?;
+    let index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type='index' AND name='idx_agent_dispatch_review_source'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index.is_none() {
+        anyhow::bail!("schema v64 migration did not create review-task dedupe index");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::db::Db;
@@ -832,6 +886,67 @@ mod tests {
             .unwrap();
         assert_eq!(ver, crate::db::SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v61_db_gains_review_task_roster_without_changing_pipeline_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id TEXT NOT NULL,
+                   worktree_path TEXT NOT NULL,
+                   agent_name TEXT NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'queued',
+                   report TEXT
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,report)
+                 VALUES ('THE-1','/wt/old','coder',1700000000000,'running','ok');
+                 PRAGMA user_version = 61;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let old: (Option<String>, Option<String>, i64) = db
+            .conn()
+            .query_row(
+                "SELECT task_kind, source_key, forge_action_attempts
+                 FROM agent_dispatches WHERE issue_id='THE-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old, (None, None, 0));
+        db.conn()
+            .execute(
+                "INSERT INTO agent_dispatches
+                 (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
+                  task_kind,source_key,source_revision,prompt,expected_head_oid)
+                 VALUES ('pr:x','/wt/r','coder',1,'queued','pr_review','source','r1','p','h')",
+                [],
+            )
+            .unwrap();
+        let duplicate = db.conn().execute(
+            "INSERT INTO agent_dispatches
+             (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
+              task_kind,source_key,source_revision,prompt,expected_head_oid)
+             VALUES ('pr:x','/wt/r','coder',2,'queued','pr_review','source','r2','p2','h2')",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "partial unique index must reject duplicates"
+        );
+        let version: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
     }
 
     #[test]
