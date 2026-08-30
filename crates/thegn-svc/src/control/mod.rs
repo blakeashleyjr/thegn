@@ -48,6 +48,25 @@ pub struct WorktreeInfo {
     pub created_at: i64,
 }
 
+/// Metadata-only description of one embedded or configured skill. The control
+/// API never returns target paths and never exposes a seed operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub harnesses: Vec<String>,
+    pub gate: String,
+    pub when: Vec<String>,
+    pub source: thegn_core::skills::SkillSource,
+}
+
+/// The bounded registry projection returned by `GET /v1/skills`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SkillsList {
+    pub skills: Vec<SkillInfo>,
+    pub diagnostics: Vec<String>,
+}
+
 /// A safe editor-handoff request (`editor.open`).
 ///
 /// The caller selects only a worktree and an optional relative file location;
@@ -742,6 +761,16 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree listing is not available",
+            ))
+        })
+    }
+
+    /// Embedded and configured skill metadata (`skills.list`). Read-only and
+    /// path-free; seeding remains a local CLI operation.
+    fn list_skills(&self) -> BoxFuture<'_, ControlResult<SkillsList>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "skill listing is not available",
             ))
         })
     }

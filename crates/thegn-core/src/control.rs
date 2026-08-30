@@ -399,6 +399,10 @@ pub enum Verb {
     AutomationsTest,
     /// Execute one trusted, configured `[[tools]]` entry by name.
     ToolsRun,
+    /// List embedded and configured skill metadata without touching targets.
+    SkillsList,
+    /// Seed skills into a local worktree through the host adapter.
+    SkillsSeed,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
@@ -493,6 +497,8 @@ impl Verb {
         Verb::AutomationsList,
         Verb::AutomationsTest,
         Verb::ToolsRun,
+        Verb::SkillsList,
+        Verb::SkillsSeed,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
         Verb::ModelProxyStart,
@@ -543,6 +549,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::AgentList
         | Verb::AutomationsList
         | Verb::AutomationsTest
+        | Verb::SkillsList
         | Verb::PreviewFetch
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
@@ -577,7 +584,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SearchReplace
         | Verb::ContainersControl
         | Verb::Split
-        | Verb::RecordSession => Scope::Write,
+        | Verb::RecordSession
+        | Verb::SkillsSeed => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeAdd
@@ -883,6 +891,7 @@ mod tests {
             AgentList,
             AutomationsList,
             AutomationsTest,
+            SkillsList,
             PreviewFetch,
             ModelProxyStatus,
             ModelProxyStats,
@@ -916,6 +925,7 @@ mod tests {
             DispatchesNote,
             SearchReplace,
             ContainersControl,
+            SkillsSeed,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset, ToolsRun];

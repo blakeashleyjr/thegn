@@ -55,6 +55,8 @@ pub mod session;
 pub mod session_fork;
 pub mod session_move;
 pub mod share;
+pub mod skills;
+pub mod skills_doctor;
 pub mod target;
 pub mod theme;
 pub mod wt;

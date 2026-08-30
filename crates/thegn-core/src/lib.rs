@@ -63,6 +63,7 @@ pub mod config_remote;
 pub mod config_repo;
 pub mod config_resolve;
 pub mod config_sandbox;
+pub mod config_skills;
 pub mod config_theme;
 pub mod config_ui;
 pub mod config_validate;
@@ -250,6 +251,7 @@ pub mod seam;
 pub mod search;
 pub mod session_fork;
 pub mod session_migration;
+pub mod skills;
 // The value-free secret audit trail (target `thegn::secret::audit`).
 pub mod secret_audit;
 // Enumerate every configured secret reference in a Config (one source for the
