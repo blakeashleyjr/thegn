@@ -238,6 +238,7 @@ async fn record_audit(state: &ControlState, cap: &str, ok: bool) {
         body: String::new(),
         urgency: None,
         source: Some("push_inbox".into()),
+        automation_origin: None,
     };
     // best-effort: the audit row is a nicety, not the command's success path.
     let _ = state.api.notify_push(note).await;

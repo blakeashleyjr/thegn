@@ -31,8 +31,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, ControlErrorCode, OpenSpec, RecordSpec,
-    SplitDir, WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, ControlErrorCode, EditorOpenRequest,
+    ForkSpec, OpenSpec, PreviewFetchRequest, RecordSpec, SplitDir, WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -180,8 +180,12 @@ impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let status = match &self {
             ControlError::NotFound(_) => StatusCode::NOT_FOUND,
+            ControlError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             ControlError::NoScope { .. } => StatusCode::FORBIDDEN,
             ControlError::Conflict(_) => StatusCode::CONFLICT,
+            ControlError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
+            ControlError::ResourceExhausted(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ControlError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ControlError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ControlError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -648,6 +652,16 @@ pub(super) async fn list_worktrees(
     }
 }
 
+pub(super) async fn list_skills(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authed(&state, &headers, Verb::SkillsList) {
+        return response;
+    }
+    match state.api.list_skills().await {
+        Ok(skills) => axum::Json(skills).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 pub(super) async fn leases(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::LeaseStatus) {
         return r;
@@ -688,6 +702,20 @@ pub(super) async fn open_session(
         return r;
     }
     match state.api.open(body.0).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn fork_session(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<ForkSpec>,
+) -> Response {
+    if let Err(r) = authed_target(&state, &headers, Verb::ForkSession, &body.session) {
+        return r;
+    }
+    match state.api.fork(body.0).await {
         Ok(info) => axum::Json(info).into_response(),
         Err(e) => e.into_response(),
     }
@@ -962,6 +990,24 @@ pub(super) async fn open_worktree(
     }
 }
 
+pub(super) async fn open_editor(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<EditorOpenRequest>,
+) -> Response {
+    if let Err(r) = authed_target(&state, &headers, Verb::OpenEditor, &body.worktree) {
+        return r;
+    }
+    let target = match body.target() {
+        Ok(target) => target,
+        Err(e) => return error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    match state.api.open_editor(target).await {
+        Ok(()) => axum::Json(json!({ "queued": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 pub(super) async fn browser(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -972,6 +1018,36 @@ pub(super) async fn browser(
     }
     match state.api.drive_browser(body.0).await {
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn preview_fetch(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::PreviewFetch) {
+        return r;
+    }
+    const REQUEST_LIMIT: usize = 32 * 1024;
+    if body.len() > REQUEST_LIMIT {
+        return ControlError::ResourceExhausted(format!(
+            "preview fetch request exceeds {REQUEST_LIMIT} bytes"
+        ))
+        .into_response();
+    }
+    let request: PreviewFetchRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ControlError::InvalidArgument(format!(
+                "invalid preview fetch request: {error}"
+            ))
+            .into_response();
+        }
+    };
+    match state.api.preview_fetch(request).await {
+        Ok(reply) => axum::Json(reply).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -1363,6 +1439,47 @@ pub(super) async fn notify_push(
     }
     match state.api.notify_push(body.0).await {
         Ok(id) => axum::Json(json!({ "id": id })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn automations_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AutomationsList) {
+        return r;
+    }
+    match state.api.automations_list().await {
+        Ok(rules) => axum::Json(json!({ "rules": rules })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn automations_test(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::AutomationTestRequest>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AutomationsTest) {
+        return r;
+    }
+    match state.api.automations_test(body.0).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn tools_run(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::ToolRunRequest>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::ToolsRun) {
+        return r;
+    }
+    match state.api.tools_run(body.0).await {
+        Ok(session) => axum::Json(session).into_response(),
         Err(e) => e.into_response(),
     }
 }

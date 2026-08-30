@@ -20,7 +20,7 @@ use thegn_core::control_wire::{EventDecoder, EventFrame, FeedFilter, PROTO_VERSI
 use thegn_core::store::{ControlStore, DaemonRow};
 
 use super::ControlErrorCode;
-use super::{OpenSpec, RecordStatus, SessionInfo};
+use super::{EditorOpenRequest, ForkSpec, OpenSpec, RecordStatus, SessionInfo};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
@@ -260,6 +260,17 @@ impl ControlClient {
         Ok(serde_json::from_value(v)?)
     }
 
+    pub async fn fork(&self, spec: &ForkSpec) -> Result<SessionInfo> {
+        let v = self
+            .request(
+                "POST",
+                "/v1/sessions/fork",
+                Some(serde_json::to_value(spec)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     /// One-shot snapshot: `(seq, rows, cols, ansi_bytes)`.
     pub async fn snapshot(&self, session: &str) -> Result<(u64, u16, u16, Vec<u8>)> {
         let v = self
@@ -394,6 +405,41 @@ impl ControlClient {
             .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
     }
 
+    pub async fn automations_list(&self) -> Result<Vec<super::AutomationRuleInfo>> {
+        let value = self.request("GET", "/v1/automations", None).await?;
+        Ok(serde_json::from_value(
+            value
+                .get("rules")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new())),
+        )?)
+    }
+
+    pub async fn automations_test(
+        &self,
+        request: &super::AutomationTestRequest,
+    ) -> Result<super::AutomationTestReply> {
+        let value = self
+            .request(
+                "POST",
+                "/v1/automations/test",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn tools_run(&self, request: &super::ToolRunRequest) -> Result<SessionInfo> {
+        let value = self
+            .request(
+                "POST",
+                "/v1/tools/run",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     /// `GET /v1/mcp_proxy/status` — the mcp-proxy hub's per-upstream state.
     pub async fn mcp_proxy_status(&self) -> Result<super::McpProxyStatus> {
         let v = self.request("GET", "/v1/mcp_proxy/status", None).await?;
@@ -414,6 +460,38 @@ impl ControlClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Queue a safe editor handoff through `POST /v1/editor/open`.
+    pub async fn open_editor(&self, request: &EditorOpenRequest) -> Result<()> {
+        request.target()?;
+        let value = self
+            .request(
+                "POST",
+                "/v1/editor/open",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        if value.get("queued").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(anyhow!("malformed editor-open reply: {value}"))
+        }
+    }
+
+    /// `POST /v1/preview/fetch` — one bounded, credential-free preview GET.
+    pub async fn preview_fetch(
+        &self,
+        req: &super::PreviewFetchRequest,
+    ) -> Result<super::PreviewFetchReply> {
+        let v = self
+            .request(
+                "POST",
+                "/v1/preview/fetch",
+                Some(serde_json::to_value(req)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
     }
 
     // --- agent orchestration (THE-57) ---------------------------------------

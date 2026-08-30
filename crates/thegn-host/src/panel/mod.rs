@@ -607,6 +607,11 @@ pub struct PanelData {
     /// ("CLEAN" | "BLOCKED" | …) for the PR view's Overview tab.
     pub pr_mergeable: String,
     pub pr_merge_state: String,
+    /// Complete PR review feedback snapshot, when the cache has a matching
+    /// branch/PR/head identity. The compact `threads` field remains the panel
+    /// summary projection.
+    pub review_snapshot: Option<thegn_core::review::PrReviewSnapshot>,
+    pub review_snapshot_status: Option<String>,
     /// Review threads (unresolved first) and open issues, from the PR cache.
     pub threads: Vec<thegn_core::forge::model::ReviewThreadRow>,
     pub issues: Vec<thegn_core::forge::model::IssueRow>,

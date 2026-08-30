@@ -256,6 +256,31 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, _focused: bool) -> Vec<PanelRow
     }
     let mut l = vec![sp(1), seg(g2(), "1").bold(), sp(1), seg(d(), "STATUS")];
     l.extend(flow_chips(&ui.git.flow, data.merge.is_some()));
+    if let Some(snapshot) = &data.review_snapshot {
+        let unresolved = snapshot
+            .conversation
+            .threads
+            .iter()
+            .filter(|thread| !thread.resolved)
+            .count();
+        l.push(seg(
+            g2(),
+            format!(" {} ", crate::caps::active_glyphs().middot),
+        ));
+        l.push(seg(
+            ac(),
+            format!(
+                "PR review: {unresolved} unresolved {} Tab in Diff",
+                crate::caps::active_glyphs().middot
+            ),
+        ));
+    } else if let Some(status) = &data.review_snapshot_status {
+        l.push(seg(
+            g2(),
+            format!(" {} ", crate::caps::active_glyphs().middot),
+        ));
+        l.push(seg(hue(Hue::Amber), format!("PR review: {status}")));
+    }
     vec![PanelRow::plain(Line::split(l, right))]
 }
 

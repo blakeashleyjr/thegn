@@ -9,8 +9,8 @@
 //! - **config-derived** ([`ConfigSource`], and the pure
 //!   [`config_candidates`] behind it) — pure functions over an already-loaded
 //!   [`Config`], so the caller decides when (and whether) to pay for the load.
-//! - **in-process** ([`StaticSource`]) — theme presets, capability ids, action
-//!   ids: constants already compiled into the binary, free to serve.
+//! - **in-process** ([`StaticSource`]) — theme presets plus bounded local theme
+//!   metadata, capability ids, and action ids. This path never creates state.
 //!
 //! ## The read-only contract
 //!
@@ -33,12 +33,17 @@
 //! moved — yields an **empty vector**, never an error. The shell then falls
 //! back to filename completion, which is exactly today's behaviour.
 
+use std::collections::BinaryHeap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::Deadline;
 use super::candidate::Candidate;
 use super::catalog::SourceKind;
 use crate::config::Config;
+
+const MAX_THEME_FILES: usize = 256;
+const MAX_THEME_FILE_BYTES: usize = 64 * 1024;
 
 /// Busy timeout for the read-only handle. Short on purpose: a `<TAB>` that
 /// blocks behind a compositor's write transaction should give up and complete
@@ -222,6 +227,12 @@ pub fn config_candidates(kind: SourceKind, cfg: &Config) -> Vec<Candidate> {
             .iter()
             .map(|t| Candidate::described(&t.name, &t.command))
             .collect(),
+        SourceKind::Automation => cfg
+            .effective_automations()
+            .rules
+            .iter()
+            .map(|rule| Candidate::described(&rule.name, &rule.when))
+            .collect(),
         SourceKind::Plugin => cfg
             .plugins
             .iter()
@@ -300,12 +311,78 @@ impl CompletionSource for ConfigSource<'_> {
 
 // ── in-process ───────────────────────────────────────────────────────────────
 
-/// The selectable theme presets.
+/// The selectable merged built-in and local theme catalog.
 pub fn theme_candidates() -> Vec<Candidate> {
-    crate::theme::PRESETS
+    theme_candidates_from_dir(&crate::util::xdg_config_home().join("thegn/themes"))
+}
+
+fn theme_candidates_from_dir(dir: &Path) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = crate::theme::PRESETS
         .iter()
         .map(|p| Candidate::new(*p))
-        .collect()
+        .collect();
+    let builtins: std::collections::HashSet<&str> = crate::theme::PRESETS.iter().copied().collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut paths = BinaryHeap::with_capacity(MAX_THEME_FILES + 1);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml")
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        if paths.len() < MAX_THEME_FILES {
+            paths.push(path);
+        } else if paths
+            .peek()
+            .is_some_and(|largest| path.as_path() < largest.as_path())
+        {
+            paths.pop();
+            paths.push(path);
+        }
+    }
+    let mut paths = paths.into_vec();
+    paths.sort();
+    let mut users = Vec::new();
+    for path in paths {
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if size > MAX_THEME_FILE_BYTES {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(size.min(MAX_THEME_FILE_BYTES + 1));
+        if file
+            .by_ref()
+            .take((MAX_THEME_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() > MAX_THEME_FILE_BYTES
+        {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(theme) = crate::theme_user::UserTheme::from_toml(text) else {
+            continue;
+        };
+        if !builtins.contains(theme.meta.name.as_str()) {
+            users.push(theme.meta.name);
+        }
+    }
+    users.sort();
+    out.extend(users.into_iter().map(Candidate::new));
+    out
 }
 
 /// Capability ids, from the one capability catalog. This is the right direction
@@ -325,12 +402,26 @@ pub fn action_candidates() -> Vec<Candidate> {
         .collect()
 }
 
+/// Embedded skill package names. User directories remain host-owned and are
+/// not traversed by a shell keypress.
+pub fn skill_candidates() -> Vec<Candidate> {
+    crate::skills::SkillRegistry::embedded()
+        .map(|registry| {
+            registry
+                .iter()
+                .map(|(name, skill)| Candidate::described(name, &skill.description))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Candidates for a kind that needs neither the DB nor the config.
 pub fn in_process_candidates(kind: SourceKind) -> Vec<Candidate> {
     match kind {
         SourceKind::Theme => theme_candidates(),
         SourceKind::Capability => capability_candidates(),
         SourceKind::Action => action_candidates(),
+        SourceKind::Skill => skill_candidates(),
         _ => Vec::new(),
     }
 }
@@ -550,6 +641,35 @@ mod tests {
     }
 
     #[test]
+    fn theme_completion_filters_junk_before_a_deterministic_file_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..300 {
+            std::fs::write(dir.path().join(format!("{index:03}-junk.txt")), b"junk").unwrap();
+        }
+        let cfg = Config::default();
+        for index in 0..=MAX_THEME_FILES {
+            let name = format!("user-{index:03}");
+            let theme = crate::theme_user::UserTheme::from_palette(&name, &cfg.palette());
+            std::fs::write(
+                dir.path().join(format!("{index:03}.toml")),
+                theme.to_toml().unwrap(),
+            )
+            .unwrap();
+        }
+
+        let candidates = theme_candidates_from_dir(dir.path());
+        let users = candidates
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .filter(|name| name.starts_with("user-"))
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), MAX_THEME_FILES);
+        assert_eq!(users.first().map(String::as_str), Some("user-000"));
+        assert_eq!(users.last().map(String::as_str), Some("user-255"));
+        assert!(!users.iter().any(|name| name == "user-256"));
+    }
+
+    #[test]
     fn db_source_kind_round_trips_and_unknown_kinds_are_inert() {
         let (_d, path) = seeded();
         let src = DbSource::at(SourceKind::Repo, &path);
@@ -581,9 +701,18 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         };
         cfg.agents.push(named("claude", "claude --dangerously"));
         cfg.tools.push(named("lazygit", "lazygit"));
+        cfg.automations
+            .rules
+            .push(crate::config_automations::AutomationRuleConfig {
+                name: "notify-on-done".into(),
+                when: "agent_finished".into(),
+                ..Default::default()
+            });
 
         let names = |k| {
             config_candidates(k, &cfg)
@@ -597,6 +726,7 @@ mod tests {
         assert_eq!(names(SourceKind::McpServer), ["git"]);
         assert_eq!(names(SourceKind::Agent), ["claude"]);
         assert_eq!(names(SourceKind::Tool), ["lazygit"]);
+        assert_eq!(names(SourceKind::Automation), ["notify-on-done"]);
         assert_eq!(
             config_candidates(SourceKind::Agent, &cfg)[0]
                 .description
@@ -657,7 +787,7 @@ mod tests {
     fn in_process_sources_project_the_existing_catalogs() {
         let themes: Vec<String> = theme_candidates().into_iter().map(|c| c.value).collect();
         assert!(themes.contains(&"prism".to_string()));
-        assert_eq!(themes.len(), crate::theme::PRESETS.len());
+        assert!(themes.len() >= crate::theme::PRESETS.len());
 
         let caps = capability_candidates();
         assert_eq!(caps.len(), crate::capability::CATALOG.len());
@@ -668,8 +798,18 @@ mod tests {
         assert_eq!(actions.len(), crate::keymap::BUILTINS.len());
         assert!(actions.iter().any(|c| c.value == "new-worktree"));
 
+        let skills = skill_candidates();
         assert_eq!(
-            in_process_candidates(SourceKind::Theme).len(),
+            skills.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            ["mq", "pipeline", "supervise"]
+        );
+        assert!(skills.iter().all(|c| c.description.is_some()));
+
+        assert_eq!(
+            in_process_candidates(SourceKind::Theme)
+                .iter()
+                .filter(|candidate| crate::theme::PRESETS.contains(&candidate.value.as_str()))
+                .count(),
             crate::theme::PRESETS.len()
         );
         assert!(in_process_candidates(SourceKind::Worktree).is_empty());

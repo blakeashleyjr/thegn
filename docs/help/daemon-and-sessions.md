@@ -2,7 +2,7 @@
 id: daemon-and-sessions
 title: Daemon & sessions
 order: 13
-actions: [detach, quit, quit-kill]
+actions: [detach, quit, quit-kill, fork-session]
 ---
 
 # Daemon & sessions
@@ -37,6 +37,7 @@ the other verbs take:
 | `thegn session snapshot --session <id>`    | dump its current screen (`--text` for plain rows, `--json` for geometry + ANSI) |
 | `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                                 |
 | `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>`        |
+| `thegn session fork <id>`                  | start a new daemon session from a live session; `--tab` places it in a new tab  |
 | `thegn session record <id>`                | record its output to a `.cast` file; `--stop` finalizes, `--status` reports     |
 
 ## Recording a session
@@ -66,6 +67,49 @@ local-only — it speaks the unix socket and never dials the TCP listener.
 `session wait` is the one built for scripting: it exits 0 on match, 2 on
 timeout, and 1 if there is no daemon, so a shell script can drive a long
 build and block on it.
+
+`session fork` starts a fresh PTY from a live daemon session. It preserves the
+launch recipe and reports the parent in `forked_from`; it never clones the
+source process or screen. `--scrollback` gives the child a bounded,
+owner-only handoff file, `--tab` adopts it in a new tab, and
+`--fork-worktree` creates a separate worktree before launching. Exited sessions
+must be reopened with `session open`; native agent conversations can also be
+forked by supplying their recorded harness id.
+
+## Moving a session to another profile
+
+`thegn --profile <source> session move <worktree> --to-profile <target>` is an
+admin-only host operation for moving one exact stored worktree path. The
+target profile must already exist and is opened by path only; its config and
+credential environment are never loaded into the source process. The git
+worktree directory, branch, and git objects stay where they are.
+
+The persisted worktree registration, every matching current group and tab,
+sidebar collapse/pin keys, and the dispatch ledger (including notes and
+artifact/chunk paths) are imported. Current layout groups/tabs are moved;
+named global layouts, caches, active transports, and whole-session focus are
+not. Opaque pane commands, scrollback, dispatch reports, and notes remain
+unchanged in the target but are omitted from human and JSON audit output.
+Credentials, tokens, identities, config overlays, accounts, pairings, and
+secrets never cross the profile boundary.
+
+The move is target-first: the target rows are committed and read back under a
+sanitized fingerprint before exact source rows are deleted. Dispatch IDs are
+fresh in the target, parent links are remapped only within the moved set, and
+source daemon/pane IDs are cleared so the target compositor can create fresh
+sessions. If a process stops after target confirmation, rerun the command;
+the identical import is adopted and only pending source deletion is retried.
+That partial result is retryable (exit 2).
+
+The source daemon is optional for a cold move. If live sessions are found for
+the exact path, or referenced by its persisted pane/dispatch rows, the move
+refuses without `--kill`. With `--kill`, every live source ID is killed and a
+second listing must show no survivors before either database is written.
+`--dry-run` performs no kill and no database write, and `--json` emits a
+redacted audit containing the selected group names, row counts, liveness,
+commit/confirmation/deletion state, resume state, and notification status.
+After confirmed cleanup, notification through a reachable daemon registered
+in the target database is best effort; failure is reported as a warning.
 
 ## Closing a session, and the dispatch door
 

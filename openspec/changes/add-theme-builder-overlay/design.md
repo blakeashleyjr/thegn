@@ -79,13 +79,13 @@ teal = "#007a6d"
 Decisions and why:
 
 - **Files, not `[themes.<name>]` config tables.** A theme is a shareable
-  artifact (N 182 is import/export/**share**); a file can be copied, mailed,
+  artifact (N 182 is import/**share**); a file can be copied, mailed,
   or dropped in a dotfiles repo without touching config.toml. It also keeps
   config.toml's schema closed (the "Rust structs are the schema" requirement —
   a dynamic map of theme tables would weaken unknown-key linting).
-- **Same key vocabulary as the override tables.** Export is "serialize the
-  resolved palette to the `[colors]`/`[hues]` shape"; import produces the same
-  struct; the config overlay code path is reused, not duplicated.
+- **Same key vocabulary as the override tables.** Import produces the
+  `[colors]`/`[hues]` struct; the config overlay code path is reused, not
+  duplicated. Saved themes are intentionally not exported to another format.
 - **Resolution seam**: the **host** owns the directory read (core is
   substrate-free); parsed themes land in a `UserThemes` map handed to
   resolution. Pure core function
@@ -102,41 +102,31 @@ Decisions and why:
 - **Cycle/list**: `PRESETS` stays the built-in table; the cycle order and
   `thegn theme list` append user themes (list marks them `user`).
 
-## Import: Gogh and base16, one mapper
+## Import: Gogh
 
 Formats (verified against Gogh-Co/Gogh master):
 
 - **Gogh**: flat YAML — `name`, `author`, `variant: dark|light`,
   `color_01`…`color_16` (ANSI 0–7 then bright 8–15), `background`,
   `foreground`, `cursor`. ~400 schemes, MIT.
-- **base16** (tinted-theming): `base00`…`base0F` hex, either classic flat
-  (`scheme:`/`author:`/`base00: "hex"`) or the newer
-  `palette: {base00: "#hex"}` nesting. base24 files degrade to their base16
-  prefix.
-
-Judgment: **support both.** Gogh is the issue's link and the largest corpus;
-base16 actually maps _better_ (its base00–07 grey ramp is semantically ordered,
-so surfaces and text tiers assign rather than derive). Both are flat string
-maps, so the marginal cost of the second format is one key-mapping table.
+  Gogh is the only v1 import format. Base16 support and export are deliberately
+  deferred so this change stays focused on the requested local Gogh flow.
 
 Parsing: a minimal line-oriented `key: value` subset parser in
-`thegn-core/src/theme_import.rs` — **no serde_yaml dependency**. Both formats
-are flat maps of scalar strings (the one nesting, `palette:`, is a single
-fixed level handled by indentation); a full YAML engine is unjustified weight
-for the deps-audit gate and the substrate-free core. The parser is pure,
-panic-free, and exhaustively unit-tested (including hostile input — see
-Security).
+`thegn-core/src/theme_import.rs` — **no serde_yaml dependency**. A full YAML
+engine is unjustified weight for the deps-audit gate and the substrate-free
+core. The parser is pure, panic-free, and exhaustively unit-tested (including
+hostile input — see Security).
 
 Mapping (pure, unit-tested):
 
-- **base16**: base00→bg0, base01→bg1/panel (panel a blend step between
-  base01 and base02), base02→panel2, base03→ghost, base04→dim/faint split,
-  base05→text, base02/03 blends→border/raise; base08–0F → red, orange, amber,
-  green, teal, blue, purple, magenta (the conventional base16 role order).
 - **Gogh**: `background`→bg0; bg1/panel/panel2/raise derived by blending
   background toward foreground in fixed steps (the same
   relative-to-own-surfaces philosophy as `extend_palette`, so light schemes
-  stay light — `variant: light` only tunes the step sizes); `foreground`→text;
+  stay light). `variant` is a checked contract: `light` requires background to
+  be lighter than foreground and `dark` requires the inverse; contradictory
+  documents are rejected rather than silently violating the declared variant.
+  `foreground`→text;
   dim/faint/ghost blended between fg and bg; hues from color_02..07 (or the
   bright row when the normal row is too close to the background); accent =
   the highest-contrast non-grey hue; focus = accent.
@@ -170,7 +160,7 @@ to use the builder (fzf fallback kept only if trivially cheap).
   kbd strip.
 - Help: new `docs/help/theming.md` claims `theme-builder-open` (and takes over
   `cycle-theme` if currently claimed elsewhere — the ratchet will arbitrate),
-  documents the overlay keys, user themes, and import formats. The overlay is
+  documents the overlay keys, user themes, and Gogh import. The overlay is
   a layer, not a zone/panel: F1 context remains the underlying zone; the page
   is reachable from the help index and the action's palette entry. Gates:
   action-recipe tests, help ratchet + prose ratchet
@@ -211,8 +201,8 @@ to use the builder (fzf fallback kept only if trivially cheap).
   and can render its own picker.
 - **`[themes.<name>]` tables in config.toml.** Rejected above (schema
   openness, shareability).
-- **serde_yaml for import.** Rejected above (deps weight for two flat
-  formats).
+- **base16 import/export.** Deferred: the issue's requested Gogh flow is
+  complete without another parser or output format.
 - **A network "browse Gogh" mode.** Rejected: a new network + trust surface
   for marginal value; the corpus is one `git clone`/download away.
 

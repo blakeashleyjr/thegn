@@ -10,6 +10,7 @@
 
 use thegn_core::proxy::attribution;
 use thegn_core::store::ModelProxyStore;
+use thegn_core::{budget_alert::cap_breaches, budget_alert::window_lapsed};
 
 use crate::model::BudgetSettings;
 use crate::shared::SharedDb;
@@ -135,7 +136,7 @@ fn current_spend(
         .model_proxy_budget_state(scope)
         .ok()
         .flatten()?;
-    let lapsed = window_len_ms > 0 && now_ms - row.window_start_ms >= window_len_ms;
+    let lapsed = window_lapsed(window_len_ms, row.window_start_ms, now_ms);
     let (tokens, cost) = if lapsed {
         (0, 0.0)
     } else {
@@ -170,9 +171,8 @@ pub fn check_budget(
         let Some((tok_cap, cost_cap)) = settings.scopes.get(scope) else {
             continue;
         };
-        let over_tokens = tok_cap.is_some_and(|lim| spent_tokens >= lim);
-        let over_cost = cost_cap.is_some_and(|lim| spent_cost >= lim);
-        if over_tokens || over_cost {
+        let breached = cap_breaches(spent_tokens, spent_cost, *tok_cap, *cost_cap);
+        if breached.any() {
             return if settings.refuses() {
                 BudgetVerdict::Refuse(format!("budget cap reached for scope '{scope}'"))
             } else if settings.downgrades() {

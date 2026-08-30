@@ -91,9 +91,12 @@ thegn wt rm fix-parser --force                    # teardown + git + DB
 
 `wt new` reuses the TUI wizard's pipeline — branch-name templates, base
 resolution, the git-mutation lock, DB registration — but never provisions
-a sandbox; the compositor prepares that lazily on first open. `wt rm`
-tears down the sandbox, runs `git worktree remove`, and cleans every DB
-row, so a removed worktree is never resurrected at the next launch.
+a sandbox; the compositor prepares that lazily on first open. It runs
+`pre_create` before git and waits for post-create hooks before printing the
+new path. `wt rm` runs `pre_destroy` before teardown, then `git worktree
+remove`, `post_destroy`, and DB cleanup. A failed blocking destroy hook leaves
+the worktree in place and names `--force`; that existing flag is also the
+explicit confirmation and skips the veto. Repo hooks are still warn-only.
 
 To put an agent in it without a pane on screen:
 
@@ -108,6 +111,39 @@ thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
 layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
 over the agent — see [[configuration]]. The daemon composes the same
 sandbox, credentials, model flag and env overlay an interactive pane gets.
+
+`wt new --from-issue` and batched project creation use the same lifecycle
+seam. The pipeline board itself is structure-only: an external supervisor
+that creates a worktree should use `wt new` or the existing
+`worktrees.create` control operation, both of which run the shared hooks.
+
+To move a persisted session presentation between profiles, use the
+admin-only, two-store operation:
+
+```sh
+thegn --profile <source> session move <worktree> --to-profile <target>
+```
+
+`--profile` (or `THEGN_PROFILE`) selects the source; `<target>` must already
+exist. The exact stored worktree path is selected. The move carries its
+worktree registration, all matching current groups and tabs, sidebar
+collapse/pin state, and dispatch ledger (including notes and artifact/chunk
+paths). Pane commands, scrollback, reports, and notes are opaque text and are
+carried unchanged, but never printed by the audit. Named global layouts,
+global caches, transports, git files/objects, branches, and worktree disk
+locations are not moved. Neither profile configuration nor credentials,
+tokens, identities, accounts, pairings, or secrets are read or copied.
+
+The target transaction commits first and is read back using a sanitized
+fingerprint. Only after confirmation are the selected source rows deleted;
+dispatch IDs are remapped and source daemon/pane IDs are cleared. A retry
+adopts an identical target import and completes pending source cleanup. A
+target-confirmed but source-pending result is retryable (exit 2). The command
+is cold-safe. Live source daemon sessions refuse the operation unless
+`--kill` is explicit; `--kill` terminates and re-lists them before import.
+`--dry-run` prints the complete redacted plan and never kills or writes, and
+`--json` emits the audit object for scripts. A target daemon notification is
+best effort and a warning cannot undo a confirmed move.
 
 ## Landing work
 
