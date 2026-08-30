@@ -16,6 +16,9 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod automation_events;
+mod automation_executor;
+mod automation_runtime;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
@@ -280,6 +283,11 @@ pub struct Cli {
 /// `thegn` (no subcommand) launches the interactive compositor.
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Inspect trusted automation rules or dry-run an event fixture.
+    Automations {
+        #[command(subcommand)]
+        action: cmd::automations::Action,
+    },
     /// GitHub PR data + actions for a worktree.
     Pr {
         #[command(subcommand)]
@@ -1055,6 +1063,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // The dry-run is store-free by contract: dispatch it before host merging,
+    // diagnostics, provider installation, and the automation runtime. Config
+    // loading itself reads only the caller-selected files.
+    if let Command::Automations {
+        action: cmd::automations::Action::Test { .. },
+    } = &command
+    {
+        return cmd::automations::run(
+            &cfg,
+            match &command {
+                Command::Automations { action } => action.clone(),
+                _ => unreachable!(),
+            },
+        );
+    }
     // Remember where it came from: a long-lived process (the daemon) re-reads
     // the same source per agent launch instead of serving a startup snapshot.
     crate::config_source::install(cli.overrides.clone(), cli.config.clone());
@@ -1096,12 +1119,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
+    crate::automation_runtime::install(&cfg);
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
     let repo_context = std::env::current_dir().ok();
-    match command {
+    let transient_notification = matches!(
+        &command,
+        Command::Notify {
+            action: cmd::notify::Action::Push { .. }
+        }
+    );
+    let result = match command {
+        Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
@@ -1278,7 +1309,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    };
+    if result.is_ok()
+        && transient_notification
+        && !crate::automation_runtime::drain(std::time::Duration::from_secs(
+            cfg.automations.action_timeout_secs.saturating_add(10),
+        ))
+    {
+        anyhow::bail!("timed out draining accepted automation events");
     }
+    result
 }
 
 // cache probe

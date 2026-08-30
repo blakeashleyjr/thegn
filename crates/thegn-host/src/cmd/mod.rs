@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod api;
 pub mod attach;
+pub mod automations;
 pub mod bundle;
 pub mod ci;
 pub mod config;

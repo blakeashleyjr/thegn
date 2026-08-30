@@ -453,13 +453,8 @@ fn notify_proxy_budget_breaches(budget: &thegn_core::config::BudgetConfig) {
         thegn_core::budget_alert::classify_breaches(budget, &rows, thegn_core::util::now_ms());
     for fact in &facts {
         let alert = crate::usage_budget::notification(fact);
-        if !crate::notify::record_global_once(
+        if let Err(error) = crate::automation_events::emit_once(
             &db,
-            alert.kind,
-            &alert.source_ref,
-            &alert.message,
-            &alert.worktree,
-        ) && let Err(error) = db.put_notification_once(
             alert.kind,
             &alert.source_ref,
             &alert.message,

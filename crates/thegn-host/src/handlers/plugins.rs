@@ -309,12 +309,12 @@ pub(crate) fn invoke_palette_action(
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
     for (plugin, alert) in state.pending_alerts.drain(..) {
         tokio::task::spawn_blocking(move || {
-            use thegn_core::store::NotificationStore;
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
             };
             // best-effort: the inbox is a cache; the audit log has the record.
-            let _ = db.put_notification(
+            let _ = crate::automation_events::emit(
+                &db,
                 "plugin",
                 &plugin,
                 &format!("{}: {}", alert.source, alert.message),

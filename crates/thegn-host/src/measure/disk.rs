@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use termwiz::terminal::TerminalWaker;
 use thegn_core::db::Db;
 use thegn_core::scan_sched;
-use thegn_core::store::{NotificationStore, WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 
 use super::LOG;
 
@@ -227,7 +227,8 @@ fn reclaim(
                 // and this says why rather than looking like a broken cache.
                 // best-effort: the reclaim already happened and is logged; a
                 // failed insert must not abort the rest of the round.
-                let _ = db.put_notification("disk_cleaned", &branch, &msg, &item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ =
+                    crate::automation_events::emit(db, "disk_cleaned", &branch, &msg, &item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 tracing::info!(
                     target: LOG,
                     worktree = %item.path,

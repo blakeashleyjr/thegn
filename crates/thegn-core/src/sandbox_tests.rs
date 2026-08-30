@@ -1425,6 +1425,7 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
         "synthetic --setenv: {j}"
     );
     let _ = std::fs::remove_file(&path); // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&state); // best-effort test cleanup
 }
 
 #[test]

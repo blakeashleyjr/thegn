@@ -118,6 +118,13 @@ pub static ROUTES: &[Route] = &[
         get(http::agent_sessions)
     }),
     route("/v1/notify", &["notify.push"], || post(http::notify_push)),
+    route("/v1/automations", &["automations.list"], || {
+        get(http::automations_list)
+    }),
+    route("/v1/automations/test", &["automations.test"], || {
+        post(http::automations_test)
+    }),
+    route("/v1/tools/run", &["tools.run"], || post(http::tools_run)),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
     }),
@@ -198,6 +205,9 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("pr.status", "GET", "/v1/pr/status"),
     ("agent.sessions", "GET", "/v1/agent/sessions"),
     ("notify.push", "POST", "/v1/notify"),
+    ("automations.list", "GET", "/v1/automations"),
+    ("automations.test", "POST", "/v1/automations/test"),
+    ("tools.run", "POST", "/v1/tools/run"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
     ("calendar.events", "GET", "/v1/calendar/events"),

@@ -603,6 +603,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
+    crate::automation_runtime::install(&cfg);
     // Register the installation identity (version/channel/build/OS) and the
     // crash-report policy now that the channel + `[diagnostics]` config are
     // known — a crash after this point stamps the resolved channel. Reconcile
@@ -8765,11 +8766,21 @@ async fn event_loop<T: Terminal>(
                         event_bus.publish(&event);
                     }
                     if dec.record {
+                        let routed = dec.clone();
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = thegn_core::db::Db::open() else {
                                 return;
                             };
-                            let _ = db.put_notification("test_failed", &wt, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            let _ = crate::automation_events::insert_routed(
+                                &db,
+                                "test_failed",
+                                &wt,
+                                &msg,
+                                &wt,
+                                Default::default(),
+                                &routed,
+                                false,
+                            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         });
                     }
                 }
@@ -9866,6 +9877,21 @@ async fn event_loop<T: Terminal>(
                         "",
                     );
                 }
+                if ev.level != thegn_core::resource_alert::AlertLevel::Ok
+                    && matches!(
+                        ev.metric,
+                        thegn_core::resource_alert::AlertMetric::DiskFree
+                            | thegn_core::resource_alert::AlertMetric::DiskEta
+                    )
+                {
+                    crate::automation_events::submit_fact(
+                        thegn_core::automation::AutomationEventKind::DiskLow,
+                        format!("disk:{}", ev.metric.key()),
+                        None,
+                        Some(msg),
+                        Default::default(),
+                    );
+                }
             }
         }
 
@@ -10320,13 +10346,22 @@ async fn event_loop<T: Terminal>(
                                 event_bus.publish(&event);
                             }
                             if dec.record {
+                                let routed = dec.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {
                                         return;
                                     };
                                     // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                                    let _ =
-                                        db.put_notification("worktree_created", &path, &msg, &path);
+                                    let _ = crate::automation_events::insert_routed(
+                                        &db,
+                                        "worktree_created",
+                                        &path,
+                                        &msg,
+                                        &path,
+                                        Default::default(),
+                                        &routed,
+                                        false,
+                                    );
                                 });
                             }
                         } else {
@@ -10693,6 +10728,7 @@ async fn event_loop<T: Terminal>(
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
                     current_config = new_cfg;
+                    crate::automation_runtime::install(&current_config);
                     preview_supervisor.set_enabled(current_config.preview.enabled);
                     request_preview_scan(
                         &mut preview_supervisor,

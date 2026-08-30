@@ -2258,6 +2258,10 @@ pub struct ProfileConfig {
     /// per-profile rules/DND/sound take effect without touching per-repo config.
     #[serde(skip_serializing_if = "NotificationsOverlay::is_empty")]
     pub notifications: NotificationsOverlay,
+    /// Trusted automation refinements for this named profile. Repo overlays
+    /// deliberately have no corresponding field.
+    #[serde(skip_serializing_if = "AutomationsOverlay::is_empty")]
+    pub automations: AutomationsOverlay,
     /// Named identity this profile resolves its credentials from
     /// (`[profiles.<p>] identity = "washu"` → `[identities.washu]`). Each tool
     /// (git config, git SSH key, `gh` config, GnuPG home, agent accounts) the
@@ -4703,6 +4707,7 @@ fn is_default_preset(s: &str) -> bool {
     s.is_empty() || s == "default"
 }
 
+pub use crate::config_automations::{AutomationsConfig, AutomationsOverlay};
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
@@ -4813,6 +4818,8 @@ pub struct Config {
     pub activity: ActivityConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
+    /// `[automations]` — trusted global event-to-catalog-action rules.
+    pub automations: AutomationsConfig,
     pub strip: StripConfig,
     pub panel: PanelConfig,
     pub search: SearchConfig,
@@ -5036,6 +5043,7 @@ impl Default for Config {
             activity: ActivityConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
+            automations: AutomationsConfig::default(),
             strip: StripConfig::default(),
             panel: PanelConfig::default(),
             search: SearchConfig::default(),
@@ -6201,6 +6209,31 @@ impl Config {
         n
     }
 
+    /// Trusted automation config: global rules plus the active named profile.
+    /// Repo-root `.thegn.*` files are never consulted by this path.
+    pub fn effective_automations(&self) -> AutomationsConfig {
+        let mut automations = self.automations.clone();
+        if let Some(profile) = self.active_profile() {
+            profile.automations.clone().apply(&mut automations);
+        }
+        automations
+    }
+
+    /// Warn when an untrusted repo overlay tries to install automation rules.
+    /// The raw top-level table is inspected separately because
+    /// [`RepoConfigFile`] intentionally has no `automations` field, ensuring
+    /// rule content can never enter effective config even after detection.
+    pub fn repo_automation_warnings(&self, repo_root: &std::path::Path) -> Vec<String> {
+        let Some(path) = repo_overlay_with_automations(repo_root) else {
+            return Vec::new();
+        };
+        vec![format!(
+            "ignoring automations in {}: automation rules are global/profile config only \
+             (a repo .thegn.* overlay cannot install persistent actions)",
+            path.display()
+        )]
+    }
+
     /// Warnings for any `kind = "command"` metrics collector a repo-root
     /// `.thegn.*` overlay tries to define. Command collectors are global config
     /// only (executing a repo-supplied argv on open would be RCE), so these are
@@ -6536,6 +6569,35 @@ pub use crate::config_repo::{
     repo_command_collector_warnings_for_overlay, validate_repo_overlay,
 };
 pub use crate::config_validate::validate_str;
+
+/// Return the first repo overlay that contains a top-level `automations` key.
+/// Parsing into a generic value is detection-only; the content is never
+/// deserialized as [`AutomationsConfig`] or merged into [`Config`].
+fn repo_overlay_with_automations(repo_root: &std::path::Path) -> Option<PathBuf> {
+    for (ext, kind) in [
+        ("toml", "toml"),
+        ("yaml", "yaml"),
+        ("yml", "yaml"),
+        ("json", "json"),
+    ] {
+        let path = repo_root.join(format!(".thegn.{ext}"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let value = match kind {
+            "toml" => toml::from_str::<toml::Value>(&text)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            "yaml" => serde_yaml::from_str::<serde_json::Value>(&text).ok(),
+            _ => serde_json::from_str::<serde_json::Value>(&text).ok(),
+        };
+        return value
+            .and_then(|value| value.as_object().map(|map| map.contains_key("automations")))
+            .filter(|present| *present)
+            .map(|_| path);
+    }
+    None
+}
 
 /// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
 /// YAML, then JSON (first existing file wins); parse errors warn and are ignored

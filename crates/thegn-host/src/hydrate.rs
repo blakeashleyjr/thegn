@@ -3530,7 +3530,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&cwd);
 
         // Snapshot the old PR state BEFORE overwriting the cache.
-        let old_pr_state: Option<String> = db
+        let old_pr: Option<Box<thegn_core::forge::model::PrStatus>> = db
             .get_pr_cache(&cache_key)
             .ok()
             .flatten()
@@ -3538,9 +3538,10 @@ pub(crate) fn spawn_pr_cache_refresh(
                 serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json).ok()
             })
             .and_then(|p| match p.state {
-                thegn_core::forge::model::PanelState::Pr(pr) => Some(pr.state),
+                thegn_core::forge::model::PanelState::Pr(pr) => Some(pr),
                 _ => None,
             });
+        let old_pr_state = old_pr.as_ref().map(|pr| pr.state.clone());
 
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
@@ -3602,6 +3603,45 @@ pub(crate) fn spawn_pr_cache_refresh(
             }
         }
 
+        // Typed automation edges come from authoritative old/new forge cache
+        // facts, never notification prose. First fetch is a baseline only.
+        if let (Some(old), thegn_core::forge::model::PanelState::Pr(pr)) =
+            (old_pr.as_deref(), &panel.state)
+        {
+            let (checks_edge, review_requested_edge) = pr_automation_edges(old, pr);
+            let wt = cwd.to_string_lossy().into_owned();
+            if let Some(new_passed) = checks_edge {
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::PrChecks,
+                    format!("pr:{}:checks:{}:{new_passed}", pr.number, pr.head_ref_oid),
+                    Some(wt.clone()),
+                    Some(format!(
+                        "PR #{} checks {}",
+                        pr.number,
+                        if new_passed { "passed" } else { "not passed" }
+                    )),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_checks_passed: Some(new_passed),
+                        ..Default::default()
+                    },
+                );
+            }
+            if review_requested_edge {
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::PrReviewRequested,
+                    format!("pr:{}:review_requested:{}", pr.number, pr.head_ref_oid),
+                    Some(wt),
+                    Some(format!("PR #{} review requested", pr.number)),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_review_requested: Some(true),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
         // Emit a notification when the PR transitions between states
         // (e.g. OPEN → MERGED). Only fires when there was a prior known state
         // to diff against — avoids spurious notifications on first fetch.
@@ -3612,8 +3652,33 @@ pub(crate) fn spawn_pr_cache_refresh(
             let pr_ref = format!("pr:{}", pr.number);
             let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
             let wt = cwd.to_string_lossy();
-            if !crate::notify::record_global(&db, "pr_state_changed", &pr_ref, &msg, &wt) {
-                let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let merged = pr.state == "MERGED";
+            let _ = crate::automation_events::emit_with_facts(
+                &db,
+                "pr_state_changed",
+                &pr_ref,
+                &msg,
+                &wt,
+                crate::automation_events::EventFacts {
+                    branch: Some(panel.branch.clone()),
+                    pr_merged: Some(merged),
+                    ..Default::default()
+                },
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if merged {
+                let origin = crate::automation_events::take_merge_origin(&db, &wt);
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::MergeLanded,
+                    format!("{pr_ref}:merged"),
+                    Some(wt.to_string()),
+                    Some(msg.clone()),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_merged: Some(true),
+                        origin,
+                        ..Default::default()
+                    },
+                );
             }
 
             // Lifecycle automation: on merge, move this worktree's linked
@@ -3736,9 +3801,8 @@ pub(crate) fn spawn_pr_cache_refresh(
                 }
                 for (source_ref, msg, wt) in pr_linked_notifications(&old_open, &prs, &wts, &hints)
                 {
-                    if !crate::notify::record_global(&db, "pr_linked", &source_ref, &msg, &wt) {
-                        let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                    }
+                    let _ =
+                        crate::automation_events::emit(&db, "pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
             }
 
@@ -3769,21 +3833,14 @@ pub(crate) fn spawn_pr_cache_refresh(
                 let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Ok(mentions) = forge.mentions(&loc, &repo) {
                     for (source_ref, msg) in mentions {
-                        if !crate::notify::record_global_once(
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                        let _ = crate::automation_events::emit_once(
                             &db,
                             "mentioned",
                             &source_ref,
                             &msg,
                             &repo_root,
-                        ) {
-                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                            let _ = db.put_notification_once(
-                                "mentioned",
-                                &source_ref,
-                                &msg,
-                                &repo_root,
-                            );
-                        }
+                        );
                     }
                 }
             }
@@ -3793,6 +3850,26 @@ pub(crate) fn spawn_pr_cache_refresh(
             }
         }
     });
+}
+
+fn pr_checks_passed(pr: &thegn_core::forge::model::PrStatus) -> bool {
+    pr.checks.total > 0 && pr.checks.failed == 0 && pr.checks.pending == 0
+}
+
+fn pr_review_requested(pr: &thegn_core::forge::model::PrStatus) -> bool {
+    pr.review_decision.as_deref() == Some("REVIEW_REQUIRED")
+}
+
+pub(crate) fn pr_automation_edges(
+    old: &thegn_core::forge::model::PrStatus,
+    new: &thegn_core::forge::model::PrStatus,
+) -> (Option<bool>, bool) {
+    let old_passed = pr_checks_passed(old);
+    let new_passed = pr_checks_passed(new);
+    (
+        (old_passed != new_passed).then_some(new_passed),
+        !pr_review_requested(old) && pr_review_requested(new),
+    )
 }
 
 /// The pure diff behind the `pr_linked` producer: for each PR whose head
@@ -3939,7 +4016,13 @@ fn maybe_clean_merged_worktrees(
                 verb,
                 thegn_core::disk::human(reclaimed)
             );
-            let _ = db.put_notification("disk_cleaned", &row.branch, &msg, &row.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let _ = crate::automation_events::emit(
+                db,
+                "disk_cleaned",
+                &row.branch,
+                &msg,
+                &row.worktree,
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }
