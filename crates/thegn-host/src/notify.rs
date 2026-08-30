@@ -12,8 +12,8 @@
 //! engine; this module only supplies the clock + runtime state and performs the
 //! I/O the decision authorizes.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::NotificationsConfig;
@@ -39,9 +39,9 @@ pub struct NotifyState {
     /// routing context so `[notifications.sound] suppress_focused` can silence a
     /// cue for the worktree the user is already looking at.
     focused_worktree: Mutex<String>,
-    /// The configured chime file (`[notifications.sound] chime_file`), empty ⇒
-    /// the bundled chime. Read on every `Chime` emit.
-    chime_file: Mutex<String>,
+    /// Off-loop provider/pack runtime. Its snapshot is swapped after config
+    /// reload, while producers only perform a bounded queue send.
+    sound_runtime: Arc<crate::notification_sound::SoundRuntime>,
     /// Sender for the transient in-app toast projection, installed once at loop
     /// startup ([`Self::set_toast_tx`]). `None` before wiring (or in headless tests),
     /// so an emit is a silent no-op rather than a panic.
@@ -59,6 +59,18 @@ pub struct NotifyState {
     waker: TerminalWaker,
 }
 
+fn global_slot() -> &'static Mutex<Weak<NotifyState>> {
+    static SLOT: OnceLock<Mutex<Weak<NotifyState>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+/// The hydration worker has no loop-owned argument, but still belongs to the
+/// single UI notification route. This weak handle avoids keeping a compositor
+/// alive after shutdown.
+pub(crate) fn global() -> Option<Arc<NotifyState>> {
+    global_slot().lock().unwrap().upgrade()
+}
+
 impl NotifyState {
     /// Build a handle from the effective notification config. `active_profile`
     /// is the resolved profile name (may be empty).
@@ -68,8 +80,9 @@ impl NotifyState {
         waker: TerminalWaker,
     ) -> std::sync::Arc<Self> {
         let active_mode = cfg.active_mode.clone();
-        let chime_file = cfg.sound.chime_file.clone();
-        std::sync::Arc::new(NotifyState {
+        let sound_cfg = cfg.sound.clone();
+        let sound_runtime = crate::notification_sound::SoundRuntime::new(waker.clone());
+        let state = Arc::new(NotifyState {
             cfg: Mutex::new(cfg),
             debounce: Mutex::new(thegn_core::notify_debounce::NotifyDebounce::default()),
             dnd_forced: Mutex::new(None),
@@ -77,12 +90,15 @@ impl NotifyState {
             active_profile,
             pending_bell: AtomicBool::new(false),
             focused_worktree: Mutex::new(String::new()),
-            chime_file: Mutex::new(chime_file),
+            sound_runtime: Arc::clone(&sound_runtime),
             toast_tx: Mutex::new(None),
             push_tx: Mutex::new(None),
             push_dropped: std::sync::atomic::AtomicU64::new(0),
             waker,
-        })
+        });
+        *global_slot().lock().unwrap() = Arc::downgrade(&state);
+        sound_runtime.reload(sound_cfg);
+        state
     }
 
     /// Install the bounded sender to the push publisher worker (wired at startup
@@ -160,7 +176,7 @@ impl NotifyState {
 
     /// Replace the effective config after a live reload.
     pub fn update_cfg(&self, cfg: NotificationsConfig) {
-        *self.chime_file.lock().unwrap() = cfg.sound.chime_file.clone();
+        self.sound_runtime.reload(cfg.sound.clone());
         // Keep the runtime mode if it is still a valid mode (or empty); else
         // reset to the new config's default.
         {
@@ -208,20 +224,14 @@ impl NotifyState {
         decide(kind, source_ref, message, worktree, &cfg, &self.route_ctx())
     }
 
-    /// Ring the resolved sound: latch the terminal bell (painted by the render
-    /// loop) or spawn the configured command off-thread. Best-effort.
+    /// Queue the resolved sound or latch the terminal bell. Best-effort and
+    /// non-blocking for every producer.
     pub fn emit_sound(&self, decision: &RouteDecision) {
         match &decision.sound {
-            Some(SoundEmit::Chime) => {
-                let file = self.chime_file.lock().unwrap().clone();
-                // No system player/file ⇒ fall back to the terminal bell so a
-                // chime is never a silent no-op.
-                if !crate::chime::play(&file) {
-                    self.ring_bell();
-                }
+            Some(sound @ (SoundEmit::File { .. } | SoundEmit::Command(_))) => {
+                crate::notification_sound::emit(&self.sound_runtime, sound);
             }
             Some(SoundEmit::Bell) => self.ring_bell(),
-            Some(SoundEmit::Command(cmd)) => spawn_sound_command(cmd),
             None => {}
         }
     }
@@ -234,7 +244,12 @@ impl NotifyState {
 
     /// Consume the latched bell (called once per render flush by the loop).
     pub fn take_bell(&self) -> bool {
-        self.pending_bell.swap(false, Ordering::Relaxed)
+        // Read both latches before combining them. Short-circuiting here would
+        // leave a fallback latch set whenever a normal BEL was also pending,
+        // replaying that fallback on the following frame.
+        let pending = self.pending_bell.swap(false, Ordering::Relaxed);
+        let fallback = self.sound_runtime.take_fallback_bell();
+        pending || fallback
     }
 
     /// Toggle the manual DND override; returns the new resolved DND state.
@@ -280,6 +295,25 @@ impl NotifyState {
     }
 }
 
+/// Decide and emit all transient channels for producers that have no DB handle.
+/// DB-backed producers use [`record`], which records before calling the same
+/// emission steps.
+pub(crate) fn route(
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> RouteDecision {
+    let decision = state.decide(kind, source_ref, message, worktree);
+    state.emit_sound(&decision);
+    if decision.toast {
+        state.emit_toast(message, decision.effective_priority);
+    }
+    state.emit_push(&decision, kind, message, "", worktree);
+    decision
+}
+
 /// Decide + conditionally persist a notification. Returns the decision and the
 /// new inbox row id (`None` when a rule dropped it). The dispatch sites use the
 /// returned decision to gate the desktop toast + sound.
@@ -290,6 +324,26 @@ pub fn record(
     source_ref: &str,
     message: &str,
     worktree: &str,
+) -> (RouteDecision, Option<i64>) {
+    record_with_facts(
+        db,
+        state,
+        kind,
+        source_ref,
+        message,
+        worktree,
+        crate::automation_events::EventFacts::default(),
+    )
+}
+
+pub(crate) fn record_with_facts(
+    db: &thegn_core::db::Db,
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+    facts: crate::automation_events::EventFacts,
 ) -> (RouteDecision, Option<i64>) {
     // Burst suppression for repeat failure alerts: a crash-respawning pane on
     // a flaky remote fires an identical process_failed every few seconds; one
@@ -311,11 +365,69 @@ pub fn record(
         }
     }
     let decision = state.decide(kind, source_ref, message, worktree);
-    let id = if decision.record {
-        crate::automation_events::emit(db, kind, source_ref, message, worktree).ok()
-    } else {
+    let id = crate::automation_events::insert_routed(
+        db, kind, source_ref, message, worktree, facts, &decision, false,
+    )
+    .unwrap_or_else(|error| {
+        tracing::debug!(target: "thegn::notify", %error, "notification cache write failed");
         None
-    };
+    });
+    emit_channels(state, &decision, kind, message, worktree);
+    (decision, id)
+}
+
+pub(crate) fn record_once_with_facts(
+    db: &thegn_core::db::Db,
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+    facts: crate::automation_events::EventFacts,
+) -> (RouteDecision, bool) {
+    let decision = state.decide(kind, source_ref, message, worktree);
+    let inserted = crate::automation_events::insert_routed(
+        db, kind, source_ref, message, worktree, facts, &decision, true,
+    )
+    .map(|id| id.is_some())
+    .unwrap_or_else(|error| {
+        tracing::debug!(target: "thegn::notify", %error, "emit-once notification cache write failed");
+        false
+    });
+    if inserted {
+        emit_channels(state, &decision, kind, message, worktree);
+    }
+    (decision, inserted)
+}
+
+#[cfg(test)]
+fn record_once(
+    db: &thegn_core::db::Db,
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+) -> (RouteDecision, bool) {
+    record_once_with_facts(
+        db,
+        state,
+        kind,
+        source_ref,
+        message,
+        worktree,
+        crate::automation_events::EventFacts::default(),
+    )
+}
+
+fn emit_channels(
+    state: &NotifyState,
+    decision: &RouteDecision,
+    kind: &str,
+    message: &str,
+    worktree: &str,
+) {
+    state.emit_sound(decision);
     // The transient in-app toast is the one funnel for routed events: it fires
     // iff the routing decision authorizes it (`toast`), governed by the same
     // rules/DND as every other channel — never a hand-rolled toast that dodges
@@ -325,36 +437,11 @@ pub fn record(
     }
     // Push-to-phone rides the same decision. The publisher worker exists only
     // when `[notifications.push]` is configured; otherwise this is a no-op.
-    state.emit_push(&decision, kind, message, "", worktree);
-    (decision, id)
+    state.emit_push(decision, kind, message, "", worktree);
 }
 
 fn parse_kind(s: &str) -> Option<NotificationKind> {
     NotificationKind::ALL.into_iter().find(|k| k.as_str() == s)
-}
-
-/// Run a sound command line off-thread via `sh -c`, fully detached. Best-effort:
-/// a missing shell or a failing command is swallowed — a sound must never
-/// disrupt the session.
-// off-loop: the wait happens on the detached "notify-sound" std::thread below.
-#[expect(clippy::disallowed_methods)]
-pub(crate) fn spawn_sound_command(cmd: &str) {
-    let cmd = cmd.to_string();
-    std::thread::Builder::new()
-        .name("notify-sound".into())
-        .spawn(move || {
-            // Utility: an audible cue paired with a toast — the user hears the result.
-            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let _ = std::process::Command::new("sh") // best-effort: sound playback is advisory: a missing player just skips it
-                .arg("-c")
-                .arg(&cmd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            // best-effort: sound thread: a failed spawn just skips the sound
-        })
-        .ok();
 }
 
 #[cfg(test)]
@@ -368,5 +455,130 @@ mod tests {
             Some(NotificationKind::TestFailed)
         );
         assert_eq!(parse_kind("bogus"), None);
+    }
+
+    #[cfg(unix)]
+    fn test_state(
+        cfg: NotificationsConfig,
+    ) -> (
+        Arc<NotifyState>,
+        std::fs::File,
+        termwiz::terminal::UnixTerminal,
+    ) {
+        use std::os::fd::FromRawFd;
+        use termwiz::terminal::{Terminal, UnixTerminal};
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let caps =
+            termwiz::caps::Capabilities::new_with_hints(termwiz::caps::ProbeHints::default())
+                .unwrap();
+        let terminal = UnixTerminal::new_with(caps, &slave, &slave).unwrap();
+        let state = NotifyState::new(cfg, String::new(), terminal.waker());
+        (state, master, terminal)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hydration_emit_once_sounds_mentions_and_overdue_only_on_insert() {
+        use std::collections::BTreeMap;
+        use thegn_core::config::{NotificationRule, NotificationsConfig};
+        use thegn_core::notification_route::SoundEmit;
+
+        let mut cfg = NotificationsConfig::default();
+        cfg.sound.min_priority = "info".into();
+        cfg.sound.per_kind = BTreeMap::from([
+            ("mentioned".into(), "bell".into()),
+            ("overdue".into(), "bell".into()),
+        ]);
+        let (state, _master, _terminal) = test_state(cfg.clone());
+        let db = thegn_core::db::Db::open_memory().unwrap();
+
+        for (kind, source_ref, message) in [
+            ("mentioned", "ghn:42:1", "mentioned in issue: fix it"),
+            ("overdue", "linear:A-1", "A-1 overdue (was due 2026-08-01)"),
+        ] {
+            let (decision, inserted) =
+                record_once(&db, &state, kind, source_ref, message, "/wt/app");
+            assert!(inserted, "first {kind} observation must insert");
+            assert_eq!(decision.sound, Some(SoundEmit::Bell));
+            assert!(state.take_bell(), "first {kind} observation must sound");
+
+            let (decision, inserted) =
+                record_once(&db, &state, kind, source_ref, message, "/wt/app");
+            assert!(!inserted, "second {kind} observation must dedupe");
+            assert_eq!(decision.sound, Some(SoundEmit::Bell));
+            assert!(!state.take_bell(), "duplicate {kind} must not sound");
+        }
+
+        let mut drop_cfg = cfg.clone();
+        drop_cfg.rules.push(NotificationRule {
+            kind: Some("mentioned".into()),
+            drop: true,
+            ..Default::default()
+        });
+        let (drop_state, _master, _terminal) = test_state(drop_cfg);
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (decision, inserted) = record_once(
+            &db,
+            &drop_state,
+            "mentioned",
+            "ghn:drop",
+            "dropped",
+            "/wt/app",
+        );
+        assert!(!inserted);
+        assert!(!decision.record);
+        assert_eq!(decision.sound, None);
+        assert!(!drop_state.take_bell());
+
+        let (dnd_state, _master, _terminal) = test_state(cfg.clone());
+        assert!(dnd_state.toggle_dnd());
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (decision, inserted) =
+            record_once(&db, &dnd_state, "overdue", "linear:dnd", "dnd", "/wt/app");
+        assert!(inserted);
+        assert_eq!(decision.sound, None);
+        assert!(!dnd_state.take_bell());
+
+        let (focused_state, _master, _terminal) = test_state(cfg);
+        focused_state.set_focused_worktree("/wt/app".into());
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (decision, inserted) = record_once(
+            &db,
+            &focused_state,
+            "mentioned",
+            "ghn:focused",
+            "focused",
+            "/wt/app",
+        );
+        assert!(inserted);
+        assert_eq!(decision.sound, None);
+        assert!(!focused_state.take_bell());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_bell_consumes_normal_and_fallback_latches_together() {
+        let (state, _master, _terminal) = test_state(NotificationsConfig::default());
+        state.ring_bell();
+        state.sound_runtime.latch_fallback_bell_for_test();
+
+        assert!(state.take_bell());
+        assert!(!state.take_bell());
     }
 }

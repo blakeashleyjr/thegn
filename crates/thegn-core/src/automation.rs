@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_task::{TaskVars, render_prompt};
-use crate::notification::Priority;
+use crate::notification::{NotificationKind, Priority};
+
+const MAX_ONCE_KEYS: usize = 2_048;
 
 /// Catalog capabilities automation rules may target in v1.
 pub const SUPPORTED_ACTION_CAPS: &[&str] =
@@ -27,6 +29,7 @@ pub const EVENT_TEMPLATE_VARS: &[&str] = &[
     "worktree",
     "branch",
     "agent_role",
+    "notification_kind",
     "priority",
     "source_ref",
     "message",
@@ -104,11 +107,16 @@ pub struct AutomationEvent {
     pub occurred_at: i64,
     pub key: EventKey,
     pub kind: AutomationEventKind,
+    /// Runtime-only targeting for independently-timed idle rules. Ordinary
+    /// events leave this absent and are evaluated against every matching rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rule: Option<String>,
     pub workspace: Option<String>,
     pub repo: Option<String>,
     pub worktree: Option<String>,
     pub branch: Option<String>,
     pub agent_role: Option<String>,
+    pub notification_kind: Option<NotificationKind>,
     pub priority: Option<Priority>,
     pub source_ref: Option<String>,
     pub message: Option<String>,
@@ -132,6 +140,12 @@ impl AutomationEvent {
             .set("branch", self.branch.as_deref().unwrap_or_default())
             .set("agent_role", self.agent_role.as_deref().unwrap_or_default())
             .set(
+                "notification_kind",
+                self.notification_kind
+                    .map(NotificationKind::as_str)
+                    .unwrap_or_default(),
+            )
+            .set(
                 "priority",
                 self.priority.map(Priority::as_str).unwrap_or_default(),
             )
@@ -144,6 +158,21 @@ impl AutomationEvent {
                 optional_bool(self.pr_review_requested),
             )
             .set("pr_merged", optional_bool(self.pr_merged))
+    }
+
+    /// Typed PR fixtures must carry the fact their event kind promises. This
+    /// keeps the dry-run surface from advertising matches no live producer can
+    /// construct.
+    pub fn validate_required_facts(&self) -> Result<(), &'static str> {
+        match self.kind {
+            AutomationEventKind::PrChecks if self.pr_checks_passed.is_none() => {
+                Err("pr_checks events require pr_checks_passed")
+            }
+            AutomationEventKind::PrReviewRequested if self.pr_review_requested.is_none() => {
+                Err("pr_review_requested events require pr_review_requested")
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -164,6 +193,7 @@ pub struct AutomationPredicate {
     pub worktree: Option<String>,
     pub branch: Option<String>,
     pub agent_role: Option<String>,
+    pub notification_kind: Option<NotificationKind>,
     pub min_priority: Option<Priority>,
     pub source_prefix: Option<String>,
     pub message_regex: Option<String>,
@@ -180,6 +210,9 @@ impl AutomationPredicate {
             && glob_field(&self.worktree, &event.worktree)
             && glob_field(&self.branch, &event.branch)
             && exact_field(&self.agent_role, &event.agent_role)
+            && self
+                .notification_kind
+                .is_none_or(|kind| event.notification_kind == Some(kind))
             && self
                 .min_priority
                 .is_none_or(|minimum| event.priority.is_some_and(|p| p >= minimum))
@@ -234,6 +267,8 @@ pub struct AutomationRule {
     pub predicate: AutomationPredicate,
     pub action: ActionTemplate,
     pub debounce_secs: u64,
+    /// Delay after the authoritative activity edge for `worktree_idle` only.
+    pub idle_secs: Option<u64>,
     pub once_per_key: bool,
     pub max_per_hour: u16,
     pub max_action_per_hour: u16,
@@ -302,20 +337,35 @@ pub fn evaluate(
     state: &EvaluationState,
     now_secs: i64,
 ) -> Vec<EvaluationDecision> {
-    rules
-        .iter()
-        .filter(|rule| rule.event == event.kind && rule.predicate.matches(event))
-        .map(|rule| evaluate_one(rule, event, state.get(&rule.id), now_secs))
-        .collect()
+    // Apply accepted transitions to a scratch ledger in config order. This is
+    // what makes max_action_per_hour action-wide when two rules target the same
+    // capability in one event, and mirrors the transactional runtime admission.
+    let mut scratch = state.clone();
+    let mut decisions = Vec::new();
+    for rule in rules.iter().filter(|rule| {
+        event.target_rule.as_ref().is_none_or(|id| id == &rule.id)
+            && rule.event == event.kind
+            && rule.predicate.matches(event)
+    }) {
+        let decision = evaluate_one(rule, event, &scratch, now_secs);
+        if let EvaluationDecision::Planned(action) = &decision {
+            scratch.insert(
+                action.transition.rule_id.clone(),
+                action.transition.state.clone(),
+            );
+        }
+        decisions.push(decision);
+    }
+    decisions
 }
 
 fn evaluate_one(
     rule: &AutomationRule,
     event: &AutomationEvent,
-    state: Option<&RuleState>,
+    state: &EvaluationState,
     now_secs: i64,
 ) -> EvaluationDecision {
-    let current = state.cloned().unwrap_or_default();
+    let current = state.get(&rule.id).cloned().unwrap_or_default();
     let skip = |reason| EvaluationDecision::Skipped {
         rule_id: rule.id.clone(),
         event_key: event.key.clone(),
@@ -350,10 +400,9 @@ fn evaluate_one(
     if recent_fires.len() >= usize::from(rule.max_per_hour) {
         return skip(SkipReason::RuleRateLimited);
     }
-    let action_recent: Vec<i64> = current
-        .action_fires
-        .get(&rule.action.cap)
-        .into_iter()
+    let action_recent: Vec<i64> = state
+        .values()
+        .filter_map(|ledger| ledger.action_fires.get(&rule.action.cap))
         .flatten()
         .copied()
         .filter(|ts| *ts > window_start && *ts <= now_secs)
@@ -375,14 +424,25 @@ fn evaluate_one(
     next.last_fired_at = Some(now_secs);
     next.recent_fires = recent_fires;
     next.recent_fires.push(now_secs);
-    next.action_fires
-        .insert(rule.action.cap.clone(), action_recent);
+    // Each rule owns only the fires it admitted. The limit is action-wide by
+    // summing those disjoint ledgers above; copying the global window into the
+    // firing rule would double-count old entries on every transition.
+    next.action_fires.retain(|_, timestamps| {
+        timestamps.retain(|ts| *ts > window_start && *ts <= now_secs);
+        !timestamps.is_empty()
+    });
     next.action_fires
         .entry(rule.action.cap.clone())
         .or_default()
         .push(now_secs);
     if rule.once_per_key {
         next.once_keys.insert(event.key.clone());
+        while next.once_keys.len() > MAX_ONCE_KEYS {
+            let Some(oldest) = next.once_keys.first().cloned() else {
+                break;
+            };
+            next.once_keys.remove(&oldest);
+        }
     }
 
     EvaluationDecision::Planned(PlannedAction {
@@ -408,11 +468,13 @@ mod tests {
             occurred_at: 1_000,
             key: EventKey("session:s1:blocked".into()),
             kind: AutomationEventKind::AgentNeedsYou,
+            target_rule: None,
             workspace: Some("product".into()),
             repo: Some("thegn".into()),
             worktree: Some("/code/product/thegn".into()),
             branch: Some("tg/the-21".into()),
             agent_role: Some("coder".into()),
+            notification_kind: None,
             priority: Some(Priority::Alert),
             source_ref: Some("session:s1".into()),
             message: Some("needs review".into()),
@@ -438,6 +500,7 @@ mod tests {
                 ]),
             },
             debounce_secs: 0,
+            idle_secs: None,
             once_per_key: false,
             max_per_hour: 30,
             max_action_per_hour: 30,
@@ -476,6 +539,7 @@ mod tests {
             worktree: Some("*/thegn".into()),
             branch: Some("tg/*".into()),
             agent_role: Some("coder".into()),
+            notification_kind: None,
             min_priority: Some(Priority::Notice),
             source_prefix: Some("session:".into()),
             message_regex: Some("review$".into()),
@@ -597,6 +661,78 @@ mod tests {
             reason(&evaluate(&[r], &event(), &action_state, 7_000)),
             &SkipReason::ActionRateLimited
         );
+    }
+
+    #[test]
+    fn notification_kind_is_typed_and_pr_fixtures_require_their_fact() {
+        let mut notification = event();
+        notification.kind = AutomationEventKind::Notification;
+        notification.notification_kind = Some(NotificationKind::TestFailed);
+        let mut r = rule("notification");
+        r.event = AutomationEventKind::Notification;
+        r.predicate.notification_kind = Some(NotificationKind::TestFailed);
+        assert!(matches!(
+            evaluate(&[r], &notification, &EvaluationState::new(), 2_000)[0],
+            EvaluationDecision::Planned(_)
+        ));
+
+        let mut checks = event();
+        checks.kind = AutomationEventKind::PrChecks;
+        checks.pr_checks_passed = None;
+        assert_eq!(
+            checks.validate_required_facts(),
+            Err("pr_checks events require pr_checks_passed")
+        );
+    }
+
+    #[test]
+    fn action_rate_is_shared_across_rules() {
+        let mut first = rule("first");
+        let mut second = rule("second");
+        first.max_action_per_hour = 1;
+        second.max_action_per_hour = 1;
+        let decisions = evaluate(&[first, second], &event(), &EvaluationState::new(), 2_000);
+        assert!(matches!(decisions[0], EvaluationDecision::Planned(_)));
+        assert!(matches!(
+            decisions[1],
+            EvaluationDecision::Skipped {
+                reason: SkipReason::ActionRateLimited,
+                ..
+            }
+        ));
+
+        // Each rule persists only its own contribution to the shared window.
+        // Two initial admissions therefore consume exactly two slots, not a
+        // copied/compounded three slots in the persisted ledgers.
+        let mut first = rule("first");
+        let mut second = rule("second");
+        first.max_action_per_hour = 3;
+        second.max_action_per_hour = 3;
+        let rules = vec![first, second];
+        let initial = evaluate(&rules, &event(), &EvaluationState::new(), 2_000);
+        assert!(
+            initial
+                .iter()
+                .all(|decision| matches!(decision, EvaluationDecision::Planned(_)))
+        );
+        let state: EvaluationState = initial
+            .into_iter()
+            .filter_map(|decision| match decision {
+                EvaluationDecision::Planned(action) => {
+                    Some((action.transition.rule_id, action.transition.state))
+                }
+                EvaluationDecision::Skipped { .. } => None,
+            })
+            .collect();
+        let next = evaluate(&rules, &event(), &state, 2_001);
+        assert!(matches!(next[0], EvaluationDecision::Planned(_)));
+        assert!(matches!(
+            next[1],
+            EvaluationDecision::Skipped {
+                reason: SkipReason::ActionRateLimited,
+                ..
+            }
+        ));
     }
 
     #[test]

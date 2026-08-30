@@ -22,7 +22,7 @@ use super::auth;
 use super::http::{ControlState, router};
 use super::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlResult, GitFileStatus, OpenSpec,
-    SessionInfo,
+    PreviewFetchReply, PreviewFetchRequest, SessionInfo,
 };
 
 /// Records every trait call; returns minimal canned data.
@@ -153,6 +153,23 @@ impl ControlApi for FakeApi {
         self.record("drive_browser");
         Box::pin(async { Err(super::ControlError::Unimplemented("drive-browser")) })
     }
+    fn preview_fetch(
+        &self,
+        req: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        self.record("preview_fetch");
+        Box::pin(async move {
+            Ok(PreviewFetchReply {
+                url: req.url,
+                status: 200,
+                content_type: Some("text/plain".into()),
+                body: "ok".into(),
+                truncated: false,
+                console_errors: Vec::new(),
+                diagnostics_source: "unavailable".into(),
+            })
+        })
+    }
     fn git_status<'a>(
         &'a self,
         _worktree: &'a str,
@@ -209,6 +226,48 @@ impl ControlApi for FakeApi {
     fn notify_push(&self, _note: super::PushedNote) -> BoxFuture<'_, ControlResult<i64>> {
         self.record("notify_push");
         Box::pin(async { Ok(7) })
+    }
+    fn automations_list(&self) -> BoxFuture<'_, ControlResult<Vec<super::AutomationRuleInfo>>> {
+        self.record("automations_list");
+        Box::pin(async {
+            Ok(vec![super::AutomationRuleInfo {
+                name: "green".into(),
+                enabled: true,
+                trusted_layer: "user".into(),
+                event: "notification".into(),
+                action: "notify.push".into(),
+                inert_reason: None,
+                recent_outcome: Some("succeeded".into()),
+            }])
+        })
+    }
+    fn automations_test(
+        &self,
+        request: super::AutomationTestRequest,
+    ) -> BoxFuture<'_, ControlResult<super::AutomationTestReply>> {
+        self.record("automations_test");
+        Box::pin(async move {
+            Ok(super::AutomationTestReply {
+                rule: request.rule,
+                decisions: serde_json::json!([{"outcome": "matched"}]),
+                executed: false,
+            })
+        })
+    }
+    fn tools_run(
+        &self,
+        _request: super::ToolRunRequest,
+    ) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        self.record("tools_run");
+        Box::pin(async {
+            Ok(SessionInfo {
+                id: "tool-session".into(),
+                program: "trusted-tool".into(),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+        })
     }
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         self.record("lease_status");
@@ -301,6 +360,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"repo":"r"}"#
     } else if path.contains("/browser") {
         r#"{"session":null,"action":"reload"}"#
+    } else if path.contains("/preview/fetch") {
+        r#"{"url":"http://localhost:3000/"}"#
     } else if path.contains("/git/stage") {
         r#"{"worktree":"/w","paths":["a"]}"#
     } else if path.contains("/git/commit") {
@@ -331,6 +392,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
         ("GET", "/v1/git/status?worktree=%2Fw"),
         ("GET", "/v1/merge/list?worktree=%2Fw"),
         ("GET", "/v1/pr/status"),
+        ("POST", "/v1/preview/fetch"),
     ] {
         assert_eq!(
             call(&r, method, path, Some(&read)).await,
@@ -338,6 +400,53 @@ async fn read_scope_covers_exactly_the_read_surface() {
             "{method} {path} must be readable with read scope"
         );
     }
+}
+
+#[tokio::test]
+async fn preview_fetch_is_rejected_without_read_scope_before_the_api() {
+    let r = rig(false);
+    let none = token(&r, "");
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&none)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(r.api.calls().is_empty());
+
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&read)).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["preview_fetch"]);
+}
+
+#[tokio::test]
+async fn preview_fetch_authenticates_before_decoding_its_bounded_body() {
+    let r = rig(false);
+    let none = token(&r, "");
+    let request = |bearer: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/preview/fetch")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap()
+    };
+    let response = router(r.state.clone())
+        .oneshot(request(&none))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty());
+
+    let read = token(&r, "read");
+    let response = router(r.state.clone())
+        .oneshot(request(&read))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(r.api.calls().is_empty());
 }
 
 #[tokio::test]
@@ -688,6 +797,82 @@ async fn pr_status_and_notify_push_route_to_the_api() {
     );
 }
 
+#[tokio::test]
+async fn automation_and_tool_verbs_have_catalog_routes_and_exact_scopes() {
+    for (capability, path) in [
+        ("automations.list", "/v1/automations"),
+        ("automations.test", "/v1/automations/test"),
+        ("tools.run", "/v1/tools/run"),
+    ] {
+        assert!(
+            super::routes::ROUTES
+                .iter()
+                .any(|route| route.path == path && route.caps.contains(&capability)),
+            "missing route/catalog projection for {capability}"
+        );
+        assert!(
+            thegn_core::capability::CATALOG
+                .iter()
+                .any(|entry| entry.id.as_str() == capability),
+            "missing capability catalog row for {capability}"
+        );
+    }
+
+    let r = rig(false);
+    let read = token(&r, "read");
+    let exec = token(&r, "exec");
+
+    assert_eq!(
+        call(&r, "GET", "/v1/automations", Some(&read)).await,
+        StatusCode::OK
+    );
+    let test_request = Request::builder()
+        .method("POST")
+        .uri("/v1/automations/test")
+        .header("authorization", format!("Bearer {read}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"rule":"green","event":{}}"#))
+        .unwrap();
+    assert_eq!(
+        router(r.state.clone())
+            .oneshot(test_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let tool_request = |bearer: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/tools/run")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"trusted-tool","worktree":"/w"}"#))
+            .unwrap()
+    };
+    assert_eq!(
+        router(r.state.clone())
+            .oneshot(tool_request(&read))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        router(r.state.clone())
+            .oneshot(tool_request(&exec))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.api.calls(),
+        ["automations_list", "automations_test", "tools_run"]
+    );
+}
+
 /// The new wire types survive a serde round-trip, and `PushedNote`'s optional
 /// fields default when absent (the minimal `{"title": …}` push is valid).
 #[test]
@@ -854,9 +1039,10 @@ mod audit_capture {
     }
 }
 
-/// Every mutating control call and every scope rejection emits one structured
-/// audit record on `thegn::control::audit`, naming the caller, capability,
-/// resource and outcome — never a secret.
+/// Every mutating control call, the network-reaching read-scoped preview fetch,
+/// and every scope rejection emits one structured audit record on
+/// `thegn::control::audit`, naming the caller, capability, resource and outcome
+/// — never a secret.
 #[tokio::test]
 async fn mutating_calls_and_rejections_emit_audit_records() {
     let captured = audit_capture::Captured::default();
@@ -880,6 +1066,10 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
         call(&r, "GET", "/v1/sessions", Some(&read)).await,
         StatusCode::OK
     );
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&read)).await,
+        StatusCode::OK
+    );
 
     let recs = captured.records();
     let ok = recs.iter().find(|m| {
@@ -892,6 +1082,10 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
     assert!(recs.iter().any(|m| {
         m.get("capability").map(String::as_str) == Some("sessions.input")
             && m.get("outcome").map(String::as_str) == Some("no_scope")
+    }));
+    assert!(recs.iter().any(|m| {
+        m.get("capability").map(String::as_str) == Some("preview.fetch")
+            && m.get("outcome").map(String::as_str) == Some("ok")
     }));
     // A read GET produced no record.
     assert!(

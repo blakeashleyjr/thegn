@@ -27,11 +27,15 @@ fn wire_schema() -> serde_json::Value {
     }
     add!(
         WorktreeInfo,
+        EditorOpenRequest,
         SessionInfo,
         OpenSpec,
+        ForkSpec,
         AttachKind,
         BrowserCommand,
         BrowserAction,
+        PreviewFetchRequest,
+        PreviewFetchReply,
         WaitCondition,
         WaitOutcome,
         SplitDir,
