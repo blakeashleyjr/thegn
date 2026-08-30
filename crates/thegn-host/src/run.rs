@@ -232,7 +232,7 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 /// queued chunk, so a congestion drop ([`crate::pane_writer::StdinSendError::Full`]) can never
 /// leave the app inside an open paste bracket, and no keystroke can land
 /// between the markers.
-fn paste_text_into_pane(
+pub(crate) fn paste_text_into_pane(
     pane: &mut crate::pane::PtyPane,
     text: &str,
 ) -> Result<(), crate::pane_writer::StdinSendError> {
@@ -9174,6 +9174,12 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            // A review snapshot may be fetched after the Changes modal opens.
+            // Deliver the accepted model's compatible snapshot directly to
+            // that view; its worktree diff must remain intact while only the
+            // review source is updated.
+            let review_for_diff_view = next_model.panel.review_snapshot.clone();
+            let review_status_for_diff_view = next_model.panel.review_snapshot_status.clone();
             // `thegn open` intents ride the hydration result (claimed from
             // the DB mailbox off-loop); take them out before the model swap —
             // last one wins, applied after the drain below.
@@ -9379,6 +9385,14 @@ async fn event_loop<T: Terminal>(
             model.status = prev_status;
             model.masthead_sel = prev_masthead_sel;
             model.statusbar_sel = prev_statusbar_sel;
+            if let Some(view) = diff_view.as_mut() {
+                let review = review_for_diff_view.filter(|review| {
+                    crate::actions::review_snapshot_matches_panel(&model.panel, review)
+                });
+                if view.set_review(review, review_status_for_diff_view) {
+                    dirty = true;
+                }
+            }
             // Seed the stale-while-revalidate cache with this worktree's fresh
             // slice (pre LSP-merge: LSP diags live in their own per-root store
             // and are re-merged on every paint) so a later switch back paints
@@ -11035,6 +11049,7 @@ async fn event_loop<T: Terminal>(
                 &mut pr_view_gen,
                 &pr_view_tx,
                 &waker,
+                &refresh_tx,
             );
         }
         if want_calendar_sync {
@@ -14227,15 +14242,19 @@ async fn event_loop<T: Terminal>(
                 // The full-screen PR view is a top-priority modal (like the
                 // detail overlay): it owns every key while open. Actions run off
                 // the loop and the view stays open (only Close dismisses it).
-                if pr_view.is_some() {
+                if pr_view.is_some() && active_menu.is_none() {
                     crate::actions::dispatch_pr_view_key(
                         &mut pr_view,
                         &k.key,
                         k.modifiers,
-                        &session,
+                        &mut session,
+                        &mut panes,
+                        &mut focus,
+                        keymap.config(),
                         &refresh_tx,
                         &waker,
                         &mut model,
+                        &mut active_menu,
                     );
                     dirty = true;
                     continue;
@@ -15035,6 +15054,9 @@ async fn event_loop<T: Terminal>(
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
                             active_menu = None;
+                            if let Some(v) = pr_view.as_mut() {
+                                v.pending_handoff = None;
+                            }
                             pending_confirm_op = None;
                             pending_undo = None;
                             pending_delete_workspace = None;
@@ -15045,6 +15067,31 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
+                            if matches!(
+                                &choice,
+                                menu::MenuChoice::Confirm {
+                                    tag: "pr-review-handoff",
+                                    ..
+                                }
+                            ) {
+                                if let Some(selection) =
+                                    pr_view.as_mut().and_then(|v| v.pending_handoff.take())
+                                {
+                                    crate::actions::dispatch_pr_handoff(
+                                        &mut pr_view,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut focus,
+                                        keymap.config(),
+                                        &mut model,
+                                        &refresh_tx,
+                                        &waker,
+                                        selection,
+                                    );
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -15071,6 +15118,11 @@ async fn event_loop<T: Terminal>(
                                 && let Some(g) = session.worktrees.get(session.active)
                             {
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
+                            }
+                            if matches!(&choice, menu::MenuChoice::Dismiss)
+                                && let Some(v) = pr_view.as_mut()
+                            {
+                                v.pending_handoff = None;
                             }
                             if let menu::MenuChoice::ConfirmCloseWorktrees = choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
@@ -17151,6 +17203,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut pr_view_gen,
                                                 &pr_view_tx,
                                                 &waker,
+                                                &refresh_tx,
                                             ) {
                                                 Some(v) => pr_view = Some(v),
                                                 None => model.status = "No pull request".into(),
@@ -21429,6 +21482,7 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     diff_view = Some(crate::actions::open_diff_view(
                                         cfg,
+                                        &model,
                                         &session,
                                         &mut diff_view_gen,
                                         &diff_view_tx,

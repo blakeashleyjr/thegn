@@ -9,6 +9,7 @@
 //! shared multi-user cache state. Each getter returns `(payload_json,
 //! fetched_at_secs)` so the caller can apply its own TTL.
 
+use crate::review::PrReviewSnapshot;
 use anyhow::Result;
 
 /// Persisted TTL caches. Object-safe (`&self` + concrete args), so
@@ -93,6 +94,13 @@ pub trait CacheStore {
     fn get_test_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;
     /// Replace the per-worktree latest-test cache.
     fn put_test_cache(&self, worktree: &str, json: &str) -> Result<()>;
+
+    /// Complete PR review snapshot for a worktree. A cache miss or malformed
+    /// payload is returned as `None`; the forge remains the source of truth.
+    fn get_pr_review_cache(&self, worktree: &str) -> Result<Option<PrReviewSnapshot>>;
+    /// Atomically replace a complete PR review snapshot. Callers must not use
+    /// this for a partial conversation/diff result.
+    fn put_pr_review_cache(&self, snapshot: &PrReviewSnapshot) -> Result<()>;
 
     /// Per-worktree LOC cache: the tokei report JSON + fetch timestamp (for TTL
     /// refresh); `None` if absent or pre-`report_json`.
