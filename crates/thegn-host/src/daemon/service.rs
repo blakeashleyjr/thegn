@@ -536,6 +536,16 @@ impl ControlApi for DaemonService {
                 Some(a) => a.agent.clone(),
                 None => crate::pane::program_name(&argv),
             };
+            if let Some(origin) = &spec.automation_origin {
+                crate::automation_runtime::register_session_origin(
+                    &id,
+                    thegn_core::automation::AutomationOrigin {
+                        root_event_id: origin.root_event_id.clone(),
+                        rule_id: origin.rule_id.clone(),
+                        run_id: origin.run_id.clone(),
+                    },
+                );
+            }
             let info = super::fork::spawn_session(
                 self,
                 super::fork::SpawnRequest {
@@ -552,17 +562,11 @@ impl ControlApi for DaemonService {
                     handoff: None,
                 },
             )
-            .await?;
-            if let Some(origin) = spec.automation_origin {
-                crate::automation_runtime::register_session_origin(
-                    &id,
-                    thegn_core::automation::AutomationOrigin {
-                        root_event_id: origin.root_event_id,
-                        rule_id: origin.rule_id,
-                        run_id: origin.run_id,
-                    },
-                );
-            }
+            .await
+            .map_err(|error| {
+                crate::automation_runtime::clear_session_origin(&id);
+                error
+            })?;
 
             // Ask a running compositor to graft this session into a real pane.
             // Best-effort by design: with no instance up, the session is simply

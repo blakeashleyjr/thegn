@@ -15,6 +15,7 @@ use crate::notification::{NotificationKind, Priority};
 const MAX_RULES: usize = 256;
 const MAX_NAME_LEN: usize = 128;
 const MAX_TEMPLATE_LEN: usize = 16 * 1024;
+const MAX_REGEX_LEN: usize = 4 * 1024;
 const MAX_PARAMS: usize = 8;
 
 fn default_rule_enabled() -> bool {
@@ -366,10 +367,14 @@ fn validate_predicate(predicate: &AutomationPredicateConfig, key: &str, errors: 
             "{key}.if.notification_kind: unknown notification kind {kind:?}"
         ));
     }
-    if let Some(pattern) = &predicate.message_regex
-        && let Err(error) = regex::Regex::new(pattern)
-    {
-        errors.push(format!("{key}.if.message_regex: invalid regex: {error}"));
+    if let Some(pattern) = &predicate.message_regex {
+        if pattern.len() > MAX_REGEX_LEN {
+            errors.push(format!(
+                "{key}.if.message_regex: must be at most {MAX_REGEX_LEN} bytes"
+            ));
+        } else if let Err(error) = regex::Regex::new(pattern) {
+            errors.push(format!("{key}.if.message_regex: invalid regex: {error}"));
+        }
     }
     for (field, value) in [
         ("agent_role", &predicate.agent_role),
@@ -621,6 +626,17 @@ urgency = "alert"
         assert!(errors.contains("max_per_hour"));
         assert!(errors.contains("unknown placeholder"));
         assert!(errors.contains("agent: not valid for notify.push"));
+    }
+
+    #[test]
+    fn rejects_oversized_message_regex() {
+        let mut cfg = valid();
+        cfg.rules[0].predicate.message_regex = Some("x".repeat(MAX_REGEX_LEN + 1));
+        assert!(
+            cfg.validate()
+                .join("\n")
+                .contains("message_regex: must be at most")
+        );
     }
 
     #[test]

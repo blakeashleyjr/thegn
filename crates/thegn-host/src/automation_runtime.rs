@@ -23,6 +23,15 @@ pub fn register_session_origin(session: &str, origin: thegn_core::automation::Au
         .insert(session.to_string(), origin);
 }
 
+pub fn clear_session_origin(session: &str) {
+    if let Some(origins) = SESSION_ORIGINS.get() {
+        origins
+            .lock()
+            .expect("automation session origin lock")
+            .remove(session);
+    }
+}
+
 fn session_origin(session: &str) -> Option<thegn_core::automation::AutomationOrigin> {
     SESSION_ORIGINS
         .get_or_init(Default::default)
@@ -54,23 +63,31 @@ pub fn install(cfg: &Config) {
         return;
     };
     let (tx, rx) = mpsc::channel(effective.queue_capacity);
-    *slot.lock().expect("automation sender lock") = Some(tx);
     let cfg = Arc::new(cfg.clone());
     let thread_cfg = effective.clone();
-    let _ = std::thread::Builder::new()
+    let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(thread_cfg.max_concurrent.max(1))
+        .max_blocking_threads(thread_cfg.max_concurrent.max(1).saturating_mul(2))
+        .enable_all()
+        .build()
+    else {
+        tracing::error!(target: "thegn::automation", "failed to build automation runtime");
+        return;
+    };
+    let spawn = std::thread::Builder::new()
         .name("automation-runtime".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(thread_cfg.max_concurrent.max(1))
-                .max_blocking_threads(thread_cfg.max_concurrent.max(1).saturating_mul(2))
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
             rt.block_on(run(rx, cfg, rules, thread_cfg));
         });
+    match spawn {
+        Ok(_) => *slot.lock().expect("automation sender lock") = Some(tx),
+        Err(error) => tracing::error!(
+            target: "thegn::automation",
+            %error,
+            "failed to start automation runtime"
+        ),
+    }
 }
 
 pub fn submit(event: AutomationEvent) {
@@ -148,6 +165,14 @@ fn audit_dropped(event: AutomationEvent) -> Option<std::thread::JoinHandle<anyho
                 db.finish_automation_run(id, "dropped", Some("queue_overflow"), None, now)?;
                 Ok(())
             })();
+            if let Err(error) = &result {
+                tracing::warn!(
+                    target: "thegn::automation",
+                    %error,
+                    outcome = "dropped",
+                    "failed to persist queue-overflow audit"
+                );
+            }
             pending_done();
             result
         })
@@ -403,7 +428,11 @@ pub fn subscribe_daemon_events(
             let next_idle = idle_deadlines.values().map(|(deadline, _)| *deadline).min();
             tokio::select! {
                 frame = rx.recv() => {
-                    let Ok(frame) = frame else { continue };
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     match frame.as_ref() {
                         EventFrame::Activity { json } => {
                             let Ok(activity) = serde_json::from_str::<SessionActivityEvent>(json) else { continue };

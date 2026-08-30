@@ -84,14 +84,25 @@ pub async fn execute(
                 .context("merge.add requires event.worktree")?;
             let origin_json = serde_json::to_string(&origin)?;
             let worktree_owned = worktree.to_string();
+            let handoff_key = worktree_owned.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 use thegn_core::store::WorkspaceStore;
                 let db = thegn_core::db::Db::open()?;
-                db.set_ui_state("automation_merge_origin", &worktree_owned, &origin_json)?;
+                db.set_ui_state("automation_merge_origin", &handoff_key, &origin_json)?;
                 Ok(())
             })
             .await??;
-            client().await?.merge_add(worktree).await?;
+            let client = match client().await {
+                Ok(client) => client,
+                Err(error) => {
+                    clear_merge_origin(&worktree_owned).await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = client.merge_add(worktree).await {
+                clear_merge_origin(&worktree_owned).await;
+                return Err(error.into());
+            }
             Ok(())
         }
         "notify.push" => {
@@ -144,16 +155,40 @@ pub async fn execute(
                 }
             };
             anyhow::ensure!(
-                outcome
-                    .get("exit_code")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0)
-                    == 0,
+                outcome.get("matched").and_then(serde_json::Value::as_bool) == Some(true),
+                "configured tool did not reach an exit outcome"
+            );
+            anyhow::ensure!(
+                outcome.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0),
                 "configured tool exited unsuccessfully"
             );
             Ok(())
         }
         other => anyhow::bail!("unsupported automation action {other}"),
+    }
+}
+
+async fn clear_merge_origin(worktree: &str) {
+    let worktree = worktree.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        use thegn_core::store::WorkspaceStore;
+        let db = thegn_core::db::Db::open()?;
+        db.del_ui_state("automation_merge_origin", &worktree)?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "thegn::automation",
+            %error,
+            "failed to clear merge ancestry after dispatch failure"
+        ),
+        Err(error) => tracing::warn!(
+            target: "thegn::automation",
+            %error,
+            "failed to join merge ancestry cleanup"
+        ),
     }
 }
 
