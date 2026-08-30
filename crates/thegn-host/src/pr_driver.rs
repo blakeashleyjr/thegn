@@ -537,11 +537,14 @@ fn refresh_review_tasks(
     };
     let repository = format!("{owner}/{repo}");
     let repo_ref = RepoRef { owner, repo };
-    let worktree = item
+    // The repo root is only a read-only forge/cache location for by-number
+    // rows. It is never an executable identity and must not enter the task.
+    let query_worktree = item
         .worktree
         .as_deref()
         .unwrap_or_else(|| repo_root.to_str().unwrap_or_default());
-    let loc = GitLoc::from_db(worktree, None);
+    let execution_worktree = item.worktree.as_deref().unwrap_or_default();
+    let loc = GitLoc::from_db(query_worktree, None);
     let conversation = match forge.conversation(&loc, &repo_ref, item.number) {
         Ok(conversation) => conversation,
         Err(error) => {
@@ -565,7 +568,7 @@ fn refresh_review_tasks(
         }
     };
     let snapshot = thegn_core::review::PrReviewSnapshot {
-        worktree_key: worktree.to_string(),
+        worktree_key: execution_worktree.to_string(),
         branch: item.branch.clone(),
         pr_number: item.number,
         head_oid: fetched.pr.head_ref_oid.clone(),
@@ -575,7 +578,9 @@ fn refresh_review_tasks(
     };
     // Complete payload only. This is the same cache consumed by THE-27's
     // panel/diff projection; a DB miss merely makes the next hydrate stale.
-    if let Err(error) = db.put_pr_review_cache(&snapshot) {
+    if !execution_worktree.is_empty()
+        && let Err(error) = db.put_pr_review_cache(&snapshot)
+    {
         tracing::warn!(target: "thegn::prq", %error, number = item.number, "review cache write failed");
     }
 
@@ -597,7 +602,7 @@ fn refresh_review_tasks(
         pr_url: fetched.pr.url.as_str(),
         pr_title: fetched.pr.title.as_str(),
         base: fetched.pr.base_ref_name.as_str(),
-        worktree_path: worktree,
+        worktree_path: execution_worktree,
         role: cfg.agent.as_str(),
         prompt_template: cfg.prompts.resolve(TaskKind::PrReview),
     };
@@ -1433,6 +1438,56 @@ mod tests {
             !statuses.contains(&PrqStatus::AgentRunning.as_str().to_string()),
             "aggregate PrReview must not launch beside a thread task"
         );
+
+        let unchanged = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert!(unchanged.review_events.is_empty());
+
+        let revised_forge = FakeForge::new(Some(requested_pr()))
+            .with_conversation(review_conversation("a newer comment"));
+        let revised = drive_queue(
+            &cfg,
+            &Config::default(),
+            &revised_forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(revised.review_events.len(), 1);
+    }
+
+    #[test]
+    fn by_number_review_task_keeps_missing_worktree_human_only() {
+        let (_dir, db) = temp_db("prq-review-by-number");
+        let forge = FakeForge::new(Some(requested_pr()))
+            .with_conversation(review_conversation("rename this"));
+        let mut cfg = cfg();
+        cfg.agent_command = "true {prompt}".into();
+        let mut number_only = item();
+        number_only.worktree = None;
+        let mut statuses = Vec::new();
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![number_only],
+            |step| statuses.push(step.status.to_string()),
+        );
+        let task = db.list_review_tasks().unwrap().pop().unwrap();
+        assert!(task.worktree_path.is_empty());
+        assert_eq!(out.review_events.len(), 1);
+        assert_eq!(out.review_events[0].0.worktree_path, "");
+        assert!(!statuses.contains(&PrqStatus::AgentRunning.as_str().to_string()));
     }
 
     #[test]

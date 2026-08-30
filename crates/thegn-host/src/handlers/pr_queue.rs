@@ -408,6 +408,13 @@ pub(crate) fn drain_msgs(rx: &mut PrqRx, ctx: &mut PrqDrainCtx) {
                 *ctx.want_model_refresh = true;
             }
             PrqMsg::ReviewTask { event, revised } => {
+                // Publish the typed automation event only after the worker has
+                // confirmed the roster upsert. The inbox notification below is
+                // a separate once-keyed attention/audit event.
+                ctx.event_bus
+                    .publish(&thegn_core::event_bus::Event::PrThreadUnresolved(Box::new(
+                        (*event).clone(),
+                    )));
                 let kind = thegn_core::notification::NotificationKind::PrReviewTaskQueued;
                 let message = thegn_core::notification::review_task_queued_message(&event, revised);
                 let notification = thegn_core::notification::Notification {

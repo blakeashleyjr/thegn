@@ -3252,9 +3252,11 @@ fn populate_review_tasks(db: &thegn_core::db::Db, panel: &mut crate::panel::Pane
             continue;
         };
 
-        let cached = db
-            .get_pr_review_cache(&task.worktree_path)
-            .ok()
+        // Number-only tasks deliberately have no cache/worktree identity. Do
+        // not probe the empty key: a legacy or unrelated empty-key row must
+        // never hydrate identity for a human-only task.
+        let cached = (!task.worktree_path.is_empty())
+            .then(|| db.get_pr_review_cache(&task.worktree_path).ok().flatten())
             .flatten()
             .filter(|snapshot| snapshot.pr_number == pr_number);
         let identity = cached.as_ref().and_then(|snapshot| {

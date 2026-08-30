@@ -12,7 +12,9 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 const REVIEW_TASK_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
-     task_kind, source_key, source_revision, prompt, expected_head_oid, \
+     task_kind, source_key, source_revision, content_revision, prompt, expected_head_oid, \
+     pending_source_revision, pending_content_revision, pending_prompt, \
+     pending_expected_head_oid, pending_role, pending_worktree_path, \
      forge_action_attempts, next_forge_action_at_ms";
 
 impl Db {
@@ -23,22 +25,46 @@ impl Db {
         let id = self.conn().query_row(
             r#"INSERT INTO agent_dispatches
                  (issue_id, worktree_path, agent_name, dispatched_at_ms, status,
-                  task_kind, source_key, source_revision, prompt,
-                  expected_head_oid, forge_action_attempts,
+                 task_kind, source_key, source_revision, content_revision, prompt,
+                  expected_head_oid, pending_source_revision, pending_content_revision,
+                  pending_prompt, pending_expected_head_oid, pending_role,
+                  pending_worktree_path, forge_action_attempts,
                   next_forge_action_at_ms)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,NULL)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL)
                ON CONFLICT(task_kind, source_key)
                  WHERE task_kind IS NOT NULL AND source_key IS NOT NULL
                DO UPDATE SET
                  issue_id=excluded.issue_id,
-                 worktree_path=excluded.worktree_path,
-                 agent_name=excluded.agent_name,
-                 status=excluded.status,
-                 source_revision=excluded.source_revision,
-                 prompt=excluded.prompt,
-                 expected_head_oid=excluded.expected_head_oid,
-                 forge_action_attempts=0,
-                 next_forge_action_at_ms=NULL
+                 worktree_path=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                    THEN agent_dispatches.worktree_path ELSE excluded.worktree_path END,
+                 agent_name=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                 THEN agent_dispatches.agent_name ELSE excluded.agent_name END,
+                 status=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                             THEN agent_dispatches.status ELSE excluded.status END,
+                 source_revision=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                      THEN agent_dispatches.source_revision ELSE excluded.source_revision END,
+                 content_revision=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                       THEN agent_dispatches.content_revision ELSE excluded.content_revision END,
+                 prompt=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                             THEN agent_dispatches.prompt ELSE excluded.prompt END,
+                 expected_head_oid=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                        THEN agent_dispatches.expected_head_oid ELSE excluded.expected_head_oid END,
+                 pending_source_revision=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                              THEN excluded.source_revision ELSE NULL END,
+                 pending_content_revision=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                               THEN excluded.content_revision ELSE NULL END,
+                 pending_prompt=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                     THEN excluded.prompt ELSE NULL END,
+                 pending_expected_head_oid=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                                THEN excluded.expected_head_oid ELSE NULL END,
+                 pending_role=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                   THEN excluded.agent_name ELSE NULL END,
+                 pending_worktree_path=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                            THEN excluded.worktree_path ELSE NULL END,
+                 forge_action_attempts=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                            THEN agent_dispatches.forge_action_attempts ELSE 0 END,
+                 next_forge_action_at_ms=CASE WHEN agent_dispatches.status IN ('spawning','running')
+                                              THEN agent_dispatches.next_forge_action_at_ms ELSE NULL END
                RETURNING id"#,
             params![
                 task.issue_id,
@@ -49,6 +75,7 @@ impl Db {
                 REVIEW_TASK_KIND,
                 task.source_key,
                 task.source_revision,
+                task.content_revision,
                 task.prompt,
                 task.expected_head_oid,
             ],
@@ -101,7 +128,10 @@ impl Db {
     pub fn resolve_review_task(&self, transition: &ReviewTaskResolution) -> Result<bool> {
         let changed = self.conn().execute(
             "UPDATE agent_dispatches SET status=?1, forge_action_attempts=0, \
-             next_forge_action_at_ms=NULL \
+             next_forge_action_at_ms=NULL, pending_source_revision=NULL, \
+             pending_content_revision=NULL, pending_prompt=NULL, \
+             pending_expected_head_oid=NULL, pending_role=NULL, \
+             pending_worktree_path=NULL \
              WHERE id=?2 AND task_kind=?3 AND source_key=?4 AND status<>?1",
             params![
                 AgentDispatchStatus::Done.as_str(),
@@ -118,6 +148,31 @@ impl Db {
             "UPDATE agent_dispatches SET status=?1 \
              WHERE id=?2 AND task_kind=?3 AND source_key IS NOT NULL",
             params![status.as_str(), id, REVIEW_TASK_KIND],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Promote the newest snapshot retained while an active handoff was
+    /// running. The conditional update makes this safe against a concurrent
+    /// refresh and preserves the one-row `(task_kind, source_key)` identity.
+    pub fn promote_review_task_pending(&self, id: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE agent_dispatches SET
+                 worktree_path=COALESCE(pending_worktree_path, worktree_path),
+                 agent_name=COALESCE(pending_role, agent_name),
+                 source_revision=pending_source_revision,
+                 content_revision=pending_content_revision,
+                 prompt=pending_prompt,
+                 expected_head_oid=pending_expected_head_oid,
+                 status='queued', forge_action_attempts=0,
+                 next_forge_action_at_ms=NULL,
+                 pending_source_revision=NULL, pending_content_revision=NULL,
+                 pending_prompt=NULL, pending_expected_head_oid=NULL,
+                 pending_role=NULL, pending_worktree_path=NULL
+             WHERE id=?1 AND task_kind=?2 AND source_key IS NOT NULL
+               AND status IN ('spawning','running')
+               AND pending_source_revision IS NOT NULL",
+            params![id, REVIEW_TASK_KIND],
         )?;
         Ok(changed > 0)
     }
@@ -142,7 +197,7 @@ impl Db {
 }
 
 fn map_review_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewTaskRecord> {
-    let attempts = row.get::<_, i64>(11)?;
+    let attempts = row.get::<_, i64>(18)?;
     Ok(ReviewTaskRecord {
         id: row.get(0)?,
         issue_id: row.get(1)?,
@@ -153,10 +208,17 @@ fn map_review_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewTaskRecord
         task_kind: row.get(6)?,
         source_key: row.get(7)?,
         source_revision: row.get(8)?,
-        prompt: row.get(9)?,
-        expected_head_oid: row.get(10)?,
+        content_revision: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        prompt: row.get(10)?,
+        expected_head_oid: row.get(11)?,
+        pending_source_revision: row.get(12)?,
+        pending_content_revision: row.get(13)?,
+        pending_prompt: row.get(14)?,
+        pending_expected_head_oid: row.get(15)?,
+        pending_role: row.get(16)?,
+        pending_worktree_path: row.get(17)?,
         forge_action_attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
-        next_forge_action_at_ms: row.get(12)?,
+        next_forge_action_at_ms: row.get(19)?,
     })
 }
 
@@ -175,10 +237,11 @@ mod tests {
             status: AgentDispatchStatus::Queued,
             source_key: "review_thread:sha256:abc".into(),
             source_revision: revision.into(),
+            content_revision: "content".into(),
             prompt: prompt.into(),
             expected_head_oid: "head".into(),
             event: ReviewTaskEvent {
-                event: crate::pr_review_tasks::REVIEW_THREAD_EVENT,
+                event: crate::pr_review_tasks::REVIEW_THREAD_EVENT.into(),
                 source_key: "review_thread:sha256:abc".into(),
                 source_revision: revision.into(),
                 forge: "github".into(),
@@ -256,6 +319,42 @@ mod tests {
             db.get_review_task(id).unwrap().unwrap().status,
             AgentDispatchStatus::Done
         );
+    }
+
+    #[test]
+    fn active_upsert_freezes_inputs_and_retains_one_pending_revision() {
+        let db = Db::open_memory().unwrap();
+        let first = task("r1", "first");
+        let id = db.upsert_review_task(&first).unwrap();
+        db.update_review_task_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        db.record_review_forge_attempt(id, Some(99), AgentDispatchStatus::Running)
+            .unwrap();
+
+        let mut revised = task("r2", "second");
+        revised.content_revision = "content-2".into();
+        revised.expected_head_oid = "head-2".into();
+        revised.role = "new-role".into();
+        db.upsert_review_task(&revised).unwrap();
+        let active = db.get_review_task(id).unwrap().unwrap();
+        assert_eq!(active.source_revision, "r1");
+        assert_eq!(active.prompt, "first");
+        assert_eq!(active.expected_head_oid, "head");
+        assert_eq!(active.role, "coder");
+        assert_eq!(active.pending_source_revision.as_deref(), Some("r2"));
+        assert_eq!(active.pending_prompt.as_deref(), Some("second"));
+        assert_eq!(active.pending_role.as_deref(), Some("new-role"));
+        assert_eq!(active.next_forge_action_at_ms, Some(99));
+
+        assert!(db.promote_review_task_pending(id).unwrap());
+        let queued = db.get_review_task(id).unwrap().unwrap();
+        assert_eq!(queued.status, AgentDispatchStatus::Queued);
+        assert_eq!(queued.source_revision, "r2");
+        assert_eq!(queued.prompt, "second");
+        assert_eq!(queued.expected_head_oid, "head-2");
+        assert_eq!(queued.role, "new-role");
+        assert!(queued.pending_source_revision.is_none());
+        assert_eq!(queued.next_forge_action_at_ms, None);
     }
 
     #[test]

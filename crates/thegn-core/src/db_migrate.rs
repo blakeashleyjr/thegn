@@ -668,6 +668,38 @@ pub(crate) fn additive_schema(conn: &Connection) {
          WHERE task_kind IS NOT NULL AND source_key IS NOT NULL",
         [],
     );
+    // v65: while a review handoff is active, its durable inputs are immutable.
+    // One newer snapshot is retained on the same unique row for promotion after
+    // the handoff, so refresh/handle interleavings cannot lose feedback or make
+    // the worker resolve against a changed baseline.
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN content_revision TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_source_revision TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_content_revision TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_prompt TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_expected_head_oid TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_role TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_worktree_path TEXT",
+        [],
+    );
 }
 
 /// v62: credential-free lineage for successful session forks. Recipes remain
@@ -798,12 +830,15 @@ pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
 }
 
 /// Verify THE-22's additive roster columns and dedupe index before stamping
-/// schema v64. Preparing the typed projection catches a partial ALTER ladder.
-pub(crate) fn verify_v64_schema(conn: &Connection) -> Result<()> {
+/// schema v65. Preparing the typed projection catches a partial ALTER ladder.
+pub(crate) fn verify_v65_schema(conn: &Connection) -> Result<()> {
     verify_v63_schema(conn)?;
     conn.prepare(
-        "SELECT task_kind, source_key, source_revision, prompt,
-                expected_head_oid, forge_action_attempts,
+        "SELECT task_kind, source_key, source_revision, content_revision, prompt,
+                expected_head_oid, pending_source_revision,
+                pending_content_revision, pending_prompt,
+                pending_expected_head_oid, pending_role, pending_worktree_path,
+                forge_action_attempts,
                 next_forge_action_at_ms
          FROM agent_dispatches LIMIT 0",
     )?;
@@ -816,7 +851,7 @@ pub(crate) fn verify_v64_schema(conn: &Connection) -> Result<()> {
         )
         .optional()?;
     if index.is_none() {
-        anyhow::bail!("schema v64 migration did not create review-task dedupe index");
+        anyhow::bail!("schema v65 migration did not create review-task dedupe index");
     }
     Ok(())
 }
