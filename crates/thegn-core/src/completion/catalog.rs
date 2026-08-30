@@ -29,12 +29,14 @@ pub enum SourceKind {
     Env,
     /// `[profiles.<name>]` keybind profiles.
     Profile,
-    /// Built-in theme presets.
+    /// Built-in and valid local user themes.
     Theme,
     /// `[[agents]]` names.
     Agent,
     /// `[[tools]]` names.
     Tool,
+    /// Trusted `[[automations.rules]]` names.
+    Automation,
     /// `[[plugins]]` ids.
     Plugin,
     /// `[[pipeline.stages]]` names.
@@ -49,6 +51,9 @@ pub enum SourceKind {
     Capability,
     /// Bindable action ids from [`crate::keymap::BUILTINS`].
     Action,
+    /// Embedded skill package names. Configured user packages are discovered by
+    /// the host and deliberately not walked on the latency-sensitive TAB path.
+    Skill,
 
     /// clap already completes this slot from the tree itself — subcommand
     /// names, flags, and `ValueEnum` arguments such as `completions <shell>`.
@@ -135,12 +140,14 @@ impl SourceKind {
         SourceKind::Theme,
         SourceKind::Agent,
         SourceKind::Tool,
+        SourceKind::Automation,
         SourceKind::Plugin,
         SourceKind::Stage,
         SourceKind::McpServer,
         SourceKind::ConfigKey,
         SourceKind::Capability,
         SourceKind::Action,
+        SourceKind::Skill,
         SourceKind::Structural,
         SourceKind::Reserved(Reserved::Branch),
         SourceKind::Reserved(Reserved::Pr),
@@ -161,12 +168,14 @@ impl SourceKind {
             SourceKind::Theme => "theme",
             SourceKind::Agent => "agent",
             SourceKind::Tool => "tool",
+            SourceKind::Automation => "automation",
             SourceKind::Plugin => "plugin",
             SourceKind::Stage => "stage",
             SourceKind::McpServer => "mcp-server",
             SourceKind::ConfigKey => "config-key",
             SourceKind::Capability => "capability",
             SourceKind::Action => "action",
+            SourceKind::Skill => "skill",
             SourceKind::Structural => "structural",
             SourceKind::Reserved(r) => r.kind(),
         }
@@ -204,6 +213,7 @@ impl SourceKind {
                 | SourceKind::Profile
                 | SourceKind::Agent
                 | SourceKind::Tool
+                | SourceKind::Automation
                 | SourceKind::Plugin
                 | SourceKind::Stage
                 | SourceKind::McpServer
@@ -234,9 +244,9 @@ const fn slot(command_path: &'static str, arg_id: &'static str, source: SourceKi
 /// The catalog. Rows are grouped by source kind, and within a kind sorted by
 /// command path, so a new verb lands next to its neighbours.
 ///
-/// Not every implemented kind has a slot yet — `theme`, `tool`, `plugin` and
-/// `action` are served (and tested) but nothing in today's CLI grammar takes
-/// one, so they wait for a verb rather than being bound to an approximation.
+/// Not every implemented kind has a slot yet — `tool`, `plugin` and `action`
+/// are served (and tested) but nothing in today's CLI grammar takes one, so
+/// they wait for a verb rather than being bound to an approximation.
 /// Everything a slot could take and this does not classify is pinned in
 /// `test/completion-slot-ratchet.txt`, which only shrinks.
 pub const CATALOG: &[Slot] = &[
@@ -315,6 +325,8 @@ pub const CATALOG: &[Slot] = &[
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
     slot("session open", "worktree", SourceKind::Worktree),
+    slot("session fork", "worktree", SourceKind::Worktree),
+    slot("session move", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
     slot("share stop", "worktree", SourceKind::Worktree),
     slot("sprite-proxy", "worktree", SourceKind::Worktree),
@@ -338,6 +350,15 @@ pub const CATALOG: &[Slot] = &[
     slot("events tail", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
     slot("session browse", "session", SourceKind::Session),
+    slot("session fork", "session", SourceKind::Session),
+    // A native harness id is not enumerable through the daemon session source;
+    // recorded rows are selected through `agent.sessions` and the remaining
+    // provider-specific value is deliberately free-form.
+    slot(
+        "session fork",
+        "harness",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("session record", "session", SourceKind::Session),
     slot("session send", "session", SourceKind::Session),
     slot("session snapshot", "session", SourceKind::Session),
@@ -365,14 +386,20 @@ pub const CATALOG: &[Slot] = &[
     // A `global = true` arg: classified once at the root, and clap propagates
     // the binding into every subcommand with the arg itself.
     slot("", "profile", SourceKind::Profile),
+    slot("session move", "to_profile", SourceKind::Profile),
     // --- agent (`[[agents]]`) ----------------------------------------------
     // Both slots also accept an `[[tools]]` name or a bare provider id; the
     // configured agents are the useful majority and the arg stays free-form.
     slot("dispatch put", "agent_name", SourceKind::Agent),
     slot("session open", "agent", SourceKind::Agent),
+    slot("session fork", "agent", SourceKind::Agent),
     // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
     slot("dispatch put", "stage", SourceKind::Stage),
     slot("session open", "stage", SourceKind::Stage),
+    // --- automation (`[[automations.rules]]`) -----------------------------
+    slot("automations test", "rule", SourceKind::Automation),
+    // A cwd is a filesystem path; clap's structural/path completer owns it.
+    slot("session fork", "cwd", SourceKind::Structural),
     // --- pipeline run-completion (THE-76) -----------------------------------
     // Roster row ids: local SQLite, so a real source is implementable — but
     // nothing serves them yet (see `Reserved::DispatchRow`).
@@ -459,12 +486,23 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // --- embedded skill ---------------------------------------------------
+    slot("skills show", "name", SourceKind::Skill),
+    // Theme names are the merged built-in/local catalog. The import path is a
+    // filesystem value and keeps clap's structural completion behavior.
+    slot("theme set", "name", SourceKind::Theme),
+    slot("theme import", "name", SourceKind::Theme),
     // --- structural (clap completes these from the tree) -------------------
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
     slot("", "config", SourceKind::Structural),
+    // `config validate --repo <PATH>`: clap owns filesystem path completion.
+    slot("config validate", "repo", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("automations test", "fixture", SourceKind::Structural),
     slot("events tail", "kinds", SourceKind::Structural),
+    slot("skills seed", "worktree", SourceKind::Structural),
+    slot("theme import", "file", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------
@@ -473,6 +511,16 @@ pub const CATALOG: &[Slot] = &[
     slot("pr create", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt diff", "base", SourceKind::Reserved(Reserved::Branch)),
     slot("wt new", "base", SourceKind::Reserved(Reserved::Branch)),
+    slot(
+        "automations test",
+        "event",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "automations test",
+        "at",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("pr queue add", "pr", SourceKind::Reserved(Reserved::Pr)),
     slot("pr queue rm", "number", SourceKind::Reserved(Reserved::Pr)),
     slot(
@@ -566,7 +614,7 @@ mod tests {
             .filter(|k| k.is_implemented() && !k.reads_db() && !k.reads_config())
             .map(|k| k.kind())
             .collect();
-        assert_eq!(in_process, ["theme", "capability", "action"]);
+        assert_eq!(in_process, ["theme", "capability", "action", "skill"]);
     }
 
     #[test]

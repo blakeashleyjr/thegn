@@ -341,6 +341,8 @@ fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     };
     cfg.agents = agents.iter().map(mk).collect();
     cfg.tools = tools.iter().map(mk).collect();

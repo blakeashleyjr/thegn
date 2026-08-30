@@ -6,6 +6,8 @@ contexts: [zone:drawer, zone:corner]
 actions:
   [
     files-drawer,
+    drawer-cycle,
+    drawer-pick,
     toggle-corner,
     toggle-strip,
     grow-strip,
@@ -46,6 +48,21 @@ still closes it. `lf` and `broot` are reserved names for a future build.
 Whatever the kind, the drawer's pooling, prewarm, per-worktree open flag,
 layout and memory containment behave the same; `thegn doctor` reports the
 selected manager (binary availability, config-home mode, caps).
+
+The drawer registry extends `[[tools]]`: set `drawer_scope = "worktree"` for
+a tool with one pane per worktree, or `drawer_scope = "global"` for one pane
+pooled across worktree switches during this thegn process. `drawer_cwd` is
+optional; it is relative to the worktree for worktree tools and must be an
+absolute or `~`-prefixed path for global tools. The existing `name`, `command`,
+and `env` fields remain the launch configuration. Invalid entries are omitted
+without hiding the built-in files occupant.
+
+`drawer-cycle` advances through the files occupant and eligible configured
+tools in config order. `drawer-pick` opens a searchable picker by name; Enter
+selects the highlighted occupant and Esc cancels without changing state. The
+selected occupant is remembered independently for each scope, and a live pane
+is pooled according to `[drawer].pool_limit` while switching worktrees. Global
+panes are process-local and do not survive detach or restart.
 
 ## The corner pin
 

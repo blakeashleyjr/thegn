@@ -1545,3 +1545,32 @@ fn healed_live_fallback_renders_its_registered_worktrees() {
         "healing must unlock registry rows: healed={healed_wt_count} vs unhealed={unhealed_wt_count}"
     );
 }
+#[test]
+fn automation_pr_edges_come_from_typed_old_and_new_forge_facts() {
+    let old = thegn_core::forge::model::PrStatus {
+        checks: thegn_core::forge::model::ChecksSummary {
+            pending: 1,
+            total: 1,
+            ..Default::default()
+        },
+        review_decision: Some("APPROVED".into()),
+        ..Default::default()
+    };
+    let new = thegn_core::forge::model::PrStatus {
+        checks: thegn_core::forge::model::ChecksSummary {
+            passed: 1,
+            total: 1,
+            ..Default::default()
+        },
+        review_decision: Some("REVIEW_REQUIRED".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::hydrate::pr_automation_edges(&old, &new),
+        (Some(true), true)
+    );
+    assert_eq!(
+        crate::hydrate::pr_automation_edges(&new, &new),
+        (None, false)
+    );
+}

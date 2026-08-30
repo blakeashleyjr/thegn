@@ -21,8 +21,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir,
-    WaitCondition,
+    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, EditorOpenRequest,
+    ForkSpec, OpenSpec, PreviewFetchRequest, SplitDir, WaitCondition,
 };
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
@@ -54,8 +54,12 @@ impl From<ControlError> for Status {
     fn from(e: ControlError) -> Status {
         match &e {
             ControlError::NotFound(_) => Status::not_found(e.to_string()),
+            ControlError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
             ControlError::NoScope { .. } => Status::permission_denied(e.to_string()),
             ControlError::Conflict(_) => Status::aborted(e.to_string()),
+            ControlError::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
+            ControlError::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            ControlError::Unavailable(_) => Status::unavailable(e.to_string()),
             ControlError::Unimplemented(_) => Status::unimplemented(e.to_string()),
             ControlError::Internal(_) => Status::internal(e.to_string()),
         }
@@ -228,6 +232,7 @@ fn info_to_proto(i: &super::SessionInfo) -> proto::SessionInfo {
         attached_clients: i.attached_clients,
         lease_expires_at: i.lease_expires_at,
         error_active: i.error_active,
+        forked_from: i.forked_from.clone(),
     }
 }
 
@@ -321,6 +326,29 @@ impl Control for GrpcControl {
         Ok(Response::new(info_to_proto(&info)))
     }
 
+    async fn fork_session(
+        &self,
+        req: Request<proto::ForkSessionRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::ForkSession)?;
+        let r = req.into_inner();
+        let info = self
+            .api
+            .fork(ForkSpec {
+                session: r.session,
+                harness: (!r.harness.is_empty()).then_some(r.harness),
+                agent: (!r.agent.is_empty()).then_some(r.agent),
+                cwd: (!r.cwd.is_empty()).then_some(r.cwd),
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                scrollback: r.scrollback,
+                adopt: r.adopt,
+                tab: r.tab,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&info)))
+    }
+
     async fn send_input(
         &self,
         req: Request<proto::SendInputRequest>,
@@ -382,6 +410,35 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn open_editor(
+        &self,
+        req: Request<proto::OpenEditorRequest>,
+    ) -> Result<Response<proto::OpenEditorReply>, Status> {
+        self.authed(&req, Verb::OpenEditor)?;
+        let r = req.into_inner();
+        let line = r
+            .line
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("line is too large"))?;
+        let col = r
+            .col
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("col is too large"))?;
+        let request = EditorOpenRequest {
+            worktree: r.worktree,
+            path: (!r.path.is_empty()).then_some(r.path),
+            line,
+            col,
+        };
+        let target = request
+            .target()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.api.open_editor(target).await.map_err(Status::from)?;
+        Ok(Response::new(proto::OpenEditorReply { queued: true }))
     }
 
     async fn list_worktrees(
@@ -483,6 +540,32 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn preview_fetch(
+        &self,
+        req: Request<proto::PreviewFetchRequest>,
+    ) -> Result<Response<proto::PreviewFetchReply>, Status> {
+        self.authed(&req, Verb::PreviewFetch)?;
+        let r = req.into_inner();
+        let reply = self
+            .api
+            .preview_fetch(PreviewFetchRequest {
+                url: r.url,
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                include_console: r.include_console,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::PreviewFetchReply {
+            url: reply.url,
+            status: u32::from(reply.status),
+            content_type: reply.content_type.unwrap_or_default(),
+            body: reply.body,
+            truncated: reply.truncated,
+            console_errors: reply.console_errors,
+            diagnostics_source: reply.diagnostics_source,
+        }))
     }
 
     async fn git_status(
@@ -732,10 +815,74 @@ impl Control for GrpcControl {
                 body: r.body,
                 urgency: (!r.urgency.is_empty()).then_some(r.urgency),
                 source: (!r.source.is_empty()).then_some(r.source),
+                automation_origin: r.automation_origin.map(|origin| super::AutomationOrigin {
+                    root_event_id: origin.root_event_id,
+                    rule_id: origin.rule_id,
+                    run_id: origin.run_id,
+                }),
             })
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::NotifyPushReply { id }))
+    }
+
+    async fn automations_list(
+        &self,
+        req: Request<proto::AutomationsListRequest>,
+    ) -> Result<Response<proto::AutomationsListReply>, Status> {
+        self.authed(&req, Verb::AutomationsList)?;
+        let rules = self.api.automations_list().await.map_err(Status::from)?;
+        let rules_json =
+            serde_json::to_string(&rules).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::AutomationsListReply { rules_json }))
+    }
+
+    async fn automations_test(
+        &self,
+        req: Request<proto::AutomationsTestRequest>,
+    ) -> Result<Response<proto::AutomationsTestReply>, Status> {
+        self.authed(&req, Verb::AutomationsTest)?;
+        let request = req.into_inner();
+        let event = serde_json::from_str(&request.event_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let reply = self
+            .api
+            .automations_test(super::AutomationTestRequest {
+                rule: request.rule,
+                event,
+                at: request.at,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::AutomationsTestReply {
+            rule: reply.rule,
+            decisions_json: reply.decisions.to_string(),
+            executed: reply.executed,
+        }))
+    }
+
+    async fn tools_run(
+        &self,
+        req: Request<proto::ToolsRunRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::ToolsRun)?;
+        let request = req.into_inner();
+        let session = self
+            .api
+            .tools_run(super::ToolRunRequest {
+                name: request.name,
+                worktree: (!request.worktree.is_empty()).then_some(request.worktree),
+                automation_origin: request.automation_origin.map(|origin| {
+                    super::AutomationOrigin {
+                        root_event_id: origin.root_event_id,
+                        rule_id: origin.rule_id,
+                        run_id: origin.run_id,
+                    }
+                }),
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&session)))
     }
 
     async fn me(&self, req: Request<proto::MeRequest>) -> Result<Response<proto::MeReply>, Status> {
@@ -770,6 +917,7 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.attach",
     "sessions.detach",
     "sessions.open",
+    "sessions.fork",
     "sessions.input",
     "sessions.resize",
     "sessions.snapshot",
@@ -778,7 +926,9 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.split",
     "worktrees.list",
     "worktrees.open",
+    "editor.open",
     "browser.drive",
+    "preview.fetch",
     "git.status",
     "git.stage",
     "git.commit",
@@ -793,6 +943,9 @@ pub const GRPC_CAPS: &[&str] = &[
     "me",
     "pr.status",
     "notify.push",
+    "automations.list",
+    "automations.test",
+    "tools.run",
 ];
 
 #[cfg(test)]
@@ -922,5 +1075,19 @@ mod tests {
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");
         }
+    }
+
+    #[test]
+    fn session_info_lineage_is_additive_on_the_grpc_wire() {
+        let info = crate::control::SessionInfo {
+            id: "child".into(),
+            forked_from: Some("parent".into()),
+            ..Default::default()
+        };
+        let wire = super::info_to_proto(&info);
+        assert_eq!(wire.forked_from.as_deref(), Some("parent"));
+
+        let legacy = crate::control::SessionInfo::default();
+        assert_eq!(super::info_to_proto(&legacy).forked_from, None);
     }
 }

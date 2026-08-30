@@ -1,6 +1,9 @@
 ---
 name: pipeline
 description: Run a configured multi-stage agent pipeline (architect → coders → reviewer → land) over one tracker issue from inside thegn — you are the Lead, thegn is the hands. Read the stage chart from config, dispatch a stage worker per slot with one call, wait on it, verify the committed artifact, and advance. Resume a failed row with the finisher pattern instead of re-dispatching, and respect chunk file scopes. Use when asked to take an issue through a design/implement/review/land pipeline, fan chunks out to several coding agents, or resume a pipeline after a restart.
+harnesses: claude,codex,pi
+gate: pipeline
+when: create,startup,explicit
 ---
 
 # Conduct an agent pipeline (`/pipeline`)
@@ -177,7 +180,8 @@ because each carries its own session.
 ## 3. Dispatch — one call: row + session + stage overrides
 
 ```bash
-thegn session open --stage <stage.name> --issue <issue-id> --adopt --json
+thegn session open --stage <stage.name> --issue <issue-id> \
+  --worktree <path> --adopt --json
 ```
 
 This is the whole dispatch: it renders the stage's prompt template (an explicit
@@ -191,7 +195,8 @@ config). `--adopt` asks a running compositor to graft the session into a pane;
 **For a coder chunk, pass the chunk file** so the row records its scope:
 
 ```bash
-thegn session open --stage code --issue linear:ABC-123 --adopt --json \
+thegn session open --stage code --issue linear:ABC-123 \
+  --worktree <path> --adopt --json \
     --chunk .thegn/pipeline/ABC-123/code/chunk-2.md
 ```
 
