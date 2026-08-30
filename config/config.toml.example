@@ -800,9 +800,11 @@ open_in = "auto"       # auto | pane | external — where the launch runs
 # output = "popup"             # none | popup | terminal
 # prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
 
-# Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
-# file sink is opt-in. THEGN_LOG is a tracing-style filter that refines the
-# level per-module, e.g. THEGN_LOG=debug,thegn::db=trace
+# Tracing diagnostics. CLI tracing can go to level-gated, branded stderr; the
+# compositor and pane daemon use their own rotating file sinks when tracing is
+# requested. THEGN_LOG is a tracing-style filter that refines the level per
+# module, e.g. THEGN_LOG=debug,thegn::db=trace. The compositor's raw stderr is
+# captured separately in thegn-stderr.log while it owns the alternate screen.
 [log]
 level = "info"            # error | warn | info | debug | trace
 file = false              # mirror to a rotating file under `dir`
@@ -810,8 +812,8 @@ dir = ""                  # "" => $XDG_STATE_HOME/thegn/logs
 rotation_size_mb = 5
 max_files = 5
 format = "text"           # text | json
-stderr_cap_mb = 5         # rotate thegn-stderr.log (and audit.log) aside at
-                          # startup once over this many MiB
+stderr_cap_mb = 5         # cap raw stderr capture (and audit.log); rotate each
+                          # aside at startup once over this many MiB
 
 # Crash reporting + traceability. Every panic (compositor, daemon, or CLI) is
 # restored terminal-first and writes a local crash report under
