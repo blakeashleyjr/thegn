@@ -109,6 +109,32 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "preview.fetch",
+        description: "Fetch a preview URL through the daemon's bounded, credential-free HTTP \
+                      client. Loopback targets only unless the operator explicitly enables \
+                      external preview URLs. Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "url",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute http/https preview URL",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree used to select bounded dev-server pane diagnostics",
+            },
+            ArgSpec {
+                name: "include_console",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Include source-labelled dev-server error lines (default false)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "leases.list",
         description: "Relay lease state per session — which detached sessions are being \
                       kept warm, and until when. Requires a running daemon.",
@@ -353,6 +379,7 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "preview.fetch",
     "leases.list",
     "me",
     "agent.sessions",
@@ -734,6 +761,7 @@ mod tests {
         let read = [
             "sessions.list",
             "worktrees.list",
+            "preview.fetch",
             "leases.list",
             "me",
             "agent.sessions",

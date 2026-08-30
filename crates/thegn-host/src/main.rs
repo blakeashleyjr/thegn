@@ -161,6 +161,7 @@ mod pr_driver;
 mod pr_view;
 mod predict;
 mod preview;
+mod preview_fetch;
 mod preview_gfx;
 mod preview_pane;
 mod preview_render;

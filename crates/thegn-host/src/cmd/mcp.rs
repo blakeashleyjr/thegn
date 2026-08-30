@@ -444,6 +444,19 @@ async fn fetch_state(
             let sessions = c.sessions().await.map_err(|e| e.to_string())?;
             Ok(json!({ "sessions": sessions }))
         }
+        "preview.fetch" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::PreviewFetchRequest {
+                url: str_arg(args, "url").ok_or("missing `url`")?.to_string(),
+                worktree: str_arg(args, "worktree").map(str::to_string),
+                include_console: args
+                    .get("include_console")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            };
+            let reply = c.preview_fetch(&request).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
         "leases.list" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             c.leases().await.map_err(|e| e.to_string())
@@ -757,6 +770,7 @@ mod tests {
     const READ_CAPS: &[&str] = &[
         "sessions.list",
         "worktrees.list",
+        "preview.fetch",
         "leases.list",
         "me",
         "agent.sessions",
