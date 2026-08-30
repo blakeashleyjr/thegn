@@ -216,6 +216,8 @@ mod tests {
                 permissions: Vec::new(),
                 resume: *resume,
                 route_via_proxy: false,
+                drawer_scope: None,
+                drawer_cwd: None,
             });
         }
         c.sandbox.backend = SandboxBackend::Auto;
@@ -304,6 +306,8 @@ mod tests {
                 permissions: Vec::new(),
                 resume: false,
                 route_via_proxy: false,
+                drawer_scope: None,
+                drawer_cwd: None,
             });
             let wt = worktree_path("tool-record");
             register(&wt, "yazi");

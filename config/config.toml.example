@@ -77,7 +77,10 @@ confirm_delete = true
 # get <dotted.key>` prints one value; `thegn config validate` checks it.
 
 [ui]
-# UI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto" to detect.
+# TUI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto". Selection
+# happens once at startup (restart to apply changes). Precedence is an explicit
+# value here, then non-empty LC_ALL, then non-empty LANG, then en-US. This does
+# not localize CLI or machine-readable output.
 language = "auto"
 # Ask before removing a workspace (Alt+Shift+X, or the sidebar "Remove
 # workspace" action — both share one modal). The modal pre-selects the safe
@@ -164,8 +167,8 @@ sidebar_icon_status = ""
 # focused chrome edge. Unfocused frames use `colors.border`.
 [theme]
 # Named palette preset: "prism" (default), "storm", "light", "abyss", "ember",
-# "aurora". Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues]
-# overrides apply on top.
+# "aurora", or a local theme name from $XDG_CONFIG_HOME/thegn/themes.
+# Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues] overrides apply on top.
 preset = "prism"
 accent = "#6ee7d8"
 focus_border = "#6ee7d8"
@@ -280,7 +283,8 @@ process_io = false         # also read per-process disk IO (one extra /proc read
 # for the focused zone), "pr" (forge + PR number, state-colored), "tests"
 # (✓pass ✗fail rollup of the last test run; green all-pass, red on failure;
 # hidden until a run), "loc" (tokei line count), "disk" (the active worktree's
-# size, incl. target/), "status" (transient messages).
+# size, incl. target/), "status" (transient messages), and "mq" (the scoped
+# merge-queue summary; opt-in because it is absent from the default list).
 [bars]
 top_left = ["brand"]
 # Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
@@ -290,7 +294,7 @@ top_left = ["brand"]
 top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"]
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
-bottom_left = ["help", "keyhints"]
+bottom_left = ["help", "drawer", "keyhints"]
 bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets. Validated at load — an
 # invalid specifier warns and falls back to the default rather than panicking
@@ -1082,6 +1086,18 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # [workspace.my-repo.keybinds]
 # new-worktree = "Alt w"
 
+# Per-worktree lifecycle commands for this workspace. These lists accumulate
+# after the global [hooks] table and before a repo-root .thegn.* [hooks] table.
+# Repo-authored entries are trust-gated and can never block an operation.
+# [workspace.my-repo.hooks]
+# pre_create = ["./.thegn/pre-create.sh"]
+# post_create = [{ command = "pnpm install --frozen-lockfile", wait = true,
+#                  timeout_secs = 120, on_failure = "warn" }]
+# pre_destroy = ["docker compose down"]
+# post_destroy = []
+# session_start = []
+# session_end = []
+
 # Per-program host-action overlays, keyed by the focused pane's program name.
 # These intercept *before* the active mode — useful for binding a host action
 # while a TUI like lazygit is focused.
@@ -1145,6 +1161,10 @@ command = "claude"
 #                       #   launch (claude: .claude/settings.local.json →
 #                       #   permissions.allow; other keys in that file survive).
 #                       #   Empty = leave the file alone.
+# Add this agent to the drawer at worktree or process-global scope; unset by default.
+# drawer_scope = "worktree"
+# Start its drawer pane relative to the scope root (or absolute/~); unset uses the root.
+# drawer_cwd = "."
 
 [[agents]]
 name = "aider"
@@ -1292,6 +1312,24 @@ command = "lazygit"
 # permissions = []      # headless allow-list seeded into the worktree at launch
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
+# drawer_scope = "worktree"  # add this tool to the drawer: worktree | global
+# drawer_cwd = ".atac"       # optional; relative to worktree, or absolute/~ for global
+
+# Drawer occupants reuse this same [[tools]] catalog. The built-in files drawer
+# is always first; entries without drawer_scope remain picker-only.
+# Worktree ATAC keeps its state under each worktree. A global database tool uses
+# one process-local pane shared while switching worktrees.
+[[tools]]
+name = "atac"
+command = "atac"
+drawer_scope = "worktree"
+# drawer_cwd = ".atac"
+# env = { ATAC_MAIN_DIR = ".atac" }
+
+[[tools]]
+name = "db"
+command = "psql"
+drawer_scope = "global"
 
 [[tools]]
 name = "yazi"
@@ -1906,23 +1944,49 @@ active_mode = ""
 # windows = ["22:00-08:00", "sat,sun 00:00-24:00"]
 # allow_priority = "alert"
 
-# Sound / chime (item 429). `mode`: "chime" (default — a bundled chime played
-# through an auto-detected system player: paplay/pw-play/afplay/PowerShell/…,
-# falling back to the terminal BEL), "bell" (terminal BEL), "command" (run a
-# command line off-thread), or "off". Fires at/above `min_priority` EXCEPT for
-# the `always_kinds` list, which chimes regardless (so a background agent that
-# finishes or needs you is audible out of the box). `suppress_focused` silences
-# the cue for the worktree you're currently viewing (the inbox record + desktop
-# toast still fire). `chime_file` points `mode = "chime"` at your own .wav.
+# Sound effects (item 429). The zero-config default is the terminal BEL. Sound
+# is opt-in per custom event: add a key under `per_kind` to select a file or
+# pack entry for that notification kind. All sound paths and packs are trusted
+# user configuration; an untrusted repository overlay cannot supply them.
+#
+# `mute = true` disables sound globally. `mode` accepts "bell" (terminal BEL),
+# "chime" (legacy generic file mode), "command" (the legacy configured command
+# mode), or "off". `min_priority` accepts "info", "notice", or "alert";
+# events below it are silent unless listed in `always_kinds`. The default
+# always-kinds are agent_done, agent_attention, and agent_failed. They bypass
+# only this priority floor: mute, DND, rule routing, and focused-worktree
+# suppression still apply. `suppress_focused` silences a cue for the worktree
+# currently in view while retaining its inbox/other-channel delivery.
+#
+# `pack` is an absolute or `~`-expanded trusted directory. `per_kind` values
+# use one restricted reference vocabulary: "off"/"none", "bell"/"terminal"
+# (or "builtin:bell"), "pack:<name>", or an absolute/`~`-expanded file path.
+# Bare pack names, relative paths, and shell commands are rejected. Pack names
+# are looked up from the immutable startup/reload snapshot; the provider checks
+# the file extension. Missing/unreadable files, packs, providers, and unsupported
+# formats fall back to the terminal BEL. `volume` is a finite 0.0..=1.0 hint;
+# providers without volume support play at their default volume.
+#
+# `chime_file` is the legacy generic file used only by `mode = "chime"` and
+# accepts an absolute or `~` path. `command` and `per_priority` retain their
+# legacy command-mode compatibility behavior; commands are trusted user config
+# and run off the event loop. No command language is accepted by `per_kind`.
 # [notifications.sound]
-# mode = "chime"
-# min_priority = "alert"
+# mute = false
+# mode = "bell"                 # bell | chime | command | off
+# min_priority = "alert"        # info | notice | alert
 # always_kinds = ["agent_done", "agent_attention", "agent_failed"]
 # suppress_focused = true
-# chime_file = "~/sounds/ding.wav"     # optional custom chime (default: bundled)
-# command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"  # mode = "command"
-# [notifications.sound.per_priority]   # optional per-priority command overrides
-# alert = "paplay /usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
+# pack = ""                     # trusted absolute or ~-expanded directory
+# volume = 1.0                   # provider hint, clamped/validated to 0.0..=1.0
+# chime_file = ""               # legacy mode = "chime" file
+# command = ""                  # legacy mode = "command" shell command
+# per_priority = {}              # legacy command-mode priority overrides
+# [notifications.sound.per_kind]
+# agent_attention = "pack:attention"
+# agent_done = "~/sounds/finished.wav"
+# queue_landed = "pack:merged"
+# log_error = "pack:error"
 
 # Routing modes (item 427): named presets you switch between at runtime with
 # Ctrl+Alt+m. A rule's `modes` selector limits it to the listed modes;
@@ -2193,6 +2257,30 @@ max_results = 1000
 # go = ["go"]
 # ruby = ["ruby"]
 # extra = []      # nixpkgs packages appended for every language mix
+
+# ── Worktree lifecycle hooks ────────────────────────────────────────────────
+# Host-side commands run at worktree/session boundaries. Lists retain their
+# declaration order and accumulate global → [workspace.<slug>] → repo overlay.
+# A string is shorthand for an object with wait = false, timeout_secs = 120,
+# and the event default for on_failure (pre_create/pre_destroy = "block";
+# every other event = "warn"). `wait` is valid only for post_create.
+#
+# The repo .thegn.* [hooks] table is untrusted until approved through the
+# existing repo trust flow; its entries are omitted while pending and are
+# always warn-only after approval. The legacy [sandbox] prepare list is also
+# run as the head of global post_create (and repo sandbox.prepare as the head
+# of repo post_create), with warn/no-wait semantics.
+[hooks]
+# String shorthand:
+pre_create = ["./.thegn/pre-create.sh"]
+# Object form with explicit policy:
+post_create = [
+  { command = "pnpm install --frozen-lockfile", wait = false, timeout_secs = 120, on_failure = "warn" },
+]
+pre_destroy = ["docker compose down"]
+post_destroy = []
+session_start = []
+session_end = []
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
@@ -2919,6 +3007,24 @@ ready_timeout_secs = 20
 # [share.iroh]    # provider = "iroh" — https://github.com/n0-computer/dumbpipe
 # extra_args = []  # extra `dumbpipe listen-tcp` flags (e.g. a self-hosted relay).
 #                  # The consumer connects with `dumbpipe connect-tcp <ticket>`.
+
+# ── Frontend preview discovery + fetch policy (`[preview]`) ─────────────────
+# Preview discovers candidate dev servers from this explicit list, bounded pane
+# output, and literal ports in package.json scripts.dev/scripts.start. `ports`
+# is a hint/allowlist only: thegn NEVER launches a process or executes a package
+# script from this section. All keys have launch-time environment equivalents.
+#
+# `preview.fetch` is an HTTP(S) GET with no cookies, authorization, browser
+# profile, or ambient proxy. By default every initial URL AND redirect must use
+# the exact authorities localhost, 127.0.0.1, or ::1. Setting
+# `allow_external_urls = true` opts out of that SSRF boundary, but timeout and
+# body limits still apply.
+[preview]
+enabled = true               # THEGN_PREVIEW_ENABLED; enable preview discovery/surfaces
+ports = []                   # THEGN_PREVIEW_PORTS (comma-separated), e.g. "3000,5173"
+fetch_timeout_ms = 3000      # THEGN_PREVIEW_FETCH_TIMEOUT_MS; clamped to 100..30000
+max_body_bytes = 1048576     # THEGN_PREVIEW_MAX_BODY_BYTES; capped at 16 MiB
+allow_external_urls = false  # THEGN_PREVIEW_ALLOW_EXTERNAL_URLS; localhost-only when false
 
 # ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
 # The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE

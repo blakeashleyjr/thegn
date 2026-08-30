@@ -36,6 +36,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/sessions", &["sessions.list", "sessions.open"], || {
         get(http::list_sessions).post(http::open_session)
     }),
+    route("/v1/sessions/fork", &["sessions.fork"], || {
+        post(http::fork_session)
+    }),
     route("/v1/sessions/{s}/snapshot", &["sessions.snapshot"], || {
         get(http::snapshot)
     }),
@@ -96,6 +99,9 @@ pub static ROUTES: &[Route] = &[
         || post(http::dispatch_set_status),
     ),
     route("/v1/browser", &["browser.drive"], || post(http::browser)),
+    route("/v1/preview/fetch", &["preview.fetch"], || {
+        post(http::preview_fetch)
+    }),
     route("/v1/git/status", &["git.status"], || get(http::git_status)),
     route("/v1/git/stage", &["git.stage"], || post(http::git_stage)),
     route("/v1/git/commit", &["git.commit"], || post(http::git_commit)),
@@ -150,6 +156,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("me", "GET", "/v1/me"),
     ("sessions.list", "GET", "/v1/sessions"),
     ("sessions.open", "POST", "/v1/sessions"),
+    ("sessions.fork", "POST", "/v1/sessions/fork"),
     ("sessions.snapshot", "GET", "/v1/sessions/{s}/snapshot"),
     ("sessions.input", "POST", "/v1/sessions/{s}/input"),
     ("sessions.resize", "POST", "/v1/sessions/{s}/resize"),
@@ -177,6 +184,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
         "/v1/dispatches/{id}/status",
     ),
     ("browser.drive", "POST", "/v1/browser"),
+    ("preview.fetch", "POST", "/v1/preview/fetch"),
     ("git.status", "GET", "/v1/git/status"),
     ("git.stage", "POST", "/v1/git/stage"),
     ("git.commit", "POST", "/v1/git/commit"),

@@ -110,3 +110,13 @@ agent through `thegn dispatch put` — still reaches an open board immediately.
 
 See [[configuration]] for the `[[pipeline.stages]]` keys, and
 [[workflows]] for what the stages are for.
+
+## Worktree setup in a pipeline
+
+`[[pipeline.stages]]` is a structure-only roster: it validates and describes
+the chart, but it does not create worktrees or execute lifecycle commands.
+External supervisors should create worktrees with `thegn wt new` or the
+existing `worktrees.create` control operation. Those doors use the shared
+`pre_create`/`post_create` lifecycle, and the same `pre_destroy`/
+`post_destroy` hooks apply when the worktree is later removed. There is no
+pipeline-specific hook configuration.

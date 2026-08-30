@@ -22,7 +22,7 @@ use super::auth;
 use super::http::{ControlState, router};
 use super::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlResult, GitFileStatus, OpenSpec,
-    SessionInfo,
+    PreviewFetchReply, PreviewFetchRequest, SessionInfo,
 };
 
 /// Records every trait call; returns minimal canned data.
@@ -170,6 +170,23 @@ impl ControlApi for FakeApi {
     fn drive_browser(&self, _cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>> {
         self.record("drive_browser");
         Box::pin(async { Err(super::ControlError::Unimplemented("drive-browser")) })
+    }
+    fn preview_fetch(
+        &self,
+        req: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        self.record("preview_fetch");
+        Box::pin(async move {
+            Ok(PreviewFetchReply {
+                url: req.url,
+                status: 200,
+                content_type: Some("text/plain".into()),
+                body: "ok".into(),
+                truncated: false,
+                console_errors: Vec::new(),
+                diagnostics_source: "unavailable".into(),
+            })
+        })
     }
     fn git_status<'a>(
         &'a self,
@@ -319,6 +336,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"repo":"r"}"#
     } else if path.contains("/browser") {
         r#"{"session":null,"action":"reload"}"#
+    } else if path.contains("/preview/fetch") {
+        r#"{"url":"http://localhost:3000/"}"#
     } else if path.contains("/git/stage") {
         r#"{"worktree":"/w","paths":["a"]}"#
     } else if path.contains("/git/commit") {
@@ -350,6 +369,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
         ("GET", "/v1/git/status?worktree=%2Fw"),
         ("GET", "/v1/merge/list?worktree=%2Fw"),
         ("GET", "/v1/pr/status"),
+        ("POST", "/v1/preview/fetch"),
     ] {
         assert_eq!(
             call(&r, method, path, Some(&read)).await,
@@ -357,6 +377,53 @@ async fn read_scope_covers_exactly_the_read_surface() {
             "{method} {path} must be readable with read scope"
         );
     }
+}
+
+#[tokio::test]
+async fn preview_fetch_is_rejected_without_read_scope_before_the_api() {
+    let r = rig(false);
+    let none = token(&r, "");
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&none)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(r.api.calls().is_empty());
+
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&read)).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), ["preview_fetch"]);
+}
+
+#[tokio::test]
+async fn preview_fetch_authenticates_before_decoding_its_bounded_body() {
+    let r = rig(false);
+    let none = token(&r, "");
+    let request = |bearer: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/preview/fetch")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap()
+    };
+    let response = router(r.state.clone())
+        .oneshot(request(&none))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(r.api.calls().is_empty());
+
+    let read = token(&r, "read");
+    let response = router(r.state.clone())
+        .oneshot(request(&read))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(r.api.calls().is_empty());
 }
 
 #[tokio::test]
@@ -898,9 +965,10 @@ mod audit_capture {
     }
 }
 
-/// Every mutating control call and every scope rejection emits one structured
-/// audit record on `thegn::control::audit`, naming the caller, capability,
-/// resource and outcome — never a secret.
+/// Every mutating control call, the network-reaching read-scoped preview fetch,
+/// and every scope rejection emits one structured audit record on
+/// `thegn::control::audit`, naming the caller, capability, resource and outcome
+/// — never a secret.
 #[tokio::test]
 async fn mutating_calls_and_rejections_emit_audit_records() {
     let captured = audit_capture::Captured::default();
@@ -924,6 +992,10 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
         call(&r, "GET", "/v1/sessions", Some(&read)).await,
         StatusCode::OK
     );
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&read)).await,
+        StatusCode::OK
+    );
 
     let recs = captured.records();
     let ok = recs.iter().find(|m| {
@@ -936,6 +1008,10 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
     assert!(recs.iter().any(|m| {
         m.get("capability").map(String::as_str) == Some("sessions.input")
             && m.get("outcome").map(String::as_str) == Some("no_scope")
+    }));
+    assert!(recs.iter().any(|m| {
+        m.get("capability").map(String::as_str) == Some("preview.fetch")
+            && m.get("outcome").map(String::as_str) == Some("ok")
     }));
     // A read GET produced no record.
     assert!(

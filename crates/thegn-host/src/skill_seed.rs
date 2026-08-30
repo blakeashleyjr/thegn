@@ -1010,6 +1010,8 @@ mod tests {
             permissions: Vec::new(),
             resume: false,
             route_via_proxy: false,
+            drawer_scope: None,
+            drawer_cwd: None,
         }
     }
 
