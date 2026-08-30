@@ -724,6 +724,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             compose_row_lines(
                 row,
                 wt,
+                model.preview.as_ref().filter(|_| row.active),
                 is_cursor,
                 show_detail,
                 is_last,
@@ -1491,6 +1492,7 @@ const STAGE_TAG_MAX: usize = 6;
 fn compose_row_lines(
     row: &crate::sidebar::SidebarRow,
     window_title: Option<&str>,
+    preview: Option<&crate::chrome::PreviewView>,
     is_cursor: bool,
     show_detail: bool,
     is_last: bool,
@@ -1770,6 +1772,21 @@ fn compose_row_lines(
                     push_sp(&mut right);
                     right.push(seg(Tok::Slot(S::Dim), gl.jj));
                 }
+            }
+            if let Some(preview) = preview {
+                push_sp(&mut right);
+                let (tone, marker) = match preview.status {
+                    thegn_core::preview::PreviewStatus::Up => {
+                        (Tok::Hue(theme::Hue::Green), gl.dot_filled)
+                    }
+                    thegn_core::preview::PreviewStatus::Down => {
+                        (Tok::Hue(theme::Hue::Red), gl.cross)
+                    }
+                    thegn_core::preview::PreviewStatus::Unknown => {
+                        (Tok::Hue(theme::Hue::Amber), gl.dot_hollow)
+                    }
+                };
+                right.push(seg(tone, format!("{marker}:{}", preview.port)));
             }
             // Compact open-PR chip (⬡N) — the full `PR #N` moves to the detail line.
             if disp.show_pr_chip
@@ -2344,7 +2361,7 @@ mod tests {
 
         let mut ws = crate::sidebar::SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha");
         ws.dir = false;
-        let lines = compose_row_lines(&ws, None, false, false, true, None, None, &disp);
+        let lines = compose_row_lines(&ws, None, None, false, false, true, None, None, &disp);
         let Line::Segs(segs) = &lines[0] else {
             panic!(
                 "workspace row composes to one Segs line, got {:?}",
@@ -2362,7 +2379,7 @@ mod tests {
 
         let mut folder = crate::sidebar::SidebarRow::base(RowKind::Folder, 1, "Merged", "alpha");
         folder.child_count = 3;
-        let lines = compose_row_lines(&folder, None, false, false, true, None, None, &disp);
+        let lines = compose_row_lines(&folder, None, None, false, false, true, None, None, &disp);
         let Line::Segs(segs) = &lines[0] else {
             panic!("folder row composes to one Segs line, got {:?}", lines[0])
         };
@@ -2592,7 +2609,7 @@ mod tests {
         let gl = crate::caps::active_glyphs();
         let disp = SidebarDisplay::default();
         let text = |row: &SidebarRow| -> String {
-            compose_row_lines(row, None, false, false, true, None, None, &disp)
+            compose_row_lines(row, None, None, false, false, true, None, None, &disp)
                 .into_iter()
                 .flat_map(|l| match l {
                     crate::seg::Line::Segs(v) => v,
