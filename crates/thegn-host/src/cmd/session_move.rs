@@ -14,7 +14,7 @@ use thegn_core::db::Db;
 use thegn_core::outln;
 use thegn_core::profile::{self, ProfilePaths};
 use thegn_core::session_migration::{MigrationBundle, MigrationCounts, plan_migration};
-use thegn_core::store::{ControlStore, SessionMigrationStore};
+use thegn_core::store::{ControlStore, DaemonRow, SessionMigrationStore};
 use thegn_svc::control::SessionInfo;
 use thegn_svc::control::client::ControlClient;
 
@@ -408,10 +408,13 @@ async fn source_daemon(
         now,
         thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS,
     )?;
-    if live_registered.is_empty() {
+    let live_daemon = migration_fenced_daemon(&live_registered)?;
+    if live_daemon.is_none() {
         if !referenced.is_empty()
             && let Some(daemon) = registered.iter().max_by_key(|daemon| daemon.heartbeat_at)
         {
+            let daemon = migration_fenced_daemon(std::slice::from_ref(daemon))?
+                .expect("one selected registry row");
             let client = Box::new(ControlClient::new(
                 thegn_svc::control::client::ControlAddr::Unix(daemon.endpoint.clone().into()),
             ));
@@ -423,18 +426,35 @@ async fn source_daemon(
         return Ok((None, Vec::new()));
     }
 
-    let addr = thegn_svc::control::client::discover(db, &scope, now)
-        .ok_or_else(|| anyhow!("source daemon is registered but not discoverable"))?;
-    let client = Box::new(ControlClient::new(addr));
+    let daemon = live_daemon.expect("checked above");
+    let client = Box::new(ControlClient::new(
+        thegn_svc::control::client::ControlAddr::Unix(daemon.endpoint.clone().into()),
+    ));
     let sessions = checked_sessions(client.as_ref())
         .await
         .context("source daemon is registered but unreachable; refusing migration")?;
-    // Keep this assertion explicit: if a future registry implementation can
-    // return a live row without `discover` seeing it, do not silently proceed.
-    if registered.is_empty() {
-        bail!("source daemon registry changed during migration preflight")
-    }
     Ok((Some(client), sessions))
+}
+
+/// Select the one daemon whose session roster migration can trust. An older
+/// daemon does not honor the per-worktree file fence, and multiple live rows
+/// cannot be reduced to one roster without hiding sessions from the others.
+fn migration_fenced_daemon(daemons: &[DaemonRow]) -> Result<Option<&DaemonRow>> {
+    if daemons.len() > 1 {
+        bail!("multiple source daemons are registered; stop them before migrating a session");
+    }
+    let Some(daemon) = daemons.first() else {
+        return Ok(None);
+    };
+    if !daemon
+        .version
+        .ends_with(crate::daemon::SESSION_MIGRATION_FENCE_VERSION_SUFFIX)
+    {
+        bail!(
+            "source daemon predates session migration fencing; restart it before migrating a session"
+        );
+    }
+    Ok(Some(daemon))
 }
 
 async fn checked_sessions(control: &dyn MigrationControl) -> Result<Vec<SessionInfo>> {
@@ -806,6 +826,40 @@ mod tests {
         };
         let error = futures::executor::block_on(checked_sessions(&control)).unwrap_err();
         assert!(error.to_string().contains("socket unavailable"));
+    }
+
+    #[test]
+    fn migration_refuses_unfenced_or_ambiguous_source_daemons() {
+        let daemon = |id: &str, version: &str| DaemonRow {
+            daemon_id: id.into(),
+            pid: 1,
+            scope: "/state".into(),
+            endpoint: format!("/run/{id}.sock"),
+            tcp_addr: None,
+            hostname: "host".into(),
+            version: version.into(),
+            started_at: 1,
+            heartbeat_at: 1,
+        };
+        let current = daemon(
+            "current",
+            &format!(
+                "0.1.0{}",
+                crate::daemon::SESSION_MIGRATION_FENCE_VERSION_SUFFIX
+            ),
+        );
+        assert_eq!(
+            migration_fenced_daemon(std::slice::from_ref(&current))
+                .unwrap()
+                .map(|row| row.daemon_id.as_str()),
+            Some("current")
+        );
+
+        let old = daemon("old", "0.1.0");
+        let error = migration_fenced_daemon(&[old]).unwrap_err();
+        assert!(error.to_string().contains("predates"));
+        let error = migration_fenced_daemon(&[current.clone(), current]).unwrap_err();
+        assert!(error.to_string().contains("multiple source daemons"));
     }
 
     #[test]
