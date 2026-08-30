@@ -123,31 +123,33 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     let mut audit = MigrationAudit::new(&source.name, &target.name, &worktree, dry_run);
 
     let target_db_path = profile_db_path(&target, &profile::default_state_home());
-    let (source_db, target_db) = with_source_instance_guard(&source, || {
-        let source_db = if dry_run {
-            Db::open_read_only()
-                .context("open source profile database read-only")?
-                .ok_or_else(|| anyhow!("source profile database does not exist"))?
-        } else {
-            Db::open().context("open source profile database")?
-        };
-        let target_db = if dry_run {
-            Db::open_read_only_at(&target_db_path).with_context(|| {
-                format!(
-                    "open target profile database read-only at {}",
-                    target_db_path.display()
-                )
-            })?
-        } else {
-            Db::open_read_only_wal_at(&target_db_path).with_context(|| {
-                format!(
-                    "open target profile database for preflight at {}",
-                    target_db_path.display()
-                )
-            })?
-        };
-        Ok((source_db, target_db))
-    })?;
+    // A real move holds both source-owner fences and the daemon's per-worktree
+    // open fence until after target commit, source cleanup and notification.
+    // Dry-run preserves its strict no-write contract and therefore only probes
+    // the existing singleton; it never deletes source state.
+    let _source_guard = source_migration_guard(&source, &worktree, dry_run)?;
+    let source_db = if dry_run {
+        Db::open_read_only()
+            .context("open source profile database read-only")?
+            .ok_or_else(|| anyhow!("source profile database does not exist"))?
+    } else {
+        Db::open().context("open source profile database")?
+    };
+    let target_db = if dry_run {
+        Db::open_read_only_at(&target_db_path).with_context(|| {
+            format!(
+                "open target profile database read-only at {}",
+                target_db_path.display()
+            )
+        })?
+    } else {
+        Db::open_read_only_wal_at(&target_db_path).with_context(|| {
+            format!(
+                "open target profile database for preflight at {}",
+                target_db_path.display()
+            )
+        })?
+    };
     let session = thegn_core::db::session();
     let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
     fill_bundle_audit(&mut audit, &bundle);
@@ -234,17 +236,19 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
     report(&audit, json)
 }
 
-/// Check the source compositor's existing profile lock before opening either
-/// migration database. The closure is deliberately the only DB-open boundary
-/// so the no-race ordering is testable without touching a live state root.
-fn with_source_instance_guard<T>(
+/// Establish the source fences before opening either migration database.
+fn source_migration_guard(
     source: &ProfilePaths,
-    open_databases: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    if profile::instance_running_at(source) {
-        bail!("the source profile has another interactive instance running");
+    worktree: &str,
+    dry_run: bool,
+) -> Result<Option<profile::SessionMigrationGuard>> {
+    if dry_run {
+        if profile::instance_running_at(source) {
+            bail!("the source profile has another interactive instance running");
+        }
+        return Ok(None);
     }
-    open_databases()
+    profile::acquire_session_migration(source, worktree).map(Some)
 }
 
 fn fill_bundle_audit(audit: &mut MigrationAudit, bundle: &MigrationBundle) {
@@ -988,14 +992,33 @@ mod tests {
                 root: root.clone(),
             };
             let mut database_opens = 0;
-            let result = with_source_instance_guard(&source, || {
+            let result = source_migration_guard(&source, "/worktree", false);
+            if result.is_ok() {
                 database_opens += 1;
-                Ok::<_, anyhow::Error>(())
-            });
+            }
             assert!(result.is_err(), "{name} owner must block migration");
             assert_eq!(database_opens, 0, "{name} DBs must not open");
             drop(owner);
             let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
         }
+    }
+
+    #[test]
+    fn dry_run_source_probe_preserves_missing_root() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-move-dry-fence-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let source = ProfilePaths {
+            name: "default".into(),
+            root: root.clone(),
+        };
+        let guard = source_migration_guard(&source, "/worktree", true).unwrap();
+        assert!(guard.is_none());
+        assert!(
+            !root.exists(),
+            "dry-run must not create migration lock files"
+        );
     }
 }

@@ -914,7 +914,13 @@ fn main() -> anyhow::Result<()> {
     let _profile_lock = thegn_core::profile::acquire_singleton();
     if matches!(
         _profile_lock,
-        thegn_core::profile::Singleton::AlreadyRunning
+        thegn_core::profile::Singleton::MigrationInProgress
+    ) {
+        anyhow::bail!("the active profile is migrating a session; retry after it completes");
+    }
+    if matches!(
+        _profile_lock,
+        thegn_core::profile::Singleton::AlreadyRunning(_)
     ) && !thegn_core::profile::active().is_default()
     {
         thegn_core::msg::warn(&format!(
