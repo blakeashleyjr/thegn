@@ -257,6 +257,7 @@ ratchet-update:
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
     RATCHET_UPDATE=1 bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
+    RATCHET_UPDATE=1 bash test/ratchet.sh i18n-literal 'jump|type to filter|matches|dismiss|offline|VIM NORMAL|VIM INSERT|NORMAL|EMACS|LOC|New terminal|New folder|Move to folder' crates/thegn-host/src/chrome.rs crates/thegn-host/src/statusbar_left.rs crates/thegn-host/src/statusbar_badges.rs crates/thegn-host/src/run.rs crates/thegn-host/src/handlers/status_line.rs crates/thegn-host/src/palette.rs crates/thegn-host/src/keymap_specs.rs
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core surface_gaps_ratchet_update -- --ignored
 
@@ -583,6 +584,7 @@ lint:
     # sat unpinned in thegn-proxy for a whole release.
     bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    bash test/ratchet.sh i18n-literal 'jump|type to filter|matches|dismiss|offline|VIM NORMAL|VIM INSERT|NORMAL|EMACS|LOC|New terminal|New folder|Move to folder' crates/thegn-host/src/chrome.rs crates/thegn-host/src/statusbar_left.rs crates/thegn-host/src/statusbar_badges.rs crates/thegn-host/src/run.rs crates/thegn-host/src/handlers/status_line.rs crates/thegn-host/src/palette.rs crates/thegn-host/src/keymap_specs.rs
     # Element contract: no NEW interactive chrome painted with raw `draw_text` +
     # a hand-built hit table — build it through `crate::element` instead (see
     # test/element-ratchet.txt for the rule + burn-down).

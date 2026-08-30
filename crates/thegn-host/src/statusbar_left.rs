@@ -227,6 +227,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translated_mode_label_respects_cells_and_keyhints_stay_atomic() {
+        let mut m = model_with(&["help", "keyhints"]);
+        m.mode_chip =
+            crate::i18n_surface::test_catalog_value("ja-JP", "statusbar-mode-vim-insert-full");
+        let translated_mode = m.mode_chip.clone();
+        let budget = 34;
+        let (segs, _) = left_layout(&m, budget);
+        let text: String = segs.iter().map(|seg| seg.text.as_str()).collect();
+        assert!(
+            text.contains(&translated_mode),
+            "translated mode is painted: {text:?}"
+        );
+        assert!(
+            seg_width(&segs) <= budget,
+            "{text:?} exceeds {budget} cells"
+        );
+        for (chord, label) in &m.keyhints {
+            assert_eq!(
+                text.contains(chord),
+                text.contains(label),
+                "binding must be wholly present or wholly absent: {text:?}"
+            );
+        }
+    }
+
     /// `Help` opens the overlay, not a bar detail popup.
     #[test]
     fn help_item_has_no_detail_popup() {

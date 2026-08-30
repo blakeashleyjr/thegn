@@ -239,23 +239,11 @@ fn apply_mode_status(
     // The mode chip always shows.
     crate::handlers::status_line::apply_mode(model, mode);
 
-    if config.ui.full_mode_chip {
-        model.mode_chip = match mode {
-            crate::keymap::Mode::Normal => "NORMAL",
-            crate::keymap::Mode::VimNormal => "VIM NORMAL",
-            crate::keymap::Mode::VimInsert => "VIM INSERT",
-            crate::keymap::Mode::Emacs => "EMACS",
-        }
-        .into();
+    model.mode_chip = if config.ui.full_mode_chip {
+        crate::i18n_surface::mode(mode, crate::i18n_surface::ModeStyle::Full)
     } else {
-        model.mode_chip = match mode {
-            crate::keymap::Mode::Normal => "N",
-            crate::keymap::Mode::VimNormal => "V",
-            crate::keymap::Mode::VimInsert => "I",
-            crate::keymap::Mode::Emacs => "E",
-        }
-        .into();
-    }
+        crate::i18n_surface::mode(mode, crate::i18n_surface::ModeStyle::Compact)
+    };
 }
 
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
@@ -700,7 +688,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `cfg` was loaded above (before the session reconcile); augment it with
     // DB-stored hosts now that we're past session load.
     thegn_core::host_config::merge_db_hosts(&mut cfg);
-    thegn_core::i18n::init(&cfg.ui.language);
+    crate::e2e_freeze::pin_locale(&mut cfg.ui.language);
+    let lc_all = std::env::var("LC_ALL").ok();
+    let lang = std::env::var("LANG").ok();
+    let pseudolocale_requested = cfg!(debug_assertions)
+        && std::env::var_os("THEGN_PSEUDOLOCALE")
+            .is_some_and(|value| !value.is_empty() && value != "0");
+    thegn_core::i18n::init(
+        &cfg.ui.language,
+        lc_all.as_deref(),
+        lang.as_deref(),
+        crate::e2e_freeze::active(),
+        pseudolocale_requested,
+    );
 
     tracing::info!(
         target: "thegn::startup",
@@ -7242,7 +7242,9 @@ async fn event_loop<T: Terminal>(
                         menu::InputOverlay::new("new folder".to_string(), String::new()),
                         HostInputKind::NewEmptyFolder { repo_path },
                     ));
-                    model.status = "New folder: type a name (Esc cancels)".into();
+                    model.status = crate::i18n_surface::status(
+                        crate::i18n_surface::StatusText::NewFolderPrompt,
+                    );
                     dirty = true;
                     continue;
                 }
@@ -16610,8 +16612,9 @@ async fn event_loop<T: Terminal>(
                                             ),
                                             HostInputKind::FileWorktreeNewFolder,
                                         ));
-                                        model.status =
-                                            "New folder: type a name (Esc cancels)".into();
+                                        model.status = crate::i18n_surface::status(
+                                            crate::i18n_surface::StatusText::NewFolderPrompt,
+                                        );
                                     } else {
                                         let r = match pending_file_target.take() {
                                             Some((wt, repo)) => {
@@ -21126,8 +21129,9 @@ async fn event_loop<T: Terminal>(
                                     crate::workspace_picker::WorkspacePicker::new(seed, excluded);
                                 p.spawn_discovery(current_config.clone(), waker.clone());
                                 workspace_picker = Some(p);
-                                model.status =
-                                    "New workspace: type to filter · Tab for manual entry".into();
+                                model.status = crate::i18n_surface::status(
+                                    crate::i18n_surface::StatusText::NewWorkspacePrompt,
+                                );
                             }
                             Action::DeleteWorkspace => {
                                 // Remove the *active* workspace. Same modal + path
