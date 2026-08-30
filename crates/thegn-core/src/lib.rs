@@ -25,6 +25,7 @@ pub mod attention;
 pub mod axis;
 pub mod backoff;
 pub mod blame;
+pub mod budget_alert;
 pub mod bundle;
 pub mod calendar;
 pub mod capabilities;

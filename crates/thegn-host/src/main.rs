@@ -229,6 +229,7 @@ mod testkit;
 mod theme_builder;
 mod theme_store;
 mod toast;
+mod usage_budget;
 mod vps_bridge;
 mod vps_reaper;
 mod warmcache;
