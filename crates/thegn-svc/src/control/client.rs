@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
+use thegn_core::control_wire::{EventDecoder, EventFrame, FeedFilter, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
 use super::ControlErrorCode;
@@ -122,6 +122,64 @@ pub enum AttachControl {
 pub struct AttachStream {
     pub frames: tokio_mpsc::Receiver<EventFrame>,
     pub control: tokio_mpsc::Sender<AttachControl>,
+}
+
+/// The JSON envelope shared by SSE, plugin consumers, and CLI-facing client
+/// code. The frame kind comes from [`EventFrame::kind`], so formatters cannot
+/// drift from filter validation or SSE metadata.
+pub fn frame_json(frame: &EventFrame) -> Value {
+    let mut value = match frame {
+        EventFrame::Hello(h) => json!({
+            "proto": h.proto, "server": h.server, "scopes": h.scopes,
+        }),
+        EventFrame::PaneSnapshot {
+            session,
+            seq,
+            cols,
+            rows,
+            bytes,
+        } => json!({
+            "session": session, "seq": seq, "cols": cols, "rows": rows,
+            "ansi_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+        EventFrame::PaneDelta {
+            session,
+            seq,
+            bytes,
+        } => json!({
+            "session": session, "seq": seq,
+            "b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+        EventFrame::Activity { json: j } => json!({
+            "event": serde_json::from_str::<Value>(j)
+                .unwrap_or_else(|_| Value::String(j.clone())),
+        }),
+        EventFrame::Lease {
+            session,
+            kind,
+            expires_at,
+        } => json!({
+            "session": session, "event": kind, "expires_at": expires_at,
+        }),
+        EventFrame::Pairing {
+            pairing_id,
+            label,
+            scope,
+            state,
+        } => json!({
+            "pairing_id": pairing_id, "label": label,
+            "scopes": scope, "state": state,
+        }),
+        EventFrame::Sessions => json!({}),
+        EventFrame::SessionExit { session, code } => json!({
+            "session": session, "code": code,
+        }),
+        EventFrame::Lagged { missed } => json!({ "missed": missed }),
+    };
+    if let Value::Object(fields) = &mut value {
+        fields.insert("kind".into(), Value::String(frame.kind().into()));
+    }
+    value
 }
 
 impl ControlClient {
@@ -500,13 +558,21 @@ impl ControlClient {
     /// keeping the [`AttachStream`] alive keeps the pump running. Dropping it
     /// ends the subscription.
     pub async fn subscribe_events(&self) -> Result<AttachStream> {
+        self.subscribe_events_opts(&FeedFilter::default()).await
+    }
+
+    /// Subscribe with per-connection narrowing and optional lag signaling.
+    /// The server-side filter is still constrained to the read-scoped feed;
+    /// this method only adds query parameters and keeps the 256-frame buffer.
+    pub async fn subscribe_events_opts(&self, filter: &FeedFilter) -> Result<AttachStream> {
         let (host, token) = match &self.addr {
             ControlAddr::Unix(_) => ("localhost".to_string(), None),
             ControlAddr::Tcp { addr, token } => (addr.clone(), Some(token.clone())),
         };
+        let path = events_path(filter);
         let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
             .method("GET")
-            .uri(format!("ws://{host}/v1/events"))
+            .uri(format!("ws://{host}{path}"))
             .header("Host", &host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -546,6 +612,12 @@ impl ControlClient {
             frames: frame_rx,
             control: ctrl_tx,
         })
+    }
+
+    /// Owned-options convenience form for callers that construct a filter at
+    /// the call site.
+    pub async fn subscribe_events_with(&self, filter: FeedFilter) -> Result<AttachStream> {
+        self.subscribe_events_opts(&filter).await
     }
 
     /// Warm-attach over WebSocket. The first frames on `frames` are `Hello`
@@ -629,6 +701,37 @@ impl ControlClient {
             control: ctrl_tx,
         })
     }
+}
+
+fn events_path(filter: &FeedFilter) -> String {
+    let mut params = Vec::new();
+    if let Some(kinds) = &filter.kinds {
+        params.push(format!("kinds={}", percent_encode(&kinds.join(","))));
+    }
+    if let Some(session) = &filter.session {
+        params.push(format!("session={}", percent_encode(session)));
+    }
+    if filter.signal_lag {
+        params.push("signal_lag=1".into());
+    }
+    if params.is_empty() {
+        "/v1/events".into()
+    } else {
+        format!("/v1/events?{}", params.join("&"))
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 type Ws<S> = tokio_tungstenite::WebSocketStream<S>;

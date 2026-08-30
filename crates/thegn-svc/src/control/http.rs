@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use thegn_core::control::{ScopeSet, TokenKind, Verb, required_scope};
 use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
-use thegn_core::control_wire::{EventFrame, Hello, PROTO_VERSION, PairingState};
+use thegn_core::control_wire::{EventFrame, FeedFilter, Hello, PROTO_VERSION, PairingState};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
@@ -1433,19 +1433,55 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
 
 /// The broadcast event feed over WebSocket: one binary message per encoded
 /// [`EventFrame`]. Read scope.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct EventsQuery {
+    /// Comma-separated [`thegn_core::control_wire::FEED_KINDS`].
+    kinds: Option<String>,
+    session: Option<String>,
+    /// `1`, `true`, `0`, or `false`; omitted means false.
+    signal_lag: Option<String>,
+}
+
+impl EventsQuery {
+    fn into_filter(self) -> Result<FeedFilter, String> {
+        let signal_lag = match self.signal_lag.as_deref() {
+            None | Some("0") | Some("false") => false,
+            Some("1") | Some("true") => true,
+            Some(value) => {
+                return Err(format!(
+                    "invalid signal_lag {value:?}; expected 0, 1, true, or false"
+                ));
+            }
+        };
+        FeedFilter::parse(self.kinds.as_deref(), self.session.as_deref(), signal_lag)
+            .map_err(|e| e.to_string())
+    }
+}
+
 pub(super) async fn events_ws(
     State(state): State<ControlState>,
     headers: HeaderMap,
+    Query(q): Query<EventsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let ctx = match authed(&state, &headers, Verb::Events) {
         Ok(c) => c,
         Err(r) => return r,
     };
-    ws.on_upgrade(move |socket| pump_events(socket, state, ctx))
+    let filter = match q.into_filter() {
+        Ok(filter) => filter,
+        Err(message) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                &message,
+            );
+        }
+    };
+    ws.on_upgrade(move |socket| pump_events(socket, state, ctx, filter))
 }
 
-async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
+async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, filter: FeedFilter) {
     let hello = hello_frame(&state, &ctx);
     if socket
         .send(Message::Binary(hello.encode().into()))
@@ -1458,17 +1494,29 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
     loop {
         match rx.recv().await {
             Ok(frame) => {
-                if socket
-                    .send(Message::Binary(frame.encode().into()))
-                    .await
-                    .is_err()
+                if filter.matches(&frame)
+                    && socket
+                        .send(Message::Binary(frame.encode().into()))
+                        .await
+                        .is_err()
                 {
                     return;
                 }
             }
             // Slow consumer skipped `n` events — that's fine for a monitor
             // feed (pane bytes ride attach streams, not this one).
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                if filter.signal_lag {
+                    let frame = EventFrame::Lagged { missed };
+                    if socket
+                        .send(Message::Binary(frame.encode().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
@@ -1476,19 +1524,46 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
 
 /// The same feed as JSON server-sent events (curl-friendly; pane bytes as
 /// base64). WS is the primary transport — this is a convenience surface.
-pub(super) async fn events_sse(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn events_sse(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<EventsQuery>,
+) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::Events) {
         return r;
     }
+    let filter = match q.into_filter() {
+        Ok(filter) => filter,
+        Err(message) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                &message,
+            );
+        }
+    };
     let rx = state.api.subscribe();
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    let stream = futures_util::stream::unfold((rx, filter), |(mut rx, filter)| async move {
         loop {
             match rx.recv().await {
                 Ok(frame) => {
-                    let ev = sse::Event::default().data(frame_json(&frame).to_string());
-                    return Some((Ok::<_, std::convert::Infallible>(ev), rx));
+                    if !filter.matches(&frame) {
+                        continue;
+                    }
+                    let ev = sse::Event::default()
+                        .event(frame.kind())
+                        .data(frame_json(&frame).to_string());
+                    return Some((Ok::<_, std::convert::Infallible>(ev), (rx, filter)));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    if filter.signal_lag {
+                        let frame = EventFrame::Lagged { missed };
+                        let ev = sse::Event::default()
+                            .event(frame.kind())
+                            .data(frame_json(&frame).to_string());
+                        return Some((Ok::<_, std::convert::Infallible>(ev), (rx, filter)));
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -1497,59 +1572,7 @@ pub(super) async fn events_sse(State(state): State<ControlState>, headers: Heade
 }
 
 /// The JSON envelope of an [`EventFrame`] for SSE / `--json` consumers.
-pub fn frame_json(frame: &EventFrame) -> serde_json::Value {
-    match frame {
-        EventFrame::Hello(h) => json!({
-            "kind": "hello", "proto": h.proto, "server": h.server,
-            "scopes": h.scopes,
-        }),
-        EventFrame::PaneSnapshot {
-            session,
-            seq,
-            cols,
-            rows,
-            bytes,
-        } => json!({
-            "kind": "snapshot", "session": session, "seq": seq,
-            "cols": cols, "rows": rows,
-            "ansi_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }),
-        EventFrame::PaneDelta {
-            session,
-            seq,
-            bytes,
-        } => json!({
-            "kind": "delta", "session": session, "seq": seq,
-            "b64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }),
-        EventFrame::Activity { json: j } => json!({
-            "kind": "activity",
-            "event": serde_json::from_str::<serde_json::Value>(j)
-                .unwrap_or_else(|_| serde_json::Value::String(j.clone())),
-        }),
-        EventFrame::Lease {
-            session,
-            kind,
-            expires_at,
-        } => json!({
-            "kind": "lease", "session": session, "event": kind,
-            "expires_at": expires_at,
-        }),
-        EventFrame::Pairing {
-            pairing_id,
-            label,
-            scope,
-            state,
-        } => json!({
-            "kind": "pairing", "pairing_id": pairing_id, "label": label,
-            "scopes": scope, "state": state,
-        }),
-        EventFrame::Sessions => json!({ "kind": "sessions" }),
-        EventFrame::SessionExit { session, code } => json!({
-            "kind": "exit", "session": session, "code": code,
-        }),
-    }
-}
+pub use super::client::frame_json;
 
 fn default_history() -> bool {
     true
@@ -1631,6 +1654,51 @@ mod error_tests {
             assert_eq!(body.error, message);
             assert_eq!(body.code, code);
         }
+    }
+}
+
+#[cfg(test)]
+mod control_events {
+    use super::*;
+
+    #[test]
+    fn event_query_uses_the_bounded_core_filter() {
+        let filter = EventsQuery {
+            kinds: Some("activity, exit".into()),
+            session: Some("s1".into()),
+            signal_lag: Some("1".into()),
+        }
+        .into_filter()
+        .unwrap();
+        assert_eq!(filter.kinds, Some(vec!["activity".into(), "exit".into()]));
+        assert_eq!(filter.session.as_deref(), Some("s1"));
+        assert!(filter.signal_lag);
+    }
+
+    #[test]
+    fn event_query_rejects_typos_and_bad_lag_values() {
+        let typo = EventsQuery {
+            kinds: Some("activty".into()),
+            ..Default::default()
+        }
+        .into_filter()
+        .unwrap_err();
+        assert!(typo.contains("unknown event kind"));
+
+        let bad_lag = EventsQuery {
+            signal_lag: Some("sometimes".into()),
+            ..Default::default()
+        }
+        .into_filter()
+        .unwrap_err();
+        assert!(bad_lag.contains("invalid signal_lag"));
+    }
+
+    #[test]
+    fn json_formatter_uses_frame_kind_and_lag_count() {
+        let json = frame_json(&EventFrame::Lagged { missed: 12 });
+        assert_eq!(json["kind"], "lagged");
+        assert_eq!(json["missed"], 12);
     }
 }
 

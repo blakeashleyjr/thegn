@@ -192,7 +192,12 @@ message GitCommitRequest {
 }
 message GitCommitReply { string commit = 1; }
 
-message EventsRequest {}
+message EventsRequest {
+  // Optional narrowing filters; empty means the legacy full feed.
+  repeated string kinds = 1;
+  string session = 2;
+  bool signal_lag = 3;
+}
 
 message LeaseStatusRequest {}
 message LeaseStatusReply { repeated Lease leases = 1; }
@@ -244,6 +249,7 @@ message Event {
     PairingEvent pairing = 7;
     Empty sessions = 8;
     SessionExit exit = 9;
+    Lagged lagged = 10;
   }
 }
 
@@ -285,4 +291,8 @@ message PairingEvent {
 message SessionExit {
   string session = 1;
   optional int32 code = 2;
+}
+
+message Lagged {
+  uint64 missed = 1;
 }
