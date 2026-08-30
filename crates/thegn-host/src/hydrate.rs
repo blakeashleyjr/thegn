@@ -2695,6 +2695,10 @@ pub(crate) fn build_model(
         // loop applies the fresh ones and drops anything stale; see
         // `run.rs`'s adopt drain for the age cutoff and why it exists.
         adopt_intents: db.take_intents("adopt_session").unwrap_or_default(),
+        // `editor.open` mailbox: claim every queued handoff off-loop. The
+        // compositor revalidates each target against the fresh sidebar model
+        // before dispatching it; malformed/stale rows are deliberately dropped.
+        open_editor_intents: db.take_intents("open_editor").unwrap_or_default(),
         // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),

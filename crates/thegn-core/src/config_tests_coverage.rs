@@ -951,6 +951,7 @@ fn config_overlay_apply_sets_every_field() {
         picker: Some(Picker::Fzf),
         git_backend: Some(GitBackendKind::Cli),
         git_structural_diff: Some(StructuralDiff::Difft),
+        editor_provider: Some(EditorProvider::Zed),
         editor_command: Some("hx {path}".into()),
         editor_open_in: Some(EditorOpenIn::External),
         worktree_mode: Some(WorktreeMode::InRepo),
@@ -1022,6 +1023,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.picker, Picker::Fzf);
     assert_eq!(cfg.git.backend, GitBackendKind::Cli);
     assert_eq!(cfg.git.structural_diff, StructuralDiff::Difft);
+    assert_eq!(cfg.editor.provider, EditorProvider::Zed);
     assert_eq!(cfg.editor.command, "hx {path}");
     assert_eq!(cfg.editor.open_in, EditorOpenIn::External);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
@@ -1200,6 +1202,7 @@ fn env_overlay_metrics_rejects_non_finite_floats() {
 #[test]
 fn env_overlay_bad_enum_values_yield_none() {
     let env = map_env(&[
+        ("THEGN_EDITOR_PROVIDER", "bogus"),
         ("THEGN_WORKTREE_MODE", "bogus"),
         ("THEGN_NAME_SCHEME", "bogus"),
         ("THEGN_LOG_LEVEL", "bogus"),
@@ -1209,6 +1212,7 @@ fn env_overlay_bad_enum_values_yield_none() {
         ("THEGN_SANDBOX_ON_MISSING", "bogus"),
     ]);
     let o = env_overlay(&env);
+    assert_eq!(o.editor_provider, None);
     assert_eq!(o.worktree_mode, None);
     assert_eq!(o.name_scheme, None);
     assert_eq!(o.log_level, None);
