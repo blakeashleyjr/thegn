@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -291,7 +292,10 @@ def _safe_archive_names(names: Iterable[str], path: Path) -> set[str]:
             raise ReleaseError(f"archive {path} contains unsafe path {name!r}")
         clean = "/".join(part for part in pure.parts if part not in ("", "."))
         if clean:
-            normalized.add(clean.rstrip("/"))
+            clean = clean.rstrip("/")
+            if clean in normalized:
+                raise ReleaseError(f"archive {path} contains duplicate path {clean!r}")
+            normalized.add(clean)
     return normalized
 
 
@@ -301,15 +305,43 @@ def _validate_archive_layout(
     try:
         if platform == "unix":
             with tarfile.open(path, "r:gz") as archive:
-                names = _safe_archive_names(archive.getnames(), path)
+                members = archive.getmembers()
+                names = _safe_archive_names((member.name for member in members), path)
+                unsafe = [
+                    member.name
+                    for member in members
+                    if not (member.isfile() or member.isdir())
+                ]
+                regular = {
+                    member.name.rstrip("/") for member in members if member.isfile()
+                }
         else:
             with zipfile.ZipFile(path) as archive:
-                names = _safe_archive_names(archive.namelist(), path)
+                members = archive.infolist()
+                names = _safe_archive_names((member.filename for member in members), path)
+                unsafe = []
+                regular = set()
+                for member in members:
+                    mode = member.external_attr >> 16
+                    file_type = stat.S_IFMT(mode)
+                    if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+                        unsafe.append(member.filename)
+                    elif not member.is_dir():
+                        regular.add(member.filename.rstrip("/"))
     except (OSError, tarfile.TarError, zipfile.BadZipFile) as error:
         raise ReleaseError(f"cannot inspect release archive {path}: {error}") from error
+    if unsafe:
+        raise ReleaseError(
+            f"archive {path} contains non-regular member(s): {', '.join(unsafe)}"
+        )
     missing = [name for name in required_files if name not in names]
     if missing:
         raise ReleaseError(f"archive {path} is missing root file(s): {', '.join(missing)}")
+    non_regular = [name for name in required_files if name not in regular]
+    if non_regular:
+        raise ReleaseError(
+            f"archive {path} has non-regular required file(s): {', '.join(non_regular)}"
+        )
 
 
 def validate_assets(
@@ -464,6 +496,8 @@ def _validate_rendered_tree(root: Path, expected: Iterable[Path]) -> None:
 
 
 def atomic_write_output(output_dir: Path, files: Mapping[Path, str]) -> None:
+    if output_dir.is_symlink():
+        raise ReleaseError(f"output path must not be a symlink: {output_dir}")
     output_dir = output_dir.resolve()
     if output_dir in {Path("/").resolve(), REPOSITORY_ROOT.resolve(), PACKAGING_DIR.resolve()}:
         raise ReleaseError(f"refusing unsafe output directory: {output_dir}")
