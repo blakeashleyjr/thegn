@@ -212,7 +212,7 @@ async fn process_event(
                 .await;
                 let (outcome, error) = match result {
                     Ok(Ok(())) => ("succeeded", None),
-                    Ok(Err(error)) => ("failed", Some(format!("{error:#}"))),
+                    Ok(Err(error)) => ("failed", Some(bounded(&format!("{error:#}")))),
                     Err(_) => (
                         "timed_out",
                         Some(format!("deadline {}s", settings.action_timeout_secs)),
