@@ -259,8 +259,9 @@ impl CrashReport {
         s.push_str(&format!("run:       {}\n", self.run_id));
         s.push_str(&format!("thread:    {}\n", self.thread));
         s.push('\n');
-        s.push_str(&self.panic_line);
-        if !self.panic_line.ends_with('\n') {
+        let panic_line = crate::log_redact::redact_text_line(&self.panic_line);
+        s.push_str(&panic_line);
+        if !panic_line.ends_with('\n') {
             s.push('\n');
         }
         s.push_str("\nbacktrace:\n");
@@ -273,7 +274,7 @@ impl CrashReport {
             s.push_str("(none)\n");
         } else {
             for line in &self.ring_tail {
-                s.push_str(line);
+                s.push_str(&crate::log_redact::redact_text_line(line));
                 s.push('\n');
             }
         }
@@ -525,6 +526,19 @@ mod tests {
         let mut r = sample_report();
         r.ring_tail.clear();
         assert!(r.render().contains("(none)"));
+    }
+
+    #[test]
+    fn render_redacts_panic_and_ring_text() {
+        let mut r = sample_report();
+        r.panic_line = "panic: --token panic-secret safe".into();
+        r.ring_tail = vec!["WARN TOKEN=ring-secret safe".into()];
+
+        let out = r.render();
+        assert!(!out.contains("panic-secret"));
+        assert!(!out.contains("ring-secret"));
+        assert!(out.contains("--token ***redacted*** safe"));
+        assert!(out.contains("TOKEN=***redacted*** safe"));
     }
 
     #[test]
