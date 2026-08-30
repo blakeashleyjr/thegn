@@ -41,6 +41,9 @@ frame compatibility contract or a serializable layout/chrome model.
 
 ## Impact
 
+- **Roadmap:** J 127 is the adjacent optional web-terminal lane; THE-40 adds no
+  native-GUI roadmap row, leaving any AP placement to a separate product
+  audit.
 - **Documentation:** adds
   `docs/superpowers/specs/2026-08-29-native-gui-frontend-lane-design.md` and
   archives this OpenSpec record.
