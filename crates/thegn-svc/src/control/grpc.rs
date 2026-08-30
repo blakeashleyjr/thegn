@@ -660,14 +660,13 @@ impl Control for GrpcControl {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        if filter.signal_lag {
-                            if tx
+                        if filter.signal_lag
+                            && tx
                                 .send(Ok(frame_to_proto(&EventFrame::Lagged { missed })))
                                 .await
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
