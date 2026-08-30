@@ -657,6 +657,17 @@ fn selection_at_cursor(
     (None, None)
 }
 
+/// Resolve a review-task selection using the same interleaved row order as the
+/// PR-queue renderer. The command palette uses this when the queue section is
+/// already open; subtracting the total PR-row count is incorrect when tasks
+/// are distributed across multiple PRs.
+pub(crate) fn selected_review_task(
+    panel: &crate::panel::PanelData,
+    cursor: usize,
+) -> Option<crate::panel::ReviewTaskRow> {
+    selection_at_cursor(panel, cursor).1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,5 +794,41 @@ mod tests {
         assert!(selection_at_cursor(&panel, 0).0.is_some());
         assert_eq!(selection_at_cursor(&panel, 1).1.unwrap().id, 9);
         assert_eq!(selection_at_cursor(&panel, 2).0.unwrap().number, 2);
+    }
+
+    #[test]
+    fn selected_review_task_handles_uneven_interleaving() {
+        let panel = crate::panel::PanelData {
+            pr_queue: vec![row("/repo#1", 1, "watching"), row("/repo#2", 2, "watching")],
+            review_tasks: vec![
+                crate::panel::ReviewTaskRow {
+                    id: 9,
+                    pr_number: 1,
+                    repository: "acme/widget".into(),
+                    thread_id: "thread-1".into(),
+                    path: "src/lib.rs".into(),
+                    line: Some(3),
+                    role: "coder".into(),
+                    status: thegn_core::issue::AgentDispatchStatus::Queued,
+                    source_revision: "revision-1".into(),
+                    worktree_path: "/w".into(),
+                },
+                crate::panel::ReviewTaskRow {
+                    id: 10,
+                    pr_number: 2,
+                    repository: "acme/widget".into(),
+                    thread_id: "thread-2".into(),
+                    path: "src/main.rs".into(),
+                    line: Some(4),
+                    role: "coder".into(),
+                    status: thegn_core::issue::AgentDispatchStatus::Queued,
+                    source_revision: "revision-2".into(),
+                    worktree_path: "/w".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        // Row order: PR1, task1, PR2, task2.
+        assert_eq!(selected_review_task(&panel, 3).unwrap().id, 10);
     }
 }

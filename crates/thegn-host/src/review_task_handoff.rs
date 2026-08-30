@@ -368,11 +368,44 @@ fn finish_resolved(
         worktree_path: task.worktree_path.clone(),
     };
     match db.resolve_review_task(&transition) {
-        Ok(true) | Ok(false) => {
+        Ok(true) => {
             if let Err(error) = db.put_review_thread_resolved_notification(&transition) {
                 tracing::warn!(target: "thegn::prq", %error, task = task.id, "review resolved notification failed");
             }
             format!("review thread {} resolved", context.thread_id)
+        }
+        Ok(false) => {
+            // A new feedback snapshot may have landed after the last read and
+            // before the provider mutation completed. The conditional DB
+            // transition rejects that stale completion; retain the latest
+            // revision for an explicit follow-up instead of claiming done.
+            match db.get_review_task(task.id) {
+                Ok(Some(current)) if current.status == AgentDispatchStatus::Done => {
+                    format!("review thread {} resolved", context.thread_id)
+                }
+                Ok(Some(current)) if current.pending_source_revision.is_some() => {
+                    match db.promote_review_task_pending(task.id) {
+                        Ok(true) => {
+                            "review task changed while resolving; latest revision requeued".into()
+                        }
+                        Ok(false) => {
+                            "review task changed while resolving; latest revision needs a refresh"
+                                .into()
+                        }
+                        Err(error) => format!(
+                            "provider resolved the thread, but latest review revision could not be requeued: {error}"
+                        ),
+                    }
+                }
+                Ok(Some(_)) => {
+                    "provider resolved the thread, but the review roster changed; refresh required"
+                        .into()
+                }
+                Ok(None) => "provider resolved the thread, but the review task disappeared".into(),
+                Err(error) => format!(
+                    "provider resolved the thread, but roster state could not be checked: {error}"
+                ),
+            }
         }
         Err(error) => format!("provider resolved the thread, but roster update failed: {error}"),
     }

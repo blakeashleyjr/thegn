@@ -123,8 +123,11 @@ impl Db {
             .optional()?)
     }
 
-    /// Apply a pure resolved transition, scoped by both id and canonical
-    /// source key so a stale plan cannot close a reused/corrupt row.
+    /// Apply a pure resolved transition, scoped by id, canonical source key,
+    /// and the active revision. A refresh may write pending feedback while a
+    /// handoff is doing its provider call; reject that transition unless the
+    /// pending snapshot is only the same-content/head-only refresh that the
+    /// handoff is expected to verify.
     pub fn resolve_review_task(&self, transition: &ReviewTaskResolution) -> Result<bool> {
         let changed = self.conn().execute(
             "UPDATE agent_dispatches SET status=?1, forge_action_attempts=0, \
@@ -132,12 +135,17 @@ impl Db {
              pending_content_revision=NULL, pending_prompt=NULL, \
              pending_expected_head_oid=NULL, pending_role=NULL, \
              pending_worktree_path=NULL \
-             WHERE id=?2 AND task_kind=?3 AND source_key=?4 AND status<>?1",
+             WHERE id=?2 AND task_kind=?3 AND source_key=?4 AND status<>?1 \
+               AND source_revision=?5 \
+               AND (status NOT IN ('spawning','running') OR (\
+                    (pending_source_revision IS NULL \
+                        OR pending_content_revision=content_revision)))",
             params![
                 AgentDispatchStatus::Done.as_str(),
                 transition.dispatch_id,
                 REVIEW_TASK_KIND,
                 transition.source_key,
+                transition.source_revision,
             ],
         )?;
         Ok(changed > 0)
@@ -387,6 +395,66 @@ mod tests {
         );
         assert!(db.claim_review_task(id, "r1").unwrap());
         assert!(!db.claim_review_task(id, "r1").unwrap());
+    }
+
+    #[test]
+    fn active_resolution_rejects_new_feedback_but_accepts_head_only_refresh() {
+        let db = Db::open_memory().unwrap();
+        let first = task("r1", "first");
+        let id = db.upsert_review_task(&first).unwrap();
+        db.update_review_task_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+
+        let mut revised = task("r2", "new feedback");
+        revised.content_revision = "content-2".into();
+        db.upsert_review_task(&revised).unwrap();
+        let row = db.get_review_task(id).unwrap().unwrap();
+        let transition = ReviewTaskResolution {
+            dispatch_id: id,
+            source_key: row.source_key.clone(),
+            source_revision: row.source_revision.clone(),
+            forge: "github".into(),
+            repository: "acme/widget".into(),
+            pr_number: 22,
+            thread_id: "thread".into(),
+            path: "src/lib.rs".into(),
+            line: Some(1),
+            head_oid: "head".into(),
+            worktree_path: "/wt/review".into(),
+        };
+        assert!(!db.resolve_review_task(&transition).unwrap());
+        assert_eq!(
+            db.get_review_task(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Running
+        );
+
+        let db = Db::open_memory().unwrap();
+        let first = task("r1", "first");
+        let id = db.upsert_review_task(&first).unwrap();
+        db.update_review_task_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        let mut head_only = task("r2", "first");
+        head_only.content_revision = first.content_revision;
+        db.upsert_review_task(&head_only).unwrap();
+        let row = db.get_review_task(id).unwrap().unwrap();
+        let transition = ReviewTaskResolution {
+            dispatch_id: id,
+            source_key: row.source_key,
+            source_revision: "r1".into(),
+            forge: "github".into(),
+            repository: "acme/widget".into(),
+            pr_number: 22,
+            thread_id: "thread".into(),
+            path: "src/lib.rs".into(),
+            line: Some(1),
+            head_oid: "head".into(),
+            worktree_path: "/wt/review".into(),
+        };
+        assert!(db.resolve_review_task(&transition).unwrap());
+        assert_eq!(
+            db.get_review_task(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
     }
 
     #[test]
