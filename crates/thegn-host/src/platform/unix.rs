@@ -288,3 +288,13 @@ pub fn max_files_per_proc() -> Option<u64> {
 pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
+
+/// Open a regular-file candidate without following a final symlink. Callers
+/// still validate the opened descriptor's metadata before consuming it.
+pub fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}

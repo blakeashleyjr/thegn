@@ -79,7 +79,10 @@ pub fn redact_argv(argv: &[String]) -> Vec<String> {
         if let Some((lhs, _rhs)) = tok.split_once('=') {
             // `--token=VALUE`, `-token=VALUE`, or `FOO_TOKEN=VALUE`.
             let key = lhs.trim_start_matches('-');
-            if is_sensitive_key(key) {
+            // Do not mistake a URL containing a sensitive query parameter for
+            // one opaque assignment. The text-line pass handles the query
+            // field itself so unrelated parameters remain available in logs.
+            if is_sensitive_key(key) && !key.chars().any(|c| ":/?&#;".contains(c)) {
                 out.push(format!("{lhs}={REDACTED}"));
                 continue;
             }
@@ -161,7 +164,7 @@ fn redact_delimited_fields(line: &str) -> String {
         let delimiter_len = delimiter.len_utf8();
         let before = &line[..delimiter_start];
         let field_start = before
-            .rfind(|ch: char| ch.is_whitespace() || "{[(,".contains(ch))
+            .rfind(|ch: char| ch.is_whitespace() || "{[(,?&#;".contains(ch))
             .map_or(0, |idx| idx + 1);
         let raw_key = before[field_start..].trim();
         let key = raw_key.trim_matches(|ch: char| ch == '"' || ch == '\'');
@@ -260,7 +263,7 @@ fn skip_whitespace(line: &str, mut start: usize) -> usize {
 fn value_token(line: &str, start: usize) -> (usize, usize) {
     let end = line[start..]
         .char_indices()
-        .find(|(_, ch)| ch.is_whitespace() || ",}]".contains(*ch))
+        .find(|(_, ch)| ch.is_whitespace() || ",}]&#;".contains(*ch))
         .map_or(line.len(), |(idx, _)| start + idx);
     (start, end)
 }
@@ -409,6 +412,10 @@ mod tests {
         assert_eq!(
             redact_text_line("token: colon-secret safe"),
             "token: ***redacted*** safe"
+        );
+        assert_eq!(
+            redact_text_line("GET https://example.test/?token=url-secret&ok=yes"),
+            "GET https://example.test/?token=***redacted***&ok=yes"
         );
     }
 
