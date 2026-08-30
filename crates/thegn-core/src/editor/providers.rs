@@ -33,7 +33,7 @@ pub fn provider(kind: EditorProvider, open_in: EditorOpenIn) -> Option<Box<dyn E
     }
 }
 
-/// Cheap, I/O-free reports for every registered logical provider. Doctor can
+/// Cheap, PATH-only reports for every registered logical provider. Doctor can
 /// enumerate these without teaching its registry vendor argv spellings.
 pub fn probes(open_in: EditorOpenIn) -> Vec<ProbeReport> {
     [
@@ -140,12 +140,17 @@ mod tests {
     }
 
     #[test]
-    fn jetbrains_degrades_column_to_line() {
+    fn jetbrains_rejects_columns_and_plans_lines() {
         let editor = provider(EditorProvider::Jetbrains, EditorOpenIn::Auto).unwrap();
         assert!(editor.caps().open_file && editor.caps().open_directory && editor.caps().line);
         assert!(!editor.caps().column);
         assert_eq!(
-            editor.open_target(&file()).unwrap().argv,
+            editor.open_target(&file()).unwrap_err(),
+            EditorError::Unsupported("column")
+        );
+        let line = EditorTarget::file("/work/tree", "src/main.rs", Some(42), None).unwrap();
+        assert_eq!(
+            editor.open_target(&line).unwrap().argv,
             strings(&["idea", "--line", "42", "/work/tree/src/main.rs"])
         );
         assert_eq!(
@@ -155,12 +160,17 @@ mod tests {
     }
 
     #[test]
-    fn nvim_remote_rejects_project_and_degrades_column() {
+    fn nvim_remote_rejects_project_and_columns() {
         let editor = provider(EditorProvider::NvimRemote, EditorOpenIn::Auto).unwrap();
         assert!(editor.caps().open_file && editor.caps().line && editor.caps().external);
         assert!(!editor.caps().open_directory && !editor.caps().column);
         assert_eq!(
-            editor.open_target(&file()).unwrap().argv,
+            editor.open_target(&file()).unwrap_err(),
+            EditorError::Unsupported("column")
+        );
+        let line = EditorTarget::file("/work/tree", "src/main.rs", Some(42), None).unwrap();
+        assert_eq!(
+            editor.open_target(&line).unwrap().argv,
             strings(&["nvr", "--remote-silent", "+42", "/work/tree/src/main.rs"])
         );
         let error = editor.open_target(&project()).unwrap_err();

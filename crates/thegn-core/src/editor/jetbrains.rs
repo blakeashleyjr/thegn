@@ -1,9 +1,9 @@
 use super::{
     Editor, EditorCaps, EditorError, EditorLaunch, EditorTarget, JumpSyntax, Placement,
-    ProgramProfile, forced_placement,
+    ProgramProfile, executable_availability, forced_placement,
 };
 use crate::config::EditorOpenIn;
-use crate::seam::{Availability, Probe, ProbeReport};
+use crate::seam::{Probe, ProbeReport};
 
 const ID: &str = "jetbrains";
 const EXECUTABLE: &str = "idea";
@@ -25,9 +25,7 @@ pub(super) fn program_profile(program: &str) -> Option<ProgramProfile> {
 }
 impl Probe for Jetbrains {
     fn probe(&self) -> ProbeReport {
-        ProbeReport::new("editor", ID, Availability::Ready)
-            .with_caps(&self.caps())
-            .note("registered; executable availability is checked by the launch edge")
+        ProbeReport::new("editor", ID, executable_availability(EXECUTABLE)).with_caps(&self.caps())
     }
 }
 impl Editor for Jetbrains {
