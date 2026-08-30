@@ -1518,8 +1518,7 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .err()
-            .expect("open after migration listing must be refused");
+            .expect_err("open after migration listing must be refused");
         assert!(error.to_string().contains("being migrated"));
         drop(migration);
         let _ = std::fs::remove_dir_all(&paths.root); // best-effort: test cleanup

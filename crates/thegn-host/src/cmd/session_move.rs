@@ -508,15 +508,26 @@ fn human_report(audit: &MigrationAudit) -> String {
         "session migration{}",
         if audit.dry_run { " (dry-run)" } else { "" }
     ));
-    lines.push(format!("  source profile: {}", audit.source_profile));
-    lines.push(format!("  target profile: {}", audit.target_profile));
-    lines.push(format!("  worktree: {}", audit.worktree));
+    lines.push(format!(
+        "  source profile: {}",
+        terminal_safe(&audit.source_profile)
+    ));
+    lines.push(format!(
+        "  target profile: {}",
+        terminal_safe(&audit.target_profile)
+    ));
+    lines.push(format!("  worktree: {}", terminal_safe(&audit.worktree)));
     lines.push(format!(
         "  groups: {}",
         if audit.groups.is_empty() {
             "(none)".to_string()
         } else {
-            audit.groups.join(", ")
+            audit
+                .groups
+                .iter()
+                .map(|group| terminal_safe(group))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     ));
     lines.push(format!(
@@ -540,10 +551,10 @@ fn human_report(audit: &MigrationAudit) -> String {
     ));
     lines.push(format!("  notification: {}", audit.notification.status));
     if let Some(warning) = &audit.notification.warning {
-        lines.push(format!("  warning: {warning}"));
+        lines.push(format!("  warning: {}", terminal_safe(warning)));
     }
     if let Some(error) = &audit.error {
-        lines.push(format!("  error: {error}"));
+        lines.push(format!("  error: {}", terminal_safe(error)));
     }
     lines.join("\n")
 }
@@ -552,8 +563,25 @@ fn display_ids(ids: &[String]) -> String {
     if ids.is_empty() {
         "(none)".to_string()
     } else {
-        ids.join(", ")
+        ids.iter()
+            .map(|id| terminal_safe(id))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
+}
+
+/// Keep untrusted paths, group names, daemon ids, and transport errors from
+/// injecting terminal control sequences or forging additional audit lines.
+fn terminal_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn fail(audit: &mut MigrationAudit, json: bool, message: &str, retryable: bool) -> Result<()> {
@@ -917,7 +945,7 @@ mod tests {
                 worktree_path: "/worktree".into(),
                 agent_name: "agent".into(),
                 dispatched_at_ms: 0,
-                status: thegn_core::issue::AgentDispatchStatus::Queued,
+                status: "queued".into(),
                 stage: None,
                 parent_id: None,
                 session_id: Some("SECRET_DAEMON".into()),
@@ -967,6 +995,23 @@ mod tests {
                 .unwrap()
                 .contains("carried unchanged")
         );
+    }
+
+    #[test]
+    fn human_audit_escapes_terminal_controls_and_forged_lines() {
+        let mut audit = MigrationAudit::new("source", "target", "/worktree\nforged", false);
+        audit.groups = vec!["group\rforged".into()];
+        audit.live_ids = vec!["id\x1b]0;owned\x07".into()];
+        audit.notification.warning = Some("warning\nforged".into());
+        audit.error = Some("error\x1b[31mred".into());
+
+        let human = human_report(&audit);
+        assert!(!human.contains('\x1b'));
+        assert!(!human.contains("\nforged"));
+        assert!(human.contains("/worktree\\nforged"));
+        assert!(human.contains("group\\rforged"));
+        assert!(human.contains("id\\u{1b}]0;owned\\u{7}"));
+        assert!(human.contains("warning\\nforged"));
     }
 
     #[test]

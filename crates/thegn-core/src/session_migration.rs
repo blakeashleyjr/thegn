@@ -5,7 +5,7 @@
 //! credentials. JSON and command fields remain opaque; the target compositor is
 //! responsible for interpreting them after resurrection.
 
-use crate::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote};
+use crate::issue::{AgentDispatch, DispatchNote};
 use crate::models::{GroupTabRow, TabGroupRow, WorktreeRow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -95,7 +95,10 @@ pub struct MigrationDispatch {
     pub worktree_path: String,
     pub agent_name: String,
     pub dispatched_at_ms: i64,
-    pub status: AgentDispatchStatus,
+    /// Preserve the exact stored value. The ordinary roster reader maps
+    /// unfamiliar legacy/future values to `Unknown`, but migration must not
+    /// write that lossy coercion back into the target database.
+    pub status: String,
     pub stage: Option<String>,
     pub parent_id: Option<i64>,
     pub session_id: Option<String>,
@@ -113,7 +116,7 @@ impl From<AgentDispatch> for MigrationDispatch {
             worktree_path: row.worktree_path,
             agent_name: row.agent_name,
             dispatched_at_ms: row.dispatched_at_ms,
-            status: row.status,
+            status: row.status.as_str().to_string(),
             stage: row.stage,
             parent_id: row.parent_id,
             session_id: row.session_id,
@@ -552,7 +555,7 @@ struct MigrationDispatchFingerprint {
     worktree_path: String,
     agent_name: String,
     dispatched_at_ms: i64,
-    status: AgentDispatchStatus,
+    status: String,
     stage: Option<String>,
     parent_index: Option<usize>,
     artifact_path: Option<String>,
@@ -611,7 +614,7 @@ impl FingerprintMaterial {
                     worktree_path: d.worktree_path.clone(),
                     agent_name: d.agent_name.clone(),
                     dispatched_at_ms: d.dispatched_at_ms,
-                    status: d.status,
+                    status: d.status.clone(),
                     stage: d.stage.clone(),
                     parent_index: d.parent_id.and_then(|id| indexes.get(&id).copied()),
                     artifact_path: d.artifact_path.clone(),
@@ -841,7 +844,7 @@ mod tests {
             worktree_path: "/wt/api".into(),
             agent_name: "agent".into(),
             dispatched_at_ms: 1,
-            status: AgentDispatchStatus::Queued,
+            status: "queued".into(),
             stage: None,
             parent_id: None,
             session_id: None,
@@ -865,7 +868,7 @@ mod tests {
                 worktree_path: "/w".into(),
                 agent_name: "a".into(),
                 dispatched_at_ms: 1,
-                status: AgentDispatchStatus::Queued,
+                status: "queued".into(),
                 stage: None,
                 parent_id: Some(99),
                 session_id: Some("s".into()),
@@ -880,7 +883,7 @@ mod tests {
                 worktree_path: "/w".into(),
                 agent_name: "b".into(),
                 dispatched_at_ms: 2,
-                status: AgentDispatchStatus::Done,
+                status: "done".into(),
                 stage: None,
                 parent_id: Some(7),
                 session_id: Some("t".into()),
