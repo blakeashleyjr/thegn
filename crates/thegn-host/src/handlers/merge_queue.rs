@@ -487,11 +487,11 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
             &thegn_core::event_bus::Event::NotificationReceived { notification: n },
         );
     }
-    if dec.record {
-        let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
-        let routed = dec.clone();
-        tokio::task::spawn_blocking(move || {
-            let Ok(db) = Db::open() else { return };
+    let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
+    let routed = dec.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(db) = Db::open() else { return };
+        if routed.record {
             // best-effort: the inbox is a cache; the queue row is the record.
             let _ = crate::automation_events::insert_routed(
                 &db,
@@ -503,21 +503,23 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
                 &routed,
                 false,
             );
-            if kind == "queue_landed" {
-                let origin = crate::automation_events::take_merge_origin(&db, &wt);
-                crate::automation_events::submit_fact(
-                    thegn_core::automation::AutomationEventKind::MergeLanded,
-                    format!("merge:{wt}"),
-                    Some(wt.clone()),
-                    Some(msg),
-                    crate::automation_events::EventFacts {
-                        origin,
-                        ..Default::default()
-                    },
-                );
-            }
-        });
-    }
+        }
+        // Preserve the typed merge edge even when notification routing drops
+        // the accompanying human-facing queue notification.
+        if kind == "queue_landed" {
+            let origin = crate::automation_events::take_merge_origin(&db, &wt);
+            crate::automation_events::submit_fact(
+                thegn_core::automation::AutomationEventKind::MergeLanded,
+                format!("merge:{wt}"),
+                Some(wt.clone()),
+                Some(msg),
+                crate::automation_events::EventFacts {
+                    origin,
+                    ..Default::default()
+                },
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
