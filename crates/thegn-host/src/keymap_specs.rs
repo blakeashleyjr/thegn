@@ -187,6 +187,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "fork-session",
         label: "Fork live session",
+        message_key: "action-fork-session",
         hint: "fork session",
         default_chords: &[],
         palette: true,
@@ -549,6 +550,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "theme-builder-open",
         label: "Open theme builder",
+        message_key: "action-theme-builder-open",
         hint: "theme builder",
         default_chords: &["Ctrl Alt Shift t"],
         palette: true,
@@ -1226,6 +1228,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "drawer-cycle",
         label: "Cycle drawer occupant",
+        message_key: "action-drawer-cycle",
         hint: "drawer+",
         // Palette-only in v1; users may bind it explicitly in [keybinds].
         default_chords: &[],
@@ -1235,6 +1238,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "drawer-pick",
         label: "Pick drawer occupant",
+        message_key: "action-drawer-pick",
         hint: "drawer?",
         // Palette-only in v1; users may bind it explicitly in [keybinds].
         default_chords: &[],
