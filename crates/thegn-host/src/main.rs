@@ -225,6 +225,8 @@ mod terminal_wizard;
 #[cfg(test)]
 mod testenv;
 mod testkit;
+mod theme_builder;
+mod theme_store;
 mod toast;
 mod vps_bridge;
 mod vps_reaper;
