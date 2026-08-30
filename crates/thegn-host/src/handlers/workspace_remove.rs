@@ -27,7 +27,10 @@ use crate::run::{forget_worktree_group, now_secs};
 /// home checkout (its path == `repo_path`, which must never be deleted) and any
 /// empty-path legacy rows. Split out so the safety-critical home-skip guard is
 /// unit-testable without real I/O.
-pub(crate) fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) -> Vec<String> {
+pub(crate) fn workspace_worktree_dirs(
+    db: &thegn_core::db::Db,
+    repo_path: &str,
+) -> Result<Vec<String>, String> {
     db.worktrees()
         .map(|rows| {
             rows.into_iter()
@@ -37,7 +40,7 @@ pub(crate) fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) 
                 .map(|w| w.worktree)
                 .collect()
         })
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
 /// Return branch worktrees known to the live session. This is deliberately
@@ -422,7 +425,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut dirs = workspace_worktree_dirs(&db, "/tmp/repo-lib");
+        let mut dirs = workspace_worktree_dirs(&db, "/tmp/repo-lib").unwrap();
         dirs.sort();
         assert_eq!(
             dirs,

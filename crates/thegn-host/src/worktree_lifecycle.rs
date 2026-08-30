@@ -97,6 +97,17 @@ fn apply_completions_from(
     let mut workspace_failures: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
     for completion in completions {
+        // Keep the physical-path ownership claim until the loop consumes the
+        // worker result. Releasing it on the worker leaves a window where the
+        // stale group is still actionable and can schedule the same teardown
+        // (and its hooks) a second time.
+        match &completion {
+            LifecycleCompletion::WorktreeDelete { path, .. }
+            | LifecycleCompletion::WorkspaceDelete { path, .. } => {
+                release_destroy_path(Path::new(path));
+            }
+            LifecycleCompletion::WorkspaceDeleteFinished { .. } => {}
+        }
         match completion {
             LifecycleCompletion::WorktreeDelete {
                 group_name,
@@ -546,7 +557,6 @@ pub fn spawn_worktree_destroy(
                     &worktree.to_string_lossy(),
                 );
             }
-            release_destroy_path(&worktree);
             complete(
                 LifecycleCompletion::WorktreeDelete {
                     group_name,
@@ -574,33 +584,21 @@ pub fn spawn_workspace_destroy(
         .name("thegn-workspace-destroy".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            let db = Db::open().ok();
-            let mut candidates = paths;
-            if let Some(db) = db.as_ref() {
-                candidates.extend(crate::handlers::workspace_remove::workspace_worktree_dirs(
+            let db = Db::open();
+            let registry_paths = match db.as_ref() {
+                Ok(db) => crate::handlers::workspace_remove::workspace_worktree_dirs(
                     db,
                     &repo_root.to_string_lossy(),
-                ));
-            }
+                ),
+                Err(error) => Err(format!("worktree registry unavailable: {error}")),
+            };
+            let (mut candidates, mut failed_paths) =
+                workspace_destroy_candidates(paths, registry_paths);
+            let db = db.ok();
             candidates.sort();
             candidates.dedup();
-            let had_candidates = !candidates.is_empty();
-            let paths: Vec<String> = candidates
-                .into_iter()
-                .filter(|path| try_claim_destroy_path(Path::new(path)))
-                .collect();
-            if had_candidates && paths.is_empty() {
-                complete(
-                    LifecycleCompletion::WorkspaceDeleteFinished {
-                        repo_path: repo_root.to_string_lossy().into_owned(),
-                        slug,
-                        failed_paths: vec!["all worktrees are already being deleted".into()],
-                    },
-                    waker,
-                );
-                return;
-            }
-            let mut failed_paths = Vec::new();
+            let (paths, claim_failures) = claim_destroy_candidates(candidates);
+            failed_paths.extend(claim_failures);
             for path in paths {
                 let branch = thegn_core::util::git_out(
                     Path::new(&path),
@@ -627,7 +625,6 @@ pub fn spawn_workspace_destroy(
                         &path,
                     );
                 }
-                release_destroy_path(Path::new(&path));
                 complete(
                     LifecycleCompletion::WorkspaceDelete {
                         repo_path: repo_root.to_string_lossy().into_owned(),
@@ -669,6 +666,39 @@ fn release_destroy_claim_on_spawn_failure(
         release_destroy_path(path);
     }
     spawned
+}
+
+fn claim_destroy_candidates(candidates: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut claimed = Vec::with_capacity(candidates.len());
+    let mut failed = Vec::new();
+    for path in candidates {
+        if try_claim_destroy_path(Path::new(&path)) {
+            claimed.push(path);
+        } else {
+            // A workspace operation cannot treat an overlapping individual
+            // deletion as success: that other worker may still fail. Keep the
+            // workspace registered and let the user retry after it completes.
+            failed.push(format!("{path}: already being deleted"));
+        }
+    }
+    (claimed, failed)
+}
+
+fn workspace_destroy_candidates(
+    live_paths: Vec<String>,
+    registry_paths: Result<Vec<String>, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut candidates = live_paths;
+    match registry_paths {
+        Ok(paths) => {
+            candidates.extend(paths);
+            (candidates, Vec::new())
+        }
+        Err(error) => (
+            candidates,
+            vec![format!("could not enumerate registered worktrees: {error}")],
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1323,6 +1353,73 @@ mod tests {
         assert!(try_claim_destroy_path(&path));
         assert!(!try_claim_destroy_path(&path));
         release_destroy_path(&path);
+        assert!(try_claim_destroy_path(&path));
+        release_destroy_path(&path);
+    }
+
+    #[test]
+    fn workspace_destroy_reports_partially_overlapping_path_claims() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-lifecycle-workspace-overlap-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let busy = root.join("busy");
+        let free = root.join("free");
+        assert!(try_claim_destroy_path(&busy));
+
+        let (claimed, failed) = claim_destroy_candidates(vec![
+            busy.to_string_lossy().into_owned(),
+            free.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(claimed, vec![free.to_string_lossy().into_owned()]);
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains("already being deleted"));
+
+        release_destroy_path(&busy);
+        release_destroy_path(&free);
+    }
+
+    #[test]
+    fn workspace_destroy_keeps_workspace_when_registry_is_unavailable() {
+        let live = vec!["/tmp/live-worktree".to_string()];
+        let (candidates, failures) = workspace_destroy_candidates(
+            live.clone(),
+            Err("injected database failure".to_string()),
+        );
+        assert_eq!(candidates, live);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("injected database failure"));
+    }
+
+    #[test]
+    fn destroy_claim_is_released_when_completion_is_consumed() {
+        let path = std::env::temp_dir().join(format!(
+            "tg-lifecycle-completion-claim-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        assert!(try_claim_destroy_path(&path));
+        let path_s = path.to_string_lossy().into_owned();
+        let mut session = completion_test_session();
+        session.worktrees[0].path = path_s.clone();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let mut model = crate::chrome::FrameModel::default();
+        let mut sb = crate::run::SidebarState::default();
+
+        assert!(apply_completions_from(
+            vec![LifecycleCompletion::WorktreeDelete {
+                group_name: "repo/feature".into(),
+                path: path_s,
+                success: false,
+                message: "injected failure".into(),
+            }],
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        ));
         assert!(try_claim_destroy_path(&path));
         release_destroy_path(&path);
     }
