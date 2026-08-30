@@ -27,6 +27,7 @@ pub(crate) enum Outcome {
         launch: EditorLaunch,
         placement: PanePlacement,
         source: String,
+        fallback: Option<String>,
     },
     Status(String),
 }
@@ -79,8 +80,8 @@ fn plan_and_launch(
         return Outcome::Status(format!("{source}: {message}"));
     }
     let editor = thegn_core::editor::editor_for_workspace(cfg, workspace_slug);
-    let launch = match editor.open_target(&target) {
-        Ok(launch) => launch,
+    let (launch, fallback) = match plan_with_fallback(editor.as_ref(), &target) {
+        Ok(planned) => planned,
         Err(error) => {
             return Outcome::Status(format!("{source}: IDE handoff unavailable: {error}"));
         }
@@ -90,11 +91,13 @@ fn plan_and_launch(
             launch,
             placement,
             source,
+            fallback,
         },
         Placement::External => {
             let label = target_label(&target);
             if spawn_external(&launch) {
-                Outcome::Status(format!("Opened {label} in {}", launch.provider))
+                let fallback = fallback.map_or_else(String::new, |note| format!("; {note}"));
+                Outcome::Status(format!("Opened {label} in {}{fallback}", launch.provider))
             } else {
                 Outcome::Status(format!(
                     "{source}: failed to launch {} for {label}",
@@ -103,6 +106,39 @@ fn plan_and_launch(
             }
         }
     }
+}
+
+fn plan_with_fallback(
+    editor: &dyn thegn_core::editor::Editor,
+    target: &EditorTarget,
+) -> Result<(EditorLaunch, Option<String>), thegn_core::editor::EditorError> {
+    let caps = editor.caps();
+    let Some(file) = target.relative_file() else {
+        return editor.open_target(target).map(|launch| (launch, None));
+    };
+
+    let (planned, fallback) = if target.line().is_some() && !caps.line {
+        (
+            EditorTarget::file(target.worktree(), file, None, None)?,
+            Some(format!(
+                "{} does not support line locations; opened the file only",
+                editor.id()
+            )),
+        )
+    } else if target.col().is_some() && !caps.column {
+        (
+            EditorTarget::file(target.worktree(), file, target.line(), None)?,
+            Some(format!(
+                "{} does not support columns; opened the requested line",
+                editor.id()
+            )),
+        )
+    } else {
+        (target.clone(), None)
+    };
+    editor
+        .open_target(&planned)
+        .map(|launch| (launch, fallback))
 }
 
 fn revalidate(target: &EditorTarget) -> Result<(), String> {
@@ -265,6 +301,7 @@ pub(crate) fn apply(
             launch,
             placement,
             source,
+            fallback,
         } => {
             let focused = session.active_group().map(|group| Path::new(&group.path))
                 == Some(launch.cwd.as_path());
@@ -295,10 +332,11 @@ pub(crate) fn apply(
             if opened {
                 focus.zone = crate::focus::Zone::Center;
                 crate::run::refresh_tab_model(model, session, sb);
+                let fallback = fallback.map_or_else(String::new, |note| format!("; {note}"));
                 model.status = format!(
-                    "Opened {} in {}",
+                    "Opened {} in {}{fallback}",
                     target_from_launch(&launch),
-                    launch.provider
+                    launch.provider,
                 );
             } else {
                 model.status = format!("{source}: failed to open terminal editor pane");
@@ -368,5 +406,21 @@ mod tests {
                 .unwrap_err()
                 .contains("malformed")
         );
+    }
+
+    #[test]
+    fn unsupported_columns_fall_back_visibly_to_the_requested_line() {
+        let editor = thegn_core::editor::providers::provider(
+            thegn_core::editor::EditorProvider::Jetbrains,
+            thegn_core::config::EditorOpenIn::Auto,
+        )
+        .unwrap();
+        let target = EditorTarget::file("/repo/wt", "src/lib.rs", Some(7), Some(2)).unwrap();
+        let (launch, fallback) = plan_with_fallback(editor.as_ref(), &target).unwrap();
+        assert_eq!(
+            launch.argv,
+            ["idea", "--line", "7", "/repo/wt/src/lib.rs"].map(String::from)
+        );
+        assert!(fallback.is_some_and(|note| note.contains("does not support columns")));
     }
 }

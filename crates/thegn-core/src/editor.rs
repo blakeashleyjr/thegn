@@ -301,6 +301,22 @@ pub trait Editor: Probe + Send + Sync {
     }
 
     fn open_target(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        let caps = self.caps();
+        match target.operation() {
+            EditorOperation::OpenFile if !caps.open_file => {
+                return Err(EditorError::unsupported("open_file"));
+            }
+            EditorOperation::OpenDirectory if !caps.open_directory => {
+                return Err(EditorError::unsupported("open_directory"));
+            }
+            _ => {}
+        }
+        if target.line().is_some() && !caps.line {
+            return Err(EditorError::unsupported("line"));
+        }
+        if target.col().is_some() && !caps.column {
+            return Err(EditorError::unsupported("column"));
+        }
         match target.operation() {
             EditorOperation::OpenFile => self.open_file(target),
             EditorOperation::OpenDirectory => self.open_directory(target),
@@ -310,7 +326,7 @@ pub trait Editor: Probe + Send + Sync {
     /// Compatibility adapter for existing file-open call sites. New handoff
     /// surfaces must use [`Self::open_target`].
     fn open(&self, req: &OpenRequest<'_>) -> Result<EditorLaunch, EditorError> {
-        self.open_target(&EditorTarget::legacy(req))
+        self.open_file(&EditorTarget::legacy(req))
     }
 }
 
@@ -488,12 +504,26 @@ pub struct ProgramEditor {
     open_in: EditorOpenIn,
 }
 
+pub(super) fn executable_availability(program: &str) -> Availability {
+    if program.contains('/') {
+        if Path::new(program).exists() {
+            Availability::Ready
+        } else {
+            Availability::Unavailable(format!("{program} not found"))
+        }
+    } else if util::which_path(program).is_some() {
+        Availability::Ready
+    } else {
+        Availability::Unavailable(format!("`{program}` not found on PATH"))
+    }
+}
+
 impl Probe for ProgramEditor {
     fn probe(&self) -> ProbeReport {
-        ProbeReport::new("editor", self.id, Availability::Ready)
+        let program = self.program.split_whitespace().next().unwrap_or("");
+        ProbeReport::new("editor", self.id, executable_availability(program))
             .with_caps(&self.caps())
             .note(format!("program: {}", self.program))
-            .note("executable availability is checked by the launch edge")
     }
 }
 
