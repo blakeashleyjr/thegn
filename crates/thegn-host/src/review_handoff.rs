@@ -74,7 +74,27 @@ pub(crate) fn target(session: &Session, panes: &Panes, cfg: &Config) -> PaneTarg
     if let Some(id) = live_agent_pane(session, panes, cfg) {
         return PaneTarget::Live(id);
     }
-    let queue = &cfg.pr_queue;
+    let queue = review_queue(session, cfg);
+    headless_target(cfg, &queue)
+}
+
+/// Resolve the repository overlay without running git on the compositor loop.
+/// Session group names are `<workspace-slug>/<branch>`; `repo_pr_queue` needs
+/// only that slug to select the already-loaded trusted workspace overlay.
+fn review_queue(session: &Session, cfg: &Config) -> thegn_core::config::PrQueueConfig {
+    let slug = session
+        .active_group()
+        .and_then(|group| group.name.split('/').next())
+        .filter(|slug| !slug.is_empty());
+    cfg.repo_pr_queue(std::path::Path::new(slug.unwrap_or("repo")))
+}
+
+fn headless_target(cfg: &Config, queue: &thegn_core::config::PrQueueConfig) -> PaneTarget {
+    if !queue.agent_command.trim().is_empty() {
+        return thegn_core::agent_task::resolve_agent(cfg, "", &queue.agent_command)
+            .map(|command| PaneTarget::Headless { command })
+            .unwrap_or(PaneTarget::None);
+    }
     let agent = if queue.agent.trim().is_empty() {
         match cfg.default_agent_name() {
             Some(agent) => agent,
@@ -152,10 +172,27 @@ pub(crate) fn dispatch(
         PaneTarget::Headless { command } => {
             let refresh_tx = refresh_tx.clone();
             let waker = waker.clone();
+            let queue = review_queue(session, cfg);
             let worktree = crate::hydrate::active_tab_path(session)
                 .to_string_lossy()
                 .into_owned();
-            let queue = cfg.repo_pr_queue(std::path::Path::new(&worktree));
+            let sandbox = match crate::agent_run::agent_floor_gate(
+                cfg,
+                &worktree,
+                queue.agent_sandbox,
+                queue.agent_isolation_floor,
+                queue.agent_on_floor_miss,
+            ) {
+                crate::agent_run::AgentDispatch::Run(sandbox) => sandbox,
+                crate::agent_run::AgentDispatch::RunDegraded(sandbox, warning) => {
+                    thegn_core::msg::warn(&warning);
+                    sandbox
+                }
+                crate::agent_run::AgentDispatch::InfraHold(reason) => {
+                    model.status = format!("review handoff blocked: {reason}");
+                    return;
+                }
+            };
             let vars = vars(&snapshot, base, title, url, &worktree, text);
             let prompt = match thegn_core::agent_task::render_prompt(
                 queue.prompts.resolve(TaskKind::PrReview),
@@ -175,13 +212,15 @@ pub(crate) fn dispatch(
                     command_template: &command,
                     vars: &vars,
                     timeout_secs: queue.agent_timeout_secs,
-                    sandbox: None,
+                    sandbox,
                 });
                 if !ok {
                     thegn_core::msg::warn("PR review agent handoff failed");
                 }
-                if refresh_tx.send(RefreshKind::Pr).is_ok() {
-                    let _ = waker.wake();
+                if refresh_tx.send(RefreshKind::Pr).is_ok()
+                    && let Err(error) = waker.wake()
+                {
+                    tracing::debug!(%error, "review handoff refresh wake failed");
                 }
             });
             model.status = "review feedback sent to headless agent".into();
@@ -239,5 +278,38 @@ mod tests {
         assert!(text.contains("fix this"));
         assert!(!text.contains("also this"));
         assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn headless_target_uses_the_resolved_repo_queue_command() {
+        let cfg = Config::default();
+        let mut queue = cfg.pr_queue.clone();
+        queue.agent_command = "repo-agent --prompt {prompt}".into();
+
+        assert_eq!(
+            headless_target(&cfg, &queue),
+            PaneTarget::Headless {
+                command: "repo-agent --prompt {prompt}".into()
+            }
+        );
+    }
+
+    #[test]
+    fn review_queue_uses_the_active_groups_workspace_overlay() {
+        let mut cfg = Config::default();
+        let mut workspace = thegn_core::config::WorkspaceConfig::default();
+        workspace.pr_queue.agent_command = Some("workspace-agent {prompt}".into());
+        cfg.workspace.insert("widget".into(), workspace);
+        let mut session = Session::default();
+        session.add_group(crate::session::WorktreeGroup::new(
+            "widget/feature",
+            crate::session::GroupKind::Branch,
+            "/worktrees/widget-feature",
+        ));
+
+        assert_eq!(
+            review_queue(&session, &cfg).agent_command,
+            "workspace-agent {prompt}"
+        );
     }
 }

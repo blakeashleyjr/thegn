@@ -276,9 +276,10 @@ impl PrView {
             self.diff = Some(review.diff.clone());
             self.review = Some(review);
         }
-        if let Some(status) = data.review_status {
-            self.status = Some(status);
-        }
+        // Every delivery carries the authoritative review-fetch state. Clear a
+        // prior cached/unavailable notice once a later generation succeeds;
+        // otherwise the stale error permanently replaces the view's key hints.
+        self.status = data.review_status;
         self.clamp_selection();
     }
 
@@ -1350,6 +1351,29 @@ mod tests {
         assert_eq!(v.repo, "widget");
         assert_eq!(v.head_sha, "deadbeef");
         assert_eq!(v.tab, PrTab::Overview);
+    }
+
+    #[test]
+    fn successful_refresh_clears_an_earlier_review_fetch_notice() {
+        let mut v = sample();
+        v.apply_data(PrViewData {
+            generation: 1,
+            conversation: None,
+            diff: None,
+            review: None,
+            review_status: Some("PR review unavailable or unsupported".into()),
+        });
+        assert!(v.status.is_some());
+
+        v.apply_data(PrViewData {
+            generation: 2,
+            conversation: Some(PrConversation::default()),
+            diff: Some(PrDiff::default()),
+            review: None,
+            review_status: None,
+        });
+        assert_eq!(v.status, None);
+        assert!(!v.loading());
     }
 
     #[test]
