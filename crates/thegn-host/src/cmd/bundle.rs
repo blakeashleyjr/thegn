@@ -16,7 +16,7 @@
 #![allow(clippy::disallowed_macros)] // a CLI verb: println! is the user surface
 
 use anyhow::{Context, Result};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use thegn_core::config::Config;
 
@@ -121,10 +121,8 @@ fn redact_toml(v: &mut toml::Value) {
     match v {
         toml::Value::Table(t) => {
             for (k, val) in t.iter_mut() {
-                if thegn_core::log_redact::is_sensitive_key(k)
-                    && !matches!(val, toml::Value::Table(_) | toml::Value::Array(_))
-                {
-                    *val = toml::Value::String(thegn_core::log_redact::REDACTED.to_string());
+                if thegn_core::log_redact::is_sensitive_key(k) {
+                    redact_sensitive_toml(val);
                 } else {
                     redact_toml(val);
                 }
@@ -132,6 +130,18 @@ fn redact_toml(v: &mut toml::Value) {
         }
         toml::Value::Array(a) => a.iter_mut().for_each(redact_toml),
         _ => {}
+    }
+}
+
+/// Redact a sensitive scalar or every scalar element below a sensitive array.
+/// The model-proxy key lanes are a real example: `api_keys` is a `Vec<String>`
+/// of SecretRefs, and leaving array elements intact would disclose those refs
+/// in the support archive even though the singular `api_key` is masked.
+fn redact_sensitive_toml(v: &mut toml::Value) {
+    match v {
+        toml::Value::Table(_) => redact_toml(v),
+        toml::Value::Array(items) => items.iter_mut().for_each(redact_sensitive_toml),
+        _ => *v = toml::Value::String(thegn_core::log_redact::REDACTED.to_string()),
     }
 }
 
@@ -183,14 +193,20 @@ fn redacted_report_text(bytes: &[u8]) -> String {
 /// check closes the symlink inclusion boundary at the bundle read site too,
 /// covering a report replaced between enumeration and reading.
 fn read_retained_report(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)?;
+    // Bind the read to a non-following open. A metadata check followed by
+    // `read(path)` still has a replacement race when the crash directory is
+    // writable by another user after permission hardening failed.
+    let mut file = crate::platform::open_read_nofollow(path)?;
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "retained report is not a regular file",
         ));
     }
-    std::fs::read(path)
+    let mut body = Vec::new();
+    file.read_to_end(&mut body)?;
+    Ok(body)
 }
 
 fn append_retained_report(
@@ -333,6 +349,19 @@ mod tests {
     }
 
     #[test]
+    fn redact_toml_masks_sensitive_array_elements() {
+        let mut v: toml::Value =
+            toml::from_str("api_key = \"env:ONE\"\napi_keys = [\"env:TWO\", \"file:/three\"]\n")
+                .unwrap();
+        redact_toml(&mut v);
+        let s = toml::to_string(&v).unwrap();
+        assert_eq!(s.matches("***redacted***").count(), 3);
+        assert!(!s.contains("env:ONE"));
+        assert!(!s.contains("env:TWO"));
+        assert!(!s.contains("file:/three"));
+    }
+
+    #[test]
     fn current_process_ring_entry_is_explicit_for_empty_and_non_empty_rings() {
         let empty = current_process_ring_log(&[]);
         assert!(empty.contains("current-process WARN ring"));
@@ -377,5 +406,31 @@ mod tests {
             1024,
             "an omitted report is not archived"
         );
+    }
+
+    #[test]
+    fn retained_report_reader_does_not_follow_symlinks() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-bundle-report-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("outside");
+        let link = dir.join("report.txt");
+        std::fs::write(&target, b"must not enter a bundle").unwrap();
+        let linked = crate::platform::symlink_file(&target, &link).is_ok();
+        if !linked {
+            let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+            return;
+        }
+
+        assert!(read_retained_report(&link).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }
