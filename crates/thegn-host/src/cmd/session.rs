@@ -463,6 +463,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     .to_string_lossy()
                     .into_owned();
                 let spec = OpenSpec {
+                    automation_origin: None,
                     argv: Vec::new(),
                     cwd: None,
                     env: Vec::new(),
@@ -917,6 +918,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         );
         let prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
         let spec = OpenSpec {
+            automation_origin: None,
             argv: Vec::new(),
             cwd: None,
             env: Vec::new(),
@@ -1156,6 +1158,7 @@ async fn resume_work(
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
         let spec = OpenSpec {
+            automation_origin: None,
             argv: Vec::new(),
             cwd: None,
             env: Vec::new(),

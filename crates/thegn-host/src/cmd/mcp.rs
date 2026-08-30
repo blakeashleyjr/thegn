@@ -518,6 +518,35 @@ async fn fetch_state(
             c.kill(session).await.map_err(|e| e.to_string())?;
             Ok(json!({ "killed": session }))
         }
+        "automations.list" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let rules = c.automations_list().await.map_err(|e| e.to_string())?;
+            Ok(json!({ "rules": rules }))
+        }
+        "automations.test" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::AutomationTestRequest {
+                rule: str_arg(args, "rule").ok_or("missing `rule`")?.to_string(),
+                event: args.get("event").cloned().ok_or("missing `event`")?,
+                at: args.get("at").and_then(serde_json::Value::as_i64),
+            };
+            serde_json::to_value(
+                c.automations_test(&request)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())
+        }
+        "tools.run" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let request = thegn_svc::control::ToolRunRequest {
+                name: str_arg(args, "name").ok_or("missing `name`")?.to_string(),
+                worktree: str_arg(args, "worktree").map(str::to_string),
+                automation_origin: None,
+            };
+            serde_json::to_value(c.tools_run(&request).await.map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        }
         other => Err(format!("unknown state capability `{other}`")),
     }
 }
@@ -656,6 +685,7 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
         agent,
         adopt: false,
         already_capped: false,
+        automation_origin: None,
     })
 }
 

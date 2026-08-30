@@ -383,6 +383,12 @@ pub enum Verb {
     /// pipeline stage (harness, model, env keys, permissions) — config-derived
     /// (read), no process is started.
     AgentList,
+    /// List trusted global/profile automation rules and recent outcomes.
+    AutomationsList,
+    /// Purely evaluate one named rule against a supplied event fixture.
+    AutomationsTest,
+    /// Execute one trusted, configured `[[tools]]` entry by name.
+    ToolsRun,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
@@ -470,6 +476,9 @@ impl Verb {
         Verb::SemanticBlastRadius,
         Verb::AgentSessions,
         Verb::AgentList,
+        Verb::AutomationsList,
+        Verb::AutomationsTest,
+        Verb::ToolsRun,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
         Verb::ModelProxyStart,
@@ -518,6 +527,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
         | Verb::AgentList
+        | Verb::AutomationsList
+        | Verb::AutomationsTest
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -557,7 +568,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::WorktreeCreate => Scope::Git,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
-        Verb::LaunchPreset => Scope::Exec,
+        Verb::LaunchPreset | Verb::ToolsRun => Scope::Exec,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing

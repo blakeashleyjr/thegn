@@ -16,6 +16,9 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod automation_events;
+mod automation_executor;
+mod automation_runtime;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
@@ -267,6 +270,11 @@ pub struct Cli {
 /// `thegn` (no subcommand) launches the interactive compositor.
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Inspect trusted automation rules or dry-run an event fixture.
+    Automations {
+        #[command(subcommand)]
+        action: cmd::automations::Action,
+    },
     /// GitHub PR data + actions for a worktree.
     Pr {
         #[command(subcommand)]
@@ -1070,11 +1078,13 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
+    crate::automation_runtime::install(&cfg);
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
     match command {
+        Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),

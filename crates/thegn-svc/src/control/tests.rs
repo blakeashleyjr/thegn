@@ -711,6 +711,7 @@ fn pr_status_row_and_pushed_note_serde_round_trip() {
         body: "there".into(),
         urgency: Some("alert".into()),
         source: Some("ci".into()),
+        automation_origin: None,
     };
     let back: super::PushedNote =
         serde_json::from_str(&serde_json::to_string(&note).unwrap()).unwrap();
@@ -721,6 +722,7 @@ fn pr_status_row_and_pushed_note_serde_round_trip() {
     assert!(minimal.body.is_empty());
     assert_eq!(minimal.urgency, None);
     assert_eq!(minimal.source, None);
+    assert_eq!(minimal.automation_origin, None);
 }
 
 #[tokio::test]

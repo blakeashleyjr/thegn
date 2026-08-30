@@ -491,10 +491,18 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
     if dec.record {
         let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
         tokio::task::spawn_blocking(move || {
-            use thegn_core::store::NotificationStore;
             let Ok(db) = Db::open() else { return };
             // best-effort: the inbox is a cache; the queue row is the record.
-            let _ = db.put_notification(kind, &wt, &msg, &wt);
+            let _ = crate::automation_events::emit(&db, kind, &wt, &msg, &wt);
+            if kind == "queue_landed" {
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::MergeLanded,
+                    format!("merge:{wt}"),
+                    Some(wt.clone()),
+                    Some(msg),
+                    Default::default(),
+                );
+            }
         });
     }
 }

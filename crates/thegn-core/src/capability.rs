@@ -346,6 +346,25 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Push a notification into the tray",
     ),
+    // --- trusted automation -------------------------------------------------
+    cap(
+        "automations.list",
+        Verb::AutomationsList,
+        SurfaceSet::ALL,
+        "List trusted automation rules and recent audited outcomes",
+    ),
+    cap(
+        "automations.test",
+        Verb::AutomationsTest,
+        SurfaceSet::ALL,
+        "Purely evaluate one automation rule against an event fixture",
+    ),
+    cap(
+        "tools.run",
+        Verb::ToolsRun,
+        SurfaceSet::ALL,
+        "Run one trusted configured tool by name in a worktree",
+    ),
     // --- agents --------------------------------------------------------------
     cap(
         "agent.sessions",
