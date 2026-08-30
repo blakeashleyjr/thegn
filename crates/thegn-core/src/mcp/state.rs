@@ -916,7 +916,8 @@ mod tests {
     fn every_state_cap_maps_to_the_scope_it_documents() {
         // The deliberate split this change introduces: listing/observing
         // tools stay Read (unchanged default `--scopes read` still covers
-        // them); mutating tools require Write. This replaces
+        // them); mutating tools require Write, while command execution
+        // requires Exec. This replaces
         // `every_state_cap_is_read_scope_today`, whose own doc comment
         // predicted exactly this: "pins that a future write-side tool
         // forces a deliberate scope-model decision rather than silently
@@ -931,6 +932,8 @@ mod tests {
             "sessions.wait",
             "semantic.map",
             "semantic.blast_radius",
+            "automations.list",
+            "automations.test",
         ];
         let write = [
             "editor.open",
@@ -939,6 +942,7 @@ mod tests {
             "sessions.input",
             "sessions.kill",
         ];
+        let exec = ["tools.run"];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Read, "{cap}");
@@ -947,8 +951,17 @@ mod tests {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Write, "{cap}");
         }
+        for cap in exec {
+            let c = lookup(cap).expect("state cap in catalog");
+            assert_eq!(scope_of(c), Scope::Exec, "{cap}");
+        }
         // Exhaustive: every implemented cap is in one of the two groups.
-        let mut grouped: Vec<&str> = read.iter().chain(write.iter()).copied().collect();
+        let mut grouped: Vec<&str> = read
+            .iter()
+            .chain(write.iter())
+            .chain(exec.iter())
+            .copied()
+            .collect();
         let mut all: Vec<&str> = MCP_STATE_CAPS.to_vec();
         grouped.sort_unstable();
         all.sort_unstable();

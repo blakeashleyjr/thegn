@@ -881,6 +881,8 @@ mod tests {
             SemanticBlastRadius,
             AgentSessions,
             AgentList,
+            AutomationsList,
+            AutomationsTest,
             PreviewFetch,
             ModelProxyStatus,
             ModelProxyStats,
@@ -916,7 +918,7 @@ mod tests {
             ContainersControl,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
-        let exec = [LaunchPreset];
+        let exec = [LaunchPreset, ToolsRun];
         let admin = [
             MigrateSession,
             IssuePairing,

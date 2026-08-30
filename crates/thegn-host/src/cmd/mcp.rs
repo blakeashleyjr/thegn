@@ -863,6 +863,8 @@ mod tests {
         "sessions.wait",
         "semantic.map",
         "semantic.blast_radius",
+        "automations.list",
+        "automations.test",
     ];
 
     fn sorted(mut v: Vec<&'static str>) -> Vec<&'static str> {
@@ -892,6 +894,7 @@ mod tests {
         assert!(allowed.contains(&"sessions.kill"), "{allowed:?}");
         assert!(allowed.contains(&"editor.open"), "{allowed:?}");
         assert!(!allowed.contains(&"sessions.input"), "{allowed:?}");
+        assert!(!allowed.contains(&"tools.run"), "{allowed:?}");
         // read-scope tools are still covered (write implies read).
         for cap in READ_CAPS {
             assert!(allowed.contains(cap), "{allowed:?} missing {cap}");
@@ -921,7 +924,7 @@ mod tests {
     #[test]
     fn mcp_scope_mapping_write_and_flag_covers_every_implemented_cap() {
         assert_eq!(
-            sorted(allowed_state_caps(ScopeSet::parse("write"), true)),
+            sorted(allowed_state_caps(ScopeSet::parse("write,exec"), true)),
             sorted(thegn_core::mcp::state::MCP_STATE_CAPS.to_vec()),
         );
     }

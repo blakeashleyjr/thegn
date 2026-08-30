@@ -1895,9 +1895,42 @@ audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
 #
 # A named profile may refine the settings and replace the rule list:
 # [profiles.work.automations]
+# enabled = false
 # max_concurrent = 4
+# queue_capacity = 64
+# action_timeout_secs = 300
+# audit_retention_per_rule = 200
 # [[profiles.work.automations.rules]]
-# ...same rule keys as above...
+# name = "profile-rule"
+# enabled = true
+# when = "agent_needs_you"
+# debounce_secs = 60
+# idle_secs = 300
+# once_per_key = true
+# max_per_hour = 30
+# max_action_per_hour = 30
+# [profiles.work.automations.rules.if]
+# workspace = "product*"
+# repo = "thegn"
+# worktree = "*/thegn"
+# branch = "tg/*"
+# agent_role = "coder"
+# notification_kind = "test_failed"
+# priority = "alert"
+# source_prefix = "session:"
+# message_regex = "needs (review|input)$"
+# session_id = "daemon-session-1"
+# pr_checks_passed = true
+# pr_review_requested = false
+# pr_merged = false
+# [profiles.work.automations.rules.then]
+# cap = "notify.push"
+# title = "Profile rule"
+# body = "{message}"
+# urgency = "alert"
+# agent = "claude"
+# prompt = "Handle {source_ref}: {message}"
+# name = "release-check"
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
