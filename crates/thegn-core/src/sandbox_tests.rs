@@ -1345,9 +1345,12 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
     // tests use it as a SYNTHETIC inline pair, so its ambient presence would
     // divert it to the env-file and break the assertion. Hermetic under nextest
     // AND in-process `cargo test`.
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
     let _env = crate::testenv::EnvGuard::mutate_pairs(&[
         ("GH_TOKEN", Some("ghp_secret")),
         ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
     ]);
     let mut s = spec(Backend::Podman);
     s.name = "thegn-test-envfile-oci".into();
@@ -1387,9 +1390,12 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
 
 #[test]
 fn systemd_local_secrets_go_to_environment_file_not_argv() {
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
     let _env = crate::testenv::EnvGuard::mutate_pairs(&[
         ("API_KEY", Some("sk_secret")),
         ("THEGN_SANDBOX", None),
+        ("XDG_STATE_HOME", Some(&state_home)),
     ]);
     let mut s = spec(Backend::Systemd);
     s.image = None;
