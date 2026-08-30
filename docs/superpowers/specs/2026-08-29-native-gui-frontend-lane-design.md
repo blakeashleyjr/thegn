@@ -23,13 +23,13 @@ database, migration, wire, route, roadmap, or ratchet change.
 The earlier OpenSpec draft correctly identified the architectural choice, but
 several of its substrate assumptions predated work now on this branch.
 
-| Area                      | Verified branch state                                                                                                                                                                               | Consequence for this decision                                                                                                                                                                                                 |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Attach contract           | `sessions.attach` is a public catalog row and control-v1 route. `PROTO_VERSION` versions the codec and unknown frame tags are rejected.                                                             | Attach is real and versioned. The binary `EventFrame` variants, headers, and sequence behavior are not fully represented by the generated JSON schema, so an independently consumable compatibility contract is still needed. |
-| Concurrent clients        | `AttachKind::Observer` and `Interactive` are on the wire. The daemon actor retains multiple subscribers, replaces only a stale matching client id, and permits resize only for interactive clients. | Basic observer/multi-subscriber attach already exists. Follow-up work concerns input/resize conflict policy and compatibility, not enabling a second client.                                                                  |
-| Pairing and browser edges | The control service serves a self-contained pairing page and supports configured exact-origin CORS.                                                                                                 | Pairing and CORS are substrate already. Control-v1 TCP remains plaintext and requires a trusted network or tunnel; public web deployment remains separate security/product work.                                              |
-| Layout and chrome         | The daemon registry is flat and the compositor keeps its pane tree, tabs, sidebar, panels, overlays, focus, keymap, hit targets, and chrome layout client-side.                                     | There is no server-side layout/chrome model for a native-widget frontend. Candidate 2 can begin as a cell renderer; semantic chrome must wait for a serializable view model.                                                  |
-| Enforcement               | GUI toolkits are not currently banned by `deny.toml` or assigned by the crate-boundary owner table.                                                                                                 | THE-40 changes neither gate. A future frontend implementation must introduce its client crate and substrate ownership together in a separate reviewed change.                                                                 |
+| Area                      | Verified branch state                                                                                                                                                                                                                                                                                                            | Consequence for this decision                                                                                                                                                                                                 |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Attach contract           | `sessions.attach` is a public catalog row and control-v1 route. `PROTO_VERSION` versions the codec and unknown frame tags are rejected.                                                                                                                                                                                          | Attach is real and versioned. The binary `EventFrame` variants, headers, and sequence behavior are not fully represented by the generated JSON schema, so an independently consumable compatibility contract is still needed. |
+| Concurrent clients        | `AttachKind::Observer` and `Interactive` are on the wire. The daemon actor retains multiple subscribers, replaces only a stale matching client id, and suppresses the initial attach resize and relay-lease hold for observers. The WebSocket still requires write scope and accepts later input/resize messages in either mode. | Basic multi-subscriber attach exists, but observer is a lifecycle hint rather than an authorization boundary. Follow-up work must pin least privilege and input/resize behavior as well as compatibility.                     |
+| Pairing and browser edges | The control service serves a self-contained pairing page and supports configured exact-origin CORS.                                                                                                                                                                                                                              | Pairing and CORS are substrate already. Control-v1 TCP remains plaintext and requires a trusted network or tunnel; public web deployment remains separate security/product work.                                              |
+| Layout and chrome         | The daemon registry is flat and the compositor keeps its pane tree, tabs, sidebar, panels, overlays, focus, keymap, hit targets, and chrome layout client-side.                                                                                                                                                                  | There is no server-side layout/chrome model for a native-widget frontend. Candidate 2 can begin as a cell renderer; semantic chrome must wait for a serializable view model.                                                  |
+| Enforcement               | GUI toolkits are not currently banned by `deny.toml` or assigned by the crate-boundary owner table.                                                                                                                                                                                                                              | THE-40 changes neither gate. A future frontend implementation must introduce its client crate and substrate ownership together in a separate reviewed change.                                                                 |
 
 The relevant implementation evidence is in
 `thegn_core::capability`, `thegn_core::control_wire`, the control routes and
@@ -55,6 +55,11 @@ Already available:
 - `sessions.attach` accepts `client_id`, rows, columns, observer mode, and
   history selection. The stream begins with `Hello`, followed by a
   `PaneSnapshot` and sequenced `PaneDelta` frames.
+- `sessions.attach` currently requires write scope even in observer mode. The
+  observer flag suppresses the attach-time resize and relay-lease hold, but the
+  WebSocket pump does not reject later input or resize messages from an
+  observer. An observer must not be presented as read-only under this contract;
+  `sessions.snapshot` plus `events.subscribe` is the available read-scoped view.
 - A bounded daemon subscriber recovers from lag with a fresh snapshot instead
   of blocking the PTY.
 - Input, resize, detach, snapshot, and kill are separate catalog capabilities.
@@ -63,13 +68,24 @@ Already available:
 Still required before a production GUI:
 
 1. Publish the binary frame variants, headers, sequencing, and compatibility
-   behavior as a first-class, fixture-tested client contract.
+   behavior as a first-class, fixture-tested client contract. Require `Hello`
+   as the first decoded frame and surface transport/decode failures distinctly
+   instead of treating every closed frame channel as ordinary session exit.
 2. Define reconnect and version-skew behavior, including stale-delta discard,
    lag/resnapshot handling, history selection, and required protocol features.
-3. Define user-facing ownership of terminal geometry and input when an
-   interactive TUI and GUI coexist. Current actor behavior is effectively the
-   last interactive resize writer winning.
-4. Select and test a client-side terminal emulator without leaking terminal,
+   The current client checks version only when the first frame is `Hello`.
+3. Define user-facing ownership and authorization of terminal geometry and
+   input when an interactive TUI and GUI coexist. Pin the current write-scope
+   requirement and bidirectional WebSocket behavior, or introduce a separately
+   reviewed read-only stream whose server rejects upstream mutation. Current
+   actor behavior for attach-time geometry is effectively the last interactive
+   resize writer winning.
+4. Define and encode session/client identifiers safely. The typed attach client
+   currently interpolates both into a URI, and replacement is keyed only by
+   caller-provided `client_id`; an older same-id socket can detach a newer
+   replacement when it closes. Pin uniqueness, reconnect, and connection-owned
+   detach semantics before relying on this from an independently released GUI.
+5. Select and test a client-side terminal emulator without leaking terminal,
    windowing, or GPU substrates into `thegn-core`.
 
 The current stream is sufficient for a future observer cell-client spike. It
@@ -121,8 +137,9 @@ existing app-wrapper tier.
 Revisit the candidate-2 product decision when all of the following are true:
 
 1. THE-40-F1 has published and fixture-tested the observer cell-client
-   contract, including reconnect, sequence, lag, geometry, and version-skew
-   behavior.
+   contract, including scope requirements, upstream mutation behavior,
+   required-first-hello and decode errors, identifier encoding/collision,
+   reconnect, sequence, lag, geometry, and version-skew behavior.
 2. Runtime-session ownership semantics are finalized for input and resize
    contention between observer and interactive clients.
 3. THE-43's component contract has matured into a stable, serializable chrome
@@ -160,7 +177,8 @@ Revisit the candidate-2 product decision when all of the following are true:
 8. **Security follows the existing edge.** Pairing and scoped bearer tokens
    remain the authority. Secrets are neither logged nor stored in plaintext;
    missing daemon, denied scope, expired pairing, lag, and mismatch are normal
-   client states.
+   client states. Observer mode is not described as a read-only permission
+   boundary while attach remains write-scoped and accepts upstream mutations.
 9. **Git and the daemon remain authoritative.** A GUI does not open the live
    SQLite cache or become a new source of truth. Any migration is a separate
    design and implementation.
@@ -175,7 +193,9 @@ contract**. Its deliberately narrow scope is to:
   `Hello`/`PaneSnapshot`/`PaneDelta`, render a single cell grid, and detach;
 - consume THE-34's final event-filter/lag contract only for session/activity
   resynchronization hints;
-- pin fixtures for sequence, reconnect, version mismatch, bounded lag, and
+- pin fixtures for required scope, observer upstream-mutation behavior,
+  required-first-hello and decode failures, identifier encoding/collision,
+  same-id reconnect/detach races, sequence, version mismatch, bounded lag, and
   geometry behavior; and
 - use an isolated test daemon or fixture with no GUI toolkit, native chrome,
   config key, capability, database migration, or web surface.

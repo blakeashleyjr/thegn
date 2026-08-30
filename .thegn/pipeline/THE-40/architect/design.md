@@ -25,13 +25,13 @@ The draft in `openspec/changes/define-gui-frontend-lane/` was useful framing,
 but several claims predate work already present on this branch and must not be
 copied into the final record:
 
-| Draft claim                                                          | Verified branch state                                                                                                                                                                                                                                                                                                                                                        | Decision-record treatment                                                                                                                                                                                                                           |
-| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Attach/frame streaming is private and not pinned.                    | Warm attach is a public `sessions.attach` catalog row (`crates/thegn-core/src/capability.rs:193-203`), route/API entry (`crates/thegn-svc/src/control/routes.rs:148-163`), and documented control-v1 route (`docs/api/control-v1.json:818-821`). The codec is versioned by `PROTO_VERSION` and rejects unknown tags (`crates/thegn-core/src/control_wire.rs:21-35,304-395`). | Say that attach exists and is versioned, but that the binary frame variants are not fully represented by the generated JSON schema. A future GUI contract still needs an explicit client-facing schema/compatibility policy; do not invent it here. |
-| Only one UI client is supported; multi-client attach is future work. | `AttachKind::Observer` and `Interactive` are part of the wire contract (`crates/thegn-svc/src/control/mod.rs:189-197`); the actor replaces a stale client id, retains multiple subscribers, and only interactive clients resize (`crates/thegn-host/src/daemon/session.rs:610-645,655-678`).                                                                                 | Mark multi-subscriber attach as already satisfied in the current substrate. Future work is conflict policy and a public GUI compatibility contract, not basic second-client existence.                                                              |
-| `GET /pair` is absent and there is no CORS story.                    | The control state carries exact-origin `cors_origins` (`crates/thegn-svc/src/control/http.rs:38-53`), and a self-contained pairing page is served at `pair_page` (`crates/thegn-svc/src/control/http.rs:276-297`).                                                                                                                                                           | Do not repeat the stale 404/no-CORS claim. TLS is still not provided by v1: `docs/api/control-v1.json:17-20` requires a trusted network or tunnel for plaintext TCP.                                                                                |
-| A dependency ban and boundary edits belong in this change.           | The draft proposes edits to `deny.toml` and `crates/thegn-core/tests/crate_boundaries.rs`, but THE-40 explicitly requires no code and only a decision record. Current bans are limited to historical `vt100`/`russh` (`deny.toml:80-92`); the boundary test is the owner table (`crates/thegn-core/tests/crate_boundaries.rs:19-66`).                                        | Cut those implementation edits. Record the future boundary rule here and make the future frontend crate own its GUI substrate through a separate, reviewed change.                                                                                  |
-| Add a new AP roadmap row as part of this issue.                      | AP currently contains the long-horizon bets (`tasks.md:1251-1259`); J 127 is the existing optional web-terminal placeholder (`tasks.md:601-617`), and K is adaptive/mobile UI (`tasks.md:619-631`).                                                                                                                                                                          | Do not mutate the roadmap in this docs-only architect commit. The coder chunk may sync the decision record into the archived openspec change; roadmap placement is a separate product-audit choice.                                                 |
+| Draft claim                                                          | Verified branch state                                                                                                                                                                                                                                                                                                                                                                                                                                     | Decision-record treatment                                                                                                                                                                                                                           |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Attach/frame streaming is private and not pinned.                    | Warm attach is a public `sessions.attach` catalog row (`crates/thegn-core/src/capability.rs:193-203`), route/API entry (`crates/thegn-svc/src/control/routes.rs:148-163`), and documented control-v1 route (`docs/api/control-v1.json:818-821`). The codec is versioned by `PROTO_VERSION` and rejects unknown tags (`crates/thegn-core/src/control_wire.rs:21-35,304-395`).                                                                              | Say that attach exists and is versioned, but that the binary frame variants are not fully represented by the generated JSON schema. A future GUI contract still needs an explicit client-facing schema/compatibility policy; do not invent it here. |
+| Only one UI client is supported; multi-client attach is future work. | `AttachKind::Observer` and `Interactive` are part of the wire contract (`crates/thegn-svc/src/control/mod.rs:189-197`), and the actor retains multiple subscribers. Observer suppresses the attach-time resize and relay-lease hold, but `sessions.attach` remains write-scoped and its WebSocket pump accepts later input/resize messages in either mode (`crates/thegn-core/src/control.rs:525-552`; `crates/thegn-svc/src/control/http.rs:1555-1667`). | Mark multi-subscriber attach as already satisfied, but do not treat observer as an authorization boundary. Future work must pin least privilege and mutation behavior as well as compatibility and conflict policy.                                 |
+| `GET /pair` is absent and there is no CORS story.                    | The control state carries exact-origin `cors_origins` (`crates/thegn-svc/src/control/http.rs:38-53`), and a self-contained pairing page is served at `pair_page` (`crates/thegn-svc/src/control/http.rs:276-297`).                                                                                                                                                                                                                                        | Do not repeat the stale 404/no-CORS claim. TLS is still not provided by v1: `docs/api/control-v1.json:17-20` requires a trusted network or tunnel for plaintext TCP.                                                                                |
+| A dependency ban and boundary edits belong in this change.           | The draft proposes edits to `deny.toml` and `crates/thegn-core/tests/crate_boundaries.rs`, but THE-40 explicitly requires no code and only a decision record. Current bans are limited to historical `vt100`/`russh` (`deny.toml:80-92`); the boundary test is the owner table (`crates/thegn-core/tests/crate_boundaries.rs:19-66`).                                                                                                                     | Cut those implementation edits. Record the future boundary rule here and make the future frontend crate own its GUI substrate through a separate, reviewed change.                                                                                  |
+| Add a new AP roadmap row as part of this issue.                      | AP currently contains the long-horizon bets (`tasks.md:1251-1259`); J 127 is the existing optional web-terminal placeholder (`tasks.md:601-617`), and K is adaptive/mobile UI (`tasks.md:619-631`).                                                                                                                                                                                                                                                       | Do not mutate the roadmap in this docs-only architect commit. The coder chunk may sync the decision record into the archived openspec change; roadmap placement is a separate product-audit choice.                                                 |
 
 The branch `tg/the-34-herdr-api` is the coordination point for event filters
 and the `events.subscribe` projection. Its architect artifact says filters are
@@ -61,8 +61,10 @@ Already present:
   pinned in `docs/api/control-v1.json:431-530`.
 - `sessions.attach` is a write-scoped WebSocket attach with `client_id`,
   `rows`, `cols`, `observer`, and `history` query parameters
-  (`crates/thegn-svc/src/control/client.rs:525-605`). `observer` is the
-  read-mostly choice; an interactive client may resize, while observers do not.
+  (`crates/thegn-svc/src/control/client.rs:525-605`). `observer` suppresses the
+  attach-time resize and relay-lease hold, but it is not a read-only permission
+  boundary: the WebSocket pump accepts later input and resize messages after
+  either attach kind (`crates/thegn-svc/src/control/http.rs:1555-1667`).
 - The initial stream is `Hello`, then a `PaneSnapshot`, then sequenced
   `PaneDelta` frames. Snapshot sequence plus the first delta sequence is the
   resynchronization contract (`crates/thegn-svc/src/control/mod.rs:199-207`;
@@ -86,13 +88,26 @@ Still needed before a production GUI client:
    emulator: when to request `history=false`, how to discard stale deltas, how
    to react to a lag/resync snapshot, and which protocol features are required.
    The current typed client has a 10-second greeting/version guard
-   (`crates/thegn-svc/src/control/client.rs:611-682`), but that is not yet a
-   complete GUI compatibility policy.
-3. Define ownership of terminal geometry when an interactive TUI and GUI are
-   both present. Today “last interactive writer wins” is the actor behavior
-   (`crates/thegn-host/src/daemon/session.rs:618-621`); a GUI product needs a
-   deliberate UX around observer mode, resize contention, and input handoff.
-4. Select and test a substrate-free client-side terminal emulator. The GUI
+   (`crates/thegn-svc/src/control/client.rs:611-682`), but checks version only
+   when the first decoded frame is `Hello`; later decode errors are logged and
+   collapse into frame-channel closure. A client contract must require the
+   first `Hello` and surface transport/decode failure distinctly from exit.
+3. Define ownership and authorization of terminal geometry and input when an
+   interactive TUI and GUI are both present. Today “last interactive writer
+   wins” describes attach-time geometry in the actor
+   (`crates/thegn-host/src/daemon/session.rs:618-621`), while the transport
+   accepts later mutations from observers. A GUI product must pin that current
+   write-authorized behavior or introduce a separately reviewed read-only
+   stream that rejects upstream mutation.
+4. Define and encode session/client identifiers safely. The typed client
+   interpolates both values into the attach URI
+   (`crates/thegn-svc/src/control/client.rs:549-562`), while replacement and
+   detach are keyed only by caller-provided `client_id`; an older same-id
+   socket can detach a newer replacement after it closes
+   (`crates/thegn-host/src/daemon/session.rs:632-652`;
+   `crates/thegn-svc/src/control/http.rs:1666-1667`). Pin identifier encoding,
+   per-connection uniqueness, reconnect, and connection-owned detach semantics.
+5. Select and test a substrate-free client-side terminal emulator. The GUI
    process may own a terminal-emulation implementation, but no emulator or
    windowing dependency may leak into `thegn-core`; the architecture boundary
    explicitly keeps substrate crates out of core (`docs/ARCHITECTURE.md:1-35`).
@@ -224,6 +239,8 @@ access. Candidate 1 is limited to the already-shipped app-wrapper tier.
    remain the authority; secrets are never logged or persisted in plaintext.
    A GUI gets no broader scope than another client and must handle missing
    daemon, denied scope, expired pairing, lag, and protocol mismatch honestly.
+   Observer mode is not described as a read-only authorization boundary while
+   attach requires write and accepts upstream input/resize messages.
 9. **No new wake, DB, or migration contract in the decision.** A future client
    may read the existing state through control APIs; it must not open the live
    SQLite state DB or make the GUI the source of truth. Any state-schema change
@@ -242,8 +259,10 @@ Its scope should be deliberately narrow:
   render a single terminal cell grid, and detach cleanly;
 - consume the post-THE-34 `events.subscribe` filter/lag contract only for
   session/activity resync hints;
-- specify sequence, reconnect, version mismatch, bounded lag, and geometry
-  behavior in a pinned client fixture/schema;
+- specify required scope, observer upstream-mutation behavior,
+  required-first-hello and decode failures, identifier encoding/collision,
+  same-id reconnect/detach races, sequence, version mismatch, bounded lag, and
+  geometry behavior in a pinned client fixture/schema;
 - use an isolated test daemon/fixture and no new GUI toolkit, chrome model,
   config key, capability, database migration, or web surface.
 
