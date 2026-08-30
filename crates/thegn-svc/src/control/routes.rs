@@ -36,6 +36,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/sessions", &["sessions.list", "sessions.open"], || {
         get(http::list_sessions).post(http::open_session)
     }),
+    route("/v1/sessions/fork", &["sessions.fork"], || {
+        post(http::fork_session)
+    }),
     route("/v1/sessions/{s}/snapshot", &["sessions.snapshot"], || {
         get(http::snapshot)
     }),
@@ -149,6 +152,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("me", "GET", "/v1/me"),
     ("sessions.list", "GET", "/v1/sessions"),
     ("sessions.open", "POST", "/v1/sessions"),
+    ("sessions.fork", "POST", "/v1/sessions/fork"),
     ("sessions.snapshot", "GET", "/v1/sessions/{s}/snapshot"),
     ("sessions.input", "POST", "/v1/sessions/{s}/input"),
     ("sessions.resize", "POST", "/v1/sessions/{s}/resize"),

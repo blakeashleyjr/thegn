@@ -60,6 +60,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // model must land on a harness with a model flag, env keys must be
             // exportable names.
             errs.extend(crate::agent_task::validate_agent_models(&cfg));
+            errs.extend(crate::config_drawer::validate_drawer_config(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
@@ -337,42 +338,19 @@ fn walk_object(
         }
         return;
     }
-    // JSON/YAML can represent `Option<T>` explicitly as null (TOML cannot).
-    // Once the schema says null is an allowed branch, do not descend into the
-    // non-null branch and report a false type error for a valid overlay.
-    if value.is_null()
-        && obj.subschemas.as_ref().is_some_and(|sub| {
-            sub.any_of
-                .iter()
-                .flatten()
-                .chain(sub.one_of.iter().flatten())
-                .any(is_null_schema)
-        })
-    {
-        return;
-    }
     // schemars 0.8 wraps a `$ref` field in `allOf` whenever the field carries
-    // ANY metadata (a `default`, a doc comment, …), and `Option<Enum>` becomes
-    // `anyOf [$ref, null]` — recurse all subschema lists unconditionally. Only
-    // the resolved enum definition carries [`ENUM_MARKER`], so a value reached
-    // through a wrapper is still checked exactly once (never double-reported).
+    // ANY metadata (a `default`, a doc comment, …), so every `allOf` constraint
+    // still applies. `anyOf` / `oneOf` are alternatives instead: validate each
+    // branch in isolation and accept the union as soon as one branch is clean.
     if let Some(sub) = &obj.subschemas {
         for s in sub.all_of.iter().flatten() {
             walk_schema(s, root, value, path, errs, check_types);
         }
-        // An Option<T> is represented as anyOf [$ref(T), null].  The document
-        // formats supported here have no null values for config fields, so do
-        // not report a spurious "expected null" beside the useful T error.
-        for s in sub
-            .any_of
-            .iter()
-            .flatten()
-            .chain(sub.one_of.iter().flatten())
-        {
-            if is_null_schema(s) {
-                continue;
-            }
-            walk_schema(s, root, value, path, errs, check_types);
+        if let Some(branches) = &sub.any_of {
+            walk_union(branches, root, value, path, errs, check_types);
+        }
+        if let Some(branches) = &sub.one_of {
+            walk_union(branches, root, value, path, errs, check_types);
         }
     }
     // `sandbox.failover` and `env.<name>.failover` retain a legacy boolean
@@ -445,15 +423,89 @@ fn walk_object(
     }
 }
 
-fn is_null_schema(schema: &Schema) -> bool {
-    matches!(
-        schema,
-        Schema::Object(obj)
-            if matches!(
-                &obj.instance_type,
-                Some(SingleOrVec::Single(boxed)) if **boxed == InstanceType::Null
-            )
-    )
+/// Validate a schema union without leaking errors from non-matching branches.
+/// JSON Schema's `oneOf` normally also requires exactly one match, but the
+/// config schemas use these lists only to describe serde alternatives; for
+/// validation, either union is satisfied by any clean branch.
+fn walk_union(
+    branches: &[Schema],
+    root: &RootSchema,
+    value: &serde_json::Value,
+    path: &str,
+    errs: &mut Vec<String>,
+    check_types: bool,
+) {
+    let matched = branches.iter().any(|branch| match branch {
+        Schema::Bool(allowed) => *allowed,
+        Schema::Object(_) => {
+            let mut branch_errs = Vec::new();
+            walk_schema(branch, root, value, path, &mut branch_errs, check_types);
+            branch_errs.is_empty()
+        }
+    });
+    if matched {
+        return;
+    }
+
+    let mut shapes = Vec::new();
+    for branch in branches {
+        collect_schema_shapes(branch, root, &mut shapes);
+    }
+    shapes.sort();
+    shapes.dedup();
+    let accepted = if shapes.is_empty() {
+        "a matching union branch".to_string()
+    } else {
+        shapes.join(" or ")
+    };
+    errs.push(format!(
+        "{path}: expected one of: {accepted}, got {}",
+        value_type(value)
+    ));
+}
+
+/// Collect concise, user-facing shape names for a union diagnostic.
+fn collect_schema_shapes(schema: &Schema, root: &RootSchema, out: &mut Vec<String>) {
+    let Schema::Object(obj) = schema else {
+        if matches!(schema, Schema::Bool(true)) {
+            out.push("any value".to_string());
+        }
+        return;
+    };
+    if let Some(reference) = &obj.reference {
+        if let Some(def) = root.definitions.get(ref_name(reference)) {
+            collect_schema_shapes(def, root, out);
+        }
+        return;
+    }
+    if let Some(types) = &obj.instance_type {
+        match types {
+            SingleOrVec::Single(instance) => out.push(instance_type_name(instance)),
+            SingleOrVec::Vec(instances) => {
+                out.extend(instances.iter().map(instance_type_name));
+            }
+        }
+        return;
+    }
+    if obj.object.is_some() {
+        out.push("table/object".to_string());
+        return;
+    }
+    if obj.array.is_some() {
+        out.push("array".to_string());
+        return;
+    }
+    if let Some(sub) = &obj.subschemas {
+        for branch in sub
+            .all_of
+            .iter()
+            .flatten()
+            .chain(sub.any_of.iter().flatten())
+            .chain(sub.one_of.iter().flatten())
+        {
+            collect_schema_shapes(branch, root, out);
+        }
+    }
 }
 
 fn expected_type(obj: &SchemaObject, value: &serde_json::Value) -> Option<String> {
@@ -602,6 +654,32 @@ fn join_key(path: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    struct UnionDocument {
+        value: StringOrObject,
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    #[serde(untagged)]
+    enum StringOrObject {
+        String(String),
+        Object(UnionObject),
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    struct UnionObject {
+        command: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    struct StrictStringDocument {
+        value: String,
+    }
 
     /// Structural walk of the schema (no TOML document): collect every
     /// `(path, enum name)` pair reachable from the root. Maps contribute a `*`
@@ -768,9 +846,11 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
+        // 90 → 91 (THE-11): `[[tools]] drawer_scope` (DrawerScope) — which
+        // eligible catalog entries can occupy the bottom drawer.
         assert_eq!(
             defs.len(),
-            90,
+            91,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -839,6 +919,88 @@ mod tests {
     }
 
     // ---- behavior ----------------------------------------------------------
+
+    #[test]
+    fn union_accepts_each_shape_and_reports_only_the_union_on_a_miss() {
+        assert!(
+            validate_schema_value::<UnionDocument>(&serde_json::json!({ "value": "echo ok" }))
+                .is_empty()
+        );
+        assert!(
+            validate_schema_value::<UnionDocument>(
+                &serde_json::json!({ "value": { "command": "echo ok" } })
+            )
+            .is_empty()
+        );
+
+        let errs = validate_schema_value::<UnionDocument>(
+            &serde_json::json!({ "value": ["neither shape"] }),
+        );
+        assert_eq!(
+            errs,
+            ["value: expected one of: string or table/object, got array"]
+        );
+
+        // Exercise the `oneOf` field directly as schemars uses `anyOf` for
+        // serde's untagged enums. Config validation intentionally gives both
+        // union spellings the same any-clean-branch semantics.
+        let string = SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            ..Default::default()
+        };
+        let object = SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            ..Default::default()
+        };
+        let one_of = SchemaObject {
+            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                one_of: Some(vec![Schema::Object(string), Schema::Object(object)]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let root = schemars::schema_for!(StrictStringDocument);
+        let mut errs = Vec::new();
+        walk_object(
+            &one_of,
+            &root,
+            &serde_json::json!(false),
+            "value",
+            &mut errs,
+            true,
+        );
+        assert_eq!(
+            errs,
+            ["value: expected one of: string or table/object, got boolean"]
+        );
+    }
+
+    #[test]
+    fn hooks_list_entries_accept_both_union_shapes() {
+        let body = r#"
+[hooks]
+pre_create = [
+  "echo shorthand",
+  { command = "echo object", timeout_secs = 30, on_failure = "block" },
+]
+"#;
+        assert!(validate_str(body).is_empty(), "{:#?}", validate_str(body));
+
+        let errs = validate_str("[hooks]\npre_create = [42]\n");
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(errs[0].contains("hooks.pre_create[0]"), "{errs:#?}");
+        assert!(
+            errs[0].contains("expected one of: string or table/object, got integer"),
+            "{errs:#?}"
+        );
+    }
+
+    #[test]
+    fn non_union_types_remain_strict() {
+        let errs =
+            validate_schema_value::<StrictStringDocument>(&serde_json::json!({ "value": false }));
+        assert_eq!(errs, ["value: expected string, got boolean"]);
+    }
 
     #[test]
     fn newly_covered_keys_error_with_dotted_path_and_valid_set() {

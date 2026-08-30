@@ -24,10 +24,7 @@ pub(crate) const STATUS_TTL: Duration = Duration::from_secs(8);
 
 /// The status text a mode contributes when nothing else is showing.
 pub(crate) fn mode_text(mode: Mode) -> String {
-    match mode {
-        Mode::Normal => String::new(),
-        m => format!("{} mode", m.as_str()),
-    }
+    crate::i18n_surface::mode(mode, crate::i18n_surface::ModeStyle::Status)
 }
 
 /// True when `s` is one of the mode strings (so it must not be subject to the
