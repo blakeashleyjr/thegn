@@ -49,6 +49,9 @@ pub enum SourceKind {
     Capability,
     /// Bindable action ids from [`crate::keymap::BUILTINS`].
     Action,
+    /// Embedded skill package names. Configured user packages are discovered by
+    /// the host and deliberately not walked on the latency-sensitive TAB path.
+    Skill,
 
     /// clap already completes this slot from the tree itself — subcommand
     /// names, flags, and `ValueEnum` arguments such as `completions <shell>`.
@@ -141,6 +144,7 @@ impl SourceKind {
         SourceKind::ConfigKey,
         SourceKind::Capability,
         SourceKind::Action,
+        SourceKind::Skill,
         SourceKind::Structural,
         SourceKind::Reserved(Reserved::Branch),
         SourceKind::Reserved(Reserved::Pr),
@@ -167,6 +171,7 @@ impl SourceKind {
             SourceKind::ConfigKey => "config-key",
             SourceKind::Capability => "capability",
             SourceKind::Action => "action",
+            SourceKind::Skill => "skill",
             SourceKind::Structural => "structural",
             SourceKind::Reserved(r) => r.kind(),
         }
@@ -458,11 +463,14 @@ pub const CATALOG: &[Slot] = &[
     slot("config set", "key", SourceKind::ConfigKey),
     // --- capability --------------------------------------------------------
     slot("api call", "cap", SourceKind::Capability),
+    // --- embedded skill ---------------------------------------------------
+    slot("skills show", "name", SourceKind::Skill),
     // --- structural (clap completes these from the tree) -------------------
     // `--config <PATH>`: a path, which the engine completes from the filesystem.
     // A `global = true` arg, so it is classified once at the root.
     slot("", "config", SourceKind::Structural),
     slot("completions", "shell", SourceKind::Structural),
+    slot("skills seed", "worktree", SourceKind::Structural),
     slot("pr merge", "method", SourceKind::Structural),
     slot("pr review", "state", SourceKind::Structural),
     // --- reserved ----------------------------------------------------------
@@ -564,7 +572,7 @@ mod tests {
             .filter(|k| k.is_implemented() && !k.reads_db() && !k.reads_config())
             .map(|k| k.kind())
             .collect();
-        assert_eq!(in_process, ["theme", "capability", "action"]);
+        assert_eq!(in_process, ["theme", "capability", "action", "skill"]);
     }
 
     #[test]

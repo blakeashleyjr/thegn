@@ -383,6 +383,10 @@ pub enum Verb {
     /// pipeline stage (harness, model, env keys, permissions) — config-derived
     /// (read), no process is started.
     AgentList,
+    /// List embedded and configured skill metadata without touching targets.
+    SkillsList,
+    /// Seed skills into a local worktree through the host adapter.
+    SkillsSeed,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
@@ -470,6 +474,8 @@ impl Verb {
         Verb::SemanticBlastRadius,
         Verb::AgentSessions,
         Verb::AgentList,
+        Verb::SkillsList,
+        Verb::SkillsSeed,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
         Verb::ModelProxyStart,
@@ -518,6 +524,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
         | Verb::AgentList
+        | Verb::SkillsList
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -549,7 +556,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SearchReplace
         | Verb::ContainersControl
         | Verb::Split
-        | Verb::RecordSession => Scope::Write,
+        | Verb::RecordSession
+        | Verb::SkillsSeed => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeAdd
@@ -852,6 +860,7 @@ mod tests {
             SemanticBlastRadius,
             AgentSessions,
             AgentList,
+            SkillsList,
             ModelProxyStatus,
             ModelProxyStats,
         ];
@@ -882,6 +891,7 @@ mod tests {
             DispatchesNote,
             SearchReplace,
             ContainersControl,
+            SkillsSeed,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];

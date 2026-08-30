@@ -263,10 +263,9 @@ fn create_and_register(
         worktree::remove(root, &path, branch, true);
         anyhow::anyhow!(e)
     })?;
-    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
-    // so agents launched in this worktree discover them (best-effort, gated on
-    // [merge_queue] enabled).
-    crate::mq_assets::seed_if_enabled(cfg, &path);
+    // Seed the configured skill registry in each harness-native layout. This
+    // non-interactive CLI path may do the bounded work synchronously.
+    crate::skill_seed::seed_if_enabled(cfg, &path, thegn_core::skills::SeedPhase::Create);
 
     // Register (git stays the source of truth; the DB row is what the sidebar
     // + session resurrection read). put_worktree is the primary path; the env

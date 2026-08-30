@@ -58,6 +58,24 @@ impl ControlApi for FakeApi {
             }])
         })
     }
+    fn list_skills(&self) -> BoxFuture<'_, ControlResult<super::SkillsList>> {
+        self.record("list_skills");
+        Box::pin(async {
+            Ok(super::SkillsList {
+                skills: vec![super::SkillInfo {
+                    name: "mq".into(),
+                    description: "merge queue".into(),
+                    harnesses: vec!["claude".into()],
+                    gate: "merge_queue".into(),
+                    when: vec!["explicit".into()],
+                    source: thegn_core::skills::SkillSource::embedded(
+                        "extensions/skills/mq/SKILL.md",
+                    ),
+                }],
+                diagnostics: vec![],
+            })
+        })
+    }
     fn open(&self, _spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         self.record("open");
         Box::pin(async {
@@ -325,6 +343,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
     for (method, path) in [
         ("GET", "/v1/sessions"),
         ("GET", "/v1/worktrees"),
+        ("GET", "/v1/skills"),
         ("GET", "/v1/leases"),
         ("GET", "/v1/me"),
         ("GET", "/v1/sessions/s1/snapshot"),
@@ -393,6 +412,33 @@ async fn worktrees_list_needs_read_and_is_rejected_before_the_api() {
         StatusCode::OK
     );
     assert_eq!(r.api.calls(), vec!["list_worktrees".to_string()]);
+}
+
+#[tokio::test]
+async fn skills_list_is_metadata_only_and_read_scoped() {
+    let r = rig(false);
+    let none = token(&r, "");
+    assert_eq!(
+        call(&r, "GET", "/v1/skills", Some(&none)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(r.api.calls().is_empty());
+    let read = token(&r, "read");
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/skills")
+        .header("authorization", format!("Bearer {read}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(r.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["skills"][0]["name"], "mq");
+    assert!(value.get("worktree").is_none());
+    assert_eq!(r.api.calls(), ["list_skills"]);
 }
 
 #[tokio::test]
