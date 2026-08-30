@@ -17,6 +17,14 @@ pub enum ControlErrorCode {
     Internal,
     Unauthorized,
     BadRequest,
+    // Added when THE-34's code taxonomy met main's wider `ControlError` set:
+    // these three variants existed as errors with no stable identifier, and
+    // collapsing them into `Internal` would have defeated the point of a
+    // machine-readable taxonomy. `InvalidArgument` maps onto the existing
+    // `BadRequest` rather than adding a fourth synonym.
+    FailedPrecondition,
+    ResourceExhausted,
+    Unavailable,
 }
 
 impl ControlErrorCode {
@@ -29,6 +37,9 @@ impl ControlErrorCode {
         Self::Internal,
         Self::Unauthorized,
         Self::BadRequest,
+        Self::FailedPrecondition,
+        Self::ResourceExhausted,
+        Self::Unavailable,
     ];
 
     /// The stable wire identifier.
@@ -41,6 +52,9 @@ impl ControlErrorCode {
             Self::Internal => "internal",
             Self::Unauthorized => "unauthorized",
             Self::BadRequest => "bad_request",
+            Self::FailedPrecondition => "failed_precondition",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -65,6 +79,9 @@ mod tests {
             (ControlErrorCode::Internal, "internal"),
             (ControlErrorCode::Unauthorized, "unauthorized"),
             (ControlErrorCode::BadRequest, "bad_request"),
+            (ControlErrorCode::FailedPrecondition, "failed_precondition"),
+            (ControlErrorCode::ResourceExhausted, "resource_exhausted"),
+            (ControlErrorCode::Unavailable, "unavailable"),
         ];
         assert_eq!(ControlErrorCode::ALL, &expected.map(|(code, _)| code));
         for (code, id) in expected {

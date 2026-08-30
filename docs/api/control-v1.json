@@ -219,6 +219,22 @@
       ],
       "type": "object"
     },
+    "ControlErrorCode": {
+      "description": "The closed set of machine-readable control-plane error identifiers.",
+      "enum": [
+        "not_found",
+        "no_scope",
+        "conflict",
+        "unimplemented",
+        "internal",
+        "unauthorized",
+        "bad_request",
+        "failed_precondition",
+        "resource_exhausted",
+        "unavailable"
+      ],
+      "type": "string"
+    },
     "DispatchPutReq": {
       "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.\n\nThe four pipeline fields (v56) are optional and default-absent, so a caller written against the three-string version keeps working unchanged. `put` carries them all: the roster gains columns, not verbs — there is deliberately no `dispatches.update`, because a mutable stage field invites thegn to become the thing that advances it.",
       "properties": {
@@ -309,6 +325,50 @@
       "required": [
         "worktree"
       ],
+      "type": "object"
+    },
+    "ErrorBody": {
+      "description": "The additive HTTP error envelope. `error` retains the existing human message; `code` is stable for machine-readable branching.",
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/ControlErrorCode"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "error"
+      ],
+      "type": "object"
+    },
+    "FeedFilter": {
+      "description": "Per-connection narrowing options for the control event feed.\n\nAn absent `kinds` or `session` field means no narrowing. The transport adapters parse their query/request representation through [`Self::parse`] or [`Self::from_parts`] before creating a subscription.",
+      "properties": {
+        "kinds": {
+          "description": "A subset of [`FEED_KINDS`]. `None` means every kind.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "session": {
+          "description": "Limit session-keyed frames to this session. Unkeyed frames still pass.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signal_lag": {
+          "default": false,
+          "description": "Emit [`EventFrame::Lagged`] when the bounded broadcast reports loss.",
+          "type": "boolean"
+        }
+      },
       "type": "object"
     },
     "ForkSpec": {
@@ -1485,6 +1545,12 @@
     },
     "EditorOpenRequest": {
       "$ref": "#/definitions/EditorOpenRequest"
+    },
+    "ErrorBody": {
+      "$ref": "#/definitions/ErrorBody"
+    },
+    "FeedFilter": {
+      "$ref": "#/definitions/FeedFilter"
     },
     "ForkSpec": {
       "$ref": "#/definitions/ForkSpec"

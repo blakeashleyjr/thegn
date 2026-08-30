@@ -1000,7 +1000,13 @@ pub(super) async fn open_editor(
     }
     let target = match body.target() {
         Ok(target) => target,
-        Err(e) => return error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                &e.to_string(),
+            );
+        }
     };
     match state.api.open_editor(target).await {
         Ok(()) => axum::Json(json!({ "queued": true })).into_response(),
