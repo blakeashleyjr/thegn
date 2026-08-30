@@ -184,7 +184,7 @@ mod tests {
         assert!(editor.caps().open_file && editor.caps().open_directory && editor.caps().column);
         assert_eq!(
             editor.open_target(&file()).unwrap().argv,
-            strings(&["emacsclient", "-n", "+42:7", "/work/tree/src/main.rs"])
+            strings(&["emacsclient", "-n", "+42:6", "/work/tree/src/main.rs"])
         );
         assert_eq!(
             editor.open_target(&project()).unwrap().argv,
