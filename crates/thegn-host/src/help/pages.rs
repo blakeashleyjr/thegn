@@ -40,6 +40,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/sandboxing.md"),
     include_str!("../../../../docs/help/plugins.md"),
     include_str!("../../../../docs/help/configuration.md"),
+    include_str!("../../../../docs/help/skills.md"),
     include_str!("../../../../docs/help/notifications.md"),
     include_str!("../../../../docs/help/terminal-compatibility.md"),
     include_str!("../../../../docs/help/best-practices.md"),
