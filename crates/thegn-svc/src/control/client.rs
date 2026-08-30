@@ -361,6 +361,21 @@ impl ControlClient {
         }
     }
 
+    /// `POST /v1/preview/fetch` — one bounded, credential-free preview GET.
+    pub async fn preview_fetch(
+        &self,
+        req: &super::PreviewFetchRequest,
+    ) -> Result<super::PreviewFetchReply> {
+        let v = self
+            .request(
+                "POST",
+                "/v1/preview/fetch",
+                Some(serde_json::to_value(req)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     // --- agent orchestration (THE-57) ---------------------------------------
 
     /// `POST /v1/worktrees` — create a worktree, optionally from an issue.

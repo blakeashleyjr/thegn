@@ -36,10 +36,11 @@ impl AuditOutcome {
 }
 
 /// Whether a verb's invocations are audited: every call whose required scope is
-/// `write`, `git` or `admin` (read verbs are not audited — auth rejections are,
-/// separately, at the adapter).
+/// `write`, `git` or `admin`, plus the read-scoped `preview.fetch` network
+/// operation. Other read verbs are not audited; auth rejections are audited
+/// separately at the adapter.
 pub fn is_audited(verb: Verb) -> bool {
-    required_scope(verb) != Scope::Read
+    required_scope(verb) != Scope::Read || verb == Verb::PreviewFetch
 }
 
 /// One audit record. Borrows its strings — built at the handler and emitted
@@ -88,10 +89,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_mutating_verbs_are_audited() {
+    fn mutating_and_network_fetch_verbs_are_audited() {
         assert!(is_audited(Verb::GitCommit));
         assert!(is_audited(Verb::SendInput));
         assert!(is_audited(Verb::Shutdown));
+        assert!(is_audited(Verb::PreviewFetch));
         assert!(!is_audited(Verb::ListSessions));
         assert!(!is_audited(Verb::Me));
     }
