@@ -1441,6 +1441,40 @@ fn metrics_env_overlay_clamps_runtime_bounds() {
     assert_eq!(c.metrics.max_body_bytes, 1);
 }
 
+#[test]
+fn preview_config_layering_and_cli_array_override() {
+    let dir = tmpdir("preview-config");
+    let file = dir.join("config.toml");
+    std::fs::write(
+        &file,
+        "[preview]\nenabled = true\nports = [1111]\nfetch_timeout_ms = 500\n\
+         max_body_bytes = 2048\nallow_external_urls = false\n",
+    )
+    .unwrap();
+    let env = map_env(&[
+        ("THEGN_PREVIEW_ENABLED", "false"),
+        ("THEGN_PREVIEW_PORTS", "2222"),
+        ("THEGN_PREVIEW_FETCH_TIMEOUT_MS", "600"),
+        ("THEGN_PREVIEW_MAX_BODY_BYTES", "4096"),
+        ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "true"),
+    ]);
+    let flags = vec![
+        "preview.enabled=true".into(),
+        "preview.ports=[4444, 3333, 4444]".into(),
+        "preview.fetch_timeout_ms=700".into(),
+        "preview.max_body_bytes=8192".into(),
+        "preview.allow_external_urls=false".into(),
+    ];
+    let config = Config::load_layered(&env, &flags, Some(file));
+    assert!(config.preview.enabled);
+    assert_eq!(config.preview.ports, vec![3333, 4444]);
+    assert_eq!(config.preview.fetch_timeout_ms, 700);
+    assert_eq!(config.preview.max_body_bytes, 8192);
+    assert!(!config.preview.allow_external_urls);
+    // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Exercise every env knob (and the canonical/deprecated/bad-value paths) so
 // the layering is covered, not just spot-checked.
 #[test]
@@ -1516,6 +1550,11 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
         ("THEGN_WEATHER_ENABLED", "yes"),
         ("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "true"),
+        ("THEGN_PREVIEW_ENABLED", "no"),
+        ("THEGN_PREVIEW_PORTS", "5173,3000,5173"),
+        ("THEGN_PREVIEW_FETCH_TIMEOUT_MS", "850"),
+        ("THEGN_PREVIEW_MAX_BODY_BYTES", "8192"),
+        ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "yes"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1597,6 +1636,11 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.disk.shared_target_dir, "/tgt");
     assert!(c.weather.enabled);
     assert!(c.notifications.agent_attention_inbox);
+    assert!(!c.preview.enabled);
+    assert_eq!(c.preview.ports, vec![3000, 5173]);
+    assert_eq!(c.preview.fetch_timeout_ms, 850);
+    assert_eq!(c.preview.max_body_bytes, 8192);
+    assert!(c.preview.allow_external_urls);
 }
 
 #[test]

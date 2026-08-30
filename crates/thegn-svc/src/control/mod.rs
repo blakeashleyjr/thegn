@@ -305,6 +305,41 @@ pub enum BrowserAction {
     Back,
 }
 
+/// A bounded, credential-free preview fetch request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreviewFetchRequest {
+    /// Absolute `http`/`https` URL. The host applies its loopback policy before
+    /// connecting and again after every redirect.
+    pub url: String,
+    /// Optional worktree identity used only to select pane diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Include bounded, redacted dev-server pane error lines. This is not a
+    /// browser JavaScript-console claim.
+    #[serde(default)]
+    pub include_console: bool,
+}
+
+/// The bounded, JSON-safe result of [`PreviewFetchRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreviewFetchReply {
+    /// Final URL after validated redirects.
+    pub url: String,
+    /// Origin server HTTP status, preserved as data (including non-2xx).
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Lossy UTF-8 rendering of at most `[preview] max_body_bytes` bytes.
+    pub body: String,
+    pub truncated: bool,
+    /// Bounded, redacted error-shaped lines from the associated dev-server pane.
+    #[serde(default)]
+    pub console_errors: Vec<String>,
+    /// `dev-server-pane` when those diagnostics were available, otherwise
+    /// `unavailable`.
+    pub diagnostics_source: String,
+}
+
 /// The payload of an [`EventFrame::Activity`] frame: one session's agent state
 /// changed.
 ///
@@ -589,12 +624,16 @@ pub struct DispatchPutReq {
 #[derive(Debug)]
 pub enum ControlError {
     NotFound(String),
+    InvalidArgument(String),
     /// The caller's token lacks the required scope. Produced by adapters (the
     /// trait impl never sees an under-scoped call).
     NoScope {
         need: Scope,
     },
     Conflict(String),
+    FailedPrecondition(String),
+    ResourceExhausted(String),
+    Unavailable(String),
     Unimplemented(&'static str),
     Internal(anyhow::Error),
 }
@@ -603,10 +642,18 @@ impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ControlError::NotFound(what) => write!(f, "not found: {what}"),
+            ControlError::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             ControlError::NoScope { need } => {
                 write!(f, "missing required scope: {}", need.as_str())
             }
             ControlError::Conflict(what) => write!(f, "conflict: {what}"),
+            ControlError::FailedPrecondition(what) => {
+                write!(f, "failed precondition: {what}")
+            }
+            ControlError::ResourceExhausted(what) => {
+                write!(f, "resource exhausted: {what}")
+            }
+            ControlError::Unavailable(what) => write!(f, "unavailable: {what}"),
             ControlError::Unimplemented(what) => write!(f, "not implemented: {what}"),
             ControlError::Internal(e) => write!(f, "{e:#}"),
         }
@@ -712,6 +759,14 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Command the preview browser. v1: always `Err(Unimplemented)`.
     fn drive_browser(&self, cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>>;
+
+    /// Perform one bounded, credential-free HTTP GET for `preview.fetch`.
+    fn preview_fetch(
+        &self,
+        _req: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("preview_fetch")) })
+    }
 
     /// Block until `session` reaches `cond` (or `timeout_ms` elapses). The
     /// default answers `Unimplemented`; the daemon overrides it to implement the

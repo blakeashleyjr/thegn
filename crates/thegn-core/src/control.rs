@@ -257,6 +257,8 @@ pub enum Verb {
     /// Queue a validated worktree/file target for the owning compositor to
     /// hand off to its locally configured editor.
     OpenEditor,
+    /// Fetch one preview URL with the bounded, credential-free host executor.
+    PreviewFetch,
     DriveBrowser,
     /// Block until a session reaches a state — observes only.
     Wait,
@@ -419,6 +421,7 @@ impl Verb {
         Verb::KillSession,
         Verb::OpenWorktree,
         Verb::OpenEditor,
+        Verb::PreviewFetch,
         Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
@@ -529,6 +532,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
         | Verb::AgentList
+        | Verb::PreviewFetch
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -866,6 +870,7 @@ mod tests {
             SemanticBlastRadius,
             AgentSessions,
             AgentList,
+            PreviewFetch,
             ModelProxyStatus,
             ModelProxyStats,
         ];
