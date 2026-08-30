@@ -88,13 +88,16 @@ fn try_submit(
     pending_add();
     if let Err(error) = tx.try_send(event) {
         let event = error.into_inner();
-        pending_done();
         tracing::warn!(
             target: "thegn::automation",
             outcome = "dropped",
             "automation event queue full or closed"
         );
-        return audit_dropped(event);
+        let audit = audit_dropped(event);
+        if audit.is_none() {
+            pending_done();
+        }
+        return audit;
     }
     None
 }
@@ -129,20 +132,24 @@ fn audit_dropped(event: AutomationEvent) -> Option<std::thread::JoinHandle<anyho
     std::thread::Builder::new()
         .name("automation-drop-audit".into())
         .spawn(move || -> anyhow::Result<()> {
-            let db = thegn_core::db::Db::open()?;
-            let now = thegn_core::util::now();
-            let id = db.start_automation_run(&NewAutomationRun {
-                rule_id: "__queue__".into(),
-                event_id: event.id,
-                event_key: event.key.0,
-                trigger_kind: event.kind.as_str().into(),
-                event_summary: bounded(event.message.as_deref().unwrap_or_default()),
-                action_cap: String::new(),
-                action_summary: String::new(),
-                started_at: now,
-            })?;
-            db.finish_automation_run(id, "dropped", Some("queue_overflow"), None, now)?;
-            Ok(())
+            let result = (|| -> anyhow::Result<()> {
+                let db = thegn_core::db::Db::open()?;
+                let now = thegn_core::util::now();
+                let id = db.start_automation_run(&NewAutomationRun {
+                    rule_id: "__queue__".into(),
+                    event_id: event.id,
+                    event_key: event.key.0,
+                    trigger_kind: event.kind.as_str().into(),
+                    event_summary: bounded(event.message.as_deref().unwrap_or_default()),
+                    action_cap: String::new(),
+                    action_summary: String::new(),
+                    started_at: now,
+                })?;
+                db.finish_automation_run(id, "dropped", Some("queue_overflow"), None, now)?;
+                Ok(())
+            })();
+            pending_done();
+            result
         })
         .ok()
 }
