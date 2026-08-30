@@ -3257,9 +3257,16 @@ pub fn launch_spec_full(
 
     // Pre-warm this worktree's `direnv` cache on the host so the in-sandbox
     // direnv hook replays it read-only instead of failing on the read-only
-    // `/nix/store`. Off-loop, gated by `needs_warm`; local worktrees only (a
-    // remote worktree's `.envrc` isn't on this host's filesystem).
-    if !loc.is_remote() && !outcome.is_remote {
+    // `/nix/store`. A host fallback has a writable store already, so warming
+    // there is both unnecessary and potentially expensive. Keep the gate on
+    // the resolved launch, rather than the configured backend: auto may have
+    // fallen through to `none` because no sandbox runtime is available.
+    let has_local_sandbox = !loc.is_remote()
+        && !outcome.is_remote
+        && outcome.spec.as_ref().is_some_and(|spec| {
+            spec.placement.is_local() && spec.backend != sandbox::Backend::None
+        });
+    if has_local_sandbox {
         crate::direnv_warm::warm_for_launch(cfg, Path::new(worktree), sync_warm);
     }
 
