@@ -2920,6 +2920,24 @@ ready_timeout_secs = 20
 # extra_args = []  # extra `dumbpipe listen-tcp` flags (e.g. a self-hosted relay).
 #                  # The consumer connects with `dumbpipe connect-tcp <ticket>`.
 
+# ── Frontend preview discovery + fetch policy (`[preview]`) ─────────────────
+# Preview discovers candidate dev servers from this explicit list, bounded pane
+# output, and literal ports in package.json scripts.dev/scripts.start. `ports`
+# is a hint/allowlist only: thegn NEVER launches a process or executes a package
+# script from this section. All keys have launch-time environment equivalents.
+#
+# `preview.fetch` is an HTTP(S) GET with no cookies, authorization, browser
+# profile, or ambient proxy. By default every initial URL AND redirect must use
+# the exact authorities localhost, 127.0.0.1, or ::1. Setting
+# `allow_external_urls = true` opts out of that SSRF boundary, but timeout and
+# body limits still apply.
+[preview]
+enabled = true               # THEGN_PREVIEW_ENABLED; enable preview discovery/surfaces
+ports = []                   # THEGN_PREVIEW_PORTS (comma-separated), e.g. "3000,5173"
+fetch_timeout_ms = 3000      # THEGN_PREVIEW_FETCH_TIMEOUT_MS; clamped to 100..30000
+max_body_bytes = 1048576     # THEGN_PREVIEW_MAX_BODY_BYTES; capped at 16 MiB
+allow_external_urls = false  # THEGN_PREVIEW_ALLOW_EXTERNAL_URLS; localhost-only when false
+
 # ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
 # The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE
 # a worktree's sandbox (container / ssh host / k8s pod), thegn auto-detects it

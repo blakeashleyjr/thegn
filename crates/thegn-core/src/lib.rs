@@ -52,6 +52,7 @@ pub mod config_pipeline;
 pub mod config_placement;
 pub mod config_pr_queue;
 pub mod config_presets;
+pub mod config_preview;
 pub mod config_push;
 pub mod config_remote;
 pub mod config_resolve;

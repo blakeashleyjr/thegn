@@ -10,6 +10,11 @@
 
 use std::path::Path;
 
+use once_cell::sync::Lazy;
+use regex::Regex;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 /// The render route a previewed file takes.
 ///
 /// Routing is extension-first with a content sniff only to disambiguate the
@@ -305,6 +310,449 @@ fn count_image_outputs(v: Option<&serde_json::Value>) -> usize {
         .count()
 }
 
+// ── Frontend dev-server discovery + fetch policy ─────────────────────────────
+
+/// Maximum pane-output characters inspected in one parser call.
+pub const MAX_PORT_HINT_CHARS: usize = 64 * 1024;
+/// Maximum `package.json` text accepted by the pure package-script parser.
+pub const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
+
+/// Where a dev-server port candidate came from, in precedence order.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum PortHintSource {
+    Config,
+    PaneOutput,
+    PackageScript,
+}
+
+impl PortHintSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::PaneOutput => "pane-output",
+            Self::PackageScript => "package-script",
+        }
+    }
+}
+
+impl std::fmt::Display for PortHintSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One valid loopback dev-server candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PortHint {
+    pub port: u16,
+    /// `localhost`, `127.0.0.1`, or `::1`. Flag/config hints use `localhost`.
+    pub host: String,
+    pub source: PortHintSource,
+}
+
+impl PortHint {
+    pub fn configured(port: u16) -> Option<Self> {
+        valid_port(port).then(|| Self {
+            port,
+            host: "localhost".into(),
+            source: PortHintSource::Config,
+        })
+    }
+
+    /// Canonical HTTP URL for this candidate.
+    pub fn url(&self) -> String {
+        if self.host.contains(':') {
+            format!("http://[{}]:{}/", self.host, self.port)
+        } else {
+            format!("http://{}:{}/", self.host, self.port)
+        }
+    }
+}
+
+fn valid_port(port: u16) -> bool {
+    port != 0
+}
+
+fn parsed_port(raw: &str) -> Option<u16> {
+    raw.parse::<u16>().ok().filter(|port| valid_port(*port))
+}
+
+fn captured_port(captures: &regex::Captures<'_>, input: &str) -> Option<u16> {
+    let capture = captures.name("port")?;
+    if input[capture.end()..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    parsed_port(capture.as_str())
+}
+
+static ANSI_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)")
+        .expect("valid ANSI regex")
+});
+static LOOPBACK_PORT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[^A-Za-z0-9_.-])(?:https?://)?(?P<host>localhost|127\.0\.0\.1|\[::1\]):(?P<port>[0-9]{1,6})",
+    )
+    .expect("valid loopback-port regex")
+});
+static FLAG_PORT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:^|[\s\"'`])(?:--port|-p)(?:\s*=\s*|\s+)[\"']?(?P<port>[0-9]{1,6})[\"']?"#)
+        .expect("valid port-flag regex")
+});
+static ENV_PORT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:^|[^A-Za-z0-9_])PORT\s*=\s*["']?(?P<port>[0-9]{1,6})["']?"#)
+        .expect("valid PORT regex")
+});
+
+/// Strip terminal escape/control sequences and bound parser work.
+pub fn sanitize_port_hint_text(input: &str) -> String {
+    let bounded: String = input.chars().take(MAX_PORT_HINT_CHARS).collect();
+    let no_ansi = ANSI_RE.replace_all(&bounded, "");
+    no_ansi
+        .chars()
+        .filter_map(|ch| match ch {
+            '\n' | '\r' | '\t' => Some(ch),
+            '\u{1b}' => None,
+            ch if ch.is_control() => Some(' '),
+            ch => Some(ch),
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct FoundHint {
+    offset: usize,
+    hint: PortHint,
+}
+
+fn parse_explicit_hints(input: &str, source: PortHintSource, urls: bool) -> Vec<PortHint> {
+    let clean = sanitize_port_hint_text(input);
+    let mut found = Vec::new();
+    if urls {
+        for captures in LOOPBACK_PORT_RE.captures_iter(&clean) {
+            let Some(port) = captured_port(&captures, &clean) else {
+                continue;
+            };
+            let host = captures
+                .name("host")
+                .map(|m| m.as_str().trim_matches(['[', ']']).to_ascii_lowercase())
+                .unwrap_or_else(|| "localhost".into());
+            found.push(FoundHint {
+                offset: captures.get(0).map_or(0, |m| m.start()),
+                hint: PortHint { port, host, source },
+            });
+        }
+    }
+    for regex in [&*FLAG_PORT_RE, &*ENV_PORT_RE] {
+        for captures in regex.captures_iter(&clean) {
+            let Some(port) = captured_port(&captures, &clean) else {
+                continue;
+            };
+            found.push(FoundHint {
+                offset: captures.get(0).map_or(0, |m| m.start()),
+                hint: PortHint {
+                    port,
+                    host: "localhost".into(),
+                    source,
+                },
+            });
+        }
+    }
+    found.sort_by_key(|item| item.offset);
+    let mut hints = Vec::new();
+    for item in found {
+        if !hints
+            .iter()
+            .any(|hint: &PortHint| hint.port == item.hint.port)
+        {
+            hints.push(item.hint);
+        }
+    }
+    hints
+}
+
+/// Parse bounded pane output for explicit loopback URLs, port flags, or `PORT=`.
+pub fn parse_port_hints(input: &str) -> Vec<PortHint> {
+    parse_explicit_hints(input, PortHintSource::PaneOutput, true)
+}
+
+/// More explicit alias used by host-side pane plumbing.
+pub fn parse_pane_port_hints(input: &str) -> Vec<PortHint> {
+    parse_port_hints(input)
+}
+
+/// Parse only `scripts.dev` and `scripts.start` from supplied `package.json`.
+///
+/// Scripts are never executed. Only literal `--port`, `-p`, and `PORT=` values
+/// are considered; framework defaults and arbitrary URLs are deliberately not
+/// inferred.
+pub fn parse_package_script_hints(package_json: &str) -> Result<Vec<PortHint>, String> {
+    if package_json.len() > MAX_PACKAGE_JSON_BYTES {
+        return Err(format!(
+            "package.json exceeds {MAX_PACKAGE_JSON_BYTES} byte preview limit"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(package_json)
+        .map_err(|error| format!("invalid package.json: {error}"))?;
+    let Some(scripts) = value.get("scripts").and_then(serde_json::Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let mut hints = Vec::new();
+    for name in ["dev", "start"] {
+        let Some(script) = scripts.get(name).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        for hint in parse_explicit_hints(script, PortHintSource::PackageScript, false) {
+            if !hints
+                .iter()
+                .any(|existing: &PortHint| existing.port == hint.port)
+            {
+                hints.push(hint);
+            }
+        }
+    }
+    Ok(hints)
+}
+
+/// Alias matching the package-level operation rather than its return value.
+pub fn parse_package_scripts(package_json: &str) -> Result<Vec<PortHint>, String> {
+    parse_package_script_hints(package_json)
+}
+
+/// Sort by source precedence and port, removing duplicate ports deterministically.
+pub fn merge_hints(hints: impl IntoIterator<Item = PortHint>) -> Vec<PortHint> {
+    let mut hints: Vec<PortHint> = hints
+        .into_iter()
+        .filter(|hint| valid_port(hint.port))
+        .collect();
+    hints.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then(left.port.cmp(&right.port))
+            .then(left.host.cmp(&right.host))
+    });
+    let mut merged = Vec::new();
+    for hint in hints {
+        if !merged
+            .iter()
+            .any(|existing: &PortHint| existing.port == hint.port)
+        {
+            merged.push(hint);
+        }
+    }
+    merged
+}
+
+/// Merge all discovery sources using config → pane → package precedence.
+pub fn merge_port_hints(
+    configured_ports: &[u16],
+    pane_output: impl IntoIterator<Item = PortHint>,
+    package_scripts: impl IntoIterator<Item = PortHint>,
+) -> Vec<PortHint> {
+    merge_hints(
+        configured_ports
+            .iter()
+            .filter_map(|port| PortHint::configured(*port))
+            .chain(pane_output)
+            .chain(package_scripts),
+    )
+}
+
+/// Reachability known from event-driven pane/forward lifecycle facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewStatus {
+    Up,
+    Down,
+    Unknown,
+}
+
+impl PreviewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for PreviewStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Live, memory-only target metadata shared by host projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewTarget {
+    pub worktree: String,
+    pub port: u16,
+    pub url: String,
+    pub source: PortHintSource,
+    pub pane: Option<String>,
+    pub session: Option<String>,
+    pub status: PreviewStatus,
+}
+
+impl PreviewTarget {
+    pub fn from_hint(worktree: impl Into<String>, hint: PortHint) -> Self {
+        Self {
+            worktree: worktree.into(),
+            port: hint.port,
+            url: hint.url(),
+            source: hint.source,
+            pane: None,
+            session: None,
+            status: PreviewStatus::Unknown,
+        }
+    }
+}
+
+/// Choose an active target: reachable first, then unknown, then down; within a
+/// lifecycle class use source precedence and ascending port order.
+pub fn select_target(targets: &[PreviewTarget]) -> Option<&PreviewTarget> {
+    fn status_rank(status: PreviewStatus) -> u8 {
+        match status {
+            PreviewStatus::Up => 0,
+            PreviewStatus::Unknown => 1,
+            PreviewStatus::Down => 2,
+        }
+    }
+    targets.iter().min_by(|left, right| {
+        status_rank(left.status)
+            .cmp(&status_rank(right.status))
+            .then(left.source.cmp(&right.source))
+            .then(left.port.cmp(&right.port))
+            .then(left.url.cmp(&right.url))
+    })
+}
+
+/// Parsed facts needed by the host fetcher after URL policy validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ValidatedPreviewUrl {
+    pub url: String,
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub is_loopback: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewUrlError {
+    Invalid,
+    UnsupportedScheme,
+    CredentialsForbidden,
+    ExternalForbidden,
+}
+
+impl std::fmt::Display for PreviewUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Invalid => "invalid preview URL",
+            Self::UnsupportedScheme => "preview URL must use http or https",
+            Self::CredentialsForbidden => "preview URL credentials are forbidden",
+            Self::ExternalForbidden => "preview URL must use localhost or a loopback address",
+        })
+    }
+}
+
+impl std::error::Error for PreviewUrlError {}
+
+fn split_authority(authority: &str) -> Result<(String, Option<u16>), PreviewUrlError> {
+    if authority.is_empty() || authority.contains('@') {
+        return Err(if authority.contains('@') {
+            PreviewUrlError::CredentialsForbidden
+        } else {
+            PreviewUrlError::Invalid
+        });
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']').ok_or(PreviewUrlError::Invalid)?;
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'))
+        {
+            return Err(PreviewUrlError::Invalid);
+        }
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let raw = suffix.strip_prefix(':').ok_or(PreviewUrlError::Invalid)?;
+            Some(parsed_port(raw).ok_or(PreviewUrlError::Invalid)?)
+        };
+        return Ok((host.to_ascii_lowercase(), port));
+    }
+    if authority.matches(':').count() > 1 {
+        return Err(PreviewUrlError::Invalid);
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, raw)) => (
+            host,
+            Some(parsed_port(raw).ok_or(PreviewUrlError::Invalid)?),
+        ),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(PreviewUrlError::Invalid);
+    }
+    Ok((host.to_ascii_lowercase(), port))
+}
+
+/// Validate an initial fetch target against the localhost-only default policy.
+pub fn validate_preview_url(
+    url: &str,
+    allow_external_urls: bool,
+) -> Result<ValidatedPreviewUrl, PreviewUrlError> {
+    if url.is_empty()
+        || url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
+    {
+        return Err(PreviewUrlError::Invalid);
+    }
+    let (scheme, remainder) = url.split_once("://").ok_or(PreviewUrlError::Invalid)?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return Err(PreviewUrlError::UnsupportedScheme);
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let (host, port) = split_authority(&remainder[..authority_end])?;
+    let is_loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
+    if !is_loopback && !allow_external_urls {
+        return Err(PreviewUrlError::ExternalForbidden);
+    }
+    Ok(ValidatedPreviewUrl {
+        url: url.into(),
+        scheme,
+        host,
+        port,
+        is_loopback,
+    })
+}
+
+/// Revalidate an absolute redirect target with exactly the initial URL policy.
+/// Relative `Location` values must be resolved by the host before this call.
+pub fn validate_preview_redirect(
+    resolved_url: &str,
+    allow_external_urls: bool,
+) -> Result<ValidatedPreviewUrl, PreviewUrlError> {
+    validate_preview_url(resolved_url, allow_external_urls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +901,214 @@ mod tests {
     fn notebook_rejects_malformed() {
         assert!(Notebook::parse("not json").is_err());
         assert!(Notebook::parse(r#"{"nope": 1}"#).is_err());
+    }
+
+    #[test]
+    fn port_hints_accept_explicit_loopback_grammar_and_strip_ansi() {
+        let output = concat!(
+            "\u{1b}[32mLocal:\u{1b}[0m http://localhost:5173/app\n",
+            "network 127.0.0.1:3000\n",
+            "ipv6 http://[::1]:8080/\n",
+            "vite --port=4173\n",
+            "other -p 9000\n",
+            "PORT=7000 npm run dev\n",
+        );
+        let hints = parse_port_hints(output);
+        assert_eq!(
+            hints.iter().map(|hint| hint.port).collect::<Vec<_>>(),
+            vec![5173, 3000, 8080, 4173, 9000, 7000]
+        );
+        assert_eq!(hints[0].host, "localhost");
+        assert_eq!(hints[1].host, "127.0.0.1");
+        assert_eq!(hints[2].host, "::1");
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint.source == PortHintSource::PaneOutput)
+        );
+    }
+
+    #[test]
+    fn port_hints_reject_external_urls_malformed_ports_and_duplicates() {
+        let hints = parse_port_hints(
+            "https://example.com:4444 http://localhost:0 localhost:65536 \
+             localhost:5173 localhost:5173 localhost:6000oops DATABASE_PORT=9999 \
+             --port nope --port 7000bad PORT=8000bad -p 42",
+        );
+        assert_eq!(
+            hints.iter().map(|hint| hint.port).collect::<Vec<_>>(),
+            vec![5173, 42]
+        );
+    }
+
+    #[test]
+    fn package_scripts_parse_known_scripts_without_execution_or_defaults() {
+        let package = r#"{
+            "scripts": {
+                "dev": "vite --port 5173 && echo done",
+                "start": "PORT=3000 node server.js",
+                "preview": "vite preview -p 4173",
+                "lint": "echo --port 9999"
+            }
+        }"#;
+        let hints = parse_package_scripts(package).unwrap();
+        assert_eq!(
+            hints.iter().map(|hint| hint.port).collect::<Vec<_>>(),
+            vec![5173, 3000]
+        );
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint.source == PortHintSource::PackageScript)
+        );
+    }
+
+    #[test]
+    fn package_script_json_edges_are_safe_and_bounded() {
+        assert!(parse_package_scripts("not json").is_err());
+        assert!(
+            parse_package_scripts(r#"{"scripts": []}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_package_scripts(r#"{"scripts":{"dev":["vite","--port","2"]}}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_package_scripts(r#"{"scripts":{"dev":"vite","start":"next"}}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_package_scripts(&" ".repeat(MAX_PACKAGE_JSON_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn hint_merge_is_precedence_ordered_stable_and_deduplicated() {
+        let pane = vec![
+            PortHint {
+                port: 5173,
+                host: "127.0.0.1".into(),
+                source: PortHintSource::PaneOutput,
+            },
+            PortHint {
+                port: 8080,
+                host: "::1".into(),
+                source: PortHintSource::PaneOutput,
+            },
+        ];
+        let package = vec![
+            PortHint {
+                port: 5173,
+                host: "localhost".into(),
+                source: PortHintSource::PackageScript,
+            },
+            PortHint {
+                port: 3000,
+                host: "localhost".into(),
+                source: PortHintSource::PackageScript,
+            },
+        ];
+        let merged = merge_port_hints(&[9000, 5173], pane, package);
+        assert_eq!(
+            merged.iter().map(|hint| hint.port).collect::<Vec<_>>(),
+            vec![5173, 9000, 8080, 3000]
+        );
+        assert_eq!(merged[0].source, PortHintSource::Config);
+        assert_eq!(merged[2].source, PortHintSource::PaneOutput);
+        assert_eq!(merged[3].source, PortHintSource::PackageScript);
+    }
+
+    #[test]
+    fn target_selection_prefers_live_then_source_then_port() {
+        let target = |port, source, status| PreviewTarget {
+            worktree: "repo-feature".into(),
+            port,
+            url: format!("http://localhost:{port}/"),
+            source,
+            pane: None,
+            session: None,
+            status,
+        };
+        let targets = vec![
+            target(3000, PortHintSource::Config, PreviewStatus::Unknown),
+            target(8080, PortHintSource::PaneOutput, PreviewStatus::Up),
+            target(5173, PortHintSource::PaneOutput, PreviewStatus::Up),
+            target(2000, PortHintSource::Config, PreviewStatus::Down),
+        ];
+        assert_eq!(select_target(&targets).unwrap().port, 5173);
+
+        let hint = PortHint::configured(9000).unwrap();
+        let target = PreviewTarget::from_hint("repo", hint);
+        assert_eq!(target.status, PreviewStatus::Unknown);
+        assert_eq!(target.url, "http://localhost:9000/");
+        assert_eq!(PreviewStatus::Down.to_string(), "down");
+        assert_eq!(PortHintSource::PaneOutput.to_string(), "pane-output");
+    }
+
+    #[test]
+    fn fetch_policy_accepts_only_exact_loopback_authorities_by_default() {
+        for url in [
+            "http://localhost:5173/",
+            "https://LOCALHOST/path",
+            "http://127.0.0.1:3000?q=1",
+            "http://[::1]:8080/",
+        ] {
+            let validated = validate_preview_url(url, false).unwrap();
+            assert!(validated.is_loopback, "{url}");
+        }
+        for url in [
+            "http://example.com:5173/",
+            "http://localhost.example.com:5173/",
+            "http://127.0.0.2:5173/",
+            "http://[::2]:5173/",
+        ] {
+            assert_eq!(
+                validate_preview_url(url, false),
+                Err(PreviewUrlError::ExternalForbidden),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_policy_external_opt_in_keeps_protocol_and_credential_guards() {
+        let external = validate_preview_url("https://example.com:8443/app", true).unwrap();
+        assert!(!external.is_loopback);
+        assert_eq!(external.host, "example.com");
+        assert_eq!(external.port, Some(8443));
+        assert_eq!(
+            validate_preview_url("ftp://example.com/file", true),
+            Err(PreviewUrlError::UnsupportedScheme)
+        );
+        assert_eq!(
+            validate_preview_url("http://user:pass@localhost:3000/", true),
+            Err(PreviewUrlError::CredentialsForbidden)
+        );
+        for malformed in [
+            "localhost:3000",
+            "http://localhost:0/",
+            "http://::1:3000/",
+            "http://localhost:99999/",
+            "http://localhost:3000\\evil",
+            "http://localhost:3000/\r\nHost: evil",
+        ] {
+            assert_eq!(
+                validate_preview_url(malformed, true),
+                Err(PreviewUrlError::Invalid),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_targets_are_revalidated_with_the_same_policy() {
+        assert!(validate_preview_redirect("http://[::1]:4000/next", false).is_ok());
+        assert_eq!(
+            validate_preview_redirect("https://example.com/escape", false),
+            Err(PreviewUrlError::ExternalForbidden)
+        );
+        assert!(validate_preview_redirect("https://example.com/escape", true).is_ok());
     }
 }
