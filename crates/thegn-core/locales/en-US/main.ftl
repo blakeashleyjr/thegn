@@ -124,6 +124,7 @@ action-open-merge-queue = Merge queue
 action-open-pr-queue = PR queue
 action-pr-queue-add = PR queue: watch this PR
 action-pr-queue-refresh = PR queue: refresh now
+action-pr-review-task-handle = PR review task: handle queued
 action-share-worktree-port = Share worktree port
 action-stop-worktree-share = Stop worktree shares
 action-open-shares = Open shares panel

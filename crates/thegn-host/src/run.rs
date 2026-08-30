@@ -19866,19 +19866,16 @@ async fn event_loop<T: Terminal>(
                                 let selected = (panel_ui.open
                                     == crate::panel::Section::PrQueue)
                                     .then(|| {
-                                        panel_ui
-                                            .cursor
-                                            .checked_sub(model.panel.pr_queue.len())
-                                            .and_then(|index| {
-                                                model.panel.review_tasks.get(index)
-                                            })
+                                        crate::handlers::pr_queue::selected_review_task(
+                                            &model.panel,
+                                            panel_ui.cursor,
+                                        )
                                     })
                                     .flatten()
                                     .filter(|task| {
                                         task.status
                                             == thegn_core::issue::AgentDispatchStatus::Queued
                                     })
-                                    .cloned()
                                     .or_else(|| {
                                         model
                                             .panel
