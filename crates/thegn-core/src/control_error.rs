@@ -1,0 +1,102 @@
+//! Stable, transport-independent error codes for the control plane.
+//!
+//! The HTTP adapter exposes these identifiers beside its existing human-readable
+//! message. Keeping the vocabulary in core lets each transport project the same
+//! error taxonomy without depending on a particular protocol.
+
+use serde::{Deserialize, Serialize};
+
+/// The closed set of machine-readable control-plane error identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlErrorCode {
+    NotFound,
+    NoScope,
+    Conflict,
+    Unimplemented,
+    Internal,
+    Unauthorized,
+    BadRequest,
+    // Added when THE-34's code taxonomy met main's wider `ControlError` set:
+    // these three variants existed as errors with no stable identifier, and
+    // collapsing them into `Internal` would have defeated the point of a
+    // machine-readable taxonomy. `InvalidArgument` maps onto the existing
+    // `BadRequest` rather than adding a fourth synonym.
+    FailedPrecondition,
+    ResourceExhausted,
+    Unavailable,
+}
+
+impl ControlErrorCode {
+    /// Every code in its stable, serialized order.
+    pub const ALL: &'static [Self] = &[
+        Self::NotFound,
+        Self::NoScope,
+        Self::Conflict,
+        Self::Unimplemented,
+        Self::Internal,
+        Self::Unauthorized,
+        Self::BadRequest,
+        Self::FailedPrecondition,
+        Self::ResourceExhausted,
+        Self::Unavailable,
+    ];
+
+    /// The stable wire identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::NoScope => "no_scope",
+            Self::Conflict => "conflict",
+            Self::Unimplemented => "unimplemented",
+            Self::Internal => "internal",
+            Self::Unauthorized => "unauthorized",
+            Self::BadRequest => "bad_request",
+            Self::FailedPrecondition => "failed_precondition",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for ControlErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_error_codes_have_stable_ids() {
+        let expected = [
+            (ControlErrorCode::NotFound, "not_found"),
+            (ControlErrorCode::NoScope, "no_scope"),
+            (ControlErrorCode::Conflict, "conflict"),
+            (ControlErrorCode::Unimplemented, "unimplemented"),
+            (ControlErrorCode::Internal, "internal"),
+            (ControlErrorCode::Unauthorized, "unauthorized"),
+            (ControlErrorCode::BadRequest, "bad_request"),
+            (ControlErrorCode::FailedPrecondition, "failed_precondition"),
+            (ControlErrorCode::ResourceExhausted, "resource_exhausted"),
+            (ControlErrorCode::Unavailable, "unavailable"),
+        ];
+        assert_eq!(ControlErrorCode::ALL, &expected.map(|(code, _)| code));
+        for (code, id) in expected {
+            assert_eq!(code.as_str(), id);
+            assert_eq!(code.to_string(), id);
+            assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{id}\""));
+            assert_eq!(
+                serde_json::from_str::<ControlErrorCode>(&format!("\"{id}\"")).unwrap(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_control_error_codes_are_rejected() {
+        assert!(serde_json::from_str::<ControlErrorCode>(r#""future_code""#).is_err());
+    }
+}

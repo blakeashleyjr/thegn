@@ -2126,6 +2126,15 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                     "-p".into(),
                     format!("EnvironmentFile={}", envfile.display()),
                 ]);
+            } else if !secret_env.is_empty() {
+                // Never put host-sourced secrets back on argv if the protected
+                // file cannot be created. A failed tool is safer than a
+                // credential leak.
+                tracing::error!(
+                    target: "thegn::sandbox",
+                    name = %spec.name,
+                    "unable to create protected systemd environment file; omitting host-sourced secrets"
+                );
             } else {
                 for (k, val) in &secret_env {
                     v.extend(["--setenv".into(), format!("{k}={val}")]);
@@ -2340,12 +2349,15 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     let (inline_env, secret_env) = partition_secret_env(spec);
     if let Some(envfile) = write_secret_env_file(&spec.name, &secret_env) {
         v.extend(["--env-file".into(), envfile.to_string_lossy().into_owned()]);
-    } else {
-        // No env-file (no secrets, or write failed) — keep secrets inline rather
-        // than silently drop them; correctness over the leak in that rare case.
-        for (k, val) in &secret_env {
-            v.extend(["-e".into(), format!("{k}={val}")]);
-        }
+    } else if !secret_env.is_empty() {
+        // Never put host-sourced secrets back on argv if the protected file
+        // cannot be created. The sandbox runs without the secret in that rare
+        // case; a failed tool is safer than a credential leak.
+        tracing::error!(
+            target: "thegn::sandbox",
+            name = %spec.name,
+            "unable to create protected OCI environment file; omitting host-sourced secrets"
+        );
     }
     for (k, val) in &inline_env {
         v.extend(["-e".into(), format!("{k}={val}")]);

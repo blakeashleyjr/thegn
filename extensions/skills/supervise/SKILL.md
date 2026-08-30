@@ -1,6 +1,9 @@
 ---
 name: supervise
 description: Run a fleet of coding-agent workers over a batch of tracker issues from inside thegn — you are the conductor, thegn is the hands. Discover issues, create a worktree per issue, dispatch an agent, wait on it, and take the right exit when it finishes or blocks. Use when asked to work through several issues, fan agents out over a backlog, or babysit dispatched workers.
+harnesses: claude,codex,pi
+gate: always
+when: create,startup,explicit
 ---
 
 # Supervise a fleet of agent workers (`/supervise`)

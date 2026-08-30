@@ -77,7 +77,8 @@ rather than crashing the compositor.
 ### Requirement: A review thread can be handed to an agent
 
 From a selected review-thread row in the PR view (Files or Conversation tab),
-thegn SHALL offer a handoff action that formats the thread — pull request
+thegn SHALL offer a handoff action (`p` for the selected thread, `P` for all
+unresolved threads) that formats the thread — pull request
 context, `path:line`, the anchoring diff hunk, and every comment — as an agent
 prompt. When the worktree's remembered agent pane is running, the handoff MUST
 insert the prompt into that pane's input via bracketed paste without a

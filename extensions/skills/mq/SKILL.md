@@ -1,6 +1,9 @@
 ---
 name: mq
 description: Manage thegn's local merge queue from inside a worktree — add the current branch to the queue, clear it, list it, or drain it. Use when the user asks to queue a branch for merge, empty/clear the merge queue, or check what's queued.
+harnesses: claude,codex,pi
+gate: merge_queue
+when: create,startup,explicit
 ---
 
 # thegn merge queue (`/mq`)

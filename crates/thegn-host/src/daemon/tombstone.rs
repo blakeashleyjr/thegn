@@ -119,6 +119,7 @@ pub(crate) mod tests {
             cwd: Some("/wt/a".to_string()),
             created_at_ms: 0,
             pid: Some(4242),
+            forked_from: None,
         }
     }
 

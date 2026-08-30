@@ -1347,6 +1347,8 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
     // tests use it as a SYNTHETIC inline pair, so its ambient presence would
     // divert it to the env-file and break the assertion. Hermetic under nextest
     // AND in-process `cargo test`.
+    let state = tempfile::tempdir().unwrap();
+    let state_home = state.path().to_string_lossy().into_owned();
     let _env = crate::testenv::EnvGuard::mutate_pairs(&[
         ("GH_TOKEN", Some("ghp_secret")),
         ("THEGN_SANDBOX", None),
@@ -1425,6 +1427,7 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
         "synthetic --setenv: {j}"
     );
     let _ = std::fs::remove_file(&path); // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&state); // best-effort test cleanup
 }
 
 #[test]

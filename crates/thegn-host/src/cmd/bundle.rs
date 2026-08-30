@@ -31,7 +31,12 @@ pub struct BundleArgs {
     pub out: Option<PathBuf>,
 }
 
-pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    args: BundleArgs,
+    config_path: PathBuf,
+    repo_context: Option<PathBuf>,
+) -> Result<()> {
     let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
     let out = args
         .out
@@ -45,8 +50,10 @@ pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
     };
 
     // 1. doctor.json (extended, with the identification block).
-    let doctor = serde_json::to_vec_pretty(&crate::cmd::doctor::doctor_json(cfg))
-        .unwrap_or_else(|_| b"{}".to_vec());
+    let health = crate::cmd::config_health::collect(&config_path, repo_context.as_deref());
+    let doctor =
+        serde_json::to_vec_pretty(&crate::cmd::doctor::doctor_json_with_health(cfg, &health))
+            .unwrap_or_else(|_| b"{}".to_vec());
     add(&mut tar, &mut manifest, "doctor.json", doctor);
 
     // 2. config.redacted.toml — the effective config with secret values masked.
