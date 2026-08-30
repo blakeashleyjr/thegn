@@ -624,6 +624,38 @@ pub(crate) fn additive_schema(conn: &Connection) {
          CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
            ON agent_dispatch_notes (dispatch_id, created_at_ms);",
     );
+    // v62: trusted automation state + bounded metadata-only audit. Additive and
+    // idempotent for the shared multi-branch DB; no existing row is rewritten.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_state (
+           rule_id           TEXT PRIMARY KEY,
+           enabled_override  INTEGER,
+           last_fired_at     INTEGER,
+           recent_fires_json TEXT NOT NULL DEFAULT '[]',
+           action_fires_json TEXT NOT NULL DEFAULT '{}',
+           once_keys_json    TEXT NOT NULL DEFAULT '[]',
+           updated_at        INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS automation_runs (
+           id             INTEGER PRIMARY KEY AUTOINCREMENT,
+           rule_id        TEXT NOT NULL,
+           event_id       TEXT NOT NULL,
+           event_key      TEXT NOT NULL,
+           trigger_kind   TEXT NOT NULL,
+           event_summary  TEXT NOT NULL DEFAULT '',
+           action_cap     TEXT NOT NULL,
+           action_summary TEXT NOT NULL DEFAULT '',
+           outcome        TEXT NOT NULL,
+           skip_reason    TEXT,
+           error          TEXT,
+           started_at     INTEGER NOT NULL,
+           finished_at    INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_time
+           ON automation_runs (rule_id, started_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
+           ON automation_runs (outcome, started_at DESC);",
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
@@ -670,6 +702,38 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
         .optional()?;
     if notes_index.is_none() {
         anyhow::bail!("schema v61 migration did not create the dispatch notes index");
+    }
+    Ok(())
+}
+
+/// Verify the v62 tables/indexes before the version stamp. The historical
+/// additive ladder is best-effort, but a swallowed DDL failure must not make a
+/// broken automation store look current on the next open.
+pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
+    conn.prepare(
+        "SELECT rule_id, enabled_override, last_fired_at, recent_fires_json, \
+                action_fires_json, once_keys_json, updated_at \
+         FROM automation_state LIMIT 0",
+    )?;
+    conn.prepare(
+        "SELECT rule_id, event_id, event_key, trigger_kind, event_summary, \
+                action_cap, action_summary, outcome, skip_reason, error, \
+                started_at, finished_at FROM automation_runs LIMIT 0",
+    )?;
+    for index in [
+        "idx_automation_runs_rule_time",
+        "idx_automation_runs_outcome_time",
+    ] {
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if present.is_none() {
+            anyhow::bail!("schema v62 migration did not create {index}");
+        }
     }
     Ok(())
 }
