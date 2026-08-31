@@ -1,8 +1,9 @@
 # THE-19 — authorized hook_run.rs platform-seam move (Lead work order)
 
 files:
-  - crates/thegn-host/src/hook_run.rs
-  - crates/thegn-host/src/platform/mod.rs
+
+- crates/thegn-host/src/hook_run.rs
+- crates/thegn-host/src/platform/mod.rs
 
 ## Authorization
 

@@ -1,8 +1,9 @@
 # THE-7 — fold-gate fix (Lead work order)
 
 files:
-  - crates/thegn-host/src/theme_store.rs
-  - crates/thegn-host/src/platform/mod.rs
+
+- crates/thegn-host/src/theme_store.rs
+- crates/thegn-host/src/platform/mod.rs
 
 ## Why this exists
 

@@ -79,6 +79,10 @@ pub enum NotificationKind {
     PrQueueReady,
     /// The PR queue could not unblock a pull request — human intervention needed.
     PrQueueNeedsHuman,
+    /// A watched PR produced a new or revised per-thread review task.
+    PrReviewTaskQueued,
+    /// A watched PR review thread was successfully resolved.
+    PrReviewThreadResolved,
     /// A calendar event is about to start.
     CalendarReminder,
     /// A calendar event moved or was cancelled since the last sync.
@@ -162,7 +166,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 28] = [
+    pub const ALL: [NotificationKind; 30] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -184,6 +188,8 @@ impl NotificationKind {
         Self::PrQueueMerged,
         Self::PrQueueReady,
         Self::PrQueueNeedsHuman,
+        Self::PrReviewTaskQueued,
+        Self::PrReviewThreadResolved,
         Self::CalendarReminder,
         Self::CalendarChanged,
         Self::UpstreamBehind,
@@ -219,6 +225,8 @@ impl NotificationKind {
             Self::PrQueueMerged => "pr_queue_merged",
             Self::PrQueueReady => "pr_queue_ready",
             Self::PrQueueNeedsHuman => "pr_queue_needs_human",
+            Self::PrReviewTaskQueued => "pr_review_task_queued",
+            Self::PrReviewThreadResolved => "pr_review_thread_resolved",
             Self::CalendarReminder => "calendar_reminder",
             Self::CalendarChanged => "calendar_changed",
             Self::UpstreamBehind => "upstream_behind",
@@ -259,7 +267,8 @@ impl NotificationKind {
             // A meeting that moved is worth recording, but it is not something
             // to interrupt the user over — only the reminder is.
             | Self::CalendarChanged
-            | Self::PrQueueMerged => Priority::Info,
+            | Self::PrQueueMerged
+            | Self::PrReviewThreadResolved => Priority::Info,
             Self::Assigned
             | Self::Mentioned
             | Self::StatusChanged
@@ -270,6 +279,7 @@ impl NotificationKind {
             | Self::AgentDone
             | Self::QueueReady
             | Self::PrQueueReady
+            | Self::PrReviewTaskQueued
             // Time-critical, but not a failure: `Notice` reaches the desktop at
             // the default threshold without claiming the red Alert group.
             | Self::CalendarReminder
@@ -303,6 +313,8 @@ impl NotificationKind {
             Self::PrQueueMerged => "✓",
             Self::PrQueueReady => "⑂",
             Self::PrQueueNeedsHuman => "✋",
+            Self::PrReviewTaskQueued => "③",
+            Self::PrReviewThreadResolved => "✓",
             Self::CalendarReminder => "◷",
             Self::CalendarChanged => "◷",
             Self::QueueReady => "◆",
@@ -344,6 +356,8 @@ impl NotificationKind {
             Self::PrQueueMerged => (gl.check, Hue::Green),
             Self::PrQueueReady => ("⑂", Hue::Blue),
             Self::PrQueueNeedsHuman => (gl.attention, Hue::Red),
+            Self::PrReviewTaskQueued => (gl.diamond_hollow, Hue::Blue),
+            Self::PrReviewThreadResolved => (gl.check, Hue::Green),
             // A reminder is time-critical but not a failure: amber, not red.
             Self::CalendarReminder => (gl.dot_filled, Hue::Amber),
             Self::CalendarChanged => (gl.dot_hollow, Hue::Blue),
@@ -378,6 +392,8 @@ impl NotificationKind {
             Self::PrQueueMerged => "pull request merged",
             Self::PrQueueReady => "pull request ready to merge",
             Self::PrQueueNeedsHuman => "pr queue needs you",
+            Self::PrReviewTaskQueued => "review task queued",
+            Self::PrReviewThreadResolved => "review thread resolved",
             Self::CalendarReminder => "event starting soon",
             Self::CalendarChanged => "event changed",
             Self::UpstreamBehind => "upstream updates",
@@ -421,7 +437,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 28, "ALL is missing kinds");
+        assert_eq!(seen.len(), 30, "ALL is missing kinds");
     }
 
     #[test]
@@ -454,6 +470,7 @@ mod tests {
                     // A merged PR is a completed lifecycle event, not something
                     // that needs you — Info, like a landed merge-queue branch.
                     | NotificationKind::PrQueueMerged
+                    | NotificationKind::PrReviewThreadResolved
                     // A meeting that moved is a record, not an interruption;
                     // only the reminder itself is worth surfacing.
                     | NotificationKind::CalendarChanged
@@ -572,4 +589,50 @@ mod tests {
             assert_eq!(Priority::parse(p.as_str()), Some(p));
         }
     }
+}
+
+pub const MAX_REVIEW_NOTIFICATION_CHARS: usize = 1024;
+
+/// Bounded audit text for a newly queued or revised review task.
+pub fn review_task_queued_message(
+    event: &crate::pr_review_tasks::ReviewTaskEvent,
+    revised: bool,
+) -> String {
+    let action = if revised { "revised" } else { "queued" };
+    let location = match event.line {
+        Some(line) if !event.path.is_empty() => format!("{}:{line}", event.path),
+        _ if event.path.is_empty() => "unanchored".to_string(),
+        _ => event.path.clone(),
+    };
+    bounded_notification(&format!(
+        "PR #{} review task {action}: {} [{} @ {}; rev {}]",
+        event.pr_number, location, event.thread_id, event.head_oid, event.source_revision
+    ))
+}
+
+/// Bounded audit text for a successfully resolved review thread.
+pub fn review_thread_resolved_message(
+    transition: &crate::pr_review_tasks::ReviewTaskResolution,
+) -> String {
+    let location = match transition.line {
+        Some(line) if !transition.path.is_empty() => format!("{}:{line}", transition.path),
+        _ if transition.path.is_empty() => "unanchored".to_string(),
+        _ => transition.path.clone(),
+    };
+    bounded_notification(&format!(
+        "PR #{} review thread resolved: {} [{} @ {}; rev {}]",
+        transition.pr_number,
+        location,
+        transition.thread_id,
+        transition.head_oid,
+        transition.source_revision
+    ))
+}
+
+fn bounded_notification(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_REVIEW_NOTIFICATION_CHARS)
+        .collect()
 }

@@ -1,8 +1,9 @@
 # THE-19 — authorized config_validate union-branch fix (Lead work order)
 
 files:
-  - crates/thegn-core/src/config_validate.rs
-  - config/config.toml.example
+
+- crates/thegn-core/src/config_validate.rs
+- config/config.toml.example
 
 ## Authorization
 
@@ -36,5 +37,5 @@ That is a **defect in the validator, not in the example config or in the
   accepted shapes, since the point is that both are legal.
 - Then run the full gate: `THEGN_ALLOW_HEAVY=1 just test`, and report its
   result. If it dies before any test runs (e.g. `sccache: Operation not
-  permitted`), retry once with `RUSTC_WRAPPER=` unset and report BLOCKED with
+permitted`), retry once with `RUSTC_WRAPPER=` unset and report BLOCKED with
   the exact error rather than FAIL.

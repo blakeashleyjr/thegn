@@ -35,6 +35,12 @@ pub(crate) enum PrqMsg {
     Done(Box<PrOutcome>),
     /// A one-line outcome from a one-shot mutation (add / remove / clear).
     Note(String),
+    /// One create/revision event whose roster upsert and inbox audit are already
+    /// durable. The loop publishes it without dispatching an agent.
+    ReviewTask {
+        event: Box<thegn_core::pr_review_tasks::ReviewTaskEvent>,
+        revised: bool,
+    },
     /// The pass (or a pre-pass step) failed outright.
     Failed(String),
 }
@@ -169,6 +175,12 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
                 detail: s.detail.to_string(),
             });
         });
+        for (event, revised) in &out.review_events {
+            send(PrqMsg::ReviewTask {
+                event: Box::new(event.clone()),
+                revised: *revised,
+            });
+        }
         send(PrqMsg::Done(Box::new(out)));
     });
 }
@@ -276,6 +288,32 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
             }
         };
         send(PrqMsg::Note(msg));
+    });
+}
+
+/// Handle one selected durable review task. The entire lifecycle (including
+/// the agent run and provider rechecks) stays on this blocking worker.
+pub(crate) fn spawn_handle(
+    tx: &PrqTx,
+    waker: &TerminalWaker,
+    cfg: Config,
+    task: crate::panel::ReviewTaskRow,
+) {
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let context = crate::review_task_handoff::HandleContext {
+            task_id: task.id,
+            pr_number: task.pr_number,
+            repository: task.repository,
+            thread_id: task.thread_id,
+            path: task.path,
+            line: task.line,
+        };
+        let message = crate::review_task_handoff::handle(&cfg, &context);
+        if tx.send(PrqMsg::Note(message)).is_ok() {
+            let _ = waker.wake(); // best-effort: completed blocking work must nudge the idle loop
+        }
     });
 }
 
@@ -394,6 +432,42 @@ pub(crate) fn drain_msgs(rx: &mut PrqRx, ctx: &mut PrqDrainCtx) {
                 ctx.toasts.success(m, now);
                 *ctx.want_model_refresh = true;
             }
+            PrqMsg::ReviewTask { event, revised } => {
+                // Publish the typed automation event only after the worker has
+                // confirmed the roster upsert. The inbox notification below is
+                // a separate once-keyed attention/audit event.
+                ctx.event_bus
+                    .publish(&thegn_core::event_bus::Event::PrThreadUnresolved(Box::new(
+                        (*event).clone(),
+                    )));
+                let kind = thegn_core::notification::NotificationKind::PrReviewTaskQueued;
+                let message = thegn_core::notification::review_task_queued_message(&event, revised);
+                let notification = thegn_core::notification::Notification {
+                    id: 0,
+                    kind,
+                    source_ref: event.source_key.clone(),
+                    message: message.clone(),
+                    created_at_ms: thegn_core::util::now_ms(),
+                    read: false,
+                    worktree_path: event.worktree_path.clone(),
+                };
+                let decision = crate::notify::route(
+                    ctx.notify_state,
+                    kind.as_str(),
+                    &event.source_key,
+                    &message,
+                    &event.worktree_path,
+                );
+                let bus_event = thegn_core::event_bus::Event::NotificationReceived { notification };
+                if decision.desktop {
+                    ctx.event_bus.publish_with_notification(&bus_event);
+                } else {
+                    ctx.event_bus.publish(&bus_event);
+                }
+                ctx.toasts
+                    .info_ttl(message, now, std::time::Duration::from_secs(6));
+                *ctx.want_model_refresh = true;
+            }
             PrqMsg::Failed(m) => {
                 *ctx.inflight = false;
                 ctx.toasts
@@ -436,6 +510,8 @@ pub(crate) enum PrqAction {
     Refresh,
     /// Open the cursor row's PR in a browser.
     OpenInBrowser,
+    /// Run one queued per-thread review task.
+    HandleReview,
 }
 
 /// The section's key table. `Err` carries the status-line hint for a key that
@@ -444,6 +520,7 @@ pub(crate) enum PrqAction {
 pub(crate) fn row_action_for(
     key: char,
     row_status: Option<&str>,
+    task_status: Option<thegn_core::issue::AgentDispatchStatus>,
 ) -> Result<PrqAction, &'static str> {
     match key {
         'a' => Ok(PrqAction::Add),
@@ -461,6 +538,15 @@ pub(crate) fn row_action_for(
             // being looked at every pass.
             Some("needs_human" | "merged" | "closed") => Ok(PrqAction::Rewatch),
             Some(_) => Err("PR queue: this row is already being watched"),
+        },
+        'h' => match task_status {
+            Some(thegn_core::issue::AgentDispatchStatus::Queued) => Ok(PrqAction::HandleReview),
+            Some(thegn_core::issue::AgentDispatchStatus::Running)
+            | Some(thegn_core::issue::AgentDispatchStatus::Spawning) => {
+                Err("review task is already running")
+            }
+            Some(_) => Err("review task is waiting for a new revision or human action"),
+            None => Err("PR queue: select a review task to handle"),
         },
         _ => Err(""),
     }
@@ -482,8 +568,12 @@ pub(crate) struct PrqKeyCtx<'a> {
 /// Handle one of the section's action keys on the row under the cursor. Returns
 /// whether the key was consumed.
 pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
-    let row: Option<PrQueueRow> = ctx.model.panel.pr_queue.get(cursor).cloned();
-    let action = match row_action_for(key, row.as_ref().map(|r| r.status.as_str())) {
+    let (row, task) = selection_at_cursor(&ctx.model.panel, cursor);
+    let action = match row_action_for(
+        key,
+        row.as_ref().map(|r| r.status.as_str()),
+        task.as_ref().map(|task| task.status),
+    ) {
         Ok(a) => a,
         Err("") => return false,
         Err(hint) => {
@@ -556,9 +646,51 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
                 });
             }
         }
+        PrqAction::HandleReview => {
+            if let Some(task) = task {
+                spawn_handle(ctx.tx, ctx.waker, ctx.cfg.clone(), task);
+            }
+        }
     }
     let _ = ctx.refresh_tx;
     true
+}
+
+/// Resolve the cursor in the same interleaved order used by the PR-queue
+/// renderer: each PR row is followed by its review-task rows.
+fn selection_at_cursor(
+    panel: &crate::panel::PanelData,
+    cursor: usize,
+) -> (Option<PrQueueRow>, Option<crate::panel::ReviewTaskRow>) {
+    let mut display_index = 0;
+    for row in &panel.pr_queue {
+        if display_index == cursor {
+            return (Some(row.clone()), None);
+        }
+        display_index += 1;
+        for task in panel
+            .review_tasks
+            .iter()
+            .filter(|task| task.pr_number == row.number)
+        {
+            if display_index == cursor {
+                return (None, Some(task.clone()));
+            }
+            display_index += 1;
+        }
+    }
+    (None, None)
+}
+
+/// Resolve a review-task selection using the same interleaved row order as the
+/// PR-queue renderer. The command palette uses this when the queue section is
+/// already open; subtracting the total PR-row count is incorrect when tasks
+/// are distributed across multiple PRs.
+pub(crate) fn selected_review_task(
+    panel: &crate::panel::PanelData,
+    cursor: usize,
+) -> Option<crate::panel::ReviewTaskRow> {
+    selection_at_cursor(panel, cursor).1
 }
 
 #[cfg(test)]
@@ -591,14 +723,14 @@ mod tests {
             ('D', PrqAction::Refresh),
             ('c', PrqAction::Clear),
         ] {
-            assert_eq!(row_action_for(k, None), Ok(want), "{k}");
+            assert_eq!(row_action_for(k, None, None), Ok(want), "{k}");
         }
     }
 
     #[test]
     fn row_keys_report_an_empty_selection_rather_than_acting() {
         for k in ['x', 'o', 'r'] {
-            match row_action_for(k, None) {
+            match row_action_for(k, None, None) {
                 Err(hint) => assert!(hint.contains("no row selected"), "{k}: {hint}"),
                 Ok(a) => panic!("{k} acted with no row: {a:?}"),
             }
@@ -608,11 +740,15 @@ mod tests {
     #[test]
     fn rewatch_applies_only_to_a_settled_row() {
         for s in ["needs_human", "merged", "closed"] {
-            assert_eq!(row_action_for('r', Some(s)), Ok(PrqAction::Rewatch), "{s}");
+            assert_eq!(
+                row_action_for('r', Some(s), None),
+                Ok(PrqAction::Rewatch),
+                "{s}"
+            );
         }
         for s in ["watching", "blocked_ci", "agent_running", "ready"] {
             assert!(
-                row_action_for('r', Some(s)).is_err(),
+                row_action_for('r', Some(s), None).is_err(),
                 "{s} is already watched; re-arming it is a no-op"
             );
         }
@@ -622,8 +758,8 @@ mod tests {
     fn an_unbound_key_is_not_consumed() {
         // Empty hint = "not ours", so the loop can fall through to other
         // handlers rather than swallowing the key.
-        assert_eq!(row_action_for('z', Some("watching")), Err(""));
-        assert_eq!(row_action_for('q', None), Err(""));
+        assert_eq!(row_action_for('z', Some("watching"), None), Err(""));
+        assert_eq!(row_action_for('q', None, None), Err(""));
     }
 
     #[test]
@@ -631,9 +767,17 @@ mod tests {
         // The section's hint row advertises these; a key shown but not handled
         // would be a lie to the reader.
         for k in ['a', 'x', 'r', 'c', 'D', 'o'] {
-            let with_row = row_action_for(k, Some("needs_human"));
+            let with_row = row_action_for(k, Some("needs_human"), None);
             assert!(with_row.is_ok(), "{k} is advertised but not dispatchable");
         }
+        assert_eq!(
+            row_action_for(
+                'h',
+                None,
+                Some(thegn_core::issue::AgentDispatchStatus::Queued)
+            ),
+            Ok(PrqAction::HandleReview)
+        );
     }
 
     #[test]
@@ -652,5 +796,64 @@ mod tests {
         // An unknown key is a no-op, not a panic.
         apply_step(&mut panel, "/repo#99", "merged", "x");
         assert_eq!(panel.pr_queue.len(), 2);
+    }
+
+    #[test]
+    fn cursor_selection_matches_interleaved_review_rows() {
+        let panel = crate::panel::PanelData {
+            pr_queue: vec![row("/repo#1", 1, "watching"), row("/repo#2", 2, "watching")],
+            review_tasks: vec![crate::panel::ReviewTaskRow {
+                id: 9,
+                pr_number: 1,
+                repository: "acme/widget".into(),
+                thread_id: "thread-1".into(),
+                path: "src/lib.rs".into(),
+                line: Some(3),
+                role: "coder".into(),
+                status: thegn_core::issue::AgentDispatchStatus::Queued,
+                source_revision: "revision".into(),
+                worktree_path: "/w".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(selection_at_cursor(&panel, 0).0.is_some());
+        assert_eq!(selection_at_cursor(&panel, 1).1.unwrap().id, 9);
+        assert_eq!(selection_at_cursor(&panel, 2).0.unwrap().number, 2);
+    }
+
+    #[test]
+    fn selected_review_task_handles_uneven_interleaving() {
+        let panel = crate::panel::PanelData {
+            pr_queue: vec![row("/repo#1", 1, "watching"), row("/repo#2", 2, "watching")],
+            review_tasks: vec![
+                crate::panel::ReviewTaskRow {
+                    id: 9,
+                    pr_number: 1,
+                    repository: "acme/widget".into(),
+                    thread_id: "thread-1".into(),
+                    path: "src/lib.rs".into(),
+                    line: Some(3),
+                    role: "coder".into(),
+                    status: thegn_core::issue::AgentDispatchStatus::Queued,
+                    source_revision: "revision-1".into(),
+                    worktree_path: "/w".into(),
+                },
+                crate::panel::ReviewTaskRow {
+                    id: 10,
+                    pr_number: 2,
+                    repository: "acme/widget".into(),
+                    thread_id: "thread-2".into(),
+                    path: "src/main.rs".into(),
+                    line: Some(4),
+                    role: "coder".into(),
+                    status: thegn_core::issue::AgentDispatchStatus::Queued,
+                    source_revision: "revision-2".into(),
+                    worktree_path: "/w".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        // Row order: PR1, task1, PR2, task2.
+        assert_eq!(selected_review_task(&panel, 3).unwrap().id, 10);
     }
 }

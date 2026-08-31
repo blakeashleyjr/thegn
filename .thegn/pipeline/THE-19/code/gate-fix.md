@@ -1,7 +1,8 @@
 # THE-19 — fold-gate fix (Lead work order)
 
 files:
-  - config/config.toml.example
+
+- config/config.toml.example
 
 ## Why this exists
 

@@ -1988,10 +1988,11 @@ active_mode = ""
 #              queue_needs_human, pr_queue_needs_human, resource_alert,
 #              usage_limit, automation_failed
 #   "info"   — log_error, worktree_created, process_exited, queue_landed,
-#              calendar_changed, pr_queue_merged
+#              calendar_changed, pr_queue_merged, pr_review_thread_resolved
 #   "notice" — assigned, mentioned, status_changed, blocker_resolved,
 #              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
-#              pr_queue_ready, calendar_reminder, upstream_behind, automation
+#              pr_queue_ready, pr_review_task_queued, calendar_reminder,
+#              upstream_behind, automation
 # Override any kind below (keys are the snake_case kind names). Unknown
 # keys/values are ignored. The queue_* kinds are the merge queue's settled
 # transitions ([merge_queue]); pr_queue_* are the PR queue's ([pr_queue]).
@@ -4211,6 +4212,11 @@ auto_enqueue = "off"          # off | worktree — whether opening a PR from a w
                               #   Off by default: a queued PR is one thegn may write to.
 watch = ["ci", "conflict", "review"]   # which blocker classes may wake the agent. A class left out
                               #   is still tracked and displayed — it just never gets an agent.
+# On each existing poll (there is no second review timer), an explicitly queued
+# row whose `watch` includes "review" gets one durable task per unresolved
+# provider thread. The current `agent` role and `[pr_queue.prompts].review` are
+# captured in each bounded task; another comment on the same thread revises that
+# task in place. Nothing scans or watches every forge PR by default.
 #
 # The agent, exactly as in [merge_queue]: name an [[agents]] entry, or spell out
 # a command. Placeholders are shell-quoted, so write them BARE. With neither set,
@@ -4262,8 +4268,13 @@ queued_folder = "In review"   # file a worktree here when its PR is queued ("" �
 failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ leave it be)
 
 # What the agent is told, per blocker kind. Empty ⇒ thegn's built-in instructions
-# (which require a `--force-with-lease` push and forbid merging, closing, or —
-# for review feedback — resolving the reviewer's threads). Prose, not shell:
+# (which require a `--force-with-lease` push and forbid the agent from merging,
+# closing, approving, or resolving review threads itself). A queued per-thread
+# task runs only when a user chooses `handle` in the PR-queue panel or palette.
+# Afterward thegn replies and resolves through the forge provider only when the
+# agent push is verified against the task worktree and the provider implements
+# `resolve_review_thread`; unsupported, unauthenticated, stale, or rate-limited
+# resolution stays unresolved and is parked for a human. Prose, not shell:
 # these are never quoted. Placeholders are per kind, and an unknown one is a
 # `config validate` error:
 #   ci_failure — {branch} {base} {worktree} {pr_number} {pr_url} {pr_title} {checks} {log}

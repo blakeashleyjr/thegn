@@ -44,7 +44,8 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ];
     }
     let mut out: Vec<PanelRow> = Vec::new();
-    for (i, r) in rows.iter().enumerate() {
+    let mut display_index = 0;
+    for r in rows {
         let mut left = vec![
             status_glyph(&r.status),
             seg(d(), format!(" #{} ", r.number)),
@@ -67,8 +68,51 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
         out.push(
             PanelRow::plain(Line::split(left, vec![seg(g2(), r.status.clone())]))
-                .with_hit(PanelHit::Row(Section::PrQueue, i)),
+                .with_hit(PanelHit::Row(Section::PrQueue, display_index)),
         );
+        display_index += 1;
+        for task in ctx
+            .model
+            .panel
+            .review_tasks
+            .iter()
+            .filter(|task| task.pr_number == r.number)
+        {
+            let location = match task.line {
+                Some(line) if !task.path.is_empty() => format!("{}:{line}", task.path),
+                _ if task.path.is_empty() => "unanchored".to_string(),
+                _ => task.path.clone(),
+            };
+            let role = if task.role.trim().is_empty() {
+                "explicit command"
+            } else {
+                task.role.as_str()
+            };
+            let task_hue = match task.status {
+                thegn_core::issue::AgentDispatchStatus::Queued => Hue::Blue,
+                thegn_core::issue::AgentDispatchStatus::Running
+                | thegn_core::issue::AgentDispatchStatus::Spawning => Hue::Amber,
+                thegn_core::issue::AgentDispatchStatus::WaitingHuman
+                | thegn_core::issue::AgentDispatchStatus::Failed => Hue::Red,
+                _ => Hue::Green,
+            };
+            let left = vec![
+                seg(g(), "   "),
+                seg(hue(task_hue), crate::caps::active_glyphs().diamond_hollow),
+                seg(d(), format!(" #{} / {} ", task.pr_number, task.thread_id)),
+                seg(g2(), location),
+                seg(g(), format!("  role {role}")),
+            ];
+            let right = vec![seg(
+                g2(),
+                format!("{} · rev {}", task.status.as_str(), task.source_revision),
+            )];
+            out.push(
+                PanelRow::plain(Line::split(left, right))
+                    .with_hit(PanelHit::Row(Section::PrQueue, display_index)),
+            );
+            display_index += 1;
+        }
     }
     out.push(prq_hint_row());
     out
@@ -84,5 +128,6 @@ fn prq_hint_row() -> PanelRow {
         ("c", "clear"),
         ("D", "refresh"),
         ("o", "browser"),
+        ("h", "handle"),
     ])
 }

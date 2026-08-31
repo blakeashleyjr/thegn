@@ -1,11 +1,12 @@
 # THE-55 — resolve main conflicts and re-gate (Lead work order)
 
 files:
-  - crates/thegn-core/src/completion/catalog.rs
-  - crates/thegn-core/src/lib.rs
-  - crates/thegn-core/src/store/mod.rs
-  - crates/thegn-host/src/cmd/mod.rs
-  - docs/help/daemon-and-sessions.md
+
+- crates/thegn-core/src/completion/catalog.rs
+- crates/thegn-core/src/lib.rs
+- crates/thegn-core/src/store/mod.rs
+- crates/thegn-host/src/cmd/mod.rs
+- docs/help/daemon-and-sessions.md
 
 ## Why this exists
 

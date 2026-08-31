@@ -1,8 +1,9 @@
 # THE-19 — authorized fix for the load-sensitive hook-drain test (Lead work order)
 
 files:
-  - crates/thegn-host/src/hook_run.rs
-  - (its test module)
+
+- crates/thegn-host/src/hook_run.rs
+- (its test module)
 
 ## Authorization
 

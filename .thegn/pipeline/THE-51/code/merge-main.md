@@ -1,7 +1,8 @@
 # THE-51 — merge main and re-gate (Lead work order)
 
 files:
-  - (whatever the merge and the gate require)
+
+- (whatever the merge and the gate require)
 
 ## Why this exists
 

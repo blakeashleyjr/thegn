@@ -1,7 +1,8 @@
 # THE-11 — merge main and re-gate (Lead work order)
 
 files:
-  - (whatever the merge and the gate require)
+
+- (whatever the merge and the gate require)
 
 ## Why this exists
 
@@ -21,6 +22,6 @@ main moves; this row re-establishes it.
 - Keep the drawer feature and the row-316 config documentation intact; this is
   a rebase/repair row, not a redesign.
 - If the gate dies before any test runs (e.g. `sccache: Operation not
-  permitted`), retry once with `RUSTC_WRAPPER=` unset and report BLOCKED with
+permitted`), retry once with `RUSTC_WRAPPER=` unset and report BLOCKED with
   the exact error rather than FAIL.
 - Report PASS only with a green full gate against current main.

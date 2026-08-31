@@ -1,9 +1,10 @@
 # THE-11 — fold-gate fix (Lead work order)
 
 files:
-  - config/config.toml.example
-  - crates/thegn-core/src/config.rs
-  - test/env-overlay-ratchet.txt
+
+- config/config.toml.example
+- crates/thegn-core/src/config.rs
+- test/env-overlay-ratchet.txt
 
 ## Why this exists
 
@@ -14,11 +15,11 @@ config-coverage ratchets. Reproduced on the folded tree
 
 1. `crates/thegn-core/tests/env_overlay_coverage.rs` —
    `config keys with neither a THEGN_* knob in env_overlay nor a
-   test/env-overlay-ratchet.txt entry: ["agents.drawer_cwd",
-   "agents.drawer_scope"]`
+test/env-overlay-ratchet.txt entry: ["agents.drawer_cwd",
+"agents.drawer_scope"]`
 2. `crates/thegn-core/tests/config_example.rs` —
    `config/config.toml.example is missing documentation for 2 key(s):
-   agents.drawer_cwd` (and `agents.drawer_scope`)
+agents.drawer_cwd` (and `agents.drawer_scope`)
 
 Both are new `[[agents]]` keys this branch introduced.
 

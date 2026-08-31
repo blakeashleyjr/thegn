@@ -1,10 +1,11 @@
 # THE-19 — resolve main conflicts (round 2) (Lead work order)
 
 files:
-  - crates/thegn-host/src/platform/mod.rs
-  - crates/thegn-host/src/platform/unix.rs
-  - crates/thegn-host/src/platform/windows.rs
-  - docs/help/cli.md
+
+- crates/thegn-host/src/platform/mod.rs
+- crates/thegn-host/src/platform/unix.rs
+- crates/thegn-host/src/platform/windows.rs
+- docs/help/cli.md
 
 ## Why this exists
 
