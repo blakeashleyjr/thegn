@@ -1039,6 +1039,7 @@ live level="debug" size_mb="20" files="5":
       "THEGN_LOG_ROTATION_SIZE_MB={{size_mb}}" \
       "THEGN_LOG_MAX_FILES={{files}}" \
       "THEGN_PERF=1" \
+      "THEGN_DATABASE_MIGRATION_EXECUTABLE=$PWD/target/release/thegn" \
       target/release/thegn 2>"$logs/thegn-stderr.log"
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):

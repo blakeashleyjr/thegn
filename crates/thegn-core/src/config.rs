@@ -4704,6 +4704,45 @@ pub use crate::config_pr_queue::{
     PrQueuePromptsOverlay, PrWatchKind,
 };
 
+config_enum! {
+    /// Which process kind may advance the shared state database schema.
+    ///
+    /// `controller` limits migrations to the interactive compositor and the
+    /// long-lived pane daemon/serve process. Ordinary CLI commands (including
+    /// commands resolved from a worktree-local `target/debug`) may still use a
+    /// database whose schema already matches, but cannot move it forward.
+    pub enum MigrationAuthority: "database migration authority" {
+        Any = "any",
+        Controller = "controller" | "host",
+        Disabled = "disabled" | "off",
+    } default = Controller;
+}
+
+/// `[database]` — ownership policy for the one shared state schema.
+///
+/// This is deliberately global/profile config, never a repo overlay: code in a
+/// worktree must not be able to grant itself migration authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DatabaseConfig {
+    /// Who may run automatic schema migrations. `controller` is the safe
+    /// default; `any` restores the legacy "first opener migrates" behavior.
+    pub migration_authority: MigrationAuthority,
+    /// Optional executable pin. When non-empty, even an otherwise-authorized
+    /// controller may migrate only when its canonical `current_exe` equals this
+    /// canonical path. Use an absolute path (a symlink is fine).
+    pub migration_executable: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            migration_authority: MigrationAuthority::Controller,
+            migration_executable: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
@@ -4776,6 +4815,8 @@ pub struct Config {
     /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
+    /// `[database]` — shared-schema migration authority and executable pin.
+    pub database: DatabaseConfig,
     pub sandbox: SandboxConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
@@ -5000,6 +5041,7 @@ impl Default for Config {
             watch: WatchConfig::default(),
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            database: DatabaseConfig::default(),
             sandbox: SandboxConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
@@ -5125,6 +5167,8 @@ pub struct ConfigOverlay {
     pub diagnostics_crash_reports: Option<bool>,
     pub diagnostics_crash_retention: Option<usize>,
     pub diagnostics_ring_size: Option<usize>,
+    pub database_migration_authority: Option<MigrationAuthority>,
+    pub database_migration_executable: Option<String>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
@@ -5202,6 +5246,14 @@ impl ConfigOverlay {
             self.diagnostics_crash_retention
         );
         set!(base.diagnostics.ring_size, self.diagnostics_ring_size);
+        set!(
+            base.database.migration_authority,
+            self.database_migration_authority
+        );
+        set!(
+            base.database.migration_executable,
+            self.database_migration_executable
+        );
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(
@@ -5429,6 +5481,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_DIAGNOSTICS_RING_SIZE") {
         o.diagnostics_ring_size = parse_num(v, "THEGN_DIAGNOSTICS_RING_SIZE").map(|n| n as usize);
     }
+
+    // [database] — startup-only schema ownership. The executable pin is an
+    // especially useful launcher override for dev/live recipes.
+    if let Some(v) = env.get("THEGN_DATABASE_MIGRATION_AUTHORITY") {
+        o.database_migration_authority = parse_enum_env(
+            v.trim(),
+            "THEGN_DATABASE_MIGRATION_AUTHORITY",
+            MigrationAuthority::from_str_validated,
+        );
+    }
+    o.database_migration_executable = env.get("THEGN_DATABASE_MIGRATION_EXECUTABLE");
 
     // [disk]
     if let Some(v) = env.get("THEGN_DISK_SHOW_SIZES") {

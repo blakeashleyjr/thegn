@@ -871,6 +871,13 @@ fn main() -> anyhow::Result<()> {
                 &cli.overrides,
                 cli.config.clone(),
             );
+            // `open` may fall through and become the interactive controller.
+            // Install its schema authority before `merge_db_hosts` performs the
+            // first best-effort DB open.
+            thegn_core::db::install_migration_policy(
+                &cfg.database,
+                thegn_core::db::MigrationActor::Controller,
+            )?;
             thegn_core::host_config::merge_db_hosts(&mut cfg);
             let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
             match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
@@ -1030,6 +1037,18 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // Install before `merge_db_hosts` (the first DB consumer on this path).
+    // Only processes that actually own long-lived shared state are controllers;
+    // a worktree-resolved `thegn dispatch report` is always a client.
+    let migration_actor = if matches!(
+        &command,
+        Command::Serve { .. } | Command::Daemon { action: None, .. }
+    ) {
+        thegn_core::db::MigrationActor::Controller
+    } else {
+        thegn_core::db::MigrationActor::Client
+    };
+    thegn_core::db::install_migration_policy(&cfg.database, migration_actor)?;
     // Remember where it came from: a long-lived process (the daemon) re-reads
     // the same source per agent launch instead of serving a startup snapshot.
     crate::config_source::install(cli.overrides.clone(), cli.config.clone());
