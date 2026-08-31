@@ -44,6 +44,52 @@ pub(crate) fn resolve(
     resolve_inner(cfg, db, spec, launch, None)
 }
 
+/// Resolve `tools.run` exclusively through a fresh trusted `[[tools]]` entry.
+/// An agent or bare harness with the same name is intentionally invisible.
+pub(crate) fn resolve_tool(
+    cfg: &Config,
+    db: &Db,
+    worktree: &str,
+    name: &str,
+) -> Result<LaunchSpec> {
+    let command = configured_tool_command(cfg, name)?;
+    let branch = db
+        .worktrees()
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|row| row.worktree == worktree)
+                .map(|row| row.branch)
+        })
+        .filter(|branch| !branch.is_empty());
+    crate::agent::launch_spec_full(
+        cfg,
+        worktree,
+        branch.as_deref(),
+        name,
+        true,
+        true,
+        LaunchExtras {
+            cmd_override: Some(command),
+            suppress_agent_record: true,
+            ..LaunchExtras::default()
+        },
+    )
+}
+
+fn configured_tool_command<'a>(cfg: &'a Config, name: &str) -> Result<&'a str> {
+    cfg.tool_command(name)
+        .with_context(|| format!("unknown configured tool `{name}`"))
+}
+
+pub(crate) fn ensure_configured_agent(cfg: &Config, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        cfg.agent_command(name).is_some(),
+        "unknown configured agent `{name}`"
+    );
+    Ok(())
+}
+
 /// Resolve a native fork while preserving the harness selected by the source
 /// row. The command is produced by the core harness seam; this function only
 /// composes the configured agent's current sandbox and credentials around it.
@@ -302,6 +348,39 @@ mod tests {
         Config::default()
     }
 
+    fn named(name: &str, command: &str) -> thegn_core::config::NamedCommand {
+        thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
+            name: name.into(),
+            command: command.into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn action_names_are_resolved_only_in_their_declared_registry() {
+        let mut c = cfg();
+        c.agents.push(named("same", "claude"));
+        assert!(configured_tool_command(&c, "same").is_err());
+        ensure_configured_agent(&c, "same").expect("configured agent");
+
+        let mut c = cfg();
+        c.tools.push(named("same", "codex"));
+        assert!(ensure_configured_agent(&c, "same").is_err());
+        assert_eq!(configured_tool_command(&c, "same").unwrap(), "codex");
+
+        assert!(configured_tool_command(&cfg(), "claude").is_err());
+        assert!(ensure_configured_agent(&cfg(), "claude").is_err());
+    }
+
     #[test]
     fn a_headless_claude_launch_carries_the_prompt() {
         let cmd = command_for(&cfg(), "claude", "write a test", true, None, false, None)
@@ -341,6 +420,8 @@ mod tests {
             model: Some("claude-sonnet-5".into()),
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         c.pipeline
             .stages
@@ -518,6 +599,7 @@ mod tests {
             agent: None,
             adopt: false,
             already_capped: false,
+            automation_origin: None,
         };
         let launch = AgentLaunch {
             agent: "claude".into(),
@@ -539,6 +621,8 @@ mod tests {
     fn native_fork_requires_the_configured_agent_provider_to_match() {
         let mut c = cfg();
         c.agents.push(thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
             name: "worker".into(),
             command: "codex".into(),
             hints: Vec::new(),
@@ -572,6 +656,8 @@ mod tests {
         let mut env = std::collections::BTreeMap::new();
         env.insert("THEGN_TEST_FORK_AGENT_ENV".into(), "fresh-context".into());
         c.agents.push(thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
             name: "worker".into(),
             command: "codex".into(),
             hints: Vec::new(),

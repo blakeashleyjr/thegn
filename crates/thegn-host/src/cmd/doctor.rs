@@ -8,6 +8,8 @@
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
 use thegn_core::config::{Config, SandboxProfile};
+use thegn_core::db::Db;
+use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
 use thegn_core::outln;
 use thegn_core::placement::{Placement, RuntimeProbe};
@@ -1247,9 +1249,87 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
         "agents": agents_json(cfg),
+        "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
+        "lifecycle_hooks": lifecycle_hooks_json(cfg),
     })
+}
+
+/// Report lifecycle-hook sources without exposing command text. Repo hooks are
+/// read only for the diagnostic surface; execution still goes through the
+/// normal trust-gated resolver.
+fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
+    let repo_root = current_repo_root();
+    let repo_hooks = repo_root
+        .as_deref()
+        .and_then(thegn_core::config::load_repo_hooks)
+        .map(|(hooks, _)| hooks)
+        .unwrap_or_default();
+    let db = Db::open().ok();
+    let resolved = repo_root
+        .as_deref()
+        .map(|root| crate::worktree_lifecycle::resolve(cfg, root, db.as_ref()));
+
+    let events = HookEvent::ALL
+        .into_iter()
+        .map(|event| {
+            let global = cfg.hooks.entries(event).len();
+            let workspace = cfg
+                .workspace
+                .values()
+                .map(|w| w.hooks.entries(event).len())
+                .sum::<usize>();
+            let repo = repo_hooks.entries(event).len();
+            let trust = if repo == 0 {
+                "none"
+            } else if db.is_none() {
+                "unknown (state DB unavailable)"
+            } else if resolved.as_ref().is_some_and(|r| {
+                r.pending
+                    .iter()
+                    .any(|request| request.key == format!("hooks.{}", event.as_str()))
+            }) {
+                "pending"
+            } else {
+                "approved"
+            };
+            (
+                event.as_str().to_string(),
+                serde_json::json!({
+                    "global": global,
+                    "workspace": workspace,
+                    "repo": repo,
+                    "repo_trust": trust,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "repo": repo_root.map(|root| root.display().to_string()),
+        "events": events,
+    })
+}
+
+fn lifecycle_hooks_report(cfg: &Config) {
+    let report = lifecycle_hooks_json(cfg);
+    outln!("Lifecycle hooks ([hooks])");
+    if let Some(repo) = report["repo"].as_str() {
+        outln!("  repo          {repo}");
+    } else {
+        outln!("  repo          (not inside a repository)");
+    }
+    for event in HookEvent::ALL {
+        let row = &report["events"][event.as_str()];
+        outln!(
+            "  {:<13} global={} workspace={} repo={} trust={}",
+            event.as_str(),
+            row["global"],
+            row["workspace"],
+            row["repo"],
+            row["repo_trust"].as_str().unwrap_or("unknown"),
+        );
+    }
 }
 
 /// Reports the model proxy: a single quiet line when disabled, else enabled
@@ -1483,6 +1563,12 @@ pub fn run(
     harness_report(cfg);
 
     outln!("");
+    super::skills_doctor::print(&super::skills_doctor::inspect(
+        cfg,
+        &super::resolve_worktree(None),
+    ));
+
+    outln!("");
 
     outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
     match &probe {
@@ -1518,6 +1604,9 @@ pub fn run(
 
     outln!("");
     model_proxy_report(cfg);
+
+    outln!("");
+    lifecycle_hooks_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
@@ -2925,13 +3014,21 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
         .map(|tool| {
             let over = cfg.managed_tools.get(&tool.name);
             let res = tool.resolve(over, thegn_core::util::which_path);
-            serde_json::json!({
+            let is_bugstalker = tool.name == "bugstalker";
+            let mut report = serde_json::json!({
                 "name": tool.name,
                 "tier": res.tier(),
                 "path": res.path(),
                 "pinned": tool.version,
                 "current": matches!(res, Resolution::Managed { current: true, .. }),
-            })
+            });
+            if is_bugstalker {
+                report["platform_supported"] =
+                    serde_json::json!(thegn_core::debug::platform_supported());
+                report["platform_note"] =
+                    serde_json::json!(thegn_core::debug::unsupported_reason());
+            }
+            report
         })
         .collect();
     serde_json::Value::Array(tools)
@@ -3223,6 +3320,19 @@ mod tests {
     }
 
     #[test]
+    fn doctor_json_exposes_lifecycle_hook_sources() {
+        let hooks = doctor_json(&Config::default())["lifecycle_hooks"].clone();
+        assert!(hooks["events"].is_object());
+        for event in HookEvent::ALL {
+            let row = &hooks["events"][event.as_str()];
+            assert!(row["global"].is_u64());
+            assert!(row["workspace"].is_u64());
+            assert!(row["repo"].is_u64());
+            assert!(row["repo_trust"].is_string());
+        }
+    }
+
+    #[test]
     fn lsp_resolution_phrases_are_distinct() {
         use thegn_svc::lsp::Resolution;
         assert_eq!(
@@ -3392,6 +3502,24 @@ mod tests {
             .find(|t| t["name"] == "bugstalker")
             .expect("bugstalker reported");
         assert_eq!(bs["pinned"], thegn_core::debug::bs_tool().version);
+        assert_eq!(
+            bs["platform_supported"],
+            thegn_core::debug::platform_supported()
+        );
+        assert_eq!(
+            bs["platform_note"],
+            serde_json::to_value(thegn_core::debug::unsupported_reason()).unwrap()
+        );
+        // The JSON formatter consumes the same pure gate used by the core
+        // debugger policy; exercise both sides without changing the host.
+        assert!(thegn_core::debug::bs_supported(
+            thegn_core::managed_tool::Os::Linux,
+            thegn_core::managed_tool::Arch::X64,
+        ));
+        assert!(!thegn_core::debug::bs_supported(
+            thegn_core::managed_tool::Os::Macos,
+            thegn_core::managed_tool::Arch::X64,
+        ));
 
         // A user override (as parsed from `[managed_tools.bugstalker]`) wins
         // the tier.

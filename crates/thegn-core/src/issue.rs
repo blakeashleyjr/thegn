@@ -292,6 +292,38 @@ pub struct AgentDispatch {
     pub exited_at_ms: Option<i64>,
 }
 
+/// The review-task projection of an `agent_dispatches` row.
+///
+/// Kept separate from [`AgentDispatch`] so the nullable review metadata does
+/// not infect ordinary pipeline rows or their control-wire shape. Only rows
+/// whose `task_kind` and `source_key` are populated map to this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewTaskRecord {
+    pub id: i64,
+    pub issue_id: String,
+    pub worktree_path: String,
+    pub role: String,
+    pub dispatched_at_ms: i64,
+    pub status: AgentDispatchStatus,
+    pub task_kind: String,
+    pub source_key: String,
+    pub source_revision: String,
+    /// Feedback identity for the active revision, excluding the PR head.
+    pub content_revision: String,
+    pub prompt: String,
+    pub expected_head_oid: String,
+    /// A newer snapshot observed while the task was active. It remains on the
+    /// same unique row until the active handoff can safely finish or promote it.
+    pub pending_source_revision: Option<String>,
+    pub pending_content_revision: Option<String>,
+    pub pending_prompt: Option<String>,
+    pub pending_expected_head_oid: Option<String>,
+    pub pending_role: Option<String>,
+    pub pending_worktree_path: Option<String>,
+    pub forge_action_attempts: u32,
+    pub next_forge_action_at_ms: Option<i64>,
+}
+
 /// A note on the per-row progress queue (see `agent_dispatch_notes`).
 /// Kept separate from [`AgentDispatch::note`] — the daemon's transport-retry
 /// observer ledger — so a progress read never conflates the two.

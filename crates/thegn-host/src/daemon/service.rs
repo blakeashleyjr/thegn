@@ -16,12 +16,13 @@ use thegn_core::attention::PaneAgentState;
 use thegn_core::control::relay_expiry;
 use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::db::Db;
+use thegn_core::editor::EditorTarget;
 use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult, ForkSpec,
-    GitFileStatus, OpenSpec, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
-    WaitCondition, WaitOutcome,
+    GitFileStatus, OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
+    SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
@@ -80,6 +81,8 @@ pub(crate) struct DaemonService {
     /// snapshot was already the wrong shape — it could not honor a
     /// `[workspace.<slug>]` refinement, or even a differing target branch).
     pub config: std::sync::Arc<thegn_core::config::Config>,
+    /// Profile root containing the cross-process session-migration gates.
+    pub profile_root: std::path::PathBuf,
     /// The control endpoint's stable string form (the socket path on unix),
     /// exported into every session's environment as `THEGN_CONTROL_SOCKET`
     /// so a program inside a pane can reach the daemon that owns it.
@@ -426,6 +429,17 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
+            // Hold the same per-worktree gate a migration owns exclusively.
+            // Keep it through registry insertion: an open is therefore either
+            // visible to migration's first listing or refused until cleanup is
+            // complete, never launched in the gap between those two events.
+            let fence_worktree = spec.worktree.as_deref().or(spec.cwd.as_deref());
+            let _migration_guard = thegn_core::profile::acquire_session_open_guard_at(
+                &self.profile_root,
+                fence_worktree,
+            )
+            .map_err(|error| ControlError::Conflict(error.to_string()))?;
+
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
@@ -449,6 +463,7 @@ impl ControlApi for DaemonService {
                         // recipe and the actual resolution use this same cfg.
                         let fresh = crate::config_source::fresh();
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                        super::agent_open::ensure_configured_agent(cfg, &launch.agent)?;
                         let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
                         let resolved = super::agent_open::resolve(cfg, db, &spec2, &launch)?;
                         Ok((recipe, Some(resolved)))
@@ -521,6 +536,16 @@ impl ControlApi for DaemonService {
                 Some(a) => a.agent.clone(),
                 None => crate::pane::program_name(&argv),
             };
+            if let Some(origin) = &spec.automation_origin {
+                crate::automation_runtime::register_session_origin(
+                    &id,
+                    thegn_core::automation::AutomationOrigin {
+                        root_event_id: origin.root_event_id.clone(),
+                        rule_id: origin.rule_id.clone(),
+                        run_id: origin.run_id.clone(),
+                    },
+                );
+            }
             let info = super::fork::spawn_session(
                 self,
                 super::fork::SpawnRequest {
@@ -537,7 +562,11 @@ impl ControlApi for DaemonService {
                     handoff: None,
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                crate::automation_runtime::clear_session_origin(&id);
+                error
+            })?;
 
             // Ask a running compositor to graft this session into a real pane.
             // Best-effort by design: with no instance up, the session is simply
@@ -738,8 +767,74 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn open_editor(&self, target: EditorTarget) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async move {
+            // The daemon only relays a validated target to the compositor. In
+            // particular, provider selection and every executable detail stay
+            // out of this mailbox and are resolved from trusted local config
+            // when the compositor claims the intent.
+            let worktree = target.worktree().to_string_lossy().into_owned();
+            let path = target
+                .relative_file()
+                .map(|p| p.to_string_lossy().into_owned());
+            let payload = serde_json::json!({
+                "worktree": worktree,
+                "path": path,
+                "line": target.line(),
+                "col": target.col(),
+                "source": "control_api",
+            });
+            self.with_db(move |db| {
+                db.put_intent("open_editor", &serde_json::to_string(&payload)?)?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
     fn drive_browser(&self, _cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async move { Err(ControlError::Unimplemented("drive-browser")) })
+    }
+
+    fn preview_fetch(
+        &self,
+        request: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        Box::pin(async move {
+            let diagnostic = if request.include_console {
+                request
+                    .worktree
+                    .as_deref()
+                    .and_then(crate::preview::diagnostic_snapshot)
+            } else {
+                None
+            };
+            let config = self.config.preview.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::preview_fetch::fetch(&config, request, diagnostic)
+            })
+            .await
+            .map_err(|error| {
+                ControlError::Internal(anyhow::anyhow!("preview fetch task join: {error}"))
+            })?
+            .map_err(|error| match error {
+                crate::preview_fetch::FetchError::Invalid(message) => {
+                    ControlError::InvalidArgument(message)
+                }
+                crate::preview_fetch::FetchError::Precondition(message) => {
+                    ControlError::FailedPrecondition(message)
+                }
+                crate::preview_fetch::FetchError::Limit(message) => {
+                    ControlError::ResourceExhausted(message)
+                }
+                crate::preview_fetch::FetchError::Timeout => {
+                    ControlError::Unavailable("preview fetch timed out".into())
+                }
+                crate::preview_fetch::FetchError::Transport(message) => {
+                    ControlError::Unavailable(message)
+                }
+            })
+        })
     }
 
     fn wait<'a>(
@@ -1106,10 +1201,13 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'_, ControlResult<i64>> {
         Box::pin(async move {
             self.with_db(move |db| {
-                use thegn_core::store::NotificationStore;
-                let kind = match note.urgency.as_deref() {
-                    Some("alert") | Some("critical") => "agent_attention",
-                    _ => "agent_done",
+                let kind = if note.automation_origin.is_some() {
+                    "automation"
+                } else {
+                    match note.urgency.as_deref() {
+                        Some("alert") | Some("critical") => "agent_attention",
+                        _ => "agent_done",
+                    }
                 };
                 let source = note.source.as_deref().unwrap_or("api");
                 let message = if note.body.is_empty() {
@@ -1117,7 +1215,132 @@ impl ControlApi for DaemonService {
                 } else {
                     format!("{} — {}", note.title, note.body)
                 };
-                db.put_notification(kind, source, &message, "")
+                crate::automation_events::emit_with_facts(
+                    db,
+                    kind,
+                    source,
+                    &message,
+                    "",
+                    crate::automation_events::EventFacts {
+                        origin: note.automation_origin.map(|origin| {
+                            thegn_core::automation::AutomationOrigin {
+                                root_event_id: origin.root_event_id,
+                                rule_id: origin.rule_id,
+                                run_id: origin.run_id,
+                            }
+                        }),
+                        ..Default::default()
+                    },
+                )
+            })
+            .await
+        })
+    }
+
+    fn automations_list(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_svc::control::AutomationRuleInfo>>> {
+        let cfg = Arc::clone(&self.config);
+        Box::pin(async move {
+            let effective = cfg.effective_automations();
+            let rules = effective
+                .compiled_rules()
+                .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
+            let profile = cfg.active_profile().is_some();
+            self.with_db(move |db| {
+                use thegn_core::store::AutomationStore;
+                Ok(rules
+                    .into_iter()
+                    .map(|rule| thegn_svc::control::AutomationRuleInfo {
+                        recent_outcome: db
+                            .automation_runs(Some(&rule.id), 1)
+                            .ok()
+                            .and_then(|rows| rows.into_iter().next())
+                            .map(|row| row.outcome),
+                        name: rule.id,
+                        enabled: rule.enabled,
+                        trusted_layer: if profile { "global+profile" } else { "global" }.into(),
+                        event: rule.event.as_str().into(),
+                        action: rule.action.cap,
+                        inert_reason: if !effective.enabled {
+                            Some("automations disabled".into())
+                        } else if !rule.enabled {
+                            Some("rule disabled".into())
+                        } else {
+                            None
+                        },
+                    })
+                    .collect())
+            })
+            .await
+        })
+    }
+
+    fn automations_test(
+        &self,
+        request: thegn_svc::control::AutomationTestRequest,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::AutomationTestReply>> {
+        let cfg = Arc::clone(&self.config);
+        Box::pin(async move {
+            let event: thegn_core::automation::AutomationEvent =
+                serde_json::from_value(request.event).map_err(|error| {
+                    ControlError::Conflict(format!("invalid event fixture: {error}"))
+                })?;
+            event.validate_required_facts().map_err(|error| {
+                ControlError::Conflict(format!("invalid event fixture: {error}"))
+            })?;
+            let rules = cfg
+                .effective_automations()
+                .compiled_rules()
+                .map_err(|errors| ControlError::Conflict(errors.join("\n")))?;
+            let rule = rules
+                .into_iter()
+                .find(|rule| rule.id == request.rule)
+                .ok_or_else(|| {
+                    ControlError::NotFound(format!("automation rule {}", request.rule))
+                })?;
+            let decisions = thegn_core::automation::evaluate(
+                std::slice::from_ref(&rule),
+                &event,
+                &thegn_core::automation::EvaluationState::new(),
+                request.at.unwrap_or(event.occurred_at),
+            );
+            Ok(thegn_svc::control::AutomationTestReply {
+                rule: rule.id,
+                decisions: serde_json::to_value(decisions).map_err(anyhow::Error::from)?,
+                executed: false,
+            })
+        })
+    }
+
+    fn tools_run(&self, request: ToolRunRequest) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async move {
+            let worktree = request
+                .worktree
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ControlError::Conflict("tools.run requires worktree".into()))?;
+            let snapshot = (*self.config).clone();
+            let name = request.name.clone();
+            let worktree_for_resolve = worktree.clone();
+            let launch = self
+                .with_db(move |db| {
+                    let fresh = crate::config_source::fresh();
+                    let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                    super::agent_open::resolve_tool(cfg, db, &worktree_for_resolve, &name)
+                })
+                .await
+                .map_err(|error| ControlError::Conflict(error.to_string()))?;
+            self.open(OpenSpec {
+                argv: launch.argv,
+                cwd: launch.cwd.map(|path| path.to_string_lossy().into_owned()),
+                env: launch.env,
+                rows: 24,
+                cols: 80,
+                worktree: Some(worktree),
+                already_capped: true,
+                automation_origin: request.automation_origin,
+                ..Default::default()
             })
             .await
         })
@@ -1340,16 +1563,56 @@ impl ControlApi for DaemonService {
                 let taken = wt::BranchSet::load(&root);
                 let branch = wt::dedupe(&seed, &taken);
                 let path = wt::worktree_path(&root, &branch, &cfg);
-                wt::add_checked(&root, &branch, &base, &path, &cfg)
-                    .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
+                let slug = repo::repo_slug(&root);
+                let pre = crate::worktree_lifecycle::run_event_with_db(
+                    &cfg,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    thegn_core::hooks::HookEvent::PreCreate,
+                    thegn_core::hooks::HookExecutionMode::User,
+                    Some(db),
+                );
+                if pre.blocked() {
+                    anyhow::bail!("worktrees.create: {}", pre.message());
+                }
+                wt::add_checked_with_state(&root, &branch, &base, &path, &cfg).map_err(|e| {
+                    anyhow::anyhow!(crate::worktree_lifecycle::create_failure_with_add_state(
+                        e.message,
+                        &cfg,
+                        &root,
+                        &path,
+                        &branch,
+                        e.branch_created,
+                    ))
+                })?;
 
                 let wt_str = path.to_string_lossy().into_owned();
-                let slug = repo::repo_slug(&root);
                 let tab = repo::branch_tab(&slug, &branch);
                 let root_s = root.to_string_lossy().into_owned();
                 let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Some(id) = &issue {
                     let _ = db.link_issue(&wt_str, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                }
+                if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
+                    &cfg,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    Some(db),
+                    None,
+                ) {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("post_create: {}", report.message()),
+                        &cfg,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    let _ = db.del_worktree(&wt_str);
+                    anyhow::bail!("worktrees.create: {message}");
                 }
                 Ok(thegn_svc::control::WorktreeInfo {
                     path: wt_str,
@@ -1397,6 +1660,27 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn list_skills(&self) -> BoxFuture<'_, ControlResult<thegn_svc::control::SkillsList>> {
+        Box::pin(async move {
+            let cfg = self.config.clone();
+            tokio::task::spawn_blocking(move || {
+                let loaded = crate::skill_seed::load_registry(&cfg);
+                thegn_svc::control::SkillsList {
+                    skills: loaded
+                        .registry
+                        .iter()
+                        .map(|(_, skill)| crate::skill_seed::metadata(skill))
+                        .collect(),
+                    diagnostics: loaded.diagnostics,
+                }
+            })
+            .await
+            .map_err(|error| {
+                ControlError::Internal(anyhow::anyhow!("skill registry join: {error}"))
+            })
+        })
+    }
+
     fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
         self.emit(EventFrame::Pairing {
             pairing_id: pairing_id.to_string(),
@@ -1434,6 +1718,7 @@ mod tests {
         grace_ms: i64,
         config: thegn_core::config::Config,
     ) -> (DaemonService, broadcast::Receiver<Arc<EventFrame>>) {
+        static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (events, rx) = broadcast::channel(64);
         let (idle_tx, _idle_rx) = mpsc::unbounded_channel();
         let svc = DaemonService {
@@ -1449,6 +1734,11 @@ mod tests {
             idle_tx,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             config: Arc::new(config),
+            profile_root: std::env::temp_dir().join(format!(
+                "tg-daemon-service-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
@@ -1456,6 +1746,32 @@ mod tests {
 
     fn leases(svc: &DaemonService) -> Vec<LeaseRow> {
         svc.db.lock().unwrap().leases(&svc.daemon_id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_fence_refuses_matching_open_after_initial_listing() {
+        let (svc, _events) = service(0);
+        let paths = thegn_core::profile::ProfilePaths {
+            name: "default".into(),
+            root: svc.profile_root.clone(),
+        };
+        let migration = thegn_core::profile::acquire_session_migration(&paths, "/worktree")
+            .expect("migration takes the cold source fence");
+        assert!(svc.list_sessions().await.unwrap().is_empty());
+
+        let error = svc
+            .open(OpenSpec {
+                argv: vec!["must-not-spawn".into()],
+                worktree: Some("/worktree".into()),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+            .await
+            .expect_err("open after migration listing must be refused");
+        assert!(error.to_string().contains("being migrated"));
+        drop(migration);
+        let _ = std::fs::remove_dir_all(&paths.root); // best-effort: test cleanup
     }
 
     /// Drain one Lease frame (skip any non-lease frames like `Sessions`).
@@ -1499,6 +1815,27 @@ mod tests {
             row.exited_at_ms.is_some(),
             "and marked finished, so a caller can tell it from a live session"
         );
+    }
+
+    #[tokio::test]
+    async fn open_editor_only_queues_a_safe_target_intent() {
+        let (svc, _rx) = service(0);
+        let target = EditorTarget::file("/w/project", "src/lib.rs", Some(12), Some(4))
+            .expect("valid target");
+
+        svc.open_editor(target).await.expect("queue editor intent");
+
+        let rows = svc.db.lock().unwrap().take_intents("open_editor").unwrap();
+        assert_eq!(rows.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&rows[0].payload).unwrap();
+        assert_eq!(payload["worktree"], "/w/project");
+        assert_eq!(payload["path"], "src/lib.rs");
+        assert_eq!(payload["line"], 12);
+        assert_eq!(payload["col"], 4);
+        assert_eq!(payload["source"], "control_api");
+        for forbidden in ["argv", "executable", "provider", "environment", "env"] {
+            assert!(payload.get(forbidden).is_none(), "leaked {forbidden}");
+        }
     }
 
     /// A supervisor waiting for a line the agent never printed still has to
@@ -1821,6 +2158,7 @@ mod tests {
                 body: "all green".into(),
                 urgency: None,
                 source: None,
+                automation_origin: None,
             })
             .await
             .unwrap();
@@ -1830,6 +2168,7 @@ mod tests {
                 body: String::new(),
                 urgency: Some("alert".into()),
                 source: Some("ci".into()),
+                automation_origin: None,
             })
             .await
             .unwrap();
@@ -2379,6 +2718,8 @@ mod tests {
         let mut boot = thegn_core::config::Config::default();
         boot.sandbox.enabled = false;
         boot.agents.push(thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
             name: "worker".into(),
             command: "sh".into(),
             hints: Vec::new(),

@@ -257,6 +257,7 @@ ratchet-update:
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
     RATCHET_UPDATE=1 bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
+    RATCHET_UPDATE=1 bash test/ratchet.sh i18n-literal 'jump|type to filter|matches|dismiss|offline|VIM NORMAL|VIM INSERT|NORMAL|EMACS|LOC|New terminal|New folder|Move to folder' crates/thegn-host/src/chrome.rs crates/thegn-host/src/statusbar_left.rs crates/thegn-host/src/statusbar_badges.rs crates/thegn-host/src/run.rs crates/thegn-host/src/handlers/status_line.rs crates/thegn-host/src/palette.rs crates/thegn-host/src/keymap_specs.rs
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core surface_gaps_ratchet_update -- --ignored
 
@@ -583,6 +584,7 @@ lint:
     # sat unpinned in thegn-proxy for a whole release.
     bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    bash test/ratchet.sh i18n-literal 'jump|type to filter|matches|dismiss|offline|VIM NORMAL|VIM INSERT|NORMAL|EMACS|LOC|New terminal|New folder|Move to folder' crates/thegn-host/src/chrome.rs crates/thegn-host/src/statusbar_left.rs crates/thegn-host/src/statusbar_badges.rs crates/thegn-host/src/run.rs crates/thegn-host/src/handlers/status_line.rs crates/thegn-host/src/palette.rs crates/thegn-host/src/keymap_specs.rs
     # Element contract: no NEW interactive chrome painted with raw `draw_text` +
     # a hand-built hit table — build it through `crate::element` instead (see
     # test/element-ratchet.txt for the rule + burn-down).
@@ -1093,6 +1095,45 @@ clean-aux:
     echo "clean-aux: reclaimed $(( (before - after) / 1024 / 1024 )) MiB from $target/"
 
 # --- release artifacts -------------------------------------------------------
+
+# Render every currently active package-manager input from synthetic, local
+# release archives. This is a pure rehearsal: no project binary, network,
+# credential, package manager, or live thegn state directory is touched.
+release-package-dry-run tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag_arg="{{tag}}"; tag="${tag_arg#tag=}"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    assets="$tmp/assets"; stage="$tmp/stage"; output="$tmp/output"
+    mkdir -p "$assets" "$stage"
+    cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
+    printf '#!/bin/sh\nexit 0\n' >"$stage/thegn"
+    chmod +x "$stage/thegn"
+    for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin; do
+      stem="thegn-$tag-$target"
+      (cd "$stage" && tar czf "$assets/$stem.tar.gz" thegn LICENSE-MIT LICENSE-APACHE README.md)
+      (cd "$assets" && shasum -a 256 "$stem.tar.gz" >"$stem.sha256")
+    done
+    python3 packaging/release.py validate --tag "$tag" --assets-dir "$assets"
+    python3 packaging/release.py render --tag "$tag" --assets-dir "$assets" --output-dir "$output"
+    for path in homebrew/thegn.rb aur/PKGBUILD nfpm/thegn-deb.yaml nfpm/thegn-rpm.yaml; do
+      test -s "$output/$path" || { echo "dry-run output is missing $path" >&2; exit 1; }
+    done
+    ! grep -R -E 'REPLACE_WITH_|@@[A-Z][A-Z0-9_]*@@|thegn-dev|\.SRCINFO' "$output"
+    echo "release-package-dry-run: ok ($tag)"
+
+# Validate and render a directory populated with real release archives and
+# their companion `<stem>.sha256` files. Output remains temporary; this recipe
+# is a rehearsal and never publishes or mutates the supplied assets.
+release-package-validate tag assets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag_arg="{{tag}}"; tag="${tag_arg#tag=}"
+    assets_arg="{{assets}}"; assets="${assets_arg#assets=}"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    python3 packaging/release.py validate --tag "$tag" --assets-dir "$assets"
+    python3 packaging/release.py render --tag "$tag" --assets-dir "$assets" --output-dir "$tmp/output"
+    echo "release-package-validate: ok ($tag)"
 
 # Build the release archive + checksum for THIS machine's target, byte-for-byte
 # the way `.github/workflows/release.yml` does (taiki-e/upload-rust-binary-action):

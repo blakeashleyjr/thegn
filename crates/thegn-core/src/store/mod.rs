@@ -29,6 +29,7 @@
 //! [`PoolStore`] (warm-spare pool), and [`HostStore`] (host state machine).
 
 mod account;
+mod automation;
 mod cache;
 mod calendar;
 mod compute;
@@ -43,6 +44,7 @@ mod pool;
 mod project;
 mod semantic;
 mod session_fork;
+mod session_migration;
 mod trust;
 mod usage;
 mod workspace;
@@ -54,6 +56,9 @@ mod worktree_aux;
 mod zone;
 
 pub use account::AccountStore;
+pub use automation::{
+    AutomationAdmission, AutomationRunRow, AutomationStateRow, AutomationStore, NewAutomationRun,
+};
 pub use cache::CacheStore;
 pub use calendar::{CalendarRow, CalendarStore, CalendarSyncRow};
 pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};
@@ -71,6 +76,7 @@ pub use pool::PoolStore;
 pub use project::{ProjectDeleteOutcome, ProjectRow, ProjectStore};
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use session_fork::SessionForkStore;
+pub use session_migration::SessionMigrationStore;
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use usage::{UsageSample, UsageStore};
 pub use workspace::WorkspaceStore;
