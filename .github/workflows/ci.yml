@@ -103,7 +103,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -113,7 +113,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -124,7 +124,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -142,7 +142,7 @@ jobs:
     # close to the old 40m cap; give it headroom.
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -159,7 +159,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -175,7 +175,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -185,7 +185,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -196,7 +196,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -208,7 +208,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -217,7 +217,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -226,7 +226,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -237,7 +237,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -247,7 +247,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -270,7 +270,7 @@ jobs:
       # does) — thread it through `env` instead, which secrets can populate.
       HAS_CACHIX: ${{ secrets.CACHIX_AUTH_TOKEN != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -342,7 +342,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -380,7 +380,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -415,7 +415,7 @@ jobs:
     # afford to be generous.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --locked
