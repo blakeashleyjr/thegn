@@ -61,6 +61,32 @@ The file is watched: edits apply live, no restart.
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 
+## Database migration ownership
+
+The shared state database has a startup-only ownership policy. Its safe default
+allows automatic migrations only from a long-lived controller, never from an
+ordinary CLI process found through a worktree-local `PATH`:
+
+```toml
+[database]
+migration_authority = "controller" # controller | any | disabled
+migration_executable = "/home/me/.local/bin/thegn" # optional absolute pin
+```
+
+With `controller`, worktree commands may use a schema that already matches but
+cannot advance it. `disabled` requires migrations to be enabled explicitly for
+an upgrade; `any` restores the legacy first-opener behavior. When
+`migration_executable` is non-empty, its canonical path must also match the
+running executable. Every database-using process holds a shared schema lease
+for its lifetime, so a rebuilt controller refuses to migrate until controllers
+using the old schema have exited. Stop the old host/daemon, rebuild, then start
+the pinned controller to upgrade.
+
+These keys are accepted only from trusted user/profile config (or the
+`THEGN_DATABASE_MIGRATION_AUTHORITY` and
+`THEGN_DATABASE_MIGRATION_EXECUTABLE` launcher overrides), never from a repo
+overlay, so code in a worktree cannot grant itself authority.
+
 Live daemon sessions can be forked with `thegn session fork` or the
 `fork-session` pane action. Forking uses the daemon's retained launch recipe
 and current harness capabilities; it has no additional TOML setting.

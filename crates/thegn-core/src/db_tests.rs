@@ -5,6 +5,44 @@ use crate::store::{
 };
 use rusqlite::params;
 
+#[test]
+fn migration_authority_is_fail_closed_for_clients_and_pins() {
+    use crate::config::MigrationAuthority;
+
+    assert_eq!(
+        migration_refusal(MigrationAuthority::Controller, MigrationActor::Client, true),
+        Some("ordinary CLI processes are not database migration controllers")
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Controller,
+            false
+        ),
+        Some("this executable is not the configured migration executable")
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Disabled,
+            MigrationActor::Controller,
+            true
+        ),
+        Some("automatic database migrations are disabled")
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Controller,
+            true
+        ),
+        None
+    );
+    assert_eq!(
+        migration_refusal(MigrationAuthority::Any, MigrationActor::Client, true),
+        None
+    );
+}
+
 fn db() -> Db {
     Db::open_memory().unwrap()
 }

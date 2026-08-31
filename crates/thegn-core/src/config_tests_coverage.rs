@@ -980,6 +980,8 @@ fn config_overlay_apply_sets_every_field() {
         diagnostics_crash_reports: Some(false),
         diagnostics_crash_retention: Some(4),
         diagnostics_ring_size: Some(64),
+        database_migration_authority: Some(MigrationAuthority::Disabled),
+        database_migration_executable: Some("/opt/thegn/bin/thegn".into()),
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
         activity_runaway_core_fraction: Some(0.75),
@@ -1042,6 +1044,11 @@ fn config_overlay_apply_sets_every_field() {
     assert!(!cfg.diagnostics.crash_reports);
     assert_eq!(cfg.diagnostics.crash_retention, 4);
     assert_eq!(cfg.diagnostics.ring_size, 64);
+    assert_eq!(
+        cfg.database.migration_authority,
+        MigrationAuthority::Disabled
+    );
+    assert_eq!(cfg.database.migration_executable, "/opt/thegn/bin/thegn");
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
     assert_eq!(cfg.activity.runaway_core_fraction, 0.75);
