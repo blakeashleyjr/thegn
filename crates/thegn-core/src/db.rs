@@ -322,7 +322,17 @@ pub fn migration_refusal(
     authority: crate::config::MigrationAuthority,
     actor: MigrationActor,
     executable_matches: bool,
+    observed: i64,
 ) -> Option<&'static str> {
+    // Creating a database is not advancing one. At `user_version == 0` there is
+    // nothing on disk for another process to be holding a stale view of, and —
+    // decisively — there is no controller yet either: the whole point of the
+    // policy is to elect one, so applying it to bootstrap makes a fresh install
+    // unusable by every ordinary CLI, and every isolated test that spawns one.
+    // Authority governs UPGRADES; `disabled` still means disabled.
+    if observed == 0 && authority != crate::config::MigrationAuthority::Disabled {
+        return None;
+    }
     if !executable_matches {
         return Some("this executable is not the configured migration executable");
     }
@@ -499,6 +509,7 @@ fn prepare_schema_access(conn: &Connection, database: &Path, initial: i64) -> Re
         runtime.policy.authority,
         runtime.policy.actor,
         executable_matches,
+        observed,
     ) {
         let pin = runtime
             .policy

@@ -5,19 +5,28 @@ use crate::store::{
 };
 use rusqlite::params;
 
+/// An EXISTING database (`observed > 0`) is the contended case the policy is for.
+const UPGRADE: i64 = 62;
+
 #[test]
 fn migration_authority_is_fail_closed_for_clients_and_pins() {
     use crate::config::MigrationAuthority;
 
     assert_eq!(
-        migration_refusal(MigrationAuthority::Controller, MigrationActor::Client, true),
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Client,
+            true,
+            UPGRADE
+        ),
         Some("ordinary CLI processes are not database migration controllers")
     );
     assert_eq!(
         migration_refusal(
             MigrationAuthority::Controller,
             MigrationActor::Controller,
-            false
+            false,
+            UPGRADE
         ),
         Some("this executable is not the configured migration executable")
     );
@@ -25,7 +34,8 @@ fn migration_authority_is_fail_closed_for_clients_and_pins() {
         migration_refusal(
             MigrationAuthority::Disabled,
             MigrationActor::Controller,
-            true
+            true,
+            UPGRADE
         ),
         Some("automatic database migrations are disabled")
     );
@@ -33,13 +43,45 @@ fn migration_authority_is_fail_closed_for_clients_and_pins() {
         migration_refusal(
             MigrationAuthority::Controller,
             MigrationActor::Controller,
-            true
+            true,
+            UPGRADE
         ),
         None
     );
     assert_eq!(
-        migration_refusal(MigrationAuthority::Any, MigrationActor::Client, true),
+        migration_refusal(
+            MigrationAuthority::Any,
+            MigrationActor::Client,
+            true,
+            UPGRADE
+        ),
         None
+    );
+}
+
+#[test]
+fn creating_a_fresh_database_is_not_advancing_one() {
+    use crate::config::MigrationAuthority;
+
+    // At user_version 0 there is nothing on disk for another process to hold a
+    // stale view of, and no controller has been elected yet — so applying the
+    // authority to bootstrap would make a fresh install unusable by every
+    // ordinary CLI, and every isolated test that spawns one. A client may
+    // create; only UPGRADES are contended.
+    assert_eq!(
+        migration_refusal(MigrationAuthority::Controller, MigrationActor::Client, true, 0),
+        None
+    );
+    // Even a pin does not block bootstrap: the pin exists to elect one upgrader
+    // among several, which is meaningless when there is nothing to upgrade.
+    assert_eq!(
+        migration_refusal(MigrationAuthority::Controller, MigrationActor::Client, false, 0),
+        None
+    );
+    // `disabled` is the one authority that still means what it says.
+    assert_eq!(
+        migration_refusal(MigrationAuthority::Disabled, MigrationActor::Controller, true, 0),
+        Some("automatic database migrations are disabled")
     );
 }
 
