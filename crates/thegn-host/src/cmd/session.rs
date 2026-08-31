@@ -974,16 +974,38 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         .agent
         .map(str::to_string)
         .unwrap_or_else(|| stage.agent.clone());
-    let row_id = db.put_agent_dispatch(NewDispatch {
-        issue_id: d.issue,
-        worktree_path: &wt,
-        agent_name: &agent_name,
-        stage: Some(&stage.name),
-        parent_id: d.parent,
-        session_id: None,
-        artifact_path: None,
-        chunk_path: d.chunk,
-    })?;
+    // Route the insert through the atomic claim rather than a bare append.
+    // This is the path a Lead actually dispatches on, so it is the one that
+    // must not race: `dispatch list` -> judgment -> insert is a
+    // read-modify-write two monitors (or one monitor and its own restart) can
+    // interleave, and counting live sessions instead of rows is what let 33
+    // issues run against a budget of 9 on 2026-08-29.
+    //
+    // A closed row frees its slot, so re-dispatching a stage after reconciling
+    // the previous attempt is unaffected — only rows still occupying a slot
+    // refuse. The deliberate-duplicate escape hatch lives on `dispatch claim
+    // --allow-duplicate <reason>`, which records the justification.
+    let row_id = match db.claim_dispatch(
+        NewDispatch {
+            issue_id: d.issue,
+            worktree_path: &wt,
+            agent_name: &agent_name,
+            stage: Some(&stage.name),
+            parent_id: d.parent,
+            session_id: None,
+            artifact_path: None,
+            chunk_path: d.chunk,
+        },
+        stage.concurrency,
+        None,
+    )? {
+        Ok(id) => id,
+        Err(decision) => anyhow::bail!(
+            "stage dispatch refused: {}\n(override with `thegn dispatch claim … \
+             --allow-duplicate <reason>` if this really is separate work)",
+            decision.reason()
+        ),
+    };
     // 7. The artifact path this stage's worker will write (D6: sanitized,
     //    per-issue, row-keyed — the row id keeps parallel coders collide-free).
     let artifact = pipeline_run::artifact_path(d.issue, &stage.name, row_id);
