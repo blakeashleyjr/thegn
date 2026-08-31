@@ -1188,3 +1188,53 @@ fn reserve_sandbox_overrides_without_an_agent_entry_keeps_everything() {
         Some("/home/u/.codex")
     );
 }
+
+/// Reserving a credential-home key must redirect the sandbox carve, not remove
+/// it: under a read-only $HOME an unmounted home makes the harness die before
+/// its first turn.
+#[test]
+fn reserved_credential_home_is_carved_at_the_entrys_own_path() {
+    let mut eff = thegn_core::agent_task::EffectiveAgent {
+        name: "pipeline-coder".into(),
+        command: "codex".into(),
+        harness: "codex".into(),
+        model: None,
+        env: Default::default(),
+        permissions: vec![],
+        route_via_proxy: false,
+    };
+    eff.env.insert(
+        "CODEX_HOME".into(),
+        "/home/u/.superzej/codex-pipeline".into(),
+    );
+    // A non-home var must not produce a mount.
+    eff.env.insert("RUST_LOG".into(), "debug".into());
+
+    let mounts = provider_home_mounts(Some(&eff));
+    assert_eq!(
+        mounts,
+        vec![(
+            "/home/u/.superzej/codex-pipeline".to_string(),
+            "/home/u/.superzej/codex-pipeline".to_string()
+        )],
+        "only the provider home is carved, path-preserving"
+    );
+}
+
+#[test]
+fn provider_home_mounts_ignores_relative_and_absent_entries() {
+    assert!(provider_home_mounts(None).is_empty());
+
+    let mut eff = thegn_core::agent_task::EffectiveAgent {
+        name: "x".into(),
+        command: "codex".into(),
+        harness: "codex".into(),
+        model: None,
+        env: Default::default(),
+        permissions: vec![],
+        route_via_proxy: false,
+    };
+    // A relative value is not a carvable path.
+    eff.env.insert("CODEX_HOME".into(), ".codex".into());
+    assert!(provider_home_mounts(Some(&eff)).is_empty());
+}
