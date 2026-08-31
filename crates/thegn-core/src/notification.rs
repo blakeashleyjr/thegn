@@ -437,7 +437,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 28, "ALL is missing kinds");
+        assert_eq!(seen.len(), 30, "ALL is missing kinds");
     }
 
     #[test]
