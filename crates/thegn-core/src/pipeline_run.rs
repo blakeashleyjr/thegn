@@ -216,6 +216,70 @@ impl std::fmt::Display for WaitSelectError {
     }
 }
 
+/// What a roster row's status plus its recorded exit actually say about it.
+///
+/// `status` alone cannot answer "is there a worker here?", and that gap is the
+/// whole shape of the 2026-08-29 runaway: `running` covered both a live worker
+/// and a worker that exited hours ago into a row nobody closed. A supervisor
+/// filling slots from live sessions saw the latter as free capacity and
+/// dispatched again, 121 times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLiveness {
+    /// Occupies a slot and its worker has not been recorded as exited.
+    Live,
+    /// Occupies a slot, but the worker exited — nobody closed the row. This is
+    /// the state that must never be counted as free capacity *or* as a live
+    /// worker: it needs a supervisor decision (verify → done, or failed).
+    ExitedUnverified {
+        /// The worker's exit code, when it was reaped.
+        exit_code: Option<i64>,
+        /// Milliseconds since the exit was stamped, when known.
+        since_ms: Option<i64>,
+    },
+    /// Reached a terminal status — done / failed / abandoned / merged.
+    Closed,
+}
+
+impl RowLiveness {
+    /// Whether this row still needs a supervisor decision before its slot is
+    /// genuinely free. True for both [`Self::Live`] and
+    /// [`Self::ExitedUnverified`] — the point being that an exited row does
+    /// **not** free a slot merely by having exited.
+    pub fn occupies_slot(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    /// A short operator-facing token for the CLI table.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::ExitedUnverified { .. } => "exited-unverified",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Classify one row. Pure: the exit stamp lives on the row (schema v63), so
+/// this needs neither the daemon nor a process table.
+///
+/// `now_ms` is used only to age the exit; pass the caller's clock so the
+/// decision stays testable.
+pub fn row_liveness(row: &crate::issue::AgentDispatch, now_ms: i64) -> RowLiveness {
+    if !row.status.is_active() {
+        return RowLiveness::Closed;
+    }
+    // An exit stamp is the only positive evidence that the worker is gone. Its
+    // ABSENCE means "unknown", never "exited" — a row from before v63, or one
+    // whose daemon died before it could stamp, must not be reported as finished.
+    match (row.exit_code, row.exited_at_ms) {
+        (None, None) => RowLiveness::Live,
+        (exit_code, exited_at_ms) => RowLiveness::ExitedUnverified {
+            exit_code,
+            since_ms: exited_at_ms.map(|t| now_ms.saturating_sub(t)),
+        },
+    }
+}
+
 /// Select the rows a wake step (`dispatch wait`) can wait on.
 ///
 /// - `Some(id)`: the row must exist, be waitable, and carry a non-empty
@@ -499,6 +563,68 @@ mod tests {
         assert!(r.reasons.iter().any(|s| s.contains("commit it")), "{r:?}");
     }
 
+    // --- row liveness ----------------------------------------------------------
+
+    #[test]
+    fn an_unstamped_active_row_is_live_not_finished() {
+        // The safe default: no exit stamp means UNKNOWN. A pre-v63 row, or one
+        // whose daemon died before stamping, must never be reported as exited —
+        // that would let a supervisor close work that is still running.
+        let r = row(1, "linear:A-1", Some("code"), S::Running, Some("s1"));
+        assert_eq!(row_liveness(&r, 1_000), RowLiveness::Live);
+        assert!(row_liveness(&r, 1_000).occupies_slot());
+    }
+
+    #[test]
+    fn an_exited_but_unclosed_row_is_neither_live_nor_free() {
+        // The 2026-08-29 state: worker exited 0 hours ago, row still `running`.
+        // It must be distinguishable from a live worker AND must still occupy a
+        // slot — reading it as free capacity is what drove the re-dispatch loop.
+        let mut r = row(1, "linear:A-1", Some("code"), S::Running, Some("s1"));
+        r.exit_code = Some(0);
+        r.exited_at_ms = Some(1_000);
+        let l = row_liveness(&r, 3_600_000 + 1_000);
+        assert_eq!(
+            l,
+            RowLiveness::ExitedUnverified {
+                exit_code: Some(0),
+                since_ms: Some(3_600_000),
+            }
+        );
+        assert!(
+            l.occupies_slot(),
+            "an exited row still needs a supervisor decision — it is not a free slot"
+        );
+        assert_eq!(l.token(), "exited-unverified");
+    }
+
+    #[test]
+    fn a_terminal_row_is_closed_whatever_its_exit_says() {
+        for st in [S::Done, S::Failed, S::Abandoned] {
+            let mut r = row(1, "linear:A-1", Some("code"), st, Some("s1"));
+            r.exit_code = Some(1);
+            r.exited_at_ms = Some(1_000);
+            let l = row_liveness(&r, 2_000);
+            assert_eq!(l, RowLiveness::Closed, "{st:?}");
+            assert!(!l.occupies_slot(), "{st:?}");
+        }
+    }
+
+    #[test]
+    fn a_stamped_exit_without_a_code_still_counts_as_exited() {
+        // An unreapable worker (relay lost, killed pane) has a timestamp but no
+        // code. That is still positive evidence the worker is gone.
+        let mut r = row(1, "linear:A-1", Some("code"), S::Running, Some("s1"));
+        r.exited_at_ms = Some(500);
+        assert_eq!(
+            row_liveness(&r, 1_500),
+            RowLiveness::ExitedUnverified {
+                exit_code: None,
+                since_ms: Some(1_000),
+            }
+        );
+    }
+
     // --- wait-target selection -------------------------------------------------
 
     fn row(
@@ -522,6 +648,8 @@ mod tests {
             note: None,
             chunk_path: None,
             report: None,
+            exit_code: None,
+            exited_at_ms: None,
         }
     }
 
