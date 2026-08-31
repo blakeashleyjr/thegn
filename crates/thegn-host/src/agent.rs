@@ -3315,6 +3315,25 @@ pub fn launch_spec_full(
     // here rather than teaching each of them the rule.
     if let Some(sandbox_spec) = outcome.spec.as_mut() {
         reserve_sandbox_overrides(&mut sandbox_spec.env_overrides, agent_env_keys);
+        // Reserving the key is only half of it. The bundle does not merely SET a
+        // credential home, it also carves that path read-write into the sandbox
+        // (`bundle::fold_cred_dir`) — because under a read-only `$HOME` the
+        // harness cannot otherwise write its own runtime state. Dropping the
+        // override without redirecting the carve leaves the entry's home
+        // unmounted, and codex dies before its first turn with
+        // `failed to initialize in-process app-server client: Read-only file
+        // system`. Carve whichever home the entry actually names.
+        for (host, dir) in provider_home_mounts(eff_agent.as_ref()) {
+            if !sandbox_spec.mounts.iter().any(|m| m.dest == dir) {
+                let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: the mount reports the real failure
+                sandbox_spec.mounts.push(sandbox::Mount {
+                    dest: dir,
+                    host,
+                    ro: false,
+                    cache: false,
+                });
+            }
+        }
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
@@ -3360,6 +3379,31 @@ fn extend_reserving(
             .into_iter()
             .filter(|(k, _)| !reserved.is_some_and(|r| r.contains_key(k))),
     );
+}
+
+/// The `(host, dest)` credential-home mounts an agent entry's own env implies:
+/// one per provider whose relocation var (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, …)
+/// the entry sets to an absolute path. Path-preserving and read-write, matching
+/// `bundle::fold_cred_dir` — this replaces the carve the bundle would have made
+/// for the default home, which reserving the key suppresses.
+///
+/// Values are taken post-expansion, so an `env:`/`file:` ref that did not
+/// resolve yields no mount (there is no path to carve).
+fn provider_home_mounts(eff: Option<&thegn_core::agent_task::EffectiveAgent>) -> Vec<(String, String)> {
+    let Some(eff) = eff else { return vec![] };
+    let homes: Vec<&str> = thegn_core::account::providers()
+        .iter()
+        .map(|p| p.home_env)
+        .filter(|e| !e.is_empty())
+        .collect();
+    eff.expanded_env()
+        .into_iter()
+        .filter(|(k, v)| homes.contains(&k.as_str()) && std::path::Path::new(v).is_absolute())
+        .map(|(_, v)| {
+            let p = thegn_core::util::expand_tilde(&v);
+            (p.clone(), p)
+        })
+        .collect()
 }
 
 /// Drop every sandbox env override the agent entry declares for itself, so the
