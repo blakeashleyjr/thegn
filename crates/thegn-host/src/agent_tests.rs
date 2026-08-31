@@ -1083,3 +1083,108 @@ fn inject_devshell_host_prepends_path_and_merges_vars() {
         "a var the user already set must not be clobbered"
     );
 }
+
+/// THE-91: the bundle's legacy per-provider account carve folds a credential
+/// home (`CODEX_HOME = ~/.codex`) into the host pane env AFTER `compose_spec`
+/// applied `[[agents]].env`. A `pipeline-*` agent that relocates that home to a
+/// headless-capable config dir must keep it, or its sandbox/approval settings
+/// never load and the worker dies unable to write.
+#[test]
+fn agent_entry_env_is_not_clobbered_by_the_host_env_fold() {
+    let reserved: std::collections::BTreeMap<String, String> = [(
+        "CODEX_HOME".to_string(),
+        "/pipeline/codex-home".to_string(),
+    )]
+    .into();
+    let mut env = vec![
+        ("THEGN_WORKTREE".to_string(), "/wt".to_string()),
+        // What `compose_spec` applied last from the entry.
+        ("CODEX_HOME".to_string(), "/pipeline/codex-home".to_string()),
+    ];
+
+    extend_reserving(
+        &mut env,
+        vec![
+            ("CODEX_HOME".to_string(), "/home/u/.codex".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), "/home/u/.claude".to_string()),
+        ],
+        Some(&reserved),
+    );
+
+    // The reserved key is not re-appended, so the entry's value still wins.
+    assert_eq!(
+        env.iter().filter(|(k, _)| k == "CODEX_HOME").count(),
+        1,
+        "the fold must not append over a key the agent entry declares"
+    );
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| v.as_str()),
+        Some("/pipeline/codex-home")
+    );
+    // Everything the entry does NOT claim still rides through.
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| v.as_str()),
+        Some("/home/u/.claude")
+    );
+}
+
+#[test]
+fn extend_reserving_without_an_agent_entry_folds_everything() {
+    let mut env = vec![("THEGN_WORKTREE".to_string(), "/wt".to_string())];
+    extend_reserving(
+        &mut env,
+        vec![("CODEX_HOME".to_string(), "/home/u/.codex".to_string())],
+        None,
+    );
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| v.as_str()),
+        Some("/home/u/.codex"),
+        "a bare harness launch has no entry env to protect"
+    );
+}
+
+/// The sandbox half of THE-91: `env_overrides` become `export KEY='…'` lines
+/// inside the wrap script, which runs after the pane's process env is set — so
+/// they clobber `[[agents]].env` just as the host fold did.
+#[test]
+fn agent_entry_env_is_not_clobbered_by_sandbox_overrides() {
+    let reserved: std::collections::BTreeMap<String, String> = [(
+        "CODEX_HOME".to_string(),
+        "/pipeline/codex-home".to_string(),
+    )]
+    .into();
+    let mut overrides: std::collections::HashMap<String, String> = [
+        ("CODEX_HOME".to_string(), "/home/u/.codex".to_string()),
+        ("SCCACHE_DIR".to_string(), "/cache/sccache".to_string()),
+    ]
+    .into();
+
+    reserve_sandbox_overrides(&mut overrides, Some(&reserved));
+
+    assert!(
+        !overrides.contains_key("CODEX_HOME"),
+        "a key the agent entry declares must not be re-exported inside the sandbox"
+    );
+    assert_eq!(
+        overrides.get("SCCACHE_DIR").map(String::as_str),
+        Some("/cache/sccache"),
+        "unclaimed overrides still apply"
+    );
+}
+
+#[test]
+fn reserve_sandbox_overrides_without_an_agent_entry_keeps_everything() {
+    let mut overrides: std::collections::HashMap<String, String> =
+        [("CODEX_HOME".to_string(), "/home/u/.codex".to_string())].into();
+    reserve_sandbox_overrides(&mut overrides, None);
+    assert_eq!(
+        overrides.get("CODEX_HOME").map(String::as_str),
+        Some("/home/u/.codex")
+    );
+}
