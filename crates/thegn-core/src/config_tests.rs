@@ -1511,6 +1511,11 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DIAGNOSTICS_CRASH_REPORTS", "off"),
         ("THEGN_DIAGNOSTICS_CRASH_RETENTION", "3"),
         ("THEGN_DIAGNOSTICS_RING_SIZE", "128"),
+        ("THEGN_DATABASE_MIGRATION_AUTHORITY", "disabled"),
+        (
+            "THEGN_DATABASE_MIGRATION_EXECUTABLE",
+            "/opt/thegn/bin/thegn",
+        ),
         ("THEGN_SANDBOX_BACKEND", "docker"),
         ("THEGN_SANDBOX_NETWORK", "host"),
         ("THEGN_SANDBOX_IMAGE", "img:9"),
@@ -1591,6 +1596,8 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.diagnostics.crash_reports);
     assert_eq!(c.diagnostics.crash_retention, 3);
     assert_eq!(c.diagnostics.ring_size, 128);
+    assert_eq!(c.database.migration_authority, MigrationAuthority::Disabled);
+    assert_eq!(c.database.migration_executable, "/opt/thegn/bin/thegn");
     assert_eq!(c.sandbox.backend, SandboxBackend::Docker);
     assert_eq!(c.sandbox.network, Network::Host);
     assert_eq!(c.sandbox.image, "img:9");

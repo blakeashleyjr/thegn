@@ -41,6 +41,13 @@ fn automation_dry_run_leaves_an_empty_state_home_empty() {
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env_remove("THEGN_LOG")
+        // Launcher overrides must not leak into a spawned test binary: `just
+        // live` exports THEGN_DATABASE_MIGRATION_EXECUTABLE, which pins the
+        // migration controller to the release build and makes this test's own
+        // isolated database unmigratable. Same rule as XDG_STATE_HOME above —
+        // a test that spawns thegn owns its whole environment.
+        .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
+        .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -98,6 +105,13 @@ body = "forwarded: {message}"
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env_remove("THEGN_LOG")
+        // Launcher overrides must not leak into a spawned test binary: `just
+        // live` exports THEGN_DATABASE_MIGRATION_EXECUTABLE, which pins the
+        // migration controller to the release build and makes this test's own
+        // isolated database unmigratable. Same rule as XDG_STATE_HOME above —
+        // a test that spawns thegn owns its whole environment.
+        .env_remove("THEGN_DATABASE_MIGRATION_EXECUTABLE")
+        .env_remove("THEGN_DATABASE_MIGRATION_AUTHORITY")
         .output()
         .unwrap();
     assert!(

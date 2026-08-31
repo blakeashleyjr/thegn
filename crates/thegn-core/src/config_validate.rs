@@ -56,6 +56,11 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // concurrency, `next` targets and cycles). Structure only — thegn
             // validates the org chart it will never execute.
             errs.extend(crate::config_pipeline::validate_pipeline(&cfg));
+            // The handoff contract: a stage prompt that never names `{row}` or
+            // never asks for `thegn dispatch report` produces rows the done-gate
+            // can never close, so the roster grows without bound. Checked here
+            // because it is a property of the prompt string, not the org chart.
+            errs.extend(crate::config_pipeline::validate_stage_contracts(&cfg));
             // `model` / `env` on [[agents]]/[[tools]] and stage overrides: a
             // model must land on a harness with a model flag, env keys must be
             // exportable names.
@@ -867,9 +872,13 @@ mod tests {
         // eligible catalog entries can occupy the bottom drawer.
         // 91 → 92 (THE-17): `[editor] provider` (EditorProvider) — the
         // logical external-editor handoff implementation.
+        // 92 → 93: `[database] migration_authority` (MigrationAuthority) — which
+        // process kind may advance the shared state schema. Added after an
+        // unlanded branch's worker migrated the live database out from under
+        // main and locked the supervisor's own CLI out of the roster.
         assert_eq!(
             defs.len(),
-            92,
+            93,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1214,17 +1223,32 @@ command = "worker --run"
 [[pipeline.stages]]
 name = "architect"
 agent = "worker"
-prompt = "Chunk {issue_title} into {artifact}"
+prompt = "Row {row}: chunk {issue_title} into {artifact}, then `thegn dispatch report {row}`"
 next = "code"
 
 [[pipeline.stages]]
 name = "code"
 agent = "worker"
-prompt = "Implement {parent_artifact} for stage {stage}"
+prompt = "Row {row}: implement {parent_artifact} for {stage}, then `thegn dispatch report {row}`"
 concurrency = 3
 on_blocked = "escalate"
 "#;
         assert!(validate_str(body).is_empty(), "{:#?}", validate_str(body));
+
+        // The handoff-contract channel: drop the report instruction and the
+        // stage can no longer produce a closable row, so validation must say so
+        // even though the org chart is still perfectly well-formed.
+        let no_contract = body.replace(", then `thegn dispatch report {row}`", "");
+        let errs = validate_str(&no_contract);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("dispatch report") && e.contains("architect")),
+            "{errs:#?}"
+        );
+        // And dropping `{row}` is reported as its own, separate gap.
+        let no_row = body.replace("Row {row}: ", "").replace(" {row}", " <id>");
+        let errs = validate_str(&no_row);
+        assert!(errs.iter().any(|e| e.contains("{row}")), "{errs:#?}");
 
         // Schema walk: an unknown `on_blocked` spelling.
         let errs = validate_str(&body.replace("\"escalate\"", "\"retry\""));

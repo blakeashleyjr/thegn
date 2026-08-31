@@ -599,6 +599,16 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // Establish schema ownership before `load_or_seed_session` (the first DB
+    // consumer). This explicit open is a preflight: migration refusal must
+    // abort startup and restore the terminal, never be swallowed by the
+    // session loader's cache-unavailable fallback (the failure mode that made
+    // most workspaces, git state, disk size, and LOC appear to vanish).
+    thegn_core::db::install_migration_policy(
+        &cfg.database,
+        thegn_core::db::MigrationActor::Controller,
+    )?;
+    drop(thegn_core::db::Db::open()?);
     // Off-loop hydration loads must build the SAME config (overrides + DB
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());

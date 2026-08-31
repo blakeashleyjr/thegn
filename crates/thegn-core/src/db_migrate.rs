@@ -700,6 +700,52 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE agent_dispatches ADD COLUMN pending_worktree_path TEXT",
         [],
     );
+    // v63: `agent_dispatches.exit_code` / `.exited_at_ms` — what the worker
+    // process actually did, recorded when its session ends.
+    //
+    // Before this, a row's `status` was the ONLY liveness signal, and `running`
+    // conflated two opposite situations: a worker still working, and a worker
+    // that finished but whose row nobody closed. A supervisor reading liveness
+    // from live sessions therefore saw a free slot for every exited-but-open
+    // row and dispatched into it — the 121-row runaway of 2026-08-29. With the
+    // exit stamped on the row, `pipeline_run::row_liveness` can name the
+    // difference without consulting the daemon at all.
+    //
+    // Nullable and idempotent, like every column above: a pre-v63 row (and any
+    // row whose worker predates the stamp) reads back `None`, which means
+    // "unknown", never "still running".
+    if !has_column(conn, "agent_dispatches", "exit_code") {
+        let _ = conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN exit_code INTEGER",
+            [],
+        );
+    }
+    if !has_column(conn, "agent_dispatches", "exited_at_ms") {
+        let _ = conn.execute(
+            "ALTER TABLE agent_dispatches ADD COLUMN exited_at_ms INTEGER",
+            [],
+        );
+    }
+}
+
+/// v63 companion: the monitor-ownership lease.
+///
+/// Two Lead processes driving one pipeline is not a hypothetical — a monitor
+/// that appears wedged gets a second one started beside it, and both then fill
+/// the same slots. A lease is the smallest thing that makes "I am the monitor"
+/// checkable across processes and across restarts: an owner token and an
+/// expiry, so a crashed holder's claim lapses on its own rather than needing a
+/// human to clear it.
+pub(crate) fn migrate_v63_leases(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pipeline_leases (
+           name          TEXT PRIMARY KEY,
+           owner         TEXT NOT NULL,
+           acquired_at_ms INTEGER NOT NULL,
+           expires_at_ms INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
 }
 
 /// v62: credential-free lineage for successful session forks. Recipes remain
@@ -862,6 +908,18 @@ pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
     {
         anyhow::bail!("schema v63 pr_review_cache has an invalid shape");
     }
+    // This build's additive pair rides the same verifier: the exit columns and
+    // the ownership lease. Losing either silently returns the supervisor to the
+    // exited-vs-running conflation that caused the 2026-08-29 runaway.
+    for col in ["exit_code", "exited_at_ms"] {
+        if !has_column(conn, "agent_dispatches", col) {
+            anyhow::bail!(
+                "schema v63 incomplete: agent_dispatches.{col} is missing after the additive pass"
+            );
+        }
+    }
+    conn.prepare("SELECT name, owner, expires_at_ms FROM pipeline_leases LIMIT 0")
+        .map_err(|e| anyhow::anyhow!("schema v63 incomplete: pipeline_leases unusable ({e})"))?;
     Ok(())
 }
 

@@ -543,9 +543,10 @@ impl Db {
 /// The explicit column list every `AgentDispatch` read selects, paired with
 /// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
 /// apart when the roster gains a column (v56 added four at once; v59 added
-/// `note`; v60 added `chunk_path`; v61 added `report`).
+/// `note`; v60 added `chunk_path`; v61 added `report`; v63 added the exit pair).
 const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
-     stage, parent_id, session_id, artifact_path, note, chunk_path, report";
+     stage, parent_id, session_id, artifact_path, note, chunk_path, report, exit_code, \
+     exited_at_ms";
 
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
@@ -570,5 +571,7 @@ fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDi
         note: r.get(10)?,
         chunk_path: r.get(11)?,
         report: r.get(12)?,
+        exit_code: r.get(13)?,
+        exited_at_ms: r.get(14)?,
     })
 }
