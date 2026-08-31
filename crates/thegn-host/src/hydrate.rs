@@ -3176,6 +3176,7 @@ pub(crate) fn build_panel(
         panel.my_work_note = feed.note;
     }
     crate::hydrate_feed::populate_notifications(db, &repo_root, app_cfg, &mut panel);
+    populate_review_tasks(db, &mut panel);
     // Tasks section: populate task specs from config + auto-discovery (reusing the
     // single layered-config load above). Configured tasks win by name; discovered
     // tasks from manifests fill gaps.
@@ -3232,6 +3233,118 @@ pub(crate) fn build_panel(
         panel.log_tail = thegn_core::log_view::error_inclusive_tail(&tail_lines, 400, 200);
     }
     panel
+}
+
+/// Join durable review-task lifecycle rows with THE-27's cached provider
+/// identity. This runs on the hydration worker and is scoped by the explicit PR
+/// queue rows already loaded into `panel`.
+fn populate_review_tasks(db: &thegn_core::db::Db, panel: &mut crate::panel::PanelData) {
+    let Ok(tasks) = db.list_review_tasks() else {
+        return;
+    };
+    for task in tasks {
+        let Some((forge, repository, pr_number)) = parse_review_issue_id(&task.issue_id) else {
+            continue;
+        };
+        let Some(queue_row) = panel.pr_queue.iter().find(|row| {
+            row.number == pr_number
+                && row.forge == forge
+                && (task.worktree_path.is_empty()
+                    || row.worktree.as_deref() == Some(task.worktree_path.as_str())
+                    || row.repo_root == task.worktree_path)
+        }) else {
+            continue;
+        };
+
+        // Number-only tasks deliberately have no cache/worktree identity. Do
+        // not probe the empty key: a legacy or unrelated empty-key row must
+        // never hydrate identity for a human-only task.
+        let cached = (!task.worktree_path.is_empty())
+            .then(|| db.get_pr_review_cache(&task.worktree_path).ok().flatten())
+            .flatten()
+            .filter(|snapshot| snapshot.pr_number == pr_number);
+        let identity = cached.as_ref().and_then(|snapshot| {
+            let context = thegn_core::pr_review_tasks::PrReviewTaskContext {
+                forge,
+                repository,
+                pr_url: "",
+                pr_title: "",
+                base: queue_row.base_branch.as_str(),
+                worktree_path: task.worktree_path.as_str(),
+                role: task.role.as_str(),
+                prompt_template: "",
+            };
+            snapshot
+                .conversation
+                .threads
+                .iter()
+                .find(|thread| {
+                    thegn_core::pr_review_tasks::thread_source_key(&context, pr_number, &thread.id)
+                        == task.source_key
+                })
+                .map(|thread| (thread.id.clone(), thread.path.clone(), thread.line))
+                .or_else(|| {
+                    (thegn_core::pr_review_tasks::decision_source_key(&context, pr_number)
+                        == task.source_key)
+                        .then(|| ("review_decision".into(), "PR-level".into(), None))
+                })
+        });
+        let identity = identity.or_else(|| {
+            panel
+                .notifications
+                .iter()
+                .find(|note| {
+                    note.kind == thegn_core::notification::NotificationKind::PrReviewTaskQueued
+                        && note.source_ref == task.source_key
+                })
+                .and_then(|note| {
+                    parse_review_task_notification(&note.message, &task.source_revision)
+                })
+        });
+        let (thread_id, path, line) = identity.unwrap_or_else(|| {
+            (
+                task.source_key.clone(),
+                "anchor unavailable (refresh pending)".into(),
+                None,
+            )
+        });
+        panel.review_tasks.push(crate::panel::ReviewTaskRow {
+            id: task.id,
+            pr_number,
+            repository: repository.to_string(),
+            thread_id,
+            path,
+            line,
+            role: task.role,
+            status: task.status,
+            source_revision: task.source_revision,
+            worktree_path: task.worktree_path,
+        });
+    }
+}
+
+fn parse_review_issue_id(issue_id: &str) -> Option<(&str, &str, u64)> {
+    let rest = issue_id.strip_prefix("pr:")?;
+    let (forge, repo_pr) = rest.split_once(':')?;
+    let (repository, number) = repo_pr.rsplit_once('#')?;
+    Some((forge, repository, number.parse().ok()?))
+}
+
+fn parse_review_task_notification(
+    message: &str,
+    revision: &str,
+) -> Option<(String, String, Option<u64>)> {
+    let (_, body) = message.split_once(": ")?;
+    let suffix = format!("; rev {revision}]");
+    let body = body.strip_suffix(&suffix)?;
+    let (location, identity) = body.rsplit_once(" [")?;
+    let (thread_id, _) = identity.rsplit_once(" @ ")?;
+    let (path, line) = match location.rsplit_once(':') {
+        Some((path, line)) if line.parse::<u64>().is_ok() => (path.to_string(), line.parse().ok()),
+        _ if location == "unanchored" => (String::new(), None),
+        _ => (location.to_string(), None),
+    };
+    Some((thread_id.to_string(), path, line))
 }
 
 /// Size of the fixed END-of-file read used to build the Logs section tail +

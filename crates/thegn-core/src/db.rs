@@ -143,8 +143,21 @@ use std::path::PathBuf;
 /// different PR.
 ///
 /// v64: adds trusted automation throttle/override state and a bounded audit
-/// log. Both are cache/audit data; action truth remains in catalog providers.
-pub const SCHEMA_VERSION: i64 = 64;
+/// log (THE-21). Both are cache/audit data; action truth remains in catalog
+/// providers.
+///
+/// v65: adds nullable review-task identity/revision/prompt metadata and durable
+/// forge-action retry bookkeeping to `agent_dispatches`, and freezes active
+/// review-task inputs so one newer snapshot is retained on the same row until
+/// the active handoff can safely finish or promote it (THE-22). A partial
+/// unique index makes `(task_kind, source_key)` one durable task even under
+/// concurrent refreshes.
+///
+/// THE-21 and THE-22 both originally claimed v64 while in flight; THE-22 takes
+/// 65 because its columns are additive on top of THE-21's tables. A single
+/// racing integer is the wrong allocation mechanism — see the pipeline
+/// follow-ups.
+pub const SCHEMA_VERSION: i64 = 65;
 
 pub struct Db {
     conn: Connection,
@@ -806,7 +819,21 @@ impl Db {
               agent_name       TEXT    NOT NULL,
               dispatched_at_ms INTEGER NOT NULL,
               status           TEXT    NOT NULL DEFAULT 'queued',
-              report           TEXT
+              report           TEXT,
+              task_kind        TEXT,
+              source_key       TEXT,
+              source_revision  TEXT,
+              content_revision TEXT,
+              prompt           TEXT,
+              expected_head_oid TEXT,
+              pending_source_revision TEXT,
+              pending_content_revision TEXT,
+              pending_prompt TEXT,
+              pending_expected_head_oid TEXT,
+              pending_role TEXT,
+              pending_worktree_path TEXT,
+              forge_action_attempts INTEGER NOT NULL DEFAULT 0,
+              next_forge_action_at_ms INTEGER
             );
             -- v61: per-row progress queue — a worker or monitor appends short
             -- notes (≤4 KiB), read newest-last by dispatch status.
@@ -1059,6 +1086,7 @@ impl Db {
         crate::db_migrate::migrate_v64(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v64_schema(&conn)?;
+            crate::db_migrate::verify_v65_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

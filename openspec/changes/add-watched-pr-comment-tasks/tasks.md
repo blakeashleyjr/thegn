@@ -1,60 +1,63 @@
-# Tasks — watched-PR comment tasks
+# Tasks — durable review tasks on watched PRs
 
-Depends on `add-pr-queue` (implemented; sync/archive first).
+Depends on the implemented PR queue and THE-27.
 
-## 1. Pure classification (thegn-core)
+## 1. Satisfied review substrate (THE-27)
 
-- [ ] 1.1 `Blocker::UnresolvedComments(n)` (wire word `unresolved_comments`)
-      with `watch_kind() = Review`, `task_kind() = PrReview`; extend
-      `classify` inputs with the unresolved-thread summary; ordering
-      `ChangesRequested > UnresolvedComments > ChecksPending` — **table
-      tests**: ranking, count display, empty-threads ⇒ unchanged behavior
-      (95% core gate).
-- [ ] 1.2 `review_trigger` gating in `decide` (`changes_requested` default ⇒
-      display-only; `any_unresolved` ⇒ dispatchable under the existing
-      watch/own/budget/worktree rules) — **table tests** for both modes.
-- [ ] 1.3 Fingerprint over sorted unresolved thread ids + refill rule
-      (refill only on a thread id not previously seen; agent replies inert)
-      — **unit tests**: new-id refill, resolve-one-open-one changes, reply
-      no-op, fetch-failure keeps previous.
+- [x] 1.1 Reuse THE-27's complete `PrReviewSnapshot`, provider thread ids,
+      cached conversation/diff, anchor model, and bounded single-thread prompt
+      formatter. Do not repeat those types or migrations.
+- [x] 1.2 Preserve THE-27's complete-success cache rule so transient fetch
+      failure leaves the last snapshot and durable tasks intact.
 
-## 2. Config (thegn-core)
+## 2. Pure per-thread derivation (thegn-core)
 
-- [ ] 2.1 `[pr_queue] review_trigger` `config_enum!`
-      (`changes_requested` | `any_unresolved`), overlay destructuring,
-      round-trip test, documented in `config/config.toml.example`.
+- [x] 2.1 Derive a canonical source key per forge/repository/PR/thread and a
+      bounded deterministic source revision from the current thread snapshot.
+- [x] 2.2 Reconcile one task per unresolved thread: insert once, revise the
+      same row when comments change, preserve running admission, and transition
+      resolved sources without a per-PR blocker or fingerprint.
+- [x] 2.3 Render the current queue role/review prompt through `PrReview`, bound
+      and sanitize prompt/event fields, and produce `pr.thread_unresolved` only
+      for durable create/revision work.
+- [x] 2.4 Cover dedupe, revision, resolution, PR-level fallback, identity,
+      hostile/bounded input, and deterministic derivation with core unit tests.
 
-## 3. Persistence (thegn-core)
+## 3. Durable roster, audit, and forge seam (thegn-core / thegn-svc)
 
-- [ ] 3.1 Additive `pr_queue` columns `agent`, `agent_command`,
-      `threads_fingerprint` + **`user_version` bump** + migration; store
-      methods and `PrQueueRow` (`--json`) extended — migration-ladder +
-      CRUD tests.
+- [x] 3.1 Add nullable review metadata and forge retry bookkeeping to the
+      shared `agent_dispatches` roster in additive schema v64, following
+      THE-27's v63 cache schema; preserve ordinary dispatch rows.
+- [x] 3.2 Add atomic partial-index upsert/dedupe, typed task CRUD, resolved
+      transition, and durable forge-attempt cooldown operations with migration
+      and CRUD coverage.
+- [x] 3.3 Add once-keyed queued/revised/resolved notification audit and the
+      optional object-safe `resolve_review_thread` provider operation,
+      capability forwarding, unsupported default, and GitHub implementation.
 
-## 4. Driver + poller (thegn-host)
+## 4. Off-loop refresh and explicit handling (thegn-host)
 
-- [ ] 4.1 Poll-path thread fetch for open non-draft rows under the existing
-      per-row backoff; fingerprint update + budget refill + re-evaluate.
-- [ ] 4.2 Dispatch resolution order row-`agent_command` > row-`agent` >
-      config, through `agent_task::resolve_agent` + template validation;
-      unresolvable override ⇒ `needs_human` with reason.
-- [ ] 4.3 New notification kind for new feedback on a watched entry (fires on
-      fingerprint gain, foreign-author rows included).
+- [x] 4.1 On the existing PR-queue cadence, deep-fetch and reconcile only
+      explicit queue rows whose resolved `watch` contains `review`; update the
+      THE-27 cache and emit each event only after durable upsert.
+- [x] 4.2 Suppress the competing aggregate review agent when per-thread work
+      owns the feedback; keep stale/empty-provider cases visible for a human.
+- [x] 4.3 Hydrate and render per-thread rows beneath their PR with anchor, role,
+      status, and revision; add TUI-only panel/palette action
+      `pr-review-task-handle` (`h`).
+- [x] 4.4 Run handle work off-loop with exact role/command resolution, saved
+      prompt, sandbox floor, unchanged revision, verified local/remote push,
+      fresh unresolved-thread recheck, optional provider reply/resolve, durable
+      backoff, and fail-closed human fallback.
 
-## 5. Surfaces (thegn-host)
+## 5. Contract, help, and scoped validation
 
-- [ ] 5.1 `pr queue add --agent/--agent-command` flags (existing catalog row;
-      `--json` list reports the override).
-- [ ] 5.2 Panel `prq` row action to set/clear the override from the
-      configured `[[agents]]` list; blocker cell renders the unresolved
-      count.
-
-## 6. Help + docs + validation
-
-- [ ] 6.1 `docs/help/pr-queue.md` (context `panel:prq`): `review_trigger`,
-      the override action/flags, the new notification — help + prose
-      ratchets; claim any new action id.
-- [ ] 6.2 Document the public-repo prompt-injection consideration of
-      `any_unresolved` alongside the config key.
-- [ ] 6.3 Run `just ci` once, pre-PR (includes `openspec validate --all
---strict`).
+- [x] 5.1 Align proposal/design/delta specs to explicit watched rows,
+      per-thread lifecycle, verified-push resolution, notification audit, and
+      no new external control/catalog/config surface.
+- [x] 5.2 Document the existing cadence, current role/prompt, revision-in-place,
+      `h`/palette handle action, bounded prompt, notification/event audit, and
+      unsupported/rate-limited human fallback in the config example and PR
+      queue help; keep unrelated snapshots unchanged.
+- [x] 5.3 Run `just quick thegn-host`, the targeted host help tests, targeted
+      core config tests, and strict validation of this OpenSpec change.
