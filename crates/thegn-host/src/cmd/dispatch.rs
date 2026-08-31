@@ -26,6 +26,7 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
+use thegn_core::pipeline_reap;
 use thegn_core::pipeline_chunk;
 use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
@@ -81,6 +82,21 @@ pub enum Action {
         #[arg(long)]
         force: bool,
         /// Emit the created row as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconcile active rows against reality: which ones still have a live
+    /// worker, which finished, and which died without handing anything off.
+    ///
+    /// This is the join a supervisor otherwise does by hand across three
+    /// places — the roster, the daemon's live sessions, and each row's
+    /// artifact in git. Dry-run by default; `--apply` performs only the
+    /// unambiguous transitions. A row whose artifact IS committed but which
+    /// filed no report is never closed automatically: that one needs a person.
+    Reap {
+        /// Perform the unambiguous transitions instead of only reporting them.
+        #[arg(long)]
+        apply: bool,
         #[arg(long)]
         json: bool,
     },
@@ -241,6 +257,7 @@ pub enum Action {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { active, json } => list(active, json),
+        Action::Reap { apply, json } => reap(cfg, apply, json),
         Action::Claim {
             issue_id,
             worktree_path,
@@ -898,6 +915,136 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         tracked,
         dirty,
         report_present,
+    }
+}
+
+/// `dispatch reap` — reconcile active rows against the daemon and git.
+///
+/// The three-way join a supervisor otherwise performs by hand. Liveness comes
+/// from the daemon when it is reachable; when it is NOT, every session reads as
+/// absent, which is correct — a restarted daemon really has lost them — and is
+/// safe, because a row is only ever auto-closed on a committed artifact plus a
+/// filed report. The genuinely ambiguous case (artifact committed, no report)
+/// is reported and left alone.
+fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (live_ids, daemon_up) = rt.block_on(live_session_ids(cfg));
+    let db = Db::open()?;
+    let rows: Vec<_> = db
+        .list_dispatches()?
+        .into_iter()
+        .filter(|r| r.status.is_active())
+        .collect();
+
+    let plan = pipeline_reap::plan(&rows, |r| {
+        let f = verify_facts(r);
+        pipeline_reap::ReapFacts {
+            session_live: r
+                .session_id
+                .as_deref()
+                .is_some_and(|s| live_ids.iter().any(|l| l == s)),
+            artifact_exists: f.exists,
+            artifact_tracked: f.tracked,
+            report_present: f.report_present,
+        }
+    });
+    let summary = pipeline_reap::summarize(&plan);
+
+    if json {
+        let items: Vec<_> = plan
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "verdict": r.verdict.token(),
+                    "why": match &r.verdict {
+                        pipeline_reap::ReapVerdict::MarkFailed { why }
+                        | pipeline_reap::ReapVerdict::NeedsDecision { why } => Some(*why),
+                        _ => None,
+                    },
+                })
+            })
+            .collect();
+        super::emit_json(&serde_json::json!({
+            "daemon_reachable": daemon_up,
+            "applied": apply,
+            "rows": items,
+            "summary": {
+                "live": summary.live,
+                "close_done": summary.close_done,
+                "mark_failed": summary.mark_failed,
+                "needs_decision": summary.needs_decision,
+            },
+        }))?;
+    } else {
+        if !daemon_up {
+            outln!(
+                "note: no daemon reachable — every session reads as absent. That is correct \\
+                 after a restart, and safe: nothing closes without a committed artifact AND a \\
+                 report."
+            );
+        }
+        for r in &plan {
+            match &r.verdict {
+                pipeline_reap::ReapVerdict::Live => outln!("  {} live", r.id),
+                pipeline_reap::ReapVerdict::MarkFailed { why }
+                | pipeline_reap::ReapVerdict::NeedsDecision { why } => {
+                    outln!("  {} {}: {why}", r.id, r.verdict.token());
+                }
+                v => outln!("  {} {}", r.id, v.token()),
+            }
+        }
+        outln!(
+            "\\n{} live, {} to close done, {} to mark failed, {} need a decision",
+            summary.live,
+            summary.close_done,
+            summary.mark_failed,
+            summary.needs_decision
+        );
+        if !apply && summary.actionable() > 0 {
+            outln!("(dry run — pass --apply to perform the {} unambiguous transition(s))", summary.actionable());
+        }
+    }
+
+    if !apply {
+        return Ok(());
+    }
+    for r in &plan {
+        match &r.verdict {
+            pipeline_reap::ReapVerdict::CloseDone => {
+                // Plain, gated `done`: it passes unforced precisely because the
+                // artifact is committed and a report exists.
+                db.update_dispatch_status(r.id, AgentDispatchStatus::Done)?;
+                outln!("dispatch {} → done", r.id);
+            }
+            pipeline_reap::ReapVerdict::MarkFailed { why } => {
+                // best-effort: the note is context; losing it must not block
+                // recording the outcome, which is the thing that matters.
+                let _ = db.append_dispatch_note(r.id, &format!("reaped: {why}"));
+                db.update_dispatch_status(r.id, AgentDispatchStatus::Failed)?;
+                outln!("dispatch {} → failed", r.id);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Live (non-tombstone) session ids, plus whether the daemon answered at all.
+async fn live_session_ids(cfg: &Config) -> (Vec<String>, bool) {
+    match crate::cmd::session::connect(cfg).await {
+        Ok(client) => match client.sessions().await {
+            Ok(sessions) => (
+                sessions
+                    .into_iter()
+                    .filter(|s| s.exited_at_ms.is_none())
+                    .map(|s| s.id)
+                    .collect(),
+                true,
+            ),
+            Err(_) => (Vec::new(), false),
+        },
+        Err(_) => (Vec::new(), false),
     }
 }
 

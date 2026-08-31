@@ -773,9 +773,13 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
+        // 90 → 91: `[database] migration_authority` (MigrationAuthority) — which
+        // process kind may advance the shared state schema. Added after an
+        // unlanded branch's worker migrated the live database out from under
+        // main and locked the supervisor's own CLI out of the roster.
         assert_eq!(
             defs.len(),
-            90,
+            91,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
