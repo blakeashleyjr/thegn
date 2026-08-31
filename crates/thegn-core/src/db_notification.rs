@@ -51,6 +51,17 @@ impl NotificationStore for Db {
         Ok(n > 0)
     }
 
+    fn put_notification_once_id(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<Option<i64>> {
+        let inserted = self.put_notification_once(kind, issue_id, message, worktree_path)?;
+        Ok(inserted.then(|| self.conn().last_insert_rowid()))
+    }
+
     fn has_notification(&self, kind: &str, issue_id: &str) -> Result<bool> {
         let n: i64 = self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM notifications WHERE kind=?1 AND issue_id=?2)",
@@ -491,6 +502,41 @@ impl NotificationStore for Db {
             }
         }
         Ok(None)
+    }
+}
+
+impl Db {
+    /// Once-keyed notification for one create/revision event. The revision is
+    /// included in the bounded message, so the same revision is idempotent and
+    /// a later comment re-arms the audit row.
+    pub fn put_review_task_queued_notification(
+        &self,
+        event: &crate::pr_review_tasks::ReviewTaskEvent,
+        revised: bool,
+    ) -> Result<bool> {
+        let message = crate::notification::review_task_queued_message(event, revised);
+        self.put_notification_once(
+            crate::notification::NotificationKind::PrReviewTaskQueued.as_str(),
+            &event.source_key,
+            &message,
+            &event.worktree_path,
+        )
+    }
+
+    /// Once-keyed resolution audit. Provider success can be observed more than
+    /// once during refresh; only one durable inbox row is retained per source
+    /// and resolved head/message.
+    pub fn put_review_thread_resolved_notification(
+        &self,
+        transition: &crate::pr_review_tasks::ReviewTaskResolution,
+    ) -> Result<bool> {
+        let message = crate::notification::review_thread_resolved_message(transition);
+        self.put_notification_once(
+            crate::notification::NotificationKind::PrReviewThreadResolved.as_str(),
+            &transition.source_key,
+            &message,
+            &transition.worktree_path,
+        )
     }
 }
 

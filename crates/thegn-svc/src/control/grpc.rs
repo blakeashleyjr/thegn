@@ -16,13 +16,13 @@ use tonic::{Request, Response, Status};
 
 use thegn_core::control::{Scope, Verb, required_scope};
 use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
-use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
+use thegn_core::control_wire::{EventFrame, FeedFilter, LeaseEventKind, PairingState};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, ForkSpec, OpenSpec,
-    SplitDir, WaitCondition,
+    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, EditorOpenRequest,
+    ForkSpec, OpenSpec, PreviewFetchRequest, SplitDir, WaitCondition,
 };
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
@@ -54,8 +54,12 @@ impl From<ControlError> for Status {
     fn from(e: ControlError) -> Status {
         match &e {
             ControlError::NotFound(_) => Status::not_found(e.to_string()),
+            ControlError::InvalidArgument(_) => Status::invalid_argument(e.to_string()),
             ControlError::NoScope { .. } => Status::permission_denied(e.to_string()),
             ControlError::Conflict(_) => Status::aborted(e.to_string()),
+            ControlError::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
+            ControlError::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            ControlError::Unavailable(_) => Status::unavailable(e.to_string()),
             ControlError::Unimplemented(_) => Status::unimplemented(e.to_string()),
             ControlError::Internal(_) => Status::internal(e.to_string()),
         }
@@ -205,6 +209,7 @@ pub fn frame_to_proto(frame: &EventFrame) -> proto::Event {
             session: session.clone(),
             code: *code,
         }),
+        EventFrame::Lagged { missed } => Kind::Lagged(proto::Lagged { missed: *missed }),
     };
     proto::Event {
         seq: match frame {
@@ -407,6 +412,35 @@ impl Control for GrpcControl {
         Ok(Response::new(proto::Empty {}))
     }
 
+    async fn open_editor(
+        &self,
+        req: Request<proto::OpenEditorRequest>,
+    ) -> Result<Response<proto::OpenEditorReply>, Status> {
+        self.authed(&req, Verb::OpenEditor)?;
+        let r = req.into_inner();
+        let line = r
+            .line
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("line is too large"))?;
+        let col = r
+            .col
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("col is too large"))?;
+        let request = EditorOpenRequest {
+            worktree: r.worktree,
+            path: (!r.path.is_empty()).then_some(r.path),
+            line,
+            col,
+        };
+        let target = request
+            .target()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.api.open_editor(target).await.map_err(Status::from)?;
+        Ok(Response::new(proto::OpenEditorReply { queued: true }))
+    }
+
     async fn list_worktrees(
         &self,
         req: Request<proto::ListWorktreesRequest>,
@@ -506,6 +540,32 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn preview_fetch(
+        &self,
+        req: Request<proto::PreviewFetchRequest>,
+    ) -> Result<Response<proto::PreviewFetchReply>, Status> {
+        self.authed(&req, Verb::PreviewFetch)?;
+        let r = req.into_inner();
+        let reply = self
+            .api
+            .preview_fetch(PreviewFetchRequest {
+                url: r.url,
+                worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+                include_console: r.include_console,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::PreviewFetchReply {
+            url: reply.url,
+            status: u32::from(reply.status),
+            content_type: reply.content_type.unwrap_or_default(),
+            body: reply.body,
+            truncated: reply.truncated,
+            console_errors: reply.console_errors,
+            diagnostics_source: reply.diagnostics_source,
+        }))
     }
 
     async fn git_status(
@@ -655,6 +715,13 @@ impl Control for GrpcControl {
         req: Request<proto::EventsRequest>,
     ) -> Result<Response<Self::EventsStream>, Status> {
         let ctx = self.authed(&req, Verb::Events)?;
+        let request = req.into_inner();
+        let filter = FeedFilter::from_parts(
+            (!request.kinds.is_empty()).then_some(request.kinds),
+            (!request.session.is_empty()).then_some(request.session),
+            request.signal_lag,
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let hello = frame_to_proto(&EventFrame::Hello(thegn_core::control_wire::Hello {
             proto: thegn_core::control_wire::PROTO_VERSION,
             server: self.server_label.clone(),
@@ -669,12 +736,22 @@ impl Control for GrpcControl {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
-                        if tx.send(Ok(frame_to_proto(&frame))).await.is_err() {
+                        if filter.matches(&frame)
+                            && tx.send(Ok(frame_to_proto(&frame))).await.is_err()
+                        {
                             return;
                         }
                     }
-                    // A lagged monitor skips events; pane bytes ride Attach.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        if filter.signal_lag
+                            && tx
+                                .send(Ok(frame_to_proto(&EventFrame::Lagged { missed })))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -738,10 +815,74 @@ impl Control for GrpcControl {
                 body: r.body,
                 urgency: (!r.urgency.is_empty()).then_some(r.urgency),
                 source: (!r.source.is_empty()).then_some(r.source),
+                automation_origin: r.automation_origin.map(|origin| super::AutomationOrigin {
+                    root_event_id: origin.root_event_id,
+                    rule_id: origin.rule_id,
+                    run_id: origin.run_id,
+                }),
             })
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::NotifyPushReply { id }))
+    }
+
+    async fn automations_list(
+        &self,
+        req: Request<proto::AutomationsListRequest>,
+    ) -> Result<Response<proto::AutomationsListReply>, Status> {
+        self.authed(&req, Verb::AutomationsList)?;
+        let rules = self.api.automations_list().await.map_err(Status::from)?;
+        let rules_json =
+            serde_json::to_string(&rules).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::AutomationsListReply { rules_json }))
+    }
+
+    async fn automations_test(
+        &self,
+        req: Request<proto::AutomationsTestRequest>,
+    ) -> Result<Response<proto::AutomationsTestReply>, Status> {
+        self.authed(&req, Verb::AutomationsTest)?;
+        let request = req.into_inner();
+        let event = serde_json::from_str(&request.event_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let reply = self
+            .api
+            .automations_test(super::AutomationTestRequest {
+                rule: request.rule,
+                event,
+                at: request.at,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::AutomationsTestReply {
+            rule: reply.rule,
+            decisions_json: reply.decisions.to_string(),
+            executed: reply.executed,
+        }))
+    }
+
+    async fn tools_run(
+        &self,
+        req: Request<proto::ToolsRunRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::ToolsRun)?;
+        let request = req.into_inner();
+        let session = self
+            .api
+            .tools_run(super::ToolRunRequest {
+                name: request.name,
+                worktree: (!request.worktree.is_empty()).then_some(request.worktree),
+                automation_origin: request.automation_origin.map(|origin| {
+                    super::AutomationOrigin {
+                        root_event_id: origin.root_event_id,
+                        rule_id: origin.rule_id,
+                        run_id: origin.run_id,
+                    }
+                }),
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&session)))
     }
 
     async fn me(&self, req: Request<proto::MeRequest>) -> Result<Response<proto::MeReply>, Status> {
@@ -785,7 +926,9 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.split",
     "worktrees.list",
     "worktrees.open",
+    "editor.open",
     "browser.drive",
+    "preview.fetch",
     "git.status",
     "git.stage",
     "git.commit",
@@ -800,6 +943,9 @@ pub const GRPC_CAPS: &[&str] = &[
     "me",
     "pr.status",
     "notify.push",
+    "automations.list",
+    "automations.test",
+    "tools.run",
 ];
 
 #[cfg(test)]
@@ -877,6 +1023,7 @@ mod tests {
                 session: x.session.clone(),
                 code: x.code,
             },
+            Kind::Lagged(l) => EventFrame::Lagged { missed: l.missed },
         }
     }
 
@@ -923,6 +1070,7 @@ mod tests {
                 session: "s".into(),
                 code: None,
             },
+            EventFrame::Lagged { missed: 4 },
         ];
         for f in frames {
             assert_eq!(proto_to_frame(&frame_to_proto(&f)), f, "{f:?}");

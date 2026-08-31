@@ -138,20 +138,32 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// v62: adds `session_forks`, a credential-free lineage cache. Live fork
 /// recipes remain daemon memory only; the cache cannot resurrect a process.
 ///
-/// v63: adds `agent_dispatches.exit_code` / `.exited_at_ms` — the worker
-/// process's recorded exit, so a row that is still `running` because nobody
-/// closed it is distinguishable from one whose worker is genuinely alive. A
-/// supervisor that could not tell the two apart counted exited rows as free
-/// slots and re-dispatched them (2026-08-29). Purely additive; a pre-v63 row
-/// reads back `None`, which is the pre-change behaviour.
+/// v63: adds `pr_review_cache`, one complete PR review snapshot per canonical
+/// worktree key. It is a best-effort cache; the branch, PR number, and head OID
+/// are retained beside the JSON so stale feedback cannot silently attach to a
+/// different PR.
 ///
-/// v64: claimed concurrently by THE-21 and THE-22 (each adding its own tables)
-/// and already stamped on the shared live database by one of their workers.
-/// This build carries no v64 migration of its own — it matches the number so it
-/// can operate a database those branches moved forward, and its own additions
-/// stay the guarded, idempotent ALTERs below. See the 2026-08-30 note in
-/// `openspec/changes/harden-pipeline-slot-accounting/`: a single racing integer
-/// is the wrong allocation mechanism and is tracked as follow-up work.
+/// v64: adds trusted automation throttle/override state and a bounded audit
+/// log (THE-21). Both are cache/audit data; action truth remains in catalog
+/// providers.
+///
+/// v65: adds nullable review-task identity/revision/prompt metadata and durable
+/// forge-action retry bookkeeping to `agent_dispatches`, and freezes active
+/// review-task inputs so one newer snapshot is retained on the same row until
+/// the active handoff can safely finish or promote it (THE-22). A partial
+/// unique index makes `(task_kind, source_key)` one durable task even under
+/// concurrent refreshes.
+///
+/// THE-21 and THE-22 both originally claimed v64 while in flight; THE-22 takes
+/// 65 because its columns are additive on top of THE-21's tables. A single
+/// racing integer is the wrong allocation mechanism — see the pipeline
+/// follow-ups.
+///
+/// This build also adds, as guarded idempotent ALTERs rather than a version of
+/// their own, `agent_dispatches.exit_code` / `.exited_at_ms` and the
+/// `pipeline_leases` table: the worker's recorded exit (so a row still
+/// `running` because nobody closed it is distinguishable from one whose worker
+/// is alive — the 2026-08-29 conflation) and monitor ownership.
 pub const SCHEMA_VERSION: i64 = 65;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
@@ -526,7 +538,6 @@ fn prepare_schema_access(conn: &Connection, database: &Path, initial: i64) -> Re
         }),
     })
 }
-
 pub struct Db {
     conn: Connection,
     /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
@@ -706,13 +717,74 @@ impl Db {
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
         if path == db_path() {
-            Self::init_shared(Self::open_connection(path)?, path)
+            let db = Self::init_shared(Self::open_connection(path)?, path)?;
+            let _ = crate::fsperm::restrict_to_owner(path); // best-effort: hardening: a failed chmod must never block DB open
+            Ok(db)
         } else {
-            Self::init(Self::open_connection(path)?)
+            let db = Self::init(Self::open_connection(path)?)?;
+            let _ = crate::fsperm::restrict_to_owner(path); // best-effort: hardening: a failed chmod must never block DB open
+            Ok(db)
         }
     }
+
+    /// Open an existing DB read-only while participating in its WAL locking.
+    ///
+    /// Unlike [`Self::open_read_only_at`], this may use existing WAL/SHM
+    /// sidecars so a real migration preflight sees the latest target rows. It
+    /// still performs no schema initialization, migration, or startup prune.
+    pub fn open_read_only_wal_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Open an existing state DB without creating, migrating, pruning, or
+    /// changing its journal mode. This is the only safe opener for commands
+    /// whose dry-run contract is strictly read-only. An absent file is
+    /// represented as `None` so callers can inspect an empty, not-yet-created
+    /// target without manufacturing a database.
+    pub fn open_read_only_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        // A plain read-only open of a WAL-mode database is still allowed to
+        // create `-wal`/`-shm` sidecars. `immutable=1` is SQLite's explicit
+        // no-write/no-lock URI mode, which is required by dry-run callers.
+        let uri = util::immutable_sqlite_uri(&path.canonicalize()?);
+        let conn = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Read-only counterpart to [`Db::open`] for dry-run command paths.
+    pub fn open_read_only() -> Result<Option<Db>> {
+        Self::open_read_only_at(&db_path())    }
 
     /// Open a state DB read-only when it was written by a newer build. The
     /// initial connection is only used to read `user_version`; reopening with
@@ -914,6 +986,17 @@ impl Db {
               branch     TEXT,
               json       TEXT,
               fetched_at INTEGER
+            );
+            -- v63: complete PR review conversation + PR-head diff snapshot.
+            -- Identity columns make stale cache validation possible without
+            -- parsing the payload and the JSON is replaced atomically.
+            CREATE TABLE IF NOT EXISTS pr_review_cache (
+              worktree   TEXT PRIMARY KEY,
+              branch     TEXT NOT NULL,
+              pr_number  INTEGER NOT NULL,
+              head_oid   TEXT NOT NULL,
+              json       TEXT NOT NULL,
+              fetched_at INTEGER NOT NULL
             );
             -- CI run-history cache per worktree (TTL'd JSON `Vec<ci::CiRun>`),
             -- so the CI panel/view paint instantly from cache then hydrate live
@@ -1163,7 +1246,21 @@ impl Db {
               agent_name       TEXT    NOT NULL,
               dispatched_at_ms INTEGER NOT NULL,
               status           TEXT    NOT NULL DEFAULT 'queued',
-              report           TEXT
+              report           TEXT,
+              task_kind        TEXT,
+              source_key       TEXT,
+              source_revision  TEXT,
+              content_revision TEXT,
+              prompt           TEXT,
+              expected_head_oid TEXT,
+              pending_source_revision TEXT,
+              pending_content_revision TEXT,
+              pending_prompt TEXT,
+              pending_expected_head_oid TEXT,
+              pending_role TEXT,
+              pending_worktree_path TEXT,
+              forge_action_attempts INTEGER NOT NULL DEFAULT 0,
+              next_forge_action_at_ms INTEGER
             );
             -- v61: per-row progress queue — a worker or monitor appends short
             -- notes (≤4 KiB), read newest-last by dispatch status.
@@ -1365,13 +1462,43 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_session_attention_wt
               ON session_attention (worktree_path);
+            -- v64: trusted automation throttle/override state. JSON columns
+            -- hold bounded pure-engine ledgers; losing them only resets
+            -- throttles and never disables configured rules.
+            CREATE TABLE IF NOT EXISTS automation_state (
+              rule_id           TEXT PRIMARY KEY,
+              enabled_override  INTEGER,
+              last_fired_at     INTEGER,
+              recent_fires_json TEXT NOT NULL DEFAULT '[]',
+              action_fires_json TEXT NOT NULL DEFAULT '{}',
+              once_keys_json    TEXT NOT NULL DEFAULT '[]',
+              updated_at        INTEGER NOT NULL
+            );
+            -- v64: metadata-only action audit. Summaries are bounded by the
+            -- runtime; full prompts, event bodies, and secrets never land here.
+            CREATE TABLE IF NOT EXISTS automation_runs (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              rule_id        TEXT NOT NULL,
+              event_id       TEXT NOT NULL,
+              event_key      TEXT NOT NULL,
+              trigger_kind   TEXT NOT NULL,
+              event_summary  TEXT NOT NULL DEFAULT '',
+              action_cap     TEXT NOT NULL,
+              action_summary TEXT NOT NULL DEFAULT '',
+              outcome        TEXT NOT NULL,
+              skip_reason    TEXT,
+              error          TEXT,
+              started_at     INTEGER NOT NULL,
+              finished_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_time
+              ON automation_runs (rule_id, started_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
+              ON automation_runs (outcome, started_at DESC);
             COMMIT;
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
-        if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v61_schema(&conn)?;
-        }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
@@ -1384,9 +1511,12 @@ impl Db {
         crate::db_model_proxy::migrate_v54(&conn)?;
         crate::db_migrate::migrate_v62(&conn)?;
         crate::db_migrate::migrate_v63_leases(&conn)?;
+        crate::db_migrate::migrate_v64(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
+            crate::db_migrate::verify_v64_schema(&conn)?;
+            crate::db_migrate::verify_v65_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

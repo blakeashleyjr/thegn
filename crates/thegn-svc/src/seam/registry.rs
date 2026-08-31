@@ -332,14 +332,22 @@ fn git_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn editor_probes(cfg: &Config) -> Vec<ProbeReport> {
-    let editor = thegn_core::editor::editor_for(cfg);
-    let caps = editor.caps();
-    let note = format!(
-        "[editor] open_in = {}; line jump {}",
-        cfg.editor.open_in.as_str(),
-        if caps.line { "yes" } else { "no" }
-    );
-    vec![editor.probe().note(note)]
+    let selected = thegn_core::editor::editor_for(cfg);
+    let selected_id = selected.id();
+    let mut reports = thegn_core::editor::providers::probes(cfg.editor.open_in);
+    if matches!(selected_id, "template" | "tool" | "visual" | "env" | "vi") {
+        reports.push(selected.probe());
+    }
+    for report in &mut reports {
+        if report.id == selected_id {
+            report.notes.push(format!(
+                "selected; [editor] provider = {}, open_in = {}",
+                cfg.editor.provider.as_str(),
+                cfg.editor.open_in.as_str()
+            ));
+        }
+    }
+    reports
 }
 
 /// A sandbox backend's probe, enriched with the runtime-state truth

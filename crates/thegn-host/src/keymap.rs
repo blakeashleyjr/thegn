@@ -68,6 +68,8 @@ pub enum Action {
     NewWorktreeFromTemplate,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
+    /// Open the boxed theme builder with live previews.
+    ThemeBuilderOpen,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
     SwitchFont,
     /// Close the active tab within the worktree. The final tab is kept; use
@@ -169,6 +171,10 @@ pub enum Action {
     /// only — the clipboard is never watched. See `[clipboard]`.
     PasteImage,
     ToggleDrawer,
+    /// Cycle the active drawer through files and eligible configured tools.
+    DrawerCycle,
+    /// Open the dedicated drawer occupant picker.
+    DrawerPick,
     /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
     /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
     ToggleCorner,
@@ -186,6 +192,7 @@ pub enum Action {
     OpenPrQueue,
     PrQueueAdd,
     PrQueueRefresh,
+    PrReviewTaskHandle,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
     /// Open the tabbed system monitor.
@@ -221,6 +228,9 @@ pub enum Action {
     Help,
     Lazygit,
     Yazi,
+    /// Hand the focused worktree to the configured external IDE/editor seam.
+    /// Distinct from [`Action::Editor`], which remains the terminal editor tool.
+    OpenInIde,
     Editor,
     Diff,
     /// Push the current branch to its upstream — fast-path, no branches-panel
@@ -501,6 +511,7 @@ impl Action {
             Action::ImportLayout => "import-layout",
             Action::NewWorktreeFromTemplate => "new-worktree-from-template",
             Action::CycleTheme => "cycle-theme",
+            Action::ThemeBuilderOpen => "theme-builder-open",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
@@ -552,6 +563,8 @@ impl Action {
             Action::PasteRegister => "paste-register",
             Action::PasteImage => "paste-image",
             Action::ToggleDrawer => "files-drawer",
+            Action::DrawerCycle => "drawer-cycle",
+            Action::DrawerPick => "drawer-pick",
             Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
@@ -560,6 +573,7 @@ impl Action {
             Action::OpenPrQueue => "open-pr-queue",
             Action::PrQueueAdd => "pr-queue-add",
             Action::PrQueueRefresh => "pr-queue-refresh",
+            Action::PrReviewTaskHandle => "pr-review-task-handle",
             Action::OpenUsage => "open-usage",
             Action::OpenMonitor => "open-monitor",
             Action::OpenPipelineBoard => "open-pipeline-board",
@@ -576,6 +590,7 @@ impl Action {
             Action::Help => "help",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
+            Action::OpenInIde => "open-in-ide",
             Action::Editor => "editor",
             Action::Diff => "show-diff",
             Action::Push => "git-push",
@@ -648,6 +663,7 @@ impl Action {
             "import-layout" => Action::ImportLayout,
             "new-worktree-from-template" | "worktree-template" => Action::NewWorktreeFromTemplate,
             "cycle-theme" | "theme" => Action::CycleTheme,
+            "theme-builder-open" | "theme-builder" => Action::ThemeBuilderOpen,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
@@ -699,6 +715,8 @@ impl Action {
             "paste-register" => Action::PasteRegister,
             "paste-image" => Action::PasteImage,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
+            "drawer-cycle" | "cycle-drawer" => Action::DrawerCycle,
+            "drawer-pick" | "pick-drawer" => Action::DrawerPick,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
@@ -707,6 +725,7 @@ impl Action {
             "open-pr-queue" => Action::OpenPrQueue,
             "pr-queue-add" => Action::PrQueueAdd,
             "pr-queue-refresh" => Action::PrQueueRefresh,
+            "pr-review-task-handle" | "review-task-handle" => Action::PrReviewTaskHandle,
             "open-usage" => Action::OpenUsage,
             "open-monitor" => Action::OpenMonitor,
             "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,
@@ -723,6 +742,7 @@ impl Action {
             "help" => Action::Help,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
+            "open-in-ide" | "ide" => Action::OpenInIde,
             "editor" | "tool-editor" => Action::Editor,
             "show-diff" | "diff" | "tool-diff" => Action::Diff,
             "git-push" | "push" => Action::Push,
@@ -1310,6 +1330,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
+    map.insert_all("Ctrl Alt Shift t", Action::ThemeBuilderOpen)
+        .unwrap();
     // Bind every `ACTION_SPECS` default chord for real: these six were
     // DECLARED (so the palette + `thegn keys list` advertised them) but never
     // registered here — pressing the shown chord did nothing.
@@ -2085,6 +2107,10 @@ mod tests {
         assert_eq!(Action::NewWorktree.key(), "new-worktree");
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
+        assert_eq!(Action::DrawerCycle.key(), "drawer-cycle");
+        assert_eq!(Action::DrawerPick.key(), "drawer-pick");
+        assert_eq!(Action::from_key("cycle-drawer"), Some(Action::DrawerCycle));
+        assert_eq!(Action::from_key("pick-drawer"), Some(Action::DrawerPick));
         assert_eq!(Action::SwitchFont.key(), "switch-font");
     }
 
@@ -2527,6 +2553,7 @@ mod tests {
                 notifications: Default::default(),
                 identity: Default::default(),
                 mcp_serve: Default::default(),
+                automations: Default::default(),
             },
         );
         let cfg = thegn_core::config::Config {

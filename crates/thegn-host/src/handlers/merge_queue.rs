@@ -66,11 +66,9 @@ pub(crate) struct DrainCtx<'a> {
     pub dirty: &'a mut bool,
     pub loop_perf: &'a mut crate::perf::LoopPerf,
     // For the sidebar-folder lifecycle's `on_landed = remove/detach`: after a
-    // land removes a worktree dir off-loop, reap the now-orphaned tab (panes +
-    // session + focus) via `delete_groups`, exactly as a manual close does.
-    pub session: &'a mut crate::session::Session,
-    pub panes: &'a mut crate::panes::Panes,
-    pub need_relayout: &'a mut bool,
+    // land removes a worktree dir off-loop, probe for the orphaned tab on a
+    // worker and deliver a typed completion to the compositor.
+    pub session: &'a crate::session::Session,
     pub waker: &'a TerminalWaker,
 }
 
@@ -78,10 +76,10 @@ impl DrainCtx<'_> {
     /// Reap any tab whose worktree dir vanished (an `on_landed = remove/detach`
     /// land). No-op when nothing was removed. Kept here so both drains share it.
     fn reap_removed_tabs(&mut self) {
-        if crate::merge_lifecycle::reconcile_removed_tabs(self.session, self.panes, self.waker) {
-            *self.need_relayout = true;
-            *self.want_model_refresh = true;
-        }
+        crate::merge_lifecycle::spawn_reconcile_removed_tabs(
+            self.session,
+            Some(self.waker.clone()),
+        );
     }
 }
 
@@ -489,15 +487,39 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
             &thegn_core::event_bus::Event::NotificationReceived { notification: n },
         );
     }
-    if dec.record {
-        let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
-        tokio::task::spawn_blocking(move || {
-            use thegn_core::store::NotificationStore;
-            let Ok(db) = Db::open() else { return };
+    let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
+    let routed = dec.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(db) = Db::open() else { return };
+        if routed.record {
             // best-effort: the inbox is a cache; the queue row is the record.
-            let _ = db.put_notification(kind, &wt, &msg, &wt);
-        });
-    }
+            let _ = crate::automation_events::insert_routed(
+                &db,
+                kind,
+                &wt,
+                &msg,
+                &wt,
+                Default::default(),
+                &routed,
+                false,
+            );
+        }
+        // Preserve the typed merge edge even when notification routing drops
+        // the accompanying human-facing queue notification.
+        if kind == "queue_landed" {
+            let origin = crate::automation_events::take_merge_origin(&db, &wt);
+            crate::automation_events::submit_fact(
+                thegn_core::automation::AutomationEventKind::MergeLanded,
+                format!("merge:{wt}"),
+                Some(wt.clone()),
+                Some(msg),
+                crate::automation_events::EventFacts {
+                    origin,
+                    ..Default::default()
+                },
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

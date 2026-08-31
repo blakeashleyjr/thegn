@@ -985,6 +985,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         cfg.accounts.push(Account {
             name: "work".into(),
@@ -1015,6 +1017,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         // No `[[accounts]]` for claude and no active pointer: thegn doesn't
         // manage it. The agent's inherited config dir (existing on disk) must

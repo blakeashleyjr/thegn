@@ -624,6 +624,82 @@ pub(crate) fn additive_schema(conn: &Connection) {
          CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
            ON agent_dispatch_notes (dispatch_id, created_at_ms);",
     );
+    // v63: one complete PR review snapshot per canonical worktree key. The
+    // identity columns are deliberately duplicated outside the JSON so a
+    // caller can reject stale feedback before presenting it.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS pr_review_cache (
+           worktree   TEXT PRIMARY KEY,
+           branch     TEXT NOT NULL,
+           pr_number  INTEGER NOT NULL,
+           head_oid   TEXT NOT NULL,
+           json       TEXT NOT NULL,
+           fetched_at INTEGER NOT NULL
+         )",
+        [],
+    );
+    // v64: nullable per-thread review-task metadata on the shared roster.
+    // Existing pipeline rows remain NULL and retain their old projection.
+    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN task_kind TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN source_key TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN source_revision TEXT",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN prompt TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN expected_head_oid TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN forge_action_attempts INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN next_forge_action_at_ms INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatch_review_source
+         ON agent_dispatches (task_kind, source_key)
+         WHERE task_kind IS NOT NULL AND source_key IS NOT NULL",
+        [],
+    );
+    // v65: while a review handoff is active, its durable inputs are immutable.
+    // One newer snapshot is retained on the same unique row for promotion after
+    // the handoff, so refresh/handle interleavings cannot lose feedback or make
+    // the worker resolve against a changed baseline.
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN content_revision TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_source_revision TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_content_revision TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_prompt TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_expected_head_oid TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_role TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN pending_worktree_path TEXT",
+        [],
+    );
     // v63: `agent_dispatches.exit_code` / `.exited_at_ms` — what the worker
     // process actually did, recorded when its session ends.
     //
@@ -672,22 +748,6 @@ pub(crate) fn migrate_v63_leases(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// v63 verifier: the exit columns and the lease table must exist after the
-/// additive pass, or a supervisor silently loses the exited-vs-running
-/// distinction (and the ownership guard) again.
-pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
-    for col in ["exit_code", "exited_at_ms"] {
-        if !has_column(conn, "agent_dispatches", col) {
-            anyhow::bail!(
-                "schema v63 incomplete: agent_dispatches.{col} is missing after the additive pass"
-            );
-        }
-    }
-    conn.prepare("SELECT name, owner, expires_at_ms FROM pipeline_leases LIMIT 0")
-        .map_err(|e| anyhow::anyhow!("schema v63 incomplete: pipeline_leases unusable ({e})"))?;
-    Ok(())
-}
-
 /// v62: credential-free lineage for successful session forks. Recipes remain
 /// in the live daemon entry only; this cache cannot resurrect a process.
 pub(crate) fn migrate_v62(conn: &Connection) -> Result<()> {
@@ -702,6 +762,42 @@ pub(crate) fn migrate_v62(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_session_forks_source
            ON session_forks (source_kind, source_id);",
+    )?;
+    Ok(())
+}
+
+/// v64: trusted automation state plus metadata-only audit. This migration is
+/// additive and idempotent for shared multi-branch state databases.
+pub(crate) fn migrate_v64(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_state (
+           rule_id           TEXT PRIMARY KEY,
+           enabled_override  INTEGER,
+           last_fired_at     INTEGER,
+           recent_fires_json TEXT NOT NULL DEFAULT '[]',
+           action_fires_json TEXT NOT NULL DEFAULT '{}',
+           once_keys_json    TEXT NOT NULL DEFAULT '[]',
+           updated_at        INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS automation_runs (
+           id             INTEGER PRIMARY KEY AUTOINCREMENT,
+           rule_id        TEXT NOT NULL,
+           event_id       TEXT NOT NULL,
+           event_key      TEXT NOT NULL,
+           trigger_kind   TEXT NOT NULL,
+           event_summary  TEXT NOT NULL DEFAULT '',
+           action_cap     TEXT NOT NULL,
+           action_summary TEXT NOT NULL DEFAULT '',
+           outcome        TEXT NOT NULL,
+           skip_reason    TEXT,
+           error          TEXT,
+           started_at     INTEGER NOT NULL,
+           finished_at    INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_time
+           ON automation_runs (rule_id, started_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
+           ON automation_runs (outcome, started_at DESC);",
     )?;
     Ok(())
 }
@@ -758,6 +854,7 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
 /// intentionally metadata-only: preparing this projection also protects the
 /// no-recipe contract from an incomplete upgrade.
 pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
+    verify_v61_schema(conn)?;
     conn.prepare(
         "SELECT child_id, source_kind, source_id, harness, worktree, created_at
          FROM session_forks LIMIT 0",
@@ -772,6 +869,115 @@ pub(crate) fn verify_v62_schema(conn: &Connection) -> Result<()> {
         .optional()?;
     if index.is_none() {
         anyhow::bail!("schema v62 migration did not create the session forks index");
+    }
+    Ok(())
+}
+
+/// Verify the v63 review-cache table after the best-effort additive ladder and
+/// before `Db::init` stamps the new schema version.
+pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
+    verify_v62_schema(conn)?;
+    let table_type: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='pr_review_cache'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if table_type.as_deref() != Some("table") {
+        anyhow::bail!("schema v63 migration did not create pr_review_cache");
+    }
+    let mut stmt = conn.prepare("PRAGMA table_info(pr_review_cache)")?;
+    let columns: Vec<(String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(1)?, r.get(3)?, r.get(5)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let expected = [
+        ("worktree", 0, 1),
+        ("branch", 1, 0),
+        ("pr_number", 1, 0),
+        ("head_oid", 1, 0),
+        ("json", 1, 0),
+        ("fetched_at", 1, 0),
+    ];
+    if columns.len() != expected.len()
+        || expected.iter().any(|wanted| {
+            !columns
+                .iter()
+                .any(|column| column.0 == wanted.0 && column.1 == wanted.1 && column.2 == wanted.2)
+        })
+    {
+        anyhow::bail!("schema v63 pr_review_cache has an invalid shape");
+    }
+    // This build's additive pair rides the same verifier: the exit columns and
+    // the ownership lease. Losing either silently returns the supervisor to the
+    // exited-vs-running conflation that caused the 2026-08-29 runaway.
+    for col in ["exit_code", "exited_at_ms"] {
+        if !has_column(conn, "agent_dispatches", col) {
+            anyhow::bail!(
+                "schema v63 incomplete: agent_dispatches.{col} is missing after the additive pass"
+            );
+        }
+    }
+    conn.prepare("SELECT name, owner, expires_at_ms FROM pipeline_leases LIMIT 0")
+        .map_err(|e| anyhow::anyhow!("schema v63 incomplete: pipeline_leases unusable ({e})"))?;
+    Ok(())
+}
+
+/// Verify the v64 automation tables/indexes before the version stamp. A DDL
+/// failure must not make a broken admission/audit store look current.
+pub(crate) fn verify_v64_schema(conn: &Connection) -> Result<()> {
+    verify_v63_schema(conn)?;
+    conn.prepare(
+        "SELECT rule_id, enabled_override, last_fired_at, recent_fires_json, \
+                action_fires_json, once_keys_json, updated_at \
+         FROM automation_state LIMIT 0",
+    )?;
+    conn.prepare(
+        "SELECT rule_id, event_id, event_key, trigger_kind, event_summary, \
+                action_cap, action_summary, outcome, skip_reason, error, \
+                started_at, finished_at FROM automation_runs LIMIT 0",
+    )?;
+    for index in [
+        "idx_automation_runs_rule_time",
+        "idx_automation_runs_outcome_time",
+    ] {
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if present.is_none() {
+            anyhow::bail!("schema v64 migration did not create {index}");
+        }
+    }
+    Ok(())
+}
+
+/// Verify THE-22's additive roster columns and dedupe index before stamping
+/// schema v65. Preparing the typed projection catches a partial ALTER ladder.
+pub(crate) fn verify_v65_schema(conn: &Connection) -> Result<()> {
+    verify_v64_schema(conn)?;
+    conn.prepare(
+        "SELECT task_kind, source_key, source_revision, content_revision, prompt,
+                expected_head_oid, pending_source_revision,
+                pending_content_revision, pending_prompt,
+                pending_expected_head_oid, pending_role, pending_worktree_path,
+                forge_action_attempts,
+                next_forge_action_at_ms
+         FROM agent_dispatches LIMIT 0",
+    )?;
+    let index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type='index' AND name='idx_agent_dispatch_review_source'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index.is_none() {
+        anyhow::bail!("schema v65 migration did not create review-task dedupe index");
     }
     Ok(())
 }
@@ -797,6 +1003,139 @@ mod tests {
             .unwrap();
         let err = super::verify_v61_schema(&conn).unwrap_err();
         assert!(err.to_string().contains("agent_dispatch_notes"), "{err}");
+    }
+
+    #[test]
+    fn pre_v63_db_gains_review_cache_without_resetting_user_data() {
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v63-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE repos (path TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO repos (path,name) VALUES ('/repo/a', 'a');
+                 PRAGMA user_version = 61;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM repos WHERE path='/repo/a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "a");
+        let snapshot = crate::review::PrReviewSnapshot {
+            worktree_key: "/wt/a".into(),
+            branch: "feature".into(),
+            pr_number: 27,
+            head_oid: "head".into(),
+            ..Default::default()
+        };
+        crate::store::CacheStore::put_pr_review_cache(&db, &snapshot).unwrap();
+        assert!(
+            crate::store::CacheStore::get_pr_review_cache(&db, "/wt/a")
+                .unwrap()
+                .is_some()
+        );
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v61_db_gains_review_task_roster_without_changing_pipeline_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id TEXT NOT NULL,
+                   worktree_path TEXT NOT NULL,
+                   agent_name TEXT NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'queued',
+                   report TEXT
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,report)
+                 VALUES ('THE-1','/wt/old','coder',1700000000000,'running','ok');
+                 PRAGMA user_version = 61;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let old: (Option<String>, Option<String>, i64) = db
+            .conn()
+            .query_row(
+                "SELECT task_kind, source_key, forge_action_attempts
+                 FROM agent_dispatches WHERE issue_id='THE-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old, (None, None, 0));
+        db.conn()
+            .execute(
+                "INSERT INTO agent_dispatches
+                 (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
+                  task_kind,source_key,source_revision,prompt,expected_head_oid)
+                 VALUES ('pr:x','/wt/r','coder',1,'queued','pr_review','source','r1','p','h')",
+                [],
+            )
+            .unwrap();
+        let duplicate = db.conn().execute(
+            "INSERT INTO agent_dispatches
+             (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
+              task_kind,source_key,source_revision,prompt,expected_head_oid)
+             VALUES ('pr:x','/wt/r','coder',2,'queued','pr_review','source','r2','p2','h2')",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "partial unique index must reject duplicates"
+        );
+        let version: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn review_cache_migration_is_idempotent_and_preserves_rows() {
+        let db = Db::open_memory().unwrap();
+        let snapshot = crate::review::PrReviewSnapshot {
+            worktree_key: "/wt/a".into(),
+            branch: "feature".into(),
+            pr_number: 27,
+            head_oid: "head".into(),
+            ..Default::default()
+        };
+        crate::store::CacheStore::put_pr_review_cache(&db, &snapshot).unwrap();
+        super::additive_schema(db.conn());
+        super::additive_schema(db.conn());
+        let got = crate::store::CacheStore::get_pr_review_cache(&db, "/wt/a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.pr_number, 27);
+        let tables: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pr_review_cache'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
     }
 
     #[test]

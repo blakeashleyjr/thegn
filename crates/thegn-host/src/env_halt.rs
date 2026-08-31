@@ -50,6 +50,9 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     for w in cfg.repo_command_collector_warnings(&repo_root) {
         tracing::warn!(target: "thegn::config", path = %repo_root.display(), "{w}");
     }
+    for w in cfg.repo_automation_warnings(&repo_root) {
+        tracing::warn!(target: "thegn::config", path = %repo_root.display(), "{w}");
+    }
     if let Some(pe) = thegn_core::config::repo_overlay_parse_error(&repo_root)
         && !pe.selected_env.is_empty()
         && let Some(envc) = cfg.env.get(&pe.selected_env)

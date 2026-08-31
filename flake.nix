@@ -282,6 +282,17 @@
           })
         else thegn;
 
+      # A self-contained launch path for users who want the known terminal/font
+      # composition without changing their system font or terminal setup. The
+      # launcher still executes the stable wrapped `thegn` package, so it
+      # inherits the same pinned runtime tools and channel clamp as `.#default`.
+      batteries = import ./nix/batteries.nix {
+        inherit pkgs thegn;
+        alacrittyProfile = "${rootSrc}/config/alacritty.toml";
+        alacritty = pkgs.alacritty;
+        firaCodeNerdFont = pkgs.nerd-fonts.fira-code;
+      };
+
       # mingw-w64 cross C toolchain for `just check-cross`'s whole-workspace
       # windows-gnu leg. `cargo check` still runs build scripts, and libz-sys /
       # libgit2-sys compile C, so without a cross cc the check dies with
@@ -574,6 +585,8 @@
         {
           default = defaultPkg;
           thegn = defaultPkg;
+          # Stable thegn in pinned Alacritty with a launcher-scoped Nerd Font.
+          batteries = batteries;
           # The host binary WITHOUT the adjacent x86_64-linux musl bridge.
           #
           # `default` builds the workspace twice on x86_64-linux — once natively
