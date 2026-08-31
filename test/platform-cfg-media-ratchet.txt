@@ -11,3 +11,4 @@
 lib.rs
 mpd.rs
 mpv.rs
+platform/mod.rs

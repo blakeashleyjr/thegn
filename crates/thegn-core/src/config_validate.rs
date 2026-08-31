@@ -875,6 +875,7 @@ mod tests {
             ("[[forges]]\nkind = \"forgejo\"\n", true),
             ("[[forges]]\nkind = \"gitea\"\n", true),
             ("[[forges]]\nkind = \"github\"\n", false),
+            ("[media]\nbackend = \"spotify\"\n", true),
             ("[media]\nbackend = \"jellyfin\"\n", true),
             ("[media]\nbackend = \"mpv\"\n", false),
             ("[sandbox]\nbackend = \"wsl\"\n", true),
