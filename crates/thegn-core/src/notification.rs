@@ -166,7 +166,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 28] = [
+    pub const ALL: [NotificationKind; 30] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,

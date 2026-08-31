@@ -897,8 +897,6 @@ pub(crate) fn verify_v64_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-}
-
 /// Verify THE-22's additive roster columns and dedupe index before stamping
 /// schema v65. Preparing the typed projection catches a partial ALTER ladder.
 pub(crate) fn verify_v65_schema(conn: &Connection) -> Result<()> {
