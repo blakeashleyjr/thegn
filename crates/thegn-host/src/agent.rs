@@ -3306,6 +3306,17 @@ pub fn launch_spec_full(
     // Reserve the entry's keys so the same env wins on both paths.
     let agent_env_keys = eff_agent.as_ref().map(|eff| &eff.env);
 
+    // The sandbox path reverses the same precedence by a different mechanism:
+    // `env_overrides` are emitted as `export KEY='…'` lines inside the wrap
+    // script (`sandbox::wrap_script`), which runs AFTER the pane's process env
+    // is set, so they too land on top of the entry env. This is the one point
+    // where every contributor to that map — the bundle, the build cache, the
+    // devShell, the ssh shim — has finished folding, so strip the reserved keys
+    // here rather than teaching each of them the rule.
+    if let Some(sandbox_spec) = outcome.spec.as_mut() {
+        reserve_sandbox_overrides(&mut sandbox_spec.env_overrides, agent_env_keys);
+    }
+
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
     // On the host path (no sandbox spec) the bundle identity + build env ride
     // the pane env (layered on the curated base in `spawn_with_env`).
@@ -3349,6 +3360,17 @@ fn extend_reserving(
             .into_iter()
             .filter(|(k, _)| !reserved.is_some_and(|r| r.contains_key(k))),
     );
+}
+
+/// Drop every sandbox env override the agent entry declares for itself, so the
+/// entry env `compose_spec` applies to the pane process is not re-exported over
+/// inside the wrap script. See the call site for why this is the right chokepoint.
+fn reserve_sandbox_overrides(
+    overrides: &mut std::collections::HashMap<String, String>,
+    reserved: Option<&std::collections::BTreeMap<String, String>>,
+) {
+    let Some(reserved) = reserved else { return };
+    overrides.retain(|k, _| !reserved.contains_key(k));
 }
 
 /// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw
