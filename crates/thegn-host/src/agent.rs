@@ -2857,6 +2857,16 @@ pub fn compose_spec(
     if let Some(p) = extras.prompt.filter(|p| !p.is_empty()) {
         env.push(("THEGN_PROMPT".to_string(), p.to_string()));
     }
+    // The binary that launched this pane, so a headless worker can call back
+    // into the SAME build that dispatched it. A bare `thegn` on the pane PATH is
+    // whatever the operator last installed: here it was a copy five schema
+    // versions stale that did not carry the `dispatch` subcommand at all, so
+    // every pipeline worker's `thegn dispatch report <row>` — the one call that
+    // closes its row — failed with `unrecognized subcommand`. That is
+    // indistinguishable from a crashed worker and is how rows pile up unclosable.
+    if let Ok(exe) = std::env::current_exe() {
+        env.push(("THEGN_BIN".to_string(), exe.to_string_lossy().into_owned()));
+    }
     // Match the build's parallelism to the pane's OWN ceiling. `CARGO_BUILD_JOBS`
     // is per-invocation, so without this every worktree claims the whole machine
     // independently and N of them multiply — the amplification behind ~67
@@ -3063,8 +3073,12 @@ pub fn launch_spec_full(
     // worker does not auto-deny its first tool call. Best-effort: a failure to
     // write is logged and the launch proceeds (the harness then prompts/denies
     // as it would have anyway).
+    // Resolved once: the permissions seed below needs the allow-list, and the
+    // host env fold near the end needs the entry's env KEYS (see there).
+    let eff_agent = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage).ok();
+
     if !loc.is_remote()
-        && let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage)
+        && let Some(eff) = &eff_agent
         && !eff.permissions.is_empty()
         && let Err(e) =
             crate::agent_permissions::seed(Path::new(worktree), &eff.harness, &eff.permissions)
@@ -3278,12 +3292,26 @@ pub fn launch_spec_full(
         spec.daemon_persistent = daemon_persistent;
     }
 
+    // `[[agents]].env` (+ the stage overlay) is applied LAST inside
+    // `compose_spec` precisely so it beats the composed identity env — and on the
+    // SANDBOX path it does, because the spec env is folded in before it. The host
+    // path folded the bundle + build env in AFTER the call, silently reversing
+    // that precedence for exactly the entries that most need it: a `pipeline-*`
+    // agent pointing `CODEX_HOME` at its own config home got the inherited
+    // `~/.codex` folded back over it by the bundle's legacy per-provider account
+    // carve (`bundle::compose_at_launch`, which falls back to the harness's
+    // `effective_config_dir` when no account is managed). The headless
+    // sandbox/approval settings then never loaded, so every worker started fine
+    // and died unable to write a file — a silent worker death, not a config error.
+    // Reserve the entry's keys so the same env wins on both paths.
+    let agent_env_keys = eff_agent.as_ref().map(|eff| &eff.env);
+
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
     // On the host path (no sandbox spec) the bundle identity + build env ride
     // the pane env (layered on the curated base in `spawn_with_env`).
     if outcome.spec.is_none() {
-        spec.env.extend(resolved.env_pairs());
-        spec.env.extend(build_env);
+        extend_reserving(&mut spec.env, resolved.env_pairs(), agent_env_keys);
+        extend_reserving(&mut spec.env, build_env, agent_env_keys);
     }
     // Host (no-sandbox) devShell injection rides the pane env directly.
     if outcome.spec.is_none()
@@ -3301,6 +3329,26 @@ pub fn launch_spec_full(
         let _ = db.set_worktree_observed(worktree, &spec.backend); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     Ok(spec)
+}
+
+/// Append `extra` to a pane env, skipping every key the agent entry declares in
+/// its own `[[agents]].env` overlay. `spec.env` is applied in order, so a later
+/// pair wins — dropping the key is what lets the entry's earlier value stand.
+///
+/// A key the entry declares but whose `env:`/`file:` ref did not resolve is
+/// reserved too: `expanded_env` drops such a value deliberately ("never exported
+/// as its literal ref"), and quietly substituting an unrelated credential home
+/// for it is the same silent-wrong-value failure the reservation exists to stop.
+fn extend_reserving(
+    env: &mut Vec<(String, String)>,
+    extra: Vec<(String, String)>,
+    reserved: Option<&std::collections::BTreeMap<String, String>>,
+) {
+    env.extend(
+        extra
+            .into_iter()
+            .filter(|(k, _)| !reserved.is_some_and(|r| r.contains_key(k))),
+    );
 }
 
 /// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw
