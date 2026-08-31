@@ -1148,3 +1148,43 @@ fn extend_reserving_without_an_agent_entry_folds_everything() {
         "a bare harness launch has no entry env to protect"
     );
 }
+
+/// The sandbox half of THE-91: `env_overrides` become `export KEY='…'` lines
+/// inside the wrap script, which runs after the pane's process env is set — so
+/// they clobber `[[agents]].env` just as the host fold did.
+#[test]
+fn agent_entry_env_is_not_clobbered_by_sandbox_overrides() {
+    let reserved: std::collections::BTreeMap<String, String> = [(
+        "CODEX_HOME".to_string(),
+        "/pipeline/codex-home".to_string(),
+    )]
+    .into();
+    let mut overrides: std::collections::HashMap<String, String> = [
+        ("CODEX_HOME".to_string(), "/home/u/.codex".to_string()),
+        ("SCCACHE_DIR".to_string(), "/cache/sccache".to_string()),
+    ]
+    .into();
+
+    reserve_sandbox_overrides(&mut overrides, Some(&reserved));
+
+    assert!(
+        !overrides.contains_key("CODEX_HOME"),
+        "a key the agent entry declares must not be re-exported inside the sandbox"
+    );
+    assert_eq!(
+        overrides.get("SCCACHE_DIR").map(String::as_str),
+        Some("/cache/sccache"),
+        "unclaimed overrides still apply"
+    );
+}
+
+#[test]
+fn reserve_sandbox_overrides_without_an_agent_entry_keeps_everything() {
+    let mut overrides: std::collections::HashMap<String, String> =
+        [("CODEX_HOME".to_string(), "/home/u/.codex".to_string())].into();
+    reserve_sandbox_overrides(&mut overrides, None);
+    assert_eq!(
+        overrides.get("CODEX_HOME").map(String::as_str),
+        Some("/home/u/.codex")
+    );
+}
