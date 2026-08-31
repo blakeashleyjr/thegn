@@ -38,3 +38,7 @@ e2e-results/
 # a stray `muse run` without --snapshots-dir would create baselines here
 /snapshots/
 /test-results/
+
+# Knowledge-graph tool scratch (present in every worktree; never committed).
+# Left untracked it makes `thegn integrate` classify clean branches as dirty.
+.understand-anything/

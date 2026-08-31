@@ -185,6 +185,7 @@ pub mod pipeline_claim;
 pub mod pipeline_exit;
 pub mod pipeline_report;
 pub mod pipeline_resume;
+pub mod pipeline_reap;
 pub mod pipeline_run;
 pub mod placement;
 #[cfg(test)]
