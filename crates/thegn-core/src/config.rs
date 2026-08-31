@@ -1440,7 +1440,8 @@ config_enum! {
     /// Spotify desktop, mpv, ncspot, VLC, cmus, …; `"mpd"` (alias `"mpc"`) talks
     /// MPD directly (mpd/mpc/rmpc/ncmpcpp, no `mpd-mpris` bridge); `"mpv"` drives
     /// one mpv over JSON IPC. `"smtc"` = Windows SMTC; `"applescript"` = macOS
-    /// Music/Spotify. `"jellyfin"` reserved. `"auto"` composes every source on the
+    /// Music/Spotify. `"spotify"` and `"jellyfin"` are reserved. Spotify desktop
+    /// and spotifyd remain supported through MPRIS/SMTC/AppleScript. `"auto"` composes every source on the
     /// OS (Linux: MPRIS + MPD + mpv) and shows whatever is actually playing; a
     /// backend on the wrong OS is inert.
     pub enum MediaBackendKind: "media backend" {
@@ -1451,6 +1452,8 @@ config_enum! {
         Mpd = "mpd" | "mpc",
         Smtc = "smtc" | "windows" | "gsmtc",
         AppleScript = "applescript" | "macos" | "osascript",
+        // Reserved: Spotify Web API/library support is not implemented.
+        Spotify = "spotify" reserved,
         // Reserved: no Jellyfin backend exists yet.
         Jellyfin = "jellyfin" reserved,
     } default = Auto;
@@ -1497,7 +1500,7 @@ pub struct MediaConfig {
     /// Larger seek step (seconds) used when the loaded media is a video, where
     /// coarser skipping is the norm.
     pub seek_step_video_secs: u64,
-    /// Render cover art in the Now-Playing overlay when the backend + terminal
+    /// Render cover art in the docked Now-Playing panel when the backend + terminal
     /// support it (kitty/sixel graphics; falls back to blocks otherwise).
     pub show_art: bool,
     /// Open the Now-Playing overlay when the statusbar media badge is clicked.

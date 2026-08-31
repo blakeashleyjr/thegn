@@ -143,7 +143,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
         cfg.ci.provider = thegn_core::config_ci::CiProviderKind::Drone;
-        cfg.media.backend = thegn_core::config::MediaBackendKind::Jellyfin;
+        cfg.media.backend = thegn_core::config::MediaBackendKind::Spotify;
         cfg.media.enabled = true;
         let reports = probes(&cfg);
         assert_report_invariants(&reports);

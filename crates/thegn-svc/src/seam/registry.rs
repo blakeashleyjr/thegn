@@ -482,6 +482,7 @@ fn media_probes(cfg: &Config) -> Vec<ProbeReport> {
             },
             "",
         ),
+        MediaBackendKind::Spotify => return vec![ProbeReport::reserved("media", "spotify")],
         // Reserved kinds returned above; exhaustive so a new kind is a compile error.
         MediaBackendKind::Jellyfin => return vec![ProbeReport::reserved("media", "jellyfin")],
     };
@@ -642,7 +643,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ci.provider = thegn_core::config::CiProviderKind::Drone;
         cfg.media.enabled = true;
-        cfg.media.backend = thegn_core::config::MediaBackendKind::Jellyfin;
+        cfg.media.backend = thegn_core::config::MediaBackendKind::Spotify;
         cfg.sandbox.enabled = true;
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Wsl;
         cfg.drawer.kind = Some(thegn_core::config::DrawerKind::Lf);
@@ -654,7 +655,7 @@ mod tests {
         let reports = probes(&cfg);
         for (seam, id) in [
             ("ci", "drone"),
-            ("media", "jellyfin"),
+            ("media", "spotify"),
             ("sandbox", "wsl"),
             ("files", "lf"),
             ("forge", "forgejo:codeberg"),
