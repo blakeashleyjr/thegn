@@ -1083,3 +1083,68 @@ fn inject_devshell_host_prepends_path_and_merges_vars() {
         "a var the user already set must not be clobbered"
     );
 }
+
+/// THE-91: the bundle's legacy per-provider account carve folds a credential
+/// home (`CODEX_HOME = ~/.codex`) into the host pane env AFTER `compose_spec`
+/// applied `[[agents]].env`. A `pipeline-*` agent that relocates that home to a
+/// headless-capable config dir must keep it, or its sandbox/approval settings
+/// never load and the worker dies unable to write.
+#[test]
+fn agent_entry_env_is_not_clobbered_by_the_host_env_fold() {
+    let reserved: std::collections::BTreeMap<String, String> = [(
+        "CODEX_HOME".to_string(),
+        "/pipeline/codex-home".to_string(),
+    )]
+    .into();
+    let mut env = vec![
+        ("THEGN_WORKTREE".to_string(), "/wt".to_string()),
+        // What `compose_spec` applied last from the entry.
+        ("CODEX_HOME".to_string(), "/pipeline/codex-home".to_string()),
+    ];
+
+    extend_reserving(
+        &mut env,
+        vec![
+            ("CODEX_HOME".to_string(), "/home/u/.codex".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), "/home/u/.claude".to_string()),
+        ],
+        Some(&reserved),
+    );
+
+    // The reserved key is not re-appended, so the entry's value still wins.
+    assert_eq!(
+        env.iter().filter(|(k, _)| k == "CODEX_HOME").count(),
+        1,
+        "the fold must not append over a key the agent entry declares"
+    );
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| v.as_str()),
+        Some("/pipeline/codex-home")
+    );
+    // Everything the entry does NOT claim still rides through.
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| v.as_str()),
+        Some("/home/u/.claude")
+    );
+}
+
+#[test]
+fn extend_reserving_without_an_agent_entry_folds_everything() {
+    let mut env = vec![("THEGN_WORKTREE".to_string(), "/wt".to_string())];
+    extend_reserving(
+        &mut env,
+        vec![("CODEX_HOME".to_string(), "/home/u/.codex".to_string())],
+        None,
+    );
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| v.as_str()),
+        Some("/home/u/.codex"),
+        "a bare harness launch has no entry env to protect"
+    );
+}
