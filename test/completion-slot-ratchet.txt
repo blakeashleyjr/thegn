@@ -17,8 +17,6 @@ agent sessions	harness
 api call	params
 bridge-revtunnel	port
 ci cancel	run_id
-ci log	job_id
-ci log	run_id
 ci logs	job_id
 ci logs	run_id
 ci rerun	run_id

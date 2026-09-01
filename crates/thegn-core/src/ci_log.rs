@@ -142,6 +142,9 @@ static JWT: Lazy<Regex> = Lazy::new(|| {
 });
 static AWS_KEY_ID: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b").unwrap());
+static PROVIDER_TOKEN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,})\b").unwrap()
+});
 
 /// Redact credentials commonly emitted by CI tools while retaining ordinary
 /// diagnostics and line structure.
@@ -176,7 +179,10 @@ pub fn redact(text: &str) -> String {
     let s = SINGLE_QUOTED_ASSIGNMENT.replace_all(&s, format!("$1'{REDACTION_MARKER}'"));
     let s = ASSIGNMENT.replace_all(&s, format!("$1{REDACTION_MARKER}"));
     let s = JWT.replace_all(&s, REDACTION_MARKER);
-    AWS_KEY_ID.replace_all(&s, REDACTION_MARKER).into_owned()
+    let s = AWS_KEY_ID.replace_all(&s, REDACTION_MARKER);
+    PROVIDER_TOKEN
+        .replace_all(&s, REDACTION_MARKER)
+        .into_owned()
 }
 
 /// Select the terminal run identities retained by a configured cache policy.
@@ -217,6 +223,8 @@ mod tests {
             "token=plain-secret password: other-secret\n",
             "jwt eyJabcdefghijk.abcde.lmnopqrstuv\n",
             "AWS AKIA1234567890ABCDEF\n",
+            "ghp_123456789012345678901234567890123456\n",
+            "glpat-123456789012345678901234567890123456\n",
             "-----BEGIN PRIVATE KEY-----\nsecret-pem\n-----END PRIVATE KEY-----\n",
             "cargo: warning: ordinary diagnostic\n",
         );
@@ -228,6 +236,8 @@ mod tests {
             "other-secret",
             "eyJabcdefghijk.abcde.lmnopqrstuv",
             "AKIA1234567890ABCDEF",
+            "ghp_123456789012345678901234567890123456",
+            "glpat-123456789012345678901234567890123456",
             "secret-pem",
         ] {
             assert!(!out.contains(secret), "secret survived: {secret} in {out}");

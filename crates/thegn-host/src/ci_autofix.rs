@@ -25,8 +25,8 @@ pub(crate) fn consider(full: &Config, db: &thegn_core::db::Db, entry: &CiLogEntr
 
     let candidate = entry.candidate();
     let ref_id = format!(
-        "ci-autofix:{}:{}:{}",
-        candidate.run_id, candidate.job_id, candidate.head_sha
+        "ci-autofix:{}:{}:{}:{}",
+        candidate.worktree, candidate.run_id, candidate.job_id, candidate.head_sha
     );
     let notify = |message: String| {
         let _ =
@@ -114,11 +114,6 @@ pub(crate) fn consider(full: &Config, db: &thegn_core::db::Db, entry: &CiLogEntr
         return;
     }
 
-    // Claim before rendering or spawning.  A refresh race therefore spends at
-    // most one dispatch even when two workers observe the same cache entry.
-    if !db.claim_ci_autofix(&candidate).unwrap_or(false) {
-        return;
-    }
     let dispatch = crate::agent_run::agent_floor_gate(
         full,
         worktree,
@@ -155,6 +150,13 @@ pub(crate) fn consider(full: &Config, db: &thegn_core::db::Db, entry: &CiLogEntr
         ));
         return;
     };
+    // Claim only after every safety and prompt gate has passed, immediately
+    // before consuming the attempt and spawning. A refresh race therefore
+    // spends at most one dispatch without permanently suppressing a candidate
+    // that was held by infrastructure or rejected by prompt validation.
+    if !db.claim_ci_autofix(&candidate).unwrap_or(false) {
+        return;
+    }
     let next_attempt = item.agent_attempts.saturating_add(1);
     let _ = db.set_pr_agent_attempts(&item.key, next_attempt);
     let note = format!(
