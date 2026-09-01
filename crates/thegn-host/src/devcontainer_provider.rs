@@ -110,8 +110,14 @@ pub(crate) fn can_honor_sandbox(sb: &thegn_core::config::SandboxConfig) -> bool 
         && sb.network == Network::Nat
         && sb.network_allow.is_empty()
         && sb.network_block.is_empty()
+        && !sb.network_audit
         && !sb.vpn.is_enabled()
         && sb.isolation_floor == thegn_core::config::IsolationFloor::Off
+        // The CLI has no equivalent for thegn's remote daemon or OCI runtime
+        // selection. Falling through preserves both the user's endpoint and
+        // any stronger userspace/guest-kernel isolation they requested.
+        && sb.oci_host.trim().is_empty()
+        && sb.oci_runtime.trim().is_empty()
         // The provider always bind-mounts the workspace. It cannot honor a
         // request for unrestricted/custom/empty host-file access.
         && matches!(sb.file_access, FileAccess::Worktree | FileAccess::WorktreePlusCaches)
@@ -280,6 +286,7 @@ pub(crate) fn status_for_selected(
     let inventory = thegn_core::devcontainer::recognized_unapplied(config);
     let provider_eligible = source_present
         && source_approved
+        && outcome.substitution.blocked_local_env.is_empty()
         && inventory.refused.is_empty()
         && inventory.reserved.is_empty()
         && inventory.unknown.is_empty();
@@ -577,6 +584,15 @@ mod tests {
         assert!(!can_honor_sandbox(&sb));
         sb.network = thegn_core::config::Network::Nat;
         sb.enabled = false;
+        assert!(!can_honor_sandbox(&sb));
+        sb.enabled = true;
+        sb.oci_host = "ssh://builder".into();
+        assert!(!can_honor_sandbox(&sb));
+        sb.oci_host.clear();
+        sb.oci_runtime = "runsc".into();
+        assert!(!can_honor_sandbox(&sb));
+        sb.oci_runtime.clear();
+        sb.network_audit = true;
         assert!(!can_honor_sandbox(&sb));
     }
 
