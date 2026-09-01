@@ -6,13 +6,15 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::VoiceConfig;
-use thegn_core::voice::{VoiceProvider, VoiceState};
+use thegn_core::voice::VoiceState;
 
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -57,6 +59,7 @@ pub(crate) struct VoiceController {
     rx: Receiver<VoiceMessage>,
     capture_stop: Option<Sender<CaptureCommand>>,
     capture_generation: u64,
+    transcription_cancel: Option<(u64, Arc<AtomicBool>)>,
 }
 
 impl VoiceController {
@@ -70,6 +73,7 @@ impl VoiceController {
             rx,
             capture_stop: None,
             capture_generation: 0,
+            transcription_cancel: None,
         }
     }
 
@@ -116,6 +120,24 @@ impl VoiceController {
         }
     }
 
+    /// Signal the current transcriber without waiting on its worker. The
+    /// worker observes this flag while the provider owns the blocking child.
+    pub(crate) fn cancel_transcription(&mut self) {
+        if let Some((_, cancel)) = self.transcription_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn transcription_finished(&mut self, request_id: u64) {
+        if self
+            .transcription_cancel
+            .as_ref()
+            .is_some_and(|(current, _)| *current == request_id)
+        {
+            self.transcription_cancel = None;
+        }
+    }
+
     pub(crate) fn capture_finished(&mut self) {
         self.capture_stop = None;
     }
@@ -125,7 +147,7 @@ impl VoiceController {
     }
 
     pub(crate) fn transcribe(
-        &self,
+        &mut self,
         pane_id: u32,
         request_id: u64,
         wav: Vec<u8>,
@@ -134,12 +156,14 @@ impl VoiceController {
         let cfg = self.cfg.clone();
         let tx = self.tx.clone();
         let wk = waker.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.transcription_cancel = Some((request_id, cancel.clone()));
         let _ = thread::Builder::new()
             .name("voice-transcribe".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-                let result =
-                    thegn_svc::voice::CommandVoiceProvider::new(cfg).transcribe_push_to_talk(&wav);
+                let result = thegn_svc::voice::CommandVoiceProvider::new(cfg)
+                    .transcribe_push_to_talk_cancellable(&wav, &cancel);
                 let msg = match result {
                     Ok(transcript) => VoiceMessage::TranscriptSucceeded {
                         pane_id,
@@ -161,6 +185,7 @@ impl VoiceController {
 impl Drop for VoiceController {
     fn drop(&mut self) {
         self.stop_capture();
+        self.cancel_transcription();
     }
 }
 
