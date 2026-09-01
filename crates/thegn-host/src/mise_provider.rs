@@ -535,7 +535,12 @@ pub(crate) fn activation_for_launch(
     let approved = db
         .map(|db| approvals_for(Some(db), repo_root))
         .unwrap_or_default();
-    let approved = pending_request(cfg, Path::new(worktree), repo_root, &approved).is_none();
+    // A remote/provider worktree's path is target-local (or may merely be a
+    // registry placeholder on this host). Never inspect that host path to
+    // derive a mise trust decision; the remote target must provide its own
+    // detection/identity through the provider boundary.
+    let approved = loc.is_remote()
+        || pending_request(cfg, Path::new(worktree), repo_root, &approved).is_none();
     let requirements = if loc.is_remote() {
         EnvRequirements::default()
     } else {
@@ -587,6 +592,17 @@ pub(crate) fn status(
     repo_root: &Path,
     db: Option<&thegn_core::db::Db>,
 ) -> ToolchainStatus {
+    if GitLoc::for_worktree(worktree).is_remote() {
+        return ToolchainStatus {
+            provider: ORIGIN.into(),
+            tier: "Reserved".into(),
+            inject: cfg.toolchain.mise.inject.as_str().into(),
+            state: "remote".into(),
+            reason: Some("toolchain state belongs to the remote target".into()),
+            trust: "not-applicable".into(),
+            ..ToolchainStatus::default()
+        };
+    }
     let requirements = thegn_core::envplan::detect_with_mise_env(
         worktree,
         std::env::var("MISE_ENV").ok().as_deref(),
@@ -651,7 +667,7 @@ pub(crate) fn doctor_status(
     db: Option<&thegn_core::db::Db>,
 ) -> ToolchainStatus {
     let mut status = status(cfg, worktree, repo_root, db);
-    if status.state == "off" || !executable_available() {
+    if matches!(status.state.as_str(), "off" | "remote") || !executable_available() {
         return status;
     }
     if let Ok(version) = run_info(worktree, &["--version"], Duration::from_secs(2)) {
