@@ -199,15 +199,20 @@ on this branch".
 Keys: `M` merge · `A` approve · `c` comment · `r` rerun failed checks ·
 `o` open in browser. See [[review-a-pr]] for the full workflow.
 
-### ci — pipeline state
+### ci — pipeline state and cached logs
 
 One row per workflow, judged by its most recent run — the same set the
 header counts, so the `✓/✗` numbers always match the rows. Fan-out
 workflows (several sibling runs from one trigger) are represented by a
 failing sibling when there is one. History is behind the drill-in.
 
-Keys: `↵`/`v` drill into the run · `o` browser · `r`/`R` rerun (all /
-failed) · `c` cancel · `g` force-refresh.
+Keys: `↵`/`v` drill into the run in place · `o` browser · `r`/`R` rerun (all /
+failed) · `c` cancel · `g` force-refresh. The drill reads bounded, redacted
+job-log tails from the CI cache first and labels their source, age, truncation,
+and redaction state while a missing or stale entry is fetched off-loop. The
+cache policy is controlled by `[ci].log_cache_runs`, `log_tail_lines`, and
+`log_max_bytes`; `[ci.autofix]` is off by default and can suggest or safely
+hand a verified failure to the existing PR-queue agent.
 
 ### merge — the local merge queue
 

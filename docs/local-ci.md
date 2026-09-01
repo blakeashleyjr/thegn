@@ -79,3 +79,21 @@ store survive between runs — without it every run reinstalls nix).
   won't run meaningfully under act.
 
 If you only want to know "will the gate pass?", use the fast path.
+
+## Optional local-runner recipes
+
+Local workflow runners are configured tools, not `CiProvider` implementations:
+they have different event, credential, job-identity, and log semantics. If a
+repository needs one, add it under `[[tools]]` and invoke it as a reproduction
+helper; keep forge-backed CI inspection on the normal provider path.
+
+- `act` reproduces GitHub Actions locally; the commands above use the checked-in
+  workflow and `.secrets` setup.
+- `gama` can be added as a configured command for a repository's local workflow
+  reproduction.
+- `wrkflw` can be added as a configured command for a repository-specific local
+  workflow reproduction.
+
+These tools do not populate the bounded CI log cache or change provider
+selection. Treat their output as local diagnostics and use `thegn ci logs` for
+the redacted forge-backed evidence used by the Work-tab drill and PR handoff.

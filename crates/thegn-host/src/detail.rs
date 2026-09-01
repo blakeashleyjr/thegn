@@ -222,6 +222,7 @@ impl DetailAction {
 /// `DetailOverlay`'s private fields); re-exported so callers keep using
 /// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
 mod ci_drill;
+pub(crate) use ci_drill::overlay_for_run;
 pub use ci_drill::{CiDetailPayload, apply_ci_detail};
 /// The date/clock widgets' month-calendar + world-clock popup. Same
 /// child-module arrangement as `ci_drill` — it reaches `DetailOverlay`'s
