@@ -10,7 +10,9 @@ actions: [mode-normal, mode-vim-normal, mode-vim-insert, mode-emacs]
 Behavior lives in `~/.config/thegn/config.toml`. Layers, low to high:
 built-in defaults < the config file < `THEGN_*` environment variables <
 CLI flags. A repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo
-settings (sandbox, keybinds, env selection).
+settings (sandbox, keybinds, env selection). CI autofix is only permitted in
+trusted user configuration: `[workspace.<slug>.ci] mode = "suggest"`
+or `"auto"`; a repo-authored file cannot enable it.
 
 `[workspace.<slug>]` in your own config refines settings for one repo —
 including `[workspace.<slug>.merge_queue]` and
@@ -52,6 +54,9 @@ The file is watched: edits apply live, no restart.
   language; `thegn doctor` lists every server and whether its command
   resolves. Servers named in a repo-local `.thegn.*` are ignored (a
   language-server command is untrusted) — declare them in your user config.
+- `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
+  persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
+  and reuses the existing trusted PR-queue agent policy.
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 

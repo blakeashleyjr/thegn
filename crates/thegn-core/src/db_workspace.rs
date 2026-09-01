@@ -366,6 +366,12 @@ impl WorkspaceStore for Db {
             .execute("DELETE FROM pr_cache WHERE worktree=?1", params![wt])?;
         self.conn()
             .execute("DELETE FROM ci_runs_cache WHERE worktree=?1", params![wt])?;
+        self.conn()
+            .execute("DELETE FROM ci_log_cache WHERE worktree=?1", params![wt])?;
+        self.conn().execute(
+            "DELETE FROM ci_autofix_dedupe WHERE worktree=?1",
+            params![wt],
+        )?;
         // best-effort: the glyph_cache table is created lazily and may not
         // exist yet on this DB.
         let _ = self
