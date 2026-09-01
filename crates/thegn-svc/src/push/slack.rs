@@ -5,7 +5,7 @@ use std::time::Duration;
 use thegn_core::config::PushKind;
 use thegn_core::config_push::PushSinkConfig;
 use thegn_core::notification::Priority;
-use thegn_core::notification_render::{MarkdownFlavor, RenderedNotification};
+use thegn_core::notification_render::{MarkdownFlavor, RenderedNotification, truncate_chars};
 use thegn_core::seam::{Availability, BoxFuture, ProbeReport};
 
 use super::{
@@ -16,15 +16,19 @@ use super::{
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(400);
+/// Slack section text is limited to 3,000 Unicode characters. Keep the
+/// fallback text within the same bound so both envelope paths are valid.
+pub const SLACK_TEXT_LIMIT: usize = 3_000;
 
 /// Build Slack's incoming-webhook envelope: text remains useful to clients
 /// that do not render blocks, while the section gives Slack mrkdwn structure.
 pub fn payload(notification: &RenderedNotification) -> serde_json::Value {
+    let message = truncate_chars(&notification.message, SLACK_TEXT_LIMIT, "…");
     serde_json::json!({
-        "text": notification.message,
+        "text": message,
         "blocks": [{
             "type": "section",
-            "text": { "type": "mrkdwn", "text": notification.message }
+            "text": { "type": "mrkdwn", "text": message }
         }],
         "attachments": [{ "color": priority_color(notification.priority) }]
     })
@@ -166,5 +170,23 @@ mod tests {
             priority_color(Priority::Alert)
         );
         assert_eq!(priority_color(Priority::Notice), "#3498DB");
+    }
+
+    #[test]
+    fn payload_truncates_section_text_by_visible_unicode_chars() {
+        let n = RenderedNotification {
+            kind: NotificationKind::AgentFailed,
+            priority: Priority::Alert,
+            source: "s".into(),
+            worktree: "w".into(),
+            timestamp: 1,
+            title: "agent failed".into(),
+            message: "界".repeat(SLACK_TEXT_LIMIT + 5),
+        };
+        let value = payload(&n);
+        let text = value["blocks"][0]["text"]["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), SLACK_TEXT_LIMIT);
+        assert!(text.ends_with('…'));
+        assert_eq!(value["text"].as_str().unwrap(), text);
     }
 }
