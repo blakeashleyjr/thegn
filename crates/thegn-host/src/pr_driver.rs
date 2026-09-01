@@ -801,6 +801,7 @@ fn run_agent(
         vars: &vars,
         timeout_secs: cfg.agent_timeout_secs,
         sandbox,
+        credential_free: false,
     });
 }
 
