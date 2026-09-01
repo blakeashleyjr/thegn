@@ -138,7 +138,7 @@ impl ProviderBridge {
 use futures_util::future::BoxFuture;
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 
-use crate::issue::{IssueBackend, IssueError};
+use crate::issue::{IssueBackend, IssueCaps, IssueError};
 
 /// An issue backend implemented by a resident plugin (`ExtensionPoint::
 /// IssueProvider`). Every trait op is one `provider.call` with seam
@@ -146,6 +146,7 @@ use crate::issue::{IssueBackend, IssueError};
 /// like a built-in provider's absent capability.
 pub struct PluginIssueBackend {
     bridge: Arc<ProviderBridge>,
+    caps: IssueCaps,
     /// `"plugin:<id>"` — the `Issue.provider` slug and probe id.
     provider_id: &'static str,
 }
@@ -153,23 +154,27 @@ pub struct PluginIssueBackend {
 impl PluginIssueBackend {
     /// `provider_id` is leaked once per plugin (a handful per process): the
     /// seam wants `&'static str` ids and plugins load once per config life.
-    pub fn new(bridge: Arc<ProviderBridge>, plugin_id: &str) -> Self {
+    pub fn new(bridge: Arc<ProviderBridge>, plugin_id: &str, caps: IssueCaps) -> Self {
         let provider_id: &'static str = Box::leak(format!("plugin:{plugin_id}").into_boxed_str());
         Self {
             bridge,
+            caps,
             provider_id,
         }
     }
 
     fn op<T: serde::de::DeserializeOwned>(
         &self,
-        op: &str,
+        op: &'static str,
         args: serde_json::Value,
     ) -> Result<T, IssueError> {
-        let out = self
-            .bridge
-            .call("issues", op, args)
-            .map_err(|e| IssueError::Api(e.to_string()))?;
+        let out = self.bridge.call("issues", op, args).map_err(|e| {
+            if e.is_unsupported() {
+                IssueError::unsupported(op)
+            } else {
+                IssueError::Api(e.to_string())
+            }
+        })?;
         serde_json::from_value(out).map_err(|e| IssueError::Api(format!("bad {op} reply: {e}")))
     }
 }
@@ -177,6 +182,10 @@ impl PluginIssueBackend {
 impl IssueBackend for PluginIssueBackend {
     fn provider_id(&self) -> &'static str {
         self.provider_id
+    }
+
+    fn caps(&self) -> IssueCaps {
+        self.caps
     }
 
     fn list_issues<'a>(
@@ -235,6 +244,9 @@ impl IssueBackend for PluginIssueBackend {
         id: &'a str,
         body: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
+        if !self.caps.comments {
+            return Box::pin(async { Err(IssueError::unsupported("add_comment")) });
+        }
         Box::pin(async move {
             self.op::<serde_json::Value>(
                 "add_comment",
@@ -249,6 +261,9 @@ impl IssueBackend for PluginIssueBackend {
         id: &'a str,
         label: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
+        if !self.caps.labels {
+            return Box::pin(async { Err(IssueError::unsupported("attach_label")) });
+        }
         Box::pin(async move {
             self.op::<serde_json::Value>(
                 "attach_label",
@@ -263,6 +278,9 @@ impl IssueBackend for PluginIssueBackend {
         id: &'a str,
         label: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
+        if !self.caps.labels {
+            return Box::pin(async { Err(IssueError::unsupported("detach_label")) });
+        }
         Box::pin(async move {
             self.op::<serde_json::Value>(
                 "detach_label",
@@ -319,7 +337,14 @@ done
     #[test]
     fn issue_ops_round_trip_through_a_scripted_plugin() {
         let (_session, bridge) = live_bridge();
-        let backend = PluginIssueBackend::new(bridge, "demo");
+        let backend = PluginIssueBackend::new(
+            bridge,
+            "demo",
+            IssueCaps {
+                comments: true,
+                labels: false,
+            },
+        );
         assert_eq!(backend.provider_id(), "plugin:demo");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -334,13 +359,10 @@ done
         let err = rt
             .block_on(backend.add_comment("plugin:demo:1", "hi"))
             .unwrap_err();
-        let IssueError::Api(msg) = &err else {
+        let IssueError::Unsupported(op) = &err else {
             panic!("{err:?}")
         };
-        assert!(
-            msg.contains("Unsupported") || msg.contains("unsupported"),
-            "{msg}"
-        );
+        assert_eq!(*op, "add_comment");
     }
 
     #[test]
