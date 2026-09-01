@@ -28,6 +28,7 @@ pub mod client;
 #[cfg(feature = "control-grpc")]
 pub mod grpc;
 pub mod http;
+pub mod http_ci;
 pub mod routes;
 #[cfg(test)]
 mod tests;
@@ -373,6 +374,32 @@ pub struct PrStatusRow {
     pub is_draft: bool,
     /// Unix seconds the cache row was fetched at.
     pub fetched_at: i64,
+}
+
+/// Cached CI run history projected through the control plane. `runs` is kept
+/// as JSON because the provider-neutral CI model intentionally belongs to
+/// `thegn-core` without a control-wire schema dependency; the response still
+/// carries the cache source and timestamp explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CiRunsReply {
+    pub worktree: String,
+    pub runs: serde_json::Value,
+    pub source: String,
+    pub fetched_at: i64,
+}
+
+/// One cache-first CI log projection. Entries contain only the bounded,
+/// redacted cache shape; the response metadata makes a provider fill explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CiLogsReply {
+    pub worktree: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub logs: Vec<serde_json::Value>,
+    pub source: String,
+    pub fetched_at: i64,
+    pub truncated: bool,
+    pub redacted: bool,
 }
 
 /// The `notify.push` verb payload — a desktop-notification-shaped note pushed
@@ -733,6 +760,27 @@ pub trait ControlApi: Send + Sync + 'static {
     /// `pr.status` verb). A cache read — the forge is the source of truth;
     /// each row's `fetched_at` carries its staleness.
     fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<PrStatusRow>>>;
+
+    /// Cached CI run history, filled from the provider only on a cache miss.
+    fn ci_runs<'a>(
+        &'a self,
+        _worktree: &'a str,
+        _limit: usize,
+    ) -> BoxFuture<'a, ControlResult<CiRunsReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("CI runs are not available")) })
+    }
+
+    /// One bounded CI job-log entry, filled from the provider only on a cache
+    /// miss. `tail_lines` may narrow an already cached entry.
+    fn ci_logs<'a>(
+        &'a self,
+        _worktree: &'a str,
+        _run_id: &'a str,
+        _job_id: &'a str,
+        _tail_lines: Option<usize>,
+    ) -> BoxFuture<'a, ControlResult<CiLogsReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("CI logs are not available")) })
+    }
 
     /// Push a notification into the tray (the `notify.push` verb). Returns
     /// the stored notification's row id.

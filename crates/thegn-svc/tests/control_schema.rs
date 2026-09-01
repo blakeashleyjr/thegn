@@ -39,6 +39,8 @@ fn wire_schema() -> serde_json::Value {
         RecordStatus,
         GitFileStatus,
         PrStatusRow,
+        CiRunsReply,
+        CiLogsReply,
         PushedNote,
         WorktreeCreateReq,
         DispatchPutReq,

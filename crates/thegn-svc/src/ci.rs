@@ -20,6 +20,17 @@ use thegn_core::ci::{
 use thegn_core::config::{CiConfig, CiProviderKind};
 use thegn_core::remote::GitLoc;
 
+use std::collections::VecDeque;
+use std::io::Read;
+use std::process::{Command, Stdio};
+
+/// Provider-side bounds are deliberately finite even before the host applies
+/// the user's cache policy.  This protects the blocking provider lane from a
+/// job that emits an unbounded log (the configured, usually smaller, bounds
+/// are applied again by the cache-facing read paths).
+const PROVIDER_LOG_MAX_LINES: usize = 2_000;
+const PROVIDER_LOG_MAX_BYTES: usize = 1024 * 1024;
+
 /// A CI/CD backend for one provider. Read methods first; mutations are
 /// capability-gated via [`Self::caps`] so a provider can decline what it can't do.
 ///
@@ -158,6 +169,127 @@ fn run_cli(cmd: &mut std::process::Command) -> Result<String, CiError> {
     }
 }
 
+/// Run a log-producing command while retaining only its newest complete lines.
+///
+/// `Command::output` is unsuitable for CI logs: it buffers the complete child
+/// stdout before the caller can impose a cap.  Drain stdout in a fixed-size
+/// reader instead and keep a bounded deque; stderr is drained concurrently so
+/// a noisy failed provider cannot deadlock the child.  The status and error
+/// classification remain identical to [`run_cli`].
+fn run_bounded_log(cmd: &mut Command) -> Result<CiLog, CiError> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CiError::Other(e.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CiError::Other("provider stdout was not piped".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CiError::Other("provider stderr was not piped".into()))?;
+
+    let out_thread = std::thread::spawn(|| collect_log(stdout));
+    let err_thread = std::thread::spawn(|| read_stderr(stderr));
+    let status = child.wait().map_err(|e| CiError::Other(e.to_string()))?;
+    let (text, truncated) = out_thread
+        .join()
+        .map_err(|_| CiError::Other("provider log reader panicked".into()))??;
+    let stderr = err_thread
+        .join()
+        .map_err(|_| CiError::Other("provider stderr reader panicked".into()))?;
+    if !status.success() {
+        return Err(classify_stderr(&stderr));
+    }
+    Ok(CiLog { text, truncated })
+}
+
+/// Read at most a fixed number of bytes per chunk and discard old complete
+/// lines as new output arrives.  An over-sized line is discarded rather than
+/// allowing one pathological line to defeat the byte ceiling.
+fn collect_log<R: Read>(mut reader: R) -> Result<(String, bool), CiError> {
+    let mut bytes = [0u8; 8192];
+    let mut line = Vec::new();
+    let mut lines: VecDeque<String> = VecDeque::new();
+    let mut kept_bytes = 0usize;
+    let mut truncated = false;
+    let mut discard_line = false;
+
+    loop {
+        let n = reader
+            .read(&mut bytes)
+            .map_err(|e| CiError::Other(e.to_string()))?;
+        if n == 0 {
+            if !line.is_empty() && !discard_line {
+                push_log_line(&mut lines, &mut kept_bytes, &line, &mut truncated);
+            }
+            break;
+        }
+        for &byte in &bytes[..n] {
+            if discard_line {
+                if byte == b'\n' {
+                    discard_line = false;
+                    truncated = true;
+                }
+                continue;
+            }
+            line.push(byte);
+            if line.len() > PROVIDER_LOG_MAX_BYTES {
+                line.clear();
+                discard_line = true;
+                truncated = true;
+            } else if byte == b'\n' {
+                push_log_line(&mut lines, &mut kept_bytes, &line, &mut truncated);
+                line.clear();
+            }
+        }
+    }
+
+    Ok((lines.into_iter().collect(), truncated))
+}
+
+fn push_log_line(
+    lines: &mut VecDeque<String>,
+    kept_bytes: &mut usize,
+    line: &[u8],
+    truncated: &mut bool,
+) {
+    let Ok(line) = std::str::from_utf8(line) else {
+        *truncated = true;
+        return;
+    };
+    let len = line.len();
+    if len > PROVIDER_LOG_MAX_BYTES {
+        *truncated = true;
+        return;
+    }
+    lines.push_back(line.to_owned());
+    *kept_bytes += len;
+    while lines.len() > PROVIDER_LOG_MAX_LINES || *kept_bytes > PROVIDER_LOG_MAX_BYTES {
+        if let Some(old) = lines.pop_front() {
+            *kept_bytes -= old.len();
+            *truncated = true;
+        }
+    }
+}
+
+fn read_stderr<R: Read>(mut reader: R) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = reader.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        if bytes.len() < 64 * 1024 {
+            let take = n.min(64 * 1024 - bytes.len());
+            bytes.extend_from_slice(&chunk[..take]);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn nonempty(s: &serde_json::Value, key: &str) -> Option<String> {
     s.get(key)
         .and_then(|v| v.as_str())
@@ -225,11 +357,7 @@ impl CiProvider for GithubCi {
 
     fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         // `gh run view --job <id> --log` (job ids are globally addressable).
-        let text = run_cli(&mut loc.gh_command(&["run", "view", "--job", job_id, "--log"]))?;
-        Ok(CiLog {
-            text,
-            truncated: false,
-        })
+        run_bounded_log(&mut loc.gh_command(&["run", "view", "--job", job_id, "--log"]))
     }
 
     fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
@@ -443,14 +571,10 @@ impl CiProvider for GitlabCi {
 
     fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
-        let text = run_cli(&mut loc.cli_command(
+        run_bounded_log(&mut loc.cli_command(
             "glab",
             &["api", &format!("projects/{proj}/jobs/{job_id}/trace")],
-        ))?;
-        Ok(CiLog {
-            text,
-            truncated: false,
-        })
+        ))
     }
 
     fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {

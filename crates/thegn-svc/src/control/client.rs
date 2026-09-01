@@ -19,7 +19,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
-use super::{OpenSpec, RecordStatus, SessionInfo};
+use super::{CiLogsReply, CiRunsReply, OpenSpec, RecordStatus, SessionInfo};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
@@ -298,6 +298,37 @@ impl ControlClient {
         Ok(serde_json::from_value(
             v.get("prs").cloned().unwrap_or(Value::Array(vec![])),
         )?)
+    }
+
+    /// `GET /v1/ci/runs` — cache-first CI run history for a worktree.
+    pub async fn ci_runs(&self, worktree: &str, limit: Option<usize>) -> Result<CiRunsReply> {
+        let mut path = format!("/v1/ci/runs?worktree={}", query_escape(worktree));
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        let value = self.request("GET", &path, None).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `GET /v1/ci/logs` — one bounded, redacted job-log projection.
+    pub async fn ci_logs(
+        &self,
+        worktree: &str,
+        run_id: &str,
+        job_id: &str,
+        tail_lines: Option<usize>,
+    ) -> Result<CiLogsReply> {
+        let mut path = format!(
+            "/v1/ci/logs?worktree={}&run={}&job={}",
+            query_escape(worktree),
+            query_escape(run_id),
+            query_escape(job_id),
+        );
+        if let Some(tail_lines) = tail_lines {
+            path.push_str(&format!("&tail_lines={tail_lines}"));
+        }
+        let value = self.request("GET", &path, None).await?;
+        Ok(serde_json::from_value(value)?)
     }
 
     /// `POST /v1/notify` — push a notification into the tray. Returns the
@@ -604,6 +635,21 @@ impl ControlClient {
             control: ctrl_tx,
         })
     }
+}
+
+/// Encode a query component without pulling URL policy into the core crate.
+/// Paths and ids normally contain only safe ASCII, but worktree names can
+/// contain spaces and the control endpoint must remain unambiguous there.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 type Ws<S> = tokio_tungstenite::WebSocketStream<S>;

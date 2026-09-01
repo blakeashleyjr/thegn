@@ -40,14 +40,18 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeFlag,
     },
-    /// A job's log ("why did it fail") with a jump-to-failure marker.
-    Log {
+    /// A job's cached log ("why did it fail") with a jump-to-failure marker.
+    #[command(alias = "log")]
+    Logs {
         /// The run id (needed by providers whose job ids aren't global).
         run_id: String,
         /// The job id.
         job_id: String,
         #[command(flatten)]
         target: super::target::WorktreeFlag,
+        /// Emit one JSON object instead of human-readable log text.
+        #[arg(long)]
+        json: bool,
     },
     /// Re-run a run (`--failed` for only the failed jobs).
     Rerun {
@@ -87,11 +91,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             json,
         } => runs(cfg, target.worktree, branch, limit, json),
         Action::View { run_id, target } => view(cfg, target.worktree, &run_id),
-        Action::Log {
+        Action::Logs {
             run_id,
             job_id,
             target,
-        } => log(cfg, target.worktree, &run_id, &job_id),
+            json,
+        } => log(cfg, target.worktree, &run_id, &job_id, json),
         Action::Rerun {
             run_id,
             target,
@@ -252,27 +257,113 @@ fn print_job(j: &CiJob) {
     }
 }
 
-fn log(cfg: &Config, worktree: Option<String>, run_id: &str, job_id: &str) -> Result<()> {
-    let (loc, client) = client(cfg, worktree)?;
-    match client.logs(&loc, run_id, job_id) {
-        Ok(mut log) => {
-            // Apply the configured tail cap.
-            let cap = cfg.ci.log_tail_lines;
-            let lines: Vec<&str> = log.text.lines().collect();
-            if cap > 0 && lines.len() > cap {
-                log.text = lines[lines.len() - cap..].join("\n");
-                log.truncated = true;
+fn log(
+    cfg: &Config,
+    worktree: Option<String>,
+    run_id: &str,
+    job_id: &str,
+    json_out: bool,
+) -> Result<()> {
+    let wt = resolve_worktree(worktree);
+    let key = GitLoc::worktree_cache_key(&wt);
+    let cached = Db::open()
+        .ok()
+        .and_then(|db| db.get_ci_log(&key, run_id, job_id).ok().flatten());
+    let entry = if let Some(mut entry) = cached {
+        // Cache rows have already been redacted and bounded. Re-apply the
+        // configured policy so a later config change cannot widen a response.
+        let (text, truncated) = thegn_core::ci_log::bounded_tail(
+            &entry.text,
+            cfg.ci
+                .log_tail_lines
+                .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+            cfg.ci
+                .log_max_bytes
+                .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+        );
+        entry.text = text;
+        entry.truncated |= truncated;
+        Some((entry, "cache"))
+    } else {
+        None
+    };
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            let (loc, provider) = match client(cfg, Some(wt.to_string_lossy().into_owned())) {
+                Ok(value) => value,
+                Err(error) if json_out => {
+                    msg::warn(&format!("ci: {error}"));
+                    return super::emit_json(&serde_json::json!({ "error": error.to_string() }));
+                }
+                Err(error) => return Err(error),
+            };
+            let detail = provider.run_detail(&loc, run_id).ok();
+            let (job_name, head_sha) = detail
+                .as_ref()
+                .and_then(|run| {
+                    run.jobs
+                        .iter()
+                        .find(|job| job.id == job_id)
+                        .map(|job| (job.name.clone(), run.sha.clone()))
+                })
+                .unwrap_or_default();
+            let raw = match provider.logs(&loc, run_id, job_id) {
+                Ok(raw) => raw,
+                Err(error) if json_out => {
+                    msg::warn(&format!("ci: {error}"));
+                    return super::emit_json(&serde_json::json!({ "error": error.to_string() }));
+                }
+                Err(error) => return Err(anyhow::anyhow!("ci: {error}")),
+            };
+            let mut entry = thegn_core::ci_log::CiLogEntry::new(
+                key.clone(),
+                run_id,
+                job_id,
+                job_name,
+                &raw.text,
+                cfg.ci
+                    .log_tail_lines
+                    .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                cfg.ci
+                    .log_max_bytes
+                    .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                thegn_core::util::now(),
+            );
+            entry.truncated |= raw.truncated;
+            entry.head_sha = head_sha;
+            if cfg.ci.log_cache_runs > 0
+                && let Ok(db) = Db::open()
+            {
+                let _ = db.put_ci_log(&entry);
             }
-            if log.truncated {
-                outln!("… (showing last {} lines)", cfg.ci.log_tail_lines);
-            }
-            if let Some(n) = log.first_failure_line() {
-                outln!(">> first failure at line {}", n + 1);
-            }
-            outln!("{}", log.text);
+            (entry, "provider")
         }
-        Err(e) => outln!("ci: {e}"),
+    };
+    let (entry, source) = entry;
+    if json_out {
+        return super::emit_json(&serde_json::json!({
+            "worktree": entry.worktree,
+            "run_id": entry.run_id,
+            "job_id": entry.job_id,
+            "logs": [entry.clone()],
+            "source": source,
+            "fetched_at": entry.fetched_at,
+            "truncated": entry.truncated,
+            "redacted": entry.redacted,
+        }));
     }
+    if entry.truncated {
+        outln!("… (showing last {} lines)", cfg.ci.log_tail_lines);
+    }
+    let log = thegn_core::ci::CiLog {
+        text: entry.text.clone(),
+        truncated: entry.truncated,
+    };
+    if let Some(n) = log.first_failure_line() {
+        outln!(">> first failure at line {}", n + 1);
+    }
+    outln!("{}", entry.text);
     Ok(())
 }
 

@@ -205,7 +205,7 @@ fn authed(state: &ControlState, headers: &HeaderMap, verb: Verb) -> Result<AuthC
 /// pairing id) for the audit record. Every mutating verb (write/git/admin) and
 /// every auth/scope rejection emits one record on `thegn::control::audit`.
 #[allow(clippy::result_large_err)]
-fn authed_target(
+pub(super) fn authed_target(
     state: &ControlState,
     headers: &HeaderMap,
     verb: Verb,
@@ -242,6 +242,11 @@ fn authed_target(
         audit(&ctx, verb, target, AuditOutcome::Ok);
     }
     Ok(ctx)
+}
+
+/// Small adapter helper shared by the split-out CI handlers.
+pub(super) fn bad_request(message: &str) -> Response {
+    error_json(StatusCode::BAD_REQUEST, message)
 }
 
 /// Emit one audit record for an authenticated caller.
