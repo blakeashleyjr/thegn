@@ -26,6 +26,7 @@ use crate::agent::{ProvisionState, ProvisionStepView};
 /// Marker inside the container `$HOME`: the per-container pipeline ran.
 /// (Volumes/images dedup the heavy parts; this only skips the cheap replay.)
 const MARKER: &str = ".thegn-host-provisioned";
+const TOOLCHAIN_PROVIDER_STEP: &str = "toolchain_provider";
 
 /// Run the host-backed per-worktree pipeline. Returns the pane-entry init
 /// line when the repo landed on the synthesized-devshell tier (`None` when
@@ -98,15 +99,11 @@ pub(crate) fn provision_worktree_on_host(
         runner.exec_in_container(&container, &marker_probe, secs(30)),
         Ok((true, ref out, _)) if out.contains("HAVE")
     );
-    let detect_cmd = format!(
-        "cd {} 2>/dev/null; {}",
-        thegn_core::util::sh_quote(worktree),
-        envplan::DETECT_PROBE_SCRIPT
-    );
-    let req = match runner.exec_in_container(&container, &detect_cmd, secs(60)) {
-        Ok((true, out, _)) => envplan::detect_from_probe(&out),
-        _ => envplan::detect_from_probe(""),
-    };
+    let (req, detect_error) =
+        match crate::mise_provider::detect_on_target(runner, &container, worktree) {
+            Ok(req) => (req, None),
+            Err(reason) => (envplan::detect_from_probe(""), Some(reason)),
+        };
 
     // 4. The plan: toolchain tier + personal layer; no clone/workspace (the
     //    worktree is already there), no provider-only steps.
@@ -130,6 +127,22 @@ pub(crate) fn provision_worktree_on_host(
         ..envplan::PlanOpts::default()
     };
     let mut plan = envplan::plan(&req, &opts);
+    // `envplan` intentionally contains no vendor command. A ToolVersions tier
+    // therefore gets a typed-in-practice provider step here, after target
+    // detection and before personal files. A detection failure is retained as
+    // a visible failed step instead of silently dropping the declared tier.
+    if (plan.tier == envplan::Tier::ToolVersions && !req.toolchain_files.is_empty())
+        || detect_error.is_some()
+    {
+        plan.steps.insert(
+            1,
+            envplan::ProvisionStep {
+                id: TOOLCHAIN_PROVIDER_STEP.into(),
+                label: "Install declared toolchain".into(),
+                kind: StepKind::Exec(String::new()),
+            },
+        );
+    }
     // Trust-gated devcontainer steps, appended after the toolchain tier and
     // covered by the same provision marker (so they run exactly once):
     //   1. feature installs (ordered), then
@@ -166,81 +179,96 @@ pub(crate) fn provision_worktree_on_host(
     for (i, step) in plan.steps.iter().enumerate() {
         views[i].state = ProvisionState::Active;
         progress(&views);
-        let result: Result<(), String> = match &step.kind {
-            StepKind::Exec(script) => {
-                let timeout = crate::agent::provision_step_timeout(&step.id);
-                match runner.exec_in_container(&container, script, timeout) {
-                    Ok((true, _, _)) => Ok(()),
-                    Ok((false, _, err)) => Err(err.lines().last().unwrap_or("failed").to_string()),
-                    Err(e) => Err(e),
-                }
-            }
-            StepKind::Dotfiles(names) => stage_and_push(runner, &container, &home, |staging| {
-                for name in names {
-                    let src = host_home.join(name);
-                    if let Ok(data) = std::fs::read(&src) {
-                        let dst = staging.join(name);
-                        if let Some(parent) = dst.parent() {
-                            let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
+        let result: Result<(), String> = if step.id == TOOLCHAIN_PROVIDER_STEP {
+            detect_error.clone().map_or_else(
+                || {
+                    crate::mise_provider::install_on_target(
+                        cfg, worktree, worktree, &repo_root, runner, &container, &req,
+                    )
+                },
+                Err,
+            )
+        } else {
+            match &step.kind {
+                StepKind::Exec(script) => {
+                    let timeout = crate::agent::provision_step_timeout(&step.id);
+                    match runner.exec_in_container(&container, script, timeout) {
+                        Ok((true, _, _)) => Ok(()),
+                        Ok((false, _, err)) => {
+                            Err(err.lines().last().unwrap_or("failed").to_string())
                         }
-                        let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
+                        Err(e) => Err(e),
                     }
                 }
-            }),
-            StepKind::AgentConfigs(ids) => stage_and_push(runner, &container, &home, |staging| {
-                for id in ids {
-                    let (dirs, files) = envplan::agent_config_paths(id);
-                    for rel in dirs {
-                        let src = host_home.join(&rel);
-                        if !src.is_dir() {
-                            continue;
-                        }
-                        for (abs, inner, _exec) in
-                            crate::agent_configs::collect_agent_config_files(&src)
-                        {
-                            let dst = staging.join(&rel).join(&inner);
-                            if let Some(parent) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-                            }
-                            let _ = std::fs::copy(&abs, &dst); // best-effort: staging: a missing file fails the install step below with a visible error
-                        }
-                    }
-                    for rel in files {
-                        let src = host_home.join(&rel);
+                StepKind::Dotfiles(names) => stage_and_push(runner, &container, &home, |staging| {
+                    for name in names {
+                        let src = host_home.join(name);
                         if let Ok(data) = std::fs::read(&src) {
-                            let dst = staging.join(&rel);
+                            let dst = staging.join(name);
                             if let Some(parent) = dst.parent() {
                                 let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
                             }
                             let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
                         }
                     }
-                }
-            }),
-            StepKind::AtuinSync => stage_and_push(runner, &container, &home, |staging| {
-                for rel in [
-                    ".config/atuin/config.toml",
-                    ".local/share/atuin/key",
-                    ".local/share/atuin/session",
-                ] {
-                    let src = host_home.join(rel);
-                    if let Ok(data) = std::fs::read(&src) {
-                        let dst = staging.join(rel);
-                        if let Some(parent) = dst.parent() {
-                            let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
+                }),
+                StepKind::AgentConfigs(ids) => {
+                    stage_and_push(runner, &container, &home, |staging| {
+                        for id in ids {
+                            let (dirs, files) = envplan::agent_config_paths(id);
+                            for rel in dirs {
+                                let src = host_home.join(&rel);
+                                if !src.is_dir() {
+                                    continue;
+                                }
+                                for (abs, inner, _exec) in
+                                    crate::agent_configs::collect_agent_config_files(&src)
+                                {
+                                    let dst = staging.join(&rel).join(&inner);
+                                    if let Some(parent) = dst.parent() {
+                                        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
+                                    }
+                                    let _ = std::fs::copy(&abs, &dst); // best-effort: staging: a missing file fails the install step below with a visible error
+                                }
+                            }
+                            for rel in files {
+                                let src = host_home.join(&rel);
+                                if let Ok(data) = std::fs::read(&src) {
+                                    let dst = staging.join(&rel);
+                                    if let Some(parent) = dst.parent() {
+                                        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
+                                    }
+                                    let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
+                                }
+                            }
                         }
-                        let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
-                    }
+                    })
                 }
-            }),
-            // Provider-only machinery: no meaning on a plain OCI host.
-            StepKind::Checkpoint
-            | StepKind::HomeClosurePush(_)
-            | StepKind::DevShellClosurePush
-            | StepKind::LocalParity { .. }
-            | StepKind::SnapshotRestore { .. } => {
-                tracing::debug!(target: "thegn::host", step = %step.id, "skipped (provider-only)");
-                Ok(())
+                StepKind::AtuinSync => stage_and_push(runner, &container, &home, |staging| {
+                    for rel in [
+                        ".config/atuin/config.toml",
+                        ".local/share/atuin/key",
+                        ".local/share/atuin/session",
+                    ] {
+                        let src = host_home.join(rel);
+                        if let Ok(data) = std::fs::read(&src) {
+                            let dst = staging.join(rel);
+                            if let Some(parent) = dst.parent() {
+                                let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
+                            }
+                            let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
+                        }
+                    }
+                }),
+                // Provider-only machinery: no meaning on a plain OCI host.
+                StepKind::Checkpoint
+                | StepKind::HomeClosurePush(_)
+                | StepKind::DevShellClosurePush
+                | StepKind::LocalParity { .. }
+                | StepKind::SnapshotRestore { .. } => {
+                    tracing::debug!(target: "thegn::host", step = %step.id, "skipped (provider-only)");
+                    Ok(())
+                }
             }
         };
         match result {
