@@ -61,9 +61,10 @@ pub(crate) fn ci_fmt_secs(s: i64) -> String {
 
 /// The drilled CI view's title: `CI ▸ <name> #<run>`.
 fn ci_drill_title(run: &thegn_core::ci::CiRun) -> String {
+    let arrow = crate::caps::active_glyphs().arrow_right;
     match run.run_number {
-        Some(n) => format!("CI \u{25b8} {} #{n}", run.name),
-        None => format!("CI \u{25b8} {}", run.name),
+        Some(n) => format!("CI {arrow} {} #{n}", run.name),
+        None => format!("CI {arrow} {}", run.name),
     }
 }
 
@@ -205,7 +206,8 @@ impl DetailOverlay {
                 log_entries
                     .iter()
                     .flat_map(|entry| {
-                        let heading = format!("── {} ──", entry.job_name);
+                        let hline = crate::caps::active_glyphs().box_h;
+                        let heading = format!("{hline}{hline} {} {hline}{hline}", entry.job_name);
                         std::iter::once(heading)
                             .chain(entry.text.lines().map(str::to_string))
                             .collect::<Vec<_>>()
