@@ -46,6 +46,19 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             g(),
             "no environments — palette → ＋ New environment…",
         )])));
+        if let Some(toolchain) = &ctx.model.panel.toolchain {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                "WORKTREE TOOLCHAIN",
+            )])));
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                format!(
+                    "{} · {} · {}",
+                    toolchain.provider, toolchain.tier, toolchain.state
+                ),
+            )])));
+        }
         return rows;
     }
     // Each env row carries a `Row` hit so the enumerate index lines up with
@@ -78,5 +91,14 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("x", "remove"),
         ("n", "new…"),
     ]));
+    if let Some(toolchain) = &ctx.model.panel.toolchain {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            d(),
+            format!(
+                "WORKTREE TOOLCHAIN  {} · {} · {}",
+                toolchain.provider, toolchain.tier, toolchain.state
+            ),
+        )])));
+    }
     rows
 }
