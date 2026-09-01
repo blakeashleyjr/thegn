@@ -563,9 +563,8 @@ impl ControlApi for DaemonService {
                 },
             )
             .await
-            .map_err(|error| {
+            .inspect_err(|_| {
                 crate::automation_runtime::clear_session_origin(&id);
-                error
             })?;
 
             // Ask a running compositor to graft this session into a real pane.
