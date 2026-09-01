@@ -302,8 +302,11 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
         &self,
         loc: &GitLoc,
         paths: &[String],
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
     ) -> Result<Vec<thegn_core::submodule::SubmoduleConflict>> {
-        submodule::conflicts(loc, paths)
+        submodule::conflicts(loc, paths, base, ours, theirs)
     }
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>>;
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;

@@ -272,7 +272,7 @@ impl PrView {
             PrTab::Conversation => self.conv_rows().len(),
             PrTab::Files => match self.open_file {
                 None => self.diff.as_ref().map_or(0, |d| d.files.len()),
-                Some(i) => self.open_file_lines(i).len(),
+                Some(i) => self.file_row_count(i),
             },
         }
     }
@@ -299,8 +299,23 @@ impl PrView {
         self.diff
             .as_ref()
             .and_then(|d| d.files.get(i))
+            .filter(|f| !f.is_submodule)
             .map(|f| f.hunks.iter().flat_map(|h| &h.lines).collect())
             .unwrap_or_default()
+    }
+
+    fn file_row_count(&self, i: usize) -> usize {
+        self.diff
+            .as_ref()
+            .and_then(|d| d.files.get(i))
+            .map(|f| {
+                if f.is_submodule {
+                    1
+                } else {
+                    self.open_file_lines(i).len()
+                }
+            })
+            .unwrap_or(0)
     }
 
     fn switch_tab(&mut self, tab: PrTab) {
@@ -473,6 +488,15 @@ impl PrView {
                     // 'c' is claimed globally as PR-comment above; only reached
                     // for line comments when a file is open. Anchor to the
                     // selected new-side line.
+                    if self
+                        .diff
+                        .as_ref()
+                        .and_then(|d| d.files.get(fi))
+                        .is_some_and(|f| f.is_submodule)
+                    {
+                        self.status = Some("submodule pointers are atomic".into());
+                        return PrViewOutcome::Pending;
+                    }
                     let lines = self.open_file_lines(fi);
                     let path = self
                         .diff
@@ -934,17 +958,19 @@ impl PrView {
             None => {
                 for (i, f) in diff.files.iter().enumerate() {
                     let selected = i == self.sel;
-                    let (adds, dels) = file_stat(f);
+                    let stats = if f.is_submodule {
+                        format!("{} pointer", crate::caps::active_glyphs().submodule)
+                    } else {
+                        let (adds, dels) = file_stat(f);
+                        format!("+{adds} -{dels}")
+                    };
                     out.push((
                         Line::split(
                             vec![
                                 seg(Tok::Slot(S::Faint), sel_marker(selected)),
                                 seg(Tok::Slot(S::Text), f.path.clone()),
                             ],
-                            vec![
-                                seg(Tok::Hue(thegn_core::theme::Hue::Green), format!("+{adds} ")),
-                                seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
-                            ],
+                            vec![seg(Tok::Slot(S::Dim), stats)],
                         ),
                         selected,
                     ));
@@ -956,19 +982,24 @@ impl PrView {
                         Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
                         false,
                     ));
-                    let mut li = 0usize; // index into flattened selectable lines
-                    for h in &f.hunks {
-                        out.push((
-                            Line::segs(vec![seg(
-                                Tok::Hue(thegn_core::theme::Hue::Teal),
-                                trunc(&h.header, cols),
-                            )]),
-                            false,
-                        ));
-                        for dl in &h.lines {
-                            let selected = li == self.sel;
-                            out.push((diff_line(dl, selected, cols), selected));
-                            li += 1;
+                    if f.is_submodule {
+                        let selected = self.sel == 0;
+                        out.push((submodule_line(f, selected, cols), selected));
+                    } else {
+                        let mut li = 0usize; // index into flattened selectable lines
+                        for h in &f.hunks {
+                            out.push((
+                                Line::segs(vec![seg(
+                                    Tok::Hue(thegn_core::theme::Hue::Teal),
+                                    trunc(&h.header, cols),
+                                )]),
+                                false,
+                            ));
+                            for dl in &h.lines {
+                                let selected = li == self.sel;
+                                out.push((diff_line(dl, selected, cols), selected));
+                                li += 1;
+                            }
                         }
                     }
                 }
@@ -1042,6 +1073,9 @@ fn review_tone(state: &str) -> Tok {
 }
 
 pub(crate) fn file_stat(f: &DiffFile) -> (usize, usize) {
+    if f.is_submodule {
+        return (0, 0);
+    }
     let mut adds = 0;
     let mut dels = 0;
     for h in &f.hunks {
@@ -1054,6 +1088,49 @@ pub(crate) fn file_stat(f: &DiffFile) -> (usize, usize) {
         }
     }
     (adds, dels)
+}
+
+fn submodule_diff(f: &DiffFile) -> thegn_core::submodule::SubmoduleDiff {
+    let mut old_sha = String::new();
+    let mut new_sha = String::new();
+    for line in f.hunks.iter().flat_map(|h| &h.lines) {
+        let Some(sha) = line.text.strip_prefix("Subproject commit ") else {
+            continue;
+        };
+        match line.kind {
+            DiffLineKind::Del => old_sha = sha.trim().to_string(),
+            DiffLineKind::Add => new_sha = sha.trim().to_string(),
+            DiffLineKind::Context => {}
+        }
+    }
+    let kind = if old_sha.is_empty() {
+        thegn_core::submodule::SubmoduleDiffKind::Added
+    } else if new_sha.is_empty() {
+        thegn_core::submodule::SubmoduleDiffKind::Deleted
+    } else {
+        thegn_core::submodule::SubmoduleDiffKind::Changed
+    };
+    thegn_core::submodule::SubmoduleDiff {
+        path: f.path.clone(),
+        old_sha,
+        new_sha,
+        kind,
+    }
+}
+
+pub(crate) fn submodule_line(f: &DiffFile, selected: bool, cols: usize) -> Line {
+    let diff = submodule_diff(f);
+    let text = thegn_core::submodule::SubmoduleRowPolicy::format_pointer(
+        crate::caps::active_glyphs().submodule,
+        crate::caps::active_glyphs().arrow_right,
+        &diff,
+        None,
+        None,
+    );
+    Line::segs(vec![
+        seg(Tok::Slot(S::Faint), sel_marker(selected)),
+        seg(Tok::Slot(S::Text), trunc(&text, cols)),
+    ])
 }
 
 pub(crate) fn diff_line(dl: &DiffLine, selected: bool, cols: usize) -> Line {
@@ -1294,6 +1371,56 @@ mod tests {
             v.handle_key(&KeyCode::Escape, Modifiers::NONE),
             PrViewOutcome::Close
         );
+    }
+
+    #[test]
+    fn submodule_file_is_one_atomic_non_commentable_row() {
+        let mut v = sample();
+        v.diff = Some(PrDiff {
+            files: vec![DiffFile {
+                path: "vendor/lib".into(),
+                old_path: Some("vendor/lib".into()),
+                is_submodule: true,
+                hunks: vec![thegn_core::forge::model::DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![
+                        DiffLine {
+                            kind: DiffLineKind::Del,
+                            text: "Subproject commit aaaaaaa".into(),
+                            old_lineno: None,
+                            new_lineno: None,
+                        },
+                        DiffLine {
+                            kind: DiffLineKind::Add,
+                            text: "Subproject commit bbbbbbb".into(),
+                            old_lineno: None,
+                            new_lineno: None,
+                        },
+                    ],
+                }],
+            }],
+        });
+        v.switch_tab(PrTab::Files);
+        assert_eq!(v.row_count(), 1);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.row_count(), 1);
+        let body = v.files_body(80);
+        let rendered = body
+            .iter()
+            .map(|(line, _)| format!("{line:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("vendor/lib"));
+        assert!(rendered.contains("aaaaaaa"));
+        assert!(rendered.contains("bbbbbbb"));
+        assert!(!rendered.contains("Subproject commit"));
+
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('c'), Modifiers::NONE),
+            PrViewOutcome::Pending
+        );
+        assert_eq!(v.status.as_deref(), Some("submodule pointers are atomic"));
+        assert!(v.composer.is_none());
     }
 
     #[test]
