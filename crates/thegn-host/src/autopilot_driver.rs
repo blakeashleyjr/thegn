@@ -59,7 +59,7 @@ pub(crate) fn pickup(
                 continue;
             }
         };
-        drive_claim(&db, cfg, &policy, repo_root, cwd, issue, claim.id);
+        drive_claim(&db, cfg, &policy, repo_root, cwd, account, issue, claim.id);
     }
 }
 
@@ -69,6 +69,7 @@ fn drive_claim(
     policy: &AutopilotConfig,
     repo_root: &Path,
     cwd: &Path,
+    account: &str,
     issue: &Issue,
     run_id: i64,
 ) {
@@ -142,7 +143,7 @@ fn drive_claim(
 
     // This edge is best-effort and never releases the durable claim.  A
     // provider outage must leave the run visible for a human to inspect.
-    let tracker_cfg = cfg.repo_issues(Some(repo_root));
+    let tracker_cfg = tracker_config_for_account(cfg, repo_root, account);
     let router = thegn_svc::issue::IssueRouter::from_config_at(&tracker_cfg, Some(cwd));
     if router.is_configured()
         && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -369,6 +370,24 @@ fn drive_claim(
     }
 }
 
+/// Keep writes routed to the same named tracker account that supplied the
+/// issue. `IssueRouter::update_issue` selects the first backend for a provider
+/// when several accounts share it, so an unfiltered router could update a
+/// different account's issue with the same provider/key.
+fn tracker_config_for_account(
+    cfg: &Config,
+    repo_root: &Path,
+    account: &str,
+) -> thegn_core::config::IssuesConfig {
+    let mut tracker_cfg = cfg.repo_issues(Some(repo_root));
+    if !tracker_cfg.issue_accounts.is_empty() {
+        tracker_cfg
+            .issue_accounts
+            .retain(|entry| entry.name == account);
+    }
+    tracker_cfg
+}
+
 fn worker_failure(current: &str, expected: &str, clean: bool, ahead: u64) -> String {
     format!(
         "worker result rejected: branch={current:?} expected={expected:?}, clean={clean}, commits_ahead={ahead}"
@@ -396,7 +415,8 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
     };
     let policy = cfg.repo_autopilot(repo_root);
     if policy.done_on_merge {
-        let router = thegn_svc::issue::IssueRouter::from_config_at(&cfg.issues, Some(repo_root));
+        let tracker_cfg = tracker_config_for_account(cfg, repo_root, &run.key.account);
+        let router = thegn_svc::issue::IssueRouter::from_config_at(&tracker_cfg, Some(repo_root));
         if router.is_configured()
             && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
