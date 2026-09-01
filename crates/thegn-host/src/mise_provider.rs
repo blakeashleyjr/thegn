@@ -13,6 +13,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+use termwiz::terminal::TerminalWaker;
+use tokio::sync::mpsc::UnboundedSender;
+
 use thegn_core::bundle::ResolvedEnv;
 use thegn_core::config::Config;
 use thegn_core::config_resolve::GatedRequest;
@@ -39,6 +43,45 @@ struct CachedActivation {
     identity: ConfigSetIdentity,
     path_entries: Vec<String>,
     env: Vec<(String, String)>,
+    #[serde(default)]
+    missing_tools: Vec<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedRemote {
+    key: String,
+    /// The probe is name-only output from `DETECT_PROBE_SCRIPT`; it contains
+    /// no target file contents or resolved environment values.
+    probe: String,
+    identity: Option<ConfigSetIdentity>,
+    binary: bool,
+    shims: Option<String>,
+    layer: Option<CachedLayer>,
+    #[serde(default)]
+    missing_tools: Vec<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedLayer {
+    path_entries: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+impl CachedLayer {
+    fn from_layer(layer: &ActivationLayer) -> Self {
+        Self {
+            path_entries: layer.path_entries.clone(),
+            env: layer.env.clone(),
+        }
+    }
+
+    fn into_layer(self) -> ActivationLayer {
+        ActivationLayer::ready(ORIGIN, self.path_entries, self.env)
+    }
 }
 
 fn cache_dir() -> PathBuf {
@@ -49,9 +92,87 @@ fn cache_path(identity: &ConfigSetIdentity) -> PathBuf {
     cache_dir().join(format!("{}.json", identity.hash))
 }
 
+fn remote_cache_key(worktree: &str, loc: &GitLoc) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(worktree.as_bytes());
+    hasher.update([0]);
+    match loc {
+        GitLoc::Local(path) => {
+            hasher.update(b"local\0");
+            hasher.update(path.to_string_lossy().as_bytes());
+        }
+        GitLoc::Remote { ssh, path } => {
+            hasher.update(b"ssh\0");
+            hasher.update(ssh.host.as_bytes());
+            hasher.update([0]);
+            hasher.update(ssh.port.to_string().as_bytes());
+            hasher.update([0]);
+            hasher.update(path.as_bytes());
+            hasher.update([0]);
+            hasher.update(ssh.ssh_config.as_deref().unwrap_or_default().as_bytes());
+            hasher.update([0]);
+            hasher.update(ssh.jump_host.as_deref().unwrap_or_default().as_bytes());
+            hasher.update([0]);
+            hasher.update(ssh.identity.as_deref().unwrap_or_default().as_bytes());
+            hasher.update([0]);
+            for arg in &ssh.extra_args {
+                hasher.update(arg.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        GitLoc::Provider {
+            control_prefix,
+            path,
+        } => {
+            hasher.update(b"provider\0");
+            for arg in control_prefix {
+                hasher.update(arg.as_bytes());
+                hasher.update([0]);
+            }
+            hasher.update(path.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn remote_cache_path(worktree: &str, loc: &GitLoc) -> PathBuf {
+    cache_dir().join(format!("remote-{}.json", remote_cache_key(worktree, loc)))
+}
+
 fn in_flight() -> &'static Mutex<BTreeSet<String>> {
     static KEYS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     KEYS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+struct RefreshTarget {
+    tx: UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+}
+
+fn refresh_target() -> &'static Mutex<Option<RefreshTarget>> {
+    static TARGET: OnceLock<Mutex<Option<RefreshTarget>>> = OnceLock::new();
+    TARGET.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the compositor's existing model-refresh sink. Resolution workers
+/// use this same channel as every other off-loop producer; the provider never
+/// owns or creates a second event-loop notification path.
+pub(crate) fn install_refresh(
+    tx: UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: TerminalWaker,
+) {
+    if let Ok(mut target) = refresh_target().lock() {
+        *target = Some(RefreshTarget { tx, waker });
+    }
+}
+
+fn pulse_refresh() {
+    if let Ok(target) = refresh_target().lock()
+        && let Some(target) = target.as_ref()
+    {
+        let _ = target.tx.send(crate::hydrate::RefreshKind::Model);
+        let _ = target.waker.wake();
+    }
 }
 
 fn config_set(worktree: &Path) -> (DetectedToolchainFiles, Option<ConfigSetIdentity>) {
@@ -90,6 +211,99 @@ pub(crate) fn pending_request(
     let (_, identity) = config_set(worktree);
     let request = mise_env_request(&identity?);
     (!repo_trust::is_approved(&request, approved)).then_some(request)
+}
+
+/// Return the target-derived trust request. Runtime callers use the cache-only
+/// form so a trust notification cannot block the event loop; the CLI passes
+/// `refresh = true` because it is already an off-loop, explicit user action.
+pub(crate) fn pending_request_for_target(
+    cfg: &Config,
+    worktree: &str,
+    repo_root: &Path,
+    loc: &GitLoc,
+    approved: &[String],
+    refresh: bool,
+) -> Option<GatedRequest> {
+    if !matches!(
+        cfg.toolchain.mise.inject,
+        MiseInject::Auto | MiseInject::Env
+    ) {
+        return None;
+    }
+    if !loc.is_remote() {
+        return pending_request(cfg, Path::new(worktree), repo_root, approved);
+    }
+    if refresh {
+        let db_approved = approved.to_vec();
+        resolve_remote_cache_sync(cfg, worktree, loc, db_approved).ok()?;
+    }
+    let identity = read_remote_cache(worktree, loc)?.identity;
+    let request = mise_env_request(&identity?);
+    (!repo_trust::is_approved(&request, approved)).then_some(request)
+}
+
+fn resolve_remote_cache_sync(
+    cfg: &Config,
+    worktree: &str,
+    loc: &GitLoc,
+    approved: Vec<String>,
+) -> Result<(), String> {
+    let key = remote_cache_key(worktree, loc);
+    let (ok, probe) = target_script(
+        loc,
+        thegn_core::envplan::DETECT_PROBE_SCRIPT,
+        TARGET_DETECT_TIMEOUT,
+        64 * 1024,
+    )?;
+    if !ok {
+        return Err("remote toolchain detection failed".into());
+    }
+    let requirements = thegn_core::envplan::detect_from_probe(&probe);
+    let binary = remote_binary_available(loc);
+    let identity = remote_identity(loc, worktree, &requirements.toolchain_files);
+    let allowed = approved_identity(identity.as_ref(), &approved);
+    let desired = policy(cfg, allowed);
+    let layer = if binary && allowed && desired == ActivationPolicy::Environment {
+        remote_env(loc).ok()
+    } else {
+        None
+    };
+    let missing_tools = if binary {
+        target_script(
+            loc,
+            "mise ls --missing --json",
+            Duration::from_secs(5),
+            64 * 1024,
+        )
+        .ok()
+        .and_then(|(ok, output)| ok.then(|| parse_missing_tools(&output)))
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let reason = if !binary {
+        Some("toolchain executable is not installed on the target".into())
+    } else if identity.is_none() {
+        Some("remote toolchain config changed or could not be read".into())
+    } else if allowed && desired == ActivationPolicy::Environment && layer.is_none() {
+        Some("remote toolchain environment resolver failed".into())
+    } else {
+        None
+    };
+    write_remote_cache(
+        worktree,
+        loc,
+        &CachedRemote {
+            key,
+            probe,
+            identity,
+            binary,
+            shims: remote_shims_dir(loc).map(|p| p.to_string_lossy().into_owned()),
+            layer: layer.as_ref().map(CachedLayer::from_layer),
+            missing_tools,
+            reason,
+        },
+    )
 }
 
 fn shims_dir() -> Option<PathBuf> {
@@ -178,6 +392,7 @@ fn target_script(
     run_target_command(loc.sh_command(script), timeout, max_output)
 }
 
+#[cfg(test)]
 fn remote_requirements(loc: &GitLoc) -> Result<EnvRequirements, String> {
     let (ok, output) = target_script(
         loc,
@@ -256,21 +471,83 @@ env -i \
     parse_env_output(&output).ok_or_else(|| "invalid remote resolver JSON".into())
 }
 
-fn remote_activation(
+fn cached_layer(layer: Option<CachedLayer>) -> Option<ActivationLayer> {
+    layer.map(CachedLayer::into_layer)
+}
+
+fn read_cache_record(identity: &ConfigSetIdentity) -> Option<CachedActivation> {
+    let path = cache_path(identity);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return None;
+        }
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cached = serde_json::from_str::<CachedActivation>(&raw).ok()?;
+    (cached.identity == *identity).then_some(cached)
+}
+
+fn read_remote_cache(worktree: &str, loc: &GitLoc) -> Option<CachedRemote> {
+    let path = remote_cache_path(worktree, loc);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return None;
+        }
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cached = serde_json::from_str::<CachedRemote>(&raw).ok()?;
+    (cached.key == remote_cache_key(worktree, loc)).then_some(cached)
+}
+
+fn write_remote_cache(worktree: &str, loc: &GitLoc, cached: &CachedRemote) -> Result<(), String> {
+    let dir = cache_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    let path = remote_cache_path(worktree, loc);
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec(cached).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())
+}
+
+fn remote_cached_activation(
     cfg: &Config,
-    loc: &GitLoc,
-    worktree_identity: &str,
+    worktree: &str,
     repo_root: &Path,
+    loc: &GitLoc,
     db: Option<&thegn_core::db::Db>,
-    requirements: &EnvRequirements,
 ) -> ProviderAnswer {
+    let Some(cached) = read_remote_cache(worktree, loc) else {
+        return ProviderAnswer::Reserved {
+            origin: ORIGIN.into(),
+            reason: "remote toolchain state is resolving; using the safe base environment".into(),
+        };
+    };
+    let requirements = thegn_core::envplan::detect_from_probe(&cached.probe);
     if requirements.toolchain_files.is_empty() {
         return ProviderAnswer::Reserved {
             origin: ORIGIN.into(),
             reason: "remote target has no declared toolchain".into(),
         };
     }
-    if !remote_binary_available(loc) {
+    if !cached.binary {
         return ProviderAnswer::Unavailable {
             origin: ORIGIN.into(),
             reason: "toolchain executable is not installed on the target".into(),
@@ -279,20 +556,18 @@ fn remote_activation(
     let approved = db
         .map(|db| approvals_for(Some(db), repo_root))
         .unwrap_or_default();
-    let identity = remote_identity(loc, worktree_identity, &requirements.toolchain_files);
-    let allowed = approved_identity(identity.as_ref(), &approved);
+    let allowed = approved_identity(cached.identity.as_ref(), &approved);
     let desired = policy(cfg, allowed);
-    let cached = (desired == ActivationPolicy::Environment && allowed)
-        .then(|| remote_env(loc).ok())
-        .flatten();
     let provider = MiseProvider {
-        binary: true,
-        shims: remote_shims_dir(loc),
-        cached,
+        binary: cached.binary,
+        shims: cached.shims.map(PathBuf::from),
+        cached: (desired == ActivationPolicy::Environment && allowed)
+            .then(|| cached_layer(cached.layer.clone()))
+            .flatten(),
     };
     provider.activate(&ProviderContext {
-        worktree_identity: worktree_identity.into(),
-        detected: requirements.toolchain_files.clone(),
+        worktree_identity: worktree.into(),
+        detected: requirements.toolchain_files,
         policy: desired,
         config_approved: allowed,
     })
@@ -487,22 +762,19 @@ pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result
 }
 
 fn read_cache(identity: &ConfigSetIdentity) -> Option<ActivationLayer> {
-    let path = cache_path(identity);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).ok()?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return None;
-        }
-    }
-    let raw = std::fs::read_to_string(path).ok()?;
-    let cached = serde_json::from_str::<CachedActivation>(&raw).ok()?;
-    (cached.identity == *identity)
+    let cached = read_cache_record(identity)?;
+    cached
+        .reason
+        .is_none()
         .then(|| ActivationLayer::ready(ORIGIN, cached.path_entries, cached.env))
 }
 
-fn write_cache(identity: &ConfigSetIdentity, layer: ActivationLayer) -> Result<(), String> {
+fn write_cache(
+    identity: &ConfigSetIdentity,
+    layer: Option<ActivationLayer>,
+    missing_tools: Vec<String>,
+    reason: Option<String>,
+) -> Result<(), String> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -515,8 +787,13 @@ fn write_cache(identity: &ConfigSetIdentity, layer: ActivationLayer) -> Result<(
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_vec(&CachedActivation {
         identity: identity.clone(),
-        path_entries: layer.path_entries,
-        env: layer.env,
+        path_entries: layer
+            .as_ref()
+            .map(|layer| layer.path_entries.clone())
+            .unwrap_or_default(),
+        env: layer.map(|layer| layer.env).unwrap_or_default(),
+        missing_tools,
+        reason,
     })
     .map_err(|e| e.to_string())?;
     std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
@@ -723,17 +1000,28 @@ fn parse_missing_tools(raw: &str) -> Vec<String> {
 fn resolve_cached(worktree: &Path, identity: &ConfigSetIdentity) {
     let result = run_env(worktree)
         .and_then(|raw| parse_env_output(&raw).ok_or_else(|| "invalid resolver JSON".to_string()))
-        .and_then(|layer| write_cache(identity, layer));
+        .and_then(|layer| {
+            let missing_tools = run_info(
+                worktree,
+                &["ls", "--missing", "--json"],
+                Duration::from_secs(5),
+            )
+            .map(|raw| parse_missing_tools(&raw))
+            .unwrap_or_default();
+            write_cache(identity, Some(layer), missing_tools, None)
+        });
     if let Err(reason) = result {
+        let _ = write_cache(identity, None, Vec::new(), Some(reason.clone()));
         tracing::debug!(target: "thegn::toolchain", %reason, "toolchain environment unavailable");
     }
+    pulse_refresh();
     if let Ok(mut keys) = in_flight().lock() {
         keys.remove(&identity.hash);
     }
 }
 
 fn prewarm(worktree: &Path, identity: &ConfigSetIdentity) {
-    if read_cache(identity).is_some() || !executable_available() {
+    if read_cache_record(identity).is_some() || !executable_available() {
         return;
     }
     let Ok(mut keys) = in_flight().lock() else {
@@ -749,6 +1037,113 @@ fn prewarm(worktree: &Path, identity: &ConfigSetIdentity) {
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             resolve_cached(&worktree, &identity);
+        })
+        .ok();
+}
+
+fn resolve_remote_cache(cfg: &Config, worktree: &str, loc: &GitLoc, approved: Vec<String>) {
+    let key = remote_cache_key(worktree, loc);
+    let result = target_script(
+        loc,
+        thegn_core::envplan::DETECT_PROBE_SCRIPT,
+        TARGET_DETECT_TIMEOUT,
+        64 * 1024,
+    )
+    .and_then(|(ok, probe)| {
+        if !ok {
+            return Err("remote toolchain detection failed".into());
+        }
+        let requirements = thegn_core::envplan::detect_from_probe(&probe);
+        let binary = remote_binary_available(loc);
+        let identity = remote_identity(loc, worktree, &requirements.toolchain_files);
+        let allowed = approved_identity(identity.as_ref(), &approved);
+        let desired = policy(cfg, allowed);
+        let layer = if binary && allowed && desired == ActivationPolicy::Environment {
+            remote_env(loc).ok()
+        } else {
+            None
+        };
+        let missing_tools = if binary {
+            target_script(
+                loc,
+                "mise ls --missing --json",
+                Duration::from_secs(5),
+                64 * 1024,
+            )
+            .ok()
+            .and_then(|(ok, output)| ok.then(|| parse_missing_tools(&output)))
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let reason = if !binary {
+            Some("toolchain executable is not installed on the target".into())
+        } else if identity.is_none() {
+            Some("remote toolchain config changed or could not be read".into())
+        } else if allowed && desired == ActivationPolicy::Environment && layer.is_none() {
+            Some("remote toolchain environment resolver failed".into())
+        } else {
+            None
+        };
+        let cached = CachedRemote {
+            key: key.clone(),
+            probe,
+            identity,
+            binary,
+            shims: remote_shims_dir(loc).map(|p| p.to_string_lossy().into_owned()),
+            layer: layer.as_ref().map(CachedLayer::from_layer),
+            missing_tools,
+            reason,
+        };
+        Ok((requirements, cached))
+    });
+    let result = result.and_then(|(_, cached)| write_remote_cache(worktree, loc, &cached));
+    if let Err(reason) = result {
+        let cached = CachedRemote {
+            key: key.clone(),
+            probe: String::new(),
+            identity: None,
+            binary: false,
+            shims: None,
+            layer: None,
+            missing_tools: Vec::new(),
+            reason: Some(reason),
+        };
+        let _ = write_remote_cache(worktree, loc, &cached);
+    }
+    pulse_refresh();
+    if let Ok(mut keys) = in_flight().lock() {
+        keys.remove(&format!("remote:{key}"));
+    }
+}
+
+fn prewarm_remote(
+    cfg: &Config,
+    worktree: &str,
+    repo_root: &Path,
+    loc: &GitLoc,
+    db: Option<&thegn_core::db::Db>,
+) {
+    let key = format!("remote:{}", remote_cache_key(worktree, loc));
+    if let Ok(mut keys) = in_flight().lock() {
+        if !keys.insert(key.clone()) {
+            return;
+        }
+    } else {
+        return;
+    }
+    let cfg = cfg.clone();
+    let worktree = worktree.to_string();
+    let repo_root = repo_root.to_path_buf();
+    let loc = loc.clone();
+    let approved = db
+        .map(|db| approvals_for(Some(db), repo_root.as_path()))
+        .unwrap_or_default();
+    std::thread::Builder::new()
+        .name("thegn-toolchain-remote".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            resolve_remote_cache(&cfg, &worktree, &loc, approved);
         })
         .ok();
 }
@@ -834,13 +1229,12 @@ pub(crate) fn activation_for_launch(
         .map(|db| approvals_for(Some(db), repo_root))
         .unwrap_or_default();
     if loc.is_remote() {
-        let answer = match remote_requirements(loc) {
-            Ok(requirements) => remote_activation(cfg, loc, worktree, repo_root, db, &requirements),
-            Err(reason) => ProviderAnswer::Reserved {
-                origin: ORIGIN.into(),
-                reason,
-            },
-        };
+        // Target detection, identity, probes, and approved env resolution are
+        // all transport operations. Refresh them off-loop, while this launch
+        // consumes only the last validated target record (or a Reserved/safe
+        // base answer on a cold cache).
+        prewarm_remote(cfg, worktree, repo_root, loc, db);
+        let answer = remote_cached_activation(cfg, worktree, repo_root, loc, db);
         return compose_activation(bundle, devshell, &[answer], None);
     }
     // A remote/provider worktree's path is target-local (or may merely be a
@@ -886,15 +1280,62 @@ pub(crate) fn status(
     repo_root: &Path,
     db: Option<&thegn_core::db::Db>,
 ) -> ToolchainStatus {
-    if GitLoc::for_worktree(worktree).is_remote() {
+    let loc = GitLoc::for_worktree(worktree);
+    if loc.is_remote() {
+        let Some(cached) = read_remote_cache(&worktree.to_string_lossy(), &loc) else {
+            return ToolchainStatus {
+                provider: ORIGIN.into(),
+                tier: "Reserved".into(),
+                inject: cfg.toolchain.mise.inject.as_str().into(),
+                state: "remote".into(),
+                reason: Some("toolchain state belongs to the remote target".into()),
+                trust: "not-applicable".into(),
+                ..ToolchainStatus::default()
+            };
+        };
+        let requirements = thegn_core::envplan::detect_from_probe(&cached.probe);
+        let approved = db
+            .map(|db| approvals_for(Some(db), repo_root))
+            .unwrap_or_default();
+        let pending = cached
+            .identity
+            .as_ref()
+            .map(mise_env_request)
+            .is_some_and(|request| !repo_trust::is_approved(&request, &approved));
+        let state = if requirements.toolchain_files.is_empty()
+            || cfg.toolchain.mise.inject == MiseInject::Off
+        {
+            "off"
+        } else if !cached.binary {
+            "missing-binary"
+        } else if pending || cached.identity.is_none() {
+            "pending-trust"
+        } else if cached.reason.is_some() {
+            "degraded"
+        } else if !cached.missing_tools.is_empty() {
+            "missing-tools"
+        } else if cached.layer.is_some() {
+            "ready"
+        } else {
+            "shims"
+        };
         return ToolchainStatus {
             provider: ORIGIN.into(),
-            tier: "Reserved".into(),
+            tier: format!("{:?}", requirements.tier()),
             inject: cfg.toolchain.mise.inject.as_str().into(),
-            state: "remote".into(),
-            reason: Some("toolchain state belongs to the remote target".into()),
-            trust: "not-applicable".into(),
-            ..ToolchainStatus::default()
+            state: state.into(),
+            files: requirements.toolchain_files.all_files(),
+            shims: cached.shims,
+            reason: cached.reason,
+            version: None,
+            trust: if requirements.toolchain_files.is_empty() {
+                "not-applicable".into()
+            } else if pending || cached.identity.is_none() {
+                "pending".into()
+            } else {
+                "approved".into()
+            },
+            missing_tools: cached.missing_tools,
         };
     }
     let requirements = thegn_core::envplan::detect_with_mise_env(
@@ -911,6 +1352,7 @@ pub(crate) fn status(
         .unwrap_or_default();
     let pending = pending_request(cfg, worktree, repo_root, &approved).is_some();
     let mode = cfg.toolchain.mise.inject.as_str().to_string();
+    let cached = identity.as_ref().and_then(read_cache_record);
     let state = if requirements.toolchain_files.is_empty()
         || cfg.toolchain.mise.inject == MiseInject::Off
     {
@@ -921,7 +1363,14 @@ pub(crate) fn status(
         "pending-trust"
     } else if shims_dir().is_none() {
         "missing-shims"
-    } else if identity.as_ref().and_then(read_cache).is_some() {
+    } else if cached.as_ref().is_some_and(|cache| cache.reason.is_some()) {
+        "degraded"
+    } else if cached
+        .as_ref()
+        .is_some_and(|cache| !cache.missing_tools.is_empty())
+    {
+        "missing-tools"
+    } else if cached.is_some() {
         "ready"
     } else {
         "shims"
@@ -933,13 +1382,18 @@ pub(crate) fn status(
         state: state.into(),
         files: requirements.toolchain_files.all_files(),
         shims: shims_dir().map(|p| p.display().to_string()),
-        reason: matches!(state, "missing-binary" | "missing-shims").then(|| {
-            if state == "missing-shims" {
-                "toolchain shims directory is not available".into()
-            } else {
-                "toolchain executable is not installed".into()
-            }
-        }),
+        reason: cached
+            .as_ref()
+            .and_then(|cache| cache.reason.clone())
+            .or_else(|| {
+                matches!(state, "missing-binary" | "missing-shims").then(|| {
+                    if state == "missing-shims" {
+                        "toolchain shims directory is not available".into()
+                    } else {
+                        "toolchain executable is not installed".into()
+                    }
+                })
+            }),
         version: None,
         trust: if requirements.toolchain_files.is_empty() {
             "not-applicable".into()
@@ -948,7 +1402,7 @@ pub(crate) fn status(
         } else {
             "approved".into()
         },
-        missing_tools: Vec::new(),
+        missing_tools: cached.map(|cache| cache.missing_tools).unwrap_or_default(),
     }
 }
 
@@ -1047,6 +1501,8 @@ mod tests {
             identity: identity.clone(),
             path_entries: layer.path_entries.clone(),
             env: layer.env.clone(),
+            missing_tools: Vec::new(),
+            reason: None,
         };
         let raw = serde_json::to_string(&cached).unwrap();
         let restored = serde_json::from_str::<CachedActivation>(&raw).unwrap();
