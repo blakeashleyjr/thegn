@@ -2926,20 +2926,28 @@ pub fn compose_spec(
         env.extend(spec.env.iter().cloned());
     }
     // Opt-in model-proxy routing (`route_via_proxy`): probe-before-inject so a
-    // down proxy can never strand the agent on a dead loopback endpoint.
-    match crate::model_proxy_daemon::agent_proxy_env(cfg, choice, worktree) {
-        crate::model_proxy_daemon::ProxyEnvDecision::Inject(vars) => env.extend(vars),
-        crate::model_proxy_daemon::ProxyEnvDecision::Skipped(why) => {
-            tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
+    // down proxy can never strand the agent on a dead loopback endpoint. A
+    // provider session is a host-side CLI process that re-reads raw repo JSON;
+    // do not expose proxy credentials or agent env to that parser. The provider
+    // handle already carries the only local-env values it is allowed to see.
+    if provider_session.is_none() {
+        match crate::model_proxy_daemon::agent_proxy_env(cfg, choice, worktree) {
+            crate::model_proxy_daemon::ProxyEnvDecision::Inject(vars) => env.extend(vars),
+            crate::model_proxy_daemon::ProxyEnvDecision::Skipped(why) => {
+                tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
+            }
+            crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
         }
-        crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
     }
     // `[[agents]].env` (+ the stage's overlay, key by key): the operator's own
     // per-entry environment — an account's `CLAUDE_CONFIG_DIR`, a pi home —
     // applied LAST so it wins over the composed identity env. Secrets expand
     // here (`env:`/`file:`); an unresolvable value is dropped, never exported
-    // as its literal ref.
-    if let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage) {
+    // as its literal ref. Keep it out of a provider CLI's host environment:
+    // that process parses raw repo JSON and must not gain a new localEnv read.
+    if provider_session.is_none()
+        && let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage)
+    {
         env.extend(eff.expanded_env());
     }
     let argv = match (&sb.spec, &provider_session) {
@@ -3331,14 +3339,19 @@ pub fn launch_spec_full(
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
-    // On the host path (no sandbox spec) the bundle identity + build env ride
-    // the pane env (layered on the curated base in `spawn_with_env`).
-    if outcome.spec.is_none() {
+    // On the bare-host path (no sandbox spec and no provider session) the bundle
+    // identity + build env ride the pane env (layered on the curated base in
+    // `spawn_with_env`). A provider CLI is also host-side, but its environment
+    // must remain limited to the provider handle's safe runtime + allowlist.
+    let provider_active = outcome.backend_label == "devcontainer"
+        && crate::devcontainer_provider::session_for(worktree).is_some();
+    if outcome.spec.is_none() && !provider_active {
         spec.env.extend(resolved.env_pairs());
         spec.env.extend(build_env);
     }
     // Host (no-sandbox) devShell injection rides the pane env directly.
     if outcome.spec.is_none()
+        && !provider_active
         && let Some(dev) = &devshell
     {
         inject_devshell_host(&mut spec, dev);

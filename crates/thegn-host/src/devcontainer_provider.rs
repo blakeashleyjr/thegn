@@ -284,7 +284,11 @@ pub(crate) fn status_for_selected(
             || request.key.starts_with("devcontainer.compose")
     });
     let inventory = thegn_core::devcontainer::recognized_unapplied(config);
+    let user_source_pinned =
+        !sandbox.image.is_empty() || sandbox.build.is_some() || sandbox.compose.is_some();
     let provider_eligible = source_present
+        && can_honor_sandbox(&folded)
+        && !user_source_pinned
         && source_approved
         && outcome.substitution.blocked_local_env.is_empty()
         && inventory.refused.is_empty()
@@ -441,7 +445,7 @@ impl DevcontainerProvider for CliProvider {
             .arg(config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         // The CLI reads the raw repository config and may evaluate
         // `${localEnv:NAME}` itself. Clear the inherited launcher environment
         // before restoring only safe runtime plumbing and the effective
@@ -655,5 +659,60 @@ mod tests {
             handle.env,
             vec![("DC_PROVIDER_ALLOWED".into(), "yes".into())]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_up_failure_preserves_stderr_for_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("devcontainer");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'provider broke\\n' >&2\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = CliProvider::with_executable(script)
+            .start(dir.path(), &dir.path().join("devcontainer.json"), &[])
+            .expect_err("failed provider start must be reported");
+        let message = error.to_string();
+        assert!(message.contains("failed with"), "{message}");
+        assert!(message.contains("provider broke"), "{message}");
+    }
+
+    #[test]
+    fn status_does_not_claim_provider_ready_when_user_pinned_source_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(&config_path, r#"{"image":"repo-image"}"#).unwrap();
+        let selection = thegn_core::devcontainer_select::select_and_parse(dir.path(), None);
+        let config = selection.config.as_ref().unwrap();
+        let approvals = thegn_core::config_resolve::Approvals::from_canonical(
+            thegn_core::devcontainer_overlay::gate_requests(config)
+                .into_iter()
+                .map(|request| request.canonical()),
+        );
+        let mut sandbox = thegn_core::config::SandboxConfig::default();
+        sandbox.profile = thegn_core::config::SandboxProfile::Open;
+        sandbox.image = "trusted-image".into();
+        let status = status_for_selected(
+            config,
+            &selection,
+            dir.path(),
+            &sandbox,
+            &approvals,
+            &ProbeReport {
+                state: ProbeState::Ready,
+                executable: Some("devcontainer".into()),
+                version: Some("1".into()),
+                reason: None,
+            },
+        );
+        assert_eq!(status.state, DevcontainerState::Degraded);
     }
 }
