@@ -104,8 +104,13 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         // A failed land must exit non-zero: `thegn land` is scripted (CI, the
         // fold-actor, git aliases), so an exit-0 conflict/gate-red would look
         // like a success. The message rides the returned error (anyhow prints it).
-        AttemptOutcome::Conflict { paths } => {
-            anyhow::bail!("{branch} conflicts with {target}: {}", paths.join(", "));
+        AttemptOutcome::Conflict {
+            paths,
+            submodule_conflicts,
+        } => {
+            let detail =
+                crate::integrate::conflict_details(&paths, &submodule_conflicts).join(", ");
+            anyhow::bail!("{branch} conflicts with {target}: {detail}");
         }
         AttemptOutcome::GateFailed { .. } => {
             anyhow::bail!("{branch} breaks the build (gate red); not landed.");

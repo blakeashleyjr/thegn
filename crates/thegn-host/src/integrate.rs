@@ -101,7 +101,14 @@ impl FoldGit for PlumbingAdapter {
             MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
             // A per-commit replay conflict is never a lockfile-regeneration
             // case (that only makes sense for a whole-branch merge), so defer.
-            MergeTreeOutcome::Conflict { paths, .. } => Ok(MergeOutcome::Conflict { paths }),
+            MergeTreeOutcome::Conflict { paths, .. } => {
+                let conflicts = self.submodule_conflicts(&paths);
+                if conflicts.is_empty() {
+                    Ok(MergeOutcome::Conflict { paths })
+                } else {
+                    Ok(MergeOutcome::SubmoduleConflict { paths, conflicts })
+                }
+            }
         }
     }
     fn commit_tree_author(
@@ -124,6 +131,15 @@ impl FoldGit for PlumbingAdapter {
 }
 
 impl PlumbingAdapter {
+    fn submodule_conflicts(
+        &self,
+        paths: &[String],
+    ) -> Vec<thegn_core::submodule::SubmoduleConflict> {
+        CliGit
+            .submodule_conflicts_for_paths(&self.loc, paths)
+            .unwrap_or_default()
+    }
+
     /// Try to salvage a conflicting merge before deferring it. In order:
     ///
     /// 1. A conflict confined to regenerable artifacts (e.g. `Cargo.lock`) is
@@ -136,6 +152,13 @@ impl PlumbingAdapter {
     ///
     /// Clean folds never reach here, so they pay none of this cost.
     fn resolve_conflict(&self, ours: &str, theirs: &str, paths: Vec<String>) -> MergeOutcome {
+        // A gitlink is an atomic pointer owned by the superproject. Partition it
+        // before regenerate/custom-driver/rerere handling so it can never enter
+        // a throwaway real merge or the `git add -A` auto-resolution path.
+        let conflicts = self.submodule_conflicts(&paths);
+        if !conflicts.is_empty() {
+            return MergeOutcome::SubmoduleConflict { paths, conflicts };
+        }
         if !self.regenerate_command.is_empty()
             && fold::classify(&paths, &self.regenerate_paths) == fold::ConflictKind::Regenerable
             && let Some(tree) = regenerate_merge(
@@ -337,6 +360,9 @@ pub struct DeferredReport {
     pub branch: String,
     pub paths: Vec<String>,
     pub kind: ConflictKind,
+    /// Typed pointer conflicts retained separately from raw paths so reports
+    /// and handoffs can name both object IDs without changing git targets.
+    pub submodule_conflicts: Vec<thegn_core::submodule::SubmoduleConflict>,
     /// True when this branch was deferred by the test-gate (bisected offender),
     /// not by a textual merge conflict.
     pub gate_failed: bool,
@@ -359,6 +385,29 @@ pub struct FoldReport {
     /// the ones we could not fast-forward, so a stale working tree is never a
     /// silent surprise. Empty when nothing advanced.
     pub resyncs: Vec<util::CheckoutResync>,
+}
+
+/// Render raw conflict paths while replacing typed gitlink paths with their
+/// pointer-specific detail. Mixed text/gitlink conflicts therefore retain the
+/// ordinary paths instead of losing them when typed metadata is available.
+pub(crate) fn conflict_details(
+    paths: &[String],
+    conflicts: &[thegn_core::submodule::SubmoduleConflict],
+) -> Vec<String> {
+    let typed: std::collections::HashSet<&str> = conflicts
+        .iter()
+        .map(|conflict| conflict.path.as_str())
+        .collect();
+    paths
+        .iter()
+        .filter(|path| !typed.contains(path.as_str()))
+        .cloned()
+        .chain(
+            conflicts
+                .iter()
+                .map(thegn_core::submodule::format_submodule_conflict),
+        )
+        .collect()
 }
 
 /// Resolve the branch the fold advances. `"auto"` (or empty) → the repo's
@@ -560,7 +609,8 @@ pub fn persist(
             } else {
                 "deferred"
             };
-            let paths = (!d.paths.is_empty()).then(|| d.paths.join("\n"));
+            let paths = (!d.paths.is_empty())
+                .then(|| conflict_details(&d.paths, &d.submodule_conflicts).join("\n"));
             db.update_merge_status(wt, status, None, paths.as_deref(), None)?;
             crate::merge_lifecycle::apply(
                 cfg,
@@ -916,6 +966,7 @@ fn build_report(
             branch: d.branch.name.clone(),
             paths: d.paths.clone(),
             kind: d.kind,
+            submodule_conflicts: d.submodule_conflicts.clone(),
             gate_failed: false,
         })
         .collect();
@@ -924,6 +975,7 @@ fn build_report(
             branch: off.clone(),
             paths: Vec::new(),
             kind: ConflictKind::Textual,
+            submodule_conflicts: Vec::new(),
             gate_failed: true,
         });
     }
@@ -1219,7 +1271,10 @@ pub(crate) enum AttemptOutcome {
     /// land. `tip` is the (unreferenced) fold commit in the object DB.
     Ready { tip: String },
     /// A textual (or unresolved regenerable) conflict against the current target.
-    Conflict { paths: Vec<String> },
+    Conflict {
+        paths: Vec<String>,
+        submodule_conflicts: Vec<thegn_core::submodule::SubmoduleConflict>,
+    },
     /// Merged clean but the gate went red. `log` is the tail of the gate output.
     /// A verdict about the *branch* — this is the one a fixing agent can act on.
     GateFailed { log: String },
@@ -1303,12 +1358,15 @@ pub(crate) fn attempt_land(
         };
         if !plan.advanced() {
             // One branch that didn't advance the tip ⇒ it was deferred (conflict).
-            let paths = plan
-                .deferred
-                .first()
-                .map(|d| d.paths.clone())
+            let deferred = plan.deferred.first();
+            let paths = deferred.map(|d| d.paths.clone()).unwrap_or_default();
+            let submodule_conflicts = deferred
+                .map(|d| d.submodule_conflicts.clone())
                 .unwrap_or_default();
-            return Ok(AttemptOutcome::Conflict { paths });
+            return Ok(AttemptOutcome::Conflict {
+                paths,
+                submodule_conflicts,
+            });
         }
         let folded_tip = plan.final_tip.clone();
         if gate_on {
@@ -1553,6 +1611,48 @@ mod tests {
         assert!(
             files.contains("a.txt") && files.contains("b.txt"),
             "{files}"
+        );
+    }
+
+    #[test]
+    fn fold_report_keeps_typed_submodule_conflict_and_formats_both_shas() {
+        let conflict = thegn_core::submodule::SubmoduleConflict {
+            path: "vendor/lib".into(),
+            ours_sha: "abc1234".into(),
+            theirs_sha: "def5678".into(),
+        };
+        let plan = FoldPlan {
+            original: "base".into(),
+            final_tip: "base".into(),
+            landed: Vec::new(),
+            deferred: vec![thegn_core::fold::Deferred {
+                branch: Branch {
+                    name: "feature".into(),
+                    tip: "tip".into(),
+                },
+                paths: vec![conflict.path.clone()],
+                kind: ConflictKind::Textual,
+                submodule_conflicts: vec![conflict.clone()],
+            }],
+        };
+        let report = build_report("main", "base", &plan, &[], GateOutcome::Skipped, 0);
+        assert_eq!(report.deferred[0].paths, ["vendor/lib"]);
+        assert_eq!(report.deferred[0].submodule_conflicts, [conflict.clone()]);
+        assert_eq!(
+            conflict_details(
+                &["src/lib.rs".into(), "vendor/lib".into()],
+                &report.deferred[0].submodule_conflicts,
+            ),
+            [
+                "src/lib.rs",
+                "submodule pointer conflict: vendor/lib (abc1234 vs def5678)",
+            ]
+        );
+        assert_eq!(
+            thegn_core::submodule::format_submodule_conflicts(
+                &report.deferred[0].submodule_conflicts
+            ),
+            "submodule pointer conflict: vendor/lib (abc1234 vs def5678)"
         );
     }
 
@@ -1860,7 +1960,9 @@ mod tests {
         let before = repo.out(&["rev-parse", "main"]);
 
         match attempt_land(&cfg(""), &repo.dir, "bad", &GitLoc::Local(repo.dir.clone())).unwrap() {
-            AttemptOutcome::Conflict { paths } => assert!(paths.iter().any(|p| p == "base.txt")),
+            AttemptOutcome::Conflict { paths, .. } => {
+                assert!(paths.iter().any(|p| p == "base.txt"))
+            }
             o => panic!("expected Conflict, got {o:?}"),
         }
         assert_eq!(

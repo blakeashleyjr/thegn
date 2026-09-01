@@ -70,6 +70,13 @@ merge=<driver>` the object-DB fold cannot honor, that branch is folded
 through a throwaway-worktree real `git merge` so the driver runs, then
 the result is gated and landed normally. Clean folds pay none of this.
 
+A mode-160000 conflict is different: the queue defers it as a **submodule
+pointer conflict**, naming the path and both ours/theirs object IDs. It never
+chooses a pointer automatically and never sends that path through lockfile
+regeneration, a custom merge driver, rerere, or the throwaway merge's blanket
+stage step. The same structured message is available to the conflict handoff;
+ordinary text conflicts retain the behavior above.
+
 ## After it lands
 
 `on_landed` decides what happens to a worktree whose branch just landed.
@@ -164,8 +171,9 @@ conflict = "Fix {branch} for {target}. Conflicts:\n{paths}"
 ```
 
 Placeholders are checked against the kind (`conflict` gets `{branch}`,
-`{target}`, `{worktree}`, `{paths}`; `gate_failure` swaps `{paths}` for
-`{log}`) — a typo is a config error, never a blank sent to the agent.
+`{target}`, `{worktree}`, `{paths}`, and `{submodule_conflicts}`;
+`gate_failure` swaps the conflict fields for `{log}`) — a typo is a config
+error, never a blank sent to the agent.
 A repo can carry its own via `[workspace.<slug>.merge_queue.prompts]`,
 merged key by key with your global ones.
 

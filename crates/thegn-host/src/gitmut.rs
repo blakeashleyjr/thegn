@@ -368,6 +368,23 @@ fn selection_of(indices: &[(usize, usize)]) -> thegn_core::patch::Selection {
     sel
 }
 
+/// Host-side guard for every line-level staging entry point. The same core
+/// validator used by the patch transform rejects a mode-160000 entry before a
+/// [`GitOp`] is queued, so the mutation worker never attempts `git apply` for a
+/// submodule pointer.
+pub(crate) fn validate_line_selection(
+    diff: &str,
+    indices: &[(usize, usize)],
+) -> std::result::Result<(), String> {
+    let selection = selection_of(indices);
+    for file in thegn_core::patch::parse_patch(diff) {
+        selection
+            .validate_for_file(&file)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Record the pre-op HEAD as an undo mark (best-effort — the undo planner
 /// degrades to treating our reset as a user action when the DB is away).
 fn record_mark(loc: &GitLoc) {
@@ -754,6 +771,23 @@ mod tests {
                 sign: None,
             }
             .rewrites_history()
+        );
+    }
+
+    #[test]
+    fn line_stage_guard_rejects_atomic_submodule_pointer() {
+        let diff = concat!(
+            "diff --git a/vendor/lib b/vendor/lib\n",
+            "index aaaaaaa..bbbbbbb 160000\n",
+            "--- a/vendor/lib\n",
+            "+++ b/vendor/lib\n",
+            "@@ -1 +1 @@\n",
+            "-Subproject commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            "+Subproject commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        );
+        assert_eq!(
+            validate_line_selection(diff, &[(0, 0)]),
+            Err("submodule pointers are atomic".into())
         );
     }
 
