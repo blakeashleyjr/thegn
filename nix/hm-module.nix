@@ -192,9 +192,16 @@ self: {
   tomlFormat = pkgs.formats.toml {};
 
   # Rendered to ~/.config/thegn/config.toml; keys match the Rust serde struct.
+  defaultProjectsDir =
+    if cfg.projectsDir != null
+    then cfg.projectsDir
+    else if cfg.workspacesDir != null
+    then cfg.workspacesDir
+    else "${config.home.homeDirectory}/code";
+
   configFile = tomlFormat.generate "thegn-config.toml" {
     worktrees_dir = cfg.worktreesDir;
-    workspaces_dir = cfg.workspacesDir;
+    projects_dir = defaultProjectsDir;
     repo_roots = cfg.repoRoots;
     repo_scan_depth = cfg.repoScanDepth;
     base_branch = cfg.baseBranch;
@@ -252,18 +259,26 @@ in {
       description = "Base directory for git worktrees (grouped per repo).";
     };
 
+    projectsDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description =
+        "Where project repositories are cloned."
+        + " Canonical replacement for workspacesDir.";
+    };
+
     workspacesDir = lib.mkOption {
-      type = lib.types.str;
-      default = "${config.home.homeDirectory}/code";
-      description = "Where remote URLs are cloned by `new-workspace`.";
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Deprecated compatibility alias for projectsDir; removed after three stable releases.";
     };
 
     repoRoots = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [cfg.workspacesDir];
-      defaultText = lib.literalExpression "[ config.programs.thegn.workspacesDir ]";
+      default = [defaultProjectsDir];
+      defaultText = lib.literalExpression "[ config.programs.thegn.projectsDir ]";
       example = lib.literalExpression ''[ "/home/you/code" "/home/you/src" ]'';
-      description = "Directories scanned by the workspace repo picker.";
+      description = "Directories scanned by the project repo picker.";
     };
 
     repoScanDepth = lib.mkOption {

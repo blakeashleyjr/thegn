@@ -30,9 +30,14 @@ pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
     if db.has_notification(kind, &source_ref).unwrap_or(false) {
         return;
     }
+    if let Some(state) = crate::notify::global() {
+        let _ = crate::notify::record(&db, &state, kind, &source_ref, &message, "");
+        let _ = waker.wake(); // best-effort: waker pulse: a routed reminder must repaint the inbox
+        return;
+    }
     // best-effort: the inbox is a cache, and a reminder that fails to record
     // must not take down the compositor.
-    if db.put_notification(kind, &source_ref, &message, "").is_ok() {
+    if crate::automation_events::emit(&db, kind, &source_ref, &message, "").is_ok() {
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
 }

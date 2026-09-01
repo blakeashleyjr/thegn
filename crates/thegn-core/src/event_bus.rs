@@ -66,6 +66,7 @@ impl NotificationUrgency {
             Event::TestsFailed { .. } => Self::Critical,
             Event::LogError { .. } => Self::Critical,
             Event::WorktreeCreated { .. } => Self::Low,
+            Event::PrThreadUnresolved(_) => Self::Low,
             Event::NotificationReceived { .. } => Self::Normal,
             // A failed non-agent process is worth a toast (Normal); a clean
             // task completion only updates the inbox/badge (Low, below the
@@ -287,6 +288,9 @@ impl DesktopNotification {
                 urgency: NotificationUrgency::Low,
                 worktree: String::new(),
             }),
+            // This is an internal automation event. Its user-facing attention
+            // path is the separate once-keyed queued notification.
+            Event::PrThreadUnresolved(_) => None,
             Event::NotificationReceived { notification } => Some(Self {
                 title: notification.kind.label().into(),
                 body: notification.message.clone(),
@@ -355,6 +359,10 @@ pub enum Event {
     LogError { message: String },
     /// A new worktree was created.
     WorktreeCreated { path: String, branch: String },
+    /// A bounded watched-review task was durably created or revised. This is
+    /// deliberately separate from the inbox/desktop notification event.
+    #[serde(rename = "pr.thread_unresolved")]
+    PrThreadUnresolved(Box<crate::pr_review_tasks::ReviewTaskEvent>),
     /// A notification was received from the DB.
     NotificationReceived {
         notification: crate::notification::Notification,
@@ -382,6 +390,9 @@ impl Event {
             Event::TestsFailed { worktree, .. } => Some(worktree),
             Event::LogError { .. } => None,
             Event::WorktreeCreated { path, .. } => Some(path),
+            Event::PrThreadUnresolved(payload) => {
+                (!payload.worktree_path.is_empty()).then_some(payload.worktree_path.as_str())
+            }
             Event::NotificationReceived { notification } => {
                 if notification.worktree_path.is_empty() {
                     None
@@ -854,6 +865,36 @@ mod tests {
         // recv() (blocking) returns the event since one is already queued.
         let ev = sub.recv();
         assert!(matches!(ev, Some(Event::LogError { .. })));
+    }
+
+    #[test]
+    fn watched_review_event_has_the_documented_wire_name_and_payload() {
+        let event = Event::PrThreadUnresolved(Box::new(crate::pr_review_tasks::ReviewTaskEvent {
+            event: crate::pr_review_tasks::REVIEW_THREAD_EVENT.into(),
+            source_key: "source".into(),
+            source_revision: "revision".into(),
+            forge: "github".into(),
+            repository: "acme/widget".into(),
+            pr_number: 22,
+            pr_url: "https://example.test/pr/22".into(),
+            pr_title: "Review".into(),
+            branch: "feature".into(),
+            base: "main".into(),
+            head_oid: "head".into(),
+            thread_id: "thread".into(),
+            path: "src/lib.rs".into(),
+            line: Some(7),
+            role: "coder".into(),
+            prompt: "fix it".into(),
+            worktree_path: "/wt/feature".into(),
+        }));
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "pr.thread_unresolved");
+        assert_eq!(wire["payload"]["source_revision"], "revision");
+        let bus = EventBus::new();
+        let sub = bus.subscribe();
+        bus.publish(&event);
+        assert!(matches!(sub.try_recv(), Some(Event::PrThreadUnresolved(_))));
     }
 
     #[test]

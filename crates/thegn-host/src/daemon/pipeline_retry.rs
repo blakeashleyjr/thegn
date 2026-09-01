@@ -292,6 +292,7 @@ async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<Se
         (cold_stage_prompt(svc, row).await?, false)
     };
     let spec = OpenSpec {
+        automation_origin: None,
         argv: Vec::new(),
         cwd: None,
         env: Vec::new(),
@@ -307,6 +308,8 @@ async fn relaunch(svc: &DaemonService, row: &AgentDispatch) -> anyhow::Result<Se
             resume: None,
             continue_last,
             stage: row.stage.clone(),
+            fork: false,
+            native_session_id: None,
         }),
         adopt: false,
         already_capped: false,

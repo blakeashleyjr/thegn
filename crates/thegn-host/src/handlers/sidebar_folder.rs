@@ -9,7 +9,7 @@
 //! a while."
 //!
 //! Now we follow the codebase's optimistic-update + deferred-persist pattern
-//! (cf. `run::persist_active_focus`, `drawer_state::set_flag`): mutate the
+//! (cf. `run::persist_active_focus`, `drawer_state::set_desired_occupant`): mutate the
 //! in-memory model so the sidebar regroups on the *same* frame, then push the
 //! durable DB write onto `spawn_blocking`. The DB is a cache; git is the source
 //! of truth, so a best-effort deferred write is the sanctioned trade. The

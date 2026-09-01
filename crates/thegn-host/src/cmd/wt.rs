@@ -80,7 +80,7 @@ pub enum Action {
     New {
         /// Branch-name tail (the configured prefix + numbering scheme are
         /// applied); omitted = a generated candidate name. Required with
-        /// `--project` (the feature's linked branch name).
+        /// `--program` (the feature's linked branch name).
         name: Option<String>,
         /// Repo to create in (default: resolved from cwd / $THEGN_WORKTREE).
         #[arg(long)]
@@ -91,11 +91,11 @@ pub enum Action {
         /// Pin a named execution env (`[env.<name>]`) for the new worktree.
         #[arg(long)]
         env: Option<String>,
-        /// Create the feature across a project's member repos: one resolved
-        /// branch name + a worktree in each member (see `thegn project`).
-        #[arg(long)]
-        project: Option<String>,
-        /// With `--project`, restrict to a comma-separated subset of member
+        /// Create the feature across a program's member repos: one resolved
+        /// branch name + a worktree in each member (see `thegn program`).
+        #[arg(long, visible_alias = "project")]
+        program: Option<String>,
+        /// With `--program`, restrict to a comma-separated subset of member
         /// repos (by name), e.g. `--repos api,web`.
         #[arg(long)]
         repos: Option<String>,
@@ -137,11 +137,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             repo,
             base,
             env,
-            project,
+            program,
             repos,
             from_issue,
             json,
-        } => match project {
+        } => match program {
             Some(p) => new_batched(cfg, name, &p, repos, base, env, json),
             None => new(cfg, name, repo, base, env, from_issue, json),
         },
@@ -258,15 +258,35 @@ fn create_and_register(
     db: &Db,
 ) -> Result<String> {
     let path = worktree::worktree_path(root, branch, cfg);
-    worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
+    let workspace = thegn_core::repo::repo_slug(root);
+    let pre = crate::worktree_lifecycle::run_event_with_db(
+        cfg,
+        root,
+        &path,
+        branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PreCreate,
+        thegn_core::hooks::HookExecutionMode::User,
+        Some(db),
+    );
+    if pre.blocked() {
+        return Err(anyhow::anyhow!(pre.message()));
+    }
+    worktree::add_checked_with_state(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
-        worktree::remove(root, &path, branch, true);
-        anyhow::anyhow!(e)
+        let message = crate::worktree_lifecycle::create_failure_with_add_state(
+            e.message,
+            cfg,
+            root,
+            &path,
+            branch,
+            e.branch_created,
+        );
+        anyhow::anyhow!(message)
     })?;
-    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
-    // so agents launched in this worktree discover them (best-effort, gated on
-    // [merge_queue] enabled).
-    crate::mq_assets::seed_if_enabled(cfg, &path);
+    // Seed the configured skill registry in each harness-native layout. This
+    // non-interactive CLI path may do the bounded work synchronously.
+    crate::skill_seed::seed_if_enabled(cfg, &path, thegn_core::skills::SeedPhase::Create);
 
     // Register (git stays the source of truth; the DB row is what the sidebar
     // + session resurrection read). put_worktree is the primary path; the env
@@ -275,8 +295,11 @@ fn create_and_register(
     let path_s = path.to_string_lossy().into_owned();
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(root), branch);
     if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, branch, None, None) {
-        worktree::remove(root, &path, branch, true);
-        return Err(anyhow::anyhow!("db: {e}"));
+        let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
+            Ok(()) => format!("db: {e}"),
+            Err(cleanup) => format!("db: {e}; rollback failed: {cleanup}"),
+        };
+        return Err(anyhow::anyhow!(message));
     }
     // Pin the env only when it differs from the ambient default this worktree
     // would inherit anyway (same rule as the wizard: a matching choice stays
@@ -287,10 +310,34 @@ fn create_and_register(
         // best-effort: the worktree exists; a missed pin re-resolves ambient.
         let _ = db.set_worktree_env(&path_s, e);
     }
+    // A CLI has no compositor to keep alive, so it waits for post-create
+    // completion before printing success and exiting. Warn-only failures are
+    // reported by the lifecycle runner but do not roll back a real worktree.
+    let post = crate::worktree_lifecycle::run_event_with_db(
+        cfg,
+        root,
+        &path,
+        branch,
+        &workspace,
+        thegn_core::hooks::HookEvent::PostCreate,
+        thegn_core::hooks::HookExecutionMode::User,
+        Some(db),
+    );
+    if post.blocked() {
+        let message = crate::worktree_lifecycle::create_failure_with_rollback(
+            format!("post_create: {}", post.message()),
+            cfg,
+            root,
+            &path,
+            branch,
+        );
+        let _ = db.del_worktree(&path_s);
+        return Err(anyhow::anyhow!(message));
+    }
     Ok(path_s)
 }
 
-/// `wt new --project <p>` — batched cross-repo feature creation. Resolves ONE
+/// `wt new --program <p>` — batched cross-repo feature creation. Resolves ONE
 /// linked branch name (prefix + slug, applied once — per-repo prefix overrides
 /// are NOT re-applied, so identity is literal) and creates that exact branch +
 /// worktree in each member repo (or a `--repos` subset), running the same
@@ -301,7 +348,7 @@ fn create_and_register(
 fn new_batched(
     cfg: &Config,
     name: Option<String>,
-    project_name: &str,
+    program_name: &str,
     repos: Option<String>,
     base: Option<String>,
     env: Option<String>,
@@ -312,7 +359,7 @@ fn new_batched(
 
     let Some(feature) = name.filter(|n| !n.trim().is_empty()) else {
         anyhow::bail!(
-            "a --project feature needs a name: `thegn wt new <name> --project {project_name}`"
+            "a --program feature needs a name: `thegn wt new <name> --program {program_name}`"
         );
     };
 
@@ -334,17 +381,17 @@ fn new_batched(
     let proj = db
         .list_projects()?
         .into_iter()
-        .find(|p| p.name == project_name)
+        .find(|p| p.name == program_name)
         .ok_or_else(|| {
             super::NotFound(format!(
-                "no project named {project_name:?} (create it with `thegn project create {project_name}`)"
+                "no program named {program_name:?} (create it with `thegn program create {program_name}`)"
             ))
         })?;
     let members = db.project_members(proj.project_id)?;
     if members.is_empty() {
         anyhow::bail!(
-            "project {project_name} has no member repos — assign some with \
-             `thegn project assign {project_name} <repo>`"
+            "program {program_name} has no member repos — assign some with \
+             `thegn program assign {program_name} <repo>`"
         );
     }
 
@@ -441,13 +488,13 @@ fn new_batched(
             unknown_repos: &'a [String],
         }
         super::emit_json(&Report {
-            project: project_name,
+            project: program_name,
             branch: &branch,
             members: &outcomes,
             unknown_repos: &plan.unknown_repos,
         })?;
     } else {
-        outln!("project {project_name}: feature branch {branch}");
+        outln!("program {program_name}: feature branch {branch}");
         for o in &outcomes {
             match (o.status, &o.path, &o.error) {
                 ("created", Some(p), _) => outln!("  {} created  {}", o.repo, p),
@@ -457,7 +504,7 @@ fn new_batched(
             }
         }
         for u in &plan.unknown_repos {
-            outln!("  (warning) --repos {u:?} matches no member of {project_name}");
+            outln!("  (warning) --repos {u:?} matches no member of {program_name}");
         }
     }
 
@@ -578,40 +625,23 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
         }
     }
 
-    // Provider/sandbox teardown, synchronous (unlike the TUI's fire-and-forget
-    // thread — a CLI exiting would orphan it). Same env-precedence resolution
-    // as `delete_groups`: DB selection → repo `.thegn.*` → global default,
-    // so a repo-selected provider env doesn't leak its sandbox.
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&path));
-    let selected = db.effective_env(&path, &root_s);
-    let env = cfg.resolve_env(
-        &root,
-        &loc,
-        std::path::Path::new(&path),
-        selected.as_deref(),
-    );
-    if !env.placement.is_local() {
-        outln!("tearing down {} sandbox…", env.name);
-        crate::agent::destroy_provider_sandbox(&path, &env.name);
-    }
-    crate::agent::deregister_vpn(&path);
-    crate::agent::deproject(&path);
-    crate::agent::deprovision_sync(&path);
-    crate::agent::checkpoint_on_close(&path);
-    thegn_core::sandbox::teardown_by_path(&path);
-
-    // git removal (worktree::remove has the --force fallback), then make sure
-    // the directory is actually gone — a lingering dir is re-adopted at next
-    // launch and looks like a failed delete.
-    worktree::remove(
+    let workspace = thegn_core::repo::repo_slug(&root);
+    // Keep the CLI and TUI on the same transaction. This is synchronous so a
+    // CLI exit cannot orphan provider resources, while `--force` selects the
+    // explicit non-blocking hook policy.
+    let (removed, message) = crate::worktree_lifecycle::destroy_one(
+        cfg,
         &root,
         std::path::Path::new(&path),
-        if delete_branch { &branch } else { "" },
+        &branch,
+        &workspace,
+        false,
         delete_branch,
+        crate::worktree_lifecycle::mode_for_user(force, false),
+        Some(&db),
     );
-    let _ = std::fs::remove_dir_all(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-    if std::path::Path::new(&path).exists() {
-        anyhow::bail!("could not remove {path}");
+    if !removed {
+        anyhow::bail!("{message}; retry with --force");
     }
 
     // DB cleanup (best-effort: the DB is a cache; git above was the truth).

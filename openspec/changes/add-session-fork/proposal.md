@@ -6,9 +6,8 @@ Linear: THE-29
 
 The research seed (orca's fork-session issue) wants to branch a working
 session at a point in time to explore an alternative path without losing the
-original: same place, same command, diverge from here. In orca that means
-re-injecting an AI conversation; thegn's AI layer is excised, so the honest,
-generic core of the feature is:
+original: same place, same command, diverge from here. Thegn cannot clone a
+live process, so the honest generic contract is:
 
 **You cannot fork a live process.** A running PTY child (a shell, a build, an
 agent CLI) has open fds, sockets, and in-memory state; no amount of protocol
@@ -29,21 +28,24 @@ would break every credential/sandbox rule). What CAN be delivered, precisely:
    source's — the existing fork-worktree flow, roadmap D-52) and start the
    forked session in the new worktree. This composes two existing pieces.
 
-Today none of this exists: the daemon retains only `program`+`cwd` in
-`SessionMeta` (not the full recipe), and there is no fork verb anywhere.
+The daemon/control/session substrate already exists. This change adds the fork
+verb beside `sessions.open`, retains the live recipe only in the daemon's
+session table, and adds the native harness source needed for a recorded row
+from `agent.sessions`.
 
 ## What Changes
 
-- **`sessions.fork` capability** (`Verb::ForkSession`, all non-streaming
-  surfaces like `sessions.open`, scope via `required_scope` — same scope as
-  open, since fork ≡ open with an inherited spec): daemon-side
-  `fork(session, opts) -> SessionInfo`.
+- **`sessions.fork` capability** (`Verb::ForkSession`, non-streaming,
+  `SurfaceSet::ALL`, scope via `required_scope` — the same write scope as
+  `sessions.open`): daemon-side `fork(session, opts) -> SessionInfo`.
 - **The daemon retains each session's resolved spawn recipe** (argv, env
   pairs, cwd, worktree, agent-launch marker) in memory for the session's
   lifetime — never persisted to the DB (env may hold credentials; the DB
-  outlives the process). `agent:`-launched sessions re-resolve their
-  composition (command, sandbox, environment) fresh at fork time instead of
-  replaying stale env.
+  outlives the process). `agent:`-launched sessions re-resolve their current
+  sandbox, credentials, and environment at fork time. A recorded native source
+  carries an explicit harness id and uses that harness's `FORK` operation; a
+  configured agent is accepted only when its provider matches the recorded
+  harness.
 - **Lineage:** the forked session's env carries `THEGN_FORKED_FROM` (source
   session id) beside the existing `THEGN_SESSION_ID`/`THEGN_CONTROL_SOCKET`;
   `SessionInfo` gains `forked_from` so listings and the UI can show lineage.
@@ -68,13 +70,15 @@ Today none of this exists: the daemon retains only `program`+`cwd` in
 - **Specs:** `control-plane` — ADDED fork requirement. Capability catalog
   gains one row (`sessions.fork`); control wire schema
   (`docs/api/control-v1.json`) regenerates (`SessionInfo.forked_from`,
-  `ForkSpec`).
+  `ForkSpec` with `session`, optional `harness`/`agent`/`cwd`/`worktree`, and
+  `scrollback`/`adopt`/`tab`).
 - **In-flight changes reconciled:** **make-daemon-default** (daemon sessions
   are the default fork substrate), **add-runtime-session-split** (adopt/graft
   placement becomes an `apply_layout` op when the daemon owns layout; fork
   itself is layout-agnostic), **add-agent-task-engine** (a future "fork task"
   can call `sessions.fork`; no dependency either way). No overlap with the
-  MCP scope-gating work: fork is not exposed on MCP in v1.
+  MCP scope-gating work: fork is exposed through the same catalog projection as
+  the other non-streaming capabilities.
 - **Help/config:** `fork-session` action claimed in
   `docs/help/daemon-and-sessions.md`; no new config section (fork has no
   knobs beyond CLI flags).

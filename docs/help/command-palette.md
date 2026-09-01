@@ -27,7 +27,7 @@ chord). Type to filter, `↵` runs, `Esc` closes, `Tab` cycles modes.
 ## Modes (type the prefix, or Tab)
 
 - _(none)_ — all actions
-- `~` — **frecency opener**: workspaces + worktrees ranked by how often
+- `~` — **frecency opener**: projects + worktrees ranked by how often
   and how recently you use them; `↵` lands in that worktree's tab
 - `>` — files in the focused worktree
 - `/` — content search across files
@@ -40,7 +40,7 @@ chord). Type to filter, `↵` runs, `Esc` closes, `Tab` cycles modes.
 - **Connect to root** — jump from a shell nested deep in a subdirectory
   straight to the owning worktree's tab.
 - **Clone and open** — paste a git URL; it clones off-loop and opens as a
-  workspace.
+  project.
 - **New environment…** — the add-environment wizard (`[env.<name>]`: cloud,
   ssh or local).
 - **Setup wizard…** — re-run first-launch setup (forge auth, hosts, sandbox,

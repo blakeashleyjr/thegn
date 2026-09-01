@@ -6,7 +6,7 @@
 //! persistence goes through `persist_session_layout` (the DB cache, best-effort;
 //! git is the source of truth).
 
-use crate::run::{SidebarState, persist_session_layout, refresh_tab_model};
+use crate::run::{SidebarState, persist_session_layout_cached, refresh_tab_model};
 
 /// The loop-scope state the close helpers touch, borrowed for the call.
 pub(crate) struct CloseCtx<'a> {
@@ -16,6 +16,8 @@ pub(crate) struct CloseCtx<'a> {
     pub sb: &'a mut SidebarState,
     pub focus: &'a mut crate::focus::FocusState,
     pub need_relayout: &'a mut bool,
+    pub lifecycle_cfg: &'a thegn_core::config::Config,
+    pub waker: &'a termwiz::terminal::TerminalWaker,
 }
 
 /// Close the currently focused split pane. If it's the only pane in the tab, do
@@ -45,7 +47,7 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
                 tab.focused_pane = first;
             }
             *cx.need_relayout = true;
-            persist_session_layout(cx.session, cx.panes);
+            persist_session_layout_cached(cx.session);
         }
     }
     refresh_tab_model(cx.model, cx.session, cx.sb);
@@ -98,23 +100,41 @@ pub(crate) fn close_tab(
         .session
         .worktrees
         .get(gi)
-        .map(|g| (g.name.clone(), gi, g.active_tab));
+        .map(|g| (g.name.clone(), g.path.clone(), gi, g.active_tab));
+    let mut session_end_error = None;
     match cx.session.close_active_tab() {
         crate::session::CloseResult::Tab(tab) => {
             for id in tab.center.pane_ids() {
                 cx.panes.table.remove(&id);
             }
-            if let Some((name, gi, ti)) = target {
+            if let Some((name, path, gi, ti)) = target {
                 tab_state.on_tab_closed(&name, gi, ti);
+                if !path.is_empty()
+                    && cx
+                        .session
+                        .worktrees
+                        .get(gi)
+                        .is_some_and(|group| group.tabs.is_empty())
+                    && let Err(error) = crate::worktree_lifecycle::session_end_once(
+                        cx.lifecycle_cfg,
+                        std::path::Path::new(&path),
+                        Some(cx.waker.clone()),
+                    )
+                {
+                    session_end_error = Some(error);
+                }
             }
         }
         crate::session::CloseResult::Nothing => {}
     }
-    persist_session_layout(cx.session, cx.panes);
+    persist_session_layout_cached(cx.session);
     // Close always lands the user on the center terminal of whichever tab is
     // now active.
     cx.focus.zone = crate::focus::Zone::Center;
     refresh_tab_model(cx.model, cx.session, cx.sb);
+    if let Some(error) = session_end_error {
+        cx.model.status = format!("Tab closed; session_end failed to start: {error}");
+    }
     *cx.need_relayout = true;
     false
 }

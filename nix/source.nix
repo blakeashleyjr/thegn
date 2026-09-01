@@ -27,6 +27,7 @@
     "crates"
     "config"
     "extensions"
+    "nix/batteries.nix"
     "docs/help"
     "docs/cli.md"
     "docs/api"

@@ -9,6 +9,7 @@ use termwiz::surface::Surface;
 
 use crate::chrome::S;
 use crate::compositor::Rect;
+use crate::i18n_surface::PaletteText;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::seg::{self, Line, Tok, seg, sp};
 use thegn_core::store::WorkspaceStore;
@@ -93,6 +94,38 @@ fn order_by_frecency_at(
 
 /// Maximum visible rows in the palette list at one time.
 const MAX_ITEMS: usize = 10;
+
+#[derive(Debug)]
+struct PaletteLabels {
+    title: String,
+    badge: String,
+    filter_placeholder: String,
+    move_hint: String,
+    run_hint: String,
+    dismiss_hint: String,
+    match_count: String,
+}
+
+impl PaletteLabels {
+    fn localized(total: usize, scroll_offset: usize) -> Self {
+        let match_count = if total > MAX_ITEMS {
+            let end = (scroll_offset + MAX_ITEMS).min(total);
+            // Numeric range data deliberately stays locale-neutral.
+            format!("{}-{end}/{total}", scroll_offset + 1)
+        } else {
+            crate::i18n_surface::palette_matches(total)
+        };
+        Self {
+            title: crate::i18n_surface::palette(PaletteText::Title),
+            badge: crate::i18n_surface::palette(PaletteText::Badge),
+            filter_placeholder: crate::i18n_surface::palette(PaletteText::FilterPlaceholder),
+            move_hint: crate::i18n_surface::palette(PaletteText::Move),
+            run_hint: crate::i18n_surface::palette(PaletteText::Run),
+            dismiss_hint: crate::i18n_surface::palette(PaletteText::Dismiss),
+            match_count,
+        }
+    }
+}
 
 pub struct Palette {
     items: Vec<PaletteItem>,
@@ -223,11 +256,16 @@ impl Palette {
     /// the Ctrl+Space binding (the mockup's ⌘K chip).
     #[allow(dead_code)] // used in tests
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
+        let labels = PaletteLabels::localized(self.matches.len(), self.scroll_offset);
+        self.render_with_labels(surface, screen, &labels);
+    }
+
+    fn render_with_labels(&self, surface: &mut Surface, screen: Rect, labels: &PaletteLabels) {
         const COLS: usize = 66;
         let shown = self.matches.len().min(MAX_ITEMS);
         let spec = LayerSpec {
-            title: "jump".into(),
-            badge: Some(" menu ".into()),
+            title: labels.title.clone(),
+            badge: Some(format!(" {} ", labels.badge)),
             cols: COLS,
             rows: shown + 4, // prompt + rule + items + rule + footer
             anchor: Anchor::TopThird,
@@ -245,7 +283,7 @@ impl Palette {
         // Prompt row: accent chevron, live query (ghost placeholder when empty).
         let mut prompt = vec![seg(Tok::Slot(S::Accent), "❯ ").bold()];
         if self.query.is_empty() {
-            prompt.push(seg(Tok::Slot(S::Ghost3), "type to filter…"));
+            prompt.push(seg(Tok::Slot(S::Ghost3), labels.filter_placeholder.clone()));
         } else {
             prompt.push(seg(Tok::Slot(S::Text), self.query.clone()));
         }
@@ -295,23 +333,16 @@ impl Palette {
         if inner.rows >= 4 {
             let fy = inner.y + inner.rows - 2;
             seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
-            let total = self.matches.len();
-            let count_str = if total > MAX_ITEMS {
-                let end = (self.scroll_offset + MAX_ITEMS).min(total);
-                format!("{}-{}/{}", self.scroll_offset + 1, end, total)
-            } else {
-                format!("{total} matches")
-            };
             let footer = Line::split(
                 vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
-                    seg(Tok::Slot(S::Ghost), " move   "),
+                    seg(Tok::Slot(S::Ghost), format!(" {}   ", labels.move_hint)),
                     seg(Tok::Slot(S::Ghost2), "↵"),
-                    seg(Tok::Slot(S::Ghost), " run   "),
+                    seg(Tok::Slot(S::Ghost), format!(" {}   ", labels.run_hint)),
                     seg(Tok::Slot(S::Ghost2), "esc"),
-                    seg(Tok::Slot(S::Ghost), " dismiss"),
+                    seg(Tok::Slot(S::Ghost), format!(" {}", labels.dismiss_hint)),
                 ],
-                vec![seg(Tok::Slot(S::Ghost3), count_str)],
+                vec![seg(Tok::Slot(S::Ghost3), labels.match_count.clone())],
             );
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
         }
@@ -347,9 +378,10 @@ pub(crate) fn build_command_palette_items(
             }
         })
         .map(|spec| {
+            let translated = crate::i18n_surface::action_label(spec.id, spec.label);
             let label = crate::keymap::chord_hint_for(cfg, spec.id)
-                .map(|chord| format!("{}  ({chord})", spec.label))
-                .unwrap_or_else(|| spec.label.to_string());
+                .map(|chord| format!("{translated}  ({chord})"))
+                .unwrap_or(translated);
             // Fold the action's hidden keywords into the fuzzy haystack so
             // synonyms ("fullscreen", "maximize", …) surface it too.
             crate::palette::PaletteItem::new(spec.id, label).with_search(spec.keywords.join(" "))
@@ -377,9 +409,10 @@ pub(crate) fn build_command_palette_items(
     // letting us surface the wizard here with its `＋ …` styling and the resolved
     // chord hint. It still dispatches as a plain Action.
     {
+        let translated = crate::i18n_surface::palette(PaletteText::NewTerminal);
         let label = crate::keymap::chord_hint_for(cfg, "new-terminal")
-            .map(|c| format!("＋ New terminal…  ({c})"))
-            .unwrap_or_else(|| "＋ New terminal…".to_string());
+            .map(|c| format!("＋ {translated}  ({c})"))
+            .unwrap_or_else(|| format!("＋ {translated}"));
         let search = crate::keymap::action_specs()
             .iter()
             .find(|s| s.id == "new-terminal")
@@ -447,7 +480,13 @@ pub(crate) fn build_move_to_folder_items(
             folder.clone(),
         ));
     }
-    items.push(PaletteItem::new("move-to-folder:__new__", "＋ New folder…"));
+    items.push(PaletteItem::new(
+        "move-to-folder:__new__",
+        format!(
+            "＋ {}",
+            crate::i18n_surface::palette(PaletteText::NewFolder)
+        ),
+    ));
     items
 }
 
@@ -514,7 +553,10 @@ pub(crate) fn build_palette(
         if items.iter().any(|i| i.key == key) {
             continue;
         }
-        items.push(PaletteItem::new(key, format!("Move to folder: {folder}")));
+        items.push(PaletteItem::new(
+            key,
+            crate::i18n_surface::move_to_folder(&folder),
+        ));
     }
 
     // Configured pins (scope-filtered to the current workspace): summon by name.
@@ -772,6 +814,43 @@ pub(crate) fn build_launch_palette(
     items
 }
 
+/// Build the dedicated bottom-drawer picker. Rows are stable selection keys,
+/// not command-palette actions: the loop's pending drawer gate consumes the
+/// `drawer:<occupant-id>` prefix before generic action dispatch.
+pub(crate) fn build_drawer_palette(
+    cfg: &thegn_core::config::Config,
+    _scope: thegn_core::config::DrawerScope,
+) -> Vec<crate::palette::PaletteItem> {
+    thegn_core::config_drawer::drawer_policy(cfg)
+        .occupants()
+        .iter()
+        .map(|occupant| {
+            let label = if occupant.id == thegn_core::config_drawer::FILES_OCCUPANT_ID {
+                "files (built-in)".to_string()
+            } else {
+                format!(
+                    "{}  ({})",
+                    occupant.name,
+                    occupant
+                        .scope
+                        .map(|scope| scope.as_str())
+                        .unwrap_or("scope")
+                )
+            };
+            crate::palette::PaletteItem::new(format!("drawer:{}", occupant.id), label)
+                .with_search(format!("drawer {}", occupant.name))
+        })
+        .collect()
+}
+
+/// Decode a dedicated drawer-picker row. Keeping this separate from
+/// `Action::from_key` prevents occupant IDs from becoming fake command
+/// actions, while still giving the loop a single pending-selection gate.
+pub(crate) fn drawer_picker_occupant(key: &str) -> Option<&str> {
+    key.strip_prefix("drawer:")
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// Build the account-switcher palette: every coding-agent account (config +
 /// managed) grouped by provider, plus an "Add account" row per provider.
 /// Selecting `account:<provider>:<name>` pins it as the focused repo's default
@@ -928,13 +1007,15 @@ pub(crate) fn build_profile_palette(cfg: &thegn_core::config::Config) -> Vec<Pal
 
 #[cfg(test)]
 mod tests {
+    use unicode_width::UnicodeWidthStr;
+
     use super::*;
 
     fn items() -> Vec<PaletteItem> {
         vec![
             PaletteItem::new("new-worktree", "New worktree"),
-            PaletteItem::new("new-workspace", "New workspace"),
-            PaletteItem::new("switch", "Switch workspace"),
+            PaletteItem::new("new-project", "New project"),
+            PaletteItem::new("switch", "Switch project"),
             PaletteItem::new("diff", "Show diff"),
         ]
     }
@@ -1219,7 +1300,7 @@ mod tests {
     fn empty_query_shows_all_in_order() {
         let p = Palette::new(items());
         let m: Vec<&str> = p.matches().iter().map(|i| i.key.as_str()).collect();
-        assert_eq!(m, vec!["new-worktree", "new-workspace", "switch", "diff"]);
+        assert_eq!(m, vec!["new-worktree", "new-project", "switch", "diff"]);
     }
 
     #[test]
@@ -1256,7 +1337,7 @@ mod tests {
         p.move_down();
         assert_eq!(
             p.selected_item().map(|i| i.key.as_str()),
-            Some("new-workspace")
+            Some("new-project")
         );
         for _ in 0..20 {
             p.move_down(); // clamps at the end
@@ -1332,6 +1413,47 @@ mod tests {
         ] {
             assert!(keys.contains(k), "{k} missing from the palette");
         }
+    }
+
+    #[test]
+    fn drawer_palette_keeps_files_first_and_uses_pending_keys() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.tools.push(thegn_core::config::NamedCommand {
+            name: "atac".into(),
+            command: "atac".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: Some(thegn_core::config::DrawerScope::Worktree),
+            drawer_cwd: None,
+        });
+        cfg.tools.push(thegn_core::config::NamedCommand {
+            name: "db".into(),
+            command: "psql".into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+            resume: false,
+            route_via_proxy: false,
+            drawer_scope: Some(thegn_core::config::DrawerScope::Global),
+            drawer_cwd: None,
+        });
+        let rows = build_drawer_palette(&cfg, thegn_core::config::DrawerScope::Worktree);
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec!["drawer:files", "drawer:tool:atac", "drawer:tool:db"]
+        );
+        assert!(rows.iter().all(|row| row.key.starts_with("drawer:")));
+        assert_eq!(drawer_picker_occupant(&rows[0].key), Some("files"));
+        assert_eq!(drawer_picker_occupant("files-drawer"), None);
     }
 
     #[test]
@@ -1475,6 +1597,56 @@ mod tests {
         assert!(text.contains("New work"), "a matching label drawn");
         assert!(text.contains("jump"), "layer title drawn");
         assert!(text.contains("menu"), "badge drawn");
-        assert!(text.contains("matches"), "footer count drawn");
+        // One fixture label still matches "work" ("New worktree") since the
+        // project rename retired "New workspace", so the footer is singular.
+        assert!(text.contains("1 match"), "footer count drawn: {text:?}");
+    }
+
+    #[test]
+    fn japanese_labels_render_within_palette_cells_without_splitting_rows() {
+        let lookup = |key: &str| crate::i18n_surface::test_catalog_value("ja-JP", key);
+        let row = lookup("action-new-worktree");
+        let p = Palette::new(vec![PaletteItem::new("new-worktree", row.clone())]);
+        let labels = PaletteLabels {
+            title: lookup("palette-title"),
+            badge: lookup("palette-badge"),
+            filter_placeholder: lookup("palette-filter-placeholder"),
+            move_hint: lookup("palette-footer-move"),
+            run_hint: lookup("palette-footer-run"),
+            dismiss_hint: lookup("palette-footer-dismiss"),
+            match_count: crate::i18n_surface::palette_matches(1),
+        };
+        let mut surface = Surface::new(72, 16);
+        p.render_with_labels(
+            &mut surface,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 72,
+                rows: 16,
+            },
+            &labels,
+        );
+        let text = surface.screen_chars_to_string();
+        assert!(
+            text.contains(&row),
+            "the translated row stays atomic: {text:?}"
+        );
+        assert!(
+            text.contains("↑↓ 移動"),
+            "move keyhint stays atomic: {text:?}"
+        );
+        assert!(
+            text.contains("↵ 実行"),
+            "run keyhint stays atomic: {text:?}"
+        );
+        assert!(
+            text.contains("esc 閉じる"),
+            "dismiss keyhint stays atomic: {text:?}"
+        );
+        assert!(
+            text.lines().all(|line| line.width() <= 72),
+            "a rendered line exceeded the screen cell budget: {text:?}"
+        );
     }
 }

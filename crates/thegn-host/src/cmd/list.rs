@@ -119,7 +119,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         return super::emit_json(&rows);
     }
     if rows.is_empty() {
-        outln!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
+        outln!("No worktrees yet. Press Alt-W to open a project, Alt-w for a worktree.");
         return Ok(());
     }
 
