@@ -94,12 +94,43 @@ impl ProbeReport {
     }
 }
 
+/// Whether the optional CLI can preserve the effective thegn sandbox policy.
+///
+/// `devcontainer up/exec` owns its own container arguments, so it cannot
+/// reproduce thegn's hardening profile, network controls, VPN, or isolation
+/// floor. Keep the provider branch deliberately narrow: any policy it cannot
+/// represent falls through to the native OCI resolver, which is the
+/// authoritative path for those settings.
+pub(crate) fn can_honor_sandbox(sb: &thegn_core::config::SandboxConfig) -> bool {
+    use thegn_core::config::{FileAccess, Network, SandboxBackend, SandboxProfile};
+
+    sb.enabled
+        && sb.backend == SandboxBackend::Auto
+        && sb.profile == SandboxProfile::Open
+        && sb.network == Network::Nat
+        && sb.network_allow.is_empty()
+        && sb.network_block.is_empty()
+        && !sb.vpn.is_enabled()
+        && sb.isolation_floor == thegn_core::config::IsolationFloor::Off
+        // The provider always bind-mounts the workspace. It cannot honor a
+        // request for unrestricted/custom/empty host-file access.
+        && matches!(sb.file_access, FileAccess::Worktree | FileAccess::WorktreePlusCaches)
+        // Per-pane ceilings are part of the native sandbox contract and are
+        // not represented by the devcontainer CLI.
+        && sb.limits.cpu.is_none()
+        && sb.limits.memory.is_none()
+}
+
 /// Opaque handle returned after `devcontainer up` succeeds.
 #[derive(Clone)]
 pub(crate) struct DevcontainerHandle {
     executable: PathBuf,
     workspace_folder: PathBuf,
     config_path: PathBuf,
+    /// Values explicitly admitted by `[sandbox].env_passthrough`. The provider
+    /// CLI receives these values for `${localEnv:...}` expansion; all other
+    /// host variables are deliberately absent from its environment.
+    env: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for DevcontainerHandle {
@@ -119,6 +150,7 @@ pub(crate) trait DevcontainerProvider: Send + Sync {
         &self,
         workspace_folder: &Path,
         config_path: &Path,
+        env: &[(String, String)],
     ) -> anyhow::Result<DevcontainerHandle>;
     fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> Vec<String>;
 }
@@ -144,13 +176,21 @@ impl DevcontainerSession {
         provider: Arc<dyn DevcontainerProvider>,
         workspace_folder: &Path,
         config_path: &Path,
+        env: &[(String, String)],
     ) -> anyhow::Result<Self> {
-        let handle = provider.start(workspace_folder, config_path)?;
+        let handle = provider.start(workspace_folder, config_path, env)?;
         Ok(Self { provider, handle })
     }
 
     pub(crate) fn exec_argv(&self, command: &str) -> Vec<String> {
         self.provider.exec_argv(&self.handle, command)
+    }
+
+    /// Environment additions for the host-side provider `exec` command. The
+    /// pane spawn chokepoint supplies its own safe runtime base environment;
+    /// these are only the explicitly allowlisted local-env values.
+    pub(crate) fn exec_env(&self) -> &[(String, String)] {
+        &self.handle.env
     }
 }
 
@@ -383,6 +423,7 @@ impl DevcontainerProvider for CliProvider {
         &self,
         workspace_folder: &Path,
         config_path: &Path,
+        env: &[(String, String)],
     ) -> anyhow::Result<DevcontainerHandle> {
         let executable = self.executable()?.to_path_buf();
         let mut command = Command::new(&executable);
@@ -394,6 +435,17 @@ impl DevcontainerProvider for CliProvider {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // The CLI reads the raw repository config and may evaluate
+        // `${localEnv:NAME}` itself. Clear the inherited launcher environment
+        // before restoring only safe runtime plumbing and the effective
+        // sandbox allowlist, so vendor parsing cannot read an arbitrary host
+        // secret.
+        let allowlisted_env = env.to_vec();
+        let provider_env = provider_env(env);
+        command.env_clear();
+        for (key, value) in &provider_env {
+            command.env(key, value);
+        }
         let output = run_bounded(&mut command, START_TIMEOUT)?;
         anyhow::ensure!(
             output.status.success(),
@@ -405,6 +457,7 @@ impl DevcontainerProvider for CliProvider {
             executable,
             workspace_folder: workspace_folder.to_path_buf(),
             config_path: config_path.to_path_buf(),
+            env: allowlisted_env,
         })
     }
 
@@ -439,6 +492,19 @@ fn stderr_suffix(bytes: &[u8]) -> String {
     first_line(bytes)
         .map(|line| format!(": {line}"))
         .unwrap_or_default()
+}
+
+/// Build the provider process environment from the same safe runtime base as
+/// pane processes, then append the effective local-env allowlist. The latter
+/// wins if a caller explicitly admits an infrastructure key with a different
+/// value.
+fn provider_env(allowlisted: &[(String, String)]) -> Vec<(String, String)> {
+    // Do not use `host_base_env` here: its optional process-wide extras are
+    // intended for ordinary panes, while raw devcontainer substitution is
+    // constrained specifically by this sandbox's `env_passthrough` list.
+    let mut env = thegn_core::util::filter_host_env(std::env::vars(), &[]);
+    env.extend(allowlisted.iter().cloned());
+    env
 }
 
 #[expect(clippy::disallowed_methods)]
@@ -481,6 +547,7 @@ mod tests {
             executable: "/bin/devcontainer".into(),
             workspace_folder: "/repo/worktree".into(),
             config_path: "/repo/.devcontainer/devcontainer.json".into(),
+            env: Vec::new(),
         };
         assert_eq!(
             provider.exec_argv(&handle, "printf ok"),
@@ -495,6 +562,82 @@ mod tests {
                 "-lc",
                 "printf ok",
             ]
+        );
+    }
+
+    #[test]
+    fn provider_rejects_unrepresentable_sandbox_policy() {
+        let mut sb = thegn_core::config::SandboxConfig::default();
+        assert!(!can_honor_sandbox(&sb));
+
+        sb.profile = thegn_core::config::SandboxProfile::Open;
+        assert!(can_honor_sandbox(&sb));
+
+        sb.network = thegn_core::config::Network::None;
+        assert!(!can_honor_sandbox(&sb));
+        sb.network = thegn_core::config::Network::Nat;
+        sb.enabled = false;
+        assert!(!can_honor_sandbox(&sb));
+    }
+
+    #[test]
+    fn provider_env_contains_only_runtime_and_explicit_values() {
+        let env = provider_env(&[("DC_ALLOWED".into(), "yes".into())]);
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == "DC_ALLOWED")
+                .map(|(_, value)| value.as_str()),
+            Some("yes")
+        );
+        assert!(!env.iter().any(|(key, _)| key == "DC_NOT_ALLOWLISTED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_up_cannot_observe_a_non_allowlisted_host_variable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("environment");
+        let script = dir.path().join("devcontainer");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n/usr/bin/env > '{}'\n", report.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let blocked = "DC_PROVIDER_BLOCKED";
+        let previous = std::env::var_os(blocked);
+        // SAFETY: the test serializes its process-environment mutation and
+        // restores the prior value before releasing the lock.
+        unsafe { std::env::set_var(blocked, "must-not-cross") };
+        let provider = CliProvider::with_executable(&script);
+        let handle = provider
+            .start(
+                dir.path(),
+                &dir.path().join("devcontainer.json"),
+                &[("DC_PROVIDER_ALLOWED".into(), "yes".into())],
+            )
+            .unwrap();
+        // SAFETY: paired with the serialized setup above.
+        match previous {
+            Some(value) => unsafe { std::env::set_var(blocked, value) },
+            None => unsafe { std::env::remove_var(blocked) },
+        }
+
+        let body = std::fs::read_to_string(report).unwrap();
+        assert!(body.lines().any(|line| line == "DC_PROVIDER_ALLOWED=yes"));
+        assert!(
+            !body
+                .lines()
+                .any(|line| line == "DC_PROVIDER_BLOCKED=must-not-cross")
+        );
+        assert_eq!(
+            handle.env,
+            vec![("DC_PROVIDER_ALLOWED".into(), "yes".into())]
         );
     }
 }

@@ -348,6 +348,7 @@ pub fn prepare_sandbox_env(
     if placement.is_local()
         && projection.is_none()
         && !unresolved_selection
+        && crate::devcontainer_provider::can_honor_sandbox(&sb)
         && let Some(dc) = &devcontainer
         && dc.provider_eligible
     {
@@ -357,6 +358,7 @@ pub fn prepare_sandbox_env(
                 provider,
                 Path::new(worktree),
                 &dc.config_path,
+                &sb.passthrough_env(),
             ) {
                 Ok(session) => {
                     crate::devcontainer_provider::publish_session(worktree, session);
@@ -2908,6 +2910,12 @@ pub fn compose_spec(
     let cap_limits = thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits);
     if let Some(jobs) = thegn_core::sandbox_cpucap::cargo_jobs_for(&cap_limits) {
         env.push(("CARGO_BUILD_JOBS".to_string(), jobs.to_string()));
+    }
+    // A provider exec is a host-side CLI process. Pass only the same explicit
+    // local-env values admitted to `devcontainer up`; `pane_pty` supplies the
+    // safe runtime base environment independently.
+    if let Some(session) = &provider_session {
+        env.extend(session.exec_env().iter().cloned());
     }
     // Local bwrap gets its passthrough env (tokens, API keys) via the pane's
     // process env, not world-readable `--setenv` argv (enter_argv skips those).
