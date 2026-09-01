@@ -50,3 +50,8 @@ panes.rs
 perf.rs
 probe.rs
 vps_bridge.rs
+# TEST-ONLY cfg: provider failure-path tests use a POSIX shell fixture and
+# executable permissions to verify stderr preservation and env sanitization;
+# the provider production path is platform-free and the tests have no
+# unprivileged Windows equivalent.
+devcontainer_provider.rs
