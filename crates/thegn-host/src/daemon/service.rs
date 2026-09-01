@@ -1217,8 +1217,8 @@ impl ControlApi for DaemonService {
             let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
             let run_id_owned = run_id.to_string();
             let job_id_owned = job_id.to_string();
-            let cached = self
-                .with_db({
+            let cached = if self.config.ci.log_cache_runs > 0 {
+                self.with_db({
                     let key = key.clone();
                     let run_id = run_id_owned.clone();
                     let job_id = job_id_owned.clone();
@@ -1229,13 +1229,19 @@ impl ControlApi for DaemonService {
                 })
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+            } else {
+                None
+            };
             if let Some(mut entry) = cached {
                 if let Some(lines) = tail_lines {
                     let (text, truncated) = thegn_core::ci_log::bounded_tail(
                         &entry.text,
                         lines.min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
-                        thegn_core::ci_log::HARD_MAX_LOG_BYTES,
+                        self.config
+                            .ci
+                            .log_max_bytes
+                            .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
                     );
                     entry.text = text;
                     entry.truncated |= truncated;

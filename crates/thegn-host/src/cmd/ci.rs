@@ -266,9 +266,13 @@ fn log(
 ) -> Result<()> {
     let wt = resolve_worktree(worktree);
     let key = GitLoc::worktree_cache_key(&wt);
-    let cached = Db::open()
-        .ok()
-        .and_then(|db| db.get_ci_log(&key, run_id, job_id).ok().flatten());
+    let cached = (cfg.ci.log_cache_runs > 0)
+        .then(|| {
+            Db::open()
+                .ok()
+                .and_then(|db| db.get_ci_log(&key, run_id, job_id).ok().flatten())
+        })
+        .flatten();
     let entry = if let Some(mut entry) = cached {
         // Cache rows have already been redacted and bounded. Re-apply the
         // configured policy so a later config change cannot widen a response.
