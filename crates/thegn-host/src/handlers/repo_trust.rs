@@ -133,6 +133,10 @@ fn overlay_devcontainer(
     let Ok(db) = Db::open() else { return None };
     let root_s = repo_root.to_string_lossy().to_string();
     let approvals = approvals_for(&db, &root_s);
+    // A user-pinned source is authoritative. The provider consumes the raw
+    // devcontainer file and cannot reproduce that image/build/compose choice,
+    // so retain the native OCI path rather than silently replacing it.
+    let user_source_pinned = !sb.image.is_empty() || sb.build.is_some() || sb.compose.is_some();
     let allowed = sb.env_passthrough.clone();
     let local_env = |key: &str| {
         allowed
@@ -171,6 +175,7 @@ fn overlay_devcontainer(
     // reserved, or unknown keys could reach the vendor process despite the
     // core overlay correctly dropping them on the OCI fallback path.
     let provider_eligible = source_present
+        && !user_source_pinned
         && outcome.pending.is_empty()
         && inventory.refused.is_empty()
         && inventory.reserved.is_empty()
