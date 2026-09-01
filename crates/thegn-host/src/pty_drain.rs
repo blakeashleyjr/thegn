@@ -40,7 +40,7 @@ use crate::pane::PaneEvent;
 use crate::panes::Panes;
 use crate::pins::pin_cwd;
 use crate::run::{
-    DrawerPool, SidebarState, active_cwd, persist_pin_state, prospective_corner_rect,
+    DrawerRuntime, SidebarState, active_cwd, persist_pin_state, prospective_corner_rect,
     update_crash_count,
 };
 
@@ -229,8 +229,7 @@ pub(crate) struct DrainCtx<'a> {
     pub dirty: &'a mut bool,
     pub need_relayout: &'a mut bool,
     pub drawer: &'a mut Option<u32>,
-    pub drawer_pool: &'a mut DrawerPool,
-    pub drawer_home: &'a mut Option<std::path::PathBuf>,
+    pub drawer_runtime: &'a mut DrawerRuntime,
     pub corner: &'a mut Option<u32>,
     pub corner_name: &'a mut Option<String>,
     pub corner_kitty: bool,
@@ -257,9 +256,13 @@ pub(crate) struct DrainCtx<'a> {
     pub shutdown: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub event_bus: &'a thegn_core::event_bus::EventBus,
     pub notify_state: &'a std::sync::Arc<crate::notify::NotifyState>,
+    /// Live browser-preview lifecycle. Pane bytes are inspected only after
+    /// normal receipt and remain pane-only damage unless the projection changes.
+    pub preview: &'a mut crate::preview::PreviewSupervisor,
     /// All stdout bytes route through the writer thread — a direct write here
     /// could interleave with an in-flight frame.
     pub writer: &'a crate::frame_writer::FrameWriter,
+    pub waker: &'a termwiz::terminal::TerminalWaker,
 }
 
 /// One budgeted drain pass. See the module docs for the shape.
@@ -323,6 +326,9 @@ pub(crate) fn drain<T: Terminal>(
         let tail = backlog.drain_pane(id);
         if !tail.is_empty() {
             handle_output(ctx, id, &tail);
+        }
+        if ctx.preview.pane_exit(id) {
+            *ctx.dirty = true;
         }
         // A degraded pane that exited needs no watchdog entry. (A missed prune
         // is harmless memory — pane ids are monotonic and never reused.)
@@ -409,6 +415,24 @@ pub(crate) fn prune_output_degraded(
 /// channel, and mark pane damage. Moved verbatim from the run.rs drain
 /// (adapted to `ctx` borrows; per-chunk work now runs once per merged buffer).
 fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
+    // Associate output with the session tree before borrowing the pane mutably.
+    // Parsing this bounded tail is pure CPU; a full chrome repaint is raised
+    // only when discovery/status changes, never for unrelated PTY bytes.
+    let preview_meta = ctx
+        .session
+        .iter_tabs()
+        .find(|(_, _, tab)| tab.center.pane_ids().contains(&id))
+        .map(|(gi, _, _)| {
+            let worktree = ctx.session.worktrees[gi].path.clone();
+            let session = ctx.panes.table.get(&id).and_then(|pane| pane.session_id());
+            (worktree, session)
+        });
+    if let Some((worktree, session)) = preview_meta
+        && !worktree.is_empty()
+        && ctx.preview.pane_output(id, &worktree, session, b)
+    {
+        *ctx.dirty = true;
+    }
     if let Some(p) = ctx.panes.table.get_mut(&id) {
         // First real output ⇒ this worktree's shell is live; drop its loading
         // splash (by owner, so a background worktree that finished while away
@@ -561,9 +585,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
             cmd,
             ctx.session,
             ctx.panes,
-            ctx.drawer,
-            ctx.drawer_pool,
-            ctx.drawer_home,
+            ctx.drawer_runtime,
             ctx.focus,
             ctx.model,
             ctx.sb,
@@ -657,17 +679,28 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .table
         .get(&id)
         .is_some_and(|p| is_daemon_agent_exit(p.is_daemon_backed(), p.program()));
+    let visible_drawer = ctx
+        .drawer_runtime
+        .visible
+        .as_ref()
+        .is_some_and(|visible| visible.pane_id == id);
+    let pooled_drawer = ctx.drawer_runtime.pool.key_for_id(id).is_some();
+    let was_drawer = visible_drawer || pooled_drawer;
     ctx.panes.table.remove(&id);
     // Set only in the sole-pane leave-for-materialize branch below.
     let mut left_for_materialize = false;
     // The visible drawer manager's process ended. Clear it, mark the worktree's
     // drawer closed, hand focus back to the center, and relayout to reclaim
     // the bottom slice.
-    if *ctx.drawer == Some(id) {
-        *ctx.drawer = None;
-        if let Some(dir) = ctx.drawer_home.take().or_else(|| active_cwd(ctx.session)) {
-            crate::drawer_state::set_flag(&dir, false);
+    if was_drawer {
+        ctx.drawer_runtime.on_exit(id, ctx.panes);
+        // A prewarmed occupant can exit while another occupant remains
+        // visible. Removing that hidden pane must not steal focus or reclaim
+        // the visible drawer's geometry.
+        if !visible_drawer {
+            return false;
         }
+        *ctx.drawer = None;
         // A clean exit is the normal `q`-quit path — stay quiet. Only an
         // abnormal exit (e.g. the contained scope hit the drawer memory
         // limit) gets a hint.
@@ -680,11 +713,6 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
             ctx.focus.zone = crate::focus::Zone::Center;
         }
         *ctx.need_relayout = true;
-        *ctx.dirty = true;
-        return false;
-    }
-    // A pooled (hidden) drawer manager exited; just forget it.
-    if ctx.drawer_pool.remove_id(id) {
         *ctx.dirty = true;
         return false;
     }
@@ -794,6 +822,13 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
         .map(|(gi, ti, t)| (gi, ti, t.center.pane_ids().len() == 1));
     if let Some((gi, ti, sole)) = owner {
+        crate::worktree_lifecycle::session_end_after_pane_exit(
+            ctx.current_config,
+            ctx.session,
+            ctx.panes,
+            id,
+            Some(ctx.waker.clone()),
+        );
         // A standalone terminal's sole shell exited: close the terminal rather
         // than respawning a fresh shell (a terminal's whole purpose IS that one
         // shell). Worktrees keep respawning below; terminals divert here (before
@@ -916,6 +951,15 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                             ),
                             Ok(None) | Err(_) => None,
                         };
+                        // Stamp the exit on the row REGARDLESS of whether the
+                        // status moves (v63). A pipeline row deliberately keeps
+                        // its `running` status here — closing it is the
+                        // supervisor's verified call — and that is exactly the
+                        // row whose worker is gone with nothing to say so. The
+                        // stamp is what makes it read as `exited-unverified`
+                        // instead of masquerading as a live worker.
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                        let _ = db.stamp_dispatch_exit(dispatch_id, exit_code.map(i64::from));
                         if let Some(status) = auto_status {
                             // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                             let _ = db.update_dispatch_status(dispatch_id, status);

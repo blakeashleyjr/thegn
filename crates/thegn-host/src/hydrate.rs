@@ -296,6 +296,10 @@ pub(crate) enum RefreshKind {
     /// Boxed: the payload is a whole table, and every other `RefreshKind`
     /// variant stays one word.
     Dispatches(Box<crate::monitor_pipeline::DispatchRoster>),
+    /// A background reconciliation found local worktree paths that vanished
+    /// outside the host. The loop only prunes the already-identified groups;
+    /// probing and cache/session persistence stay off-loop.
+    VanishedTabs(Box<crate::merge_lifecycle::VanishedTabs>),
     /// The pane daemon's live session list, fetched over the control socket when
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.
@@ -2691,6 +2695,10 @@ pub(crate) fn build_model(
         // loop applies the fresh ones and drops anything stale; see
         // `run.rs`'s adopt drain for the age cutoff and why it exists.
         adopt_intents: db.take_intents("adopt_session").unwrap_or_default(),
+        // `editor.open` mailbox: claim every queued handoff off-loop. The
+        // compositor revalidates each target against the fresh sidebar model
+        // before dispatching it; malformed/stale rows are deliberately dropped.
+        open_editor_intents: db.take_intents("open_editor").unwrap_or_default(),
         // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),
@@ -2917,6 +2925,24 @@ pub(crate) fn build_panel(
             || cached.worktree == loc.path()
         {
             apply_pr_cache(&mut panel, cached);
+        }
+    }
+
+    // The deep review cache is identity-checked before it reaches either
+    // renderer. A branch/head switch must never make old comments look
+    // anchored to the current PR; keep the row visible only as an explicit
+    // stale status until the off-loop refresh replaces it.
+    if let Ok(Some(snapshot)) = db.get_pr_review_cache(&cache_key) {
+        let matches_current = panel.pr.as_ref().is_some_and(|pr| {
+            snapshot.worktree_key == cache_key
+                && snapshot.branch == panel.branch
+                && snapshot.pr_number == pr.number
+                && snapshot.head_oid == panel.pr_head_oid
+        });
+        if matches_current {
+            panel.review_snapshot = Some(snapshot);
+        } else {
+            panel.review_snapshot_status = Some("stale PR review snapshot".into());
         }
     }
 
@@ -3150,6 +3176,7 @@ pub(crate) fn build_panel(
         panel.my_work_note = feed.note;
     }
     crate::hydrate_feed::populate_notifications(db, &repo_root, app_cfg, &mut panel);
+    populate_review_tasks(db, &mut panel);
     // Tasks section: populate task specs from config + auto-discovery (reusing the
     // single layered-config load above). Configured tasks win by name; discovered
     // tasks from manifests fill gaps.
@@ -3206,6 +3233,118 @@ pub(crate) fn build_panel(
         panel.log_tail = thegn_core::log_view::error_inclusive_tail(&tail_lines, 400, 200);
     }
     panel
+}
+
+/// Join durable review-task lifecycle rows with THE-27's cached provider
+/// identity. This runs on the hydration worker and is scoped by the explicit PR
+/// queue rows already loaded into `panel`.
+fn populate_review_tasks(db: &thegn_core::db::Db, panel: &mut crate::panel::PanelData) {
+    let Ok(tasks) = db.list_review_tasks() else {
+        return;
+    };
+    for task in tasks {
+        let Some((forge, repository, pr_number)) = parse_review_issue_id(&task.issue_id) else {
+            continue;
+        };
+        let Some(queue_row) = panel.pr_queue.iter().find(|row| {
+            row.number == pr_number
+                && row.forge == forge
+                && (task.worktree_path.is_empty()
+                    || row.worktree.as_deref() == Some(task.worktree_path.as_str())
+                    || row.repo_root == task.worktree_path)
+        }) else {
+            continue;
+        };
+
+        // Number-only tasks deliberately have no cache/worktree identity. Do
+        // not probe the empty key: a legacy or unrelated empty-key row must
+        // never hydrate identity for a human-only task.
+        let cached = (!task.worktree_path.is_empty())
+            .then(|| db.get_pr_review_cache(&task.worktree_path).ok().flatten())
+            .flatten()
+            .filter(|snapshot| snapshot.pr_number == pr_number);
+        let identity = cached.as_ref().and_then(|snapshot| {
+            let context = thegn_core::pr_review_tasks::PrReviewTaskContext {
+                forge,
+                repository,
+                pr_url: "",
+                pr_title: "",
+                base: queue_row.base_branch.as_str(),
+                worktree_path: task.worktree_path.as_str(),
+                role: task.role.as_str(),
+                prompt_template: "",
+            };
+            snapshot
+                .conversation
+                .threads
+                .iter()
+                .find(|thread| {
+                    thegn_core::pr_review_tasks::thread_source_key(&context, pr_number, &thread.id)
+                        == task.source_key
+                })
+                .map(|thread| (thread.id.clone(), thread.path.clone(), thread.line))
+                .or_else(|| {
+                    (thegn_core::pr_review_tasks::decision_source_key(&context, pr_number)
+                        == task.source_key)
+                        .then(|| ("review_decision".into(), "PR-level".into(), None))
+                })
+        });
+        let identity = identity.or_else(|| {
+            panel
+                .notifications
+                .iter()
+                .find(|note| {
+                    note.kind == thegn_core::notification::NotificationKind::PrReviewTaskQueued
+                        && note.source_ref == task.source_key
+                })
+                .and_then(|note| {
+                    parse_review_task_notification(&note.message, &task.source_revision)
+                })
+        });
+        let (thread_id, path, line) = identity.unwrap_or_else(|| {
+            (
+                task.source_key.clone(),
+                "anchor unavailable (refresh pending)".into(),
+                None,
+            )
+        });
+        panel.review_tasks.push(crate::panel::ReviewTaskRow {
+            id: task.id,
+            pr_number,
+            repository: repository.to_string(),
+            thread_id,
+            path,
+            line,
+            role: task.role,
+            status: task.status,
+            source_revision: task.source_revision,
+            worktree_path: task.worktree_path,
+        });
+    }
+}
+
+fn parse_review_issue_id(issue_id: &str) -> Option<(&str, &str, u64)> {
+    let rest = issue_id.strip_prefix("pr:")?;
+    let (forge, repo_pr) = rest.split_once(':')?;
+    let (repository, number) = repo_pr.rsplit_once('#')?;
+    Some((forge, repository, number.parse().ok()?))
+}
+
+fn parse_review_task_notification(
+    message: &str,
+    revision: &str,
+) -> Option<(String, String, Option<u64>)> {
+    let (_, body) = message.split_once(": ")?;
+    let suffix = format!("; rev {revision}]");
+    let body = body.strip_suffix(&suffix)?;
+    let (location, identity) = body.rsplit_once(" [")?;
+    let (thread_id, _) = identity.rsplit_once(" @ ")?;
+    let (path, line) = match location.rsplit_once(':') {
+        Some((path, line)) if line.parse::<u64>().is_ok() => (path.to_string(), line.parse().ok()),
+        _ if location == "unanchored" => (String::new(), None),
+        _ => (location.to_string(), None),
+    };
+    Some((thread_id.to_string(), path, line))
 }
 
 /// Size of the fixed END-of-file read used to build the Logs section tail +
@@ -3504,7 +3643,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&cwd);
 
         // Snapshot the old PR state BEFORE overwriting the cache.
-        let old_pr_state: Option<String> = db
+        let old_pr: Option<Box<thegn_core::forge::model::PrStatus>> = db
             .get_pr_cache(&cache_key)
             .ok()
             .flatten()
@@ -3512,9 +3651,10 @@ pub(crate) fn spawn_pr_cache_refresh(
                 serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json).ok()
             })
             .and_then(|p| match p.state {
-                thegn_core::forge::model::PanelState::Pr(pr) => Some(pr.state),
+                thegn_core::forge::model::PanelState::Pr(pr) => Some(pr),
                 _ => None,
             });
+        let old_pr_state = old_pr.as_ref().map(|pr| pr.state.clone());
 
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
@@ -3543,6 +3683,78 @@ pub(crate) fn spawn_pr_cache_refresh(
             let _ = db.put_pr_cache(&cache_key, &panel.branch, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
+        // Deep review data is a separate complete snapshot. Fetching either
+        // half failing leaves the previous snapshot untouched, so an outage
+        // cannot turn a useful cached conversation into a partial one.
+        if let thegn_core::forge::model::PanelState::Pr(pr) = &panel.state
+            && let Some((owner, repo)) = thegn_core::forge::model::owner_repo_from_url(&pr.url)
+        {
+            let deep_forge = forges.for_loc(&loc);
+            if let (Ok(conversation), Ok(diff)) = (
+                deep_forge.conversation(
+                    &loc,
+                    &thegn_core::forge::RepoRef { owner, repo },
+                    pr.number,
+                ),
+                deep_forge.pr_diff(&loc, thegn_core::forge::PrRef::Current),
+            ) {
+                let snapshot = thegn_core::review::PrReviewSnapshot {
+                    worktree_key: cache_key.clone(),
+                    // Review-cache identity follows the checked-out local
+                    // branch, just like pr_cache. The PR head ref may use a
+                    // different name for fork/remote workflows.
+                    branch: panel.branch.clone(),
+                    pr_number: pr.number,
+                    head_oid: pr.head_ref_oid.clone(),
+                    fetched_at: thegn_core::util::now(),
+                    conversation,
+                    diff,
+                };
+                // Complete payload only; DB failures are cache misses on the
+                // next hydrate and do not affect the primary PR refresh.
+                let _ = db.put_pr_review_cache(&snapshot);
+            }
+        }
+
+        // Typed automation edges come from authoritative old/new forge cache
+        // facts, never notification prose. First fetch is a baseline only.
+        if let (Some(old), thegn_core::forge::model::PanelState::Pr(pr)) =
+            (old_pr.as_deref(), &panel.state)
+        {
+            let (checks_edge, review_requested_edge) = pr_automation_edges(old, pr);
+            let wt = cwd.to_string_lossy().into_owned();
+            if let Some(new_passed) = checks_edge {
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::PrChecks,
+                    format!("pr:{}:checks:{}:{new_passed}", pr.number, pr.head_ref_oid),
+                    Some(wt.clone()),
+                    Some(format!(
+                        "PR #{} checks {}",
+                        pr.number,
+                        if new_passed { "passed" } else { "not passed" }
+                    )),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_checks_passed: Some(new_passed),
+                        ..Default::default()
+                    },
+                );
+            }
+            if review_requested_edge {
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::PrReviewRequested,
+                    format!("pr:{}:review_requested:{}", pr.number, pr.head_ref_oid),
+                    Some(wt),
+                    Some(format!("PR #{} review requested", pr.number)),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_review_requested: Some(true),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
         // Emit a notification when the PR transitions between states
         // (e.g. OPEN → MERGED). Only fires when there was a prior known state
         // to diff against — avoids spurious notifications on first fetch.
@@ -3553,8 +3765,33 @@ pub(crate) fn spawn_pr_cache_refresh(
             let pr_ref = format!("pr:{}", pr.number);
             let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
             let wt = cwd.to_string_lossy();
-            if !crate::notify::record_global(&db, "pr_state_changed", &pr_ref, &msg, &wt) {
-                let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let merged = pr.state == "MERGED";
+            let _ = crate::automation_events::emit_with_facts(
+                &db,
+                "pr_state_changed",
+                &pr_ref,
+                &msg,
+                &wt,
+                crate::automation_events::EventFacts {
+                    branch: Some(panel.branch.clone()),
+                    pr_merged: Some(merged),
+                    ..Default::default()
+                },
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            if merged {
+                let origin = crate::automation_events::take_merge_origin(&db, &wt);
+                crate::automation_events::submit_fact(
+                    thegn_core::automation::AutomationEventKind::MergeLanded,
+                    format!("{pr_ref}:merged"),
+                    Some(wt.to_string()),
+                    Some(msg.clone()),
+                    crate::automation_events::EventFacts {
+                        branch: Some(panel.branch.clone()),
+                        pr_merged: Some(true),
+                        origin,
+                        ..Default::default()
+                    },
+                );
             }
 
             // Lifecycle automation: on merge, move this worktree's linked
@@ -3677,9 +3914,8 @@ pub(crate) fn spawn_pr_cache_refresh(
                 }
                 for (source_ref, msg, wt) in pr_linked_notifications(&old_open, &prs, &wts, &hints)
                 {
-                    if !crate::notify::record_global(&db, "pr_linked", &source_ref, &msg, &wt) {
-                        let _ = db.put_notification("pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                    }
+                    let _ =
+                        crate::automation_events::emit(&db, "pr_linked", &source_ref, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
             }
 
@@ -3710,21 +3946,14 @@ pub(crate) fn spawn_pr_cache_refresh(
                 let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Ok(mentions) = forge.mentions(&loc, &repo) {
                     for (source_ref, msg) in mentions {
-                        if !crate::notify::record_global_once(
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                        let _ = crate::automation_events::emit_once(
                             &db,
                             "mentioned",
                             &source_ref,
                             &msg,
                             &repo_root,
-                        ) {
-                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                            let _ = db.put_notification_once(
-                                "mentioned",
-                                &source_ref,
-                                &msg,
-                                &repo_root,
-                            );
-                        }
+                        );
                     }
                 }
             }
@@ -3734,6 +3963,26 @@ pub(crate) fn spawn_pr_cache_refresh(
             }
         }
     });
+}
+
+fn pr_checks_passed(pr: &thegn_core::forge::model::PrStatus) -> bool {
+    pr.checks.total > 0 && pr.checks.failed == 0 && pr.checks.pending == 0
+}
+
+fn pr_review_requested(pr: &thegn_core::forge::model::PrStatus) -> bool {
+    pr.review_decision.as_deref() == Some("REVIEW_REQUIRED")
+}
+
+pub(crate) fn pr_automation_edges(
+    old: &thegn_core::forge::model::PrStatus,
+    new: &thegn_core::forge::model::PrStatus,
+) -> (Option<bool>, bool) {
+    let old_passed = pr_checks_passed(old);
+    let new_passed = pr_checks_passed(new);
+    (
+        (old_passed != new_passed).then_some(new_passed),
+        !pr_review_requested(old) && pr_review_requested(new),
+    )
 }
 
 /// The pure diff behind the `pr_linked` producer: for each PR whose head
@@ -3880,7 +4129,13 @@ fn maybe_clean_merged_worktrees(
                 verb,
                 thegn_core::disk::human(reclaimed)
             );
-            let _ = db.put_notification("disk_cleaned", &row.branch, &msg, &row.worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let _ = crate::automation_events::emit(
+                db,
+                "disk_cleaned",
+                &row.branch,
+                &msg,
+                &row.worktree,
+            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }

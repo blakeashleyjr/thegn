@@ -12,8 +12,8 @@ use crate::compositor::Rect;
 use crate::menu::{self, MenuOverlay};
 use crate::panes::Panes;
 use crate::run::{
-    DrawerPool, ResidentWorkspace, SidebarState, WorkspacePool, persist_session_layout,
-    refresh_tab_model, remap_cold_workspace_ids, sync_drawer_persistence,
+    DrawerRuntime, ResidentWorkspace, SidebarState, WorkspacePool, persist_session_layout,
+    refresh_tab_model, remap_cold_workspace_ids,
 };
 
 fn looks_like_git_url(input: &str) -> bool {
@@ -309,9 +309,7 @@ pub(crate) fn complete_workspace_create(
     focus: &mut crate::focus::FocusState,
     model: &mut FrameModel,
     sb: &mut SidebarState,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
     center: Rect,
 ) -> bool {
@@ -330,15 +328,9 @@ pub(crate) fn complete_workspace_create(
             remap_cold_workspace_ids(session, panes);
             focus.zone = crate::focus::Zone::Center;
             refresh_tab_model(model, session, sb);
-            sync_drawer_persistence(
-                session,
-                panes,
-                drawer,
-                drawer_pool,
-                drawer_home,
-                cfg,
-                center,
-            );
+            if let Some(dir) = crate::run::active_cwd(session) {
+                drawer_runtime.reconcile(cfg, &dir, panes, center);
+            }
             model.status = format!("workspace created: {}", path.display());
             true
         }
@@ -369,9 +361,7 @@ pub(crate) fn apply_clone_event(
     focus: &mut crate::focus::FocusState,
     model: &mut FrameModel,
     sb: &mut SidebarState,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
     center: Rect,
 ) -> bool {
@@ -407,9 +397,7 @@ pub(crate) fn apply_clone_event(
                         focus,
                         model,
                         sb,
-                        drawer,
-                        drawer_pool,
-                        drawer_home,
+                        drawer_runtime,
                         cfg,
                         center,
                     )
@@ -444,9 +432,7 @@ pub(crate) fn handle_picker_outcome(
     focus: &mut crate::focus::FocusState,
     model: &mut FrameModel,
     sb: &mut SidebarState,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
     center: Rect,
 ) -> bool {
@@ -460,9 +446,7 @@ pub(crate) fn handle_picker_outcome(
                   focus: &mut crate::focus::FocusState,
                   model: &mut FrameModel,
                   sb: &mut SidebarState,
-                  drawer: &mut Option<u32>,
-                  drawer_pool: &mut DrawerPool,
-                  drawer_home: &mut Option<std::path::PathBuf>| {
+                  drawer_runtime: &mut DrawerRuntime| {
         *picker = None;
         complete_workspace_create(
             input,
@@ -473,9 +457,7 @@ pub(crate) fn handle_picker_outcome(
             focus,
             model,
             sb,
-            drawer,
-            drawer_pool,
-            drawer_home,
+            drawer_runtime,
             cfg,
             center,
         )
@@ -497,9 +479,7 @@ pub(crate) fn handle_picker_outcome(
             focus,
             model,
             sb,
-            drawer,
-            drawer_pool,
-            drawer_home,
+            drawer_runtime,
         ),
         PickerOutcome::Manual(input) => match plan_new_workspace_input(&input, cfg) {
             SubmitPlan::Clone { url, dest } => {
@@ -522,9 +502,7 @@ pub(crate) fn handle_picker_outcome(
                 focus,
                 model,
                 sb,
-                drawer,
-                drawer_pool,
-                drawer_home,
+                drawer_runtime,
             ),
             SubmitPlan::CreateNew { leaf } => {
                 *picker = None;

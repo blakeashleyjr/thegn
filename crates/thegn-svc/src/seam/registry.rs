@@ -193,6 +193,7 @@ fn forge_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use crate::issue::IssueCaps;
     use thegn_core::config_issues::IssueProviderKind;
     cfg.issues
         .active_accounts()
@@ -203,9 +204,11 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                 return ProbeReport::reserved("issues", &id);
             }
             match a.provider {
-                IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready),
+                IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready)
+                    .with_caps(&IssueCaps::default()),
                 IssueProviderKind::Github => {
                     ProbeReport::new("issues", id, binary_availability("gh"))
+                        .with_caps(&IssueCaps::default())
                 }
                 IssueProviderKind::Linear | IssueProviderKind::Jira | IssueProviderKind::Kaneo => {
                     let avail =
@@ -214,7 +217,16 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                         } else {
                             Availability::Ready
                         };
+                    let caps = if a.provider == IssueProviderKind::Kaneo {
+                        IssueCaps {
+                            comments: true,
+                            labels: true,
+                        }
+                    } else {
+                        IssueCaps::default()
+                    };
                     ProbeReport::new("issues", id, avail)
+                        .with_caps(&caps)
                         .note("network provider; not probed offline")
                 }
             }
@@ -332,14 +344,22 @@ fn git_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn editor_probes(cfg: &Config) -> Vec<ProbeReport> {
-    let editor = thegn_core::editor::editor_for(cfg);
-    let caps = editor.caps();
-    let note = format!(
-        "[editor] open_in = {}; line jump {}",
-        cfg.editor.open_in.as_str(),
-        if caps.line { "yes" } else { "no" }
-    );
-    vec![editor.probe().note(note)]
+    let selected = thegn_core::editor::editor_for(cfg);
+    let selected_id = selected.id();
+    let mut reports = thegn_core::editor::providers::probes(cfg.editor.open_in);
+    if matches!(selected_id, "template" | "tool" | "visual" | "env" | "vi") {
+        reports.push(selected.probe());
+    }
+    for report in &mut reports {
+        if report.id == selected_id {
+            report.notes.push(format!(
+                "selected; [editor] provider = {}, open_in = {}",
+                cfg.editor.provider.as_str(),
+                cfg.editor.open_in.as_str()
+            ));
+        }
+    }
+    reports
 }
 
 /// A sandbox backend's probe, enriched with the runtime-state truth

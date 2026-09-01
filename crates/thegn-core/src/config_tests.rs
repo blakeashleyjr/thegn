@@ -1441,6 +1441,40 @@ fn metrics_env_overlay_clamps_runtime_bounds() {
     assert_eq!(c.metrics.max_body_bytes, 1);
 }
 
+#[test]
+fn preview_config_layering_and_cli_array_override() {
+    let dir = tmpdir("preview-config");
+    let file = dir.join("config.toml");
+    std::fs::write(
+        &file,
+        "[preview]\nenabled = true\nports = [1111]\nfetch_timeout_ms = 500\n\
+         max_body_bytes = 2048\nallow_external_urls = false\n",
+    )
+    .unwrap();
+    let env = map_env(&[
+        ("THEGN_PREVIEW_ENABLED", "false"),
+        ("THEGN_PREVIEW_PORTS", "2222"),
+        ("THEGN_PREVIEW_FETCH_TIMEOUT_MS", "600"),
+        ("THEGN_PREVIEW_MAX_BODY_BYTES", "4096"),
+        ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "true"),
+    ]);
+    let flags = vec![
+        "preview.enabled=true".into(),
+        "preview.ports=[4444, 3333, 4444]".into(),
+        "preview.fetch_timeout_ms=700".into(),
+        "preview.max_body_bytes=8192".into(),
+        "preview.allow_external_urls=false".into(),
+    ];
+    let config = Config::load_layered(&env, &flags, Some(file));
+    assert!(config.preview.enabled);
+    assert_eq!(config.preview.ports, vec![3333, 4444]);
+    assert_eq!(config.preview.fetch_timeout_ms, 700);
+    assert_eq!(config.preview.max_body_bytes, 8192);
+    assert!(!config.preview.allow_external_urls);
+    // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Exercise every env knob (and the canonical/deprecated/bad-value paths) so
 // the layering is covered, not just spot-checked.
 #[test]
@@ -1453,6 +1487,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_PICKER", "fzf"),
         ("THEGN_GIT_BACKEND", "cli"),
         ("THEGN_GIT_STRUCTURAL_DIFF", "difft"),
+        ("THEGN_EDITOR_PROVIDER", "zed"),
         ("THEGN_EDITOR_COMMAND", "hx {path}"),
         ("THEGN_EDITOR_OPEN_IN", "external"),
         ("THEGN_WORKTREE_MODE", "in_repo"),
@@ -1476,6 +1511,11 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DIAGNOSTICS_CRASH_REPORTS", "off"),
         ("THEGN_DIAGNOSTICS_CRASH_RETENTION", "3"),
         ("THEGN_DIAGNOSTICS_RING_SIZE", "128"),
+        ("THEGN_DATABASE_MIGRATION_AUTHORITY", "disabled"),
+        (
+            "THEGN_DATABASE_MIGRATION_EXECUTABLE",
+            "/opt/thegn/bin/thegn",
+        ),
         ("THEGN_SANDBOX_BACKEND", "docker"),
         ("THEGN_SANDBOX_NETWORK", "host"),
         ("THEGN_SANDBOX_IMAGE", "img:9"),
@@ -1515,6 +1555,14 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
         ("THEGN_WEATHER_ENABLED", "yes"),
         ("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "true"),
+        ("THEGN_SKILLS_ENABLED", "false"),
+        ("THEGN_SKILLS_USER_DIRS", "/one, ~/.skills"),
+        ("THEGN_SKILLS_EXCLUDE", "mq, pipeline"),
+        ("THEGN_PREVIEW_ENABLED", "no"),
+        ("THEGN_PREVIEW_PORTS", "5173,3000,5173"),
+        ("THEGN_PREVIEW_FETCH_TIMEOUT_MS", "850"),
+        ("THEGN_PREVIEW_MAX_BODY_BYTES", "8192"),
+        ("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS", "yes"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1523,6 +1571,7 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.branch_prefix, "x/");
     assert_eq!(c.git.backend, GitBackendKind::Cli);
     assert_eq!(c.git.structural_diff, StructuralDiff::Difft);
+    assert_eq!(c.editor.provider, EditorProvider::Zed);
     assert_eq!(c.editor.command, "hx {path}");
     assert_eq!(c.editor.open_in, EditorOpenIn::External);
     assert_eq!(c.picker, Picker::Fzf);
@@ -1547,6 +1596,8 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.diagnostics.crash_reports);
     assert_eq!(c.diagnostics.crash_retention, 3);
     assert_eq!(c.diagnostics.ring_size, 128);
+    assert_eq!(c.database.migration_authority, MigrationAuthority::Disabled);
+    assert_eq!(c.database.migration_executable, "/opt/thegn/bin/thegn");
     assert_eq!(c.sandbox.backend, SandboxBackend::Docker);
     assert_eq!(c.sandbox.network, Network::Host);
     assert_eq!(c.sandbox.image, "img:9");
@@ -1595,6 +1646,65 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.disk.shared_target_dir, "/tgt");
     assert!(c.weather.enabled);
     assert!(c.notifications.agent_attention_inbox);
+    assert!(!c.skills.enabled);
+    assert_eq!(c.skills.user_dirs, vec!["/one", "~/.skills"]);
+    assert_eq!(c.skills.exclude, vec!["mq", "pipeline"]);
+    assert!(!c.preview.enabled);
+    assert_eq!(c.preview.ports, vec![3000, 5173]);
+    assert_eq!(c.preview.fetch_timeout_ms, 850);
+    assert_eq!(c.preview.max_body_bytes, 8192);
+    assert!(c.preview.allow_external_urls);
+}
+
+#[test]
+fn skills_config_defaults_parse_overlay_and_validate_syntax() {
+    let defaults: Config = toml::from_str("").unwrap();
+    assert!(defaults.skills.enabled);
+    assert!(defaults.skills.user_dirs.is_empty());
+    assert!(defaults.skills.exclude.is_empty());
+
+    let body = r#"
+[skills]
+enabled = false
+user_dirs = ["~/.skills", "./project-skills"]
+exclude = ["mq", "pipeline"]
+"#;
+    let cfg: Config = toml::from_str(body).unwrap();
+    assert!(!cfg.skills.enabled);
+    assert_eq!(cfg.skills.user_dirs, vec!["~/.skills", "./project-skills"]);
+    assert_eq!(cfg.skills.exclude, vec!["mq", "pipeline"]);
+    assert!(crate::config_validate::validate_str(body).is_empty());
+
+    let invalid = r#"
+[skills]
+user_dirs = ["", "bad,dir"]
+exclude = ["../escape", "mq", "mq"]
+"#;
+    let errors = crate::config_validate::validate_str(invalid);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.user_dirs[0]") && e.contains("empty")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.user_dirs[1]") && e.contains("separator")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.exclude[0]") && e.contains("path-safe")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("skills.exclude[2]") && e.contains("duplicate")),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -1773,6 +1883,8 @@ fn agent_command() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1794,6 +1906,8 @@ fn default_agent_name_skips_the_shell_fallback() {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         }],
         ..Default::default()
     };
@@ -1810,6 +1924,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
@@ -1822,6 +1938,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
@@ -1840,6 +1958,8 @@ fn tool_command() {
         model: None,
         env: Default::default(),
         permissions: Vec::new(),
+        drawer_scope: None,
+        drawer_cwd: None,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);

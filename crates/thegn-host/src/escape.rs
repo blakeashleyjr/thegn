@@ -6,7 +6,7 @@
 //! file drawer closed. That behaviour is opt-in via `[panel] collapse_on_escape`
 //! (default on) and lives here so the event loop only calls a one-liner.
 
-use crate::drawer_state::{DrawerPool, hide_drawer_into_pool, set_flag};
+use crate::drawer_state::DrawerRuntime;
 use crate::run::active_cwd;
 
 /// Close the focused bottom drawer: stash its pane into the pool and persist the
@@ -14,18 +14,16 @@ use crate::run::active_cwd;
 /// remove when the cwd is unknown). Shared by the Esc/q drawer-dismiss path and
 /// [`escape_to_center`].
 pub(crate) fn close_drawer_to_pool(
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     session: &crate::session::Session,
     panes: &mut crate::panes::Panes,
     cfg: &thegn_core::config::Config,
+    center: crate::compositor::Rect,
 ) {
     if let Some(cwd) = active_cwd(session) {
-        hide_drawer_into_pool(drawer, drawer_pool, drawer_home, &cwd, cfg, panes);
-        set_flag(&cwd, false);
-    } else if let Some(id) = drawer.take() {
-        panes.table.remove(&id);
+        drawer_runtime.close_visible(cfg, &cwd, panes, center);
+    } else if let Some(visible) = drawer_runtime.visible.take() {
+        panes.table.remove(&visible.pane_id);
     }
 }
 
@@ -38,12 +36,11 @@ pub(crate) fn close_drawer_to_pool(
 pub(crate) fn escape_to_center(
     focus: &mut crate::focus::FocusState,
     panel_ui: &mut crate::panel::PanelUi,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     session: &crate::session::Session,
     panes: &mut crate::panes::Panes,
     cfg: &thegn_core::config::Config,
+    center: crate::compositor::Rect,
 ) -> bool {
     focus.zone = crate::focus::Zone::Center;
     if !cfg.panel.collapse_on_escape {
@@ -54,8 +51,8 @@ pub(crate) fn escape_to_center(
         panel_ui.width = crate::layout::PanelWidth::Normal;
         relayout = true;
     }
-    if drawer.is_some() {
-        close_drawer_to_pool(drawer, drawer_pool, drawer_home, session, panes, cfg);
+    if drawer_runtime.visible.is_some() {
+        close_drawer_to_pool(drawer_runtime, session, panes, cfg, center);
         relayout = true;
     }
     relayout

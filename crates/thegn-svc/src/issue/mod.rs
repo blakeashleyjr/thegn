@@ -6,6 +6,7 @@
 //! collections when no provider is configured rather than erroring, so the
 //! panel always has something to render.
 
+pub mod capabilities;
 pub mod github;
 pub mod jira;
 pub mod kaneo;
@@ -16,11 +17,15 @@ pub mod secret;
 use futures_util::future::BoxFuture;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
+use thegn_core::seam::{ErrorClass, SeamError};
+
+pub use capabilities::IssueCaps;
 
 /// Errors from any issue backend.
 #[derive(Debug)]
 pub enum IssueError {
     NotConfigured,
+    Unsupported(&'static str),
     Network(reqwest::Error),
     Auth(String),
     Api(String),
@@ -32,6 +37,7 @@ impl std::fmt::Display for IssueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IssueError::NotConfigured => write!(f, "no issue provider configured"),
+            IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
             IssueError::Network(e) => write!(f, "network: {e}"),
             IssueError::Auth(s) => write!(f, "auth: {s}"),
             IssueError::Api(s) => write!(f, "api: {s}"),
@@ -44,11 +50,43 @@ impl std::fmt::Display for IssueError {
 impl std::error::Error for IssueError {}
 
 impl IssueError {
+    /// Construct the typed error returned by an absent optional operation.
+    pub fn unsupported(op: &'static str) -> Self {
+        IssueError::Unsupported(op)
+    }
+
     /// Whether this is a transient connectivity failure (connect/timeout) — as
     /// opposed to auth/parse/not-configured. Feeds the connectivity holder so a
     /// dropped link (not a bad token) is what flips the app offline.
     pub fn is_transient(&self) -> bool {
-        matches!(self, IssueError::Network(e) if e.is_connect() || e.is_timeout())
+        <Self as SeamError>::is_transient(self)
+    }
+}
+
+impl SeamError for IssueError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            IssueError::Unsupported(_) => ErrorClass::Unsupported,
+            IssueError::NotConfigured => ErrorClass::NotConfigured,
+            IssueError::Auth(_) => ErrorClass::Auth,
+            IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
+            IssueError::Network(_) => ErrorClass::Other,
+            IssueError::Subprocess(message)
+                if message
+                    .to_ascii_lowercase()
+                    .contains("no such file or directory")
+                    || message.to_ascii_lowercase().contains("program not found") =>
+            {
+                ErrorClass::NotInstalled
+            }
+            IssueError::Api(_) | IssueError::Subprocess(_) | IssueError::Parse(_) => {
+                ErrorClass::Other
+            }
+        }
+    }
+
+    fn unsupported(op: &'static str) -> Self {
+        Self::unsupported(op)
     }
 }
 
@@ -76,6 +114,7 @@ pub(crate) fn parse_due_date_ms(s: &str) -> Option<i64> {
 /// object-safe — the router dispatches over `Box<dyn IssueBackend>`.
 pub trait IssueBackend: Send + Sync {
     fn provider_id(&self) -> &'static str;
+    fn caps(&self) -> IssueCaps;
 
     fn list_issues<'a>(
         &'a self,
@@ -107,11 +146,7 @@ pub trait IssueBackend: Send + Sync {
         _id: &'a str,
         _body: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
-        Box::pin(async move {
-            Err(IssueError::Api(
-                "comments not supported by this provider".into(),
-            ))
-        })
+        Box::pin(async move { Err(IssueError::unsupported("add_comment")) })
     }
     /// Attach a label (by name) to an issue, creating it if the provider allows.
     fn attach_label<'a>(
@@ -119,11 +154,7 @@ pub trait IssueBackend: Send + Sync {
         _id: &'a str,
         _label: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
-        Box::pin(async move {
-            Err(IssueError::Api(
-                "labels not supported by this provider".into(),
-            ))
-        })
+        Box::pin(async move { Err(IssueError::unsupported("attach_label")) })
     }
     /// Remove a label (by name) from an issue.
     fn detach_label<'a>(
@@ -131,11 +162,7 @@ pub trait IssueBackend: Send + Sync {
         _id: &'a str,
         _label: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
-        Box::pin(async move {
-            Err(IssueError::Api(
-                "labels not supported by this provider".into(),
-            ))
-        })
+        Box::pin(async move { Err(IssueError::unsupported("detach_label")) })
     }
 
     /// Downcast to the concrete Kaneo backend for board/project browsing, which

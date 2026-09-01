@@ -25,11 +25,10 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub(crate) use crate::config_repo::lenient_env_selector;
 pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
-
+pub use crate::hooks::HooksConfig;
 fn is_false(value: &bool) -> bool {
     !*value
 }
-
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
 pub fn config_warn(msg: &str) {
@@ -275,11 +274,15 @@ pub use crate::config_theme::{
 // The file-manager seam's `[drawer] kind` enum lives with the seam in
 // `file_manager`; re-exported so `config::DrawerKind` keeps working.
 pub use crate::file_manager::DrawerKind;
+// The editor seam owns its logical provider enum; re-export it beside the
+// other config-selected provider kinds.
+pub use crate::editor::EditorProvider;
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
 pub use crate::config_activity::ActivityConfig;
 pub use crate::config_daemon::{DaemonConfig, ServeConfig};
+pub use crate::config_drawer::{DrawerOccupant, DrawerPolicy, DrawerScope};
 pub use crate::config_notifications::{
     DndConfig, NotificationMode, NotificationRule, NotificationsConfig, NotificationsOverlay,
     SoundConfig, SoundMode,
@@ -299,13 +302,14 @@ config_enum! {
     } default = Auto;
 }
 
-/// `[editor]` — how thegn opens a file (from the files tree, a diff hunk, a
-/// test failure, a problem, a search hit, `config edit`). Resolution:
-/// `command` here → the `[[tools]]` entry named `editor` → `$VISUAL` /
-/// `$EDITOR` → `vi`; the program's basename picks the line-jump syntax.
+/// `[editor]` — how thegn opens a worktree or one of its files. A non-empty
+/// `command` wins; otherwise an explicit logical `provider` wins; `auto` keeps
+/// the `[[tools]] editor` → `$VISUAL` → `$EDITOR` → `vi` ladder.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EditorConfig {
+    /// Logical provider. `auto` preserves the custom-program ladder.
+    pub provider: EditorProvider,
     /// A command template with `{path}`, `{line}` and `{col}` placeholders
     /// (`{path}` is shell-quoted for you). Empty = resolve from tools/env.
     pub command: String,
@@ -1759,6 +1763,17 @@ pub struct NamedCommand {
     /// Off by default. See [`crate::config_model_proxy`].
     #[serde(default)]
     pub route_via_proxy: bool,
+    /// Opt this tool into the bottom drawer as a worktree- or process-global
+    /// occupant. Absent keeps the existing picker-only behavior.
+    #[serde(
+        default,
+        deserialize_with = "crate::config_drawer::deserialize_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drawer_scope: Option<DrawerScope>,
+    /// Optional scope-relative working directory for a drawer occupant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawer_cwd: Option<String>,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -2246,6 +2261,10 @@ pub struct ProfileConfig {
     /// per-profile rules/DND/sound take effect without touching per-repo config.
     #[serde(skip_serializing_if = "NotificationsOverlay::is_empty")]
     pub notifications: NotificationsOverlay,
+    /// Trusted automation refinements for this named profile. Repo overlays
+    /// deliberately have no corresponding field.
+    #[serde(skip_serializing_if = "AutomationsOverlay::is_empty")]
+    pub automations: AutomationsOverlay,
     /// Named identity this profile resolves its credentials from
     /// (`[profiles.<p>] identity = "washu"` → `[identities.washu]`). Each tool
     /// (git config, git SSH key, `gh` config, GnuPG home, agent accounts) the
@@ -2267,6 +2286,11 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkspaceConfig {
+    /// Trusted per-workspace logical editor provider. `None` inherits
+    /// `[editor] provider`; an explicit `auto` selects the custom-program
+    /// ladder for this workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<EditorProvider>,
     /// Keybind overrides applied when this workspace is focused.
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
@@ -2276,6 +2300,9 @@ pub struct WorkspaceConfig {
     /// global active account. See [`crate::account`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// Lifecycle hooks for worktrees in this workspace. Entries accumulate
+    /// after global hooks and before a repo overlay's hooks.
+    pub hooks: HooksConfig,
     /// Extra sandbox bind mounts for this workspace, same format as
     /// `[sandbox] mounts` (`"host"`, `"host:dest"`, `"host:dest:ro|rw|cache"`;
     /// `~` is expanded). These **extend** the global `[sandbox] mounts` (plus
@@ -2676,13 +2703,6 @@ impl Default for ThemeConfig {
     }
 }
 
-/// Accent/focus values treated as "not customized" when deciding whether the
-/// user's `[theme]` should clobber a preset's own accent: the current default
-/// plus the pre-prism defaults (a config that pinned the old default keeps
-/// preset-cycling behavior).
-const DEFAULTISH_ACCENTS: &[&str] = &["#6ee7d8", "#76eede"];
-const DEFAULTISH_FOCUS: &[&str] = &["#6ee7d8", "#9bd1ff"];
-
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
 /// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
@@ -3026,7 +3046,7 @@ impl Default for BarsConfig {
             ],
             // `help` is the clickable `?` chip — the one always-visible pointer
             // at the help system. Drop it from the list to hide it.
-            bottom_left: vec!["help".into(), "keyhints".into()],
+            bottom_left: vec!["help".into(), "drawer".into(), "keyhints".into()],
             bottom_right: vec![
                 "pr".into(),
                 "tests".into(),
@@ -4690,6 +4710,7 @@ fn is_default_preset(s: &str) -> bool {
     s.is_empty() || s == "default"
 }
 
+pub use crate::config_automations::{AutomationsConfig, AutomationsOverlay};
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
@@ -4706,6 +4727,47 @@ pub use crate::config_pr_queue::{
     PrAutoEnqueue, PrMergeMethod, PrMergeMode, PrQueueConfig, PrQueueOverlay, PrQueuePrompts,
     PrQueuePromptsOverlay, PrWatchKind,
 };
+pub use crate::config_preview::PreviewConfig;
+pub use crate::config_skills::SkillsConfig;
+
+config_enum! {
+    /// Which process kind may advance the shared state database schema.
+    ///
+    /// `controller` limits migrations to the interactive compositor and the
+    /// long-lived pane daemon/serve process. Ordinary CLI commands (including
+    /// commands resolved from a worktree-local `target/debug`) may still use a
+    /// database whose schema already matches, but cannot move it forward.
+    pub enum MigrationAuthority: "database migration authority" {
+        Any = "any",
+        Controller = "controller" | "host",
+        Disabled = "disabled" | "off",
+    } default = Controller;
+}
+
+/// `[database]` — ownership policy for the one shared state schema.
+///
+/// This is deliberately global/profile config, never a repo overlay: code in a
+/// worktree must not be able to grant itself migration authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DatabaseConfig {
+    /// Who may run automatic schema migrations. `controller` is the safe
+    /// default; `any` restores the legacy "first opener migrates" behavior.
+    pub migration_authority: MigrationAuthority,
+    /// Optional executable pin. When non-empty, even an otherwise-authorized
+    /// controller may migrate only when its canonical `current_exe` equals this
+    /// canonical path. Use an absolute path (a symlink is fine).
+    pub migration_executable: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            migration_authority: MigrationAuthority::Controller,
+            migration_executable: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -4779,7 +4841,12 @@ pub struct Config {
     /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
+    /// `[database]` — shared-schema migration authority and executable pin.
+    pub database: DatabaseConfig,
     pub sandbox: SandboxConfig,
+    /// `[hooks]` lifecycle commands. Workspace and trusted repo layers add to
+    /// these lists; repo entries are trust-gated before execution.
+    pub hooks: HooksConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
     pub toolchain: crate::toolchain::ToolchainConfig,
@@ -4795,6 +4862,8 @@ pub struct Config {
     pub activity: ActivityConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
+    /// `[automations]` — trusted global event-to-catalog-action rules.
+    pub automations: AutomationsConfig,
     pub strip: StripConfig,
     pub panel: PanelConfig,
     pub search: SearchConfig,
@@ -4830,6 +4899,9 @@ pub struct Config {
     /// displays it and never advances a stage itself. Empty by default.
     /// See [`crate::config_pipeline`].
     pub pipeline: Pipeline,
+    /// `[skills]` — embedded and configured agent recipes seeded into native
+    /// per-project harness layouts. Discovery and path access are host-owned.
+    pub skills: SkillsConfig,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
@@ -4864,6 +4936,8 @@ pub struct Config {
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
     /// loopback for browser preview. On by default (loopback-only ⇒ safe).
     pub forward: ForwardConfig,
+    /// `[preview]` — pure frontend target discovery and bounded-fetch policy.
+    pub preview: PreviewConfig,
     /// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
     /// sandboxes (keep recently-used ones warm for fast resume; let idle ones
     /// suspend; provision ahead of focus). Budget-safe defaults.
@@ -5003,7 +5077,9 @@ impl Default for Config {
             watch: WatchConfig::default(),
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            database: DatabaseConfig::default(),
             sandbox: SandboxConfig::default(),
+            hooks: HooksConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
@@ -5012,6 +5088,7 @@ impl Default for Config {
             activity: ActivityConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
+            automations: AutomationsConfig::default(),
             strip: StripConfig::default(),
             panel: PanelConfig::default(),
             search: SearchConfig::default(),
@@ -5023,6 +5100,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             pipeline: Pipeline::default(),
+            skills: SkillsConfig::default(),
             replay: ReplayConfig::default(),
             recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
@@ -5034,6 +5112,7 @@ impl Default for Config {
             host_discovery: crate::config_host_discovery::HostDiscoveryConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
+            preview: PreviewConfig::default(),
             lifecycle: LifecycleConfig::default(),
             placement: PlacementConfig::default(),
             keybinds: KeybindConfig::default(),
@@ -5098,6 +5177,7 @@ pub struct ConfigOverlay {
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
     pub git_structural_diff: Option<StructuralDiff>,
+    pub editor_provider: Option<EditorProvider>,
     pub editor_command: Option<String>,
     pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -5128,6 +5208,8 @@ pub struct ConfigOverlay {
     pub diagnostics_crash_reports: Option<bool>,
     pub diagnostics_crash_retention: Option<usize>,
     pub diagnostics_ring_size: Option<usize>,
+    pub database_migration_authority: Option<MigrationAuthority>,
+    pub database_migration_executable: Option<String>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
@@ -5147,6 +5229,10 @@ pub struct ConfigOverlay {
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
+    pub skills_enabled: Option<bool>,
+    pub skills_user_dirs: Option<Vec<String>>,
+    pub skills_exclude: Option<Vec<String>>,
+    pub preview: crate::config_preview::PreviewOverlay,
     pub sandbox: SandboxOverlay,
 }
 
@@ -5167,6 +5253,7 @@ impl ConfigOverlay {
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
         set!(base.git.structural_diff, self.git_structural_diff);
+        set!(base.editor.provider, self.editor_provider);
         set!(base.editor.command, self.editor_command);
         set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
@@ -5205,6 +5292,14 @@ impl ConfigOverlay {
             self.diagnostics_crash_retention
         );
         set!(base.diagnostics.ring_size, self.diagnostics_ring_size);
+        set!(
+            base.database.migration_authority,
+            self.database_migration_authority
+        );
+        set!(
+            base.database.migration_executable,
+            self.database_migration_executable
+        );
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(
@@ -5233,6 +5328,10 @@ impl ConfigOverlay {
             base.notifications.agent_attention_inbox,
             self.notifications_agent_attention_inbox
         );
+        set!(base.skills.enabled, self.skills_enabled);
+        set!(base.skills.user_dirs, self.skills_user_dirs);
+        set!(base.skills.exclude, self.skills_exclude);
+        self.preview.apply(&mut base.preview);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -5317,6 +5416,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             v.trim(),
             "THEGN_GIT_STRUCTURAL_DIFF",
             StructuralDiff::from_str_validated,
+        );
+    }
+    if let Some(v) = env.get("THEGN_EDITOR_PROVIDER") {
+        o.editor_provider = parse_enum_env(
+            v.trim(),
+            "THEGN_EDITOR_PROVIDER",
+            EditorProvider::from_str_validated,
         );
     }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");
@@ -5433,6 +5539,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.diagnostics_ring_size = parse_num(v, "THEGN_DIAGNOSTICS_RING_SIZE").map(|n| n as usize);
     }
 
+    // [database] — startup-only schema ownership. The executable pin is an
+    // especially useful launcher override for dev/live recipes.
+    if let Some(v) = env.get("THEGN_DATABASE_MIGRATION_AUTHORITY") {
+        o.database_migration_authority = parse_enum_env(
+            v.trim(),
+            "THEGN_DATABASE_MIGRATION_AUTHORITY",
+            MigrationAuthority::from_str_validated,
+        );
+    }
+    o.database_migration_executable = env.get("THEGN_DATABASE_MIGRATION_EXECUTABLE");
+
     // [disk]
     if let Some(v) = env.get("THEGN_DISK_SHOW_SIZES") {
         o.disk_show_sizes = parse_bool(&v, "THEGN_DISK_SHOW_SIZES");
@@ -5495,6 +5612,39 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX") {
         o.notifications_agent_attention_inbox =
             parse_bool(&v, "THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX");
+    }
+
+    // [skills] — all three values are shallow, useful for isolated launches,
+    // and therefore deliberately participate in the env layer.
+    if let Some(v) = env.get("THEGN_SKILLS_ENABLED") {
+        o.skills_enabled = parse_bool(&v, "THEGN_SKILLS_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_SKILLS_USER_DIRS") {
+        o.skills_user_dirs = Some(parse_list(v));
+    }
+    if let Some(v) = env.get("THEGN_SKILLS_EXCLUDE") {
+        o.skills_exclude = Some(parse_list(v));
+    }
+
+    // [preview] — all five keys are trusted launch-time knobs.
+    if let Some(v) = env.get("THEGN_PREVIEW_ENABLED") {
+        o.preview.enabled = parse_bool(&v, "THEGN_PREVIEW_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_PORTS") {
+        match crate::config_preview::parse_ports_env(&v) {
+            Ok(ports) => o.preview.ports = Some(ports),
+            Err(error) => config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring")),
+        }
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_FETCH_TIMEOUT_MS") {
+        o.preview.fetch_timeout_ms = parse_num(v, "THEGN_PREVIEW_FETCH_TIMEOUT_MS");
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_MAX_BODY_BYTES") {
+        o.preview.max_body_bytes = parse_num(v, "THEGN_PREVIEW_MAX_BODY_BYTES")
+            .and_then(|value| usize::try_from(value).ok());
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS") {
+        o.preview.allow_external_urls = parse_bool(&v, "THEGN_PREVIEW_ALLOW_EXTERNAL_URLS");
     }
 
     // [sandbox]
@@ -5804,6 +5954,8 @@ impl Config {
     }
 
     pub(crate) fn post_process(&mut self) {
+        crate::config_drawer::warn_policy_issues(self);
+        crate::config_drawer::strip_agent_metadata(&mut self.agents);
         // Install the resolved [remote] tuning into the process-global holders
         // (ssh keepalives / control-plane retry / heal cadence); first set wins.
         self.remote.install();
@@ -5821,6 +5973,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "shell".into(),
@@ -5833,6 +5987,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -5849,6 +6005,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "yazi".into(),
@@ -5861,6 +6019,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "editor".into(),
@@ -5873,6 +6033,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "diff".into(),
@@ -5885,6 +6047,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -5907,6 +6071,7 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        self.preview.normalize();
         // Drop unusable command collectors up front so the supervisor never has
         // to guess: a `kind = "command"` target with an empty/blank argv can
         // never run, and a `kind = "prometheus"` target with no URL can never be
@@ -6110,6 +6275,31 @@ impl Config {
         n
     }
 
+    /// Trusted automation config: global rules plus the active named profile.
+    /// Repo-root `.thegn.*` files are never consulted by this path.
+    pub fn effective_automations(&self) -> AutomationsConfig {
+        let mut automations = self.automations.clone();
+        if let Some(profile) = self.active_profile() {
+            profile.automations.clone().apply(&mut automations);
+        }
+        automations
+    }
+
+    /// Warn when an untrusted repo overlay tries to install automation rules.
+    /// The raw top-level table is inspected separately because
+    /// [`RepoConfigFile`] intentionally has no `automations` field, ensuring
+    /// rule content can never enter effective config even after detection.
+    pub fn repo_automation_warnings(&self, repo_root: &std::path::Path) -> Vec<String> {
+        let Some(path) = repo_overlay_with_automations(repo_root) else {
+            return Vec::new();
+        };
+        vec![format!(
+            "ignoring automations in {}: automation rules are global/profile config only \
+             (a repo .thegn.* overlay cannot install persistent actions)",
+            path.display()
+        )]
+    }
+
     /// Warnings for any `kind = "command"` metrics collector a repo-root
     /// `.thegn.*` overlay tries to define. Command collectors are global config
     /// only (executing a repo-supplied argv on open would be RCE), so these are
@@ -6300,51 +6490,24 @@ impl Config {
     /// uses this. Extension tokens a legacy preset leaves empty are derived
     /// last, so derivations follow any user-overridden base colors.
     pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
-        let mut p = crate::theme::preset(preset).unwrap_or_default();
-        let set = |slot: &mut String, hex: &Option<String>| {
-            if let Some(rgb) = hex.as_deref().and_then(parse_hex_rgb) {
-                *slot = rgb;
-            }
-        };
-        let c = &self.theme.colors;
-        set(&mut p.bg0, &c.bg0);
-        set(&mut p.bg1, &c.bg1);
-        set(&mut p.panel, &c.panel);
-        set(&mut p.panel2, &c.panel2);
-        set(&mut p.raise, &c.raise);
-        set(&mut p.border, &c.border);
-        set(&mut p.text, &c.text);
-        set(&mut p.dim, &c.dim);
-        set(&mut p.faint, &c.faint);
-        set(&mut p.ghost, &c.ghost);
-        set(&mut p.ghost2, &c.ghost2);
-        set(&mut p.ghost3, &c.ghost3);
-        set(&mut p.shadow_bg, &c.shadow_bg);
-        set(&mut p.shadow_fg, &c.shadow_fg);
-        set(&mut p.chip_fg, &c.chip_fg);
-        set(&mut p.activity_active, &c.activity_active);
-        set(&mut p.activity_waiting, &c.activity_waiting);
-        set(&mut p.activity_done, &c.activity_done);
-        let h = &self.theme.hues;
-        set(&mut p.hues.teal, &h.teal);
-        set(&mut p.hues.magenta, &h.magenta);
-        set(&mut p.hues.purple, &h.purple);
-        set(&mut p.hues.green, &h.green);
-        set(&mut p.hues.amber, &h.amber);
-        set(&mut p.hues.red, &h.red);
-        set(&mut p.hues.blue, &h.blue);
-        set(&mut p.hues.orange, &h.orange);
-        // Only override the preset's focus/accent when the user actually
-        // customized them (a default — current or pre-prism — would clobber
-        // presets).
-        if !DEFAULTISH_FOCUS.contains(&self.theme.focus_border.as_str()) {
-            set(&mut p.focus, &Some(self.theme.focus_border.clone()));
-        }
-        if !DEFAULTISH_ACCENTS.contains(&self.theme.accent.as_str()) {
-            p.accent = self.accent_rgb();
-        }
-        crate::theme::extend_palette(&mut p);
-        p
+        self.palette_with_user_themes(preset, &[])
+    }
+
+    /// Resolve a named built-in or loaded user theme, then apply this config's
+    /// overrides. Built-in names take precedence over user-theme collisions.
+    pub fn palette_with_user_themes(
+        &self,
+        preset: &str,
+        user_themes: &[crate::theme_user::UserTheme],
+    ) -> crate::theme::Palette {
+        crate::theme_resolve::palette_with_catalog(
+            preset,
+            user_themes,
+            &self.theme.colors,
+            &self.theme.hues,
+            &self.theme.accent,
+            &self.theme.focus_border,
+        )
     }
 
     /// Look up a dotted config key as a bare string (for `config get` and the
@@ -6473,11 +6636,48 @@ pub use crate::config_repo::{
 };
 pub use crate::config_validate::validate_str;
 
+/// Return the first repo overlay that contains a top-level `automations` key.
+/// Parsing into a generic value is detection-only; the content is never
+/// deserialized as [`AutomationsConfig`] or merged into [`Config`].
+fn repo_overlay_with_automations(repo_root: &std::path::Path) -> Option<PathBuf> {
+    for (ext, kind) in [
+        ("toml", "toml"),
+        ("yaml", "yaml"),
+        ("yml", "yaml"),
+        ("json", "json"),
+    ] {
+        let path = repo_root.join(format!(".thegn.{ext}"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let value = match kind {
+            "toml" => toml::from_str::<toml::Value>(&text)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            "yaml" => serde_yaml::from_str::<serde_json::Value>(&text).ok(),
+            _ => serde_json::from_str::<serde_json::Value>(&text).ok(),
+        };
+        return value
+            .and_then(|value| value.as_object().map(|map| map.contains_key("automations")))
+            .filter(|present| *present)
+            .map(|_| path);
+    }
+    None
+}
+
 /// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
 /// YAML, then JSON (first existing file wins); parse errors warn and are ignored
 /// so a malformed repo file never blocks opening a worktree.
 pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
     crate::config_repo::load_repo_overlay(repo_root)
+}
+
+/// Load only the lifecycle-hook portion of a repo overlay for the host
+/// orchestration boundary. The policy resolver in `hooks.rs` remains pure: it
+/// receives these typed values rather than discovering files itself.
+pub fn load_repo_hooks(repo_root: &std::path::Path) -> Option<(HooksConfig, Vec<String>)> {
+    load_repo_overlay(repo_root)
+        .map(|overlay| (overlay.hooks, overlay.sandbox.prepare.unwrap_or_default()))
 }
 
 /// A repo-root `.thegn.*` overlay that EXISTS but failed to parse. Returned by
@@ -6497,21 +6697,10 @@ pub fn repo_overlay_parse_error(repo_root: &Path) -> Option<RepoOverlayParseErro
     crate::config_repo::repo_overlay_parse_error(repo_root)
 }
 
-/// "#rrggbb" / "#rgb" -> "R;G;B".
+// Compatibility shim for the config unit tests and existing private callers;
+// color parsing itself lives in the shared theme resolver.
 fn parse_hex_rgb(hex: &str) -> Option<String> {
-    let h = hex.trim().strip_prefix('#')?;
-    let h = match h.len() {
-        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
-        6 => h.to_string(),
-        _ => return None,
-    };
-    let n = u32::from_str_radix(&h, 16).ok()?;
-    Some(format!(
-        "{};{};{}",
-        (n >> 16) & 255,
-        (n >> 8) & 255,
-        n & 255
-    ))
+    crate::theme_resolve::parse_hex_rgb(hex)
 }
 
 #[cfg(test)]

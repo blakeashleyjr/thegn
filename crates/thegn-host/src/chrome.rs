@@ -359,6 +359,18 @@ pub struct DaemonStatus {
     pub remote: bool,
 }
 
+/// Renderer-neutral projection of the selected live frontend preview target.
+/// The host supervisor owns lifecycle; chrome and panel code only paint this
+/// memory-only snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewView {
+    pub worktree: String,
+    pub port: u16,
+    pub url: String,
+    pub source: thegn_core::preview::PortHintSource,
+    pub status: thegn_core::preview::PreviewStatus,
+}
+
 /// What the chrome needs to paint a frame. Populated from session state + DB +
 /// git by the host; kept renderer-agnostic so it's unit-testable.
 #[derive(Debug, Clone, Default)]
@@ -437,6 +449,10 @@ pub struct FrameModel {
     /// Same loop-drain contract otherwise (never rendered, never part of
     /// `hydration_eq`).
     pub adopt_intents: Vec<thegn_core::store::IntentRow>,
+    /// Pending `editor.open` requests claimed from the control mailbox. All
+    /// rows are drained before model swap and revalidated by `ide_handoff`;
+    /// this carrier is never rendered or compared by `hydration_eq`.
+    pub open_editor_intents: Vec<thegn_core::store::IntentRow>,
     /// A cold worktree switch blanked the panel (switch-cache miss) and its
     /// hydration hasn't landed yet: the panel draws its skeleton placeholder
     /// instead of a void. Loop-transient (set by `WorktreeSlice::clear`,
@@ -614,6 +630,9 @@ pub struct FrameModel {
     /// the System ▸ Forward panel section + the `o` open-in-browser action.
     /// Synced from the `ForwardSupervisor` (loop-local), not from hydration.
     pub forwards: Vec<crate::forward::ForwardView>,
+    /// Selected frontend preview for the active worktree. Loop-owned and
+    /// re-applied after hydration, like shares and forwards.
+    pub preview: Option<PreviewView>,
     /// Deterministic container name for the active worktree path. The sandbox
     /// panel uses this to show the sandbox for the selected worktree instead of
     /// the first thegn-owned container on the machine.
@@ -677,6 +696,22 @@ pub struct FrameModel {
     /// `shares`/`forwards` it is re-stamped after every model swap); rendered
     /// by [`draw_statusbar`] in the gap between the left and right clusters.
     pub plugin_segments: Vec<(String, thegn_core::plugin_api::View)>,
+    /// Loop-owned state for the removable bottom drawer presence widget.
+    /// Keeping this small snapshot on the renderer model makes the widget
+    /// pure and keeps it stable across hydration model swaps.
+    pub drawer_bar: DrawerBarState,
+}
+
+/// The renderer-facing state of the bottom drawer indicator.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DrawerBarState {
+    /// Whether a drawer pane is currently visible.
+    pub open: bool,
+    /// Stable occupant label (`files` or the configured tool name).
+    pub occupant: String,
+    /// Number of valid occupants available in the active scope, including
+    /// the built-in files occupant.
+    pub occupant_count: usize,
 }
 
 /// Health of the active worktree's container.
@@ -1505,10 +1540,36 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
     match id {
         // "keyhints" is special-cased by draw_statusbar (chip + label segs).
         "keyhints" => None,
+        "drawer" => {
+            let glyph = crate::caps::glyph(crate::caps::Glyph::Folder);
+            let count = if model.drawer_bar.occupant_count > 1 {
+                format!(" ({})", model.drawer_bar.occupant_count)
+            } else {
+                String::new()
+            };
+            let text = if model.drawer_bar.open {
+                let label = if model.drawer_bar.occupant.is_empty() {
+                    "files"
+                } else {
+                    model.drawer_bar.occupant.as_str()
+                };
+                format!("{glyph} {label}{count}")
+            } else {
+                format!("{glyph} drawer{count}")
+            };
+            Some(w(
+                text,
+                if model.drawer_bar.open {
+                    col(S::Accent)
+                } else {
+                    col(S::Dim)
+                },
+            ))
+        }
         "loc" => model
             .loc
             .as_ref()
-            .map(|r| w(format!("{} LOC", r.compact_total()), col(S::Dim))),
+            .map(|r| w(crate::i18n_surface::loc(&r.compact_total()), col(S::Dim))),
         // Active worktree's disk usage (size of its checkout incl. target/),
         // from the off-loop scan; sits next to LOC. Hidden until first scanned.
         "disk" => model
@@ -1637,7 +1698,11 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
                 BarItemId::Badge(BarBadge::DiskWarn),
                 vec![Seg::chip(
                     Tok::Hue(hue),
-                    format!(" {} {free}% free ", ic.disk_icon),
+                    format!(
+                        " {} {} ",
+                        ic.disk_icon,
+                        crate::i18n_surface::disk_free(free)
+                    ),
                 )],
             ));
         }
@@ -1705,40 +1770,44 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         ));
     }
     if model.zoomed {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Zoom);
         items.push((
             BarItemId::Badge(BarBadge::Zoom),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Purple),
-                " \u{26f6} ZOOM ",
+                format!(" \u{26f6} {label} "),
             )],
         ));
     }
     // Maximize-in-chrome (mutually exclusive with `zoomed`): a framed square
     // reads as "pane filling its region", distinct from the fullscreen chip.
     if model.maximized {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Maximized);
         items.push((
             BarItemId::Badge(BarBadge::Maximized),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Teal),
-                " \u{25a3} MAX ",
+                format!(" \u{25a3} {label} "),
             )],
         ));
     }
     if model.key_locked {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Locked);
         items.push((
             BarItemId::Badge(BarBadge::Lock),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Amber),
-                " \u{2301} LOCKED ",
+                format!(" \u{2301} {label} "),
             )],
         ));
     }
     if model.sync_panes {
+        let label = crate::i18n_surface::status(crate::i18n_surface::StatusText::Sync);
         items.push((
             BarItemId::Badge(BarBadge::Sync),
             vec![Seg::chip(
                 Tok::Hue(thegn_core::theme::Hue::Red),
-                " \u{29c9} SYNC ",
+                format!(" \u{29c9} {label} "),
             )],
         ));
     }
