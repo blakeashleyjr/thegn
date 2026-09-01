@@ -37,6 +37,9 @@ pub(crate) struct TrustedDevcontainer {
     /// every use so a later repo-file replacement cannot bypass this trust
     /// decision while preserving config-relative path resolution.
     pub config_digest: [u8; 32],
+    /// Exact bytes parsed and trust-gated. The provider runs against a
+    /// snapshot of these bytes, never a later reopen of the repository path.
+    pub config_content: Vec<u8>,
     pub provider_eligible: bool,
 }
 
@@ -186,6 +189,14 @@ fn overlay_devcontainer(
         && inventory.reserved.is_empty()
         && inventory.unknown.is_empty();
     let config_path = selected.selected.unwrap_or_default();
+    let Some(config_content) = selected.raw_content.as_ref() else {
+        tracing::warn!(
+            target: "thegn::config_trust",
+            path = %config_path.display(),
+            "selected devcontainer config has no parsed source snapshot"
+        );
+        return None;
+    };
     let config_digest = match crate::devcontainer_provider::config_digest(&config_path) {
         Ok(digest) => digest,
         Err(error) => {
@@ -200,6 +211,7 @@ fn overlay_devcontainer(
     Some(TrustedDevcontainer {
         config_path,
         config_digest,
+        config_content: config_content.as_bytes().to_vec(),
         provider_eligible,
     })
 }

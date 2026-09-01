@@ -359,6 +359,7 @@ pub fn prepare_sandbox_env(
                 Path::new(worktree),
                 &dc.config_path,
                 &dc.config_digest,
+                &dc.config_content,
                 &sb.passthrough_env(),
             ) {
                 Ok(session) => {

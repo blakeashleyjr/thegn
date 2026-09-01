@@ -44,6 +44,10 @@ pub struct SelectionResult {
     pub config: Option<DevContainer>,
     /// A surfaced selection, read, or parse failure.
     pub error: Option<SelectionError>,
+    /// The exact source text that was parsed for the selected config. Host
+    /// providers use this to make an immutable handoff instead of reopening a
+    /// mutable repository path after trust has been decided.
+    pub raw_content: Option<String>,
 }
 
 /// Why a devcontainer could not be selected or parsed.
@@ -98,6 +102,7 @@ pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionRes
             selected: None,
             config: None,
             error: None,
+            raw_content: None,
         };
     }
 
@@ -116,6 +121,7 @@ pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionRes
             selected: None,
             config: None,
             error: Some(SelectionError::Ambiguous(found)),
+            raw_content: None,
         };
     };
 
@@ -128,6 +134,7 @@ pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionRes
                 selector: selector.unwrap_or_default().trim().to_string(),
                 candidates: found,
             }),
+            raw_content: None,
         };
     };
     let read = match std::fs::read_to_string(&path) {
@@ -141,6 +148,7 @@ pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionRes
                     path,
                     error: error.to_string(),
                 }),
+                raw_content: None,
             };
         }
     };
@@ -153,6 +161,7 @@ pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionRes
                 selected: Some(path),
                 config: Some(config),
                 error: None,
+                raw_content: Some(read),
             }
         }
         Err(error) => SelectionResult {
@@ -160,6 +169,7 @@ pub fn select_and_parse(worktree: &Path, selector: Option<&str>) -> SelectionRes
             selected: Some(path.clone()),
             config: None,
             error: Some(SelectionError::Parse { path, error }),
+            raw_content: None,
         },
     }
 }
