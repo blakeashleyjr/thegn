@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest as Sha2Digest, Sha256};
+
 const CLI_NAME: &str = "devcontainer";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -133,6 +135,7 @@ pub(crate) struct DevcontainerHandle {
     executable: PathBuf,
     workspace_folder: PathBuf,
     config_path: PathBuf,
+    config_digest: [u8; 32],
     /// Values explicitly admitted by `[sandbox].env_passthrough`. The provider
     /// CLI receives these values for `${localEnv:...}` expansion; all other
     /// host variables are deliberately absent from its environment.
@@ -156,9 +159,10 @@ pub(crate) trait DevcontainerProvider: Send + Sync {
         &self,
         workspace_folder: &Path,
         config_path: &Path,
+        config_digest: &[u8; 32],
         env: &[(String, String)],
     ) -> anyhow::Result<DevcontainerHandle>;
-    fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> Vec<String>;
+    fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> anyhow::Result<Vec<String>>;
 }
 
 /// A started provider session. Its `exec_argv` adapter remains provider-owned;
@@ -182,14 +186,19 @@ impl DevcontainerSession {
         provider: Arc<dyn DevcontainerProvider>,
         workspace_folder: &Path,
         config_path: &Path,
+        config_digest: &[u8; 32],
         env: &[(String, String)],
     ) -> anyhow::Result<Self> {
-        let handle = provider.start(workspace_folder, config_path, env)?;
+        let handle = provider.start(workspace_folder, config_path, config_digest, env)?;
         Ok(Self { provider, handle })
     }
 
-    pub(crate) fn exec_argv(&self, command: &str) -> Vec<String> {
+    pub(crate) fn exec_argv(&self, command: &str) -> anyhow::Result<Vec<String>> {
         self.provider.exec_argv(&self.handle, command)
+    }
+
+    fn verify_config(&self) -> anyhow::Result<()> {
+        verify_config_digest(&self.handle.config_path, &self.handle.config_digest)
     }
 
     /// Environment additions for the host-side provider `exec` command. The
@@ -223,11 +232,24 @@ pub(crate) fn publish_session(worktree: &str, session: DevcontainerSession) {
 }
 
 pub(crate) fn session_for(worktree: &str) -> Option<DevcontainerSession> {
-    sessions()
+    let session = sessions()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(worktree)
-        .cloned()
+        .cloned()?;
+    if let Err(error) = session.verify_config() {
+        tracing::warn!(
+            target: "thegn::config_trust",
+            worktree,
+            "devcontainer session invalidated: {error}"
+        );
+        sessions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(worktree);
+        return None;
+    }
+    Some(session)
 }
 
 /// Derive the single status decision shared by launch, doctor, and hydration.
@@ -434,9 +456,11 @@ impl DevcontainerProvider for CliProvider {
         &self,
         workspace_folder: &Path,
         config_path: &Path,
+        config_digest: &[u8; 32],
         env: &[(String, String)],
     ) -> anyhow::Result<DevcontainerHandle> {
         let executable = self.executable()?.to_path_buf();
+        verify_config_digest(config_path, config_digest)?;
         let mut command = Command::new(&executable);
         command
             .args(["up", "--workspace-folder"])
@@ -457,6 +481,10 @@ impl DevcontainerProvider for CliProvider {
         for (key, value) in &provider_env {
             command.env(key, value);
         }
+        // Keep the final check adjacent to the child spawn. The earlier check
+        // rejects a stale path before any provider setup; this one closes the
+        // setup window immediately before the CLI reads the config.
+        verify_config_digest(config_path, config_digest)?;
         let output = run_bounded(&mut command, START_TIMEOUT)?;
         anyhow::ensure!(
             output.status.success(),
@@ -468,15 +496,17 @@ impl DevcontainerProvider for CliProvider {
             executable,
             workspace_folder: workspace_folder.to_path_buf(),
             config_path: config_path.to_path_buf(),
+            config_digest: *config_digest,
             env: allowlisted_env,
         })
     }
 
-    fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> Vec<String> {
+    fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> anyhow::Result<Vec<String>> {
+        verify_config_digest(&handle.config_path, &handle.config_digest)?;
         // The CLI accepts the command after the workspace/config options. Keep
         // it as one shell command so the core's normalized command semantics
         // and init hooks remain unchanged.
-        vec![
+        Ok(vec![
             handle.executable.display().to_string(),
             "exec".into(),
             "--workspace-folder".into(),
@@ -486,8 +516,29 @@ impl DevcontainerProvider for CliProvider {
             "sh".into(),
             "-lc".into(),
             command.into(),
-        ]
+        ])
     }
+}
+
+/// Hash the selected file's bytes for the provider trust boundary. Keeping the
+/// original path (rather than copying the JSON elsewhere) is intentional: the
+/// devcontainer CLI resolves Dockerfile, Compose, and mount paths relative to
+/// the config directory.
+pub(crate) fn config_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(hasher.finalize().into())
+}
+
+fn verify_config_digest(path: &Path, expected: &[u8; 32]) -> anyhow::Result<()> {
+    let actual = config_digest(path)?;
+    anyhow::ensure!(
+        actual == *expected,
+        "devcontainer config changed after trust approval; refusing provider use"
+    );
+    Ok(())
 }
 
 fn first_line(bytes: &[u8]) -> Option<String> {
@@ -552,28 +603,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_exec_argv_keeps_provider_flags_inside_the_seam() {
+    fn cli_exec_argv_keeps_provider_flags_inside_the_seam_for_verified_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, "{\"image\":\"repo\"}").unwrap();
+        let digest = config_digest(&config_path).unwrap();
         let provider = CliProvider::with_executable("/bin/devcontainer");
         let handle = DevcontainerHandle {
             executable: "/bin/devcontainer".into(),
             workspace_folder: "/repo/worktree".into(),
-            config_path: "/repo/.devcontainer/devcontainer.json".into(),
+            config_path: config_path.clone(),
+            config_digest: digest,
             env: Vec::new(),
         };
         assert_eq!(
-            provider.exec_argv(&handle, "printf ok"),
+            provider.exec_argv(&handle, "printf ok").unwrap(),
             vec![
-                "/bin/devcontainer",
-                "exec",
-                "--workspace-folder",
-                "/repo/worktree",
-                "--config",
-                "/repo/.devcontainer/devcontainer.json",
-                "sh",
-                "-lc",
-                "printf ok",
+                "/bin/devcontainer".into(),
+                "exec".into(),
+                "--workspace-folder".into(),
+                "/repo/worktree".into(),
+                "--config".into(),
+                config_path.display().to_string(),
+                "sh".into(),
+                "-lc".into(),
+                "printf ok".into(),
             ]
         );
+    }
+
+    #[test]
+    fn provider_rejects_config_changed_after_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, "{\"image\":\"approved\"}").unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        std::fs::write(&config_path, "{\"image\":\"changed\"}").unwrap();
+
+        let provider = CliProvider::with_executable("/bin/devcontainer");
+        let error = provider
+            .start(dir.path(), &config_path, &digest, &[])
+            .expect_err("changed config must not reach the provider");
+        assert!(error.to_string().contains("changed after trust approval"));
+    }
+
+    #[test]
+    fn provider_rejects_config_changed_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, "{\"image\":\"approved\"}").unwrap();
+        let digest = config_digest(&config_path).unwrap();
+        let handle = DevcontainerHandle {
+            executable: "/bin/devcontainer".into(),
+            workspace_folder: dir.path().into(),
+            config_path: config_path.clone(),
+            config_digest: digest,
+            env: Vec::new(),
+        };
+        std::fs::write(&config_path, "{\"image\":\"changed\"}").unwrap();
+
+        let error = CliProvider::with_executable("/bin/devcontainer")
+            .exec_argv(&handle, "printf ok")
+            .expect_err("changed config must not produce an exec command");
+        assert!(error.to_string().contains("changed after trust approval"));
     }
 
     #[test]
@@ -626,6 +718,9 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, "{\"image\":\"repo\"}").unwrap();
+        let config_digest = config_digest(&config_path).unwrap();
 
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
@@ -638,7 +733,8 @@ mod tests {
         let handle = provider
             .start(
                 dir.path(),
-                &dir.path().join("devcontainer.json"),
+                &config_path,
+                &config_digest,
                 &[("DC_PROVIDER_ALLOWED".into(), "yes".into())],
             )
             .unwrap();
@@ -674,9 +770,12 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(&config_path, "{\"image\":\"repo\"}").unwrap();
+        let config_digest = config_digest(&config_path).unwrap();
 
         let error = CliProvider::with_executable(script)
-            .start(dir.path(), &dir.path().join("devcontainer.json"), &[])
+            .start(dir.path(), &config_path, &config_digest, &[])
             .expect_err("failed provider start must be reported");
         let message = error.to_string();
         assert!(message.contains("failed with"), "{message}");

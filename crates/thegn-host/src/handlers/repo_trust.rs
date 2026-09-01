@@ -33,6 +33,10 @@ pub(crate) struct TrustedEnvironment {
 #[derive(Debug, Clone)]
 pub(crate) struct TrustedDevcontainer {
     pub config_path: std::path::PathBuf,
+    /// Digest of the parsed config content. The provider rechecks this before
+    /// every use so a later repo-file replacement cannot bypass this trust
+    /// decision while preserving config-relative path resolution.
+    pub config_digest: [u8; 32],
     pub provider_eligible: bool,
 }
 
@@ -181,8 +185,21 @@ fn overlay_devcontainer(
         && inventory.refused.is_empty()
         && inventory.reserved.is_empty()
         && inventory.unknown.is_empty();
+    let config_path = selected.selected.unwrap_or_default();
+    let config_digest = match crate::devcontainer_provider::config_digest(&config_path) {
+        Ok(digest) => digest,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::config_trust",
+                path = %config_path.display(),
+                "devcontainer config could not be verified: {error}"
+            );
+            return None;
+        }
+    };
     Some(TrustedDevcontainer {
-        config_path: selected.selected.unwrap_or_default(),
+        config_path,
+        config_digest,
         provider_eligible,
     })
 }
