@@ -109,6 +109,65 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "editor.open",
+        description: "Queue a worktree or one of its relative files for handoff to the owning \
+                      compositor's locally configured editor. The request never selects an \
+                      executable, provider, argv or environment. Write-scoped (`--scopes \
+                      write`). Requires a running daemon and compositor.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute path of the worktree to open",
+            },
+            ArgSpec {
+                name: "path",
+                kind: ArgKind::String,
+                required: false,
+                description: "File path relative to the worktree",
+            },
+            ArgSpec {
+                name: "line",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "1-based line number (requires path)",
+            },
+            ArgSpec {
+                name: "col",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "1-based column number (requires path and line)",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "preview.fetch",
+        description: "Fetch a preview URL through the daemon's bounded, credential-free HTTP \
+                      client. Loopback targets only unless the operator explicitly enables \
+                      external preview URLs. Read-scoped; requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "url",
+                kind: ArgKind::String,
+                required: true,
+                description: "Absolute http/https preview URL",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree used to select bounded dev-server pane diagnostics",
+            },
+            ArgSpec {
+                name: "include_console",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Include source-labelled dev-server error lines (default false)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "leases.list",
         description: "Relay lease state per session — which detached sessions are being \
                       kept warm, and until when. Requires a running daemon.",
@@ -301,6 +360,64 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         ],
     },
     StateToolSpec {
+        cap: "sessions.fork",
+        description: "Fork a live daemon or recorded harness session into a new process. \
+                      The source is never paused or cloned; a recorded source uses only \
+                      the harness's native fork operation. Write-scoped \
+                      (`--scopes write`). No argv, environment, prompt, transcript, or \
+                      vendor file data is accepted. Requires a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "session",
+                kind: ArgKind::String,
+                required: true,
+                description: "Live daemon session id, or native id from agent_sessions",
+            },
+            ArgSpec {
+                name: "harness",
+                kind: ArgKind::String,
+                required: false,
+                description: "Harness id when session is a recorded native session",
+            },
+            ArgSpec {
+                name: "agent",
+                kind: ArgKind::String,
+                required: false,
+                description: "Configured agent name for the fork launch context",
+            },
+            ArgSpec {
+                name: "cwd",
+                kind: ArgKind::String,
+                required: false,
+                description: "Working directory override",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree override",
+            },
+            ArgSpec {
+                name: "scrollback",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Request a bounded plain-text scrollback handoff file",
+            },
+            ArgSpec {
+                name: "tab",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Adopt the child in a new tab",
+            },
+            ArgSpec {
+                name: "adopt",
+                kind: ArgKind::Boolean,
+                required: false,
+                description: "Ask a connected compositor to adopt the child",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "sessions.input",
         description: "Send terminal input to a live session — raw bytes to its stdin, \
                       exactly as if typed at its keyboard (control characters included). \
@@ -392,6 +509,53 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             description: "Worktree path (default: the server's working directory)",
         }],
     },
+    StateToolSpec {
+        cap: "automations.list",
+        description: "List trusted global/profile automation rules, inert reasons, and recent audited outcomes. Read-only.",
+        args: &[],
+    },
+    StateToolSpec {
+        cap: "automations.test",
+        description: "Purely evaluate one named automation rule against a normalized event fixture. Never executes or writes state.",
+        args: &[
+            ArgSpec {
+                name: "rule",
+                kind: ArgKind::String,
+                required: true,
+                description: "Stable automation rule name",
+            },
+            ArgSpec {
+                name: "event",
+                kind: ArgKind::Object,
+                required: true,
+                description: "Normalized AutomationEvent JSON object",
+            },
+            ArgSpec {
+                name: "at",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Evaluation clock in Unix seconds (defaults to event.occurred_at)",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "tools.run",
+        description: "Run one trusted configured [[tools]] entry by name in an optional worktree. Exec-scoped; command and sandbox resolve on the daemon.",
+        args: &[
+            ArgSpec {
+                name: "name",
+                kind: ArgKind::String,
+                required: true,
+                description: "Configured [[tools]] name",
+            },
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree in which to run the tool",
+            },
+        ],
+    },
 ];
 
 /// Host capabilities the MCP server exposes as state tools, by catalog id.
@@ -403,6 +567,8 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
 pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.list",
     "worktrees.list",
+    "editor.open",
+    "preview.fetch",
     "leases.list",
     "me",
     "ci.runs",
@@ -410,10 +576,14 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
+    "sessions.fork",
     "sessions.input",
     "sessions.kill",
     "semantic.map",
     "semantic.blast_radius",
+    "automations.list",
+    "automations.test",
+    "tools.run",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.
@@ -675,6 +845,19 @@ mod tests {
     }
 
     #[test]
+    fn editor_open_schema_has_only_the_safe_target_arguments() {
+        let r = StateRouter::new(vec!["editor.open"], |_, _| Ok(json!(null)));
+        let entries = r.tool_entries();
+        let schema = &entries[0]["inputSchema"];
+        let properties = schema["properties"].as_object().unwrap();
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["col", "line", "path", "worktree"]);
+        assert_eq!(schema["required"], json!(["worktree"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
     fn tool_entries_string_array_declares_items() {
         let r = StateRouter::new(vec!["sessions.open"], |_, _| Ok(json!(null)));
         let entries = r.tool_entries();
@@ -715,6 +898,13 @@ mod tests {
         let r = StateRouter::new(vec![], |_, _| Ok(json!(null)));
         let (code, msg) = r
             .call("sessions_kill", &json!({"session":"s1"}))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(code, -32001);
+        assert!(msg.contains("scope `write`"), "{msg}");
+
+        let (code, msg) = r
+            .call("editor_open", &json!({"worktree":"/w"}))
             .unwrap()
             .unwrap_err();
         assert_eq!(code, -32001);
@@ -778,7 +968,8 @@ mod tests {
     fn every_state_cap_maps_to_the_scope_it_documents() {
         // The deliberate split this change introduces: listing/observing
         // tools stay Read (unchanged default `--scopes read` still covers
-        // them); mutating tools require Write. This replaces
+        // them); mutating tools require Write, while command execution
+        // requires Exec. This replaces
         // `every_state_cap_is_read_scope_today`, whose own doc comment
         // predicted exactly this: "pins that a future write-side tool
         // forces a deliberate scope-model decision rather than silently
@@ -786,6 +977,7 @@ mod tests {
         let read = [
             "sessions.list",
             "worktrees.list",
+            "preview.fetch",
             "leases.list",
             "me",
             "ci.runs",
@@ -794,8 +986,17 @@ mod tests {
             "sessions.wait",
             "semantic.map",
             "semantic.blast_radius",
+            "automations.list",
+            "automations.test",
         ];
-        let write = ["sessions.open", "sessions.input", "sessions.kill"];
+        let write = [
+            "editor.open",
+            "sessions.open",
+            "sessions.fork",
+            "sessions.input",
+            "sessions.kill",
+        ];
+        let exec = ["tools.run"];
         for cap in read {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Read, "{cap}");
@@ -804,8 +1005,17 @@ mod tests {
             let c = lookup(cap).expect("state cap in catalog");
             assert_eq!(scope_of(c), Scope::Write, "{cap}");
         }
+        for cap in exec {
+            let c = lookup(cap).expect("state cap in catalog");
+            assert_eq!(scope_of(c), Scope::Exec, "{cap}");
+        }
         // Exhaustive: every implemented cap is in one of the two groups.
-        let mut grouped: Vec<&str> = read.iter().chain(write.iter()).copied().collect();
+        let mut grouped: Vec<&str> = read
+            .iter()
+            .chain(write.iter())
+            .chain(exec.iter())
+            .copied()
+            .collect();
         let mut all: Vec<&str> = MCP_STATE_CAPS.to_vec();
         grouped.sort_unstable();
         all.sort_unstable();

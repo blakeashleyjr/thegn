@@ -240,8 +240,13 @@ pub fn resolve_serve_scopes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verb {
     ListSessions,
+    /// Move one persisted worktree presentation between profile stores. This
+    /// is deliberately a CLI-only admin operation, not a daemon route.
+    MigrateSession,
     ListWorktrees,
     OpenSession,
+    /// Fork a live daemon or recorded harness session into a new process.
+    ForkSession,
     Attach,
     Detach,
     SendInput,
@@ -249,6 +254,11 @@ pub enum Verb {
     Snapshot,
     KillSession,
     OpenWorktree,
+    /// Queue a validated worktree/file target for the owning compositor to
+    /// hand off to its locally configured editor.
+    OpenEditor,
+    /// Fetch one preview URL with the bounded, credential-free host executor.
+    PreviewFetch,
     DriveBrowser,
     /// Block until a session reaches a state — observes only.
     Wait,
@@ -387,10 +397,22 @@ pub enum Verb {
     /// pipeline stage (harness, model, env keys, permissions) — config-derived
     /// (read), no process is started.
     AgentList,
+    /// List trusted global/profile automation rules and recent outcomes.
+    AutomationsList,
+    /// Purely evaluate one named rule against a supplied event fixture.
+    AutomationsTest,
+    /// Execute one trusted, configured `[[tools]]` entry by name.
+    ToolsRun,
+    /// List embedded and configured skill metadata without touching targets.
+    SkillsList,
+    /// Seed skills into a local worktree through the host adapter.
+    SkillsSeed,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
     ModelProxyStats,
+    /// Read bounded issue-autopilot run summaries. CLI-only; no remote route.
+    AutopilotStatus,
     /// Start (launch) the model proxy daemon.
     ModelProxyStart,
     /// Stop (terminate) the model proxy daemon.
@@ -403,8 +425,10 @@ impl Verb {
     /// against the enum.
     pub const ALL: &'static [Verb] = &[
         Verb::ListSessions,
+        Verb::MigrateSession,
         Verb::ListWorktrees,
         Verb::OpenSession,
+        Verb::ForkSession,
         Verb::Attach,
         Verb::Detach,
         Verb::SendInput,
@@ -412,6 +436,8 @@ impl Verb {
         Verb::Snapshot,
         Verb::KillSession,
         Verb::OpenWorktree,
+        Verb::OpenEditor,
+        Verb::PreviewFetch,
         Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
@@ -476,8 +502,14 @@ impl Verb {
         Verb::SemanticBlastRadius,
         Verb::AgentSessions,
         Verb::AgentList,
+        Verb::AutomationsList,
+        Verb::AutomationsTest,
+        Verb::ToolsRun,
+        Verb::SkillsList,
+        Verb::SkillsSeed,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
+        Verb::AutopilotStatus,
         Verb::ModelProxyStart,
         Verb::ModelProxyStop,
     ];
@@ -526,19 +558,26 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
         | Verb::AgentList
+        | Verb::AutomationsList
+        | Verb::AutomationsTest
+        | Verb::SkillsList
+        | Verb::PreviewFetch
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
+        | Verb::AutopilotStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
         Verb::OpenSession
+        | Verb::ForkSession
         | Verb::Attach
         | Verb::Detach
         | Verb::SendInput
         | Verb::Resize
         | Verb::KillSession
         | Verb::OpenWorktree
+        | Verb::OpenEditor
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
@@ -557,7 +596,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SearchReplace
         | Verb::ContainersControl
         | Verb::Split
-        | Verb::RecordSession => Scope::Write,
+        | Verb::RecordSession
+        | Verb::SkillsSeed => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeAdd
@@ -565,7 +605,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::WorktreeCreate => Scope::Git,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
-        Verb::LaunchPreset => Scope::Exec,
+        Verb::LaunchPreset | Verb::ToolsRun => Scope::Exec,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing
@@ -582,6 +622,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SecretMigrate
         | Verb::SecretAudit
         | Verb::SecretSshRotate
+        | Verb::MigrateSession
         // Starting/stopping a spend-capable daemon is an admin action; the
         // OPERATOR surfaces + Admin scope keep it off any tool-calling door.
         | Verb::ModelProxyStart
@@ -862,17 +903,24 @@ mod tests {
             SemanticBlastRadius,
             AgentSessions,
             AgentList,
+            AutomationsList,
+            AutomationsTest,
+            SkillsList,
+            PreviewFetch,
             ModelProxyStatus,
             ModelProxyStats,
+            AutopilotStatus,
         ];
         let write = [
             OpenSession,
+            ForkSession,
             Attach,
             Detach,
             SendInput,
             Resize,
             KillSession,
             OpenWorktree,
+            OpenEditor,
             DriveBrowser,
             Split,
             RecordSession,
@@ -892,10 +940,12 @@ mod tests {
             DispatchesNote,
             SearchReplace,
             ContainersControl,
+            SkillsSeed,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
-        let exec = [LaunchPreset];
+        let exec = [LaunchPreset, ToolsRun];
         let admin = [
+            MigrateSession,
             IssuePairing,
             ListPairings,
             RevokePairing,

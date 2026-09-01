@@ -9,6 +9,8 @@ pub struct ActionSpec {
     pub id: &'static str,
     /// Human label shown in the command palette and help surfaces.
     pub label: &'static str,
+    /// Stable Fluent key for the localized command-palette label.
+    pub message_key: &'static str,
     /// Short label for compact bottom-bar hints.
     pub hint: &'static str,
     /// Built-in normal-mode/default chords. Config layers may override these.
@@ -32,6 +34,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-worktree",
         label: "New worktree",
+        message_key: "action-new-worktree",
         hint: "worktree",
         default_chords: &["Alt w"],
         palette: true,
@@ -47,6 +50,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "search-replace-open",
         label: "Search & Replace — workspace-wide find and replace",
+        message_key: "action-search-replace-open",
         hint: "replace",
         default_chords: &["Ctrl Shift h"],
         palette: true,
@@ -64,6 +68,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "connect-root",
         label: "Connect to root — jump to this pane's worktree",
+        message_key: "action-connect-root",
         hint: "root",
         default_chords: &[],
         palette: true,
@@ -74,6 +79,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "clone-open",
         label: "Clone and open — paste a git URL",
+        message_key: "action-clone-open",
         hint: "clone",
         default_chords: &[],
         palette: true,
@@ -90,6 +96,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-environment",
         label: "New environment… (cloud / ssh / local)",
+        message_key: "action-new-environment",
         hint: "env",
         default_chords: &[],
         palette: true,
@@ -110,6 +117,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "setup-wizard",
         label: "Setup wizard… (forge / hosts / sandbox / appearance)",
+        message_key: "action-setup-wizard",
         hint: "setup",
         default_chords: &[],
         palette: true,
@@ -131,6 +139,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "enter-replay",
         label: "Replay pane history",
+        message_key: "action-enter-replay",
         hint: "replay",
         default_chords: &["Alt r"],
         palette: true,
@@ -146,6 +155,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "export-cast",
         label: "Export pane replay as cast",
+        message_key: "action-export-cast",
         hint: "export cast",
         default_chords: &[],
         palette: true,
@@ -161,6 +171,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-recorder",
         label: "Toggle session recorder",
+        message_key: "action-toggle-recorder",
         hint: "record",
         default_chords: &["Ctrl Alt r"],
         palette: true,
@@ -174,8 +185,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "fork-session",
+        label: "Fork live session",
+        message_key: "action-fork-session",
+        hint: "fork session",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "fork",
+            "session",
+            "conversation",
+            "native session",
+            "new session",
+        ],
+    },
+    ActionSpec {
         id: "paste-register",
         label: "Paste from register",
+        message_key: "action-paste-register",
         hint: "paste reg",
         default_chords: &[],
         palette: true,
@@ -184,6 +211,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "paste-image",
         label: "Paste image",
+        message_key: "action-paste-image",
         hint: "paste img",
         default_chords: &[],
         palette: true,
@@ -200,6 +228,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-workspace",
         label: "New workspace",
+        message_key: "action-new-workspace",
         hint: "workspace",
         default_chords: &["Alt W"],
         palette: true,
@@ -216,6 +245,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "delete-workspace",
         label: "Delete workspace",
+        message_key: "action-delete-workspace",
         hint: "remove the active workspace",
         // No default chord — `Alt X` / `Space X` belong to close-worktree, so
         // this action is palette-driven + user-bindable (also reachable from the
@@ -233,6 +263,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "integrate",
         label: "Integrate (fold-actor)",
+        message_key: "action-integrate",
         hint: "integrate",
         // No default chord — palette-only + user-bindable, gated on
         // [merge_queue].enabled (see palette::build_command_palette_items).
@@ -250,6 +281,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "sweep-merged",
         label: "Merge queue: sweep merged worktrees",
+        message_key: "action-sweep-merged",
         hint: "sweep merged",
         // No default chord — matches its siblings (integrate, merge-drain):
         // palette-driven + user-bindable, gated on [merge_queue].enabled.
@@ -268,6 +300,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "merge-drain",
         label: "Merge queue: drain (agent autopilot)",
+        message_key: "action-merge-drain",
         hint: "drain queue",
         // No default chord — palette + the section's `D`; gated on
         // [merge_queue].enabled like the other fold-actor actions.
@@ -285,6 +318,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-tab",
         label: "New tab — same worktree",
+        message_key: "action-new-tab",
         hint: "tab",
         default_chords: &["Alt t"],
         palette: true,
@@ -293,6 +327,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-terminal",
         label: "New terminal",
+        message_key: "action-new-terminal",
         hint: "terminal",
         // `Alt T` — the capital T encodes Shift (see `sequence.rs`), so this is
         // physically Alt+Shift+T; `Alt t` (above) is the new-tab sibling. Registered
@@ -314,6 +349,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-pane",
         label: "New pane — smart split",
+        message_key: "action-new-pane",
         hint: "smart split",
         default_chords: &["Alt p"],
         palette: true,
@@ -329,6 +365,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "split-down",
         label: "Split pane down",
+        message_key: "action-split-down",
         hint: "split↓",
         default_chords: &["Alt n"],
         palette: true,
@@ -344,6 +381,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "split-right",
         label: "Split pane right",
+        message_key: "action-split-right",
         hint: "split→",
         default_chords: &["Alt N"],
         palette: true,
@@ -359,6 +397,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "close-pane",
         label: "Close pane",
+        message_key: "action-close-pane",
         hint: "close pane",
         // No default chord: the smart `close` action (`Alt x`) closes the pane
         // when the tab is split. Kept explicit + rebindable for "always the
@@ -376,6 +415,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "zoom",
         label: "Toggle zoom",
+        message_key: "action-zoom",
         hint: "zoom",
         default_chords: &["Ctrl Alt z"],
         palette: true,
@@ -397,6 +437,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "redraw",
         label: "Redraw screen",
+        message_key: "action-redraw",
         hint: "redraw",
         default_chords: &["Ctrl Shift l"],
         palette: true,
@@ -415,6 +456,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "sync-panes",
         label: "Toggle sync-panes (broadcast input)",
+        message_key: "action-sync-panes",
         hint: "sync",
         default_chords: &["Ctrl Alt y"],
         palette: true,
@@ -430,6 +472,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "save-layout",
         label: "Save layout as…",
+        message_key: "action-save-layout",
         hint: "save layout",
         default_chords: &[],
         palette: true,
@@ -438,6 +481,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "apply-layout",
         label: "Apply saved layout…",
+        message_key: "action-apply-layout",
         hint: "apply layout",
         default_chords: &[],
         palette: true,
@@ -446,6 +490,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "export-layout",
         label: "Export layout to file…",
+        message_key: "action-export-layout",
         hint: "export layout",
         default_chords: &[],
         palette: true,
@@ -459,6 +504,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "import-layout",
         label: "Import layout from file…",
+        message_key: "action-import-layout",
         hint: "import layout",
         default_chords: &[],
         palette: true,
@@ -472,6 +518,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-worktree-from-template",
         label: "New worktree from template…",
+        message_key: "action-new-worktree-from-template",
         hint: "template",
         default_chords: &[],
         palette: true,
@@ -486,6 +533,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "cycle-theme",
         label: "Cycle theme",
+        message_key: "action-cycle-theme",
         hint: "theme",
         default_chords: &["Ctrl Alt t"],
         palette: true,
@@ -500,10 +548,28 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "theme-builder-open",
+        label: "Open theme builder",
+        message_key: "action-theme-builder-open",
+        hint: "theme builder",
+        default_chords: &["Ctrl Alt Shift t"],
+        palette: true,
+        keywords: &[
+            "theme",
+            "builder",
+            "appearance",
+            "colors",
+            "palette",
+            "preview",
+            "customize",
+        ],
+    },
+    ActionSpec {
         id: "switch-font",
         // Single chord `Alt f`; the old redundant `Alt F` alias was dropped so
         // Shift keeps its "up-a-level" meaning everywhere in the Alt layer.
         label: "Switch font",
+        message_key: "action-switch-font",
         hint: "font",
         default_chords: &["Alt f"],
         palette: true,
@@ -512,6 +578,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "close",
         label: "Close (pane or tab)",
+        message_key: "action-close",
         hint: "close",
         default_chords: &["Alt x"],
         palette: true,
@@ -527,6 +594,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "close-tab",
         label: "Close tab",
+        message_key: "action-close-tab",
         hint: "close tab",
         // No default chord: `Alt x` is the smart `close` above. Explicit +
         // rebindable for "close the tab specifically".
@@ -543,6 +611,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "close-worktree",
         label: "Remove worktree",
+        message_key: "action-close-worktree",
         hint: "remove worktree (from disk)",
         default_chords: &["Alt X"],
         palette: true,
@@ -558,6 +627,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "switch-workspace",
         label: "Switch workspace",
+        message_key: "action-switch-workspace",
         hint: "switch",
         default_chords: &["Alt o"],
         palette: true,
@@ -572,6 +642,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "switch-account",
         label: "Switch agent account",
+        message_key: "action-switch-account",
         hint: "account",
         // Palette-only: no default chord is installed by `default_keymap`.
         // A chord was declared here but never bound, so the hint strip,
@@ -590,6 +661,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "switch-bundle",
         label: "Switch env bundle",
+        message_key: "action-switch-bundle",
         hint: "bundle",
         // Palette-only: no default chord is installed by `default_keymap`.
         // A chord was declared here but never bound, so the hint strip,
@@ -607,6 +679,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "switch-profile",
         label: "Switch profile",
+        message_key: "action-switch-profile",
         hint: "profile",
         // Palette-only: no default chord is installed by `default_keymap`.
         // A chord was declared here but never bound, so the hint strip,
@@ -624,6 +697,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "switch-identity",
         label: "Switch identity",
+        message_key: "action-switch-identity",
         hint: "identity",
         // Palette-only by default (reach via Ctrl+Space → "switch identity");
         // rebindable. Avoids clashing with the crowded Ctrl+Alt chord space.
@@ -641,6 +715,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "prev-tab",
         label: "Previous tab",
+        message_key: "action-prev-tab",
         hint: "prev tab",
         // Alt+← reaches this via the seamless `nav-left` fall-through (at the
         // left edge with nowhere further to focus); kept chord-free + palette /
@@ -658,6 +733,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "next-tab",
         label: "Next tab",
+        message_key: "action-next-tab",
         hint: "next tab",
         // Reached via `nav-right` at the right edge; chord-free + rebindable.
         default_chords: &[],
@@ -667,6 +743,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "prev-worktree",
         label: "Previous worktree",
+        message_key: "action-prev-worktree",
         hint: "prev worktree",
         // Reached via `nav-up` at the top edge; chord-free + rebindable.
         default_chords: &[],
@@ -682,6 +759,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "next-worktree",
         label: "Next worktree",
+        message_key: "action-next-worktree",
         hint: "next worktree",
         // Reached via `nav-down` at the bottom edge; chord-free + rebindable.
         default_chords: &[],
@@ -696,6 +774,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "prev-workspace",
         label: "Previous workspace",
+        message_key: "action-prev-workspace",
         hint: "prev ws",
         default_chords: &["Shift Alt Up"],
         palette: true,
@@ -709,6 +788,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "next-workspace",
         label: "Next workspace",
+        message_key: "action-next-workspace",
         hint: "next ws",
         default_chords: &["Shift Alt Down"],
         palette: true,
@@ -717,6 +797,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-region",
         label: "Toggle workspaces / terminals",
+        message_key: "action-toggle-region",
         hint: "ws↔term",
         default_chords: &["Alt `"],
         palette: true,
@@ -732,6 +813,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "move-item-up",
         label: "Move up (workspace/worktree)",
+        message_key: "action-move-item-up",
         hint: "move↑",
         default_chords: &["Ctrl Alt Up"],
         palette: true,
@@ -747,6 +829,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "move-item-down",
         label: "Move down (workspace/worktree)",
+        message_key: "action-move-item-down",
         hint: "move↓",
         default_chords: &["Ctrl Alt Down"],
         palette: true,
@@ -762,6 +845,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "move-worktree-to-folder",
         label: "Move worktree to folder…",
+        message_key: "action-move-worktree-to-folder",
         hint: "file worktree",
         default_chords: &[],
         palette: true,
@@ -776,6 +860,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "focus-left",
         label: "Focus left",
+        message_key: "action-focus-left",
         hint: "focus←",
         default_chords: &["Ctrl Left", "Ctrl h"],
         palette: true,
@@ -791,6 +876,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "focus-right",
         label: "Focus right",
+        message_key: "action-focus-right",
         hint: "focus→",
         default_chords: &["Ctrl Right", "Ctrl l"],
         palette: true,
@@ -806,6 +892,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "focus-up",
         label: "Focus up",
+        message_key: "action-focus-up",
         hint: "focus↑",
         default_chords: &["Ctrl Up", "Ctrl k"],
         palette: true,
@@ -821,6 +908,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "focus-down",
         label: "Focus down",
+        message_key: "action-focus-down",
         hint: "focus↓",
         default_chords: &["Ctrl Down", "Ctrl j"],
         palette: true,
@@ -838,6 +926,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "resize-left",
         label: "Resize pane left",
+        message_key: "action-resize-left",
         hint: "resize←",
         default_chords: &["Ctrl Shift Left"],
         palette: true,
@@ -853,6 +942,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "resize-right",
         label: "Resize pane right",
+        message_key: "action-resize-right",
         hint: "resize→",
         default_chords: &["Ctrl Shift Right"],
         palette: true,
@@ -868,6 +958,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "resize-up",
         label: "Resize pane up",
+        message_key: "action-resize-up",
         hint: "resize↑",
         default_chords: &["Ctrl Shift Up"],
         palette: true,
@@ -883,6 +974,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "resize-down",
         label: "Resize pane down",
+        message_key: "action-resize-down",
         hint: "resize↓",
         default_chords: &["Ctrl Shift Down"],
         palette: true,
@@ -898,6 +990,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "swap-pane-left",
         label: "Swap pane left",
+        message_key: "action-swap-pane-left",
         hint: "swap←",
         default_chords: &["Alt H"],
         palette: true,
@@ -912,6 +1005,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "swap-pane-right",
         label: "Swap pane right",
+        message_key: "action-swap-pane-right",
         hint: "swap→",
         default_chords: &["Alt L"],
         palette: true,
@@ -926,6 +1020,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "swap-pane-up",
         label: "Swap pane up",
+        message_key: "action-swap-pane-up",
         hint: "swap↑",
         default_chords: &["Alt K"],
         palette: true,
@@ -940,6 +1035,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "swap-pane-down",
         label: "Swap pane down",
+        message_key: "action-swap-pane-down",
         hint: "swap↓",
         default_chords: &["Alt J"],
         palette: true,
@@ -957,6 +1053,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "nav-left",
         label: "Navigate left",
+        message_key: "action-nav-left",
         hint: "nav←",
         default_chords: &["Alt Left"],
         palette: true,
@@ -971,6 +1068,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "nav-right",
         label: "Navigate right",
+        message_key: "action-nav-right",
         hint: "nav→",
         default_chords: &["Alt Right"],
         palette: true,
@@ -985,6 +1083,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "nav-up",
         label: "Previous worktree",
+        message_key: "action-nav-up",
         hint: "wt↑",
         default_chords: &["Alt Up"],
         palette: true,
@@ -997,6 +1096,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "nav-down",
         label: "Next worktree",
+        message_key: "action-nav-down",
         hint: "wt↓",
         default_chords: &["Alt Down"],
         palette: true,
@@ -1009,6 +1109,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-sidebar",
         label: "Cycle sidebar: full / rail / hidden",
+        message_key: "action-toggle-sidebar",
         hint: "sidebar",
         default_chords: &["Ctrl Alt s"],
         palette: true,
@@ -1025,6 +1126,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "sidebar-narrower",
         label: "Sidebar: narrower",
+        message_key: "action-sidebar-narrower",
         hint: "narrower",
         default_chords: &["Ctrl Alt ,"],
         palette: true,
@@ -1040,6 +1142,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "sidebar-wider",
         label: "Sidebar: wider",
+        message_key: "action-sidebar-wider",
         hint: "wider",
         default_chords: &["Ctrl Alt ."],
         palette: true,
@@ -1055,6 +1158,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "warm-pool-increment",
         label: "Warm pool: add a spare",
+        message_key: "action-warm-pool-increment",
         hint: "warm+",
         // Palette-only: no default chord is installed by `default_keymap`.
         // A chord was declared here but never bound, so the hint strip,
@@ -1074,6 +1178,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "warm-pool-decrement",
         label: "Warm pool: remove a spare",
+        message_key: "action-warm-pool-decrement",
         hint: "warm-",
         // Palette-only: no default chord is installed by `default_keymap`.
         // A chord was declared here but never bound, so the hint strip,
@@ -1092,6 +1197,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-panel",
         label: "Toggle diff / PR panel",
+        message_key: "action-toggle-panel",
         hint: "panel",
         default_chords: &["Ctrl Alt p"],
         palette: true,
@@ -1107,6 +1213,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "files-drawer",
         label: "Toggle files drawer",
+        message_key: "action-files-drawer",
         hint: "drawer",
         default_chords: &["Ctrl Alt f"],
         palette: true,
@@ -1119,8 +1226,29 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "drawer-cycle",
+        label: "Cycle drawer occupant",
+        message_key: "action-drawer-cycle",
+        hint: "drawer+",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "cycle drawer", "next drawer tool", "files drawer"],
+    },
+    ActionSpec {
+        id: "drawer-pick",
+        label: "Pick drawer occupant",
+        message_key: "action-drawer-pick",
+        hint: "drawer?",
+        // Palette-only in v1; users may bind it explicitly in [keybinds].
+        default_chords: &[],
+        palette: true,
+        keywords: &["drawer", "pick drawer", "drawer tool", "choose drawer"],
+    },
+    ActionSpec {
         id: "toggle-corner",
         label: "Toggle corner overlay (video)",
+        message_key: "action-toggle-corner",
         hint: "corner",
         default_chords: &["Ctrl Alt o"],
         palette: true,
@@ -1136,6 +1264,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "focus-sidebar",
         label: "Focus workspace sidebar",
+        message_key: "action-focus-sidebar",
         hint: "sidebar",
         default_chords: &["Alt s"],
         palette: true,
@@ -1150,6 +1279,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "focus-panel",
         label: "Focus diff / PR panel",
+        message_key: "action-focus-panel",
         hint: "panel",
         default_chords: &["Alt ."],
         palette: true,
@@ -1164,6 +1294,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-notifications",
         label: "Toggle Notifications panel",
+        message_key: "action-toggle-notifications",
         hint: "notifications",
         default_chords: &["Ctrl Alt i"],
         palette: true,
@@ -1178,6 +1309,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-ci",
         label: "Open CI/CD runs panel",
+        message_key: "action-open-ci",
         hint: "ci",
         default_chords: &[],
         palette: true,
@@ -1196,6 +1328,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-usage",
         label: "AI account usage",
+        message_key: "action-open-usage",
         hint: "usage",
         default_chords: &["Alt u"],
         palette: true,
@@ -1214,6 +1347,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-monitor",
         label: "System monitor",
+        message_key: "action-open-monitor",
         hint: "monitor",
         default_chords: &["Ctrl Alt M"],
         palette: true,
@@ -1243,6 +1377,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-pipeline-board",
         label: "Pipeline board",
+        message_key: "action-open-pipeline-board",
         hint: "pipeline",
         default_chords: &["Alt b"],
         palette: true,
@@ -1262,6 +1397,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-calendar",
         label: "Calendar & world clocks",
+        message_key: "action-open-calendar",
         hint: "calendar",
         default_chords: &["Alt d"],
         palette: true,
@@ -1287,6 +1423,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-merge-queue",
         label: "Merge queue",
+        message_key: "action-open-merge-queue",
         hint: "merge queue",
         // Palette-only: no default chord is installed by `default_keymap`.
         // A chord was declared here but never bound, so the hint strip,
@@ -1306,6 +1443,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-pr-queue",
         label: "PR queue",
+        message_key: "action-open-pr-queue",
         hint: "pr queue",
         // No default chord: `Ctrl Alt q` is the merge queue's, and the two are
         // distinct features. Reachable from the palette and the panel.
@@ -1324,6 +1462,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "pr-queue-add",
         label: "PR queue: watch this PR",
+        message_key: "action-pr-queue-add",
         hint: "watch pr",
         default_chords: &[],
         palette: true,
@@ -1338,6 +1477,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "pr-queue-refresh",
         label: "PR queue: refresh now",
+        message_key: "action-pr-queue-refresh",
         hint: "refresh prs",
         default_chords: &[],
         palette: true,
@@ -1351,8 +1491,25 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         .as_slice(),
     },
     ActionSpec {
+        id: "pr-review-task-handle",
+        label: "PR review task: handle queued",
+        message_key: "action-pr-review-task-handle",
+        hint: "handle review",
+        // TUI-only: choose it from the command palette, or press `h` on an
+        // explicit per-thread task row in the PR queue panel.
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "handle review task",
+            "resolve review thread",
+            "watched pr comments",
+            "review agent",
+        ],
+    },
+    ActionSpec {
         id: "share-worktree-port",
         label: "Share worktree port",
+        message_key: "action-share-worktree-port",
         hint: "share",
         default_chords: &["Alt Shift S"],
         palette: true,
@@ -1368,6 +1525,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "stop-worktree-share",
         label: "Stop worktree shares",
+        message_key: "action-stop-worktree-share",
         hint: "unshare",
         default_chords: &[],
         palette: true,
@@ -1382,6 +1540,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "open-shares",
         label: "Open shares panel",
+        message_key: "action-open-shares",
         hint: "shares",
         default_chords: &[],
         palette: true,
@@ -1396,6 +1555,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "palette",
         label: "Command palette",
+        message_key: "action-palette",
         hint: "menu",
         default_chords: &["Ctrl Space"],
         palette: true,
@@ -1413,6 +1573,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "launch-menu",
         label: "Launch menu — presets, agents, tools, shell",
+        message_key: "action-launch-menu",
         hint: "launch",
         default_chords: &["Ctrl Alt l"],
         palette: true,
@@ -1432,6 +1593,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "help",
         label: "Help — built-in docs",
+        message_key: "action-help",
         hint: "help",
         default_chords: &["F1"],
         palette: true,
@@ -1449,6 +1611,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "lazygit",
         label: "Open lazygit",
+        message_key: "action-lazygit",
         hint: "lazygit",
         default_chords: &["Alt g"],
         palette: true,
@@ -1465,6 +1628,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "yazi",
         label: "Open yazi drawer",
+        message_key: "action-yazi",
         hint: "yazi",
         default_chords: &["Alt y"],
         palette: true,
@@ -1480,6 +1644,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "editor",
         label: "Open editor",
+        message_key: "action-editor",
         hint: "editor",
         default_chords: &["Alt e"],
         palette: true,
@@ -1494,8 +1659,27 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "open-in-ide",
+        label: "Open focused worktree in IDE",
+        message_key: "action-open-in-ide",
+        hint: "open in IDE",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "ide",
+            "open in ide",
+            "external editor",
+            "project",
+            "worktree",
+            "vscode",
+            "cursor",
+            "zed",
+        ],
+    },
+    ActionSpec {
         id: "show-diff",
         label: "Open git diff",
+        message_key: "action-show-diff",
         hint: "diff",
         default_chords: &["Alt /"],
         palette: true,
@@ -1511,6 +1695,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "git-push",
         label: "Git push (current branch)",
+        message_key: "action-git-push",
         hint: "push",
         default_chords: &[],
         palette: true,
@@ -1525,6 +1710,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "git-pull",
         label: "Git pull (current branch)",
+        message_key: "action-git-pull",
         hint: "pull",
         default_chords: &[],
         palette: true,
@@ -1539,6 +1725,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "git-fetch",
         label: "Git fetch (all remotes, prune)",
+        message_key: "action-git-fetch",
         hint: "fetch",
         default_chords: &[],
         palette: true,
@@ -1553,6 +1740,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "rollback",
         label: "Rollback / discard changes…",
+        message_key: "action-rollback",
         hint: "rollback",
         default_chords: &[],
         palette: true,
@@ -1569,6 +1757,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "scroll-up",
         label: "Scroll pane up",
+        message_key: "action-scroll-up",
         hint: "scroll↑",
         default_chords: &["Shift PageUp", "PageUp"],
         palette: true,
@@ -1583,6 +1772,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "scroll-down",
         label: "Scroll pane down",
+        message_key: "action-scroll-down",
         hint: "scroll↓",
         default_chords: &["Shift PageDown", "PageDown"],
         palette: true,
@@ -1597,6 +1787,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "copy-pane",
         label: "Copy pane contents",
+        message_key: "action-copy-pane",
         hint: "copy",
         default_chords: &["Ctrl Alt c"],
         palette: true,
@@ -1612,6 +1803,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "search-pane",
         label: "Search pane history",
+        message_key: "action-search-pane",
         hint: "search",
         // Must match what `default_keymap` actually binds. A bare `/` was
         // declared here for a long time while dispatch bound `Ctrl Alt /` —
@@ -1633,6 +1825,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "search-global",
         label: "Search across all panes (worktree scope)",
+        message_key: "action-search-global",
         hint: "search all",
         default_chords: &["Ctrl /"],
         palette: true,
@@ -1647,6 +1840,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-key-lock",
         label: "Lock/unlock keybinds (pass through)",
+        message_key: "action-toggle-key-lock",
         hint: "lock",
         default_chords: &["Ctrl g"],
         palette: true,
@@ -1663,6 +1857,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "mode-normal",
         label: "Switch to Normal mode",
+        message_key: "action-mode-normal",
         hint: "normal",
         default_chords: &["Ctrl Alt n"],
         palette: true,
@@ -1671,6 +1866,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "mode-vim-normal",
         label: "Switch to Vim-normal mode",
+        message_key: "action-mode-vim-normal",
         hint: "vim",
         default_chords: &["Ctrl Alt v"],
         palette: true,
@@ -1679,6 +1875,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "mode-vim-insert",
         label: "Switch to Vim-insert mode",
+        message_key: "action-mode-vim-insert",
         hint: "insert",
         default_chords: &[],
         palette: true,
@@ -1687,6 +1884,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "mode-emacs",
         label: "Switch to Emacs mode",
+        message_key: "action-mode-emacs",
         hint: "emacs",
         default_chords: &["Ctrl Alt e"],
         palette: true,
@@ -1695,6 +1893,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "toggle-strip",
         label: "Toggle pin strip",
+        message_key: "action-toggle-strip",
         hint: "pins",
         default_chords: &["Ctrl Alt b"],
         palette: true,
@@ -1710,6 +1909,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "grow-strip",
         label: "Grow pin strip",
+        message_key: "action-grow-strip",
         hint: "pins+",
         default_chords: &["Ctrl Alt ]"],
         palette: true,
@@ -1724,6 +1924,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "shrink-strip",
         label: "Shrink pin strip",
+        message_key: "action-shrink-strip",
         hint: "pins-",
         default_chords: &["Ctrl Alt ["],
         palette: true,
@@ -1738,6 +1939,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "promote-pin",
         label: "Promote pane to pin strip",
+        message_key: "action-promote-pin",
         hint: "pin pane",
         default_chords: &["Ctrl Alt P"],
         palette: true,
@@ -1752,6 +1954,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "unpin",
         label: "Unpin focused/first pin",
+        message_key: "action-unpin",
         hint: "unpin",
         default_chords: &["Ctrl Alt U"],
         palette: true,
@@ -1760,6 +1963,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "quit",
         label: "Quit thegn",
+        message_key: "action-quit",
         hint: "quit",
         default_chords: &["Ctrl q"],
         palette: true,
@@ -1770,6 +1974,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "detach",
         label: "Detach — quit, keep panes running",
+        message_key: "action-detach",
         hint: "detach",
         default_chords: &[],
         palette: true,
@@ -1784,6 +1989,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "quit-kill",
         label: "Quit and kill sessions",
+        message_key: "action-quit-kill",
         hint: "quit+kill",
         default_chords: &[],
         palette: true,
@@ -1800,6 +2006,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-play-pause",
         label: "Media: Play/Pause",
+        message_key: "action-media-play-pause",
         hint: "play/pause",
         default_chords: &["Alt m m"],
         palette: true,
@@ -1815,6 +2022,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-next",
         label: "Media: Next track",
+        message_key: "action-media-next",
         hint: "next",
         default_chords: &["Alt m n"],
         palette: true,
@@ -1829,6 +2037,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-previous",
         label: "Media: Previous track",
+        message_key: "action-media-previous",
         hint: "prev",
         default_chords: &["Alt m p"],
         palette: true,
@@ -1843,6 +2052,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-shuffle-toggle",
         label: "Media: Toggle shuffle",
+        message_key: "action-media-shuffle-toggle",
         hint: "shuffle",
         default_chords: &["Alt m s"],
         palette: true,
@@ -1851,6 +2061,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-loop-cycle",
         label: "Media: Cycle repeat",
+        message_key: "action-media-loop-cycle",
         hint: "loop",
         default_chords: &["Alt m r"],
         palette: true,
@@ -1859,6 +2070,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-volume-up",
         label: "Media: Volume up",
+        message_key: "action-media-volume-up",
         hint: "vol+",
         default_chords: &["Alt m k"],
         palette: true,
@@ -1867,6 +2079,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-volume-down",
         label: "Media: Volume down",
+        message_key: "action-media-volume-down",
         hint: "vol−",
         default_chords: &["Alt m j"],
         palette: true,
@@ -1881,6 +2094,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-seek-forward",
         label: "Media: Skip forward",
+        message_key: "action-media-seek-forward",
         hint: "seek+",
         default_chords: &["Alt m ."],
         palette: true,
@@ -1895,6 +2109,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-seek-back",
         label: "Media: Skip back",
+        message_key: "action-media-seek-back",
         hint: "seek−",
         default_chords: &["Alt m ,"],
         palette: true,
@@ -1903,6 +2118,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-open-panel",
         label: "Media: Now-Playing panel…",
+        message_key: "action-media-open-panel",
         hint: "now playing",
         default_chords: &["Alt m enter"],
         palette: true,
@@ -1917,6 +2133,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-chapter-next",
         label: "Media: Next chapter (video)",
+        message_key: "action-media-chapter-next",
         hint: "chapter+",
         default_chords: &["Alt m ]"],
         palette: true,
@@ -1925,6 +2142,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-chapter-prev",
         label: "Media: Previous chapter (video)",
+        message_key: "action-media-chapter-prev",
         hint: "chapter−",
         default_chords: &["Alt m ["],
         palette: true,
@@ -1933,6 +2151,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-fullscreen",
         label: "Media: Toggle fullscreen (video)",
+        message_key: "action-media-fullscreen",
         hint: "fullscreen",
         default_chords: &["Alt m v"],
         palette: true,
@@ -1947,6 +2166,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-select-playlist",
         label: "Media: Select playlist…",
+        message_key: "action-media-select-playlist",
         hint: "playlist",
         default_chords: &["Alt m l"],
         palette: true,
@@ -1955,6 +2175,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "media-select-player",
         label: "Media: Select player…",
+        message_key: "action-media-select-player",
         hint: "player",
         default_chords: &["Alt m o"],
         palette: true,
@@ -1966,10 +2187,42 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "output device",
         ],
     },
+    ActionSpec {
+        id: "voice-toggle",
+        label: "Voice: toggle recording",
+        message_key: "action-voice-toggle",
+        hint: "voice",
+        default_chords: &["Alt v"],
+        palette: true,
+        keywords: &[
+            "voice",
+            "record",
+            "dictation",
+            "speech to text",
+            "transcribe",
+            "microphone",
+        ],
+    },
+    ActionSpec {
+        id: "voice-cancel",
+        label: "Voice: cancel recording/transcription",
+        message_key: "action-voice-cancel",
+        hint: "voice cancel",
+        default_chords: &["Alt V"],
+        palette: true,
+        keywords: &[
+            "voice cancel",
+            "cancel recording",
+            "discard dictation",
+            "stop voice",
+            "abort transcription",
+        ],
+    },
     // Notification routing (items 426/427).
     ActionSpec {
         id: "notify-dnd-toggle",
         label: "Notifications: Toggle do-not-disturb",
+        message_key: "action-notify-dnd-toggle",
         hint: "dnd",
         default_chords: &["Ctrl Alt d"],
         palette: true,
@@ -1984,6 +2237,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "notify-mode-cycle",
         label: "Notifications: Cycle routing mode",
+        message_key: "action-notify-mode-cycle",
         hint: "notif mode",
         default_chords: &["Ctrl Alt m"],
         palette: true,
@@ -1997,6 +2251,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "attention-next",
         label: "Jump to next attention",
+        message_key: "action-attention-next",
         hint: "needs you",
         default_chords: &["Alt a"],
         palette: true,
@@ -2012,6 +2267,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "mark-all-read",
         label: "Notifications: Mark all as read",
+        message_key: "action-mark-all-read",
         hint: "mark all read",
         default_chords: &["Alt Shift R"],
         palette: true,

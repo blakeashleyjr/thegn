@@ -241,6 +241,7 @@ fn consider_candidate(
         vars: &vars,
         timeout_secs: pq.agent_timeout_secs,
         sandbox,
+        credential_free: false,
     });
 }
 

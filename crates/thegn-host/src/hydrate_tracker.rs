@@ -8,7 +8,7 @@
 //! cache (no network).
 
 use termwiz::terminal::TerminalWaker;
-use thegn_core::store::{CacheStore, NotificationStore, WorktreeAuxStore};
+use thegn_core::store::{CacheStore, WorktreeAuxStore};
 
 /// Refresh the per-repo issue cache off-thread: fetch every configured
 /// provider, diff old vs new per `(repo_root, provider)` key for
@@ -104,7 +104,7 @@ pub(crate) fn spawn_issue_cache_refresh(
                 .unwrap_or_default();
             for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked)
             {
-                let _ = db.put_notification(kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             // Overdue is re-derived (not diffed) each refresh; the store-side
             // emit-once (`put_notification_once`) keeps it to one row per
@@ -112,10 +112,29 @@ pub(crate) fn spawn_issue_cache_refresh(
             for (source_ref, msg) in
                 overdue_notifications(&issues, &linked, thegn_core::util::now())
             {
-                let _ = db.put_notification_once("overdue", &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ = crate::automation_events::emit_once(
+                    &db,
+                    "overdue",
+                    &source_ref,
+                    &msg,
+                    &repo_key,
+                ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             changed = true;
+            // The refresh already runs on `sched::spawn_bg`; autopilot claims
+            // here but schedules each slow agent on its own bounded background
+            // worker. It receives filter provenance rather than guessing
+            // consent from issue display fields.
+            crate::autopilot_driver::pickup(
+                &app_cfg,
+                &repo_root,
+                &cwd,
+                &account,
+                provider,
+                &issues,
+                cfg.filter_assignee_me,
+            );
         }
         if changed && let Some(w) = &waker {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path

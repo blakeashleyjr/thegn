@@ -134,7 +134,7 @@ edits. Then: `caps()` ⇔ optional ops defaulting to `Unsupported`, a
 (`Unsupported`/`NotInstalled`/`NotConfigured` fall through; `Auth`/
 `NotFound`/`Transient` are final), `Probe` → `thegn doctor`'s Providers
 section, and a `config_enum!` kind where every value is implemented or
-`reserved` (`config validate --strict` rejects reserved) — or, for
+`reserved` (`config validate` rejects reserved) — or, for
 account-shaped seams (issues, calendar), an open `[[…_accounts]]` list whose
 factory builds `Some` exactly for implemented kinds. Vendor CLIs are called
 only inside their implementation files. Account routers accept
@@ -179,6 +179,15 @@ Every mutating control call and every auth/scope rejection emits a structured
 record on the `thegn::control::audit` tracing target (`thegn_core::control_audit`;
 never a token secret).
 
+The CLI's `thegn events tail` is the reference thin client for the streaming
+`events.subscribe` projection. It uses the existing discovered Unix socket or
+the existing bearer-authenticated TCP endpoint, and accepts only narrowing
+filters (`--kinds`, `--session`) plus opt-in bounded-loss signaling
+(`--signal-lag`). It has no replay journal: a `lagged` frame or reconnect tells
+the consumer to resynchronize through `sessions.list` and `worktrees.list`.
+The command is read-only and does not enable the `sessions.input` interlock
+(`--allow-session-input`).
+
 **Plugins** speak the NDJSON wire in `thegn_core::plugin_api`, versioned by
 `API_VERSION` and pinned by `docs/api/plugin-api-<v>.json`, and are _run_ by
 the plugin runtime (`openspec/specs/plugin-runtime`): loader (`[[plugins]]`
@@ -199,19 +208,34 @@ test, and `thegn plugin check` / `thegn plugin list` in `test/smoke.sh`.
 ## 7. Configuration
 
 Rust structs are the schema (`schemars` → `thegn config schema`, the strict
-validator, the MCP resource). `config/config.toml.example` documents every
-key and is the source of the runtime-generated config-reference help page.
-Layering: built-in defaults → `$XDG_CONFIG_HOME/thegn/config.toml` →
-`THEGN_<SECTION>_<KEY>` env → `--set`; a repo's `.thegn.toml` overlays
-`[sandbox]` only. Unknown keys are dropped on load (a launch is never blocked)
-and rejected by `thegn config validate --strict` with a did-you-mean.
+validator, the MCP resource). `config/config.toml.example` is hand-authored
+prose that documents every key and is the source of the runtime-generated
+config-reference help page; schema/example gates keep it from losing keys, and
+the reference documents the example's values rather than promising code-default
+parity. Trusted configuration is TOML-only: built-in defaults →
+`$XDG_CONFIG_HOME/thegn/config.toml` (or `--config`, which changes the path but
+not the parser) → the active external profile's
+`profiles/<name>/config.toml` → `THEGN_<SECTION>_<KEY>` value overlays →
+`--set` values/fragments.
+
+A repo-local overlay is the deliberate untrusted exception and may be
+`.thegn.toml`, `.thegn.yaml`, `.thegn.yml`, or `.thegn.json`, in that precedence
+order. It carries repo-scoped `[sandbox]` (trust-clamped), `[keybinds]`,
+`[notifications]`, `[issues]`, the `env` selector, and metrics
+detection/refusal data. Unknown keys and malformed values are dropped or
+warned on tolerant load so a launch is never blocked; `thegn config validate`
+strictly checks the main file, active profile, and selected repo overlay with
+file/key context. When candidates are shadowed, the loader warns with paths
+only.
 
 **Gate:** `tests/config_example.rs` (every key documented; example parses and
-validates clean), `tests/env_overlay_coverage.rs` (every shallow key has an
-env knob or is pinned in `test/env-overlay-ratchet.txt`; every knob is
-exercised), `tests/hm_module_drift.rs` (the home-manager module renders only
-real keys and offers only accepted enum values), the `config_enum` pinned
-count.
+validates clean, and the generated reference retains the documented key set),
+`tests/env_overlay_coverage.rs` (every shallow key has an env knob or is
+pinned in `test/env-overlay-ratchet.txt`; every knob is exercised),
+`tests/hm_module_drift.rs` (the home-manager module renders only real keys and
+offers only accepted enum values), the `config_enum` pinned count, and the
+format-specific repo-overlay unit tests. No JSON/YAML reader is added to the
+trusted config path.
 
 ## 8. Keymap, palette, help
 

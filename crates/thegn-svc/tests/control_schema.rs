@@ -11,6 +11,7 @@
 //! additive (new optional fields, new variants with defaults) — the same
 //! compatibility rule as the plugin wire.
 
+use thegn_core::control_wire::FeedFilter;
 use thegn_svc::control::*;
 
 fn wire_schema() -> serde_json::Value {
@@ -27,11 +28,17 @@ fn wire_schema() -> serde_json::Value {
     }
     add!(
         WorktreeInfo,
+        SkillInfo,
+        SkillsList,
+        EditorOpenRequest,
         SessionInfo,
         OpenSpec,
+        ForkSpec,
         AttachKind,
         BrowserCommand,
         BrowserAction,
+        PreviewFetchRequest,
+        PreviewFetchReply,
         WaitCondition,
         WaitOutcome,
         SplitDir,
@@ -42,9 +49,16 @@ fn wire_schema() -> serde_json::Value {
         CiRunsReply,
         CiLogsReply,
         PushedNote,
+        AutomationOrigin,
+        AutomationRuleInfo,
+        AutomationTestRequest,
+        AutomationTestReply,
+        ToolRunRequest,
         WorktreeCreateReq,
         DispatchPutReq,
         SessionRecord,
+        ErrorBody,
+        FeedFilter,
     );
     let routes: Vec<serde_json::Value> = routes::API_CALLS
         .iter()

@@ -31,8 +31,8 @@ use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::panes::Panes;
 use crate::run::{
-    DrawerPool, SidebarState, persist_active_focus, sidebar_worktree_order,
-    sync_drawer_persistence, visible_index_of_active,
+    DrawerRuntime, SidebarState, persist_active_focus, sidebar_worktree_order,
+    visible_index_of_active,
 };
 use crate::session::Session;
 
@@ -170,9 +170,7 @@ pub(crate) fn cycle_tab(
     model: &mut FrameModel,
     sb: &mut SidebarState,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
     center: Rect,
 ) {
@@ -181,7 +179,7 @@ pub(crate) fn cycle_tab(
     } else {
         session.prev_tab();
     }
-    finish_switch(session, model, sb, panes, drawer, pool, home, cfg, center);
+    finish_switch(session, model, sb, panes, drawer_runtime, cfg, center);
 }
 
 /// `Action::NextWorktree` / `Action::PrevWorktree` (non-terminal arm): step to
@@ -197,9 +195,7 @@ pub(crate) fn cycle_worktree(
     model: &mut FrameModel,
     sb: &mut SidebarState,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
     center: Rect,
 ) -> usize {
@@ -224,7 +220,7 @@ pub(crate) fn cycle_worktree(
         let step = if next { (p + 1) % n } else { (p + n - 1) % n };
         session.switch_to(order[step]);
     }
-    finish_switch(session, model, sb, panes, drawer, pool, home, cfg, center);
+    finish_switch(session, model, sb, panes, drawer_runtime, cfg, center);
     session.active
 }
 
@@ -236,14 +232,14 @@ fn finish_switch(
     model: &mut FrameModel,
     sb: &mut SidebarState,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     cfg: &thegn_core::config::Config,
     center: Rect,
 ) {
     refresh_tab_model_switch(model, session, sb);
-    sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
+    if let Some(dir) = crate::run::active_cwd(session) {
+        drawer_runtime.reconcile(cfg, &dir, panes, center);
+    }
     persist_active_focus(session);
 }
 
