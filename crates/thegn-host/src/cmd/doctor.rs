@@ -8,6 +8,8 @@
 use anyhow::Result;
 use thegn_core::capabilities::{Capabilities, IsolationClass};
 use thegn_core::config::{Config, SandboxProfile};
+use thegn_core::db::Db;
+use thegn_core::hooks::HookEvent;
 use thegn_core::managed_tool::{ManagedTool, Resolution};
 use thegn_core::outln;
 use thegn_core::placement::{Placement, RuntimeProbe};
@@ -15,6 +17,8 @@ use thegn_core::sandbox::Backend;
 use thegn_core::seam::Kind as _;
 use thegn_core::store::HostStore;
 use thegn_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
+
+use super::config_health::ConfigHealth;
 
 fn color_str(d: ColorDepth) -> &'static str {
     match d {
@@ -506,6 +510,48 @@ fn providers_report(cfg: &Config) {
         for n in &r.notes {
             outln!("  {:<9} {:<24}   {n}", "", "");
         }
+    }
+    let sound = crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound);
+    let provider = &sound["provider"];
+    let availability = provider["availability"]["state"]
+        .as_str()
+        .unwrap_or("unknown");
+    outln!(
+        "  {:<9} {:<24} {availability}{}",
+        "sound",
+        provider["id"].as_str().unwrap_or("none"),
+        provider["availability"]["reason"]
+            .as_str()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default(),
+    );
+    outln!(
+        "  {:<9} {:<24} formats: {}; volume: {}",
+        "",
+        "",
+        provider["caps"]["formats"]
+            .as_array()
+            .map(|formats| {
+                formats
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        provider["caps"]["volume"].as_bool().map_or("unknown", |v| {
+            if v { "supported" } else { "unsupported" }
+        }),
+    );
+    outln!(
+        "  {:<9} {:<24} pack: {}; entries: {}",
+        "",
+        "",
+        sound["pack"].as_str().unwrap_or("(none)"),
+        sound["pack_entries"].as_u64().unwrap_or(0),
+    );
+    if let Some(reason) = sound["fallback"].as_str() {
+        outln!("  {:<9} {:<24} fallback: {reason}", "", "");
     }
 }
 
@@ -1140,6 +1186,75 @@ fn daemon_health() -> (&'static str, Option<String>) {
     }
 }
 
+/// The binary a running process is executing, via `/proc/<pid>/exe`.
+///
+/// No `#[cfg]`: on a platform without procfs the read simply fails and the
+/// caller prints "(unknown)", which is the honest answer there.
+fn exe_of_pid(pid: i64) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// Print the two facts that distinguish "the rebuild took" from "the rebuild
+/// took for the CLI only".
+///
+/// # Why `--version` is not enough
+///
+/// On 2026-08-29 a v57 daemon drove a v62 database for hours while both the CLI
+/// and the daemon reported `0.1.0-alpha.2` — the crate version had not changed,
+/// only the schema and the code had. The decisive facts are the **schema pair**
+/// (what the database is at vs what this build expects) and the **binary paths**
+/// (whether the daemon is executing the same file the CLI is), so `doctor`
+/// prints both.
+fn build_parity_lines() {
+    let build = thegn_core::db::SCHEMA_VERSION;
+    match thegn_core::db::on_disk_schema_version() {
+        Some(on_disk) if on_disk == build => {
+            outln!("  schema        db v{on_disk} == build v{build}");
+        }
+        Some(on_disk) if on_disk > build => {
+            outln!(
+                "  schema        db v{on_disk} > build v{build}  ** THIS BUILD IS TOO OLD — \
+                 rebuild/reinstall; it cannot see what the newer build writes **"
+            );
+        }
+        Some(on_disk) => {
+            outln!("  schema        db v{on_disk} < build v{build} (migrates on next open)");
+        }
+        None => outln!("  schema        (no database yet) build v{build}"),
+    }
+    let cli = std::env::current_exe().ok();
+    outln!(
+        "  cli binary    {}",
+        cli.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown)".into())
+    );
+    // Every registered daemon's actual executable — a daemon still running an
+    // older build is invisible in its reported version but obvious here.
+    use thegn_core::store::ControlStore;
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return;
+    };
+    for d in db.daemons().unwrap_or_default() {
+        let exe = exe_of_pid(d.pid);
+        let same = match (&cli, &exe) {
+            (Some(a), Some(b)) => {
+                if a == b {
+                    "  (same as CLI)"
+                } else {
+                    "  ** DIFFERENT FROM THE CLI — restart the daemon from this build **"
+                }
+            }
+            _ => "",
+        };
+        outln!(
+            "  daemon binary {}{same}",
+            exe.map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("(pid {} — unreadable)", d.pid))
+        );
+    }
+}
+
 /// Report thegn's own identity: version, channel, build, OS, the daemon's
 /// version + reachability, the `[log]` sinks with sizes/caps, and recent crash
 /// reports — the first questions any bug report needs answered.
@@ -1160,6 +1275,7 @@ fn identification_report(cfg: &Config) {
         dver.as_deref().unwrap_or("unknown")
     );
     outln!("  run id        {}", thegn_core::diagnostics::run_id());
+    build_parity_lines();
     outln!("");
     outln!("Logs ([log])");
     outln!("  level         {}", cfg.log.level.as_str());
@@ -1243,8 +1359,16 @@ fn identification_json(cfg: &Config) -> serde_json::Value {
 }
 
 /// The full `doctor --json` report, reused by `thegn doctor bundle`. Recomputes
-/// terminal detection so it is standalone.
+/// terminal detection so it is standalone. This compatibility wrapper keeps
+/// the existing bundle/tests API for callers that use the default path.
+#[cfg(test)]
 pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
+    let path = thegn_core::config::Config::path();
+    let health = super::config_health::collect(&path, None);
+    doctor_json_with_health(cfg, &health)
+}
+
+pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
     let resolved = crate::run::resolve_termcaps(cfg);
@@ -1274,6 +1398,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
             "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
             "undercurl": cfg.theme.undercurl.as_str(),
         },
+        "config_health": health.json(),
         "detected": caps_json(&detected),
         "resolved": caps_json(&resolved),
         "probe": probe.as_ref().map(|p| serde_json::json!({
@@ -1297,6 +1422,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "mcp_servers": mcp_servers_json(cfg),
         "network": network_json(cfg),
         "providers": providers_json(cfg),
+        "sound": crate::notification_sound::SoundRuntime::report(&cfg.notifications.sound),
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
@@ -1304,9 +1430,87 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
         "agents": agents_json(cfg),
+        "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
+        "lifecycle_hooks": lifecycle_hooks_json(cfg),
     })
+}
+
+/// Report lifecycle-hook sources without exposing command text. Repo hooks are
+/// read only for the diagnostic surface; execution still goes through the
+/// normal trust-gated resolver.
+fn lifecycle_hooks_json(cfg: &Config) -> serde_json::Value {
+    let repo_root = current_repo_root();
+    let repo_hooks = repo_root
+        .as_deref()
+        .and_then(thegn_core::config::load_repo_hooks)
+        .map(|(hooks, _)| hooks)
+        .unwrap_or_default();
+    let db = Db::open().ok();
+    let resolved = repo_root
+        .as_deref()
+        .map(|root| crate::worktree_lifecycle::resolve(cfg, root, db.as_ref()));
+
+    let events = HookEvent::ALL
+        .into_iter()
+        .map(|event| {
+            let global = cfg.hooks.entries(event).len();
+            let workspace = cfg
+                .workspace
+                .values()
+                .map(|w| w.hooks.entries(event).len())
+                .sum::<usize>();
+            let repo = repo_hooks.entries(event).len();
+            let trust = if repo == 0 {
+                "none"
+            } else if db.is_none() {
+                "unknown (state DB unavailable)"
+            } else if resolved.as_ref().is_some_and(|r| {
+                r.pending
+                    .iter()
+                    .any(|request| request.key == format!("hooks.{}", event.as_str()))
+            }) {
+                "pending"
+            } else {
+                "approved"
+            };
+            (
+                event.as_str().to_string(),
+                serde_json::json!({
+                    "global": global,
+                    "workspace": workspace,
+                    "repo": repo,
+                    "repo_trust": trust,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "repo": repo_root.map(|root| root.display().to_string()),
+        "events": events,
+    })
+}
+
+fn lifecycle_hooks_report(cfg: &Config) {
+    let report = lifecycle_hooks_json(cfg);
+    outln!("Lifecycle hooks ([hooks])");
+    if let Some(repo) = report["repo"].as_str() {
+        outln!("  repo          {repo}");
+    } else {
+        outln!("  repo          (not inside a repository)");
+    }
+    for event in HookEvent::ALL {
+        let row = &report["events"][event.as_str()];
+        outln!(
+            "  {:<13} global={} workspace={} repo={} trust={}",
+            event.as_str(),
+            row["global"],
+            row["workspace"],
+            row["repo"],
+            row["repo_trust"].as_str().unwrap_or("unknown"),
+        );
+    }
 }
 
 /// Reports the model proxy: a single quiet line when disabled, else enabled
@@ -1427,9 +1631,18 @@ fn model_proxy_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
-pub fn run(cfg: &Config, json: bool) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    json: bool,
+    config_path: std::path::PathBuf,
+    repo_context: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let health = super::config_health::collect(&config_path, repo_context.as_deref());
     if json {
-        outln!("{}", serde_json::to_string_pretty(&doctor_json(cfg))?);
+        outln!(
+            "{}",
+            serde_json::to_string_pretty(&doctor_json_with_health(cfg, &health))?
+        );
         return Ok(());
     }
 
@@ -1446,6 +1659,20 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
     identification_report(cfg);
+    outln!(
+        "Config health: {} problem(s), {} warning(s); main {}; profile {}; repo {}; detail: `thegn config validate`",
+        health.problems(),
+        health.warnings,
+        health.main_path.display(),
+        health
+            .profile_path
+            .as_deref()
+            .map_or("(none)".to_string(), |path| path.display().to_string()),
+        health
+            .repo_path
+            .as_deref()
+            .map_or("(none)".to_string(), |path| path.display().to_string()),
+    );
     outln!("");
     channel_report();
     outln!("");
@@ -1517,6 +1744,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     harness_report(cfg);
 
     outln!("");
+    super::skills_doctor::print(&super::skills_doctor::inspect(
+        cfg,
+        &super::resolve_worktree(None),
+    ));
+
+    outln!("");
 
     outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
     match &probe {
@@ -1552,6 +1785,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     model_proxy_report(cfg);
+
+    outln!("");
+    lifecycle_hooks_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
@@ -2211,7 +2447,6 @@ fn macos_report(env: &thegn_core::termcaps::TermEnv) {
     outln!("  integrations");
     for (bin, what) in [
         ("osascript", "desktop notifications"),
-        ("afplay", "chime"),
         ("pbcopy", "clipboard copy"),
         ("pbpaste", "clipboard paste"),
         (
@@ -2963,13 +3198,21 @@ fn managed_tools_json(cfg: &Config) -> serde_json::Value {
         .map(|tool| {
             let over = cfg.managed_tools.get(&tool.name);
             let res = tool.resolve(over, thegn_core::util::which_path);
-            serde_json::json!({
+            let is_bugstalker = tool.name == "bugstalker";
+            let mut report = serde_json::json!({
                 "name": tool.name,
                 "tier": res.tier(),
                 "path": res.path(),
                 "pinned": tool.version,
                 "current": matches!(res, Resolution::Managed { current: true, .. }),
-            })
+            });
+            if is_bugstalker {
+                report["platform_supported"] =
+                    serde_json::json!(thegn_core::debug::platform_supported());
+                report["platform_note"] =
+                    serde_json::json!(thegn_core::debug::unsupported_reason());
+            }
+            report
         })
         .collect();
     serde_json::Value::Array(tools)
@@ -3195,8 +3438,8 @@ mod tests {
     #[test]
     fn run_does_not_panic_on_default_config() {
         let cfg = Config::default();
-        assert!(run(&cfg, false).is_ok());
-        assert!(run(&cfg, true).is_ok());
+        assert!(run(&cfg, false, Config::path(), None).is_ok());
+        assert!(run(&cfg, true, Config::path(), None).is_ok());
     }
 
     /// THE-70. The three states must read differently — "unknown" in
@@ -3258,6 +3501,19 @@ mod tests {
         // Tests never own a tty, so the probe is skipped and every field is
         // null — which is exactly the "unknown ⇒ assume it works" state.
         assert!(kb["ctrl_digits_reportable"].is_null());
+    }
+
+    #[test]
+    fn doctor_json_exposes_lifecycle_hook_sources() {
+        let hooks = doctor_json(&Config::default())["lifecycle_hooks"].clone();
+        assert!(hooks["events"].is_object());
+        for event in HookEvent::ALL {
+            let row = &hooks["events"][event.as_str()];
+            assert!(row["global"].is_u64());
+            assert!(row["workspace"].is_u64());
+            assert!(row["repo"].is_u64());
+            assert!(row["repo_trust"].is_string());
+        }
     }
 
     #[test]
@@ -3430,6 +3686,24 @@ mod tests {
             .find(|t| t["name"] == "bugstalker")
             .expect("bugstalker reported");
         assert_eq!(bs["pinned"], thegn_core::debug::bs_tool().version);
+        assert_eq!(
+            bs["platform_supported"],
+            thegn_core::debug::platform_supported()
+        );
+        assert_eq!(
+            bs["platform_note"],
+            serde_json::to_value(thegn_core::debug::unsupported_reason()).unwrap()
+        );
+        // The JSON formatter consumes the same pure gate used by the core
+        // debugger policy; exercise both sides without changing the host.
+        assert!(thegn_core::debug::bs_supported(
+            thegn_core::managed_tool::Os::Linux,
+            thegn_core::managed_tool::Arch::X64,
+        ));
+        assert!(!thegn_core::debug::bs_supported(
+            thegn_core::managed_tool::Os::Macos,
+            thegn_core::managed_tool::Arch::X64,
+        ));
 
         // A user override (as parsed from `[managed_tools.bugstalker]`) wins
         // the tier.

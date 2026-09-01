@@ -304,7 +304,7 @@ fn apply_zone(db: &Db, cfg: &Config, worktree: &str, env: &mut Environment) {
         if let Ok(existing) = db.get_all_notifications(200)
             && !existing.iter().any(|n| n.source_ref == issue)
         {
-            let _ = db.put_notification("zone_egress", &issue, &msg, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let _ = crate::automation_events::emit(db, "zone_egress", &issue, &msg, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }
@@ -356,5 +356,5 @@ fn surface(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| repo_root.to_string())
     );
-    let _ = db.put_notification(CLAMP_KIND, &issue_id, &msg, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let _ = crate::automation_events::emit(db, CLAMP_KIND, &issue_id, &msg, worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 }

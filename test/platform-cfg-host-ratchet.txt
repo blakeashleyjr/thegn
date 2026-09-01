@@ -12,10 +12,14 @@
 
 agent_configs.rs
 agent_run.rs
-chime.rs
 clipboard.rs
 cmd/debug.rs
 daemon/mod.rs
+# TEST-ONLY cfg, not per-OS production code: the daemon fork integration test
+# uses a real Unix PTY and Unix owner-permission bits to verify the handoff
+# lifecycle. The production fork path is platform-free; moving the test behind
+# a platform helper would stop it from asserting the actual daemon seam.
+daemon/service.rs
 # TEST-ONLY cfg, not per-OS production code: the failed-final-flush case
 # opens `/dev/full` to reproduce ENOSPC deterministically (and skips itself
 # when it is absent). There is no call site to make platform-free here —
@@ -46,6 +50,11 @@ merge_driver.rs
 # Windows has no unprivileged equivalent for. Nothing here to move behind a
 # `platform::` function — the production path already is one.
 metrics.rs
+# TEST-ONLY cfg, not production platform code: the notification routing tests
+# need a Unix PTY solely to obtain a real TerminalWaker and exercise bell
+# latching; moving this harness behind the sound provider would obscure the
+# NotifyState behavior under test.
+notify.rs
 panes.rs
 perf.rs
 probe.rs

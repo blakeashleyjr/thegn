@@ -264,6 +264,20 @@ An environment can keep a **warm spare pool** so new worktrees start
 instantly; the warm-pool actions raise and lower the active workspace's
 target (palette-runnable and bindable).
 
+## Lifecycle hooks and pane setup
+
+`[hooks]` commands are host-side worktree/session lifecycle jobs. They run
+outside the sandbox with a curated environment, capture stdout/stderr in the
+worktree state log, and use the event-specific repository/worktree directory;
+see [[configuration]] for the six events, ordering, trust gate, timeout, and
+failure policy. The legacy `[sandbox].prepare` list is the compatibility
+alias for `post_create`, not a second fire-and-forget path.
+
+`[sandbox].init_script` remains separate: it is a POSIX shell snippet executed
+inside the sandbox before each agent or shell pane starts. Use it for
+per-pane/container setup; use lifecycle hooks for host-side worktree setup,
+teardown, or session edges.
+
 ## Remote worktrees
 
 `[sandbox.remote] host` runs worktrees on another machine. Control-plane

@@ -282,6 +282,17 @@
           })
         else thegn;
 
+      # A self-contained launch path for users who want the known terminal/font
+      # composition without changing their system font or terminal setup. The
+      # launcher still executes the stable wrapped `thegn` package, so it
+      # inherits the same pinned runtime tools and channel clamp as `.#default`.
+      batteries = import ./nix/batteries.nix {
+        inherit pkgs thegn;
+        alacrittyProfile = "${rootSrc}/config/alacritty.toml";
+        alacritty = pkgs.alacritty;
+        firaCodeNerdFont = pkgs.nerd-fonts.fira-code;
+      };
+
       # mingw-w64 cross C toolchain for `just check-cross`'s whole-workspace
       # windows-gnu leg. `cargo check` still runs build scripts, and libz-sys /
       # libgit2-sys compile C, so without a cross cc the check dies with
@@ -461,6 +472,15 @@
       # CARGO_BUILD_JOBS headroom, pinned yazi, OpenSpec seeding). Used by BOTH the
       # full `default` shell and the trimmed `sprite-full` shell so they never drift.
       devShellHook = ''
+        # NOTE: this puts the DEBUG build on PATH, while `just live` runs the
+        # RELEASE build. The two age independently and both print the same
+        # `thegn --version` (the crate version rarely moves), so "I rebuilt it"
+        # can be true of one and false of the other — that is how a v57 runtime
+        # came to drive a v62 database for hours on 2026-08-29.
+        # `thegn doctor` now prints the schema pair and BOTH binaries' paths;
+        # check it before trusting a rebuild, and note that a database newer
+        # than the binary is refused outright (THEGN_ALLOW_SCHEMA_DOWNGRADE=1
+        # restores the old tolerant read-only behaviour).
         export PATH="$PWD/target/debug:$PATH"
         # Point pkg-config at the nix zlib/openssl .pc files. Without this,
         # PKG_CONFIG_PATH is empty and pkg-config falls back to its host
@@ -565,6 +585,8 @@
         {
           default = defaultPkg;
           thegn = defaultPkg;
+          # Stable thegn in pinned Alacritty with a launcher-scoped Nerd Font.
+          batteries = batteries;
           # The host binary WITHOUT the adjacent x86_64-linux musl bridge.
           #
           # `default` builds the workspace twice on x86_64-linux — once natively

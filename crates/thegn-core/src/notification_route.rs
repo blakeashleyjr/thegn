@@ -16,13 +16,13 @@ use chrono::{Datelike, NaiveDateTime, Timelike, Weekday};
 
 use crate::config::{DndConfig, NotificationRule, NotificationsConfig, SoundConfig, SoundMode};
 use crate::notification::{NotificationKind, Priority};
+use crate::notification_sound::SoundRef;
 
 /// The audible cue a decision resolves to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SoundEmit {
-    /// Play the bundled (or configured) chime through an auto-detected system
-    /// player; the host resolves this to real I/O and falls back to `Bell`.
-    Chime,
+    /// Play a pure sound reference through the host provider.
+    File { sound_ref: SoundRef, volume: f32 },
     /// Write a terminal `BEL` (`\x07`) on the next render flush.
     Bell,
     /// Run this command line off-thread (best-effort).
@@ -30,7 +30,7 @@ pub enum SoundEmit {
 }
 
 /// What should happen to one notification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteDecision {
     /// Persist to the inbox DB.
     pub record: bool,
@@ -155,15 +155,19 @@ pub fn decide(
         push = false;
     }
 
-    // Kinds in `always_kinds` chime regardless of `min_priority` (the
-    // agent-done/needs-you set is on by default).
+    // Kinds in always_kinds bypass only the min-priority floor.
     let forced = cfg.sound.always_kinds.iter().any(|k| k == kind.as_str());
-    let mut sound = if !sound_allowed {
+    let below_min = !forced
+        && effective.rank()
+            < Priority::parse(&cfg.sound.min_priority)
+                .unwrap_or(Priority::Alert)
+                .rank();
+    let mut sound = if cfg.sound.mute || !sound_allowed || below_min {
         None
     } else if let Some(over) = rule_sound {
         over
     } else {
-        sound_emit_gated(&cfg.sound, effective, forced)
+        sound_emit_for_kind(&cfg.sound, kind, effective, forced)
     };
 
     // Suppress the audible cue for the worktree the user is already looking at
@@ -210,7 +214,7 @@ pub fn sound_emit(cfg: &SoundConfig, priority: Priority) -> Option<SoundEmit> {
 /// (used for `always_kinds`, so an agent-done/needs-you cue fires even below the
 /// configured threshold).
 pub fn sound_emit_gated(cfg: &SoundConfig, priority: Priority, forced: bool) -> Option<SoundEmit> {
-    if cfg.mode == SoundMode::Off {
+    if cfg.mute || cfg.mode == SoundMode::Off {
         return None;
     }
     if !forced {
@@ -221,7 +225,21 @@ pub fn sound_emit_gated(cfg: &SoundConfig, priority: Priority, forced: bool) -> 
     }
     match cfg.mode {
         SoundMode::Off => None,
-        SoundMode::Chime => Some(SoundEmit::Chime),
+        SoundMode::Chime => {
+            if cfg.chime_file.trim().is_empty() {
+                Some(SoundEmit::Bell)
+            } else {
+                Some(
+                    SoundRef::parse(&cfg.chime_file)
+                        .ok()
+                        .map(|sound_ref| SoundEmit::File {
+                            sound_ref,
+                            volume: cfg.clamped_volume(),
+                        })
+                        .unwrap_or(SoundEmit::Bell),
+                )
+            }
+        }
         SoundMode::Bell => Some(SoundEmit::Bell),
         SoundMode::Command => {
             let cmd = cfg
@@ -237,6 +255,38 @@ pub fn sound_emit_gated(cfg: &SoundConfig, priority: Priority, forced: bool) -> 
             }
         }
     }
+}
+
+/// Resolve the event-specific reference after all audible gates have passed.
+/// Invalid references are ignored; strict config validation reports them before
+/// a user relies on them.
+pub fn sound_emit_for_kind(
+    cfg: &SoundConfig,
+    kind: NotificationKind,
+    priority: Priority,
+    forced: bool,
+) -> Option<SoundEmit> {
+    if cfg.mute || cfg.mode == SoundMode::Off {
+        return None;
+    }
+    if !forced {
+        let min = Priority::parse(&cfg.min_priority).unwrap_or(Priority::Alert);
+        if priority.rank() < min.rank() {
+            return None;
+        }
+    }
+    if let Some(raw) = cfg.per_kind.get(kind.as_str()) {
+        return Some(match SoundRef::parse(raw) {
+            Ok(SoundRef::Off) => return None,
+            Ok(SoundRef::Bell) => SoundEmit::Bell,
+            Ok(sound_ref) => SoundEmit::File {
+                sound_ref,
+                volume: cfg.clamped_volume(),
+            },
+            Err(_) => SoundEmit::Bell,
+        });
+    }
+    sound_emit_gated(cfg, priority, forced)
 }
 
 fn priority_key(p: Priority) -> &'static str {
@@ -504,7 +554,7 @@ mod tests {
         assert!(d.desktop);
         assert!(!d.toast); // toast opt-in
         assert_eq!(d.effective_priority, Priority::Alert);
-        assert_eq!(d.sound, Some(SoundEmit::Chime)); // alert >= default min_priority
+        assert_eq!(d.sound, Some(SoundEmit::Bell)); // alert >= default min_priority
     }
 
     #[test]
@@ -536,7 +586,7 @@ mod tests {
             &ctx(),
         );
         assert_eq!(d.effective_priority, Priority::Notice);
-        assert_eq!(d.sound, Some(SoundEmit::Chime));
+        assert_eq!(d.sound, Some(SoundEmit::Bell));
     }
 
     #[test]
@@ -566,7 +616,7 @@ mod tests {
             &base_cfg(),
             &c,
         );
-        assert_eq!(d2.sound, Some(SoundEmit::Chime));
+        assert_eq!(d2.sound, Some(SoundEmit::Bell));
     }
 
     #[test]
@@ -585,7 +635,7 @@ mod tests {
             &cfg,
             &c,
         );
-        assert_eq!(d.sound, Some(SoundEmit::Chime));
+        assert_eq!(d.sound, Some(SoundEmit::Bell));
     }
 
     // --- rules ---
@@ -680,7 +730,7 @@ mod tests {
             &ctx(),
         );
         assert_eq!(d.effective_priority, Priority::Alert);
-        assert_eq!(d.sound, Some(SoundEmit::Chime));
+        assert_eq!(d.sound, Some(SoundEmit::Bell));
     }
 
     #[test]
@@ -1012,7 +1062,7 @@ mod tests {
         // Alert breaks through.
         let d2 = decide(NotificationKind::TestFailed, "wt", "x", "/wt/app", &cfg, &c);
         assert!(d2.desktop);
-        assert_eq!(d2.sound, Some(SoundEmit::Chime));
+        assert_eq!(d2.sound, Some(SoundEmit::Bell));
     }
 
     #[test]
@@ -1118,6 +1168,106 @@ mod tests {
         };
         assert!(scheduled_dnd_active(&dnd, Some(dt(2026, 6, 27, 12, 0)))); // Sat
         assert!(!scheduled_dnd_active(&dnd, Some(dt(2026, 6, 29, 12, 0)))); // Mon
+    }
+
+    #[test]
+    fn per_kind_reference_precedes_priority_and_mode() {
+        let mut cfg = base_cfg();
+        cfg.sound.mode = SoundMode::Command;
+        cfg.sound.command = "generic.sh".into();
+        cfg.sound
+            .per_priority
+            .insert("alert".into(), "priority.sh".into());
+        cfg.sound
+            .per_kind
+            .insert("test_failed".into(), "/tmp/failure.wav".into());
+        let decision = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "failed",
+            "/wt/other",
+            &cfg,
+            &ctx(),
+        );
+        assert_eq!(
+            decision.sound,
+            Some(SoundEmit::File {
+                sound_ref: SoundRef::File("/tmp/failure.wav".into()),
+                volume: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn per_kind_off_and_bell_are_not_commands() {
+        let mut cfg = base_cfg();
+        cfg.sound
+            .per_kind
+            .insert("test_failed".into(), "off".into());
+        assert_eq!(
+            decide(
+                NotificationKind::TestFailed,
+                "wt",
+                "failed",
+                "/wt/other",
+                &cfg,
+                &ctx()
+            )
+            .sound,
+            None
+        );
+        cfg.sound
+            .per_kind
+            .insert("test_failed".into(), "builtin:bell".into());
+        assert_eq!(
+            decide(
+                NotificationKind::TestFailed,
+                "wt",
+                "failed",
+                "/wt/other",
+                &cfg,
+                &ctx()
+            )
+            .sound,
+            Some(SoundEmit::Bell)
+        );
+    }
+
+    #[test]
+    fn sound_gates_precede_per_kind_resolution() {
+        let mut cfg = base_cfg();
+        cfg.sound.mute = true;
+        cfg.sound
+            .per_kind
+            .insert("test_failed".into(), "/tmp/failure.wav".into());
+        assert_eq!(
+            decide(
+                NotificationKind::TestFailed,
+                "wt",
+                "failed",
+                "/wt/other",
+                &cfg,
+                &ctx()
+            )
+            .sound,
+            None
+        );
+
+        cfg.sound.mute = false;
+        cfg.sound.always_kinds.clear();
+        cfg.sound.min_priority = "alert".into();
+        assert_eq!(
+            decide(
+                NotificationKind::AgentDone,
+                "wt",
+                "done",
+                "/wt/other",
+                &cfg,
+                &ctx()
+            )
+            .sound,
+            None
+        );
     }
 
     // --- sound config ---

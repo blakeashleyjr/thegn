@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "project": {
+    "binary": "thegn",
+    "alias": "tg",
+    "description": "Terminal-native git-worktree IDE that is its own terminal multiplexer",
+    "homepage": "https://github.com/blakeashleyjr/thegn",
+    "repository": "https://github.com/blakeashleyjr/thegn",
+    "channel": "stable"
+  },
+  "archive": {
+    "stem": "thegn-{tag}-{target}",
+    "checksum_suffix": ".sha256",
+    "formats": {
+      "unix": "tar.gz",
+      "windows": "zip"
+    },
+    "root_files": [
+      "thegn",
+      "LICENSE-MIT",
+      "LICENSE-APACHE",
+      "README.md"
+    ]
+  },
+  "targets": {
+    "x86_64-unknown-linux-gnu": {
+      "enabled": true,
+      "platform": "unix"
+    },
+    "x86_64-unknown-linux-musl": {
+      "enabled": true,
+      "platform": "unix"
+    },
+    "aarch64-apple-darwin": {
+      "enabled": true,
+      "platform": "unix"
+    },
+    "x86_64-pc-windows-msvc": {
+      "enabled": false,
+      "platform": "windows",
+      "binary": "thegn.exe"
+    }
+  },
+  "runtime_dependencies": {
+    "homebrew_optional": [
+      "gh",
+      "git-delta",
+      "lazygit"
+    ],
+    "aur_optional": [
+      "github-cli: GitHub pull request integration",
+      "git-delta: syntax-highlighted diffs",
+      "lazygit: embedded Git UI"
+    ],
+    "deb": [
+      "git",
+      "gh",
+      "git-delta",
+      "lazygit"
+    ],
+    "rpm": [
+      "git",
+      "gh",
+      "git-delta",
+      "lazygit"
+    ]
+  },
+  "managers": {
+    "homebrew": {
+      "enabled": true,
+      "target": "aarch64-apple-darwin",
+      "template": "homebrew/thegn.rb.tmpl",
+      "output": "homebrew/thegn.rb"
+    },
+    "aur": {
+      "enabled": true,
+      "target": "x86_64-unknown-linux-musl",
+      "package": "thegn-bin",
+      "template": "aur/PKGBUILD.tmpl",
+      "output": "aur/PKGBUILD"
+    },
+    "nfpm": {
+      "enabled": true,
+      "target": "x86_64-unknown-linux-gnu",
+      "package": "thegn",
+      "template": "nfpm.yaml.tmpl",
+      "architectures": {
+        "deb": "amd64",
+        "rpm": "x86_64"
+      },
+      "outputs": {
+        "deb": "nfpm/thegn-deb.yaml",
+        "rpm": "nfpm/thegn-rpm.yaml"
+      }
+    },
+    "scoop": {
+      "enabled": false,
+      "target": "x86_64-pc-windows-msvc",
+      "template": "scoop/thegn.json.tmpl",
+      "output": "scoop/thegn.json"
+    },
+    "winget": {
+      "enabled": false,
+      "target": "x86_64-pc-windows-msvc",
+      "template": "winget/thegn.yaml.tmpl",
+      "output": "winget/thegn.yaml"
+    }
+  }
+}

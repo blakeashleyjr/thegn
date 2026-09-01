@@ -149,4 +149,7 @@ Only metadata is ever recorded: route, backend, model, token counts (including
 prompt-cache reads/writes), cost, and timings — **never any prompt or response
 text**. Subscription/flat-rate lanes account at `$0`, so the spend figure
 reflects only marginal, metered cost. Per-scope budget breaches (`[model_proxy.
-budget]`) surface through this same usage-alert path.
+budget]`) produce one deduplicated `UsageLimit` notification for each breached
+scope, rolling-window anchor, and token/cost dimension. These configured spend
+caps are separate from the provider quota windows and `[usage.alerts]` warnings
+described above; no new usage-budget key is involved.
