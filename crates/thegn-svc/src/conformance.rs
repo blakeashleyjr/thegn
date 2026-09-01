@@ -285,6 +285,11 @@ mod tests {
             let backend = crate::issue::backend_from_account(
                 &IssueAccount {
                     provider: *kind,
+                    // Keep factory construction hermetic: an empty Kaneo
+                    // token would trigger its legacy stored-token fallback,
+                    // which reads the live state DB before the offline cap
+                    // assertions even begin.
+                    token: "offline-conformance-token".into(),
                     ..Default::default()
                 },
                 None,
