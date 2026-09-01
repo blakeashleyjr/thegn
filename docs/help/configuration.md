@@ -52,8 +52,25 @@ The file is watched: edits apply live, no restart.
   language; `thegn doctor` lists every server and whether its command
   resolves. Servers named in a repo-local `.thegn.*` are ignored (a
   language-server command is untrusted) — declare them in your user config.
-- `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
+- `[merge_queue]`, `[pr_queue]`, `[autopilot]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
+
+### Issue autopilot
+
+`[autopilot]` is disabled by default. When enabled, it considers only issues
+returned by the provider's authenticated “my issues” filter whose status is
+`pickup_status` (default `todo`) and whose labels contain the exact
+`trigger_label` (default `agent-ready`). `assignee = "me"` is the only accepted
+value: the provider, rather than issue text, supplies consent.
+
+Because enabling autopilot can run a command and write to a forge, repository
+settings belong in the trusted user configuration under
+`[workspace.<slug>.autopilot]`; a repo-root `.thegn.*` file cannot enable it.
+`max_concurrent` and `max_attempts` bound work. `agent` selects an existing
+`[[agents]]` entry or `agent_command` supplies its command template. A verified
+commit is opened as `ready` or `draft`; the existing PR queue remains the owner
+of review, CI, and merge. `done_on_merge` updates the matching issue only after
+that queue observes a real merge.
 
 ## Agents, models and accounts
 
