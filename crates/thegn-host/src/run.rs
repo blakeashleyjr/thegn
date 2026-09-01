@@ -10404,6 +10404,14 @@ async fn event_loop<T: Terminal>(
             &mut last_media_full,
         );
         panel_ui.media.sync_snapshot(model.panel.media.as_ref());
+        if media_position_visible && panel_ui.media.needs_queue(model.panel.media.as_ref()) {
+            panel_ui.media.begin_request(model.panel.media.as_ref());
+            crate::media_ctl::spawn_media_queue(
+                media_effective_cfg(&current_config.media, &media_player_override),
+                media_queue_tx.clone(),
+                waker.clone(),
+            );
+        }
         if let Some(url) = panel_ui
             .media
             .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
