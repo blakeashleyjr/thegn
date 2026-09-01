@@ -12,11 +12,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use thegn_core::config::{PushConfig, PushKind};
 use thegn_core::notification::Priority;
 use thegn_core::notification_render::RenderedNotification;
 use thegn_core::seam::{ErrorClass, SeamError};
+use thegn_svc::push::rate_limit::{Decision, TokenBucket};
 use thegn_svc::push::{PushMessage, PushProvider};
 
 use crate::notification_delivery::{DeliveryEvent, DeliverySnapshot};
@@ -39,6 +41,12 @@ pub struct PushJob {
 /// needs no backlog; overflow drops (counted) rather than growing memory behind
 /// a stalled server.
 pub const QUEUE_DEPTH: usize = 64;
+
+/// A deferred job gets only this much time to acquire its provider token.  A
+/// bounded window keeps a saturated sink from turning the worker into an
+/// unbounded backlog while allowing the normal one-request/second providers
+/// to make progress off the event loop.
+const RATE_LIMIT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
 type Providers = BTreeMap<String, Box<dyn PushProvider>>;
 type DeliveryRows = Vec<(String, String)>;
@@ -67,6 +75,10 @@ pub fn spawn(
                     return;
                 }
             };
+            let mut limiters: BTreeMap<String, TokenBucket> = providers
+                .iter()
+                .map(|(name, provider)| (name.clone(), TokenBucket::for_kind(provider.kind())))
+                .collect();
             while let Ok(job) = rx.recv() {
                 let sink = job.sink.clone();
                 let rendered = job.rendered.clone();
@@ -75,6 +87,13 @@ pub fn spawn(
                     snapshot.event(&sink, DeliveryEvent::DeadLetter);
                     continue;
                 };
+                let Some(limiter) = limiters.get_mut(&sink) else {
+                    snapshot.event(&sink, DeliveryEvent::DeadLetter);
+                    continue;
+                };
+                if !acquire_rate_limit(limiter, &rt, &snapshot, &sink) {
+                    continue;
+                }
                 // The provider owns its bounded retry; block this worker thread
                 // (never the event loop) on the result.
                 let result = if provider.kind() == PushKind::Ntfy {
@@ -103,6 +122,39 @@ pub fn spawn(
             // best-effort: push worker: a failed spawn just disables push this session; delivery failures are already logged below
         })
         .ok();
+}
+
+/// Consume one token for a queued sink job, waiting only on the worker's
+/// current-thread runtime.  The same job is considered until the fixed retry
+/// window expires; no deferred queue is created.
+fn acquire_rate_limit(
+    limiter: &mut TokenBucket,
+    rt: &tokio::runtime::Runtime,
+    snapshot: &DeliverySnapshot,
+    sink: &str,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        let remaining = RATE_LIMIT_RETRY_BUDGET.saturating_sub(started.elapsed());
+        match rate_limit_decision(limiter, remaining) {
+            Decision::Send => return true,
+            Decision::Defer(delay) => {
+                snapshot.event(sink, DeliveryEvent::Retry);
+                rt.block_on(tokio::time::sleep(delay));
+            }
+            Decision::Drop => {
+                snapshot.event(sink, DeliveryEvent::RateLimitDrop);
+                return false;
+            }
+        }
+    }
+}
+
+/// Keep the production worker's policy decision in a small, directly tested
+/// seam.  This is intentionally a thin wrapper around the service limiter so
+/// the worker cannot accidentally bypass the configured sink policy again.
+fn rate_limit_decision(limiter: &mut TokenBucket, retry_budget: Duration) -> Decision {
+    limiter.decide(retry_budget)
 }
 
 /// Build one provider per effective sink.  Keeping the scalar factory call
@@ -180,5 +232,22 @@ mod tests {
             rendered: None,
         });
         assert!(m.body.is_empty());
+    }
+
+    #[test]
+    fn worker_policy_consumes_defers_and_drops_tokens() {
+        let mut limiter = TokenBucket::for_kind(PushKind::Slack);
+        assert_eq!(
+            rate_limit_decision(&mut limiter, Duration::ZERO),
+            Decision::Send
+        );
+        assert!(matches!(
+            rate_limit_decision(&mut limiter, Duration::from_secs(1)),
+            Decision::Defer(wait) if wait > Duration::ZERO && wait <= Duration::from_secs(1)
+        ));
+        assert_eq!(
+            rate_limit_decision(&mut limiter, Duration::ZERO),
+            Decision::Drop
+        );
     }
 }

@@ -39,13 +39,14 @@ impl RenderedNotification {
         timestamp: i64,
         flavor: MarkdownFlavor,
     ) -> Self {
-        let title = kind.label().to_string();
+        let template = template_for(kind);
+        let title = template.title.to_string();
         let body = sanitize(message);
         let body = escape(&body, flavor);
         let message = if body.is_empty() {
             title.clone()
         } else {
-            format!("{title}: {body}")
+            format!("{}: {body}", template.prefix)
         };
         Self {
             kind,
@@ -56,6 +57,125 @@ impl RenderedNotification {
             title,
             message,
         }
+    }
+}
+
+/// The built-in, provider-neutral message vocabulary.  Keeping this table in
+/// core makes the event text deterministic for every provider and prevents a
+/// provider from inventing a second event taxonomy.  The match is deliberately
+/// exhaustive: adding a notification kind requires choosing its push copy.
+#[derive(Debug, Clone, Copy)]
+struct BuiltinTemplate {
+    title: &'static str,
+    prefix: &'static str,
+}
+
+fn template_for(kind: NotificationKind) -> BuiltinTemplate {
+    match kind {
+        NotificationKind::Assigned => BuiltinTemplate {
+            title: "Assignment",
+            prefix: "Assigned issue",
+        },
+        NotificationKind::Mentioned => BuiltinTemplate {
+            title: "Mention",
+            prefix: "Mentioned in issue",
+        },
+        NotificationKind::StatusChanged => BuiltinTemplate {
+            title: "Status changed",
+            prefix: "Issue status changed",
+        },
+        NotificationKind::BlockerResolved => BuiltinTemplate {
+            title: "Blocker resolved",
+            prefix: "Blocker resolved",
+        },
+        NotificationKind::PrLinked => BuiltinTemplate {
+            title: "Pull request linked",
+            prefix: "Pull request linked",
+        },
+        NotificationKind::Overdue => BuiltinTemplate {
+            title: "Overdue",
+            prefix: "Issue overdue",
+        },
+        NotificationKind::PrStateChanged => BuiltinTemplate {
+            title: "Pull request changed",
+            prefix: "Pull request state changed",
+        },
+        NotificationKind::AgentDone => BuiltinTemplate {
+            title: "Agent done",
+            prefix: "Agent finished",
+        },
+        NotificationKind::AgentFailed => BuiltinTemplate {
+            title: "Agent failed",
+            prefix: "Agent failed",
+        },
+        NotificationKind::AgentAttention => BuiltinTemplate {
+            title: "Agent needs attention",
+            prefix: "Agent needs attention",
+        },
+        NotificationKind::TestFailed => BuiltinTemplate {
+            title: "Tests failed",
+            prefix: "Tests failed",
+        },
+        NotificationKind::WorktreeCreated => BuiltinTemplate {
+            title: "Worktree created",
+            prefix: "Worktree created",
+        },
+        NotificationKind::LogError => BuiltinTemplate {
+            title: "Log error",
+            prefix: "Log error",
+        },
+        NotificationKind::ProcessExited => BuiltinTemplate {
+            title: "Process exited",
+            prefix: "Process exited",
+        },
+        NotificationKind::ProcessFailed => BuiltinTemplate {
+            title: "Process failed",
+            prefix: "Process failed",
+        },
+        NotificationKind::QueueLanded => BuiltinTemplate {
+            title: "Merge queue landed",
+            prefix: "Merge queue landed",
+        },
+        NotificationKind::QueueReady => BuiltinTemplate {
+            title: "Merge queue ready to land",
+            prefix: "Merge queue ready to land",
+        },
+        NotificationKind::QueueNeedsHuman => BuiltinTemplate {
+            title: "Merge queue needs you",
+            prefix: "Merge queue needs you",
+        },
+        NotificationKind::PrQueueMerged => BuiltinTemplate {
+            title: "Pull request merged",
+            prefix: "Pull request merged",
+        },
+        NotificationKind::PrQueueReady => BuiltinTemplate {
+            title: "Pull request ready to merge",
+            prefix: "Pull request ready to merge",
+        },
+        NotificationKind::PrQueueNeedsHuman => BuiltinTemplate {
+            title: "PR queue needs you",
+            prefix: "PR queue needs you",
+        },
+        NotificationKind::CalendarReminder => BuiltinTemplate {
+            title: "Event starting soon",
+            prefix: "Event starting soon",
+        },
+        NotificationKind::CalendarChanged => BuiltinTemplate {
+            title: "Event changed",
+            prefix: "Calendar event changed",
+        },
+        NotificationKind::UpstreamBehind => BuiltinTemplate {
+            title: "Upstream updates",
+            prefix: "Upstream updates available",
+        },
+        NotificationKind::ResourceAlert => BuiltinTemplate {
+            title: "Resource alert",
+            prefix: "Resource alert",
+        },
+        NotificationKind::UsageLimit => BuiltinTemplate {
+            title: "Usage limit",
+            prefix: "Usage limit approaching",
+        },
     }
 }
 
@@ -139,9 +259,37 @@ mod tests {
                 42,
                 MarkdownFlavor::Plain,
             );
-            assert!(!rendered.title.is_empty(), "{kind:?}");
-            assert!(rendered.message.contains(kind.label()), "{kind:?}");
+            let template = template_for(kind);
+            assert!(!template.title.is_empty(), "{kind:?}");
+            assert!(!template.prefix.is_empty(), "{kind:?}");
+            assert_eq!(rendered.title, template.title, "{kind:?}");
+            assert!(rendered.message.contains(template.prefix), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn event_templates_are_not_one_generic_shape() {
+        let assigned = render(
+            NotificationKind::Assigned,
+            Priority::Notice,
+            "ABC-1",
+            "linear:ABC-1",
+            "/repo",
+            42,
+            MarkdownFlavor::Plain,
+        );
+        let failed = render(
+            NotificationKind::TestFailed,
+            Priority::Alert,
+            "ABC-1",
+            "ci:run",
+            "/repo",
+            42,
+            MarkdownFlavor::Plain,
+        );
+        assert_eq!(assigned.message, "Assigned issue: ABC-1");
+        assert_eq!(failed.message, "Tests failed: ABC-1");
+        assert_ne!(assigned.title, failed.title);
     }
 
     #[test]
