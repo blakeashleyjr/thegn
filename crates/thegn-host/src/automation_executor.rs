@@ -101,7 +101,7 @@ pub async fn execute(
             };
             if let Err(error) = client.merge_add(worktree).await {
                 clear_merge_origin(&worktree_owned).await;
-                return Err(error.into());
+                return Err(error);
             }
             Ok(())
         }
