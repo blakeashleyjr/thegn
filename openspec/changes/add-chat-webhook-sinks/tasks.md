@@ -26,8 +26,9 @@ implements its reserved `webhook` kind and adds siblings).
       inside the push worker's bounded-retry budget; over-limit drops
       counted — limiter logic **unit-tested** as pure state transitions;
       HTTP by smoke.
-- [ ] 2.3 Doctor probes per sink: config + secret resolution + drop
-      counters, never a network post; secrets never in probe output.
+- [ ] 2.3 Doctor probes per sink: config + secret resolution + offline request
+      shape, never a network post; runtime delivery counters belong to Monitor
+      and secrets never appear in probe output.
 
 ## 3. Wiring and docs (thegn-host)
 

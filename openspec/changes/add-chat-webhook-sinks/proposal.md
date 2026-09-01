@@ -84,8 +84,10 @@ lanes, and only one of them is cheap and clearly right:
   out-of-process bot story (referenced, not depended on); no overlap with
   `add-osc-attention-signaling` (different channel). No capability-catalog
   change (no new externally invokable verb; delivery is internal routing).
-- **No DB change, no render-path change**; all delivery work is off-loop in
-  the existing push worker.
+- **No DB migration, control-wire field, or capability-catalog change**; the
+  pure notification renderer and conditional Monitor delivery view remain
+  local projections, while all network delivery stays off-loop in the
+  existing push worker.
 
 ## Non-goals
 
