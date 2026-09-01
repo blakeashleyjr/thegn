@@ -185,8 +185,8 @@ the section says so rather than silently searching every repo.
 
 A read-mostly stream of things needing attention in your _other_
 worktrees — currently each worktree's failing CI (latest run per
-workflow), grouped by worktree. Scoped to the active workspace by
-default; `a` widens to every workspace. `↵` jumps to that worktree's tab.
+workflow), grouped by worktree. Scoped to the active project by
+default; `a` widens to every project. `↵` jumps to that worktree's tab.
 
 ### pr — the branch's PR, and the repo's open PRs
 
@@ -212,7 +212,7 @@ failed) · `c` cancel · `g` force-refresh.
 ### merge — the local merge queue
 
 The fold-actor's per-branch land/defer status. Scoped to the active
-workspace by default; `g` widens to every workspace. Keys: `a`/`A` add ·
+project by default; `g` widens to every project. Keys: `a`/`A` add ·
 `x` remove · `l` land · `r` retry · `D` drain. See [[merge-queue]].
 
 ### prq — the PR queue
@@ -236,7 +236,7 @@ refresh.
 Compiler/linter/test diagnostics, collected from two sources: parsed
 output of tasks you run in **jobs**, and language-server pushes for the
 files you touch. Only the active worktree's diagnostics are shown — other
-workspaces' problems never bleed in. `↵` opens the editor at file:line.
+projects' problems never bleed in. `↵` opens the editor at file:line.
 
 ### jobs and tests
 
@@ -300,8 +300,11 @@ env to this worktree, `t` tests its token, `n` adds, `x` removes
 
 **share** and **forward** list the worktree's tunnels and port forwards
 (`↵` copy · `o` browser · share's `x` stops) — see [[share-and-forward]].
-**media** is the now-playing view ([[media]]). **telemetry** is the live
-stats/loop-profiler view. **keys** is the generated cheatsheet of the
+**media** is the docked now-playing view ([[media]]): `Alt-m` and the media
+badge focus the same System section. Its Normal/Half/Full widths progressively
+show the current track, source/detail controls, and queue/artwork; `j`/`k`
+select source or queue rows and `↵` activates the selected row. **telemetry** is
+the live stats/loop-profiler view. **keys** is the generated cheatsheet of the
 effective keymap.
 
 ### usage — AI-account rate-limit usage

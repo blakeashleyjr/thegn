@@ -244,6 +244,8 @@ pub struct SidebarRow {
     /// The env is a managed provider but content resolved local (degraded to the
     /// host) — renders the `«env»` badge as `«env ✗»`.
     pub env_degraded: bool,
+    /// Read-only devcontainer variant/provider status from hydration.
+    pub devcontainer_status: Option<String>,
     pub activity: ActivityState,
     /// Render/navigation visibility: false when hidden by a collapsed parent or
     /// filtered out.
@@ -302,6 +304,10 @@ pub struct SidebarRow {
     /// [`RowKind::PipelineSummary`] rows only: the counts the row renders.
     /// `None` everywhere else.
     pub pipeline: Option<PipelineSummary>,
+    /// Workspace-only merge-queue rollup, derived from the statuses of its
+    /// child worktree rows. `None` for worktrees and workspaces with no active
+    /// queue entries.
+    pub mq_rollup: Option<thegn_core::merge_queue_view::MqRollup>,
 }
 
 impl SidebarRow {
@@ -329,6 +335,7 @@ impl SidebarRow {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            devcontainer_status: None,
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
@@ -347,6 +354,7 @@ impl SidebarRow {
             pipeline_stage: None,
             repo_prefix: None,
             pipeline: None,
+            mq_rollup: None,
         }
     }
 
@@ -399,6 +407,8 @@ pub struct SidebarStatus {
     /// worktree), so the displayed branch must come from here or it goes stale
     /// forever. Absent for a detached HEAD or a worktree never scanned.
     pub branches: std::collections::BTreeMap<String, String>,
+    /// Read-only devcontainer variant/provider status, keyed by worktree path.
+    pub devcontainer_status: std::collections::BTreeMap<String, String>,
     pub agent: std::collections::BTreeMap<String, String>,
     pub activity: std::collections::BTreeMap<String, ActivityState>,
     /// Badge: open PR count per worktree (item 28).
@@ -755,6 +765,9 @@ pub(crate) fn compose_detail_line(
         && backend != "host"
     {
         segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
+    }
+    if let Some(devcontainer) = &row.devcontainer_status {
+        segs.push(seg(Tok::Slot(S::Faint), format!("{devcontainer} ")));
     }
     if row
         .worktree_path
@@ -1129,7 +1142,7 @@ pub fn build_rows(
     }
 
     if rows.is_empty() {
-        rows.push(SidebarRow::base(RowKind::Workspace, 0, "no workspaces", ""));
+        rows.push(SidebarRow::base(RowKind::Workspace, 0, "no projects", ""));
     }
 
     // One compact roster rollup, only while agents are actually running. Placed
@@ -1291,6 +1304,24 @@ pub fn build_rows(
             }
             _ => {}
         }
+    }
+
+    // Roll up only the queue statuses of this workspace's child worktree rows.
+    // Children are emitted even when their workspace is collapsed, so this
+    // projection remains complete before visibility/filtering is applied.
+    for index in 0..rows.len() {
+        if rows[index].kind != RowKind::Workspace {
+            continue;
+        }
+        let workspace_slug = &rows[index].workspace_slug;
+        let mq_rollup = thegn_core::merge_queue_view::rollup(
+            rows.iter()
+                .filter(|child| {
+                    child.kind == RowKind::Worktree && child.workspace_slug == *workspace_slug
+                })
+                .filter_map(|child| child.mq_status),
+        );
+        rows[index].mq_rollup = mq_rollup;
     }
 
     apply_pins(&mut rows, &view.pins);
@@ -1550,6 +1581,10 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    let devcontainer_status = wt_path
+        .as_deref()
+        .and_then(|p| status.devcontainer_status.get(p))
+        .cloned();
     SidebarRow {
         tab_target: Some(gr.target.clone()),
         active: gr.active,
@@ -1560,6 +1595,7 @@ fn worktree_row(
         sandbox_backend: gr.sandbox_backend.clone(),
         env_name: gr.env_name.clone(),
         env_degraded: gr.env_degraded,
+        devcontainer_status,
         activity: gr.activity,
         visible,
         pr_count,
@@ -2087,6 +2123,113 @@ mod tests {
             .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/a"))
             .expect("worktree row");
         assert_eq!(row.branch.as_deref(), Some("tg-old"));
+    }
+
+    #[test]
+    fn workspace_rows_roll_up_only_their_children_even_when_collapsed() {
+        let s = session(
+            vec![
+                tab("alpha/queued", "/wt/alpha-queued"),
+                tab("alpha/folding", "/wt/alpha-folding"),
+                tab("beta/blocked", "/wt/beta-blocked"),
+            ],
+            0,
+        );
+        let ws = vec![
+            (
+                "alpha".to_string(),
+                "alpha".to_string(),
+                "repo".to_string(),
+                "/repos/alpha".to_string(),
+            ),
+            (
+                "beta".to_string(),
+                "beta".to_string(),
+                "repo".to_string(),
+                "/repos/beta".to_string(),
+            ),
+        ];
+        let view = ViewState {
+            collapsed: ["alpha".to_string()].into_iter().collect(),
+            ..ViewState::default()
+        };
+        let mut status = no_activity();
+        status.mq.insert(
+            "/wt/alpha-queued".into(),
+            thegn_core::attention::MqStatus::Queued,
+        );
+        status.mq.insert(
+            "/wt/alpha-folding".into(),
+            thegn_core::attention::MqStatus::Folding,
+        );
+        status.mq.insert(
+            "/wt/beta-blocked".into(),
+            thegn_core::attention::MqStatus::NeedsHuman,
+        );
+
+        let rows = build_rows(&s, &ws, &view, &status, &[], &[], &[]);
+        let alpha = rows
+            .iter()
+            .find(|row| row.kind == RowKind::Workspace && row.workspace_slug == "alpha")
+            .expect("alpha workspace row");
+        assert_eq!(
+            alpha.mq_rollup,
+            Some(thegn_core::merge_queue_view::MqRollup {
+                tier: thegn_core::merge_queue_view::MqTier::Working,
+                count: 1,
+            })
+        );
+        assert!(alpha.collapsed);
+
+        let beta = rows
+            .iter()
+            .find(|row| row.kind == RowKind::Workspace && row.workspace_slug == "beta")
+            .expect("beta workspace row");
+        assert_eq!(
+            beta.mq_rollup,
+            Some(thegn_core::merge_queue_view::MqRollup {
+                tier: thegn_core::merge_queue_view::MqTier::Blocked,
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_rows_keep_empty_and_landed_only_queues_silent() {
+        let s = session(
+            vec![
+                tab("alpha/landed", "/wt/landed"),
+                tab("beta/none", "/wt/none"),
+            ],
+            0,
+        );
+        let ws = vec![
+            (
+                "alpha".to_string(),
+                "alpha".to_string(),
+                "repo".to_string(),
+                "/repos/alpha".to_string(),
+            ),
+            (
+                "beta".to_string(),
+                "beta".to_string(),
+                "repo".to_string(),
+                "/repos/beta".to_string(),
+            ),
+        ];
+        let mut status = no_activity();
+        status
+            .mq
+            .insert("/wt/landed".into(), thegn_core::attention::MqStatus::Landed);
+
+        let rows = build_rows(&s, &ws, &ViewState::default(), &status, &[], &[], &[]);
+        for slug in ["alpha", "beta"] {
+            let row = rows
+                .iter()
+                .find(|row| row.kind == RowKind::Workspace && row.workspace_slug == slug)
+                .expect("workspace row");
+            assert_eq!(row.mq_rollup, None);
+        }
     }
 
     fn session(worktrees: Vec<WorktreeGroup>, active: usize) -> Session {

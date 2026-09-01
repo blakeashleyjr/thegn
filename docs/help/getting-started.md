@@ -8,11 +8,11 @@ order: 1
 
 thegn is **one session**. Switching repos or worktrees is a tab switch,
 never a session change — quitting and relaunching restores your exact
-workspace, worktree, and pane position.
+project, worktree, and pane position.
 
 ## The mental model
 
-- A **workspace** is a repo. Create or open one with `Alt-W`.
+- A **project** is a repo. Create or open one with `Alt-W`.
 - A **worktree** is a git worktree, shown as a tab. `Alt-w` branches one
   off the base branch and asks what to run in it — a coding agent, a tool,
   or a plain shell, optionally sandboxed.
@@ -26,8 +26,8 @@ workspace, worktree, and pane position.
 - `Alt-←/↓/↑/→` moves focus the same way, but running off the outer edge
   falls through to the next thing: `←/→` to the previous/next tab, `↑/↓` to
   the previous/next worktree — one motion for the whole layout.
-- `Shift-Alt-↑/↓` cycles workspaces, stepping past any you have collapsed.
-- `Alt-1..9` jumps to a worktree, `Ctrl-1..9` to a workspace, by sidebar
+- `Shift-Alt-↑/↓` cycles projects, stepping past any you have collapsed.
+- `Alt-1..9` jumps to a worktree, `Ctrl-1..9` to a project, by sidebar
   order. Some terminals cannot send `Ctrl-<digit>` at all; if those do
   nothing, see [[terminal-compatibility]].
 - `Ctrl-Space` opens the [[command-palette]] — every action, fuzzy-searched.

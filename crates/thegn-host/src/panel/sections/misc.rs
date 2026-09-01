@@ -263,24 +263,43 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-/// `[forward]` auto port forwards for the active worktree: one row per detected
-/// sandbox port → its `http://localhost:<host_port>` preview URL (remaps shown
-/// as `container → host`). Pure — `model.forwards` is the supervisor's snapshot.
+/// Live frontend preview plus `[forward]` auto port forwards for the active
+/// worktree. Preview rows expose source + honest lifecycle status; sandbox
+/// mappings retain their existing URL/hit affordances beneath it.
 pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
     let forwards = &ctx.model.forwards;
-    if forwards.is_empty() {
+    let preview = ctx.model.preview.as_ref();
+    if forwards.is_empty() && preview.is_none() {
         return vec![PanelRow::plain(Line::segs(vec![seg(
             g(),
-            "no forwards — start a dev server in the sandbox".to_string(),
+            "no preview targets — start a dev server or configure [preview]".to_string(),
         )]))];
     }
     if ctx.full() {
         return forward_full(ctx);
     }
-    let mut rows: Vec<PanelRow> = forwards
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
+    let mut rows: Vec<PanelRow> = preview
+        .into_iter()
+        .map(|p| {
+            let tone = match p.status {
+                thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+                thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
+                thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
+            };
+            let gl = crate::caps::active_glyphs();
+            let marker = match p.status {
+                thegn_core::preview::PreviewStatus::Up => gl.dot_filled,
+                thegn_core::preview::PreviewStatus::Down => gl.cross,
+                thegn_core::preview::PreviewStatus::Unknown => gl.dot_hollow,
+            };
+            PanelRow::plain(Line::segs(vec![
+                seg(tone, format!("{marker} {} {} ", p.port, p.status)).bold(),
+                seg(g2(), format!("{}  ", p.source)),
+                seg(g(), p.url.clone()),
+            ]))
+            .with_hit(PanelHit::Row(Section::Forward, 0))
+        })
+        .chain(forwards.iter().enumerate().map(|(i, f)| {
             // Show the port mapping; a remap (host ≠ container) is amber to flag
             // that the preview URL isn't on the dev server's own number. Each
             // row is a cursor target (see `share` above).
@@ -296,8 +315,11 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(color, format!("\u{21c5} {port_label} ")).bold(),
                 seg(g(), f.url.clone()),
             ]))
-            .with_hit(PanelHit::Row(Section::Forward, i))
-        })
+            .with_hit(PanelHit::Row(
+                Section::Forward,
+                i + usize::from(preview.is_some()),
+            ))
+        }))
         .collect();
     rows.push(hint_row(&[("↵", "copy url"), ("o", "browser")]));
     rows
@@ -414,74 +436,132 @@ fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
 fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
     use super::{rule, t, two_col, wrap_text};
     let forwards = &ctx.model.forwards;
+    let preview = ctx.model.preview.as_ref();
     let cols = ctx.cols;
     let mut rows: Vec<PanelRow> = Vec::new();
+    let total = forwards.len() + usize::from(preview.is_some());
     rows.push(PanelRow::plain(Line::segs(vec![
-        seg(d(), "FORWARDS"),
-        seg(g2(), format!(" · {} port(s) forwarded", forwards.len())),
+        seg(d(), "PREVIEW & FORWARDS"),
+        seg(g2(), format!(" · {total} target(s)")),
     ])));
     rows.push(rule());
 
-    let cursor = ctx.ui.cursor.min(forwards.len().saturating_sub(1));
+    let cursor = ctx.ui.cursor.min(total.saturating_sub(1));
     let list_w = 45_usize.min(cols / 2);
-    let list_rows: Vec<Vec<crate::seg::Seg>> = forwards
-        .iter()
-        .enumerate()
-        .map(|(i, fw)| {
-            let sel = i == cursor;
-            let tone = if fw.remapped {
-                hue(Hue::Amber)
-            } else {
-                hue(Hue::Teal)
-            };
-            vec![
-                seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
-                seg(tone, format!("⇅ {}", fw.container_port)),
-                seg(
-                    if sel { t() } else { d() },
-                    format!(" → localhost:{}", fw.host_port),
-                ),
-            ]
-        })
-        .collect();
+    let mut list_rows: Vec<Vec<crate::seg::Seg>> = Vec::new();
+    if let Some(p) = preview {
+        let gl = crate::caps::active_glyphs();
+        let tone = match p.status {
+            thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+            thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
+            thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
+        };
+        list_rows.push(vec![
+            seg(
+                if cursor == 0 { t() } else { g() },
+                if cursor == 0 {
+                    format!("{} ", gl.chevron)
+                } else {
+                    "  ".to_string()
+                },
+            ),
+            seg(tone, format!("{} :{}", p.status, p.port)),
+            seg(
+                if cursor == 0 { t() } else { d() },
+                format!(" · {}", p.source),
+            ),
+        ]);
+    }
+    list_rows.extend(forwards.iter().enumerate().map(|(i, fw)| {
+        let row_index = i + usize::from(preview.is_some());
+        let sel = row_index == cursor;
+        let tone = if fw.remapped {
+            hue(Hue::Amber)
+        } else {
+            hue(Hue::Teal)
+        };
+        vec![
+            seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+            seg(tone, format!("⇅ {}", fw.container_port)),
+            seg(
+                if sel { t() } else { d() },
+                format!(" → localhost:{}", fw.host_port),
+            ),
+        ]
+    }));
 
     let detail_w = cols.saturating_sub(list_w + 2);
-    let fw = &forwards[cursor];
-    let mut detail: Vec<Vec<crate::seg::Seg>> = vec![
-        vec![
-            seg(t(), format!("container port {}", fw.container_port)).bold(),
-            seg(g2(), "  →  "),
-            seg(t(), format!("host port {}", fw.host_port)).bold(),
-        ],
-        vec![
+    let mut detail: Vec<Vec<crate::seg::Seg>> = Vec::new();
+    if cursor == 0
+        && let Some(p) = preview
+    {
+        let tone = match p.status {
+            thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+            thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
+            thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
+        };
+        detail.push(vec![seg(t(), format!("preview port {}", p.port)).bold()]);
+        detail.push(vec![
+            seg(g2(), "status  "),
+            seg(tone, p.status.to_string()),
+            seg(g2(), "   source  "),
+            seg(d(), p.source.to_string()),
+        ]);
+        detail.push(vec![
             seg(g2(), "worktree  "),
             seg(
                 d(),
-                fw.worktree
+                p.worktree
                     .rsplit('/')
                     .next()
-                    .unwrap_or(&fw.worktree)
+                    .unwrap_or(&p.worktree)
                     .to_string(),
             ),
-        ],
-    ];
-    if fw.remapped {
-        detail.push(vec![seg(
-            hue(Hue::Amber),
-            format!(
-                "remapped — {} was taken on the host, so the preview URL is on :{}",
-                fw.container_port, fw.host_port
-            ),
-        )]);
-    }
-    detail.push(Vec::new());
-    detail.push(vec![seg(g2(), "preview url".to_string())]);
-    for chunk in wrap_text(&fw.url, detail_w) {
-        detail.push(vec![seg(hue(Hue::Teal), chunk)]);
+        ]);
+        detail.push(Vec::new());
+        detail.push(vec![seg(g2(), "preview url".to_string())]);
+        for chunk in wrap_text(&p.url, detail_w) {
+            detail.push(vec![seg(hue(Hue::Teal), chunk)]);
+        }
+    } else {
+        let forward_index = cursor.saturating_sub(usize::from(preview.is_some()));
+        let fw = &forwards[forward_index];
+        detail.extend([
+            vec![
+                seg(t(), format!("container port {}", fw.container_port)).bold(),
+                seg(g2(), "  →  "),
+                seg(t(), format!("host port {}", fw.host_port)).bold(),
+            ],
+            vec![
+                seg(g2(), "worktree  "),
+                seg(
+                    d(),
+                    fw.worktree
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&fw.worktree)
+                        .to_string(),
+                ),
+            ],
+        ]);
+        if fw.remapped {
+            detail.push(vec![seg(
+                hue(Hue::Amber),
+                format!(
+                    "remapped — {} was taken on the host, so the preview URL is on :{}",
+                    fw.container_port, fw.host_port
+                ),
+            )]);
+        }
+        detail.push(Vec::new());
+        detail.push(vec![seg(g2(), "preview url".to_string())]);
+        for chunk in wrap_text(&fw.url, detail_w) {
+            detail.push(vec![seg(hue(Hue::Teal), chunk)]);
+        }
     }
 
     let combined = two_col(&list_rows, &detail, list_w, 2);
-    let n = forwards.len();
+    let n = total;
     rows.extend(combined.into_iter().enumerate().map(|(i, line)| {
         let row = PanelRow::plain(line);
         if i < n {

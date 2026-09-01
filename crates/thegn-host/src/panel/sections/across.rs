@@ -52,9 +52,9 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 s.matches,
                 s.worktrees,
                 if all {
-                    " (all workspaces)"
+                    " (all projects)"
                 } else {
-                    " (this workspace · a = all)"
+                    " (this project · a = all)"
                 }
             ),
         ),
@@ -149,9 +149,9 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
 fn build_rows(agg: &Aggregation, deep: bool) -> Vec<PanelRow> {
     let all = crate::panel::scope::across_all();
     let scope_tail = if all {
-        " (all workspaces)"
+        " (all projects)"
     } else {
-        " (this workspace · a = all)"
+        " (this project · a = all)"
     };
     if agg.is_empty() {
         return vec![PanelRow::plain(Line::segs(vec![seg(

@@ -4,7 +4,8 @@
 # throwaway repo in an isolated HOME. Exits non-zero on any failure.
 #
 # The interactive compositor (worktree/agent/pin actions) is exercised by the
-# host's own unit tests; this covers the shell-invocable surface.
+# host's own unit tests; this covers the shell-invocable surface, including the
+# cross-profile session migration boundary.
 #
 # Usage: test/smoke.sh [path-to-thegn]   (defaults to ./target/debug/thegn)
 set -euo pipefail
@@ -62,6 +63,17 @@ mode = "tabs"
 # The lazygit-suite git keys must parse and validate.
 [git]
 override_gpg = true
+
+# Lifecycle hooks (THE-19): exercise successful setup and make one teardown
+# intentionally veto until --force is supplied. These markers stay in the
+# throwaway repo/worktrees and never touch the checkout that runs smoke.
+[hooks]
+pre_create = ["printf '%s\\n' \"\$THEGN_BRANCH\" > \"\$THEGN_REPO_ROOT/.thegn-smoke-pre-create\""]
+post_create = ["printf '%s\\n' \"\$THEGN_EVENT\" > \"\$THEGN_WORKTREE/.thegn-smoke-post-create\""]
+pre_destroy = ["test \"\$THEGN_BRANCH\" = smoke-fail-hook && exit 23 || true"]
+post_destroy = ["printf '%s\\n' \"\$THEGN_EVENT\" >> \"\$THEGN_REPO_ROOT/.thegn-smoke-post-destroy\""]
+session_start = []
+session_end = []
 
 [[git_commands]]
 key = "p"
@@ -207,6 +219,8 @@ check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
 check "doctor reports a Mobile access section" \
   "'$SZ' doctor | grep -q '^Mobile access'"
+check "doctor reports devcontainer selection and provider status" \
+  "D2=\$(mktemp -d); mkdir -p \"\$D2/repo/.devcontainer\"; git init -q \"\$D2/repo\"; printf '{\"image\":\"alpine\"}\n' > \"\$D2/repo/.devcontainer/devcontainer.json\"; (cd \"\$D2/repo\" && XDG_STATE_HOME=\"\$D2/state\" '$SZ' doctor --json | grep -q '\"devcontainer\"')"
 # The drawer's file-manager provider is a seam like every other backend: it
 # reports a row in the Providers section (seam "files", provider "yazi" by
 # default) with its availability + caps.
@@ -432,6 +446,8 @@ check "repo recent matches legacy recent" \
 # git + DB; removal cleans the checkout + DB rows and honors --delete-branch.
 NP="$("$SZ" wt new smoke-cli --repo "$R")"
 check "wt new prints an existing worktree path" "[[ -d '$NP' ]]"
+check "wt new runs the pre-create hook" "grep -qx 'smoke-cli' '$R/.thegn-smoke-pre-create'"
+check "wt new runs the post-create hook" "grep -qx 'post_create' '$NP/.thegn-smoke-post-create'"
 check "wt new registered the branch in git" \
   "git -C '$R' worktree list --porcelain | grep -q 'smoke-cli'"
 check "wt new appears in wt list" "'$SZ' wt list | grep -q 'smoke-cli'"
@@ -448,6 +464,20 @@ check "wt rm --delete-branch drops the branch" \
    [[ -z \$(git -C '$R' branch --list '*smoke-json*') ]]"
 check "wt rm unknown target exits 3" \
   "'$SZ' wt rm no-such-thing --force >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+
+# A blocking pre-destroy failure is visible, while the existing --force
+# override lets cleanup continue and still runs post-destroy.
+NF="$("$SZ" wt new smoke-fail-hook --repo "$R")"
+fail_rm_rc=0
+fail_rm_out="$("$SZ" wt rm "$NF" --force 2>&1)" || fail_rm_rc=$?
+if [[ $fail_rm_rc -eq 0 && ! -d $NF ]] &&
+  grep -q 'pre_destroy: hook failed' <<<"$fail_rm_out"; then
+  ok "forced teardown reports failed pre-destroy hook"
+else
+  bad "forced teardown reports failed pre-destroy hook"
+fi
+check "wt rm runs post-destroy after forced cleanup" \
+  "grep -qx 'post_destroy' '$R/.thegn-smoke-post-destroy'"
 if command -v sqlite3 >/dev/null 2>&1; then
   DBS="$XDG_STATE_HOME/thegn/thegn.db"
   check "wt rm cleaned the DB worktree rows" \
@@ -456,20 +486,22 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM tab_groups WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
 fi
 
-# Projects (THE-33): group two repos, batch-create a feature across both, and
+# Programs (THE-33): group two repos, batch-create a feature across both, and
 # verify the retry/attach path. `alpha` + `beta` under $TMP/code are the members.
-"$SZ" project create smoke-proj >/dev/null
-"$SZ" project assign smoke-proj "$TMP/code/alpha" >/dev/null
-"$SZ" project assign smoke-proj "$TMP/code/beta" >/dev/null
-check "project list --json reports the two members" \
-  "[[ \$('$SZ' project list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
-check "project rm refuses a non-empty project without --force" \
-  "! '$SZ' project rm smoke-proj >/dev/null 2>&1"
+"$SZ" program create smoke-proj >/dev/null
+"$SZ" program assign smoke-proj "$TMP/code/alpha" >/dev/null
+"$SZ" program assign smoke-proj "$TMP/code/beta" >/dev/null
+check "program list --json reports the two members" \
+  "[[ \$('$SZ' program list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
+check "legacy project alias warns" \
+  "'$SZ' project list --json 2>&1 >/dev/null | grep -q 'use.*thegn program'"
+check "program rm refuses a non-empty program without --force" \
+  "! '$SZ' program rm smoke-proj >/dev/null 2>&1"
 
 # Batched create: one linked branch name, a worktree in each member repo.
 # shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
-PJ="$("$SZ" wt new cross-feat --project smoke-proj --json)"
-check "wt new --project emits a per-member report" \
+PJ="$("$SZ" wt new cross-feat --program smoke-proj --json)"
+check "wt new --program emits a per-member report" \
   "printf '%s' \"\$PJ\" | grep -q '\"branch\"' && printf '%s' \"\$PJ\" | grep -q '\"status\":\"created\"'"
 check "batched create made the branch in alpha" \
   "[[ -n \$(git -C '$TMP/code/alpha' branch --list '*cross-feat*') ]]"
@@ -478,22 +510,24 @@ check "batched create made the branch in beta" \
 
 # Re-run attaches: both members already have the branch → reported exists,
 # exit 0 (idempotent retry-after-partial-failure recovery path).
-check "re-running --project attaches existing members and exits 0" \
-  "'$SZ' wt new cross-feat --project smoke-proj --json | grep -q '\"status\":\"exists\"'"
+check "re-running --project alias warns and attaches existing members" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 | grep -q '\"status\":\"exists\"'"
+check "re-running --project alias emits deprecation warning" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 >/dev/null | grep -q 'use.*wt new --program'"
 
 # Subset: --repos restricts creation to the named member(s) only.
 # shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
-PJ2="$("$SZ" wt new subset-feat --project smoke-proj --repos beta --json)"
-check "wt new --project --repos restricts to the named subset" \
+PJ2="$("$SZ" wt new subset-feat --program smoke-proj --repos beta --json)"
+check "wt new --program --repos restricts to the named subset" \
   "printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"beta\"' && ! printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"alpha\"'"
 check "batched create did not touch the excluded member" \
   "[[ -z \$(git -C '$TMP/code/alpha' branch --list '*subset-feat*') ]]"
 
 # Assign none unprojects; the project can then be deleted.
-"$SZ" project assign none "$TMP/code/alpha" >/dev/null
-"$SZ" project assign none "$TMP/code/beta" >/dev/null
-check "project rm removes an emptied project" \
-  "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
+"$SZ" program assign none "$TMP/code/alpha" >/dev/null
+"$SZ" program assign none "$TMP/code/beta" >/dev/null
+check "program rm removes an emptied program" \
+  "'$SZ' program rm smoke-proj >/dev/null && ! '$SZ' program list | grep -q smoke-proj"
 
 # Repo map: `thegn map` builds a capped tree-sitter entity index from the git
 # listing and renders a ranked, budgeted outline (no language server needed).
@@ -539,7 +573,7 @@ check "ci runs --json degrades gracefully" \
   "'$SZ' ci runs --worktree '$WT' --json >/dev/null 2>&1"
 
 # Grouped help + shell completions.
-check "--help shows the Workspace group" "'$SZ' --help | grep -q 'Workspace:'"
+check "--help shows the Projects & worktrees group" "'$SZ' --help | grep -q 'Projects & worktrees:'"
 check "--help shows the Forge group" "'$SZ' --help | grep -q 'Forge:'"
 check "setup appears in --help (onboarding wizard)" \
   "'$SZ' --help | grep -q '^  setup '"
@@ -1040,10 +1074,266 @@ SQL
 else
   echo "  skip v5→v6 migration check (sqlite3 not on PATH)"
 fi
-
 # ── control plane: pairing CRUD, no-daemon degradation, daemon lifecycle ────
 echo "control plane:"
 
+# --- cross-profile session move (THE-55), hermetic CLI coverage -------------
+# Every case gets a complete profile sandbox. The migration selector is an
+# exact stored path, so these rows are seeded directly into the isolated
+# SQLite stores; git is created only to prove the move never touches it.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  bad "session move smoke requires sqlite3 for isolated row fixtures"
+else
+  move_cli() {
+    local root="$1"
+    shift
+    env -u THEGN_PROFILE HOME="$root/home" \
+      XDG_CONFIG_HOME="$root/config" \
+      XDG_STATE_HOME="$root/state" \
+      XDG_RUNTIME_DIR="$root/run" \
+      THEGN_DIR="$root/thegn" \
+      THEGN_CHANNEL=dev "$SZ" "$@"
+  }
+
+  init_move_case() {
+    local root="$1"
+    mkdir -p "$root/home" "$root/config/thegn" "$root/state" "$root/run" \
+      "$root/thegn/profiles/target"
+    # `repos` is filesystem-only; dispatch listing is the smallest daemon-free
+    # CLI path that opens and initializes the profile database.
+    move_cli "$root" dispatch list --json >/dev/null 2>&1
+  }
+
+  seed_move_rows() {
+    local root="$1" wt="$2" group="$3" pane_sessions="$4"
+    sqlite3 "$root/state/thegn/thegn.db" <<SQL
+INSERT INTO worktrees
+  (worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,env_name)
+VALUES ('$wt','default','$group','$wt','smoke-move','smoke',1,'local','default');
+INSERT INTO tab_groups
+  (session_name,name,kind,worktree,ordinal,active_tab)
+VALUES ('default','$group','worktree','$wt',7,0);
+INSERT INTO group_tabs
+  (session_name,group_name,ordinal,title,pane_tree,focused_pane,pane_cwds,pane_cmds,pane_sessions,scrollback_snapshot)
+VALUES ('default','$group',0,'move smoke','{"leaf":0}',0,'["$wt"]','["SMOKE_OPAQUE_COMMAND"]',NULLIF('$pane_sessions',''),'SMOKE_OPAQUE_SCROLLBACK');
+INSERT INTO ui_state(scope,key,value) VALUES
+  ('sidebar','collapse:$group','1'),
+  ('sidebar','pin:$group','1'),
+  ('sidebar','pin_ordinal:$group','7');
+INSERT INTO session_state(session_name,pin_state,updated_at)
+VALUES ('default','SMOKE_OPAQUE_PIN',1);
+INSERT INTO agent_dispatches
+  (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,session_id,artifact_path,note,chunk_path,report)
+VALUES ('smoke:move','$wt','smoke-agent',1,'queued','code',NULL,
+        'SMOKE_OPAQUE_ARTIFACT','SMOKE_OPAQUE_NOTE','SMOKE_OPAQUE_CHUNK','SMOKE_OPAQUE_REPORT');
+INSERT INTO agent_dispatch_notes(dispatch_id,created_at_ms,text)
+SELECT id,1,'SMOKE_OPAQUE_PROGRESS'
+  FROM agent_dispatches WHERE worktree_path='$wt' ORDER BY id DESC LIMIT 1;
+SQL
+  }
+
+  # Cold move: target-first import carries every selected table while the
+  # source rows are cleaned only after target confirmation.
+  COLD="$TMP/session-move-cold"
+  init_move_case "$COLD"
+  COLD_WT="$COLD/git-worktree"
+  git init -q "$COLD_WT"
+  git -C "$COLD_WT" commit -q --allow-empty -m move-smoke
+  seed_move_rows "$COLD" "$COLD_WT" move-cold ""
+  COLD_DB="$COLD/state/thegn/thegn.db"
+  COLD_TARGET_DB="$COLD/thegn/profiles/target/state/thegn/thegn.db"
+  cold_head_before="$(git -C "$COLD_WT" rev-parse HEAD)"
+  cold_git_before="$(git -C "$COLD_WT" worktree list --porcelain)"
+  cold_git_status_before="$(git -C "$COLD_WT" status --porcelain)"
+  cold_git_objects_before="$(git -C "$COLD_WT" count-objects -v)"
+  set +e
+  # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+  cold_out="$(move_cli "$COLD" session move "$COLD_WT" --to-profile target 2>&1)"
+  cold_rc=$?
+  set -e
+  cold_source_rows="$(sqlite3 "$COLD_DB" "SELECT (SELECT count(*) FROM worktrees WHERE worktree='$COLD_WT'),(SELECT count(*) FROM tab_groups WHERE worktree='$COLD_WT'),(SELECT count(*) FROM group_tabs WHERE group_name='move-cold'),(SELECT count(*) FROM ui_state WHERE key IN ('collapse:move-cold','pin:move-cold','pin_ordinal:move-cold')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT'),(SELECT count(*) FROM agent_dispatch_notes),(SELECT count(*) FROM session_state WHERE session_name='default' AND pin_state IS NOT NULL);")"
+  cold_target_rows="$(sqlite3 "$COLD_TARGET_DB" "SELECT (SELECT count(*) FROM worktrees WHERE worktree='$COLD_WT'),(SELECT count(*) FROM tab_groups WHERE worktree='$COLD_WT'),(SELECT count(*) FROM group_tabs WHERE group_name='move-cold' AND pane_sessions IS NULL),(SELECT count(*) FROM ui_state WHERE key IN ('collapse:move-cold','pin:move-cold','pin_ordinal:move-cold')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT' AND session_id IS NULL),(SELECT count(*) FROM agent_dispatch_notes),(SELECT count(*) FROM session_state WHERE session_name='default' AND pin_state='SMOKE_OPAQUE_PIN');")"
+  cold_head_after="$(git -C "$COLD_WT" rev-parse HEAD)"
+  cold_git_after="$(git -C "$COLD_WT" worktree list --porcelain)"
+  cold_git_status_after="$(git -C "$COLD_WT" status --porcelain)"
+  cold_git_objects_after="$(git -C "$COLD_WT" count-objects -v)"
+  check "session move cold CLI imports and confirms the target" \
+    "[[ $cold_rc -eq 0 ]] && grep -q 'target committed: true' <<<\"\$cold_out\" && grep -q 'target confirmed: true' <<<\"\$cold_out\""
+  check "session move cold removes selected source rows" \
+    "[[ \"$cold_source_rows\" == '0|0|0|0|0|0|0' ]]"
+  check "session move cold imports rows and clears daemon ids" \
+    "[[ \"$cold_target_rows\" == '1|1|1|3|1|1|1' ]]"
+  check "session move cold leaves git files and objects unchanged" \
+    "[[ \"$cold_head_after\" == \"$cold_head_before\" ]] && [[ \"$cold_git_after\" == \"$cold_git_before\" ]] && [[ \"$cold_git_status_after\" == \"$cold_git_status_before\" ]] && [[ \"$cold_git_objects_after\" == \"$cold_git_objects_before\" ]]"
+
+  # --kill move: a real isolated daemon provides a controllable live session;
+  # the command must kill/re-list it before importing the referenced pane row.
+  KILL="$TMP/session-move-kill"
+  init_move_case "$KILL"
+  KILL_WT="$KILL/live-worktree"
+  KILL_DB="$KILL/state/thegn/thegn.db"
+  KILL_TARGET_DB="$KILL/thegn/profiles/target/state/thegn/thegn.db"
+  if ! command -v curl >/dev/null 2>&1; then
+    bad "session move --kill smoke requires curl for the isolated daemon fixture"
+  else
+    # Keep the Unix socket comfortably below platform sockaddr limits; the
+    # profile root remains isolated even though the endpoint is a short path.
+    KILL_SOCK="$TMP/thegn-move-kill.sock"
+    move_cli "$KILL" daemon --socket "$KILL_SOCK" &
+    KILL_PID=$!
+    for _ in $(seq 1 40); do
+      [[ -S $KILL_SOCK ]] && break
+      sleep 0.1
+    done
+    kill_fixture_ok=1
+    [[ -S $KILL_SOCK ]] || kill_fixture_ok=0
+    if ! curl -sS --unix-socket "$KILL_SOCK" -X POST http://d/v1/sessions \
+      -H 'content-type: application/json' \
+      -d '{"argv":["/bin/sh","-c","sleep 30"],"rows":24,"cols":80}' >/dev/null; then
+      kill_fixture_ok=0
+    fi
+    sleep 0.3
+    KILL_ID="$(move_cli "$KILL" session list --json 2>/dev/null |
+      python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["id"] if rows else "")' 2>/dev/null || true)"
+    [[ -n $KILL_ID ]] || kill_fixture_ok=0
+    if [[ $kill_fixture_ok -eq 1 ]]; then
+      seed_move_rows "$KILL" "$KILL_WT" move-kill \
+        "{\"0\":{\"provider\":\"daemon\",\"session\":\"$KILL_ID\"}}"
+      set +e
+      # A refusal is a true preflight: it must not initialize the absent
+      # target DB merely to discover the already-known live-session blocker.
+      # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+      live_refuse_out="$(move_cli "$KILL" session move "$KILL_WT" --to-profile target 2>&1)"
+      live_refuse_rc=$?
+      set -e
+      check "session move live refusal leaves both profile stores unchanged" \
+        "[[ $live_refuse_rc -ne 0 ]] && grep -q '$KILL_ID' <<<\"\$live_refuse_out\" && [[ ! -e '$KILL_TARGET_DB' ]] && [[ \$(sqlite3 '$KILL_DB' \"SELECT count(*) FROM tab_groups WHERE worktree='$KILL_WT';\") == 1 ]]"
+      set +e
+      # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+      kill_out="$(move_cli "$KILL" session move "$KILL_WT" --to-profile target --kill --json 2>&1)"
+      kill_rc=$?
+      set -e
+      kill_source_rows="$(sqlite3 "$KILL_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$KILL_WT';")"
+      kill_target_panes="$(sqlite3 "$KILL_TARGET_DB" "SELECT count(*) FROM group_tabs WHERE group_name='move-kill' AND pane_sessions IS NULL;")"
+      check "session move --kill kills before importing the live session" \
+        "[[ $kill_rc -eq 0 ]] && grep -q '\"killed_ids\":\[\"$KILL_ID\"\]' <<<\"\$kill_out\" && grep -q '\"target_committed\":true' <<<\"\$kill_out\""
+      check "session move --kill clears source rows and target daemon ids" \
+        "[[ \"$kill_source_rows\" == 0 && \"$kill_target_panes\" == 1 ]]"
+    else
+      bad "session move --kill fixture could not start or create a daemon session"
+    fi
+    kill "$KILL_PID" 2>/dev/null || true
+    wait "$KILL_PID" 2>/dev/null || true
+  fi
+
+  # Collision: exercise each strict target conflict class. Every command must
+  # report the conflict before changing either profile database.
+  COLLISION="$TMP/session-move-collision"
+  init_move_case "$COLLISION"
+  COLLISION_WT="$COLLISION/collision-worktree"
+  seed_move_rows "$COLLISION" "$COLLISION_WT" move-collision ""
+  for conflict in group ui pin; do
+    mkdir -p "$COLLISION/thegn/profiles/$conflict"
+    move_cli "$COLLISION" --profile "$conflict" dispatch list --json >/dev/null 2>&1
+  done
+  COLLISION_GROUP_DB="$COLLISION/thegn/profiles/group/state/thegn/thegn.db"
+  sqlite3 "$COLLISION_GROUP_DB" <<SQL
+INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
+VALUES ('default','move-collision','worktree','/target-owned',9,0);
+INSERT INTO group_tabs(session_name,group_name,ordinal,title,pane_tree,focused_pane)
+VALUES ('default','move-collision',0,'target','{"leaf":0}',0);
+SQL
+  COLLISION_UI_DB="$COLLISION/thegn/profiles/ui/state/thegn/thegn.db"
+  sqlite3 "$COLLISION_UI_DB" <<SQL
+-- Deliberately leave this key orphaned: stale sidebar state must conflict even
+-- when no target group remains to lead the snapshot to it.
+INSERT INTO ui_state(scope,key,value) VALUES ('sidebar','pin:move-collision','target');
+SQL
+  COLLISION_PIN_DB="$COLLISION/thegn/profiles/pin/state/thegn/thegn.db"
+  sqlite3 "$COLLISION_PIN_DB" <<SQL
+INSERT INTO session_state(session_name,pin_state,updated_at)
+VALUES ('default','TARGET_PIN',2);
+SQL
+  COLLISION_DB="$COLLISION/state/thegn/thegn.db"
+  check_collision() {
+    local kind="$1" db="$2" target="$3" query="$4"
+    local before after source_before source_after out rc
+    before="$(sqlite3 "$db" "$query")"
+    source_before="$(sqlite3 "$COLLISION_DB" "SELECT worktrees.worktree,tab_groups.name FROM worktrees JOIN tab_groups ON tab_groups.worktree=worktrees.worktree WHERE worktrees.worktree='$COLLISION_WT'; SELECT pin_state FROM session_state WHERE session_name='default';")"
+    set +e
+    # shellcheck disable=SC2034 # read by the `check` body below through `eval`
+    out="$(move_cli "$COLLISION" session move "$COLLISION_WT" --to-profile "$target" 2>&1)"
+    rc=$?
+    set -e
+    after="$(sqlite3 "$db" "$query")"
+    source_after="$(sqlite3 "$COLLISION_DB" "SELECT worktrees.worktree,tab_groups.name FROM worktrees JOIN tab_groups ON tab_groups.worktree=worktrees.worktree WHERE worktrees.worktree='$COLLISION_WT'; SELECT pin_state FROM session_state WHERE session_name='default';")"
+    check "session move $kind collision exits before either store changes" \
+      "[[ $rc -ne 0 ]] && grep -q 'collision' <<<\"\$out\" && [[ \"$source_before\" == \"$source_after\" ]] && [[ \"$before\" == \"$after\" ]]"
+  }
+  check_collision group "$COLLISION_GROUP_DB" group \
+    "SELECT name,worktree FROM tab_groups WHERE name='move-collision';"
+  check_collision sidebar-ui "$COLLISION_UI_DB" ui \
+    "SELECT key,value FROM ui_state WHERE key='pin:move-collision';"
+  check_collision running-pin "$COLLISION_PIN_DB" pin \
+    "SELECT pin_state FROM session_state WHERE session_name='default';"
+
+  # Dry-run: the target profile root exists but has no database at all. Both
+  # output modes must carry the stable warning while leaving the root byte-for-
+  # byte untouched (including no state directory, WAL, journal, or schema file).
+  DRY="$TMP/session-move-dry-run"
+  init_move_case "$DRY"
+  DRY_WT="$DRY/dry-worktree"
+  seed_move_rows "$DRY" "$DRY_WT" move-dry ""
+  DRY_TARGET_ROOT="$DRY/thegn/profiles/target"
+  DRY_DB="$DRY/state/thegn/thegn.db"
+  dry_source_before="$(sqlite3 "$DRY_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$DRY_WT';")"
+  dry_target_before="$(find "$DRY_TARGET_ROOT" -mindepth 1 -print | sort)"
+  set +e
+  # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+  dry_human="$(move_cli "$DRY" session move "$DRY_WT" --to-profile target --dry-run 2>&1)"
+  dry_human_rc=$?
+  # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+  dry_json="$(move_cli "$DRY" session move "$DRY_WT" --to-profile target --dry-run --json 2>&1)"
+  dry_json_rc=$?
+  set -e
+  dry_target_after="$(find "$DRY_TARGET_ROOT" -mindepth 1 -print | sort)"
+  dry_source_after="$(sqlite3 "$DRY_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$DRY_WT';")"
+  check "session move dry-run human output warns about opaque payloads" \
+    "[[ $dry_human_rc -eq 0 ]] && grep -q 'opaque payload warning:' <<<\"\$dry_human\" && grep -q 'carried unchanged' <<<\"\$dry_human\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_human\""
+  check "session move dry-run JSON output is redacted and complete" \
+    "[[ $dry_json_rc -eq 0 ]] && grep -q '\"opaque_payload_warning\"' <<<\"\$dry_json\" && grep -q 'carried unchanged' <<<\"\$dry_json\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_json\""
+  check "session move dry-run does not create target DB sidecars or schema" \
+    "[[ \"$dry_source_before\" == \"$dry_source_after\" ]] && [[ \"$dry_target_before\" == \"$dry_target_after\" ]] && [[ ! -e '$DRY_TARGET_ROOT/state' ]]"
+
+  # Repeat dry-run against an already-created target DB to cover the stale
+  # target path as well as the absent-target path above.
+  DRY_STALE="$TMP/session-move-dry-run-stale"
+  init_move_case "$DRY_STALE"
+  move_cli "$DRY_STALE" --profile target dispatch list --json >/dev/null 2>&1
+  DRY_STALE_WT="$DRY_STALE/stale-worktree"
+  seed_move_rows "$DRY_STALE" "$DRY_STALE_WT" move-dry-stale ""
+  DRY_STALE_TARGET_ROOT="$DRY_STALE/thegn/profiles/target"
+  DRY_STALE_DB="$DRY_STALE/state/thegn/thegn.db"
+  DRY_STALE_TARGET_DB="$DRY_STALE/thegn/profiles/target/state/thegn/thegn.db"
+  dry_stale_source_before="$(sqlite3 "$DRY_STALE_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$DRY_STALE_WT';")"
+  dry_stale_target_before="$(find "$DRY_STALE_TARGET_ROOT" -mindepth 1 -print | sort)"
+  dry_stale_db_before="$(sha256sum "$DRY_STALE_TARGET_DB")"
+  set +e
+  # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+  dry_stale_human="$(move_cli "$DRY_STALE" session move "$DRY_STALE_WT" --to-profile target --dry-run 2>&1)"
+  dry_stale_human_rc=$?
+  # shellcheck disable=SC2034 # read by the `check` bodies below through `eval`
+  dry_stale_json="$(move_cli "$DRY_STALE" session move "$DRY_STALE_WT" --to-profile target --dry-run --json 2>&1)"
+  dry_stale_json_rc=$?
+  set -e
+  dry_stale_target_after="$(find "$DRY_STALE_TARGET_ROOT" -mindepth 1 -print | sort)"
+  dry_stale_source_after="$(sqlite3 "$DRY_STALE_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$DRY_STALE_WT';")"
+  dry_stale_db_after="$(sha256sum "$DRY_STALE_TARGET_DB")"
+  check "session move dry-run leaves a stale target DB unchanged" \
+    "[[ $dry_stale_human_rc -eq 0 && $dry_stale_json_rc -eq 0 ]] && [[ \"$dry_stale_source_before\" == \"$dry_stale_source_after\" ]] && [[ \"$dry_stale_target_before\" == \"$dry_stale_target_after\" ]] && [[ \"$dry_stale_db_before\" == \"$dry_stale_db_after\" ]]"
+  check "session move stale dry-run outputs remain redacted" \
+    "grep -q 'opaque payload warning:' <<<\"\$dry_stale_human\" && grep -q '\"opaque_payload_warning\"' <<<\"\$dry_stale_json\" && ! grep -q 'SMOKE_OPAQUE_' <<<\"\$dry_stale_human\$dry_stale_json\""
+fi
 # Pairing management is pure DB — must work with NO daemon running.
 # NOTE: command output is never interpolated into check()'s eval'd condition —
 # the no-daemon message contains backticks, which eval would execute.
@@ -1123,7 +1413,7 @@ cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
 [[pipeline.stages]]
 name = "smoke"
 agent = "claude"
-prompt = "task {issue_number} on {branch} in {worktree}, artifact {artifact}"
+prompt = "row {row}: task {issue_number} on {branch} in {worktree}, artifact {artifact}; then run \`thegn dispatch report {row} --text '…'\`"
 EOF
 # `dispatch put` is the roster's writer, and the v56 pipeline columns
 # (stage/parent/session/artifact) ride it — there is no second verb. A parent id
@@ -1225,6 +1515,8 @@ sopen_ok=1
 [[ $sopen_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sopen_out" || sopen_ok=0
 check "session open without a daemon exits 1 with a clear message" \
   "[[ $sopen_ok -eq 1 ]]"
+check "session fork help is available in an isolated state" \
+  "'$SZ' session fork --help | grep -q -- '--fork-worktree'"
 # THE-76: `session close` shares that same connect path, `session list --live`
 # degrades identically in both modes, and `session open`'s offline refusals
 # (stage lookup, clap conflict, empty-prompt-with-headless) are answerable

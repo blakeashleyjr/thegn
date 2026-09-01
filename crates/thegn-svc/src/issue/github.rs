@@ -160,6 +160,10 @@ impl IssueBackend for GitHubIssuesBackend {
         "github"
     }
 
+    fn caps(&self) -> super::IssueCaps {
+        super::IssueCaps::default()
+    }
+
     fn list_issues<'a>(
         &'a self,
         filter: &'a IssueFilter,

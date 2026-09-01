@@ -1,4 +1,29 @@
-# Add a theme preset
+# Add a theme preset or user theme
+
+## User themes
+
+The theme builder stores validated, versioned TOML files under
+`$XDG_CONFIG_HOME/thegn/themes`. The closed `UserTheme` model contains only
+editable surface, text, border, accent, focus, and eight hue roles; derived
+tokens are always rebuilt by `extend_palette`. Do not add derived fields to a
+user file when the palette grows.
+
+Gogh YAML and JSON imports are intentionally local and bounded. The core
+importer accepts `name`, optional `variant`, `background`, `foreground`,
+`cursor`, and `color_01` through `color_16`; the host owns path reads and
+validated atomic writes. `foreground`, `background`, and `cursor` become
+`text`, `bg0`, and `focus`, while the ANSI pairs seed the semantic hues.
+
+The CLI flow is headless:
+
+```sh
+thegn theme import ~/Downloads/theme.yml --name paper
+thegn theme set paper
+```
+
+A selected user theme is persisted through the existing `[theme].preset` key
+and `[theme.colors]` / `[theme.hues]` overrides. There is no separate user-theme
+config key and no export or network-import command.
 
 1. Add the name to `PRESETS` and a `match` arm in `preset()` in
    `crates/thegn-core/src/theme.rs`, returning a `Palette` of `"R;G;B"`

@@ -70,6 +70,7 @@ impl Forge for Ladder<dyn Forge> {
             c.checks_rerun |= lc.checks_rerun;
             c.reviews |= lc.reviews;
             c.review_threads |= lc.review_threads;
+            c.resolve_review_thread |= lc.resolve_review_thread;
             c.line_comments |= lc.line_comments;
             c.conversation |= lc.conversation;
             c.pr_diff |= lc.pr_diff;
@@ -180,6 +181,18 @@ impl Forge for Ladder<dyn Forge> {
     fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), ForgeError> {
         forward!(self, "reply_thread", |l| l
             .reply_thread(loc, thread_id, body))
+    }
+    fn resolve_review_thread(
+        &self,
+        loc: &GitLoc,
+        thread_id: &str,
+        bounded_reply: &str,
+    ) -> Result<(), ForgeError> {
+        forward!(self, "resolve_review_thread", |l| l.resolve_review_thread(
+            loc,
+            thread_id,
+            bounded_reply
+        ))
     }
     fn add_line_comment(&self, loc: &GitLoc, c: LineComment<'_>) -> Result<(), ForgeError> {
         forward!(self, "add_line_comment", |l| l.add_line_comment(loc, c))
@@ -365,6 +378,7 @@ mod tests {
             ForgeCaps {
                 pr_status: true,
                 merge: self.id == "cli",
+                resolve_review_thread: self.id == "cli",
                 ..ForgeCaps::default()
             }
         }
@@ -391,6 +405,14 @@ mod tests {
         ) -> Result<(), ForgeError> {
             self.calls.lock().unwrap().push("merge");
             Ok(())
+        }
+        fn resolve_review_thread(&self, _: &GitLoc, _: &str, _: &str) -> Result<(), ForgeError> {
+            self.calls.lock().unwrap().push("resolve_review_thread");
+            if self.id == "cli" {
+                Ok(())
+            } else {
+                Err(ForgeError::Unsupported("resolve_review_thread"))
+            }
         }
     }
 
@@ -424,6 +446,8 @@ mod tests {
             l.merge_pr(&loc(), PrRef::Current, MergeMethod::Squash, false, false)
                 .is_ok()
         );
+        assert!(l.resolve_review_thread(&loc(), "thread", "reply").is_ok());
+        assert!(l.caps().resolve_review_thread);
     }
 
     #[test]

@@ -279,6 +279,49 @@ pub struct AgentDispatch {
     /// filed one.
     #[serde(default)]
     pub report: Option<String>,
+    /// The worker process's exit status, stamped when its session ended (v63).
+    /// `None` means **unknown** — a pre-v63 row, or one whose daemon went away
+    /// before it could stamp — never "still running": absence of evidence that
+    /// the worker exited must not be read as evidence that it did.
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// When the exit above was recorded (epoch ms, v63). Paired with
+    /// `exit_code` so a supervisor can age an unclosed row and see that its
+    /// worker has been gone for hours.
+    #[serde(default)]
+    pub exited_at_ms: Option<i64>,
+}
+
+/// The review-task projection of an `agent_dispatches` row.
+///
+/// Kept separate from [`AgentDispatch`] so the nullable review metadata does
+/// not infect ordinary pipeline rows or their control-wire shape. Only rows
+/// whose `task_kind` and `source_key` are populated map to this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewTaskRecord {
+    pub id: i64,
+    pub issue_id: String,
+    pub worktree_path: String,
+    pub role: String,
+    pub dispatched_at_ms: i64,
+    pub status: AgentDispatchStatus,
+    pub task_kind: String,
+    pub source_key: String,
+    pub source_revision: String,
+    /// Feedback identity for the active revision, excluding the PR head.
+    pub content_revision: String,
+    pub prompt: String,
+    pub expected_head_oid: String,
+    /// A newer snapshot observed while the task was active. It remains on the
+    /// same unique row until the active handoff can safely finish or promote it.
+    pub pending_source_revision: Option<String>,
+    pub pending_content_revision: Option<String>,
+    pub pending_prompt: Option<String>,
+    pub pending_expected_head_oid: Option<String>,
+    pub pending_role: Option<String>,
+    pub pending_worktree_path: Option<String>,
+    pub forge_action_attempts: u32,
+    pub next_forge_action_at_ms: Option<i64>,
 }
 
 /// A note on the per-row progress queue (see `agent_dispatch_notes`).
@@ -881,6 +924,8 @@ mod spec {
             note: Some("transport: connection error. (attempt 1/3)".into()),
             chunk_path: Some(".thegn/pipeline/ABC-1/code/chunk-1.md".into()),
             report: None,
+            exit_code: Some(0),
+            exited_at_ms: Some(1_700_000_100_000),
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: AgentDispatch = serde_json::from_str(&json).unwrap();

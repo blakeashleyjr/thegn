@@ -52,6 +52,12 @@ pub(crate) enum SidebarOutcome {
     },
     /// Copy this text (a worktree path) to the system clipboard via OSC-52.
     CopyText(String),
+    /// Hand the selected worktree row to the configured IDE without activating
+    /// it first. Pane-only editors degrade if that dormant row is not focused.
+    OpenInIde {
+        target: thegn_core::editor::EditorTarget,
+        workspace_slug: String,
+    },
     /// Prompt to rename the worktree group at this session index (its current
     /// branch seeds the input). Item 53.
     PromptRename { gi: usize, branch: String },
@@ -84,6 +90,8 @@ pub(crate) enum SidebarOutcome {
     CloseTerminal { name: String },
     /// Open the sort-mode menu (`s`).
     SortMenu,
+    /// Open the existing Work → Merge queue section for this workspace.
+    OpenMergeQueue { repo_path: String },
     /// Show the sidebar help overlay (`?`).
     ShowHelp,
     /// A merge-queue action fired from the row/workspace context menu (mirrors
@@ -142,7 +150,7 @@ pub(crate) enum NewWorktreeTarget {
 
 /// The refusal message displayed when `NewWorktreeTarget::Refuse` fires.
 pub(crate) const NEW_WORKTREE_REFUSAL: &str =
-    "No repo path for this workspace yet — it registers on the next refresh";
+    "No repo path for this project yet — it registers on the next refresh";
 
 impl SidebarState {
     /// What the cursor row activates, if anything.
@@ -296,7 +304,7 @@ impl SidebarState {
                     // Essential-tier key and must never silently no-op.
                     if let Some(slug) = dormant_ws {
                         model.status = format!(
-                            "Open workspace \"{slug}\" first to close or delete this worktree"
+                            "Open project \"{slug}\" first to close or delete this worktree"
                         );
                         return Some(SidebarOutcome::Redraw);
                     }
@@ -326,6 +334,9 @@ impl SidebarState {
             RowKind::Worktree => {
                 if row.tab_target.is_some() {
                     entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
+                }
+                if row.worktree_path.is_some() {
+                    entries.push(e("open-in-ide", "Open in IDE", None));
                 }
                 entries.push(sep());
                 entries.push(e(
@@ -414,6 +425,9 @@ impl SidebarState {
                     "Row detail: all / cursor / off",
                     Some(chord_of(Id::CycleDetail)),
                 ));
+                if row.worktree_path.is_some() {
+                    entries.push(e("open-merge-queue", "Open merge queue", None));
+                }
                 // Workspace-wide merge-queue controls (panel `A` / clear / `D`).
                 entries.push(sep());
                 entries.push(e("mq-add-all", "Queue all worktrees", None));
@@ -423,8 +437,8 @@ impl SidebarState {
                     entries.push(sep());
                     entries.push(
                         e(
-                            "remove-workspace",
-                            "Remove workspace…",
+                            "remove-project",
+                            "Remove project…",
                             Some(chord_of(Id::Delete)),
                         )
                         .danger(),
@@ -759,7 +773,7 @@ impl SidebarState {
                         }
                         self.sync(model);
                     } else {
-                        model.status = "Only worktrees and workspaces can be marked".into();
+                        model.status = "Only worktrees and projects can be marked".into();
                     }
                 }
             }
@@ -804,7 +818,7 @@ impl SidebarState {
                 if let Some(out) = self.folder_outcome(model) {
                     return out;
                 }
-                model.status = "Folders apply to worktree and workspace rows".into();
+                model.status = "Folders apply to worktree and project rows".into();
             }
             Id::CopyPath => {
                 if let Some(p) = self
@@ -882,8 +896,7 @@ impl SidebarState {
                 // Dormant workspace's worktree: rename runs through the live
                 // session; surface why nothing happened instead of no-opping.
                 if let Some(slug) = dormant_ws {
-                    model.status =
-                        format!("Open workspace \"{slug}\" first to rename this worktree");
+                    model.status = format!("Open project \"{slug}\" first to rename this worktree");
                     return Some(SidebarOutcome::Redraw);
                 }
                 None
@@ -995,7 +1008,7 @@ impl SidebarState {
         let skipped = self.marked_nonworktree_count(model);
         if skipped > 0 {
             model.status =
-                format!("{skipped} workspace(s) skipped — select worktrees to close/delete");
+                format!("{skipped} project(s) skipped — select worktrees to close/delete");
         }
     }
 
@@ -1101,7 +1114,7 @@ impl SidebarState {
                 self.view.sort.as_str()
             )
         } else {
-            "Sidebar: grouped by workspace".into()
+            "Sidebar: grouped by project".into()
         };
         SidebarOutcome::Redraw
     }
@@ -1206,7 +1219,7 @@ impl SidebarState {
                     return SidebarOutcome::DeleteGroups(vec![g]);
                 }
             }
-            "remove-workspace" | "delete-folder" | "close-terminal" => {
+            "remove-project" | "remove-workspace" | "delete-folder" | "close-terminal" => {
                 if let Some(out) = self.delete_outcome(model, session) {
                     return out;
                 }
@@ -1217,6 +1230,23 @@ impl SidebarState {
                     .and_then(|r| r.worktree_path.clone())
                 {
                     return SidebarOutcome::CopyText(p);
+                }
+            }
+            "open-in-ide" => {
+                if let Some(row) = self.selected_row(model)
+                    && let Some(path) = row.worktree_path.as_deref()
+                {
+                    match thegn_core::editor::EditorTarget::project(path) {
+                        Ok(target) => {
+                            return SidebarOutcome::OpenInIde {
+                                target,
+                                workspace_slug: row.workspace_slug.clone(),
+                            };
+                        }
+                        Err(error) => model.status = error.to_string(),
+                    }
+                } else {
+                    model.status = "This worktree row has no IDE target".into();
                 }
             }
             "fork" => {
@@ -1246,6 +1276,15 @@ impl SidebarState {
                 }
             }
             "sort" => return SidebarOutcome::SortMenu,
+            "open-merge-queue" => {
+                if let Some(repo_path) = self
+                    .selected_row(model)
+                    .filter(|row| row.kind == crate::sidebar::RowKind::Workspace)
+                    .and_then(|row| row.worktree_path.clone())
+                {
+                    return SidebarOutcome::OpenMergeQueue { repo_path };
+                }
+            }
             "mq-add" | "mq-remove" | "mq-land" | "mq-retry" => {
                 use crate::handlers::merge_queue::SidebarMq;
                 if let Some(path) = self
@@ -1547,5 +1586,70 @@ mod tests {
         for s in [MqStatus::Landed, MqStatus::AgentRunning] {
             assert_eq!(ids(Some(s)), vec!["mq-remove"], "{s:?}");
         }
+    }
+
+    #[test]
+    fn workspace_menu_opens_merge_queue_without_a_new_keybind() {
+        use crate::sidebar::{RowKind, SidebarRow};
+
+        let mut model = FrameModel {
+            sidebar_rows: vec![SidebarRow {
+                worktree_path: Some("/repos/app".into()),
+                pin_key: "app".into(),
+                ..SidebarRow::base(RowKind::Workspace, 0, "app", "app")
+            }],
+            ..Default::default()
+        };
+        let sb = SidebarState::default();
+        let menu = sb
+            .menu_for_cursor(&model, &crate::session::Session::default())
+            .expect("workspace menu");
+        assert!(
+            menu.entries
+                .iter()
+                .any(|entry| entry.id == "open-merge-queue")
+        );
+
+        let mut sb = sb;
+        let out = sb.run_menu_action(
+            "open-merge-queue",
+            &mut model,
+            &crate::session::Session::default(),
+        );
+        assert!(matches!(
+            out,
+            SidebarOutcome::OpenMergeQueue { ref repo_path }
+                if repo_path == "/repos/app"
+        ));
+    }
+
+    #[test]
+    fn worktree_menu_hands_the_selected_path_to_the_core_target_policy() {
+        use crate::sidebar::{RowKind, SidebarRow};
+
+        let mut model = FrameModel {
+            sidebar_rows: vec![SidebarRow {
+                worktree_path: Some("/repos/app-feature".into()),
+                pin_key: "app-feature".into(),
+                ..SidebarRow::base(RowKind::Worktree, 1, "feature", "app")
+            }],
+            ..Default::default()
+        };
+        let mut sb = SidebarState::default();
+        let menu = sb
+            .menu_for_cursor(&model, &crate::session::Session::default())
+            .expect("worktree menu");
+        assert!(menu.entries.iter().any(|entry| entry.id == "open-in-ide"));
+
+        assert!(matches!(
+            sb.run_menu_action(
+                "open-in-ide",
+                &mut model,
+                &crate::session::Session::default(),
+            ),
+            SidebarOutcome::OpenInIde { target, workspace_slug }
+                if target.worktree() == std::path::Path::new("/repos/app-feature")
+                    && workspace_slug == "app"
+        ));
     }
 }

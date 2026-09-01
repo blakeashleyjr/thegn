@@ -61,18 +61,28 @@ which case it ticks once a second.
 ## Status bar (bottom)
 
 - **Left:** the `?` help chip (click for the context-sensitive page `F1`
-  would give), the mode chip, and the contextual key hints — the keys that
+  would give), the mode chip, the removable `drawer` presence widget, and the contextual key hints — the keys that
   work _right now_, for whatever owns focus. The hints follow you: sidebar
   keys while the sidebar is focused, section keys while the panel is, and
   in the git-family sections only the keys that dispatch at the panel's
   current width (`e widen` stands in for the action keys at the resting
   width).
+
+The `drawer` widget is configured in `[bars].bottom_left` and is shipped
+before `keyhints`, so it remains visible when narrow terminals shed hints. It
+uses the folder glyph and the dim `drawer` label while closed; an open drawer
+uses the accent color and names its active occupant. A count is appended when
+more than one valid drawer occupant exists, and the built-in files occupant is
+always counted. Clicking the widget performs the same files-drawer toggle as
+`files-drawer`; it is not a separate focus zone.
+
 - **Right:** the `[bars] bottom_right` widgets (`pr`, `tests`, `loc`,
   `disk`, and `status` — the transient status message, which clears itself
   after a few seconds), then the badge cluster: the do-not-disturb / routing
   mode chip, the attention `✋` chip (or the quiet `✉` inbox count),
-  `offline`, CI, merge-queue (`⚑ N MQ`), PR-queue, disk-warn, share `⇅`,
-  media `▶`, zoom / max / `LOCKED` / `SYNC`.
+  `offline`, CI, PR-queue, disk-warn, share `⇅`, media `▶`, zoom / max /
+  `LOCKED` / `SYNC`. The merge queue is not in the default bar; add `"mq"`
+  to `bottom_right` for a compact scoped summary.
 - **Far right:** the always-on **daemon/status indicator** — a single glyph,
   no label. It is the one badge that is never silent, since it is a persistent
   affordance rather than an alert.
@@ -164,8 +174,8 @@ the sidebar dot and the `✋` chip and clears the moment you answer. It reaches
 the notification list only if you turn on
 `[notifications] agent_attention_inbox`.
 
-The `✋`/`✉` chip and the merge- and PR-queue chips all open the **one
-unified surface** — a single grouped list of _Needs you · Alerts · Merge
+The `✋`/`✉` chip, the opt-in `mq` widget, and the PR-queue chip all open the
+**one unified surface** — a single grouped list of _Needs you · Alerts · Merge
 queue · Notifications · Other repos · Logs_, sized to the terminal and
 showing **only unread** rows (read history lives in the panel's System ▸
 Notifications section behind its show-read toggle). Moving the cursor never
@@ -190,7 +200,7 @@ The `✋` chip, the "Needs you" list, and `Alt a` (jump to next) are **scoped
 to the active worktree's repo**, like the notification inbox — a sibling
 repo's failing CI shouldn't nag you in the repo you're working in. Nothing is
 hidden: worktrees elsewhere are counted as a dim `+N` beside the chip and
-listed under **Other repos**, still one `↵` away (which switches workspace if
+listed under **Other repos**, still one `↵` away (which switches project if
 the worktree's tab isn't open). A terminal tab scopes to its session's repo.
 Press `g` in the panel's System ▸ Notifications section to widen every scoped
 view to all worktrees, and again to narrow back.

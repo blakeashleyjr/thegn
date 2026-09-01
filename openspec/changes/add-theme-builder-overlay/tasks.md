@@ -23,23 +23,19 @@ Depends on `add-theme-contrast-contract` (`theme_contrast::audit`) for 3.4 and
 - [ ] 1.4 Extend the config fs-watch registration to the themes dir so an
       edited theme file live-reloads the palette.
 
-## 2. Import/export (pure core + CLI)
+## 2. Gogh import (pure core + CLI)
 
 - [ ] 2.1 New `crates/thegn-core/src/theme_import.rs`: minimal flat
-      `key: value` YAML-subset parser (one fixed nesting level for base16
-      `palette:`), panic-free, size-capped, no serde_yaml dependency.
+      `key: value` YAML-subset parser, panic-free, size-capped, no serde_yaml
+      dependency.
       Hostile-input unit tables: truncation, BOM, huge lines, escape bytes in
       values, non-UTF-8.
-- [ ] 2.2 Format detection + mapping: Gogh
-      (`color_01..16`/`background`/`foreground`/`variant`) and base16
-      (`base00..base0F`, flat and nested) → token `Palette` per the design's
-      mapping tables; `variant: light` flips surface derivation. Unit tests
-      with real fixture schemes (a Gogh dark, a Gogh light, a classic base16,
-      a nested base16) asserting light-stays-light and hue assignment.
-- [ ] 2.3 `thegn theme import <file> [--name <n>]` and
-      `thegn theme export <name>` in `cmd/theme.rs`; import writes the
-      user-theme file and prints the contrast-audit summary. List-shaped
-      output follows the CLI JSON emitter convention where applicable.
+- [ ] 2.2 Gogh mapping (`color_01..16`/`background`/`foreground`/`variant`)
+      → token `Palette` per the design's mapping table; `variant: light`
+      flips surface derivation. Unit tests with dark and light Gogh fixtures
+      assert light-stays-light and hue assignment.
+- [ ] 2.3 `thegn theme import <file> [--name <n>]` in `cmd/theme.rs`; import
+      writes the user-theme file and prints the contrast-audit summary.
 - [ ] 2.4 Fix the persist bug: one helper writing `[theme] preset` via
       `toml_edit` (not `theme.name`); `thegn theme set <name>` becomes
       non-interactive; drop the hard fzf/gum requirement. Smoke-test the
@@ -77,7 +73,7 @@ Depends on `add-theme-contrast-contract` (`theme_contrast::audit`) for 3.4 and
       `every_action_has_search_keywords`.
 - [ ] 4.2 New `docs/help/theming.md`: claims `theme-builder-open` (and
       `cycle-theme` if it migrates here), documents overlay keys, user
-      themes, import formats, contrast badges. Help ratchet + prose ratchet
+      themes, Gogh import, contrast badges. Help ratchet + prose ratchet
       stay shrink-only — no new allowlist entries.
 - [ ] 4.3 Document user-theme names for `[theme] preset` and the themes dir in
       `config/config.toml.example` (no new config keys).

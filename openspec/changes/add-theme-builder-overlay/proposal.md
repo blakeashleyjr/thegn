@@ -27,8 +27,8 @@ choices as the user makes them.
 
 THE-7 links Gogh (Gogh-Co/Gogh): ~400 MIT-licensed terminal schemes as flat
 YAML (`name`/`variant`/`color_01..16`/`background`/`foreground`/`cursor`).
-Users should be able to bring those (and base16 schemes) into thegn's
-token-palette world instead of hand-porting hex values.
+Users should be able to bring those Gogh schemes into thegn's token-palette
+world instead of hand-porting hex values.
 
 ## What Changes
 
@@ -52,13 +52,12 @@ token-palette world instead of hand-porting hex values.
   cycle, the builder); built-in names win collisions with a warning. Theme
   files ride the existing config fs-watch for live reload.
 - **Import**: `thegn theme import <file> [--name <n>]` and an in-overlay
-  import path accepting **Gogh YAML** and **base16 YAML** (classic flat and
-  `palette:`-nested). A pure `thegn-core` mapper converts 16-color +
-  bg/fg schemes into the token palette (surfaces blended from
-  background toward foreground mirroring `extend_palette`, ANSI/base08–0F
+  import path accepting **Gogh YAML**. A pure `thegn-core` mapper converts
+  16-color + bg/fg schemes into the token palette (surfaces blended from
+  background toward foreground mirroring `extend_palette`, ANSI values
   slots to the eight hues, `variant: light` flipping derivation), then runs
-  the contrast audit and reports warnings. Export writes the user-theme TOML
-  (`thegn theme export <name>`).
+  the contrast audit and reports warnings. There is no export command; saved
+  user-theme TOML is the only output format.
 - **Fix the persist bug**: theme selection writes `[theme] preset` (not the
   dead `theme.name`), via `toml_edit` so user comments survive; `thegn theme
 set` is repointed at the same write and its fzf/gum dependency dropped in
@@ -68,7 +67,7 @@ set` is repointed at the same write and its fzf/gum dependency dropped in
 ## Impact
 
 - **Linear**: THE-7.
-- **Roadmap**: group **N** — delivers **N 182** (Theme import/export/share)
+- **Roadmap**: group **N** — advances **N 182** (Theme import/export/share)
   and turns **N 172/173**'s config-only story into a UI; adjacent to
   **M 170** (palette preview/themes) but deliberately not inside the command
   palette.
@@ -78,12 +77,12 @@ set` is repointed at the same write and its fzf/gum dependency dropped in
   scoped as a pair.
 - **Specs**: `theming` — MODIFIED "Named presets with per-color overrides"
   (user themes join the preset namespace); ADDED requirements (builder
-  overlay, token editing with feedback, user themes on disk, import/export,
+  overlay, token editing with feedback, user themes on disk, Gogh import,
   correct persistence).
 - **Code**: `thegn-core/src/{theme_import.rs,theme_user.rs}` (pure parse/map +
   user-theme model; unit-tested, 95 % gate), `thegn-host/src/theme_builder.rs`
   (+ `handlers/theme_builder.rs`, a `run.rs` dispatch arm, `keymap.rs`
-  action + `keymap_specs.rs` spec), `cmd/theme.rs` (import/export/save, set
+  action + `keymap_specs.rs` spec), `cmd/theme.rs` (Gogh import/save, set
   fix). Host reads the themes dir off the loop and hands parsed themes to core
   — core stays substrate-free.
 - **Help/actions gates**: new action id(s) claimed by a new
@@ -111,5 +110,6 @@ set` is repointed at the same write and its fzf/gum dependency dropped in
   competitor.
 - **Non-goals**: fetching schemes over the network (import is local files
   only — no new network surface); a full color-picker widget (v1 is hex entry
-  - hue swatches); exporting _to_ Gogh/base16 formats; per-profile theme
+  - hue swatches); base16 support and export in either scheme format;
+    per-profile theme
     switching (N 174, blocked on profiles); theme plugins (N 204).

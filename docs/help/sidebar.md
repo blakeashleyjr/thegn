@@ -18,7 +18,7 @@ actions:
 
 # Sidebar
 
-The left tree: every workspace, its worktrees, and your standalone
+The left tree: every project, its worktrees, and your standalone
 terminals. `Alt-s` (or `Ctrl-←` from the leftmost pane) focuses it;
 `Ctrl-Alt-s` cycles it through three states: **full → rail → hidden**. The
 rail is a slim strip that keeps each row's activity dot and initial visible
@@ -28,18 +28,26 @@ tree. `q` or `Esc` returns to the terminal.
 ## Reading the tree
 
 The sidebar is tiered so a repo and its drawers never read the same. Each
-**workspace** header is the loudest row in the column — bold, in the accent
+**project** header is the loudest row in the column — bold, in the accent
 color, marked `◆` (`⌂` for a plain directory, `≡`/`⇅` for a terminal-host
 group) and sitting on its own recessed band. **Folder** headers are
 deliberately quieter: plain text, a faint `▪`, and the filed count grayed —
 a drawer inside the repo, not a repo itself. Worktree and terminal rows are
 the body of the tree.
 
-A blank separator row separates one workspace's block from the next, so
+A blank separator row separates one project's block from the next, so
 two open repos never run together (a click on it just selects the header
 below; it never folds anything). `[ui] sidebar_dividers = false` turns the
 separators off and restores the old dense layout; they also disappear while
 a `/` filter is active and never exist in the rail.
+
+When a project has active merge-queue entries, its full-mode header shows a
+compact token immediately before the warm-pool token: the count followed by a
+red blocked, amber working, or dim populated marker. Landed-only and empty
+queues stay quiet. The token is a shortcut to Work ▸ Merge queue; click it, or
+choose **Open merge queue** from the project's `m` menu. Narrow headers drop
+the count before hiding the marker, and the token is never painted in rail
+mode.
 
 ## Navigate
 
@@ -49,17 +57,17 @@ a `/` filter is active and never exist in the rail.
 - `←` / `h` — fold a header (from a row inside one: jump to the header);
   `→` / `l` — unfold
 - `/` — filter the tree (`↵` applies it; the next `Esc` or `q` clears it)
-- `Alt-1..9` / `Ctrl-1..9` — jump to worktree / workspace by slot. The
+- `Alt-1..9` / `Ctrl-1..9` — jump to worktree / project by slot. The
   `Ctrl-` digits need a terminal that reports modified keys; when it does
   not, thegn stops painting those digits — see [[terminal-compatibility]]
-- `Alt-\`` — bounce between the workspaces and terminals regions
+- `Alt-\`` — bounce between the projects and terminals regions
 - `q` or `Esc` — back to the terminal
 
 ## Create
 
-- `n` — new worktree in the workspace under the cursor (in the TERMINALS
+- `n` — new worktree in the project under the cursor (in the TERMINALS
   section: a new terminal)
-- `N` — new workspace
+- `N` — new project
 - `b` — branch a new worktree off the one under the cursor
 
 ## Organize
@@ -77,7 +85,7 @@ a `/` filter is active and never exist in the rail.
 `Shift-↑↓` moves the row under the cursor (or every marked row, as a
 block); `Ctrl-Alt-↑↓` moves one item and works from anywhere.
 
-A worktree moves within its **run** — the loose list under its workspace,
+A worktree moves within its **run** — the loose list under its project,
 or the folder it is filed into. Push it past the end of a run and it
 crosses into the next one, leaving or joining that folder as it goes: one
 key both reorders and re-files. `home` is anchored at the top of the loose
@@ -86,11 +94,11 @@ stepped over rather than entered, so a worktree can't vanish into a folder
 you have closed.
 
 Put the cursor on a folder header to reorder the folder itself among its
-workspace's folders — its worktrees travel with it. Workspace headers and
+project's folders — its worktrees travel with it. Project headers and
 terminals reorder among their own kind the same way.
 
 Manual reordering implies the manual sort, so a move under a computed sort
-(`s`) switches back to manual first. Order is saved per workspace and
+(`s`) switches back to manual first. Order is saved per project and
 restored on the next launch.
 
 ## Mouse
@@ -110,9 +118,9 @@ gesture below has a keyboard equivalent.
   worktree in that row's place — the row you drop on moves aside. Drop on the
   **last** row to land at the end. This works _inside_ a folder too, which
   files and positions it in one go; drop on a folder header to file it at the
-  end of that folder, or on its workspace header to move it back out. Drag a
-  folder header to reorder folders, or a workspace header to reorder
-  workspaces. Dragging across workspaces is refused, `home` stays anchored at
+  end of that folder, or on its project header to move it back out. Drag a
+  folder header to reorder folders, or a project header to reorder
+  projects. Dragging across projects is refused, `home` stays anchored at
   the top, and the insertion rule shows exactly where a release will land.
   Releasing anywhere inside the sidebar lands on the nearest row — the blank
   tail below the list puts the row at the end — and a release outside the
@@ -122,8 +130,8 @@ gesture below has a keyboard equivalent.
 
 While agents are dispatched, a compact `Pipeline ▸ N running` row sits at the
 bottom of the tree (`↵` or a click opens the pipeline board). Inside every
-workspace whose worktrees a pipeline has spawned, the tree also grows a
-**`Pipelines` folder** — one per workspace, at the tail of that workspace's own
+project whose worktrees a pipeline has spawned, the tree also grows a
+**`Pipelines` folder** — one per project, at the tail of that project's own
 tree — holding one folder per pipeline, named from the roster's issue id:
 
 ```
@@ -140,14 +148,14 @@ tree — holding one folder per pipeline, named from the roster's issue id:
 Every worktree the pipeline's roster rows reference hangs inside its lane
 folder. `↵` (or a double-click, or a click on the caret) folds and unfolds a
 group or a lane; `↵` on a worktree opens it, exactly as opening it from its
-normal row would — including switching workspace when the worktree belongs to
+normal row would — including switching project when the worktree belongs to
 another one.
 
 These folders are **derived, not real folders**. They come from the dispatch
 roster — its rows of **any** status, not only the live ones — so they survive a
 restart and a finished lane stays until its rows are removed from the roster.
 A worktree no roster row references stays exactly where it was; a lane thegn
-could not tie to any workspace groups under the door row at the bottom of the
+could not tie to any project groups under the door row at the bottom of the
 tree instead. So a lane cannot be renamed, reordered, pinned, marked or filed
 into, and the same worktree shows up once per lane that references it — the
 worktrees' own rows higher up the tree are untouched, a lane shows a second
@@ -189,7 +197,9 @@ Thresholds are tunable — see [[config-reference]] `[activity]`, and
 - `d` / `Del` — close or delete… (deleting files from disk is always the
   explicit second choice, never the default)
 - `c` — copy the worktree path
-- `m` — the full row action menu
+- `m` — the full row action menu; on a worktree row choose **Open in IDE** to
+  hand that exact worktree over without first switching to it. Dormant rows are
+  valid for a windowed IDE; a terminal-only editor asks you to focus the row.
 
 ## View
 
@@ -198,8 +208,8 @@ Thresholds are tunable — see [[config-reference]] `[activity]`, and
 - `?` — this page
 - `g` — flat / grouped: toggle between one list of every worktree across
   all repos (each tagged with its repo, ordered by the current `s` sort)
-  and the per-workspace grouping. Pair with the `s` → live sort to always
-  see the latest-changed worktree at the top, regardless of workspace
+  and the per-project grouping. Pair with the `s` → live sort to always
+  see the latest-changed worktree at the top, regardless of project
 - `i` — row detail: cycle the secondary line (branch, ahead/behind, PR)
   between **all** rows, the **cursor** row only, and **off**. The detail
   line only ever shows while the sidebar has focus. Defaults to the cursor
@@ -207,8 +217,8 @@ Thresholds are tunable — see [[config-reference]] `[activity]`, and
   how much of the tree fits. This overrides
   `sidebar_focus_detail` from [[config-reference]] `[ui]` and persists
 
-Workspace ordering is configurable: `sidebar_workspace_sort = "attention"`
-bubbles the workspace that most needs you to the top. See
+Project ordering is configurable: `sidebar_project_sort = "attention"`
+bubbles the project that most needs you to the top. See
 [[config-reference]] `[ui]`.
 
 ## Width
