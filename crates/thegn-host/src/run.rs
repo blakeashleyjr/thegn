@@ -6647,6 +6647,9 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    panel_ui
+        .media
+        .set_art_enabled(current_config.media.show_art);
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
     // subprocesses — is spawned only AFTER the first frame flushes (see the
@@ -10564,6 +10567,9 @@ async fn event_loop<T: Terminal>(
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
                     current_config = new_cfg;
+                    panel_ui
+                        .media
+                        .set_art_enabled(current_config.media.show_art);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded

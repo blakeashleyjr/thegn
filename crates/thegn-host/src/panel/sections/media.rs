@@ -157,7 +157,7 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
             );
         }
     }
-    if policy.show_art {
+    if policy.show_art && media.art_visible() {
         // Art is optional decoration and is intentionally not a hit target.
         if let Some(art) = &media.art {
             rows.extend(art.lines.iter().cloned().map(PanelRow::plain));
