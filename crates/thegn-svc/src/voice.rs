@@ -120,11 +120,7 @@ impl CommandVoiceProvider {
         // the configured bound.
         let deadline = Instant::now() + self.cfg.max_duration();
         let mut command = Command::new(&argv[0]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+        crate::plugin::proc::set_process_group(&mut command);
         let mut child = command
             .args(&argv[1..])
             .stdin(Stdio::piped())
@@ -326,16 +322,9 @@ fn try_recv<T>(rx: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
 }
 
 fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        // The command is its own process-group leader, so descendants cannot
-        // retain our pipes after cancellation or timeout.
-        let pid = child.id() as i32;
-        // best-effort: the child may have exited between try_wait and kill
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
+    // The command is isolated in the plugin process seam's process group/job,
+    // so descendants cannot retain our pipes after cancellation or timeout.
+    crate::plugin::proc::kill_group(child.id());
     let _ = child.kill(); // best-effort: the child may have exited already
     let _ = child.wait(); // best-effort: reap after termination
 }

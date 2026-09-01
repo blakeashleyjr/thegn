@@ -198,6 +198,15 @@ impl GroupHandle {
         )
         .ok();
     }
+
+    /// Best-effort hard termination of the whole process group.
+    pub fn kill(&self) {
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(self.pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .ok();
+    }
 }
 
 /// Spawn `cmd` in its own process group (Job Object on Windows) and return the
