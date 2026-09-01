@@ -121,7 +121,55 @@ pub(super) fn tab(input: TabInput) -> TabBuild {
         // cached `container_rows` mirrors that exact order, so `input.sel`
         // indexes the same row the key handler resolves.
         MonitorTab::Containers => containers(&cx, input.sel),
+        MonitorTab::Notifications => notifications(&cx),
     }
+}
+
+/// Build the conditional Notifications tab from the worker's counter-only
+/// snapshot. Endpoints and payloads never cross into the render model.
+fn notifications(cx: &Ctx<'_>) -> TabBuild {
+    let rows = cx.model.notification_delivery.rows();
+    if rows.is_empty() {
+        return plain(vec![heading(
+            "delivery",
+            Some("no configured sinks".into()),
+        )]);
+    }
+    let table_rows = rows
+        .into_iter()
+        .map(|row| {
+            let outcome_tone = if row.dead_letters > 0 {
+                Tok::Hue(Hue::Red)
+            } else {
+                Tok::Slot(S::Text)
+            };
+            vec![
+                Cell::Text(trunc(&row.name, 18), Tok::Slot(S::Text)),
+                Cell::Text(trunc(&row.kind, 10), Tok::Slot(S::Ghost)),
+                Cell::Text(row.queue_drops.to_string(), Tok::Slot(S::Dim)),
+                Cell::Text(row.rate_limit_drops.to_string(), Tok::Slot(S::Dim)),
+                Cell::Text(row.retries.to_string(), Tok::Slot(S::Dim)),
+                Cell::Text(row.sent.to_string(), Tok::Slot(S::Text)),
+                Cell::Text(row.dead_letters.to_string(), outcome_tone),
+            ]
+        })
+        .collect();
+    plain(vec![
+        heading("delivery", Some("bounded, best-effort".into())),
+        Section::Table(TableSection {
+            header: vec![
+                "sink".into(),
+                "kind".into(),
+                "queue drop".into(),
+                "rate drop".into(),
+                "retry".into(),
+                "sent".into(),
+                "dead-letter".into(),
+            ],
+            rows: table_rows,
+            sel: None,
+        }),
+    ])
 }
 
 /// Build the Disk tab's worktree-usage rows from the sidebar's `worktree_disk`
