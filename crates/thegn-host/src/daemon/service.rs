@@ -1115,6 +1115,225 @@ impl ControlApi for DaemonService {
         })
     }
 
+    /// `ci.runs`: cache-first run history. A provider miss is deliberately
+    /// isolated in `spawn_blocking`; control requests must never make the
+    /// daemon's async runtime wait on `gh`/`glab`.
+    fn ci_runs<'a>(
+        &'a self,
+        worktree: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, ControlResult<thegn_svc::control::CiRunsReply>> {
+        Box::pin(async move {
+            let requested = if limit == 0 {
+                self.config.ci.max_runs
+            } else {
+                limit
+            };
+            let path = if worktree.is_empty() {
+                std::env::current_dir().map_err(|e| ControlError::Internal(e.into()))?
+            } else {
+                std::path::PathBuf::from(worktree)
+            };
+            let path_string = path.to_string_lossy().into_owned();
+            self.confine_worktree(&path_string).await?;
+            let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
+            let cached = self
+                .with_db({
+                    let key = key.clone();
+                    move |db| {
+                        use thegn_core::store::CacheStore;
+                        db.get_ci_cache(&key)
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some((json, fetched_at)) = cached
+                && let Ok(mut runs) = serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json)
+            {
+                runs.truncate(requested);
+                return Ok(thegn_svc::control::CiRunsReply {
+                    worktree: path_string.clone(),
+                    runs: serde_json::to_value(runs).unwrap_or_default(),
+                    source: "cache".into(),
+                    fetched_at,
+                });
+            }
+
+            let cfg = self.config.ci.clone();
+            let provider_path = path.clone();
+            let fetched = tokio::task::spawn_blocking(move || {
+                let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
+                let client = thegn_svc::ci::provider_for(&loc, &cfg)
+                    .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
+                let branch = loc
+                    .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .filter(|branch| !branch.is_empty());
+                client
+                    .runs(&loc, branch.as_deref(), requested)
+                    .map_err(|error| anyhow::anyhow!("CI provider: {error}"))
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI runs task join: {e}")))?
+            .map_err(ControlError::Internal)?;
+            let fetched_at = thegn_core::util::now();
+            if let Ok(json) = serde_json::to_string(&fetched) {
+                let key_for_write = key.clone();
+                let _ = self
+                    .with_db(move |db| {
+                        use thegn_core::store::CacheStore;
+                        db.put_ci_cache(&key_for_write, "", &json)
+                    })
+                    .await;
+            }
+            Ok(thegn_svc::control::CiRunsReply {
+                worktree: path_string,
+                runs: serde_json::to_value(fetched).unwrap_or_default(),
+                source: "provider".into(),
+                fetched_at,
+            })
+        })
+    }
+
+    /// `ci.logs`: cache-first bounded log read. On a miss the provider call,
+    /// including its job-detail lookup, lives in the blocking lane and the
+    /// redacted/tail-capped entry is written only as a best-effort cache side
+    /// effect.
+    fn ci_logs<'a>(
+        &'a self,
+        worktree: &'a str,
+        run_id: &'a str,
+        job_id: &'a str,
+        tail_lines: Option<usize>,
+    ) -> BoxFuture<'a, ControlResult<thegn_svc::control::CiLogsReply>> {
+        Box::pin(async move {
+            let path = if worktree.is_empty() {
+                std::env::current_dir().map_err(|e| ControlError::Internal(e.into()))?
+            } else {
+                std::path::PathBuf::from(worktree)
+            };
+            let path_string = path.to_string_lossy().into_owned();
+            self.confine_worktree(&path_string).await?;
+            let key = thegn_core::remote::GitLoc::worktree_cache_key(&path);
+            let run_id_owned = run_id.to_string();
+            let job_id_owned = job_id.to_string();
+            let cached = self
+                .with_db({
+                    let key = key.clone();
+                    let run_id = run_id_owned.clone();
+                    let job_id = job_id_owned.clone();
+                    move |db| {
+                        use thegn_core::store::CacheStore;
+                        db.get_ci_log(&key, &run_id, &job_id)
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(mut entry) = cached {
+                if let Some(lines) = tail_lines {
+                    let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                        &entry.text,
+                        lines.min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                        thegn_core::ci_log::HARD_MAX_LOG_BYTES,
+                    );
+                    entry.text = text;
+                    entry.truncated |= truncated;
+                }
+                let fetched_at = entry.fetched_at;
+                let truncated = entry.truncated;
+                let redacted = entry.redacted;
+                return Ok(thegn_svc::control::CiLogsReply {
+                    worktree: path_string.clone(),
+                    run_id: run_id_owned,
+                    job_id: job_id_owned,
+                    logs: vec![serde_json::to_value(entry).unwrap_or_default()],
+                    source: "cache".into(),
+                    fetched_at,
+                    truncated,
+                    redacted,
+                });
+            }
+
+            let cfg = self.config.ci.clone();
+            let provider_path = path.clone();
+            let run_for_provider = run_id_owned.clone();
+            let job_for_provider = job_id_owned.clone();
+            let mut entry = tokio::task::spawn_blocking(move || {
+                let loc = thegn_core::remote::GitLoc::for_worktree(&provider_path);
+                let client = thegn_svc::ci::provider_for(&loc, &cfg)
+                    .ok_or_else(|| anyhow::anyhow!("no CI provider for this worktree"))?;
+                let detail = client.run_detail(&loc, &run_for_provider).ok();
+                let (job_name, head_sha) = detail
+                    .as_ref()
+                    .and_then(|run| {
+                        run.jobs
+                            .iter()
+                            .find(|job| job.id == job_for_provider)
+                            .map(|job| (job.name.clone(), run.sha.clone()))
+                    })
+                    .unwrap_or_default();
+                let raw = client
+                    .logs(&loc, &run_for_provider, &job_for_provider)
+                    .map_err(|error| anyhow::anyhow!("CI provider: {error}"))?;
+                let raw_truncated = raw.truncated;
+                let mut entry = thegn_core::ci_log::CiLogEntry::new(
+                    thegn_core::remote::GitLoc::worktree_cache_key(&provider_path),
+                    run_for_provider,
+                    job_for_provider,
+                    job_name,
+                    &raw.text,
+                    cfg.log_tail_lines
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                    cfg.log_max_bytes
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                    thegn_core::util::now(),
+                );
+                entry.truncated |= raw_truncated;
+                entry.head_sha = head_sha;
+                Ok::<_, anyhow::Error>(entry)
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("CI logs task join: {e}")))?
+            .map_err(ControlError::Internal)?;
+
+            if self.config.ci.log_cache_runs > 0 {
+                let entry_for_write = entry.clone();
+                let _ = self
+                    .with_db(move |db| {
+                        use thegn_core::store::CacheStore;
+                        db.put_ci_log(&entry_for_write)
+                    })
+                    .await;
+            }
+            if let Some(lines) = tail_lines {
+                let (text, truncated) = thegn_core::ci_log::bounded_tail(
+                    &entry.text,
+                    lines.min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                    self.config
+                        .ci
+                        .log_max_bytes
+                        .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                );
+                entry.text = text;
+                entry.truncated |= truncated;
+            }
+            let fetched_at = entry.fetched_at;
+            let truncated = entry.truncated;
+            let redacted = entry.redacted;
+            Ok(thegn_svc::control::CiLogsReply {
+                worktree: path_string,
+                run_id: run_id_owned,
+                job_id: job_id_owned,
+                logs: vec![serde_json::to_value(entry).unwrap_or_default()],
+                source: "provider".into(),
+                fetched_at,
+                truncated,
+                redacted,
+            })
+        })
+    }
+
     /// `notify.push`: append a tray notification, exactly like the other
     /// producers (`thegn notify push`, the hydration diff engines) — via
     /// [`thegn_core::store::NotificationStore::put_notification`]. Urgency

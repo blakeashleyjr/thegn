@@ -7,7 +7,8 @@
 
 use axum::routing::{MethodRouter, delete, get, post};
 
-use super::http::{self, ControlState};
+use super::http::ControlState;
+use super::{http, http_ci};
 
 /// One path. `caps` lists every capability the method router serves (a
 /// `GET`+`POST` path serves two); unauthenticated routes (`/health`, `GET
@@ -104,6 +105,8 @@ pub static ROUTES: &[Route] = &[
         post(http::merge_clear)
     }),
     route("/v1/pr/status", &["pr.status"], || get(http::pr_status)),
+    route("/v1/ci/runs", &["ci.runs"], || get(http_ci::ci_runs)),
+    route("/v1/ci/logs", &["ci.logs"], || get(http_ci::ci_logs)),
     route("/v1/agent/sessions", &["agent.sessions"], || {
         get(http::agent_sessions)
     }),
@@ -182,6 +185,8 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("merge.add", "POST", "/v1/merge/add"),
     ("merge.clear", "POST", "/v1/merge/clear"),
     ("pr.status", "GET", "/v1/pr/status"),
+    ("ci.runs", "GET", "/v1/ci/runs"),
+    ("ci.logs", "GET", "/v1/ci/logs"),
     ("agent.sessions", "GET", "/v1/agent/sessions"),
     ("notify.push", "POST", "/v1/notify"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
