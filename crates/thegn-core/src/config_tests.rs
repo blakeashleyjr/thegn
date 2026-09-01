@@ -1447,6 +1447,7 @@ fn metrics_env_overlay_clamps_runtime_bounds() {
 fn env_overlay_covers_every_knob() {
     let env = map_env(&[
         ("THEGN_WORKTREES_DIR", "/wt"),
+        ("THEGN_PROJECTS_DIR", "/ws"),
         ("THEGN_WORKSPACES_DIR", "/ws"),
         ("THEGN_BASE_BRANCH", "develop"),
         ("THEGN_BRANCH_PREFIX", "x/"),
@@ -1595,6 +1596,13 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.disk.shared_target_dir, "/tgt");
     assert!(c.weather.enabled);
     assert!(c.notifications.agent_attention_inbox);
+}
+
+#[test]
+fn legacy_projects_env_alias_is_still_accepted() {
+    let env = map_env(&[("THEGN_WORKSPACES_DIR", "/legacy-projects")]);
+    let c = Config::load_layered(&env, &[], None);
+    assert_eq!(c.workspaces_dir, "/legacy-projects");
 }
 
 #[test]

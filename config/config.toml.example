@@ -42,10 +42,16 @@
 
 # Where worktrees live (grouped per repo) and where remote URLs are cloned.
 worktrees_dir = "~/.thegn/worktrees"
-workspaces_dir = "~/code"
+projects_dir = "~/code"
+
+# Compatibility: workspaces_dir, [workspace.<slug>],
+# confirm_delete_workspace, sidebar_workspace_sort, and
+# THEGN_WORKSPACES_DIR remain accepted for 3 stable releases. Canonical values
+# win when both spellings are present; removal is planned for the fourth stable
+# release after introduction.
 
 # Roots scanned by the workspace repo picker (new-workspace / bare `thegn`).
-# Defaults to [workspaces_dir] if omitted.
+# Defaults to [projects_dir] if omitted.
 repo_roots = ["~/code", "~/src"]
 repo_scan_depth = 5
 
@@ -84,7 +90,7 @@ language = "auto"
 # "remove from thegn — keep all files"; deleting the branch worktree dirs
 # from disk is the explicit second choice. Set false to skip the prompt
 # (removal then keeps files; it never silently deletes from disk).
-confirm_delete_workspace = true
+confirm_delete_project = true
 # Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
 full_mode_chip = true
 # Left-click outside an open detail popup (a stat/badge overlay, e.g. the
@@ -98,7 +104,7 @@ dismiss_overlay_on_click_outside = true
 # *within* a workspace is the separate sidebar sort mode (`s` opens the sort
 # menu: manual/name/recent/attention; manual — rows stay where you put them —
 # is the default).
-sidebar_workspace_sort = "manual"
+sidebar_project_sort = "manual"
 # Sidebar TERMINALS section: "always" keeps the banner visible (with a
 # "no terminals" hint when empty) so the entry point never vanishes;
 # "nonempty" hides the whole section until a terminal exists.
@@ -1080,7 +1086,7 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
 # above [keybinds] but below a repo-root `.thegn.{toml,yaml,json}` overlay,
 # which may also carry its own [keybinds] table — the most specific layer wins.
-# [workspace.my-repo.keybinds]
+# [project.my-repo.keybinds]
 # new-worktree = "Alt w"
 
 # Per-program host-action overlays, keyed by the focused pane's program name.
@@ -1336,7 +1342,7 @@ command = "git diff"
 #
 # Make a repo default to an account (resolution: worktree override → this
 # workspace default → global active → the CLI's own default home):
-# [workspace.my-work-repo]
+# [project.my-work-repo]
 # accounts = { codex = "work", claude = "work" }
 # Bind extra directories into the sandbox for THIS workspace only (same format
 # as [sandbox] mounts below). These extend the global mounts; the global list is
