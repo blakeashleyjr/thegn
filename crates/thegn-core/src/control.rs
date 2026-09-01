@@ -387,6 +387,8 @@ pub enum Verb {
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
     ModelProxyStats,
+    /// Read bounded issue-autopilot run summaries. CLI-only; no remote route.
+    AutopilotStatus,
     /// Start (launch) the model proxy daemon.
     ModelProxyStart,
     /// Stop (terminate) the model proxy daemon.
@@ -472,6 +474,7 @@ impl Verb {
         Verb::AgentList,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
+        Verb::AutopilotStatus,
         Verb::ModelProxyStart,
         Verb::ModelProxyStop,
     ];
@@ -521,6 +524,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
+        | Verb::AutopilotStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -854,6 +858,7 @@ mod tests {
             AgentList,
             ModelProxyStatus,
             ModelProxyStats,
+            AutopilotStatus,
         ];
         let write = [
             OpenSession,

@@ -704,6 +704,15 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Stop the model proxy daemon",
     ),
+    // The supervisor's status view is intentionally local and read-only. A
+    // remote control route would need a process/session handle and an
+    // authenticated repository scope that do not exist in this surface.
+    cap(
+        "autopilot.status",
+        Verb::AutopilotStatus,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Report bounded issue-autopilot run summaries for a repository",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
