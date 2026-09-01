@@ -4709,6 +4709,7 @@ pub use crate::config_pr_queue::{
 pub struct Config {
     // --- scalar values (must serialize before any sub-table for TOML) ---
     pub worktrees_dir: String,
+    #[serde(rename = "projects_dir", alias = "workspaces_dir")]
     pub workspaces_dir: String,
     pub base_branch: String,
     pub window_margin: usize,
@@ -4890,8 +4891,9 @@ pub struct Config {
     /// independently (mix-and-match). See [`crate::identity`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub identities: std::collections::BTreeMap<String, IdentityConfig>,
-    /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
+    /// Per-project (one-repo) config keyed by repo slug (`[project.<slug>]`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(rename = "project", alias = "workspace")]
     pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
     /// Named execution environments (`[env.<name>]`) — the reusable library a
     /// workspace/repo/worktree selects from. See [`Config::resolve_env`].
@@ -5296,7 +5298,22 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     };
 
     o.worktrees_dir = env.get("THEGN_WORKTREES_DIR");
-    o.workspaces_dir = env.get("THEGN_WORKSPACES_DIR");
+    let canonical_projects_dir = env.get("THEGN_PROJECTS_DIR");
+    let legacy_workspaces_dir = env.get("THEGN_WORKSPACES_DIR");
+    if canonical_projects_dir.is_some() && legacy_workspaces_dir.is_some() {
+        config_warn(&format!(
+            "duplicate environment keys THEGN_PROJECTS_DIR and THEGN_WORKSPACES_DIR; using THEGN_PROJECTS_DIR (legacy accepted for {} stable releases; removal: {})",
+            crate::config_compat::LEGACY_RELEASE_WINDOW,
+            crate::config_compat::LEGACY_REMOVAL_RELEASE,
+        ));
+    } else if legacy_workspaces_dir.is_some() {
+        config_warn(&format!(
+            "THEGN_WORKSPACES_DIR is deprecated; use THEGN_PROJECTS_DIR (accepted for {} stable releases; removal: {})",
+            crate::config_compat::LEGACY_RELEASE_WINDOW,
+            crate::config_compat::LEGACY_REMOVAL_RELEASE,
+        ));
+    }
+    o.workspaces_dir = canonical_projects_dir.or(legacy_workspaces_dir);
     o.base_branch = env.get("THEGN_BASE_BRANCH");
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
     if let Some(v) = env.get("THEGN_PICKER") {
@@ -5623,7 +5640,11 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
         };
-        let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
+        let normalized = crate::config_compat::normalize(&s)?;
+        for diagnostic in &normalized.diagnostics {
+            config_warn(diagnostic);
+        }
+        let mut cfg: Config = toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
 
         // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
         // removed before the public alpha. A leftover section is harmless
@@ -5639,7 +5660,7 @@ impl Config {
         // this one key.
         static LEGACY_KEYS_WARNED: std::sync::Once = std::sync::Once::new();
         LEGACY_KEYS_WARNED.call_once(|| {
-            if let Ok(raw) = toml::from_str::<toml::Value>(&s)
+            if let Ok(raw) = toml::from_str::<toml::Value>(&normalized.body)
                 && raw.get("llm_proxy").is_some()
             {
                 config_warn("[llm_proxy] is no longer supported and is ignored");
@@ -5714,7 +5735,12 @@ impl Config {
     /// keys the overlay omits are preserved). The mechanism behind the profile
     /// (and later subprofile) full overlays. Pure + unit-tested.
     pub fn apply_toml_overlay(cfg: &mut Config, toml_str: &str) -> Result<(), String> {
-        let overlay: serde_json::Value = toml::from_str(toml_str).map_err(|e| format!("{e}"))?;
+        let normalized = crate::config_compat::normalize(toml_str)?;
+        for diagnostic in normalized.diagnostics {
+            config_warn(&diagnostic);
+        }
+        let overlay: serde_json::Value =
+            toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
         let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
         deep_merge_json(&mut base, overlay);
         *cfg = serde_json::from_value(base).map_err(|e| format!("{e}"))?;
@@ -5749,6 +5775,7 @@ impl Config {
     }
 
     pub(crate) fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
+        let key = crate::config_compat::canonical_key(key);
         if key == "apps.tab_order" {
             cfg.apps.tab_order = val
                 .split(',')
@@ -6347,9 +6374,10 @@ impl Config {
     /// Look up a dotted config key as a bare string (for `config get` and the
     /// plugin feed). `None` for an unknown key.
     pub fn get_dotted(&self, key: &str) -> Option<String> {
-        Some(match key {
+        let key = crate::config_compat::canonical_key(key);
+        Some(match key.as_str() {
             "worktrees_dir" => self.worktrees_dir.clone(),
-            "workspaces_dir" => self.workspaces_dir.clone(),
+            "projects_dir" => self.workspaces_dir.clone(),
             "base_branch" => self.base_branch.clone(),
             "branch_prefix" => self.branch_prefix.clone(),
             "picker" => self.picker.to_string(),
@@ -6429,7 +6457,7 @@ impl Config {
             // `[ui]`, `[drawer]`, `[placement]`, … which made `config get`
             // unusable for the entire nested surface even though `config
             // explain` resolved the same dotted paths fine.
-            _ => return self.value_at(key).map(render_scalar),
+            _ => return self.value_at(&key).map(render_scalar),
         })
     }
 
@@ -6439,7 +6467,8 @@ impl Config {
     /// `Value::Null` cannot — `config get` needs that to keep reporting an
     /// unknown key as an error.
     pub fn value_at(&self, key: &str) -> Option<serde_json::Value> {
-        let ptr = crate::config_resolve::dotted_to_pointer(key);
+        let key = crate::config_compat::canonical_key(key);
+        let ptr = crate::config_resolve::dotted_to_pointer(&key);
         serde_json::to_value(self).ok()?.pointer(&ptr).cloned()
     }
 }
