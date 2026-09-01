@@ -20935,6 +20935,40 @@ async fn event_loop<T: Terminal>(
                                 env_wizard_ui =
                                     Some(crate::env_wizard::EnvWizard::new(keymap.config()));
                             }
+                            Action::InstallToolchain => {
+                                let worktree = active_tab_path(&session);
+                                if !worktree.is_dir() {
+                                    model.status = "Toolchain install: no active worktree".into();
+                                } else {
+                                    let cfg = current_config.clone();
+                                    let refresh = refresh_tx.clone();
+                                    let wake = waker.clone();
+                                    model.status = "Installing worktree toolchain…".into();
+                                    task::spawn_blocking(move || {
+                                        let repo_root = thegn_core::repo::main_worktree(&worktree)
+                                            .unwrap_or_else(|| worktree.clone());
+                                        let message = match crate::mise_provider::install(
+                                            &cfg, &worktree, &repo_root,
+                                        ) {
+                                            Ok(()) => {
+                                                "Worktree toolchain installed; refreshing status"
+                                                    .to_string()
+                                            }
+                                            Err(reason) => format!("Toolchain install: {reason}"),
+                                        };
+                                        let priority = if message.starts_with("Toolchain install:")
+                                        {
+                                            thegn_core::notification::Priority::Notice
+                                        } else {
+                                            thegn_core::notification::Priority::Info
+                                        };
+                                        let _ =
+                                            refresh.send(RefreshKind::Toast { message, priority }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                        let _ = refresh.send(RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                        let _ = wake.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                    });
+                                }
+                            }
                             Action::SetupWizard => {
                                 onboarding.ui =
                                     Some(crate::onboarding::OnboardingWizard::new(keymap.config()));

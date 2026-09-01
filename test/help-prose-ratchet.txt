@@ -2,7 +2,3 @@
 # action in `actions:` frontmatter but never mentions it in the body.
 # Claiming an id must not substitute for writing about it.
 # This list may only SHRINK (or run `just help-ratchet-update`).
-#
-# Currently EMPTY, and worth keeping that way: the action ratchet only
-# checks that an id is *claimed*, which is how the corpus drifted while
-# coverage read ~100%.
