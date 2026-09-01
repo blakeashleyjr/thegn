@@ -4033,6 +4033,42 @@ organize_folders = true       # master switch for the folder automation
 queued_folder = "In review"   # file a worktree here when its PR is queued ("" ⇒ don't)
 failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ leave it be)
 
+# ── Issue autopilot (opt-in) ────────────────────────────────────────────────
+# Pick up issues returned by the provider's authenticated "my issues" query,
+# hand them to the configured generic coding agent, and bridge a verified
+# commit into a PR. The worker never pushes or merges; the existing PR queue
+# owns review, CI, and merge decisions. This supervisor is disabled by default.
+#
+# Repo-specific trusted settings belong under:
+#   [workspace.my-repo.autopilot]
+# A repository's `.thegn.*` overlay cannot enable or configure this section.
+[autopilot]
+enabled = false
+trigger_label = "agent-ready"  # exact, case-sensitive label
+assignee = "me"                # only the provider's authenticated user is supported
+pickup_status = "todo"
+max_concurrent = 1
+max_attempts = 1
+agent = ""                     # [[agents]] entry; empty uses no automatic worker
+agent_command = ""             # optional command template, e.g. 'claude -p {prompt}'
+agent_timeout_secs = 1800
+open_as = "ready"              # ready | draft
+done_on_merge = false           # update only this run's issue after a real merge
+
+# Example trusted per-repository refinement:
+# [workspace.my-repo.autopilot]
+# enabled = true
+# trigger_label = "agent-ready"
+# assignee = "me"
+# pickup_status = "todo"
+# max_concurrent = 1
+# max_attempts = 1
+# agent = "claude"
+# agent_command = ""
+# agent_timeout_secs = 1800
+# open_as = "ready"
+# done_on_merge = false
+
 # What the agent is told, per blocker kind. Empty ⇒ thegn's built-in instructions
 # (which require a `--force-with-lease` push and forbid merging, closing, or —
 # for review feedback — resolving the reviewer's threads). Prose, not shell:

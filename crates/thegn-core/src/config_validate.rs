@@ -49,6 +49,13 @@ pub fn validate_str(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            errs.extend(cfg.autopilot.validate("autopilot"));
+            for (slug, ws) in &cfg.workspace {
+                errs.extend(
+                    ws.autopilot
+                        .validate(&format!("workspace.{slug}.autopilot")),
+                );
+            }
             // `[[presets]]` semantic checks (empty preset, template `preset`
             // exclusivity) — strings to the schema, so only checkable post-parse.
             errs.extend(crate::config_presets::validate_presets(&cfg));
@@ -166,6 +173,13 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         check(key, template, kind.prompt_vars(), false);
     }
 
+    check(
+        "autopilot.agent_command",
+        &cfg.autopilot.agent_command,
+        COMMAND_VARS,
+        true,
+    );
+
     // The per-repo layer carries the same keys, so it needs the same check —
     // otherwise a bad template hides in a `[workspace.<slug>]` block until that
     // repo happens to drain.
@@ -174,6 +188,14 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         if let Some(c) = p.agent_command.as_deref() {
             check(
                 &format!("workspace.{slug}.pr_queue.agent_command"),
+                c,
+                COMMAND_VARS,
+                true,
+            );
+        }
+        if let Some(c) = ws.autopilot.agent_command.as_deref() {
+            check(
+                &format!("workspace.{slug}.autopilot.agent_command"),
                 c,
                 COMMAND_VARS,
                 true,
@@ -622,9 +644,10 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
+        // 90 → 91 (THE-56): `[autopilot] open_as` (AutopilotOpenAs).
         assert_eq!(
             defs.len(),
-            90,
+            91,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

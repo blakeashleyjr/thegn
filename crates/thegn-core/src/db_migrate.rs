@@ -622,7 +622,46 @@ pub(crate) fn additive_schema(conn: &Connection) {
            text           TEXT    NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
-           ON agent_dispatch_notes (dispatch_id, created_at_ms);",
+         ON agent_dispatch_notes (dispatch_id, created_at_ms);",
+    );
+    // v63: the issue-autopilot claim/correlation journal. This is deliberately
+    // a fresh table: the existing issue cache and dispatch roster have
+    // different ownership and status semantics. The unique constraint makes
+    // concurrent refreshes lose a claim race instead of creating duplicates.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS autopilot_runs (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           provider TEXT NOT NULL,
+           account TEXT NOT NULL,
+           issue_id TEXT NOT NULL,
+           repo_root TEXT NOT NULL,
+           worktree TEXT,
+           branch TEXT,
+           base_branch TEXT,
+           state TEXT NOT NULL,
+           attempt INTEGER NOT NULL DEFAULT 1,
+           dispatch_id INTEGER,
+           pr_number INTEGER,
+           pr_head TEXT,
+           pr_url TEXT,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           claimed_at INTEGER,
+           finished_at INTEGER,
+           last_reason TEXT,
+           UNIQUE(provider, account, issue_id)
+         )",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_autopilot_runs_repo_state
+         ON autopilot_runs (repo_root, state, updated_at)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_autopilot_runs_repo_pr
+         ON autopilot_runs (repo_root, pr_number)",
+        [],
     );
 }
 
@@ -645,6 +684,7 @@ fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
 /// Verify that contract before `Db::init` stamps the schema version; otherwise
 /// a disk/lock/schema error swallowed by the historical ladder would make a
 /// broken upgrade look complete on the next open.
+#[cfg(test)]
 pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
     // Preparing the projection catches a missing `report` column without
     // reading any user payload.
@@ -670,6 +710,34 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
         .optional()?;
     if notes_index.is_none() {
         anyhow::bail!("schema v61 migration did not create the dispatch notes index");
+    }
+    Ok(())
+}
+
+/// Verify the v63 autopilot claim journal before `Db::init` stamps the schema
+/// version. The unique index is part of the claim contract: without it a
+/// concurrent refresh could start two runs for one issue.
+pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
+    conn.prepare("SELECT provider, account, issue_id, state FROM autopilot_runs LIMIT 0")?;
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='autopilot_runs'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if table.as_deref() != Some("table") {
+        anyhow::bail!("schema v63 migration did not create autopilot_runs");
+    }
+    let unique: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name LIKE 'sqlite_autoindex_autopilot_runs_%' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if unique.is_none() {
+        anyhow::bail!("schema v63 migration did not create the autopilot claim index");
     }
     Ok(())
 }

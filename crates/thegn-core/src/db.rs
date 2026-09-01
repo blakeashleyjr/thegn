@@ -133,7 +133,12 @@ use std::path::PathBuf;
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-pub const SCHEMA_VERSION: i64 = 61;
+///
+/// v62 is reserved by THE-27 and THE-48, whose migrations are reconciled when
+/// those branches land. v63 adds `autopilot_runs`, the provider-qualified
+/// issue claim/correlation journal. It is additive and never replaces the
+/// existing dispatch roster or issue cache.
+pub const SCHEMA_VERSION: i64 = 63;
 
 pub struct Db {
     conn: Connection,
@@ -836,6 +841,35 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_pr_queue_repo
               ON pr_queue (repo_root, status, queued_at);
+            -- autopilot_runs (v63): durable issue claim/correlation journal.
+            -- The provider/account/issue tuple is the unique consent claim;
+            -- dispatches remain the worker roster and are correlated by id.
+            CREATE TABLE IF NOT EXISTS autopilot_runs (
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              provider     TEXT NOT NULL,
+              account      TEXT NOT NULL,
+              issue_id     TEXT NOT NULL,
+              repo_root    TEXT NOT NULL,
+              worktree     TEXT,
+              branch       TEXT,
+              base_branch  TEXT,
+              state        TEXT NOT NULL,
+              attempt      INTEGER NOT NULL DEFAULT 1,
+              dispatch_id  INTEGER,
+              pr_number    INTEGER,
+              pr_head      TEXT,
+              pr_url       TEXT,
+              created_at   INTEGER NOT NULL,
+              updated_at   INTEGER NOT NULL,
+              claimed_at   INTEGER,
+              finished_at  INTEGER,
+              last_reason  TEXT,
+              UNIQUE(provider, account, issue_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_autopilot_runs_repo_state
+              ON autopilot_runs (repo_root, state, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_autopilot_runs_repo_pr
+              ON autopilot_runs (repo_root, pr_number);
             -- usage_samples (v53): AI-account rate-limit history, one row per
             -- (account, window) per poll. Feeds the usage section's trend
             -- sparkline and the "you'll hit the cap at …" forecast. `account_key`
@@ -931,7 +965,7 @@ impl Db {
         )?;
         crate::db_migrate::additive_schema(&conn);
         if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v61_schema(&conn)?;
+            crate::db_migrate::verify_v63_schema(&conn)?;
         }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
