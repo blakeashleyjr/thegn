@@ -397,6 +397,7 @@ pub fn classify_repo_overlay(
         default_env,
         main_env,
         backend_chain,
+        devcontainer,
         image,
         profile,
         on_dormant,
@@ -458,6 +459,23 @@ pub fn classify_repo_overlay(
         "sandbox.backend_chain",
         "a repo may not reorder the backend fallback chain"
     );
+    // The repo may opt out of reading its own devcontainer file, but may not
+    // use the overlay to turn a trusted user's opt-out back on.
+    if let Some(v) = devcontainer {
+        if v == crate::config::DevcontainerMode::Off
+            || base.devcontainer == crate::config::DevcontainerMode::Auto
+        {
+            out.devcontainer = Some(v);
+        } else {
+            events.push(ClampEvent::deny(
+                layer,
+                "sandbox.devcontainer",
+                RepoFieldRule::Floor,
+                json!(v.to_string()),
+                "a repo may disable devcontainer reading but may not override a trusted opt-out",
+            ));
+        }
+    }
     forbid!(
         default_env,
         "sandbox.default_env",
@@ -1086,6 +1104,11 @@ impl Config {
                     let before = self.issues.issue_accounts.len();
                     self.issues.issue_accounts.retain(|a| !is_exp(a.provider));
                     was |= self.issues.issue_accounts.len() != before;
+                    was
+                }
+                Feature::Voice => {
+                    let was = self.voice.enabled;
+                    self.voice.enabled = false;
                     was
                 }
             };

@@ -717,6 +717,27 @@ fn sandbox_profile_defaults_and_env_overlay() {
     assert_eq!(base.profile, SandboxProfile::Open);
 }
 
+#[test]
+fn devcontainer_mode_round_trips_and_repo_can_only_opt_out() {
+    let cfg: Config = toml::from_str("[sandbox]\ndevcontainer = \"off\"\n").unwrap();
+    assert_eq!(cfg.sandbox.devcontainer, DevcontainerMode::Off);
+    assert_eq!(
+        DevcontainerMode::from_str_validated("auto").unwrap(),
+        DevcontainerMode::Auto
+    );
+
+    let base = SandboxConfig::default();
+    let granted = crate::config_resolve::classify_repo_overlay(
+        SandboxOverlay {
+            devcontainer: Some(DevcontainerMode::Off),
+            ..Default::default()
+        },
+        &base,
+        &crate::config_resolve::Approvals::deny_all(),
+    );
+    assert_eq!(granted.sanctioned.devcontainer, Some(DevcontainerMode::Off));
+}
+
 // The same overlay expressed in each format must produce identical results,
 // and only the present keys override the global defaults.
 #[test]
@@ -2973,6 +2994,7 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     cfg.host.insert("gpu".into(), Default::default());
     cfg.issues.provider = K::Linear;
     cfg.issues.providers = vec![K::Linear, K::Github, K::Kaneo];
+    cfg.voice.enabled = true;
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
@@ -2984,6 +3006,7 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     // Trackers: GitHub survives, Linear/Kaneo are dropped.
     assert_eq!(cfg.issues.provider, K::None);
     assert_eq!(cfg.issues.providers, vec![K::Github]);
+    assert!(!cfg.voice.enabled);
     // Every gated feature reports as clamped.
     assert_eq!(clamped.len(), Feature::ALL.len());
 }
@@ -2993,6 +3016,7 @@ fn clamp_to_channel_is_a_noop_in_dev() {
     use crate::channel::Channel;
     let mut cfg = Config::default();
     cfg.observe.enabled = true;
+    cfg.voice.enabled = true;
     cfg.sandbox.remote.host = "box.example".into();
     let before = cfg.clone();
 
@@ -3000,6 +3024,7 @@ fn clamp_to_channel_is_a_noop_in_dev() {
 
     assert!(clamped.is_empty(), "dev honours every feature");
     assert_eq!(cfg.observe.enabled, before.observe.enabled);
+    assert_eq!(cfg.voice.enabled, before.voice.enabled);
     assert_eq!(cfg.sandbox.remote.host, before.sandbox.remote.host);
 }
 

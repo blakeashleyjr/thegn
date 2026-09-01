@@ -24,19 +24,29 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::MediaConfig;
-use thegn_core::media::MediaState;
+use thegn_core::media::{MediaSnapshot, MediaState};
+
+/// A now-playing result tagged with the watcher/config/player generation that
+/// produced it. The tag is captured before a producer starts async work, so a
+/// late result cannot overwrite a newer selection.
+#[derive(Debug, Clone)]
+pub(crate) struct MediaSnapshotDelivery {
+    pub(crate) generation: u64,
+    pub(crate) snapshot: Option<MediaSnapshot>,
+}
 
 /// Spawn the now-playing watcher for `cfg`. Returns the task handle so the caller
 /// can abort it on a config/player change; `None` when media is disabled.
 pub(crate) fn spawn(
     cfg: MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    generation: u64,
+    tx: tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.enabled {
         return None;
     }
-    Some(tokio::spawn(run(cfg, tx, waker)))
+    Some(tokio::spawn(run(cfg, generation, tx, waker)))
 }
 
 /// Grace applied on the badge active→inactive edge before we believe a player
@@ -71,8 +81,8 @@ fn flap_action(was_showing: bool, new_active: bool) -> FlapAction {
 }
 
 /// Read one snapshot, logging read errors instead of swallowing them.
-async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaState> {
-    match client.snapshot().await {
+async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaSnapshot> {
+    match client.snapshot_with_caps().await {
         Ok(snap) => snap,
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "media snapshot failed");
@@ -82,8 +92,8 @@ async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaState> 
 }
 
 /// Whether a snapshot would render a badge (i.e. an active player).
-fn shows_badge(snap: &Option<MediaState>) -> bool {
-    snap.as_ref().and_then(|s| s.badge()).is_some()
+fn shows_badge(snap: &Option<MediaSnapshot>) -> bool {
+    snap.as_ref().and_then(|s| s.state.badge()).is_some()
 }
 
 /// Read a snapshot and push it to the loop, suppressing a *transient*
@@ -95,7 +105,8 @@ fn shows_badge(snap: &Option<MediaState>) -> bool {
 /// gone and the task should stop.
 async fn push_snapshot(
     client: &thegn_media::MediaClient,
-    tx: &tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    generation: u64,
+    tx: &tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
     waker: &TerminalWaker,
     was_showing: bool,
 ) -> Option<bool> {
@@ -111,7 +122,13 @@ async fn push_snapshot(
         snap = confirm;
     }
     let active = shows_badge(&snap);
-    if tx.send(snap).is_err() {
+    if tx
+        .send(MediaSnapshotDelivery {
+            generation,
+            snapshot: snap,
+        })
+        .is_err()
+    {
         return None;
     }
     let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -133,7 +150,8 @@ fn note_cleared(prev_active: bool, now_active: bool) {
 
 async fn run(
     cfg: MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    generation: u64,
+    tx: tokio_mpsc::UnboundedSender<MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) {
     let period = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
@@ -152,7 +170,7 @@ async fn run(
         backoff = std::time::Duration::from_secs(1);
 
         // Initial snapshot. Nothing is shown yet, so no disappear to confirm.
-        let mut active = match push_snapshot(&client, &tx, &waker, false).await {
+        let mut active = match push_snapshot(&client, generation, &tx, &waker, false).await {
             Some(a) => a,
             None => return, // receiver gone
         };
@@ -176,7 +194,7 @@ async fn run(
                 if !changed {
                     break true; // signal stream ended → reconnect
                 }
-                match push_snapshot(&client, &tx, &waker, active).await {
+                match push_snapshot(&client, generation, &tx, &waker, active).await {
                     Some(a) => {
                         note_cleared(active, a);
                         active = a;
@@ -196,7 +214,7 @@ async fn run(
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
-                match push_snapshot(&client, &tx, &waker, active).await {
+                match push_snapshot(&client, generation, &tx, &waker, active).await {
                     Some(a) => {
                         note_cleared(active, a);
                         active = a;
@@ -214,8 +232,8 @@ async fn run(
 /// Repaint discipline: a `Playing` snapshot ticks its position several times a
 /// second, and a full chrome recompose per tick is a self-sustaining flicker
 /// storm (and an idle-CPU violation). So repaint only what the snapshot moves
-/// on screen: while the Media panel section or Now-Playing overlay is open
-/// (`coalesce_full` — they show the live position stamp) coalesce full frames
+/// on screen: while the Media panel section is open (`coalesce_full` — it shows
+/// the live position stamp) coalesce full frames
 /// to ~1/s, repainting immediately only when the statusbar badge text changed;
 /// with both closed, a badge change takes the cheap bars path and a
 /// position-only change repaints nothing.
@@ -223,39 +241,31 @@ async fn run(
 /// Returns `(full, bars)` repaint intent for the loop's `dirty` / `bars_dirty`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_snapshots(
-    rx: &mut tokio_mpsc::UnboundedReceiver<Option<MediaState>>,
+    rx: &mut tokio_mpsc::UnboundedReceiver<MediaSnapshotDelivery>,
     perf: &mut crate::perf::LoopPerf,
     enabled: bool,
-    show_art: bool,
+    generation: u64,
     media: &mut Option<MediaState>,
-    overlay: &mut Option<crate::media_overlay::MediaOverlay>,
-    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
-    waker: &TerminalWaker,
+    caps: &mut Option<thegn_core::media::MediaCaps>,
     coalesce_full: bool,
     last_full: &mut Option<std::time::Instant>,
 ) -> (bool, bool) {
     let (mut full, mut bars) = (false, false);
-    while let Ok(snap) = rx.try_recv() {
+    while let Ok(delivery) = rx.try_recv() {
         perf.tick(crate::perf::WakeSource::Refresh);
-        let shown = if enabled { snap } else { None };
-        if *media == shown {
+        if delivery.generation != generation {
+            continue;
+        }
+        let shown = if enabled { delivery.snapshot } else { None };
+        let shown_state = shown.as_ref().map(|snapshot| snapshot.state.clone());
+        let shown_caps = shown.as_ref().map(|snapshot| snapshot.caps);
+        if *media == shown_state && *caps == shown_caps {
             continue;
         }
         let badge_changed =
-            media.as_ref().and_then(|m| m.badge()) != shown.as_ref().and_then(|m| m.badge());
-        *media = shown;
-        if let Some(ov) = overlay.as_mut() {
-            ov.snapshot = media.clone();
-            if let Some(url) = ov.wants_art(show_art) {
-                crate::media_art::spawn_fetch(
-                    url,
-                    crate::media_overlay::ART_COLS,
-                    crate::media_overlay::ART_ROWS,
-                    art_tx.clone(),
-                    waker.clone(),
-                );
-            }
-        }
+            media.as_ref().and_then(|m| m.badge()) != shown_state.as_ref().and_then(|m| m.badge());
+        *media = shown_state;
+        *caps = shown_caps;
         if coalesce_full {
             if badge_changed
                 || last_full
@@ -274,7 +284,10 @@ pub(crate) fn drain_snapshots(
 
 #[cfg(test)]
 mod tests {
-    use super::{FlapAction, flap_action};
+    use tokio::sync::mpsc;
+
+    use super::{FlapAction, MediaSnapshotDelivery, drain_snapshots, flap_action};
+    use thegn_core::media::{MediaCaps, MediaSnapshot, MediaState};
 
     #[test]
     fn confirms_only_on_the_disappear_edge() {
@@ -286,5 +299,55 @@ mod tests {
         assert_eq!(flap_action(false, true), FlapAction::Emit);
         // Already hidden and still empty → emit (no repeated re-confirm loop).
         assert_eq!(flap_action(false, false), FlapAction::Emit);
+    }
+
+    #[test]
+    fn stale_snapshot_after_restart_cannot_replace_current_generation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut perf = crate::perf::LoopPerf::new();
+        let mut media = None;
+        let mut caps = None;
+        let mut last_full = None;
+        let current = MediaSnapshot {
+            state: MediaState {
+                player: "new-player".into(),
+                title: "new-track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        let stale = MediaSnapshot {
+            state: MediaState {
+                player: "old-player".into(),
+                title: "old-track".into(),
+                ..Default::default()
+            },
+            caps: MediaCaps::default(),
+        };
+        tx.send(MediaSnapshotDelivery {
+            generation: 1,
+            snapshot: Some(current.clone()),
+        })
+        .unwrap();
+        tx.send(MediaSnapshotDelivery {
+            generation: 0,
+            snapshot: Some(stale),
+        })
+        .unwrap();
+
+        drain_snapshots(
+            &mut rx,
+            &mut perf,
+            true,
+            1,
+            &mut media,
+            &mut caps,
+            false,
+            &mut last_full,
+        );
+
+        assert_eq!(media, Some(current.state));
+        assert_eq!(caps, Some(current.caps));
+        assert!(last_full.is_none());
     }
 }
