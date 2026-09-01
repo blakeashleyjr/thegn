@@ -1966,6 +1966,35 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "output device",
         ],
     },
+    ActionSpec {
+        id: "voice-toggle",
+        label: "Voice: toggle recording",
+        hint: "voice",
+        default_chords: &["Alt v"],
+        palette: true,
+        keywords: &[
+            "voice",
+            "record",
+            "dictation",
+            "speech to text",
+            "transcribe",
+            "microphone",
+        ],
+    },
+    ActionSpec {
+        id: "voice-cancel",
+        label: "Voice: cancel recording/transcription",
+        hint: "voice cancel",
+        default_chords: &["Alt V"],
+        palette: true,
+        keywords: &[
+            "voice cancel",
+            "cancel recording",
+            "discard dictation",
+            "stop voice",
+            "abort transcription",
+        ],
+    },
     // Notification routing (items 426/427).
     ActionSpec {
         id: "notify-dnd-toggle",

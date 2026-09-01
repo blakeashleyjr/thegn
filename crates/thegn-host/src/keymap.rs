@@ -284,6 +284,10 @@ pub enum Action {
     MediaSelectPlaylist,
     /// Open the picker to choose which player to control.
     MediaSelectPlayer,
+    /// Toggle command-backed voice capture for the focused pane.
+    VoiceToggle,
+    /// Cancel voice capture or an in-flight transcription.
+    VoiceCancel,
     /// Toggle do-not-disturb (quiet notifications) on/off (item 426).
     NotifyDndToggle,
     /// Cycle the active notification routing mode (item 427).
@@ -613,6 +617,8 @@ impl Action {
             Action::MediaOpenPanel => "media-open-panel",
             Action::MediaSelectPlaylist => "media-select-playlist",
             Action::MediaSelectPlayer => "media-select-player",
+            Action::VoiceToggle => "voice-toggle",
+            Action::VoiceCancel => "voice-cancel",
             Action::NotifyDndToggle => "notify-dnd-toggle",
             Action::NotifyModeCycle => "notify-mode-cycle",
             Action::JumpAttention => "attention-next",
@@ -759,6 +765,8 @@ impl Action {
             "media-open-panel" | "media-panel" | "media-now-playing" => Action::MediaOpenPanel,
             "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
             "media-select-player" | "media-player" => Action::MediaSelectPlayer,
+            "voice-toggle" | "voice" => Action::VoiceToggle,
+            "voice-cancel" | "voice-stop" => Action::VoiceCancel,
             "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
             "notify-mode-cycle" | "notify-mode" => Action::NotifyModeCycle,
             "attention-next" | "jump-attention" => Action::JumpAttention,
@@ -1460,6 +1468,10 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt m v", Action::MediaFullscreen).unwrap();
     map.insert_all("Alt m ]", Action::MediaChapterNext).unwrap();
     map.insert_all("Alt m [", Action::MediaChapterPrev).unwrap();
+    // Experimental voice mode: toggle-to-talk. Esc is handled specially only
+    // while recording, so ordinary overlay Escape behavior remains intact.
+    map.insert_all("Alt v", Action::VoiceToggle).unwrap();
+    map.insert_all("Alt V", Action::VoiceCancel).unwrap();
     map.insert_all("Ctrl Alt d", Action::NotifyDndToggle)
         .unwrap();
     map.insert_all("Ctrl Alt m", Action::NotifyModeCycle)

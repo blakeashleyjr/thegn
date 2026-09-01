@@ -94,6 +94,9 @@ pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
         // changes on its own — the two things a byte-identical frame cannot
         // survive. Off entirely while frozen, like `[usage]` and `[media]`.
         cfg.weather.enabled = false;
+        // Voice is an explicit microphone/process surface; deterministic runs
+        // must remain idle and must never launch a user command.
+        cfg.voice.enabled = false;
     }
 }
 
@@ -171,5 +174,6 @@ mod tests {
         apply_to_config(&mut cfg);
         assert!(cfg.disk.show_sizes, "sizes stay on outside the freeze");
         assert!(cfg.loc.enabled, "LOC stays on outside the freeze");
+        assert!(!cfg.voice.enabled, "voice defaults off outside the freeze");
     }
 }
