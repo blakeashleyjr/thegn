@@ -181,23 +181,7 @@ fn apply_mode_status(
     // The mode chip always shows.
     crate::handlers::status_line::apply_mode(model, mode);
 
-    if config.ui.full_mode_chip {
-        model.mode_chip = match mode {
-            crate::keymap::Mode::Normal => "NORMAL",
-            crate::keymap::Mode::VimNormal => "VIM NORMAL",
-            crate::keymap::Mode::VimInsert => "VIM INSERT",
-            crate::keymap::Mode::Emacs => "EMACS",
-        }
-        .into();
-    } else {
-        model.mode_chip = match mode {
-            crate::keymap::Mode::Normal => "N",
-            crate::keymap::Mode::VimNormal => "V",
-            crate::keymap::Mode::VimInsert => "I",
-            crate::keymap::Mode::Emacs => "E",
-        }
-        .into();
-    }
+    model.mode_chip = crate::voice::mode_chip(mode, config.ui.full_mode_chip, false);
 }
 
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
@@ -232,7 +216,7 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 /// queued chunk, so a congestion drop ([`crate::pane_writer::StdinSendError::Full`]) can never
 /// leave the app inside an open paste bracket, and no keystroke can land
 /// between the markers.
-fn paste_text_into_pane(
+pub(crate) fn paste_text_into_pane(
     pane: &mut crate::pane::PtyPane,
     text: &str,
 ) -> Result<(), crate::pane_writer::StdinSendError> {
@@ -6648,6 +6632,7 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    let mut voice = crate::voice::VoiceController::new(current_config.voice.clone());
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
     // subprocesses — is spawned only AFTER the first frame flushes (see the
@@ -10388,6 +10373,7 @@ async fn event_loop<T: Terminal>(
         );
         dirty |= media_full;
         bars_dirty |= media_bars;
+        dirty |= crate::handlers::voice::drain(&mut voice, &mut panes, focused, &mut model, &waker);
         // Media picker results: open a secondary palette of playlists / players.
         while let Ok(pick) = media_pick_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
@@ -10535,6 +10521,12 @@ async fn event_loop<T: Terminal>(
                     help_registry =
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
+                    crate::handlers::voice::reconfigure(
+                        &mut voice,
+                        new_cfg.voice.clone(),
+                        &mut model,
+                        &waker,
+                    );
                     current_config = new_cfg;
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
@@ -11270,6 +11262,8 @@ async fn event_loop<T: Terminal>(
         model.zoomed = zoom.is_some();
         model.maximized = maximized;
         model.sync_panes = sync_panes;
+        model.mode_chip =
+            crate::voice::mode_chip(mode, current_config.ui.full_mode_chip, voice.is_recording());
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
         model.sidebar_hints =
             crate::sidebar_keytable::footer_hints(keymap.config(), model.ctrl_digits_reportable);
@@ -13859,6 +13853,15 @@ async fn event_loop<T: Terminal>(
                 }
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
                 let k = normalize_key(k);
+                // Escape cancels an active utterance before any modal or pane
+                // sees it. While idle it remains available to every existing
+                // overlay, preserving their established behavior.
+                if voice.is_recording() && crate::input::is_escape_key(&k.key) {
+                    model.status = crate::handlers::voice::cancel(&mut voice, &waker);
+                    keymap.reset();
+                    dirty = true;
+                    continue;
+                }
                 // The help overlay is modal: it owns every key while open.
                 if let Some(h) = help_overlay.as_mut() {
                     match h.handle_key(&k.key, k.modifiers) {
@@ -18951,6 +18954,21 @@ async fn event_loop<T: Terminal>(
                             };
                         }
                         match action {
+                            Action::VoiceToggle => {
+                                model.status = crate::handlers::voice::toggle(
+                                    &mut voice,
+                                    focused,
+                                    panes.table.contains_key(&focused),
+                                    start.elapsed().as_millis() as u64,
+                                    &waker,
+                                );
+                            }
+                            Action::VoiceCancel => {
+                                let note = crate::handlers::voice::cancel(&mut voice, &waker);
+                                if !note.is_empty() {
+                                    model.status = note;
+                                }
+                            }
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();

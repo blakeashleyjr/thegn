@@ -224,6 +224,7 @@ mod terminal_wizard;
 mod testenv;
 mod testkit;
 mod toast;
+mod voice;
 mod vps_bridge;
 mod vps_reaper;
 mod warmcache;

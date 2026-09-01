@@ -35,6 +35,7 @@ pub mod sessions;
 pub mod share;
 pub mod snapshot;
 pub mod usage;
+pub mod voice;
 pub mod vpn;
 pub mod vps;
 pub mod weather;
