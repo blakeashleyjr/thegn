@@ -4371,7 +4371,10 @@ keep_hours = 24                # sweep drops older than this on the next paste (
 #   • macOS   → AppleScript via `osascript` — Music.app + Spotify.
 # Force a specific backend with `mpris` / `smtc` / `applescript`, or `mpv` to
 # drive a single mpv instance over its JSON IPC socket (see [media.mpv]).
-# `jellyfin` is reserved. A backend selected on the wrong OS is simply inert.
+# `spotify` and `jellyfin` are reserved. Spotify desktop/spotifyd control is
+# already available through MPRIS on Linux, SMTC on Windows, and AppleScript on
+# macOS; the reserved Spotify kind does not read credentials or use the network.
+# A backend selected on the wrong OS is simply inert.
 #
 # Only the selected backend's sub-table is consulted. On by default; it degrades
 # to inert (no badge, no panel section, no watcher) wherever no supported player
@@ -4379,7 +4382,7 @@ keep_hours = 24                # sweep drops older than this on the next paste (
 # make every media-* keybind inert — zero idle cost.
 [media]
 enabled = true
-# auto | none | mpris | mpv | mpd | smtc | applescript | jellyfin
+# auto | none | mpris | mpv | mpd | smtc | applescript | spotify | jellyfin
 # "auto" composes EVERY source reachable on this OS and shows whatever is actually
 # playing — on Linux that's MPRIS (browsers/Spotify/VLC/mpv-with-mpv-mpris) + native
 # MPD (mpd/mpc/rmpc/ncmpcpp, no mpd-mpris bridge needed) + a live mpv IPC socket, all
@@ -4397,10 +4400,11 @@ volume_step = 0.05
 # larger step, matching the coarser skipping people expect from a video player.
 seek_step_secs = 10
 seek_step_video_secs = 30
-# Render cover art in the Now-Playing overlay (Alt-m) when the backend exposes it
+# Render cover art in the docked Now-Playing panel (Alt-m) when the backend exposes it
 # and the terminal supports kitty/sixel graphics; otherwise a block-glyph mosaic.
 show_art = true
-# Open the Now-Playing overlay when the statusbar media badge is clicked.
+# Open/focus the docked System ▸ Media panel when the statusbar media badge is clicked.
+# (The compatibility key retains its historical name.)
 overlay_on_badge_click = true
 # Fallback poll cadence (seconds) for backends WITHOUT a push stream (a live mpv
 # IPC socket / playerctl). Native MPRIS (D-Bus signals), native MPD (`idle`),

@@ -25,6 +25,7 @@ pub mod gitfull;
 pub mod gitui;
 pub mod graph;
 pub mod hints;
+pub(crate) mod media;
 pub mod rollback;
 pub mod scope;
 pub mod section_keys;
@@ -102,9 +103,30 @@ pub enum PanelHit {
     Expand,
     /// The i-th actionable row of a section's content.
     Row(Section, usize),
+    /// A painted media transport control. Unlike a row, this is a direct
+    /// operation target and is shared by keyboard and mouse dispatch.
+    MediaAction(MediaAction),
     /// A click on the tab bar: resolved by x-position via `panel_tab_hit`.
     #[allow(dead_code)]
     Tab(PanelTab),
+}
+
+/// Transport controls painted by the Media section. The panel owns only the
+/// intent; `media_ctl` owns the provider dispatch and keeps it off the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaAction {
+    PlayPause,
+    Next,
+    Previous,
+    Shuffle,
+    Loop,
+    VolumeUp,
+    VolumeDown,
+    SeekForward,
+    SeekBack,
+    ChapterNext,
+    ChapterPrev,
+    Fullscreen,
 }
 
 /// One of the accordion sections, in built-in display order.
@@ -984,6 +1006,9 @@ pub struct PanelUi {
     /// The Help section's state: which page is docked, and the registry it
     /// renders from (installed at startup, refreshed on config reload).
     pub help: HelpPanelState,
+    /// Interactive state for the docked Media section: source/queue cursors
+    /// and identity-checked asynchronous decoration.
+    pub(crate) media: media::MediaPanelState,
     /// The live accordion order (config-resolved, possibly trimmed) across ALL
     /// tabs. Sections are filtered to the active tab before display.
     /// The numbered jump keys index the ACTIVE TAB's slice. Never empty.
@@ -1075,6 +1100,7 @@ impl Default for PanelUi {
         PanelUi {
             tests: TestPanelState::default(),
             help: HelpPanelState::default(),
+            media: media::MediaPanelState::default(),
             order: SECTION_ORDER.to_vec(),
             tab: PanelTab::default(),
             open: Section::default(),
