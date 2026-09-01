@@ -100,21 +100,19 @@ skipped with a warning rather than failing startup or reload.
 - **THEN** it is skipped with a warning naming the file and the remaining
   themes load normally
 
-### Requirement: Terminal color schemes import from Gogh and base16 formats
+### Requirement: Terminal color schemes import from Gogh
 
 thegn SHALL import terminal color schemes in Gogh YAML format
-(`color_01..color_16`, `background`, `foreground`, `variant`) and base16 YAML
-format (`base00..base0F`, both classic flat and `palette:`-nested), from a
-local file via `thegn theme import <file> [--name <n>]` and from the builder
-overlay, mapping the scheme onto the token palette with a pure, unit-tested
-converter in `thegn-core` (a scheme's light variant MUST yield a light
-palette). The import MUST run the contrast-contract audit on the mapped result
-and report failing pairs as warnings, MUST cap the input file size and parse
-untrusted input without panicking, and MUST funnel every color through hex
-parsing to numeric channels so an imported file cannot inject terminal escape
-sequences. A named user theme SHALL be exportable back to the user-theme file
-form via `thegn theme export <name>`. Import is local-file only; no network
-access is performed.
+(`color_01..color_16`, `background`, `foreground`, `variant`) from a local
+file via `thegn theme import <file> [--name <n>]` and from the builder overlay,
+mapping the scheme onto the token palette with a pure, unit-tested converter
+in `thegn-core` (a scheme's light variant MUST yield a light palette). The
+import MUST run the contrast-contract audit on the mapped result and report
+failing pairs as warnings, MUST cap the input file size and parse untrusted
+input without panicking, and MUST funnel every color through hex parsing to
+numeric channels so an imported file cannot inject terminal escape sequences.
+Saved user themes use the user-theme TOML form; there is no export command.
+Import is local-file only; no network access is performed.
 
 #### Scenario: Importing a Gogh scheme
 

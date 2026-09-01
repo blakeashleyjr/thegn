@@ -1,5 +1,6 @@
 use super::super::*;
 use super::{map_env, tmpdir};
+use crate::seam::Kind;
 
 #[test]
 fn config_enum_defaults_and_displays() {
@@ -17,6 +18,7 @@ fn config_enum_defaults_and_displays() {
     assert_eq!(LogFormat::default(), LogFormat::Text);
     assert_eq!(PinLocation::default(), PinLocation::Tab);
     assert_eq!(PinScope::default(), PinScope::Global);
+    assert_eq!(DrawerScope::default(), DrawerScope::Worktree);
     assert_eq!(GitCmdOutput::default(), GitCmdOutput::Popup);
     assert_eq!(IssueProviderKind::default(), IssueProviderKind::None);
 
@@ -133,10 +135,10 @@ fn notification_priority_defaults_and_overrides() {
     // deliberately absent: a PR waiting on a colleague is the normal resting
     // state, and a permanently red badge teaches people to ignore it.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 8);
+    assert_eq!(alerts.len(), 9);
     let want = "agent_failed agent_attention test_failed \
                     process_failed queue_needs_human pr_queue_needs_human \
-                    resource_alert usage_limit";
+                    resource_alert usage_limit automation_failed";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }
@@ -606,6 +608,16 @@ fn media_config_defaults_and_enums() {
         MediaBackendKind::from_str_validated("osascript").unwrap(),
         MediaBackendKind::AppleScript
     );
+    assert!(MediaBackendKind::Spotify.is_reserved());
+    assert!(MediaBackendKind::from_str_validated("spotify").is_err());
+    let spotify_cfg = MediaConfig {
+        backend: MediaBackendKind::Spotify,
+        ..Default::default()
+    };
+    assert_eq!(
+        spotify_cfg.resolve_opts().backend,
+        thegn_media::BackendKind::Spotify
+    );
 
     // Native MPD backend: alias parses, config exposes a default endpoint, and
     // resolve_opts lowers the backend + endpoint into the leaf's ResolveOpts.
@@ -644,7 +656,7 @@ fn bars_config_defaults() {
         ]
     );
     // "help" is the clickable `?` chip, first so it is never trimmed away.
-    assert_eq!(b.bottom_left, vec!["help", "keyhints"]);
+    assert_eq!(b.bottom_left, vec!["help", "drawer", "keyhints"]);
     assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
     assert_eq!(b.date_format, "%a %b %-d");
     assert_eq!(b.clock_format, "%H:%M");
@@ -950,6 +962,7 @@ fn config_overlay_apply_sets_every_field() {
         picker: Some(Picker::Fzf),
         git_backend: Some(GitBackendKind::Cli),
         git_structural_diff: Some(StructuralDiff::Difft),
+        editor_provider: Some(EditorProvider::Zed),
         editor_command: Some("hx {path}".into()),
         editor_open_in: Some(EditorOpenIn::External),
         worktree_mode: Some(WorktreeMode::InRepo),
@@ -980,6 +993,8 @@ fn config_overlay_apply_sets_every_field() {
         diagnostics_crash_reports: Some(false),
         diagnostics_crash_retention: Some(4),
         diagnostics_ring_size: Some(64),
+        database_migration_authority: Some(MigrationAuthority::Disabled),
+        database_migration_executable: Some("/opt/thegn/bin/thegn".into()),
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
         activity_runaway_core_fraction: Some(0.75),
@@ -999,6 +1014,16 @@ fn config_overlay_apply_sets_every_field() {
         loc_watch_invalidate_secs: Some(11),
         weather_enabled: Some(true),
         notifications_agent_attention_inbox: Some(true),
+        skills_enabled: Some(false),
+        skills_user_dirs: Some(vec!["/skills".into()]),
+        skills_exclude: Some(vec!["mq".into()]),
+        preview: crate::config_preview::PreviewOverlay {
+            enabled: Some(false),
+            ports: Some(vec![3000, 5173]),
+            fetch_timeout_ms: Some(850),
+            max_body_bytes: Some(8192),
+            allow_external_urls: Some(true),
+        },
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -1014,6 +1039,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.picker, Picker::Fzf);
     assert_eq!(cfg.git.backend, GitBackendKind::Cli);
     assert_eq!(cfg.git.structural_diff, StructuralDiff::Difft);
+    assert_eq!(cfg.editor.provider, EditorProvider::Zed);
     assert_eq!(cfg.editor.command, "hx {path}");
     assert_eq!(cfg.editor.open_in, EditorOpenIn::External);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
@@ -1042,6 +1068,11 @@ fn config_overlay_apply_sets_every_field() {
     assert!(!cfg.diagnostics.crash_reports);
     assert_eq!(cfg.diagnostics.crash_retention, 4);
     assert_eq!(cfg.diagnostics.ring_size, 64);
+    assert_eq!(
+        cfg.database.migration_authority,
+        MigrationAuthority::Disabled
+    );
+    assert_eq!(cfg.database.migration_executable, "/opt/thegn/bin/thegn");
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
     assert_eq!(cfg.activity.runaway_core_fraction, 0.75);
@@ -1061,6 +1092,14 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(cfg.weather.enabled);
     assert!(cfg.notifications.agent_attention_inbox);
+    assert!(!cfg.skills.enabled);
+    assert_eq!(cfg.skills.user_dirs, vec!["/skills"]);
+    assert_eq!(cfg.skills.exclude, vec!["mq"]);
+    assert!(!cfg.preview.enabled);
+    assert_eq!(cfg.preview.ports, vec![3000, 5173]);
+    assert_eq!(cfg.preview.fetch_timeout_ms, 850);
+    assert_eq!(cfg.preview.max_body_bytes, 8192);
+    assert!(cfg.preview.allow_external_urls);
     assert!(!cfg.sandbox.enabled);
 }
 
@@ -1187,6 +1226,7 @@ fn env_overlay_metrics_rejects_non_finite_floats() {
 #[test]
 fn env_overlay_bad_enum_values_yield_none() {
     let env = map_env(&[
+        ("THEGN_EDITOR_PROVIDER", "bogus"),
         ("THEGN_WORKTREE_MODE", "bogus"),
         ("THEGN_NAME_SCHEME", "bogus"),
         ("THEGN_LOG_LEVEL", "bogus"),
@@ -1196,6 +1236,7 @@ fn env_overlay_bad_enum_values_yield_none() {
         ("THEGN_SANDBOX_ON_MISSING", "bogus"),
     ]);
     let o = env_overlay(&env);
+    assert_eq!(o.editor_provider, None);
     assert_eq!(o.worktree_mode, None);
     assert_eq!(o.name_scheme, None);
     assert_eq!(o.log_level, None);
@@ -1731,6 +1772,24 @@ hints = [{ key = "q", label = "quit" }]
     assert_eq!(cfg.tools[0].hints.len(), 1);
     assert_eq!(cfg.tools[0].hints[0].key, "q");
     assert_eq!(cfg.tools[0].hints[0].label, "quit");
+}
+
+#[test]
+fn named_command_drawer_metadata_parses_and_defaults() {
+    let legacy: Config =
+        toml::from_str("[[tools]]\nname = 'legacy'\ncommand = 'legacy'\n").unwrap();
+    assert_eq!(legacy.tools[0].drawer_scope, None);
+    assert_eq!(legacy.tools[0].drawer_cwd, None);
+
+    let configured: Config = toml::from_str(
+        "[[tools]]\nname = 'atac'\ncommand = 'atac'\ndrawer_scope = 'worktree'\ndrawer_cwd = '.atac'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        configured.tools[0].drawer_scope,
+        Some(DrawerScope::Worktree)
+    );
+    assert_eq!(configured.tools[0].drawer_cwd.as_deref(), Some(".atac"));
 }
 
 #[test]

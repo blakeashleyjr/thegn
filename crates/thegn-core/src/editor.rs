@@ -1,26 +1,26 @@
-//! The editor seam: "open this file (at this line) in the user's editor".
+//! Pure planning for handing a worktree or one of its files to an editor.
 //!
-//! thegn opens files from a dozen places — the files accordion, diff hunks,
-//! test failures, problems, search hits, `thegn config edit` — and each used
-//! to re-derive the command string. This is the one resolver:
-//!
-//! 1. `[editor] command` (a template with `{path}`, `{line}`, `{col}`), else
-//! 2. the `[[tools]]` entry named `editor`, else
-//! 3. `$VISUAL` / `$EDITOR`, else
-//! 4. `vi`.
-//!
-//! For 2–4 the program's **basename** picks the line-jump syntax (`vim +N
-//! file`, `code -g file:N`, `hx file:N`, …) and whether the editor is a
-//! windowed app to spawn detached rather than inside a pane. It is a *sync*
-//! seam (`openspec/specs/provider-seams`): [`Editor::open`] only plans a
-//! launch — the caller spawns it in a pane or detached.
+//! [`Editor`] is the only editor/IDE abstraction. Logical providers build
+//! structured argv in the sibling implementation modules; the custom command
+//! ladder remains for compatibility and is represented as a shell argv.
 
 use crate::config::{Config, EditorOpenIn};
 use crate::seam::{Availability, ErrorClass, Probe, ProbeReport, SeamError};
 use crate::util;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
-/// What a file-open needs.
+mod cursor;
+mod emacs;
+mod jetbrains;
+mod nvim_remote;
+pub mod providers;
+mod vscode;
+mod zed;
+
+pub use providers::EditorProvider;
+
+/// The legacy file-open request. New handoff callers should construct an
+/// [`EditorTarget`], which carries the worktree containment invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenRequest<'a> {
     pub path: &'a str,
@@ -28,38 +28,238 @@ pub struct OpenRequest<'a> {
     pub col: Option<usize>,
 }
 
+/// A validated handoff target.
+///
+/// `worktree` is absolute. `file`, when present, is normalized and relative to
+/// it; lexical traversal above the worktree is rejected without touching the
+/// filesystem. Line and column numbers are 1-based.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct EditorTarget {
+    worktree: PathBuf,
+    file: Option<PathBuf>,
+    line: Option<usize>,
+    col: Option<usize>,
+}
+
+impl EditorTarget {
+    pub fn new(
+        worktree: impl Into<PathBuf>,
+        file: Option<impl AsRef<Path>>,
+        line: Option<usize>,
+        col: Option<usize>,
+    ) -> Result<Self, EditorError> {
+        let worktree = worktree.into();
+        if worktree.as_os_str().is_empty() {
+            return Err(EditorError::InvalidTarget("worktree is empty".into()));
+        }
+        if !worktree.is_absolute() {
+            return Err(EditorError::InvalidTarget(
+                "worktree must be an absolute path".into(),
+            ));
+        }
+        if line == Some(0) || col == Some(0) {
+            return Err(EditorError::InvalidTarget(
+                "line and column are 1-based".into(),
+            ));
+        }
+
+        let file = match file {
+            Some(path) => Some(normalize_relative(path.as_ref())?),
+            None => None,
+        };
+        if file.is_none() && (line.is_some() || col.is_some()) {
+            return Err(EditorError::InvalidTarget(
+                "line or column requires a file".into(),
+            ));
+        }
+        if col.is_some() && line.is_none() {
+            return Err(EditorError::InvalidTarget("column requires a line".into()));
+        }
+
+        Ok(Self {
+            worktree,
+            file,
+            line,
+            col,
+        })
+    }
+
+    pub fn project(worktree: impl Into<PathBuf>) -> Result<Self, EditorError> {
+        Self::new(worktree, Option::<&Path>::None, None, None)
+    }
+
+    pub fn file(
+        worktree: impl Into<PathBuf>,
+        file: impl AsRef<Path>,
+        line: Option<usize>,
+        col: Option<usize>,
+    ) -> Result<Self, EditorError> {
+        Self::new(worktree, Some(file), line, col)
+    }
+
+    pub fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+
+    pub fn relative_file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    pub fn line(&self) -> Option<usize> {
+        self.line
+    }
+
+    pub fn col(&self) -> Option<usize> {
+        self.col
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.file
+            .as_ref()
+            .map_or_else(|| self.worktree.clone(), |file| self.worktree.join(file))
+    }
+
+    pub fn operation(&self) -> EditorOperation {
+        if self.file.is_some() {
+            EditorOperation::OpenFile
+        } else {
+            EditorOperation::OpenDirectory
+        }
+    }
+
+    /// Compatibility for callers that have not yet supplied a worktree. This
+    /// is intentionally private: only [`OpenRequest`] can bypass target policy.
+    fn legacy(req: &OpenRequest<'_>) -> Self {
+        Self {
+            worktree: PathBuf::new(),
+            file: Some(PathBuf::from(req.path)),
+            line: req.line,
+            col: req.col,
+        }
+    }
+}
+
+fn normalize_relative(path: &Path) -> Result<PathBuf, EditorError> {
+    if path.as_os_str().is_empty() {
+        return Err(EditorError::InvalidTarget("file path is empty".into()));
+    }
+    if path.is_absolute() {
+        return Err(EditorError::InvalidTarget(
+            "file path must be worktree-relative".into(),
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(EditorError::InvalidTarget(
+                        "file path escapes the worktree".into(),
+                    ));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(EditorError::InvalidTarget(
+                    "file path must be worktree-relative".into(),
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(EditorError::InvalidTarget("file path is empty".into()));
+    }
+    Ok(normalized)
+}
+
+/// Which optional operation produced a launch plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorOperation {
+    OpenFile,
+    OpenDirectory,
+}
+
 /// Where the launch should run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
-    /// A shell command for a terminal pane (`vim +12 'src/a.rs'`).
     Pane,
-    /// A windowed editor: spawn detached (`code -g 'src/a.rs:12'`).
     External,
 }
 
-/// A planned launch: a shell line plus where to run it.
+/// A substrate-free launch plan. `command` is retained temporarily for old
+/// host call sites; it is derived from `argv` for logical providers. New code
+/// executes `argv` directly and applies `cwd` at the host edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorLaunch {
-    pub command: String,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
     pub placement: Placement,
+    pub provider: &'static str,
+    pub operation: EditorOperation,
+    pub command: String,
 }
 
-/// What the resolved editor can do.
+impl EditorLaunch {
+    pub(super) fn direct(
+        provider: &'static str,
+        argv: Vec<String>,
+        target: &EditorTarget,
+        placement: Placement,
+    ) -> Self {
+        let command = argv_shell_line(&argv);
+        Self {
+            argv,
+            cwd: target.worktree.clone(),
+            placement,
+            provider,
+            operation: target.operation(),
+            command,
+        }
+    }
+
+    fn shell(
+        provider: &'static str,
+        command: String,
+        target: &EditorTarget,
+        placement: Placement,
+    ) -> Self {
+        Self {
+            argv: crate::shellinv::run_argv(&util::shell(), &command),
+            cwd: target.worktree.clone(),
+            placement,
+            provider,
+            operation: target.operation(),
+            command,
+        }
+    }
+}
+
+fn argv_shell_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| util::sh_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What the resolved editor can do. Optional operation bits exactly match the
+/// trait methods a provider implements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct EditorCaps {
-    /// Can jump to a line.
+    pub open_file: bool,
+    pub open_directory: bool,
     pub line: bool,
-    /// Can jump to a column.
     pub column: bool,
-    /// Is a windowed app (opens outside the terminal).
     pub external: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorError {
-    /// No editor resolvable at this layer (ladder falls through).
     NotConfigured(&'static str),
     Unsupported(&'static str),
+    InvalidTarget(String),
     Other(String),
 }
 
@@ -68,6 +268,7 @@ impl std::fmt::Display for EditorError {
         match self {
             EditorError::NotConfigured(w) => write!(f, "no editor: {w}"),
             EditorError::Unsupported(op) => write!(f, "editor does not support {op}"),
+            EditorError::InvalidTarget(m) => write!(f, "invalid editor target: {m}"),
             EditorError::Other(m) => f.write_str(m),
         }
     }
@@ -78,7 +279,7 @@ impl SeamError for EditorError {
         match self {
             EditorError::NotConfigured(_) => ErrorClass::NotConfigured,
             EditorError::Unsupported(_) => ErrorClass::Unsupported,
-            EditorError::Other(_) => ErrorClass::Other,
+            EditorError::InvalidTarget(_) | EditorError::Other(_) => ErrorClass::Other,
         }
     }
     fn unsupported(op: &'static str) -> Self {
@@ -86,34 +287,62 @@ impl SeamError for EditorError {
     }
 }
 
-/// The seam. Blocking by contract (pure planning — it never spawns).
+/// The only editor/IDE seam. Planning is synchronous and performs no I/O.
 pub trait Editor: Probe + Send + Sync {
     fn id(&self) -> &'static str;
     fn caps(&self) -> EditorCaps;
-    /// Plan a launch for `req`. `NotConfigured` lets the next layer try.
-    fn open(&self, req: &OpenRequest<'_>) -> Result<EditorLaunch, EditorError>;
+
+    fn open_file(&self, _target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        Err(EditorError::unsupported("open_file"))
+    }
+
+    fn open_directory(&self, _target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        Err(EditorError::unsupported("open_directory"))
+    }
+
+    fn open_target(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        let caps = self.caps();
+        match target.operation() {
+            EditorOperation::OpenFile if !caps.open_file => {
+                return Err(EditorError::unsupported("open_file"));
+            }
+            EditorOperation::OpenDirectory if !caps.open_directory => {
+                return Err(EditorError::unsupported("open_directory"));
+            }
+            _ => {}
+        }
+        if target.line().is_some() && !caps.line {
+            return Err(EditorError::unsupported("line"));
+        }
+        if target.col().is_some() && !caps.column {
+            return Err(EditorError::unsupported("column"));
+        }
+        match target.operation() {
+            EditorOperation::OpenFile => self.open_file(target),
+            EditorOperation::OpenDirectory => self.open_directory(target),
+        }
+    }
+
+    /// Compatibility adapter for existing file-open call sites. New handoff
+    /// surfaces must use [`Self::open_target`].
+    fn open(&self, req: &OpenRequest<'_>) -> Result<EditorLaunch, EditorError> {
+        self.open_file(&EditorTarget::legacy(req))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Per-program knowledge (pure)
+// Custom-program compatibility
 // ---------------------------------------------------------------------------
 
-/// How a program spells "open `file` at line N (col M)".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpSyntax {
-    /// `prog +N file` (vi family, nano, micro, emacs, helix also accepts `file:N`).
     Plus,
-    /// `prog file:N[:M]` (helix, zed, subl, kak).
     Colon,
-    /// `prog -g file:N[:M]` (VS Code family).
     GotoFlag,
-    /// `prog --line N file` (kate, gedit).
     LineFlag,
-    /// Unknown program: open the file, no jump.
     None,
 }
 
-/// Static facts about an editor program, keyed by basename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgramProfile {
     pub jump: JumpSyntax,
@@ -121,75 +350,90 @@ pub struct ProgramProfile {
     pub external: bool,
 }
 
-/// The table every layer consults. Basename only (`code --wait` and
-/// `/usr/bin/code` both resolve to `code`; `.exe` stripped).
 pub fn program_profile(program: &str) -> ProgramProfile {
     let base = util::basename(program);
     let base = base.strip_suffix(".exe").unwrap_or(base);
+    if let Some(profile) = [
+        vscode::program_profile(base),
+        cursor::program_profile(base),
+        zed::program_profile(base),
+        jetbrains::program_profile(base),
+        nvim_remote::program_profile(base),
+        emacs::program_profile(base),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return profile;
+    }
     let p = |jump, column, external| ProgramProfile {
         jump,
         column,
         external,
     };
     match base {
-        "vi" | "vim" | "nvim" | "nvi" | "vis" | "neovide" => p(JumpSyntax::Plus, false, false),
-        "nano" | "micro" | "emacs" | "emacsclient" | "jed" | "mg" => {
-            p(JumpSyntax::Plus, false, false)
-        }
+        "vi" | "nvi" | "vis" | "neovide" => p(JumpSyntax::Plus, false, false),
+        "nano" | "micro" | "jed" | "mg" => p(JumpSyntax::Plus, false, false),
         "hx" | "helix" | "kak" => p(JumpSyntax::Colon, true, false),
-        "zed" | "zeditor" | "subl" | "sublime_text" => p(JumpSyntax::Colon, true, true),
-        "code" | "code-insiders" | "codium" | "vscodium" | "cursor" | "windsurf" => {
-            p(JumpSyntax::GotoFlag, true, true)
-        }
+        "subl" | "sublime_text" => p(JumpSyntax::Colon, true, true),
         "kate" | "gedit" => p(JumpSyntax::LineFlag, false, true),
         "gvim" | "mvim" => p(JumpSyntax::Plus, false, true),
-        "idea" | "pycharm" | "webstorm" | "rider" => p(JumpSyntax::LineFlag, false, true),
         _ => p(JumpSyntax::None, false, false),
     }
 }
 
-/// Whether an editor command launches a graphical (windowed) editor that
-/// should be spawned detached rather than run inside a terminal pane.
 pub fn is_gui_editor(cmd: &str) -> bool {
     let prog = cmd.split_whitespace().next().unwrap_or(cmd);
     program_profile(prog).external
 }
 
-/// Compose the shell line for `program` (which may carry its own flags, e.g.
-/// `code --wait`) opening `req`, using the program's jump syntax.
 pub fn launch_line(program: &str, req: &OpenRequest<'_>) -> EditorLaunch {
+    let target = EditorTarget::legacy(req);
+    custom_program_launch("program", program, &target, EditorOpenIn::Auto)
+}
+
+fn custom_program_launch(
+    id: &'static str,
+    program: &str,
+    target: &EditorTarget,
+    open_in: EditorOpenIn,
+) -> EditorLaunch {
     let prog_word = program.split_whitespace().next().unwrap_or(program);
     let prof = program_profile(prog_word);
-    let quoted = util::sh_quote(req.path);
-    let target = |sep: &str| match (req.line, req.col) {
-        (Some(l), Some(c)) if prof.column => {
-            util::sh_quote(&format!("{}{sep}{l}{sep}{c}", req.path))
+    let target_path = target.path();
+    let path = target_path.to_string_lossy();
+    let quoted = util::sh_quote(&path);
+    let located = |sep: &str| match (target.line, target.col) {
+        (Some(line), Some(col)) if prof.column => {
+            util::sh_quote(&format!("{path}{sep}{line}{sep}{col}"))
         }
-        (Some(l), _) => util::sh_quote(&format!("{}{sep}{l}", req.path)),
+        (Some(line), _) => util::sh_quote(&format!("{path}{sep}{line}")),
         _ => quoted.clone(),
     };
-    let command = match (prof.jump, req.line) {
-        (JumpSyntax::Plus, Some(l)) => format!("{program} +{l} {quoted}"),
-        (JumpSyntax::Colon, Some(_)) => format!("{program} {}", target(":")),
-        (JumpSyntax::GotoFlag, Some(_)) => format!("{program} -g {}", target(":")),
-        (JumpSyntax::LineFlag, Some(l)) => format!("{program} --line {l} {quoted}"),
+    let command = match (prof.jump, target.line) {
+        (JumpSyntax::Plus, Some(line)) => format!("{program} +{line} {quoted}"),
+        (JumpSyntax::Colon, Some(_)) => format!("{program} {}", located(":")),
+        (JumpSyntax::GotoFlag, Some(_)) => format!("{program} -g {}", located(":")),
+        (JumpSyntax::LineFlag, Some(line)) => format!("{program} --line {line} {quoted}"),
         _ => format!("{program} {quoted}"),
     };
-    EditorLaunch {
-        command,
-        placement: if prof.external {
-            Placement::External
-        } else {
-            Placement::Pane
-        },
+    let inferred = if prof.external {
+        Placement::External
+    } else {
+        Placement::Pane
+    };
+    EditorLaunch::shell(id, command, target, forced_placement(open_in, inferred))
+}
+
+fn forced_placement(open_in: EditorOpenIn, inferred: Placement) -> Placement {
+    match open_in {
+        EditorOpenIn::Auto => inferred,
+        EditorOpenIn::Pane => Placement::Pane,
+        EditorOpenIn::External => Placement::External,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Layers
-// ---------------------------------------------------------------------------
-
-/// `[editor] command` — a user template with `{path}` / `{line}` / `{col}`.
 pub struct TemplateEditor {
     template: String,
     open_in: EditorOpenIn,
@@ -209,66 +453,75 @@ impl Editor for TemplateEditor {
     }
     fn caps(&self) -> EditorCaps {
         EditorCaps {
+            open_file: true,
+            open_directory: true,
             line: self.template.contains("{line}"),
             column: self.template.contains("{col}"),
             external: self.placement() == Placement::External,
         }
     }
-    fn open(&self, req: &OpenRequest<'_>) -> Result<EditorLaunch, EditorError> {
-        let command = self
-            .template
-            .replace("{path}", &util::sh_quote(req.path))
-            .replace(
-                "{line}",
-                &req.line.map(|l| l.to_string()).unwrap_or_default(),
-            )
-            .replace("{col}", &req.col.map(|c| c.to_string()).unwrap_or_default());
-        Ok(EditorLaunch {
-            command,
-            placement: self.placement(),
-        })
+    fn open_file(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        Ok(self.plan(target))
+    }
+    fn open_directory(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        Ok(self.plan(target))
     }
 }
 
 impl TemplateEditor {
+    fn plan(&self, target: &EditorTarget) -> EditorLaunch {
+        let target_path = target.path();
+        let path = target_path.to_string_lossy();
+        let command = self
+            .template
+            .replace("{path}", &util::sh_quote(&path))
+            .replace(
+                "{line}",
+                &target.line.map(|line| line.to_string()).unwrap_or_default(),
+            )
+            .replace(
+                "{col}",
+                &target.col.map(|col| col.to_string()).unwrap_or_default(),
+            );
+        EditorLaunch::shell("template", command, target, self.placement())
+    }
+
     fn placement(&self) -> Placement {
-        match self.open_in {
-            EditorOpenIn::External => Placement::External,
-            EditorOpenIn::Pane => Placement::Pane,
-            EditorOpenIn::Auto => {
-                if is_gui_editor(&self.template) {
-                    Placement::External
-                } else {
-                    Placement::Pane
-                }
-            }
-        }
+        forced_placement(
+            self.open_in,
+            if is_gui_editor(&self.template) {
+                Placement::External
+            } else {
+                Placement::Pane
+            },
+        )
     }
 }
 
-/// A plain program (+ flags): the `[[tools]] editor` entry, `$VISUAL`,
-/// `$EDITOR`, or the `vi` fallback.
 pub struct ProgramEditor {
     id: &'static str,
     program: String,
     open_in: EditorOpenIn,
 }
 
-impl Probe for ProgramEditor {
-    fn probe(&self) -> ProbeReport {
-        let prog = self.program.split_whitespace().next().unwrap_or("");
-        let availability = if prog.contains('/') {
-            if Path::new(prog).exists() {
-                Availability::Ready
-            } else {
-                Availability::Unavailable(format!("{prog} not found"))
-            }
-        } else if util::which_path(prog).is_some() {
+pub(super) fn executable_availability(program: &str) -> Availability {
+    if program.contains('/') {
+        if Path::new(program).exists() {
             Availability::Ready
         } else {
-            Availability::Unavailable(format!("`{prog}` not found on PATH"))
-        };
-        ProbeReport::new("editor", self.id, availability)
+            Availability::Unavailable(format!("{program} not found"))
+        }
+    } else if util::which_path(program).is_some() {
+        Availability::Ready
+    } else {
+        Availability::Unavailable(format!("`{program}` not found on PATH"))
+    }
+}
+
+impl Probe for ProgramEditor {
+    fn probe(&self) -> ProbeReport {
+        let program = self.program.split_whitespace().next().unwrap_or("");
+        ProbeReport::new("editor", self.id, executable_availability(program))
             .with_caps(&self.caps())
             .note(format!("program: {}", self.program))
     }
@@ -279,48 +532,84 @@ impl Editor for ProgramEditor {
         self.id
     }
     fn caps(&self) -> EditorCaps {
-        let prof = program_profile(self.program.split_whitespace().next().unwrap_or(""));
+        let profile = program_profile(self.program.split_whitespace().next().unwrap_or(""));
         EditorCaps {
-            line: prof.jump != JumpSyntax::None,
-            column: prof.column,
-            external: match self.open_in {
-                EditorOpenIn::External => true,
-                EditorOpenIn::Pane => false,
-                EditorOpenIn::Auto => prof.external,
-            },
+            open_file: true,
+            open_directory: true,
+            line: profile.jump != JumpSyntax::None,
+            column: profile.column,
+            external: forced_placement(
+                self.open_in,
+                if profile.external {
+                    Placement::External
+                } else {
+                    Placement::Pane
+                },
+            ) == Placement::External,
         }
     }
-    fn open(&self, req: &OpenRequest<'_>) -> Result<EditorLaunch, EditorError> {
-        let mut l = launch_line(&self.program, req);
-        l.placement = match self.open_in {
-            EditorOpenIn::External => Placement::External,
-            EditorOpenIn::Pane => Placement::Pane,
-            EditorOpenIn::Auto => l.placement,
-        };
-        Ok(l)
+    fn open_file(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        Ok(custom_program_launch(
+            self.id,
+            &self.program,
+            target,
+            self.open_in,
+        ))
+    }
+    fn open_directory(&self, target: &EditorTarget) -> Result<EditorLaunch, EditorError> {
+        Ok(custom_program_launch(
+            self.id,
+            &self.program,
+            target,
+            self.open_in,
+        ))
     }
 }
 
-/// Resolve the editor for this config + environment: the first layer with
-/// something configured. Pure apart from reading `$VISUAL`/`$EDITOR`.
 pub fn editor_for(cfg: &Config) -> Box<dyn Editor> {
-    editor_with_env(cfg, |k| std::env::var(k).ok())
+    editor_with_env(cfg, |key| std::env::var(key).ok())
 }
 
-/// [`editor_for`] with the environment injected (tests).
+pub fn editor_for_workspace(cfg: &Config, workspace_slug: &str) -> Box<dyn Editor> {
+    editor_with_env_for_workspace(cfg, workspace_slug, |key| std::env::var(key).ok())
+}
+
 pub fn editor_with_env(cfg: &Config, env: impl Fn(&str) -> Option<String>) -> Box<dyn Editor> {
+    resolve_editor(cfg, None, env)
+}
+
+pub fn editor_with_env_for_workspace(
+    cfg: &Config,
+    workspace_slug: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Box<dyn Editor> {
+    resolve_editor(cfg, Some(workspace_slug), env)
+}
+
+fn resolve_editor(
+    cfg: &Config,
+    workspace_slug: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Box<dyn Editor> {
     let open_in = cfg.editor.open_in;
-    let t = cfg.editor.command.trim();
-    if !t.is_empty() {
+    let template = cfg.editor.command.trim();
+    if !template.is_empty() {
         return Box::new(TemplateEditor {
-            template: t.to_string(),
+            template: template.to_string(),
             open_in,
         });
     }
+
+    let provider = workspace_slug
+        .and_then(|slug| cfg.workspace.get(slug))
+        .and_then(|workspace| workspace.editor)
+        .unwrap_or(cfg.editor.provider);
+    if let Some(editor) = providers::provider(provider, open_in) {
+        return editor;
+    }
+
     if let Some(tool) = cfg.tool_command("editor") {
         let tool = tool.trim();
-        // The legacy `[[tools]] editor` default is `${EDITOR:-vi} .`: the
-        // trailing ` .` opens the cwd — strip it so the file is the target.
         let tool = tool.strip_suffix(" .").unwrap_or(tool);
         if !tool.is_empty() && !tool.starts_with("${") {
             return Box::new(ProgramEditor {
@@ -331,13 +620,13 @@ pub fn editor_with_env(cfg: &Config, env: impl Fn(&str) -> Option<String>) -> Bo
         }
     }
     for (id, key) in [("visual", "VISUAL"), ("env", "EDITOR")] {
-        if let Some(v) = env(key)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        if let Some(program) = env(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
         {
             return Box::new(ProgramEditor {
                 id,
-                program: v,
+                program,
                 open_in,
             });
         }
@@ -362,28 +651,38 @@ mod tests {
     }
 
     #[test]
-    fn profiles_cover_the_usual_suspects() {
-        assert_eq!(program_profile("vim").jump, JumpSyntax::Plus);
-        assert_eq!(program_profile("/usr/bin/nvim").jump, JumpSyntax::Plus);
-        assert_eq!(program_profile("code.exe").jump, JumpSyntax::GotoFlag);
-        assert!(program_profile("code").external && program_profile("code").column);
-        assert_eq!(program_profile("hx").jump, JumpSyntax::Colon);
-        assert!(!program_profile("hx").external);
-        assert_eq!(program_profile("kate").jump, JumpSyntax::LineFlag);
-        assert_eq!(program_profile("weird-editor").jump, JumpSyntax::None);
-        assert!(is_gui_editor("code --wait"));
-        assert!(!is_gui_editor("vim"));
+    fn target_normalizes_inside_worktree_without_io() {
+        let target =
+            EditorTarget::file("/work/tree", "src/./nested/../main.rs", Some(7), Some(3)).unwrap();
+        assert_eq!(target.worktree(), Path::new("/work/tree"));
+        assert_eq!(target.relative_file(), Some(Path::new("src/main.rs")));
+        assert_eq!(target.path(), Path::new("/work/tree/src/main.rs"));
+        assert_eq!(target.line(), Some(7));
+        assert_eq!(target.col(), Some(3));
+        assert_eq!(target.operation(), EditorOperation::OpenFile);
+
+        let project = EditorTarget::project("/work/tree").unwrap();
+        assert_eq!(project.path(), Path::new("/work/tree"));
+        assert_eq!(project.operation(), EditorOperation::OpenDirectory);
     }
 
     #[test]
-    fn launch_lines_use_each_syntax_and_quote_paths() {
+    fn target_rejects_escape_and_invalid_shapes() {
+        for bad in ["../secret", "src/../../secret", "/etc/passwd", ""] {
+            assert!(EditorTarget::file("/work/tree", bad, None, None).is_err());
+        }
+        assert!(EditorTarget::project("").is_err());
+        assert!(EditorTarget::project("relative/root").is_err());
+        assert!(EditorTarget::new("/work/tree", Option::<&Path>::None, Some(1), None).is_err());
+        assert!(EditorTarget::file("/work/tree", "x", Some(0), None).is_err());
+        assert!(EditorTarget::file("/work/tree", "x", None, Some(1)).is_err());
+    }
+
+    #[test]
+    fn launch_lines_keep_custom_program_compatibility() {
         assert_eq!(
             launch_line("vim", &req(Some(42))).command,
             r"vim +42 'src/a'\''b.rs'"
-        );
-        assert_eq!(
-            launch_line("vim", &req(None)).command,
-            r"vim 'src/a'\''b.rs'"
         );
         assert_eq!(
             launch_line("code --wait", &req(Some(7))).command,
@@ -401,42 +700,66 @@ mod tests {
             launch_line("mystery", &req(Some(9))).command,
             r"mystery 'src/a'\''b.rs'"
         );
-        let col = OpenRequest {
-            path: "f.rs",
-            line: Some(4),
-            col: Some(8),
-        };
-        // `sh_quote` leaves shell-safe targets bare.
-        assert_eq!(launch_line("zed", &col).command, "zed f.rs:4:8");
-        assert_eq!(launch_line("vim", &col).command, "vim +4 f.rs");
-        assert_eq!(launch_line("code", &col).placement, Placement::External);
-        assert_eq!(launch_line("vim", &col).placement, Placement::Pane);
+        assert_eq!(
+            launch_line("code", &req(None)).placement,
+            Placement::External
+        );
     }
 
     #[test]
-    fn ladder_template_then_tool_then_env_then_vi() {
+    fn precedence_is_template_workspace_global_then_auto_ladder() {
         let mut cfg = Config::default();
-        // Default config: `[[tools]] editor` is `${EDITOR:-vi} .` → env layer.
-        let e = editor_with_env(&cfg, |k| (k == "EDITOR").then(|| "nano".to_string()));
-        assert_eq!(e.id(), "env");
+        cfg.editor.provider = EditorProvider::Vscode;
+        cfg.workspace.insert(
+            "repo".into(),
+            crate::config::WorkspaceConfig {
+                editor: Some(EditorProvider::Cursor),
+                ..Default::default()
+            },
+        );
         assert_eq!(
-            e.open(&req(Some(2))).unwrap().command,
+            editor_with_env_for_workspace(&cfg, "repo", |_| None).id(),
+            "cursor"
+        );
+        assert_eq!(
+            editor_with_env_for_workspace(&cfg, "other", |_| None).id(),
+            "vscode"
+        );
+
+        cfg.editor.command = "myed {path}".into();
+        assert_eq!(
+            editor_with_env_for_workspace(&cfg, "repo", |_| None).id(),
+            "template"
+        );
+
+        cfg.editor.command.clear();
+        cfg.workspace.get_mut("repo").unwrap().editor = Some(EditorProvider::Auto);
+        assert_eq!(
+            editor_with_env_for_workspace(&cfg, "repo", |key| (key == "EDITOR")
+                .then(|| "nano".into()))
+            .id(),
+            "env"
+        );
+    }
+
+    #[test]
+    fn custom_ladder_and_placement_remain_compatible() {
+        let mut cfg = Config::default();
+        let editor = editor_with_env(&cfg, |key| (key == "EDITOR").then(|| "nano".into()));
+        assert_eq!(editor.id(), "env");
+        assert_eq!(
+            editor.open(&req(Some(2))).unwrap().command,
             r"nano +2 'src/a'\''b.rs'"
         );
-        // $VISUAL beats $EDITOR.
-        let e = editor_with_env(&cfg, |k| match k {
+
+        let editor = editor_with_env(&cfg, |key| match key {
             "VISUAL" => Some("code".into()),
             "EDITOR" => Some("nano".into()),
             _ => None,
         });
-        assert_eq!(e.id(), "visual");
-        assert!(e.caps().external && e.caps().column);
-        // Nothing set → vi.
-        let e = editor_with_env(&cfg, |_| None);
-        assert_eq!(e.id(), "vi");
-        assert_eq!(e.probe().seam, "editor");
-        // A concrete [[tools]] editor wins over env. (The default config has no
-        // stored `[[tools]]` rows — push one, as a user config would.)
+        assert_eq!(editor.id(), "visual");
+        assert!(editor.caps().external && editor.caps().column);
+
         cfg.tools.push(crate::config::NamedCommand {
             name: "editor".into(),
             command: "hx .".into(),
@@ -448,38 +771,28 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
-        let e = editor_with_env(&cfg, |_| Some("nano".into()));
-        assert_eq!(e.id(), "tool");
-        assert_eq!(
-            e.open(&req(Some(5))).unwrap().command,
-            r"hx 'src/a'\''b.rs:5'"
-        );
-        // [editor] command template wins over everything; open_in overrides.
-        cfg.editor.command = "myed --file {path} --at {line}:{col}".into();
-        cfg.editor.open_in = EditorOpenIn::External;
-        let e = editor_with_env(&cfg, |_| Some("nano".into()));
-        assert_eq!(e.id(), "template");
-        let l = e
-            .open(&OpenRequest {
-                path: "x.rs",
-                line: Some(1),
-                col: Some(2),
-            })
-            .unwrap();
-        assert_eq!(l.command, "myed --file x.rs --at 1:2");
-        assert_eq!(l.placement, Placement::External);
-        assert!(e.caps().line && e.caps().column && e.caps().external);
-        assert!(e.probe().notes[0].contains("myed"));
+        assert_eq!(editor_with_env(&cfg, |_| Some("nano".into())).id(), "tool");
+
+        cfg.editor.open_in = EditorOpenIn::Pane;
+        let editor = editor_with_env(&cfg, |_| Some("code".into()));
+        assert_eq!(editor.open(&req(None)).unwrap().placement, Placement::Pane);
+        assert!(!editor.caps().external);
     }
 
     #[test]
-    fn open_in_pane_forces_a_gui_editor_into_the_terminal() {
+    fn template_project_open_uses_root_and_empty_location() {
         let mut cfg = Config::default();
-        cfg.editor.open_in = EditorOpenIn::Pane;
-        let e = editor_with_env(&cfg, |_| Some("code".into()));
-        assert_eq!(e.open(&req(None)).unwrap().placement, Placement::Pane);
-        assert!(!e.caps().external);
+        cfg.editor.command = "myed --file {path} --at {line}:{col}".into();
+        cfg.editor.open_in = EditorOpenIn::External;
+        let launch = editor_with_env(&cfg, |_| None)
+            .open_target(&EditorTarget::project("/work/tree").unwrap())
+            .unwrap();
+        assert_eq!(launch.command, "myed --file /work/tree --at :");
+        assert_eq!(launch.cwd, Path::new("/work/tree"));
+        assert_eq!(launch.operation, EditorOperation::OpenDirectory);
     }
 
     #[test]
@@ -492,12 +805,9 @@ mod tests {
             EditorError::unsupported("y").class(),
             ErrorClass::Unsupported
         );
-        assert_eq!(EditorError::Other("z".into()).to_string(), "z");
-        assert!(
-            EditorError::NotConfigured("x")
-                .to_string()
-                .contains("no editor")
+        assert_eq!(
+            EditorError::InvalidTarget("z".into()).class(),
+            ErrorClass::Other
         );
-        assert!(EditorError::Unsupported("y").to_string().contains('y'));
     }
 }

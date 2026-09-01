@@ -52,6 +52,12 @@ pub(crate) enum SidebarOutcome {
     },
     /// Copy this text (a worktree path) to the system clipboard via OSC-52.
     CopyText(String),
+    /// Hand the selected worktree row to the configured IDE without activating
+    /// it first. Pane-only editors degrade if that dormant row is not focused.
+    OpenInIde {
+        target: thegn_core::editor::EditorTarget,
+        workspace_slug: String,
+    },
     /// Prompt to rename the worktree group at this session index (its current
     /// branch seeds the input). Item 53.
     PromptRename { gi: usize, branch: String },
@@ -328,6 +334,9 @@ impl SidebarState {
             RowKind::Worktree => {
                 if row.tab_target.is_some() {
                     entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
+                }
+                if row.worktree_path.is_some() {
+                    entries.push(e("open-in-ide", "Open in IDE", None));
                 }
                 entries.push(sep());
                 entries.push(e(
@@ -1223,6 +1232,23 @@ impl SidebarState {
                     return SidebarOutcome::CopyText(p);
                 }
             }
+            "open-in-ide" => {
+                if let Some(row) = self.selected_row(model)
+                    && let Some(path) = row.worktree_path.as_deref()
+                {
+                    match thegn_core::editor::EditorTarget::project(path) {
+                        Ok(target) => {
+                            return SidebarOutcome::OpenInIde {
+                                target,
+                                workspace_slug: row.workspace_slug.clone(),
+                            };
+                        }
+                        Err(error) => model.status = error.to_string(),
+                    }
+                } else {
+                    model.status = "This worktree row has no IDE target".into();
+                }
+            }
             "fork" => {
                 if let Some(out) = self.fork_outcome(model) {
                     return out;
@@ -1594,6 +1620,36 @@ mod tests {
             out,
             SidebarOutcome::OpenMergeQueue { ref repo_path }
                 if repo_path == "/repos/app"
+        ));
+    }
+
+    #[test]
+    fn worktree_menu_hands_the_selected_path_to_the_core_target_policy() {
+        use crate::sidebar::{RowKind, SidebarRow};
+
+        let mut model = FrameModel {
+            sidebar_rows: vec![SidebarRow {
+                worktree_path: Some("/repos/app-feature".into()),
+                pin_key: "app-feature".into(),
+                ..SidebarRow::base(RowKind::Worktree, 1, "feature", "app")
+            }],
+            ..Default::default()
+        };
+        let mut sb = SidebarState::default();
+        let menu = sb
+            .menu_for_cursor(&model, &crate::session::Session::default())
+            .expect("worktree menu");
+        assert!(menu.entries.iter().any(|entry| entry.id == "open-in-ide"));
+
+        assert!(matches!(
+            sb.run_menu_action(
+                "open-in-ide",
+                &mut model,
+                &crate::session::Session::default(),
+            ),
+            SidebarOutcome::OpenInIde { target, workspace_slug }
+                if target.worktree() == std::path::Path::new("/repos/app-feature")
+                    && workspace_slug == "app"
         ));
     }
 }

@@ -2,146 +2,92 @@
 
 ## ADDED Requirements
 
-### Requirement: The drawer hosts a registry of occupants
+### Requirement: The drawer hosts the effective tools registry
 
-The bottom drawer SHALL host an ordered registry of occupants: the built-in
-**files** occupant (the file-manager drawer, resolved through its provider
-seam) followed by each `[[drawer.tools]]` entry in config order. An entry MUST
-either reference a `[[tools]]` entry by name (`tool = "<name>"`) or declare an
-inline `command`, and MAY set a display `name`, a `cwd`, an `env` map, and a
-`scope` of `worktree` (default) or `global`. Config validation MUST reject an
-entry with both or neither of `tool`/`command`, and MUST warn on a `tool`
-reference naming no `[[tools]]` entry (that occupant is omitted at runtime).
-With no `[[drawer.tools]]` configured, drawer behavior SHALL be identical to
-the single-occupant file drawer.
+The bottom drawer SHALL host the built-in files occupant followed by each
+eligible `[[tools]]` entry in config order. A tool is eligible only when it
+has valid `drawer_scope = "worktree"` or `drawer_scope = "global"`; its
+existing `name`, `command`, and `env` remain authoritative, and `drawer_cwd`
+is optional. Tools without drawer metadata remain picker-only. Strict config
+validation SHALL report malformed drawer metadata, while normal loading SHALL
+omit only the invalid occupant and warn.
 
-#### Scenario: An ATAC occupant opens in the drawer
+#### Scenario: A configured ATAC tool is listed
 
-- **WHEN** `[[tools]] name = "atac"` exists and a `[[drawer.tools]]` entry
-  references `tool = "atac"` with `scope = "worktree"`, and the user switches
-  the drawer to it
-- **THEN** the drawer pane runs `atac` with cwd resolved against the active
-  worktree and the entry's `env` applied
+- **WHEN** `[[tools]] name = "atac"`, `command = "atac"`, and
+  `drawer_scope = "worktree"` are configured
+- **THEN** the drawer picker lists `tool:atac` after `files`
 
-#### Scenario: A dangling tool reference degrades to a warning
+#### Scenario: A global tool is reachable from worktree chrome
 
-- **WHEN** a `[[drawer.tools]]` entry references `tool = "nope"` and no
-  `[[tools]]` entry has that name
-- **THEN** config validation warns naming the entry, the occupant is absent
-  from the drawer picker, and the remaining occupants work normally
+- **WHEN** a tool has `drawer_scope = "global"` and the active scope is a
+  worktree
+- **THEN** cycle and picker include that tool and selection persists it under
+  the fixed global state key
 
-#### Scenario: No registry entries means today's drawer
+### Requirement: One visible occupant uses one runtime boundary
 
-- **WHEN** no `[[drawer.tools]]` are configured
-- **THEN** toggling the drawer opens the files occupant exactly as before,
-  with no new chrome behavior
+The drawer SHALL show one occupant at a time. `files-drawer`, `drawer-cycle`,
+and `drawer-pick` SHALL share one runtime for selection, switching, pooling,
+persistence, async results, process exit, and geometry. Switching SHALL stash
+the outgoing pane under `(scope-key, occupant-id)` rather than creating a
+second lifecycle. A process exit SHALL remove the pane and clear its matching
+state.
 
-### Requirement: One visible occupant, switchable by global actions
+#### Scenario: A visible drawer survives a worktree switch
 
-The drawer SHALL show exactly one occupant at a time. The existing
-`files-drawer` toggle SHALL open the worktree's last-open occupant (files when
-none is remembered). Two bindable actions SHALL switch occupants —
-`drawer-cycle` (next occupant in registry order) and `drawer-pick` (a
-dedicated picker palette listing every occupant) — dispatched as chrome-level
-chords, since a focused occupant owns every keystroke. Switching MUST stash
-the outgoing occupant's pane in the keep-alive pool (state preserved) rather
-than killing it, and an occupant process exiting on its own MUST close the
-drawer, remove its pane, and clear the persisted open state.
+- **WHEN** a drawer occupant is visible and the active worktree changes
+- **THEN** the runtime stashes or restores the correct scoped pane, with an
+  open destination worktree occupant taking precedence over a global one
 
-#### Scenario: Cycling swaps the pane and keeps both alive
+#### Scenario: Prewarm does not create a second drawer lifecycle
 
-- **WHEN** the files occupant is open and the user invokes `drawer-cycle`
-- **THEN** the next occupant's pane composites into the drawer rect, and
-  toggling back to files restores its previous cursor/position
+- **WHEN** `[drawer].prewarm = true` and a configured occupant is selected
+- **THEN** only the runtime's files-only prewarm path may request a files pane;
+  no legacy drawer request or pool is used
 
-#### Scenario: The occupant quitting closes the drawer
+### Requirement: Scope and persistence are explicit
 
-- **WHEN** the visible occupant's process exits (e.g. `q` quits the tool)
-- **THEN** the drawer closes, the pane is removed from pool and table, and the
-  worktree's persisted drawer state is cleared
+Worktree occupants SHALL use one pane and state slot per worktree. Global
+occupants SHALL use one process-local local PTY and the fixed global state slot
+across in-process worktree switches. Global panes SHALL not be daemon-owned or
+restored after restart. Legacy `true` state SHALL decode as `files`, and
+`false` SHALL decode as closed.
 
-### Requirement: Worktree and global occupant scopes
+#### Scenario: Global pane follows an in-process worktree switch
 
-A `scope = "worktree"` occupant SHALL run one pane per worktree with cwd at
-the worktree root (or the entry's `cwd` resolved relative to it), pooled and
-persisted per worktree. A `scope = "global"` occupant SHALL run a single
-shared pane that follows the user across worktrees, with cwd at `$HOME` (or an
-absolute/`~` `cwd`), pooled and persisted under one global slot. The pane
-pool's `pool_limit` bound and eviction SHALL apply across all occupants keyed
-by (scope key, occupant).
+- **WHEN** a global occupant is open and the user switches worktrees
+- **THEN** the same local pane is reused, while a destination worktree
+  occupant takes precedence when its state is open
 
-#### Scenario: A global scratch tool keeps its state across worktrees
+#### Scenario: Legacy drawer state remains readable
 
-- **WHEN** a `scope = "global"` occupant is open and the user switches to
-  another worktree and reopens the drawer to that occupant
-- **THEN** the same pane (same process, same screen state) is shown, not a new
-  instance
+- **WHEN** a persisted worktree drawer file contains `true`
+- **THEN** the runtime treats it as the built-in `files` occupant
 
-#### Scenario: Worktree-scoped occupants stay per-worktree
+### Requirement: Occupants are contained and resolved off-loop
 
-- **WHEN** a `scope = "worktree"` occupant is open in worktree A and the user
-  switches to worktree B
-- **THEN** B shows its own persisted drawer state, and reopening the occupant
-  in B spawns or restores B's instance, never A's
+Every occupant SHALL use the existing drawer argv conversion, containment,
+and local-spawn seams. Cold resolution, environment expansion, and PATH or
+filesystem checks SHALL happen off the event loop through a channel and waker,
+deduplicated by `(scope-key, occupant-id)`; stale results SHALL be dropped.
 
-### Requirement: Persisted drawer state records the occupant
+#### Scenario: Rapid selection deduplicates a cold spawn
 
-The per-worktree persisted drawer state SHALL record which occupant is open
-(closed when none), remaining memory-first with write-through persistence off
-the event loop. Legacy boolean flag files (`true`) MUST be read as the files
-occupant so existing state survives the upgrade. No SQLite schema change is
-involved.
+- **WHEN** the user selects the same cold occupant repeatedly before its
+  result arrives
+- **THEN** one `(scope-key, occupant-id)` request is in flight and stale
+  results cannot open a different selection
 
-#### Scenario: Restart restores the right occupant per worktree
+### Requirement: The drawer indicator is discoverable and removable
 
-- **WHEN** worktree A had the ATAC occupant open and worktree B had the drawer
-  closed, and thegn restarts
-- **THEN** switching to A reopens the drawer on ATAC and B stays closed
+The `drawer` bars widget SHALL be present in the default `bottom_left` order,
+use existing glyph/theme chokepoints, show closed/open occupant state and the
+configured occupant count, and toggle the same files-drawer action when
+clicked. Removing it from `[bars]` SHALL remove both its paint and hit target.
 
-#### Scenario: Legacy flags mean files
+#### Scenario: The indicator reflects the active occupant
 
-- **WHEN** a pre-upgrade flag file containing `true` exists for a worktree
-- **THEN** that worktree's drawer opens on the files occupant
-
-### Requirement: A statusbar widget indicates the drawer
-
-A `drawer` widget SHALL join the `[bars]` widget vocabulary (present in the
-default `bottom_left` set) showing that the drawer exists and its state: a dim
-glyph when closed, a highlighted glyph plus the active occupant's label when
-open, and an occupant count when more than one is configured. Clicking the
-widget SHALL toggle the drawer. The widget MUST be removable via `[bars]` like
-any other widget, and its glyphs and colors MUST go through the caps/theme
-chokepoints (no literals at the draw site).
-
-#### Scenario: A closed drawer is discoverable
-
-- **WHEN** the drawer is closed and the `drawer` widget is in `bottom_left`
-- **THEN** the statusbar shows the dim drawer chip, and clicking it opens the
-  drawer
-
-#### Scenario: The open chip names the occupant
-
-- **WHEN** the ATAC occupant is open
-- **THEN** the chip renders highlighted with the occupant's label
-
-### Requirement: Every occupant is contained and spawned off-loop
-
-Every drawer occupant SHALL be wrapped in the `[drawer]` containment scope
-(`contain`, `memory_max`, `memory_swap_max`, `cpu_quota`) with the same
-fail-safe skips as the file manager (containment disabled, `systemd-run`
-unavailable, or an already-wrapped argv pass through unchanged). Cold spawns
-SHALL resolve off the event loop — request deduplicated per (scope key,
-occupant), result delivered over a channel with a waker pulse — so opening or
-switching occupants never blocks the loop.
-
-#### Scenario: A runaway occupant is contained
-
-- **WHEN** an occupant's process tree exceeds the drawer memory cap
-- **THEN** it is OOM-killed inside its own scope and the terminal session
-  survives
-
-#### Scenario: Rapid switching does not duplicate spawns
-
-- **WHEN** the user cycles quickly through a cold occupant several times
-  before its spawn resolves
-- **THEN** exactly one instance is spawned and later requests reuse it
+- **WHEN** the drawer is closed or a configured occupant is open
+- **THEN** the widget shows the dim closed state or the accented occupant
+  label and configured count, and clicking it invokes files-drawer

@@ -7,10 +7,9 @@
 //! remote-dir removal, and a recursive `remove_dir_all` (a Rust worktree with a
 //! `target/` is easily multi-GB → tens of seconds). That work MUST NOT run on
 //! the event loop, so it is handed to a spawned thread that pulses the
-//! `TerminalWaker` when done — mirroring [`crate::run::delete_groups`]. Only the
-//! in-memory session prune + DB-row pruning (cheap, cache writes) stays on the
-//! loop, and the status line reports "removing N worktrees…" until the thread
-//! finishes.
+//! `TerminalWaker` when done — mirroring [`crate::run::delete_groups_with_mode`]. The
+//! loop retains live groups until each worker reports success, then only
+//! performs the in-memory prune; cache writes stay on the worker.
 
 use std::path::Path;
 
@@ -18,14 +17,20 @@ use thegn_core::store::WorkspaceStore;
 
 use crate::chrome::FrameModel;
 use crate::panes::Panes;
-use crate::run::{SIDEBAR_SCOPE, forget_worktree_group, now_secs};
+use crate::run::SIDEBAR_SCOPE;
+
+#[cfg(test)]
+use crate::run::{forget_worktree_group, now_secs};
 
 /// Worktree directories to delete from disk when removing the workspace at
 /// `repo_path`: every registered worktree whose `repo_root` matches, EXCEPT the
 /// home checkout (its path == `repo_path`, which must never be deleted) and any
 /// empty-path legacy rows. Split out so the safety-critical home-skip guard is
 /// unit-testable without real I/O.
-pub(crate) fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) -> Vec<String> {
+pub(crate) fn workspace_worktree_dirs(
+    db: &thegn_core::db::Db,
+    repo_path: &str,
+) -> Result<Vec<String>, String> {
     db.worktrees()
         .map(|rows| {
             rows.into_iter()
@@ -35,36 +40,52 @@ pub(crate) fn workspace_worktree_dirs(db: &thegn_core::db::Db, repo_path: &str) 
                 .map(|w| w.worktree)
                 .collect()
         })
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
+}
+
+/// Return branch worktrees known to the live session. This is deliberately
+/// independent of SQLite so an unregistered live checkout is still included
+/// in a destructive workspace removal.
+pub(crate) fn live_workspace_worktree_dirs(
+    session: &crate::session::Session,
+    repo_path: &str,
+    slug: &str,
+) -> Vec<String> {
+    session
+        .worktrees
+        .iter()
+        .filter(|group| {
+            crate::sidebar::split_tab(&group.name).is_some_and(|(group_slug, _)| group_slug == slug)
+                && !group.path.is_empty()
+                && group.path != repo_path
+                && group.kind != crate::session::GroupKind::Home
+        })
+        .map(|group| group.path.clone())
+        .collect()
 }
 
 /// Delete a workspace's worktree directories from disk OFF the event loop.
 /// Runs `git worktree remove` + `purge_worktree_files` (local + remote ssh) per
 /// dir on a dedicated thread, then pulses `waker` so the loop repaints. Callers
-/// keep the in-memory/DB prune on the loop and show a pending status until this
-/// finishes. No-op (no thread spawned) when `dirs` is empty.
+/// keep the in-memory groups and show a pending status until this finishes.
+/// No-op (no thread spawned) when `dirs` is empty.
 pub(crate) fn spawn_delete_workspace_dirs(
     repo_path: &str,
     dirs: Vec<String>,
+    cfg: thegn_core::config::Config,
+    slug: &str,
+    session_id: &str,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
-    if dirs.is_empty() {
-        return;
-    }
-    let root = repo_path.to_string();
-    std::thread::spawn(move || {
-        let root = Path::new(&root);
-        for path in &dirs {
-            // git is the source of truth; both calls are idempotent and
-            // best-effort — a failure only leaves a dir that re-adopts on the
-            // next launch, never corrupts state.
-            thegn_core::worktree::remove(root, Path::new(path), "", false);
-            thegn_core::worktree::purge_worktree_files(Path::new(path));
-        }
-        if let Some(waker) = waker {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
-    });
+) -> std::io::Result<()> {
+    let root = Path::new(repo_path).to_path_buf();
+    crate::worktree_lifecycle::spawn_workspace_destroy(
+        cfg,
+        root,
+        slug.to_string(),
+        session_id.to_string(),
+        dirs,
+        waker,
+    )
 }
 
 /// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
@@ -79,6 +100,7 @@ pub(crate) fn spawn_delete_workspace_dirs(
 ///
 /// The destructive disk-removal is dispatched to a background thread (see
 /// [`spawn_delete_workspace_dirs`]) so the compositor never blocks on git/ssh/fs.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn remove_workspace(
     session: &mut crate::session::Session,
     panes: &mut Panes,
@@ -86,36 +108,65 @@ pub(crate) fn remove_workspace(
     slug: &str,
     display: &str,
     keep_files: bool,
+    cfg: &thegn_core::config::Config,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
-    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: removal proceeds on disk/git; a failed open just leaves stale rows
     let was_active = session.id == repo_path;
 
-    // Read the workspace's branch-worktree dirs from the registry BEFORE
-    // `remove_workspace_with_db` prunes it. The home checkout (its path ==
-    // `repo_path`) is never included — only branch worktrees. Used either to
-    // delete them (destructive) or to report how many survive (keep-files).
-    let worktree_dirs = db
-        .as_ref()
-        .map(|db| workspace_worktree_dirs(db, repo_path))
-        .unwrap_or_default();
+    // Start from live session groups. The worker adds DB-only rows after it
+    // opens SQLite, so a missing DB row or a DB-open failure cannot hide a live
+    // checkout from the destructive set.
+    let live_dirs = live_workspace_worktree_dirs(session, repo_path, slug);
 
-    // Destructive: delete the workspace's worktree dirs from disk — OFF the
-    // event loop (git subprocess + ssh remote rm + recursive delete can take
-    // seconds to minutes). The DB/session prune below runs on the loop.
+    // Destructive: delete each worktree dir from disk off-loop. The DB/session
+    // rows stay visible until each worker reports a successful transaction.
     if !keep_files {
-        spawn_delete_workspace_dirs(repo_path, worktree_dirs.clone(), waker);
+        if let Err(error) = spawn_delete_workspace_dirs(
+            repo_path,
+            live_dirs.clone(),
+            cfg.clone(),
+            slug,
+            &session.id,
+            waker,
+        ) {
+            return format!("Workspace '{display}' removal failed to start: {error}");
+        }
+        return workspace_removed_status(display, false, live_dirs.len());
     }
 
-    remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);
+    // Keep-files is a pure in-memory reconciliation on the loop. Its cache
+    // cleanup runs on the DB writer and, by contract, does not run destroy
+    // hooks or touch the checkout.
+    let session_end_errors: Vec<String> = live_dirs
+        .iter()
+        .filter_map(|path| {
+            crate::worktree_lifecycle::session_end_once(cfg, Path::new(path), waker.clone())
+                .err()
+                .map(|error| format!("{path}: {error}"))
+        })
+        .collect();
+    remove_workspace_in_memory(session, panes, slug);
+    let session_id = session.id.clone();
+    let repo_path_owned = repo_path.to_string();
+    let slug_owned = slug.to_string();
+    crate::db_task::persist(move |db| {
+        forget_workspace_in_db(db, &session_id, &repo_path_owned, &slug_owned);
+    });
 
     // Removing the active workspace leaves the session pointing at nothing;
     // land on the next available workspace, else empty out.
     if was_active {
-        land_after_workspace_removed(session, db.as_ref());
+        land_after_workspace_removed(session, None);
     }
 
-    workspace_removed_status(display, keep_files, worktree_dirs.len())
+    let mut status = workspace_removed_status(display, keep_files, live_dirs.len());
+    if !session_end_errors.is_empty() {
+        status.push_str(&format!(
+            "; session_end failed to start: {}",
+            session_end_errors.join("; ")
+        ));
+    }
+    status
 }
 
 /// After removing the *active* workspace, land on the first remaining workspace,
@@ -167,6 +218,7 @@ pub(crate) fn workspace_removed_status(
 /// (always, reaping their panes) and — when a `db` is present — prunes every DB
 /// trace and persists the trimmed layout. Non-destructive: never touches the
 /// worktree files on disk.
+#[cfg(test)]
 pub(crate) fn remove_workspace_with_db(
     session: &mut crate::session::Session,
     panes: &mut Panes,
@@ -174,34 +226,22 @@ pub(crate) fn remove_workspace_with_db(
     repo_path: &str,
     slug: &str,
 ) {
-    // Close (forget, never delete from disk) the workspace's live groups,
-    // highest index first so earlier indices stay valid as groups are removed.
-    let mut targets: Vec<usize> = session
+    let groups: Vec<crate::session::WorktreeGroup> = session
         .worktrees
         .iter()
-        .enumerate()
-        .filter_map(|(gi, g)| {
+        .filter(|g| {
             crate::sidebar::split_tab(&g.name)
                 .filter(|(repo, _)| repo == slug)
-                .map(|_| gi)
+                .is_some()
         })
+        .cloned()
         .collect();
-    targets.sort_unstable_by(|a, b| b.cmp(a));
-    for gi in targets {
-        if gi >= session.worktrees.len() {
-            continue;
+    if let Some(db) = db {
+        for group in &groups {
+            forget_worktree_group(db, &session.id, group, true);
         }
-        if let Some(db) = db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
-        }
-        for tab in &session.worktrees[gi].tabs {
-            for id in tab.center.pane_ids() {
-                panes.table.remove(&id);
-            }
-        }
-        session.switch_to(gi);
-        session.close_active_group();
     }
+    remove_workspace_in_memory(session, panes, slug);
 
     if let Some(db) = db {
         // Prune every DB trace so the workspace doesn't re-render or resurrect.
@@ -229,6 +269,80 @@ pub(crate) fn remove_workspace_with_db(
         // resurrect the closed groups on the next launch (see `delete_groups`).
         let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the trimmed layout feed; git/disk removal already reported
     }
+}
+
+/// Close the live groups belonging to a workspace without touching disk or
+/// the DB. Lifecycle completion handling uses this after its worker has
+/// already completed the cache transaction.
+pub(crate) fn remove_workspace_in_memory(
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    slug: &str,
+) {
+    let mut targets: Vec<usize> = session
+        .worktrees
+        .iter()
+        .enumerate()
+        .filter_map(|(gi, g)| {
+            crate::sidebar::split_tab(&g.name)
+                .filter(|(repo, _)| repo == slug)
+                .map(|_| gi)
+        })
+        .collect();
+    targets.sort_unstable_by(|a, b| b.cmp(a));
+    for gi in targets {
+        if gi >= session.worktrees.len() {
+            continue;
+        }
+        for tab in &session.worktrees[gi].tabs {
+            for id in tab.center.pane_ids() {
+                panes.table.remove(&id);
+            }
+        }
+        session.switch_to(gi);
+        session.close_active_group();
+    }
+}
+
+/// Remove a successfully destroyed worktree from the cache on a worker. The
+/// loop later reconciles the corresponding live group separately.
+pub(crate) fn forget_worktree_path_in_db(db: &thegn_core::db::Db, session_id: &str, path: &str) {
+    if let Ok(groups) = db.groups_for_session(session_id) {
+        for group in groups.into_iter().filter(|group| group.worktree == path) {
+            let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: layout is resurrection state
+            del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", &group.name);
+        }
+    }
+    let _ = db.del_worktree(path); // best-effort: cache write: git is the source of truth
+    let _ = db.delete_tab_groups_for_worktree(session_id, path); // best-effort: cache write: clean up legacy layout rows
+    thegn_core::activity::forget(path);
+}
+
+/// Remove a successfully destroyed workspace from the cache on a worker. The
+/// current session's tab groups are removed by slug so an in-flight deletion
+/// cannot leave the home group or a stale layout resurrected.
+pub(crate) fn forget_workspace_in_db(
+    db: &thegn_core::db::Db,
+    session_id: &str,
+    repo_path: &str,
+    slug: &str,
+) {
+    if let Ok(groups) = db.groups_for_session(session_id) {
+        for group in groups.into_iter().filter(|group| {
+            crate::sidebar::split_tab(&group.name).is_some_and(|(group_slug, _)| group_slug == slug)
+        }) {
+            let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: layout is resurrection state
+        }
+    }
+    let _ = db.del_worktrees_for_repo(repo_path); // best-effort: cache write: git is the source of truth
+    let _ = db.del_workspace(repo_path); // best-effort: cache write: git is the source of truth
+    let _ = db.del_repo_slug(repo_path); // best-effort: cache write: git is the source of truth
+    let _ = db.tombstone_workspace(repo_path); // best-effort: cache write: removal tombstone
+    if db.active_workspace().ok().flatten().as_deref() == Some(repo_path) {
+        let _ = db.del_ui_state("", "active_workspace"); // best-effort: cache write: active-workspace pointer
+    }
+    del_ui_state_segment(db, SIDEBAR_SCOPE, "collapse", slug);
+    del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", slug);
 }
 
 /// Segment-anchored delete of a `{prefix}:{name}` ui_state key family: removes
@@ -311,7 +425,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut dirs = workspace_worktree_dirs(&db, "/tmp/repo-lib");
+        let mut dirs = workspace_worktree_dirs(&db, "/tmp/repo-lib").unwrap();
         dirs.sort();
         assert_eq!(
             dirs,
@@ -322,6 +436,23 @@ mod tests {
             "only this workspace's branch worktrees, never home or siblings"
         );
         let _ = std::fs::remove_file(&db_path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn live_workspace_dirs_include_unregistered_worktrees_but_not_home() {
+        let session = Session {
+            id: "/tmp/repo-lib".into(),
+            worktrees: vec![
+                WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/repo-lib"),
+                WorktreeGroup::new("lib/unregistered", GroupKind::Branch, "/tmp/lib-live"),
+                WorktreeGroup::new("app/other", GroupKind::Branch, "/tmp/app-live"),
+            ],
+            active: 0,
+        };
+        assert_eq!(
+            live_workspace_worktree_dirs(&session, "/tmp/repo-lib", "lib"),
+            vec!["/tmp/lib-live"]
+        );
     }
 
     #[test]

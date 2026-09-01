@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::config::{
     KeybindConfig, MetricsTarget, MetricsTargetKind, NotificationsOverlay, SandboxOverlay,
 };
+use crate::hooks::HooksConfig;
 
 /// The formats accepted for repo-local overlays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +135,8 @@ impl std::fmt::Display for RepoOverlayDiagnostic {
 #[serde(default)]
 pub(crate) struct RepoConfigFile {
     pub(crate) sandbox: SandboxOverlay,
+    /// Repo-authored lifecycle hooks. These are trust-gated before execution.
+    pub(crate) hooks: HooksConfig,
     pub(crate) keybinds: KeybindConfig,
     /// Per-repo notification routing overlay.
     pub(crate) notifications: NotificationsOverlay,
@@ -141,6 +144,9 @@ pub(crate) struct RepoConfigFile {
     pub(crate) issues: crate::config_issues::IssuesOverlay,
     /// Selects a named environment for every worktree of this repo.
     pub(crate) env: String,
+    /// Selects a `.devcontainer/<name>/devcontainer.json` variant. This is a
+    /// preference only; it grants no trust for the selected file's contents.
+    pub(crate) devcontainer: String,
     /// Metrics are present only so command collectors can be detected and
     /// refused; their targets never reach the running scraper.
     pub(crate) metrics: RepoMetricsOverlay,

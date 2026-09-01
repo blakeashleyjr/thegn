@@ -11,9 +11,9 @@
 //! [`model`] types, with per-OS impls that degrade gracefully ("a gap is slower
 //! or unavailable, never broken"):
 //!
-//! - `mpris` (Linux) — the D-Bus standard (`org.mpris.MediaPlayer2`), native
+//! - `platform::linux::mpris` (Linux) — the D-Bus standard (`org.mpris.MediaPlayer2`), native
 //!   via `zbus`, with a push **signal watcher** (the ~0%-idle contract).
-//! - `mpris_cli` (Linux) — the `playerctl` CLI fallback when the session bus
+//! - `platform::linux::mpris_cli` (Linux) — the `playerctl` CLI fallback when the session bus
 //!   can't be opened.
 //! - [`mpv`] (Unix) — a single mpv instance over its JSON IPC socket.
 //! - `smtc` (Windows) — the System Media Transport Controls session manager,
@@ -37,11 +37,8 @@ pub mod applescript;
 pub mod mediaremote;
 pub mod mpd;
 mod mpd_parse;
-#[cfg(target_os = "linux")]
-pub mod mpris;
-#[cfg(target_os = "linux")]
-pub mod mpris_cli;
 pub mod mpv;
+pub mod platform;
 #[cfg(windows)]
 pub mod smtc;
 // Pure per-OS decoders, split out so they're unit-tested on Linux without the
@@ -63,11 +60,11 @@ use futures::future::BoxFuture;
 
 use model::{LoopMode, MediaState, Playlist, QueueItem};
 
-#[cfg(target_os = "linux")]
-pub use mpris::{MprisWatch, MprisZbus};
-#[cfg(target_os = "linux")]
-pub use mpris_cli::MprisCli;
 pub use mpv::MpvIpc;
+#[cfg(target_os = "linux")]
+pub use platform::linux::mpris::{MprisWatch, MprisZbus};
+#[cfg(target_os = "linux")]
+pub use platform::linux::mpris_cli::MprisCli;
 
 /// What went wrong talking to a player. Callers treat every variant as "show
 /// nothing / no-op" — a missing player or absent tool is never a hard error.
@@ -79,6 +76,8 @@ pub enum MediaError {
     /// The backend's transport (D-Bus, the mpv socket, the `playerctl` binary,
     /// the SMTC session manager, `osascript`) could not be reached.
     Unavailable(String),
+    /// The selected backend does not expose an optional operation.
+    Unsupported(String),
     /// The player rejected the request or returned something unparseable.
     Backend(String),
 }
@@ -88,6 +87,7 @@ impl std::fmt::Display for MediaError {
         match self {
             MediaError::NoPlayer => f.write_str("no media player available"),
             MediaError::Unavailable(m) => write!(f, "media backend unavailable: {m}"),
+            MediaError::Unsupported(m) => write!(f, "media operation unsupported: {m}"),
             MediaError::Backend(m) => write!(f, "media backend error: {m}"),
         }
     }
@@ -98,7 +98,7 @@ impl std::error::Error for MediaError {}
 /// Per-backend capabilities — lets the UI hide controls a backend can't do
 /// (e.g. `playerctl`/mpv have no MPRIS Playlists; SMTC has no volume). Mirrors
 /// `ci::CiCaps`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MediaCaps {
     pub shuffle: bool,
     pub loop_mode: bool,
@@ -120,6 +120,16 @@ pub struct MediaCaps {
     pub fullscreen: bool,
 }
 
+/// A now-playing snapshot together with the capabilities of the backend that
+/// produced it. Keeping these values together prevents a later backend switch
+/// (or an aggregate's active-child change) from making the panel infer
+/// capabilities from incidental track metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaSnapshot {
+    pub state: MediaState,
+    pub caps: MediaCaps,
+}
+
 /// A media-control backend for one player protocol. Read (`snapshot`) first;
 /// the mutations mirror MPRIS's `Player` interface. Methods take `&self` so a
 /// caller can hold one connection.
@@ -131,6 +141,21 @@ pub struct MediaCaps {
 pub trait MediaBackend: Send + Sync {
     /// The current now-playing snapshot, or `None` when nothing is loaded.
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>>;
+
+    /// Read the current snapshot and its provider capabilities as one host
+    /// delivery. Backends keep the normalized read operation above; the
+    /// default is sufficient because [`MediaBackend::caps`] is synchronous and
+    /// the aggregate updates its active child during `snapshot`.
+    fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+        Box::pin(async move {
+            self.snapshot().await.map(|state| {
+                state.map(|state| MediaSnapshot {
+                    state,
+                    caps: self.caps(),
+                })
+            })
+        })
+    }
 
     /// Toggle play/pause.
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>>;
@@ -155,7 +180,7 @@ pub trait MediaBackend: Send + Sync {
     /// (MPRIS `Seek(±µs)`, mpv relative `seek`). Default: unsupported no-op error
     /// — override + set [`MediaCaps::seek`] where the backend can seek.
     fn seek(&self, _offset: Duration, _forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("seek unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("seek".into())) })
     }
     /// Jump to an absolute `pos` (MPRIS `SetPosition(trackid, µs)`, mpv absolute
     /// `seek`). `track_id` is the current [`MediaState::track_id`] when the
@@ -165,12 +190,12 @@ pub trait MediaBackend: Send + Sync {
         _pos: Duration,
         _track_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("set_position unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("set_position".into())) })
     }
     /// Set an absolute volume `level` in `0..=100`. Default: unsupported —
     /// override for exact control and set [`MediaCaps::abs_volume`].
     fn set_volume(&self, _level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("set_volume unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("set_volume".into())) })
     }
 
     /// The play queue / up-next list, where the backend exposes one (MPRIS
@@ -181,24 +206,24 @@ pub trait MediaBackend: Send + Sync {
     }
     /// Jump to a queue entry by its opaque [`QueueItem::id`]. Default: unsupported.
     fn play_queue_item<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("play_queue_item unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("play_queue_item".into())) })
     }
 
     /// Next chapter (mpv `add chapter 1`; players exposing chapters). Default:
     /// unsupported — gate on [`MediaCaps::chapters`].
     fn chapter_next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("chapters unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("chapter_next".into())) })
     }
     /// Previous chapter. Default: unsupported.
     fn chapter_prev(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("chapters unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("chapter_prev".into())) })
     }
 
     /// Toggle player fullscreen (mpv `cycle fullscreen`, MPRIS root `Fullscreen`).
     /// Self-contained (reads current state where needed) so the UI holds no
     /// fullscreen state. Default: unsupported — gate on [`MediaCaps::fullscreen`].
     fn toggle_fullscreen(&self) -> BoxFuture<'_, Result<(), MediaError>> {
-        Box::pin(async { Err(MediaError::Backend("fullscreen unsupported".into())) })
+        Box::pin(async { Err(MediaError::Unsupported("toggle_fullscreen".into())) })
     }
 
     fn caps(&self) -> MediaCaps;
@@ -246,7 +271,10 @@ pub enum BackendKind {
     Smtc,
     /// macOS `osascript` (Music.app + Spotify).
     AppleScript,
-    /// Reserved.
+    /// Reserved Spotify Web API/library provider. Desktop control remains
+    /// available through the existing platform integrations.
+    Spotify,
+    /// Reserved Jellyfin provider.
     Jellyfin,
 }
 
@@ -284,6 +312,10 @@ pub async fn client_for(opts: &ResolveOpts) -> Option<MediaClient> {
         BackendKind::Mpd => mpd_client(opts).await,
         BackendKind::Smtc => smtc_client(opts).await,
         BackendKind::AppleScript => applescript_client(opts),
+        BackendKind::Spotify => {
+            tracing::debug!(target: "thegn::media", "spotify backend reserved; use MPRIS/SMTC/AppleScript for desktop control");
+            None
+        }
         BackendKind::Jellyfin => {
             tracing::debug!(target: "thegn::media", "jellyfin backend not implemented yet");
             None

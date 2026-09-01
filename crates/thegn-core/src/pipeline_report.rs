@@ -175,6 +175,8 @@ mod tests {
             note: None,
             chunk_path: None,
             report: report.map(str::to_string),
+            exit_code: None,
+            exited_at_ms: None,
         }
     }
 

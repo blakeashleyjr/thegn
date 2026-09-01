@@ -16,6 +16,7 @@
 
 use crate::log::buffer::LogBuffer;
 use crate::log::parser::{LogLevel, ParsedLog};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -259,8 +260,9 @@ impl CrashReport {
         s.push_str(&format!("run:       {}\n", self.run_id));
         s.push_str(&format!("thread:    {}\n", self.thread));
         s.push('\n');
-        s.push_str(&self.panic_line);
-        if !self.panic_line.ends_with('\n') {
+        let panic_line = crate::log_redact::redact_text_line(&self.panic_line);
+        s.push_str(&panic_line);
+        if !panic_line.ends_with('\n') {
             s.push('\n');
         }
         s.push_str("\nbacktrace:\n");
@@ -273,7 +275,7 @@ impl CrashReport {
             s.push_str("(none)\n");
         } else {
             for line in &self.ring_tail {
-                s.push_str(line);
+                s.push_str(&crate::log_redact::redact_text_line(line));
                 s.push('\n');
             }
         }
@@ -311,6 +313,15 @@ pub fn write_crash_report(report: &CrashReport, retain: usize) -> Option<PathBuf
 /// environment (same split as `handlers/paste_image.rs::write_drop_to_dir`).
 fn write_crash_report_to_dir(dir: &Path, report: &CrashReport, retain: usize) -> Option<PathBuf> {
     std::fs::create_dir_all(dir).ok()?;
+    // `create_dir_all` accepts an existing symlink. Do not write reports into
+    // an attacker-selected directory when the state tree has been tampered
+    // with or its permissions are degraded.
+    if !std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return None;
+    }
     // Directory first: `fsperm` tightens perms *after* creation, so anything
     // created before this line would sit at the umask default for a moment.
     // Same ordering as `handlers/paste_image.rs::write_drop_to_dir`.
@@ -319,10 +330,10 @@ fn write_crash_report_to_dir(dir: &Path, report: &CrashReport, retain: usize) ->
     let path = dir.join(&name);
     // Create empty + restrict, then write the body — so the report text is
     // never on disk at a wider mode than intended, not even briefly.
-    let file_err = match std::fs::File::create(&path) {
-        Ok(_) => crate::fsperm::restrict_to_owner(&path).err(),
+    let (mut report_file, file_err) = match create_report_file(&path) {
+        Ok(file) => (Some(file), crate::fsperm::restrict_to_owner(&path).err()),
         // The body write below fails for the same reason and returns `None`.
-        Err(e) => Some(e),
+        Err(e) => (None, Some(e)),
     };
 
     let mut body = report.render();
@@ -346,19 +357,40 @@ fn write_crash_report_to_dir(dir: &Path, report: &CrashReport, retain: usize) ->
         ));
     }
 
-    std::fs::write(&path, body).ok()?;
+    report_file.as_mut()?.write_all(body.as_bytes()).ok()?;
     prune_reports(dir, retain.max(1));
     Some(path)
 }
 
+/// Create a report without following or overwriting a pre-existing path. The
+/// crash directory normally prevents other users from planting entries, but
+/// the writer deliberately continues after a failed directory restriction.
+fn create_report_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 /// List report file names (basenames) in `dir`, newest last (name-sorted).
 fn report_names(dir: &Path) -> Vec<String> {
+    if !std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.ends_with(".txt"))
+        .filter(|n| {
+            std::fs::symlink_metadata(dir.join(n))
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false)
+        })
         .collect();
     names.sort();
     names
@@ -401,6 +433,12 @@ pub fn unacknowledged(names: &[String], ack_names: &[String]) -> Vec<String> {
 /// absent). Newest last.
 pub fn unacknowledged_reports() -> Vec<PathBuf> {
     let dir = crash_dir();
+    if !std::fs::symlink_metadata(&dir)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
     let entries: Vec<String> = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
@@ -412,11 +450,7 @@ pub fn unacknowledged_reports() -> Vec<PathBuf> {
         .filter(|n| n.ends_with(".ack"))
         .cloned()
         .collect();
-    let reports: Vec<String> = entries
-        .iter()
-        .filter(|n| n.ends_with(".txt"))
-        .cloned()
-        .collect();
+    let reports = report_names(&dir);
     unacknowledged(&reports, &acks)
         .into_iter()
         .map(|n| dir.join(n))
@@ -528,6 +562,19 @@ mod tests {
     }
 
     #[test]
+    fn render_redacts_panic_and_ring_text() {
+        let mut r = sample_report();
+        r.panic_line = "panic: --token panic-secret safe".into();
+        r.ring_tail = vec!["WARN TOKEN=ring-secret safe".into()];
+
+        let out = r.render();
+        assert!(!out.contains("panic-secret"));
+        assert!(!out.contains("ring-secret"));
+        assert!(out.contains("--token ***redacted*** safe"));
+        assert!(out.contains("TOKEN=***redacted*** safe"));
+    }
+
+    #[test]
     fn file_name_is_timestamped_and_sortable() {
         let r = sample_report();
         let ts = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
@@ -625,5 +672,106 @@ mod tests {
         assert_eq!(unacknowledged(&names, &acks).len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn report_names_skips_symlinks_and_non_regular_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-crash-types-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("regular.txt"), b"safe").unwrap();
+        std::fs::create_dir(dir.join("nested.txt")).unwrap();
+        let sentinel = dir.with_extension("sentinel");
+        std::fs::write(&sentinel, b"must not enter a bundle").unwrap();
+        let link = dir.join("evil.txt");
+        let linked = std::process::Command::new("ln")
+            .args(["-s"])
+            .arg(&sentinel)
+            .arg(&link)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !linked {
+            let _ = std::fs::remove_file(&sentinel); // best-effort: test cleanup: scratch removal must never fail the test
+            let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+            return;
+        }
+
+        assert_eq!(report_names(&dir), vec!["regular.txt"]);
+
+        let _ = std::fs::remove_file(&sentinel); // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn crash_report_creation_does_not_follow_existing_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-crash-create-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("report.txt");
+        std::fs::write(&target, b"must remain unchanged").unwrap();
+        let linked = std::process::Command::new("ln")
+            .args(["-s"])
+            .arg(&target)
+            .arg(&link)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !linked {
+            let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+            return;
+        }
+
+        assert!(create_report_file(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"must remain unchanged");
+
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+    }
+
+    #[test]
+    fn report_names_rejects_a_symlinked_crash_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "tg-crash-dir-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = root.join("target");
+        let link = root.join("crash");
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("outside.txt"), b"must not be included").unwrap();
+        let linked = std::process::Command::new("ln")
+            .args(["-s"])
+            .arg(&target)
+            .arg(&link)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !linked {
+            let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: scratch removal must never fail the test
+            return;
+        }
+
+        assert!(report_names(&link).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

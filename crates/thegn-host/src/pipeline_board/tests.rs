@@ -59,6 +59,8 @@ fn d(id: i64, st: Option<&str>, parent: Option<i64>) -> AgentDispatch {
         note: None,
         chunk_path: None,
         report: None,
+        exit_code: None,
+        exited_at_ms: None,
     }
 }
 

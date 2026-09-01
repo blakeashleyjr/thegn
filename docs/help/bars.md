@@ -61,12 +61,21 @@ which case it ticks once a second.
 ## Status bar (bottom)
 
 - **Left:** the `?` help chip (click for the context-sensitive page `F1`
-  would give), the mode chip, and the contextual key hints — the keys that
+  would give), the mode chip, the removable `drawer` presence widget, and the contextual key hints — the keys that
   work _right now_, for whatever owns focus. The hints follow you: sidebar
   keys while the sidebar is focused, section keys while the panel is, and
   in the git-family sections only the keys that dispatch at the panel's
   current width (`e widen` stands in for the action keys at the resting
   width).
+
+The `drawer` widget is configured in `[bars].bottom_left` and is shipped
+before `keyhints`, so it remains visible when narrow terminals shed hints. It
+uses the folder glyph and the dim `drawer` label while closed; an open drawer
+uses the accent color and names its active occupant. A count is appended when
+more than one valid drawer occupant exists, and the built-in files occupant is
+always counted. Clicking the widget performs the same files-drawer toggle as
+`files-drawer`; it is not a separate focus zone.
+
 - **Right:** the `[bars] bottom_right` widgets (`pr`, `tests`, `loc`,
   `disk`, and `status` — the transient status message, which clears itself
   after a few seconds), then the badge cluster: the do-not-disturb / routing
