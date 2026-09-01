@@ -8,8 +8,8 @@
 //! **Two halves, both off by default:**
 //!
 //! - **Outbound** ([`PushConfig`]): a delivery channel behind the push-provider
-//!   seam (`thegn_svc::push`). `kind = ntfy` is implemented; `telegram` /
-//!   `gotify` / `pushover` / `webhook` are reserved. The router
+//!   seam (`thegn_svc::push`). `kind = ntfy`, `webhook`, `discord`, and `slack`
+//!   are implemented; `telegram` / `gotify` / `pushover` are reserved. The router
 //!   (`crate::notification_route`) decides *whether* a notification pushes; this
 //!   is the *where/how*. The auth token is a SecretRef (`env:` / `file:`).
 //! - **Inbound** ([`PushInboxConfig`]): a phone-initiated command inbox hosted
@@ -25,17 +25,19 @@ use crate::notification::Priority;
 
 config_enum! {
     /// Which push provider `[notifications.push]` delivers through. `ntfy`
-    /// (self-hostable pub/sub over plain HTTP, stock mobile apps) is
-    /// implemented; the rest are reserved — accepted by config so the seam is
-    /// declared, but unimplemented in this build (they error gracefully in
-    /// `thegn doctor` rather than silently dropping).
+    /// (self-hostable pub/sub over plain HTTP, stock mobile apps), generic
+    /// webhook, Discord, and Slack are implemented; the rest are reserved —
+    /// accepted by config so the seam is declared, but unimplemented in this
+    /// build (they error gracefully in `thegn doctor`).
     pub enum PushKind : "push channel" {
         Ntfy     = "ntfy",
         // Reserved until their publishers land (telegram = AI 423).
         Telegram = "telegram" reserved,
         Gotify   = "gotify" reserved,
         Pushover = "pushover" reserved,
-        Webhook  = "webhook" reserved,
+        Webhook  = "webhook",
+        Discord  = "discord",
+        Slack    = "slack",
     } default = Ntfy;
 }
 
@@ -48,8 +50,7 @@ config_enum! {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PushConfig {
-    /// The push provider. `ntfy` today; reserved: `telegram`, `gotify`,
-    /// `pushover`, `webhook`.
+    /// The legacy scalar push provider. Named providers belong in `sinks`.
     pub kind: PushKind,
     /// The push server base URL, e.g. `"https://ntfy.sh"`. Self-hosting is
     /// strongly recommended — the server sees message plaintext.
@@ -66,6 +67,9 @@ pub struct PushConfig {
     /// below this never push (they still record in the inbox). One of
     /// `"info"` / `"notice"` / `"alert"`. Default `"notice"`.
     pub min_priority: String,
+    /// Explicit named push sinks. When empty, the legacy scalar fields above
+    /// materialize one sink named after `kind`.
+    pub sinks: Vec<PushSinkConfig>,
     /// The inbound command inbox (hard-off by default). See [`PushInboxConfig`].
     pub inbox: PushInboxConfig,
 }
@@ -78,6 +82,7 @@ impl Default for PushConfig {
             topic: String::new(),
             token: String::new(),
             min_priority: "notice".into(),
+            sinks: Vec::new(),
             inbox: PushInboxConfig::default(),
         }
     }
@@ -87,8 +92,9 @@ impl PushConfig {
     /// True when outbound push is usable: an implemented kind with a server and
     /// a topic. A reserved kind or a missing topic ⇒ inert (nothing published).
     pub fn is_configured(&self) -> bool {
-        use crate::seam::Kind;
-        !self.kind.is_reserved() && !self.server.trim().is_empty() && !self.topic.trim().is_empty()
+        self.effective_sinks()
+            .iter()
+            .any(PushSinkConfig::is_configured)
     }
 
     /// The resolved auth token (SecretRef expanded), or `None` for a public
@@ -98,6 +104,149 @@ impl PushConfig {
     }
 
     /// The parsed channel priority floor; garbage falls back to `Notice`.
+    pub fn min_priority(&self) -> Priority {
+        Priority::parse(&self.min_priority).unwrap_or(Priority::Notice)
+    }
+
+    /// Materialize the backward-compatible scalar form into a named sink.
+    /// Explicit sinks are returned in config order, which is also the stable
+    /// fan-out order used by the router.
+    pub fn effective_sinks(&self) -> Vec<PushSinkConfig> {
+        if self.sinks.is_empty() {
+            vec![PushSinkConfig {
+                name: self.kind.as_str().to_string(),
+                kind: self.kind,
+                server: self.server.clone(),
+                topic: self.topic.clone(),
+                token: self.token.clone(),
+                url: String::new(),
+                min_priority: self.min_priority.clone(),
+            }]
+        } else {
+            self.sinks.clone()
+        }
+    }
+
+    /// Static validation for named sinks and webhook URL custody. Errors never
+    /// include endpoint text because webhook URLs are bearer credentials.
+    pub fn validate_errors(&self) -> Vec<String> {
+        use crate::seam::Kind;
+        use std::collections::BTreeSet;
+
+        const MAX_SINKS: usize = 32;
+        const MAX_NAME_CHARS: usize = 64;
+        let sinks = self.effective_sinks();
+        let mut errors = Vec::new();
+        if self.sinks.len() > MAX_SINKS {
+            errors.push(format!(
+                "[notifications.push.sinks] more than {MAX_SINKS} sinks"
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for sink in &sinks {
+            let name = sink.name.trim();
+            if name.is_empty() {
+                errors.push("[notifications.push.sinks] sink name must not be empty".to_string());
+            } else if name.chars().count() > MAX_NAME_CHARS {
+                errors.push(format!(
+                    "[notifications.push.sinks] sink {name:?} name exceeds {MAX_NAME_CHARS} characters"
+                ));
+            } else if !names.insert(name.to_string()) {
+                errors.push(format!(
+                    "[notifications.push.sinks] duplicate sink name {name:?}"
+                ));
+            }
+            if !matches!(
+                sink.kind,
+                PushKind::Ntfy | PushKind::Webhook | PushKind::Discord | PushKind::Slack
+            ) && sink.kind.is_reserved()
+            {
+                // The enum walker reports the kind itself; this names the sink
+                // for the multi-sink form without duplicating the enum error.
+                errors.push(format!(
+                    "[notifications.push.sinks] sink {name:?} selects reserved kind {}",
+                    sink.kind.as_str()
+                ));
+            }
+            if Priority::parse(&sink.min_priority).is_none() {
+                errors.push(format!(
+                    "[notifications.push.sinks] sink {name:?} has invalid min_priority (expected info, notice, or alert)"
+                ));
+            }
+            if matches!(
+                sink.kind,
+                PushKind::Webhook | PushKind::Discord | PushKind::Slack
+            ) {
+                let url = sink.url.trim();
+                let valid_ref = ["env:", "file:"].iter().any(|prefix| {
+                    url.strip_prefix(prefix)
+                        .is_some_and(|operand| !operand.trim().is_empty())
+                });
+                if !valid_ref {
+                    errors.push(format!(
+                        "[notifications.push.sinks] sink {name:?} url must be a SecretRef (env:VAR or file:PATH), never a raw URL"
+                    ));
+                }
+            }
+        }
+        for (index, sink) in self.sinks.iter().enumerate() {
+            if sink.name.trim().is_empty() {
+                errors.push(format!(
+                    "[notifications.push.sinks[{index}]] name is required"
+                ));
+            }
+        }
+        errors
+    }
+}
+
+/// One explicitly named sink under `[[notifications.push.sinks]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PushSinkConfig {
+    /// Stable selector used by `push:<name>` rules and delivery diagnostics.
+    pub name: String,
+    /// Provider kind for this sink.
+    pub kind: PushKind,
+    /// ntfy server base URL.
+    pub server: String,
+    /// ntfy topic.
+    pub topic: String,
+    /// ntfy auth token (legacy-compatible field).
+    pub token: String,
+    /// Webhook/Discord/Slack endpoint, accepted only as `env:` or `file:`.
+    pub url: String,
+    /// Per-sink priority floor.
+    pub min_priority: String,
+}
+
+impl Default for PushSinkConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: PushKind::Ntfy,
+            server: "https://ntfy.sh".into(),
+            topic: String::new(),
+            token: String::new(),
+            url: String::new(),
+            min_priority: "notice".into(),
+        }
+    }
+}
+
+impl PushSinkConfig {
+    pub fn is_configured(&self) -> bool {
+        use crate::seam::Kind;
+        if self.kind.is_reserved() {
+            return false;
+        }
+        match self.kind {
+            PushKind::Ntfy => !self.server.trim().is_empty() && !self.topic.trim().is_empty(),
+            PushKind::Webhook | PushKind::Discord | PushKind::Slack => !self.url.trim().is_empty(),
+            PushKind::Telegram | PushKind::Gotify | PushKind::Pushover => false,
+        }
+    }
+
     pub fn min_priority(&self) -> Priority {
         Priority::parse(&self.min_priority).unwrap_or(Priority::Notice)
     }
@@ -270,12 +419,15 @@ mod tests {
     fn push_kind_parses_and_reserves() {
         assert_eq!(PushKind::from_str_validated("ntfy"), Ok(PushKind::Ntfy));
         assert!(!PushKind::Ntfy.is_reserved());
-        for reserved in ["telegram", "gotify", "pushover", "webhook"] {
+        for reserved in ["telegram", "gotify", "pushover"] {
             let e = PushKind::from_str_validated(reserved).unwrap_err();
             assert!(e.contains(reserved) && e.contains("reserved"), "{e}");
         }
         assert!(PushKind::Telegram.is_reserved());
-        assert!(PushKind::from_str_validated("slack").is_err());
+        assert!(!PushKind::Webhook.is_reserved());
+        assert!(!PushKind::Discord.is_reserved());
+        assert!(!PushKind::Slack.is_reserved());
+        assert!(PushKind::from_str_validated("matrix").is_err());
     }
 
     #[test]
@@ -299,6 +451,46 @@ mod tests {
         assert_eq!(c.min_priority(), Priority::Alert);
         c.min_priority = "garbage".into();
         assert_eq!(c.min_priority(), Priority::Notice, "fallback");
+    }
+
+    #[test]
+    fn explicit_sinks_materialize_and_validate_without_echoing_urls() {
+        let mut c = PushConfig::default();
+        c.sinks = vec![PushSinkConfig {
+            name: "oncall".into(),
+            kind: PushKind::Slack,
+            url: "https://hooks.slack.test/SECRET_SENTINEL".into(),
+            ..Default::default()
+        }];
+        assert_eq!(c.effective_sinks().len(), 1);
+        assert!(c.is_configured());
+        let errors = c.validate_errors();
+        assert!(errors.iter().any(|e| e.contains("oncall")));
+        assert!(!errors.iter().any(|e| e.contains("SECRET_SENTINEL")));
+    }
+
+    #[test]
+    fn named_sink_secret_refs_and_floors_are_accepted() {
+        let c = PushConfig {
+            sinks: vec![
+                PushSinkConfig {
+                    name: "phone".into(),
+                    kind: PushKind::Ntfy,
+                    topic: "alerts".into(),
+                    min_priority: "alert".into(),
+                    ..Default::default()
+                },
+                PushSinkConfig {
+                    name: "oncall".into(),
+                    kind: PushKind::Discord,
+                    url: "env:DISCORD_WEBHOOK".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(c.validate_errors().is_empty(), "{:?}", c.validate_errors());
+        assert_eq!(c.effective_sinks()[0].min_priority(), Priority::Alert);
     }
 
     #[test]

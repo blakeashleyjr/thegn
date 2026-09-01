@@ -13,7 +13,7 @@ lanes, and only one of them is cheap and clearly right:
    exact right seam for this: the notification router's push-provider seam
    (in-flight `add-ntfy-push-bridge`, THE-12) — object-safe trait, config
    `kind` implemented-or-`reserved`, best-effort off-loop delivery, doctor
-   probe — which explicitly **reserves a `webhook` kind**. "queue needs a
+   probe — which provides the `webhook` kind. "queue needs a
    human" landing in the team's Slack channel is the actual value of this
    issue, and it is three payload formatters deep, not a platform.
 2. **Interactive bots** (the issue's seed link, serenity-rs). serenity is a
@@ -40,7 +40,7 @@ lanes, and only one of them is cheap and clearly right:
   - `slack` — Slack incoming-webhook payload (text + minimal blocks,
     priority mapped to attachment color).
 - **Named sinks, one router.** The router supports one or more named push
-  sinks; rules' `channels` selectors address all of them (`push`) or one by
+  sinks; rules' `route` selectors address all of them (`push`) or one by
   name (`push:<name>`), so "alerts → Slack, everything → phone" is a routing
   rule, not code. Priority/DND/mode/profile machinery applies per sink
   unchanged.
@@ -52,8 +52,8 @@ lanes, and only one of them is cheap and clearly right:
   best-effort worker: over the limit coalesces to drop-with-counter, never a
   send queue that grows and never a blocked loop.
 - **Doctor probes per sink** report config + secret resolution without
-  posting (a probe message into a team channel is spam; a `--send-test` flag
-  on `thegn notify` covers deliberate verification).
+  posting. Deliberate test delivery is outside this change and never a
+  diagnostic side effect.
 - **Bots stay out, with criteria.** No serenity, no gateway, no bot tokens in
   thegn. If interactive chat control is ever wanted, the revisit path is
   fixed: the command-inbox envelope (allowlisted capability calls, HMAC,

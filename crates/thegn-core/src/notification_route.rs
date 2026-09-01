@@ -41,13 +41,9 @@ pub struct RouteDecision {
     pub desktop: bool,
     /// Eligible for an in-app toast overlay.
     pub toast: bool,
-    /// Eligible for push-to-phone delivery (`[notifications.push]`). An
-    /// ephemeral channel: DND suppresses it below `allow_priority`, and the
-    /// `[notifications.push] min_priority` floor still gates it on the final
-    /// effective priority (the inbox row remains the durable record). Whether a
-    /// push is actually sent additionally depends on push being *configured* —
-    /// this is only the routing eligibility.
-    pub push: bool,
+    /// Named push sinks eligible for delivery. An empty collection means no
+    /// push; names preserve the deterministic config order.
+    pub push_sinks: Vec<String>,
     /// The audible cue, if any.
     pub sound: Option<SoundEmit>,
 }
@@ -87,9 +83,10 @@ pub fn decide(
     let mut record = true;
     let mut desktop = true;
     let mut toast = false;
-    // Push defaults eligible (like desktop); the `min_priority` floor is applied
-    // below on the final effective priority.
-    let mut push = true;
+    // Push defaults eligible for every effective sink; each sink's floor is
+    // applied below after the final effective priority is known.
+    let all_sinks = cfg.push.effective_sinks();
+    let mut push_sinks: Vec<String> = all_sinks.iter().map(|s| s.name.clone()).collect();
     let mut sound_allowed = true;
     // A rule sound override: outer Some = overridden, inner None = explicitly off.
     let mut rule_sound: Option<Option<SoundEmit>> = None;
@@ -104,7 +101,7 @@ pub fn decide(
                 effective_priority: effective,
                 desktop: false,
                 toast: false,
-                push: false,
+                push_sinks: Vec::new(),
                 sound: None,
             };
         }
@@ -115,13 +112,13 @@ pub fn decide(
             record = chan_has(chans, "inbox");
             desktop = chan_has(chans, "desktop");
             toast = chan_has(chans, "toast");
-            push = chan_has(chans, "push");
+            push_sinks = push_targets(chans, &all_sinks);
             sound_allowed = chan_has(chans, "sound");
         }
         if rule.mute {
             desktop = false;
             toast = false;
-            push = false;
+            push_sinks.clear();
             sound_allowed = false;
         }
         if let Some(s) = rule.sound.as_deref() {
@@ -141,19 +138,18 @@ pub fn decide(
         if effective.rank() < allow.rank() {
             desktop = false;
             toast = false;
-            push = false;
+            push_sinks.clear();
             sound_allowed = false;
         }
     }
 
-    // Push channel floor: below `[notifications.push] min_priority`, push is
-    // suppressed — evaluated on the FINAL effective priority, so a rule's
-    // `set_priority` bump can lift a notification over the floor (and a
-    // low-priority event never pushes even if a rule routed it there). The
-    // inbox row still records; push is best-effort and ephemeral.
-    if effective.rank() < cfg.push.min_priority().rank() {
-        push = false;
-    }
+    // Apply each sink floor after rule priority overrides and DND have settled.
+    push_sinks.retain(|name| {
+        all_sinks
+            .iter()
+            .find(|sink| sink.name == *name)
+            .is_some_and(|sink| effective.rank() >= sink.min_priority().rank())
+    });
 
     // Kinds in `always_kinds` chime regardless of `min_priority` (the
     // agent-done/needs-you set is on by default).
@@ -180,7 +176,7 @@ pub fn decide(
         effective_priority: effective,
         desktop,
         toast,
-        push,
+        push_sinks,
         sound,
     }
 }
@@ -188,6 +184,27 @@ pub fn decide(
 /// Whether a channel token is present in a rule's `route` list (case-insensitive).
 fn chan_has(chans: &[String], want: &str) -> bool {
     chans.iter().any(|c| c.trim().eq_ignore_ascii_case(want))
+}
+
+/// Resolve push channel selectors while preserving sink order. `push` fans out
+/// to every configured sink; `push:<name>` selects exactly one sink. Invalid
+/// selectors are rejected by config validation, while runtime routing treats
+/// them conservatively as no target.
+fn push_targets(chans: &[String], sinks: &[crate::config_push::PushSinkConfig]) -> Vec<String> {
+    if chans.iter().any(|c| c.trim().eq_ignore_ascii_case("push")) {
+        return sinks.iter().map(|sink| sink.name.clone()).collect();
+    }
+    let wanted: std::collections::HashSet<&str> = chans
+        .iter()
+        .filter_map(|channel| channel.trim().strip_prefix("push:"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    sinks
+        .iter()
+        .filter(|sink| wanted.contains(sink.name.as_str()))
+        .map(|sink| sink.name.clone())
+        .collect()
 }
 
 /// Parse a rule's `sound` override: `off`/`none` ⇒ silence, `bell` ⇒ bell,
@@ -720,7 +737,7 @@ mod tests {
             &cfg,
             &ctx(),
         );
-        assert!(d.push, "notice ≥ floor");
+        assert!(!d.push_sinks.is_empty(), "notice ≥ floor");
         // ...an info-priority one does not (but still records in the inbox).
         cfg.priority.insert("test_failed".into(), "info".into());
         let d = decide(
@@ -731,7 +748,7 @@ mod tests {
             &cfg,
             &ctx(),
         );
-        assert!(!d.push, "info < notice floor");
+        assert!(d.push_sinks.is_empty(), "info < notice floor");
         assert!(d.record, "inbox row still written below the push floor");
     }
 
@@ -752,7 +769,7 @@ mod tests {
             &cfg,
             &ctx(),
         );
-        assert!(d.push, "push listed in route");
+        assert!(!d.push_sinks.is_empty(), "push listed in route");
         assert!(!d.desktop, "desktop not in route");
         // A route that omits push disables it (route is authoritative).
         cfg.rules[0].route = Some(vec!["inbox".into(), "desktop".into()]);
@@ -764,7 +781,7 @@ mod tests {
             &cfg,
             &ctx(),
         );
-        assert!(!d.push, "push not in route");
+        assert!(d.push_sinks.is_empty(), "push not in route");
     }
 
     #[test]
@@ -776,7 +793,7 @@ mod tests {
         c.dnd_forced = Some(true);
         let d = decide(NotificationKind::TestFailed, "wt", "x", "/wt/app", &cfg, &c);
         assert!(
-            !d.push,
+            d.push_sinks.is_empty(),
             "DND suppresses ephemeral push below allow_priority"
         );
         assert!(d.record, "inbox still records under DND");
@@ -799,7 +816,7 @@ mod tests {
             &cfg,
             &ctx(),
         );
-        assert!(!d.push, "mute disables push");
+        assert!(d.push_sinks.is_empty(), "mute disables push");
         // A drop rule zeroes every channel including push.
         let mut cfg = base_cfg();
         cfg.rules.push(NotificationRule {
@@ -815,7 +832,10 @@ mod tests {
             &cfg,
             &ctx(),
         );
-        assert!(!d.push && !d.record, "drop disables push and record");
+        assert!(
+            d.push_sinks.is_empty() && !d.record,
+            "drop disables push and record"
+        );
     }
 
     #[test]
@@ -840,9 +860,56 @@ mod tests {
         );
         assert_eq!(d.effective_priority, Priority::Alert);
         assert!(
-            d.push,
+            !d.push_sinks.is_empty(),
             "set_priority lifted the notification over the push floor"
         );
+    }
+
+    #[test]
+    fn named_sinks_fan_out_and_apply_individual_floors() {
+        let mut cfg = base_cfg();
+        cfg.push.sinks = vec![
+            crate::config_push::PushSinkConfig {
+                name: "phone".into(),
+                kind: crate::config_push::PushKind::Ntfy,
+                topic: "alerts".into(),
+                min_priority: "notice".into(),
+                ..Default::default()
+            },
+            crate::config_push::PushSinkConfig {
+                name: "oncall".into(),
+                kind: crate::config_push::PushKind::Slack,
+                url: "env:SLACK_URL".into(),
+                min_priority: "alert".into(),
+                ..Default::default()
+            },
+        ];
+        cfg.priority.insert("agent_done".into(), "notice".into());
+        let all = decide(
+            NotificationKind::AgentDone,
+            "src",
+            "done",
+            "/wt",
+            &cfg,
+            &ctx(),
+        );
+        assert_eq!(all.push_sinks, vec!["phone"]);
+
+        cfg.rules.push(NotificationRule {
+            kind: Some("agent_done".into()),
+            route: Some(vec!["push:oncall".into()]),
+            set_priority: Some("alert".into()),
+            ..Default::default()
+        });
+        let one = decide(
+            NotificationKind::AgentDone,
+            "src",
+            "done",
+            "/wt",
+            &cfg,
+            &ctx(),
+        );
+        assert_eq!(one.push_sinks, vec!["oncall"]);
     }
 
     #[test]
