@@ -415,6 +415,8 @@ impl SubmoduleRowPolicy {
                 "dirty".to_string()
             } else if state.untracked {
                 "untracked".to_string()
+            } else if matches!(state.pointer, SubmodulePointer::Conflict) {
+                "conflict".to_string()
             } else if matches!(state.pointer, SubmodulePointer::Diverged) {
                 "diverged".to_string()
             } else if let Some(summary) = summary {
@@ -694,6 +696,35 @@ mod tests {
         assert_eq!(
             format_submodule_conflict(&conflict),
             "submodule pointer conflict: vendor/lib (abc1234 vs def5678)"
+        );
+    }
+
+    #[test]
+    fn row_policy_labels_pointer_conflicts_before_summary() {
+        let diff = SubmoduleDiff {
+            path: "vendor/lib".into(),
+            old_sha: "abc1234".into(),
+            new_sha: "def5678".into(),
+            kind: SubmoduleDiffKind::Changed,
+        };
+        let state = SubmoduleState {
+            path: diff.path.clone(),
+            recorded_sha: diff.old_sha.clone(),
+            checked_out_sha: diff.new_sha.clone(),
+            initialized: true,
+            dirty: false,
+            untracked: false,
+            pointer: SubmodulePointer::Conflict,
+        };
+        let summary = SubmoduleSummary::bounded(
+            SubmoduleDirection::Forward,
+            vec!["1234567".into()],
+            4,
+            false,
+        );
+        assert_eq!(
+            SubmoduleRowPolicy::pointer(&diff, Some(&state), Some(&summary)).label,
+            "conflict"
         );
     }
 }

@@ -1012,14 +1012,26 @@ fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphRe
                 } else {
                     Ok(None)
                 };
-                let submodule_dirty = submodule_status_idx
-                    .and_then(|idx| r.get(idx))
-                    .filter(|res| res.exit == 0)
-                    .map(|res| {
-                        submodule::dirty_from_outputs(&res.stdout, &r[0].stdout)
-                            .map_err(|e| anyhow::anyhow!(e))
-                    })
-                    .unwrap_or_else(|| Ok(false));
+                let submodule_dirty = if let Some(idx) = submodule_status_idx {
+                    match r.get(idx) {
+                        Some(res) if res.exit == 0 && r[0].exit == 0 => {
+                            submodule::dirty_from_outputs(&res.stdout, &r[0].stdout)
+                                .map_err(|e| anyhow::anyhow!(e))
+                        }
+                        Some(res) if res.exit != 0 => Err(anyhow::anyhow!(
+                            "git submodule status failed: {}",
+                            res.stderr.trim()
+                        )),
+                        Some(_) => {
+                            Err(anyhow::anyhow!("git status failed: {}", r[0].stderr.trim()))
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "git submodule status result missing from batch"
+                        )),
+                    }
+                } else {
+                    Ok(false)
+                };
                 return Some(GlyphReads {
                     dirty,
                     ahead_behind,
