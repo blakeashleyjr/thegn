@@ -32,7 +32,7 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
         let token = match toolchain.state.as_str() {
             "ready" | "shims" => "(mise)",
             "pending-trust" => "(mise ~)",
-            "missing-binary" | "missing-shims" => "(mise !)",
+            "missing-binary" | "missing-shims" | "missing-tools" | "degraded" => "(mise !)",
             _ => "",
         };
         if !token.is_empty() {

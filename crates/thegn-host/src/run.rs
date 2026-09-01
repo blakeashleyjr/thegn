@@ -601,6 +601,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the ticker still receives its clone at its spawn site below.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
+    crate::mise_provider::install_refresh(refresh_tx.clone(), waker.clone());
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
     // read — diff panel included — at another worktree) and fast-forward a main

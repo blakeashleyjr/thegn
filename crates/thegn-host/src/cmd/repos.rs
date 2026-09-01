@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use thegn_core::config::Config;
 use thegn_core::config_resolve::Approvals;
 use thegn_core::db::Db;
+use thegn_core::remote::GitLoc;
 use thegn_core::store::{RepoTrustStore, WorkspaceStore};
 use thegn_core::{outln, repo, repo_trust, util};
 
@@ -85,6 +86,29 @@ fn repo_root_arg(path: Option<String>) -> PathBuf {
     repo::main_worktree(&start).unwrap_or(start)
 }
 
+/// Pick the target whose trust request is being reviewed. A remote worktree
+/// may have only a local placeholder, so prefer the explicitly supplied
+/// remote row and otherwise use the first remote row registered for the repo.
+/// The target-side bytes are resolved by the provider below; this helper never
+/// treats the placeholder as the source of truth.
+fn trust_target(start: &std::path::Path, root: &PathBuf, db: &Db) -> (PathBuf, GitLoc) {
+    let direct = GitLoc::for_worktree(start);
+    if direct.is_remote() {
+        return (start.to_path_buf(), direct);
+    }
+    if let Ok(rows) = db.worktrees()
+        && let Some(row) = rows.into_iter().find(|row| {
+            row.repo_root == root.to_string_lossy()
+                && GitLoc::from_db(&row.worktree, Some(&row.location)).is_remote()
+        })
+    {
+        let worktree = PathBuf::from(row.worktree);
+        let loc = GitLoc::for_worktree(&worktree);
+        return (worktree, loc);
+    }
+    (root.clone(), direct)
+}
+
 /// `thegn repos trust [path] [--approve <id>] [--revoke <id>]` — review and
 /// decide the gated sandbox requests a repo `.thegn.*` overlay makes. With no
 /// flag, lists the current denials, pending requests (with ids), and recorded
@@ -95,9 +119,19 @@ pub fn trust(
     approve: Option<String>,
     revoke: Option<String>,
 ) -> Result<()> {
+    let start = path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let root = repo_root_arg(path);
-    let root_s = root.to_string_lossy().to_string();
     let db = Db::open()?;
+    let root = db
+        .repo_root_for(&start.to_string_lossy())?
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(root);
+    let root_s = root.to_string_lossy().to_string();
+    let (target, target_loc) = trust_target(&start, &root, &db);
 
     if let Some(id) = revoke {
         let row = db
@@ -116,9 +150,14 @@ pub fn trust(
     let approvals = Approvals::from_canonical(approved_canonical.clone());
     let resolved = cfg.repo_sandbox_resolved(&root, &approvals);
     let mut pending = resolved.pending.clone();
-    if let Some(request) =
-        crate::mise_provider::pending_request(cfg, &root, &root, &approved_canonical)
-    {
+    if let Some(request) = crate::mise_provider::pending_request_for_target(
+        cfg,
+        &target.to_string_lossy(),
+        &root,
+        &target_loc,
+        &approved_canonical,
+        true,
+    ) {
         pending.push(request);
     }
 
