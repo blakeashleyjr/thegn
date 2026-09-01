@@ -1,8 +1,10 @@
 # Cut prebuilt `thegn` binaries on a version tag.
 #
 # Trigger: push a `v*` tag (e.g. `v0.1.0-alpha.1`). Builds the `thegn` binary for
-# the supported targets and attaches per-target archives + a checksums file
-# to a GitHub Release. Uses taiki-e/upload-rust-binary-action, whose archive
+# the supported targets and attaches per-target archives, checksums, provenance,
+# rendered manager metadata, and standalone Linux packages to a GitHub Release.
+# External manager repositories are a separate protected manual operation.
+# Uses taiki-e/upload-rust-binary-action, whose archive
 # naming (`thegn-<tag>-<target>.{tar.gz,zip}`) matches the `[package.metadata.
 # binstall]` pkg-url in crates/thegn-host/Cargo.toml, so a future `cargo binstall`
 # (once the crates are published) resolves the same assets.
@@ -39,8 +41,20 @@ on:
       tag:
         description: "Tag to build (e.g. v0.1.0-alpha.1)"
         required: true
+        type: string
+      operation:
+        description: "Build a draft, or publish generated metadata after the draft is published"
+        required: true
+        type: choice
+        default: build
+        options:
+          - build
+          - publish-external
 permissions:
-  contents: write # create the release + upload assets
+  contents: read
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}-${{ inputs.operation || 'build' }}
+  cancel-in-progress: false
 jobs:
   # Create the (draft) GitHub Release the build legs upload into.
   # upload-rust-binary-action only uploads — it never creates a release — so
@@ -56,7 +70,10 @@ jobs:
   # re-run, the draft and its assets survive, and the upload's `--clobber`
   # makes the retried leg safe.
   create-release:
+    if: github.event_name == 'push' || inputs.operation == 'build'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/create-gh-release-action@v1
@@ -66,9 +83,14 @@ jobs:
           ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
   upload:
+    if: github.event_name == 'push' || inputs.operation == 'build'
     name: ${{ matrix.target }}
     needs: create-release
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -91,7 +113,8 @@ jobs:
       - name: Install musl tools
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - id: upload
+        uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: thegn
           target: ${{ matrix.target }}
@@ -111,6 +134,12 @@ jobs:
           ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          # `tar` is the exact local archive uploaded by the preceding action;
+          # checksums remain ordinary release assets, not signing keys.
+          subject-path: ${{ steps.upload.outputs.tar }}
   # Shell completions ship ONCE, as a single arch-independent asset, rather than
   # riding inside each per-target archive. Three reasons:
   #   - the CLI tree has no `#[cfg]`-gated `Command` variants, so every target
@@ -123,9 +152,12 @@ jobs:
   # tarball / cargo-binstall path. Runs in parallel with `upload`: both only
   # need the draft release to exist.
   completions:
+    if: github.event_name == 'push' || inputs.operation == 'build'
     name: completions
     needs: create-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -188,3 +220,262 @@ jobs:
             "thegn-$TAG-completions.tar.gz" \
             "thegn-$TAG-completions.tar.gz.sha256" \
             --clobber
+  # The source archives are immutable inputs here. Nothing is uploaded until
+  # every currently enabled manager has validated its archive/checksum pair,
+  # rendered successfully, and nfpm has produced both standalone packages.
+  package:
+    if: github.event_name == 'push' || inputs.operation == 'build'
+    needs: upload
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || '' }}
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          cache-lane: release-package
+      - name: Resolve release tag
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          package_root="$(mktemp -d)"
+          echo "TAG=$REQUESTED_TAG" >> "$GITHUB_ENV"
+          echo "PACKAGE_ROOT=$package_root" >> "$GITHUB_ENV"
+          mkdir -p "$package_root/assets" "$package_root/rendered" \
+            "$package_root/package/stage" "$package_root/release-assets"
+      - name: Download this tag's source assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir "$PACKAGE_ROOT/assets" \
+            --pattern "thegn-$TAG-*.tar.gz" \
+            --pattern "thegn-$TAG-*.sha256"
+      - name: Validate all active inputs and render metadata
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py validate \
+            --tag "$TAG" \
+            --assets-dir "$PACKAGE_ROOT/assets" \
+            | tee "$PACKAGE_ROOT/validation.txt"
+          python3 packaging/release.py render \
+            --tag "$TAG" \
+            --assets-dir "$PACKAGE_ROOT/assets" \
+            --output-dir "$PACKAGE_ROOT/rendered" \
+            | tee "$PACKAGE_ROOT/rendered.txt"
+      - name: Build standalone deb and rpm packages
+        run: |
+          set -euo pipefail
+          tar -xzf \
+            "$PACKAGE_ROOT/assets/thegn-$TAG-x86_64-unknown-linux-gnu.tar.gz" \
+            -C "$PACKAGE_ROOT/package/stage"
+          # validate already proved this tag is exactly v<workspace version>.
+          version="${TAG#v}"
+          nfpm_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#nfpm)"
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$TAG")"
+          (
+            cd "$PACKAGE_ROOT/package"
+            "$nfpm_store/bin/nfpm" package \
+              --config "$PACKAGE_ROOT/rendered/nfpm/thegn-deb.yaml" \
+              --packager deb \
+              --target "$PACKAGE_ROOT/release-assets/thegn_${version}_amd64.deb"
+            "$nfpm_store/bin/nfpm" package \
+              --config "$PACKAGE_ROOT/rendered/nfpm/thegn-rpm.yaml" \
+              --packager rpm \
+              --target "$PACKAGE_ROOT/release-assets/thegn-${version}-1.x86_64.rpm"
+          )
+      - name: Stage rendered metadata
+        run: |
+          set -euo pipefail
+          cp "$PACKAGE_ROOT/rendered/homebrew/thegn.rb" \
+            "$PACKAGE_ROOT/release-assets/thegn-$TAG-homebrew.rb"
+          cp "$PACKAGE_ROOT/rendered/aur/PKGBUILD" \
+            "$PACKAGE_ROOT/release-assets/thegn-$TAG-PKGBUILD"
+          cp "$PACKAGE_ROOT/rendered/nfpm/thegn-deb.yaml" \
+            "$PACKAGE_ROOT/release-assets/thegn-$TAG-deb.nfpm.yaml"
+          cp "$PACKAGE_ROOT/rendered/nfpm/thegn-rpm.yaml" \
+            "$PACKAGE_ROOT/release-assets/thegn-$TAG-rpm.nfpm.yaml"
+      - name: Upload packages and rendered metadata
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # This directory contains no source archive, so --clobber cannot
+          # retract or overwrite any matrix output.
+          gh release upload "$TAG" "$PACKAGE_ROOT/release-assets/"* --clobber
+      - name: Summarize package outputs
+        env:
+          PUBLICATION_ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED || 'false' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Package artifacts for $TAG"
+            echo
+            echo "Outputs:"
+            while IFS= read -r path; do
+              echo "- \`$(basename "$path")\`"
+            done < <(find "$PACKAGE_ROOT/release-assets" -maxdepth 1 -type f | sort)
+            echo
+            echo "Validated target/checksum mapping:"
+            echo '```text'
+            sed 's/^/  /' "$PACKAGE_ROOT/validation.txt"
+            echo '```'
+            echo
+            echo "Verify provenance after downloading an archive:"
+            echo '```sh'
+            echo "gh attestation verify thegn-$TAG-<target>.tar.gz --repo $GITHUB_REPOSITORY"
+            echo '```'
+            echo
+            echo "External publication enabled: \`$PUBLICATION_ENABLED\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  # Publication is deliberately a separate manual operation. It cannot reach
+  # create-release or mutate release assets, and the protected environment is
+  # the review boundary for the two narrowly scoped deploy keys.
+  publish-external:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-external'
+    runs-on: ubuntu-latest
+    environment: package-publication
+    permissions:
+      contents: read
+    steps:
+      - name: Require a main-branch dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$DISPATCH_REF" != refs/heads/main ]; then
+            echo "::error::External publication must be dispatched from the main branch."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          cache-lane: release-publication
+      - name: Check publication enablement
+        id: publication
+        env:
+          ENABLED: ${{ vars.PACKAGE_PUBLICATION_ENABLED }}
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          AUR_DEPLOY_KEY: ${{ secrets.AUR_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ "$ENABLED" = true ] || missing+=("PACKAGE_PUBLICATION_ENABLED=true")
+          [[ "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || missing+=("HOMEBREW_TAP_REPOSITORY=<owner>/homebrew-tap")
+          [ -n "$TAP_DEPLOY_KEY" ] || missing+=("HOMEBREW_TAP_DEPLOY_KEY")
+          [ -n "$AUR_DEPLOY_KEY" ] || missing+=("AUR_DEPLOY_KEY")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=External publication pending::Nothing was pushed; missing: ${missing[*]}"
+            checklist="Setup checklist: (1) create public homebrew-tap; (2) create AUR thegn-bin;"
+            checklist+=" (3) add write-scoped deploy keys for only those repositories;"
+            checklist+=" (4) configure the package-publication GitHub environment"
+            checklist+=" with a required reviewer and both key secrets;"
+            checklist+=" (5) set HOMEBREW_TAP_REPOSITORY; (6) rehearse a local tap and makepkg;"
+            checklist+=" (7) set PACKAGE_PUBLICATION_ENABLED=true."
+            echo "::warning::$checklist"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Require a published release and download generated metadata
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+            echo "::error::Publish the draft release before external publication."
+            exit 1
+          fi
+          publish_root="$(mktemp -d)"
+          echo "PUBLISH_ROOT=$publish_root" >> "$GITHUB_ENV"
+          mkdir -p "$publish_root/metadata" "$publish_root/keys"
+          gh release download "$TAG" --dir "$publish_root/metadata" \
+            --pattern "thegn-$TAG-homebrew.rb" \
+            --pattern "thegn-$TAG-PKGBUILD"
+      - name: Configure scoped deploy keys
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          AUR_DEPLOY_KEY: ${{ secrets.AUR_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/homebrew"
+          printf '%s\n' "$AUR_DEPLOY_KEY" > "$PUBLISH_ROOT/keys/aur"
+          chmod 600 "$PUBLISH_ROOT/keys/homebrew" "$PUBLISH_ROOT/keys/aur"
+      - name: Publish identical Homebrew and AUR commits
+        if: steps.publication.outputs.ready == 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          tap_ssh="ssh -i $PUBLISH_ROOT/keys/homebrew -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          aur_ssh="ssh -i $PUBLISH_ROOT/keys/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+          GIT_SSH_COMMAND="$tap_ssh" git clone \
+            "git@github.com:$TAP_REPOSITORY.git" "$PUBLISH_ROOT/tap"
+          mkdir -p "$PUBLISH_ROOT/tap/Formula"
+          cp "$PUBLISH_ROOT/metadata/thegn-$TAG-homebrew.rb" \
+            "$PUBLISH_ROOT/tap/Formula/thegn.rb"
+          git -C "$PUBLISH_ROOT/tap" add Formula/thegn.rb
+          if ! git -C "$PUBLISH_ROOT/tap" diff --cached --quiet; then
+            git -C "$PUBLISH_ROOT/tap" \
+              -c user.name='thegn release automation' \
+              -c user.email='actions@users.noreply.github.com' \
+              commit -m "thegn $TAG"
+            GIT_SSH_COMMAND="$tap_ssh" git -C "$PUBLISH_ROOT/tap" push origin HEAD
+          fi
+
+          GIT_SSH_COMMAND="$aur_ssh" git clone \
+            ssh://aur@aur.archlinux.org/thegn-bin.git "$PUBLISH_ROOT/aur"
+          cp "$PUBLISH_ROOT/metadata/thegn-$TAG-PKGBUILD" "$PUBLISH_ROOT/aur/PKGBUILD"
+          pacman_store="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#pacman)"
+          (
+            cd "$PUBLISH_ROOT/aur"
+            "$pacman_store/bin/makepkg" --printsrcinfo > .SRCINFO
+          )
+          git -C "$PUBLISH_ROOT/aur" add PKGBUILD .SRCINFO
+          if ! git -C "$PUBLISH_ROOT/aur" diff --cached --quiet; then
+            git -C "$PUBLISH_ROOT/aur" \
+              -c user.name='thegn release automation' \
+              -c user.email='actions@users.noreply.github.com' \
+              commit -m "thegn $TAG"
+            GIT_SSH_COMMAND="$aur_ssh" git -C "$PUBLISH_ROOT/aur" push origin HEAD
+          fi
+      - name: Summarize publication
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          READY: ${{ steps.publication.outputs.ready }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "## External publication for $TAG"
+            echo
+            if [ "$READY" = true ] && [ "$JOB_STATUS" = success ]; then
+              echo "Generated Homebrew and AUR metadata was published or was already identical."
+              echo "Unchanged repositories were left untouched."
+            elif [ "$READY" = true ]; then
+              echo "Publication was enabled but failed; no success claim is being made."
+            else
+              echo "Publication remains pending; see the actionable warning above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove temporary deploy keys
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${PUBLISH_ROOT:-}" ] && [[ "$PUBLISH_ROOT" == "$RUNNER_TEMP/"* ]]; then
+            rm -rf "$PUBLISH_ROOT"
+          fi

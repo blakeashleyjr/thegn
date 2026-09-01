@@ -35,10 +35,35 @@ database only caches and resurrects what git already knows.
   (`base_branch = "auto"` follows the current branch), names it with your
   `branch_prefix`, opens a tab, and asks what to run: a coding agent from
   `[[agents]]`, a tool from `[[tools]]`, or a plain shell — optionally
-  inside a sandbox.
+  inside a sandbox. Configured `pre_create` hooks run before git creates it;
+  `post_create` hooks run after registration and existing provisioning.
 - Saved `[[worktree_templates]]` presets (and existing tmuxinator/sesh
   project files) appear in the "what to run" picker and the
   [[command-palette]].
+
+Lifecycle hooks apply to every creation door, including the wizard, `wt new`,
+issue dispatch, and the daemon's `worktrees.create` request. A blocking
+`pre_create` leaves both git and the database unchanged. The wizard schedules
+the default asynchronous `post_create` work before its completion event; a
+`wait = true` entry gates the first pane. Headless CLI creation waits for its
+post-create job before returning, while daemon creation reports the existing
+worktree response and completes post-create asynchronously.
+
+## Lifecycle and sessions
+
+`pre_destroy` runs before provider teardown and git removal, and `post_destroy`
+runs from the repository root after a successful removal. User deletion keeps
+the worktree visible when a blocking pre-destroy hook fails; the existing
+delete confirmation supplies the force/delete-anyway path. Explicit workspace
+cleanup and wizard rollback use force semantics so speculative worktrees do
+not leak. Automatic merge reclaim is unattended: it reports hook failures and
+continues only after the existing clean guard.
+
+`session_start` runs once when the first pane for a worktree session is about
+to spawn, and `session_end` runs once when the last pane exits or its tab
+closes. Both are asynchronous and never delay pane creation or tab close. See
+[[configuration]] for the event lists, working directories, environment, and
+repo trust behavior.
 
 ## Switching
 

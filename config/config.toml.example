@@ -82,8 +82,23 @@ confirm_delete = true
 # `thegn config show` prints the effective merged config; `thegn config
 # get <dotted.key>` prints one value; `thegn config validate` checks it.
 
+# ── Shared database schema ownership ─────────────────────────────────────────
+# The safe default permits schema migrations only in a long-lived controller
+# (the interactive host, bare pane daemon, or `serve`). Worktree-local CLI
+# binaries can still read/write a matching schema but cannot advance it.
+[database]
+migration_authority = "controller" # controller | any | disabled
+# Strongest mode: pin migration authority to one installed/stable executable.
+# The path must be absolute (a symlink is fine). Empty disables only the pin;
+# the controller-only rule and process-lifetime schema lease still apply.
+migration_executable = ""
+# migration_executable = "/home/me/.local/bin/thegn"
+
 [ui]
-# UI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto" to detect.
+# TUI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto". Selection
+# happens once at startup (restart to apply changes). Precedence is an explicit
+# value here, then non-empty LC_ALL, then non-empty LANG, then en-US. This does
+# not localize CLI or machine-readable output.
 language = "auto"
 # Ask before removing a project (Alt+Shift+X, or the sidebar "Remove
 # project" action — both share one modal). The modal pre-selects the safe
@@ -170,8 +185,8 @@ sidebar_icon_status = ""
 # focused chrome edge. Unfocused frames use `colors.border`.
 [theme]
 # Named palette preset: "prism" (default), "storm", "light", "abyss", "ember",
-# "aurora". Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues]
-# overrides apply on top.
+# "aurora", or a local theme name from $XDG_CONFIG_HOME/thegn/themes.
+# Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues] overrides apply on top.
 preset = "prism"
 accent = "#6ee7d8"
 focus_border = "#6ee7d8"
@@ -297,7 +312,7 @@ top_left = ["brand"]
 top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"]
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
-bottom_left = ["help", "keyhints"]
+bottom_left = ["help", "drawer", "keyhints"]
 bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets. Validated at load — an
 # invalid specifier warns and falls back to the default rather than panicking
@@ -779,12 +794,13 @@ auto_fetch_colocated = false  # also run background auto_fetch in repos colocate
                               # thegn stays out of a colocated repo's way. Read
                               # operations and the jj badge are unaffected.
 
-# How thegn opens a file (files tree, diff hunks, test failures, problems,
-# search hits, `thegn config edit`). Resolution: `command` here → the
-# [[tools]] entry named "editor" → $VISUAL / $EDITOR → vi. The program's
-# basename picks the line-jump syntax (vim +N, code -g file:N, hx file:N, …)
-# and whether it is a windowed editor to spawn detached.
+# How thegn opens a worktree or one of its files. A non-empty `command` wins;
+# otherwise an explicit logical provider wins. `auto` keeps the existing
+# [[tools]] editor → $VISUAL → $EDITOR → vi ladder. Logical providers
+# produce argv directly and never scan PATH during a UI action.
 [editor]
+provider = "auto"      # auto | vscode | cursor | zed | jetbrains |
+                       # nvim_remote | emacs. Also THEGN_EDITOR_PROVIDER.
 command = ""           # template with {path} (shell-quoted for you), {line}, {col};
                        # e.g. "myed --file {path} --at {line}:{col}". "" = resolve
 open_in = "auto"       # auto | pane | external — where the launch runs
@@ -807,9 +823,11 @@ open_in = "auto"       # auto | pane | external — where the launch runs
 # output = "popup"             # none | popup | terminal
 # prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
 
-# Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
-# file sink is opt-in. THEGN_LOG is a tracing-style filter that refines the
-# level per-module, e.g. THEGN_LOG=debug,thegn::db=trace
+# Tracing diagnostics. CLI tracing can go to level-gated, branded stderr; the
+# compositor and pane daemon use their own rotating file sinks when tracing is
+# requested. THEGN_LOG is a tracing-style filter that refines the level per
+# module, e.g. THEGN_LOG=debug,thegn::db=trace. The compositor's raw stderr is
+# captured separately in thegn-stderr.log while it owns the alternate screen.
 [log]
 level = "info"            # error | warn | info | debug | trace
 file = false              # mirror to a rotating file under `dir`
@@ -817,8 +835,8 @@ dir = ""                  # "" => $XDG_STATE_HOME/thegn/logs
 rotation_size_mb = 5
 max_files = 5
 format = "text"           # text | json
-stderr_cap_mb = 5         # rotate thegn-stderr.log (and audit.log) aside at
-                          # startup once over this many MiB
+stderr_cap_mb = 5         # cap raw stderr capture (and audit.log); rotate each
+                          # aside at startup once over this many MiB
 
 # Crash reporting + traceability. Every panic (compositor, daemon, or CLI) is
 # restored terminal-first and writes a local crash report under
@@ -1089,6 +1107,18 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # [project.my-repo.keybinds]
 # new-worktree = "Alt w"
 
+# Per-worktree lifecycle commands for this project. These lists accumulate
+# after the global [hooks] table and before a repo-root .thegn.* [hooks] table.
+# Repo-authored entries are trust-gated and can never block an operation.
+# [project.my-repo.hooks]
+# pre_create = ["./.thegn/pre-create.sh"]
+# post_create = [{ command = "pnpm install --frozen-lockfile", wait = true,
+#                  timeout_secs = 120, on_failure = "warn" }]
+# pre_destroy = ["docker compose down"]
+# post_destroy = []
+# session_start = []
+# session_end = []
+
 # Per-program host-action overlays, keyed by the focused pane's program name.
 # These intercept *before* the active mode — useful for binding a host action
 # while a TUI like lazygit is focused.
@@ -1152,6 +1182,10 @@ command = "claude"
 #                       #   launch (claude: .claude/settings.local.json →
 #                       #   permissions.allow; other keys in that file survive).
 #                       #   Empty = leave the file alone.
+# Add this agent to the drawer at worktree or process-global scope; unset by default.
+# drawer_scope = "worktree"
+# Start its drawer pane relative to the scope root (or absolute/~); unset uses the root.
+# drawer_cwd = "."
 
 [[agents]]
 name = "aider"
@@ -1299,6 +1333,24 @@ command = "lazygit"
 # permissions = []      # headless allow-list seeded into the worktree at launch
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
+# drawer_scope = "worktree"  # add this tool to the drawer: worktree | global
+# drawer_cwd = ".atac"       # optional; relative to worktree, or absolute/~ for global
+
+# Drawer occupants reuse this same [[tools]] catalog. The built-in files drawer
+# is always first; entries without drawer_scope remain picker-only.
+# Worktree ATAC keeps its state under each worktree. A global database tool uses
+# one process-local pane shared while switching worktrees.
+[[tools]]
+name = "atac"
+command = "atac"
+drawer_scope = "worktree"
+# drawer_cwd = ".atac"
+# env = { ATAC_MAIN_DIR = ".atac" }
+
+[[tools]]
+name = "db"
+command = "psql"
+drawer_scope = "global"
 
 [[tools]]
 name = "yazi"
@@ -1798,6 +1850,108 @@ command = "git diff"
 #                               # agent CLI names recognized on top of [[agents]] entries and
 #                               #   each worktree's own bound agent
 
+# Trusted event → catalog-action automations. Rules are disabled by default and
+# are accepted only from this global file or a trusted profile config. A repo's
+# checked-in `.thegn.toml/.yaml/.json` can never install them and is warned.
+[automations]
+enabled = false
+max_concurrent = 2          # bounded off-loop actions (1..16)
+queue_capacity = 64         # pending action plans before overflow drops (1..1024)
+action_timeout_secs = 300   # per-action deadline (1..3600)
+audit_retention_per_rule = 200 # newest audit rows retained per rule (1..10000)
+
+# One rule is exactly one normalized event (`when`) and one catalog action
+# (`then.cap`). Rules run in file order. Unknown events/caps/params, duplicate or
+# empty names, invalid globs/regexes/templates, and out-of-range limits are
+# rejected by `thegn config validate`.
+# [[automations.rules]]
+# name = "tell-me-when-a-coder-is-blocked" # unique, non-empty, <=128 bytes
+# enabled = true
+# when = "agent_needs_you" # notification | agent_needs_you | agent_finished |
+#                          # agent_failed | pr_checks | pr_review_requested |
+#                          # merge_landed | worktree_idle | disk_low
+# debounce_secs = 60       # minimum seconds between plans for this rule (0..86400)
+# idle_secs = 300          # required only for worktree_idle (60..86400)
+# once_per_key = true      # fire once for the producer's stable event/entity key
+# max_per_hour = 30        # per-rule sliding-window bound (1..1000)
+# max_action_per_hour = 30 # action-wide bound shared by every rule using this cap
+#
+# Every present selector below is ANDed; a missing event field never matches.
+# Glob fields support only `*` (any run) and `?` (one character).
+# [automations.rules.if]
+# workspace = "product*"
+# repo = "thegn"
+# worktree = "*/thegn"
+# branch = "tg/*"
+# agent_role = "coder"
+# notification_kind = "test_failed" # exact built-in kind; notification events only
+# priority = "alert"       # minimum: info | notice | alert
+# source_prefix = "session:"
+# message_regex = "needs (review|input)$"
+# session_id = "daemon-session-1"
+# pr_checks_passed = true
+# pr_review_requested = false
+# pr_merged = false
+#
+# Action ids are typed strings validated against the v1 catalog set. Parameter
+# templates may use: {event_id}, {event_key}, {event_kind}, {event_time},
+# {workspace}, {repo}, {worktree}, {branch}, {agent_role}, {notification_kind}, {priority},
+# {source_ref}, {message}, {session_id}, {pr_checks_passed},
+# {pr_review_requested}, and {pr_merged}. Values are prose/data substitution,
+# never shell expansion. `agent` and tool `name` must be literal configured names.
+# [automations.rules.then]
+# cap = "notify.push"       # notify.push: body required; title/urgency optional
+# title = "Coder needs attention"
+# body = "{message} on {branch}"
+# urgency = "alert"         # info | notice | alert
+#
+# Other supported action shapes (one `then` table per rule):
+# cap = "sessions.open"     # agent required; prompt optional
+# agent = "claude"
+# prompt = "Handle {source_ref}: {message}"
+# cap = "merge.add"         # no parameters; worktree comes from the event
+# cap = "tools.run"         # name required; resolves trusted global/profile [[tools]]
+# name = "release-check"
+#
+# A named profile may refine the settings and replace the rule list:
+# [profiles.work.automations]
+# enabled = false
+# max_concurrent = 4
+# queue_capacity = 64
+# action_timeout_secs = 300
+# audit_retention_per_rule = 200
+# [[profiles.work.automations.rules]]
+# name = "profile-rule"
+# enabled = true
+# when = "agent_needs_you"
+# debounce_secs = 60
+# idle_secs = 300
+# once_per_key = true
+# max_per_hour = 30
+# max_action_per_hour = 30
+# [profiles.work.automations.rules.if]
+# workspace = "product*"
+# repo = "thegn"
+# worktree = "*/thegn"
+# branch = "tg/*"
+# agent_role = "coder"
+# notification_kind = "test_failed"
+# priority = "alert"
+# source_prefix = "session:"
+# message_regex = "needs (review|input)$"
+# session_id = "daemon-session-1"
+# pr_checks_passed = true
+# pr_review_requested = false
+# pr_merged = false
+# [profiles.work.automations.rules.then]
+# cap = "notify.push"
+# title = "Profile rule"
+# body = "{message}"
+# urgency = "alert"
+# agent = "claude"
+# prompt = "Handle {source_ref}: {message}"
+# name = "release-check"
+
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
 # in-app inbox, and optionally as OS desktop notifications.
@@ -1850,12 +2004,13 @@ active_mode = ""
 # same list, generated from the enum):
 #   "alert"  — agent_failed, agent_attention, test_failed, process_failed,
 #              queue_needs_human, pr_queue_needs_human, resource_alert,
-#              usage_limit
+#              usage_limit, automation_failed
 #   "info"   — log_error, worktree_created, process_exited, queue_landed,
-#              calendar_changed, pr_queue_merged
+#              calendar_changed, pr_queue_merged, pr_review_thread_resolved
 #   "notice" — assigned, mentioned, status_changed, blocker_resolved,
 #              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
-#              pr_queue_ready, calendar_reminder, upstream_behind
+#              pr_queue_ready, pr_review_task_queued, calendar_reminder,
+#              upstream_behind, automation
 # Override any kind below (keys are the snake_case kind names). Unknown
 # keys/values are ignored. The queue_* kinds are the merge queue's settled
 # transitions ([merge_queue]); pr_queue_* are the PR queue's ([pr_queue]).
@@ -2227,6 +2382,30 @@ max_results = 1000
 # ruby = ["ruby"]
 # extra = []      # nixpkgs packages appended for every language mix
 
+# ── Worktree lifecycle hooks ────────────────────────────────────────────────
+# Host-side commands run at worktree/session boundaries. Lists retain their
+# declaration order and accumulate global → [project.<slug>] → repo overlay.
+# A string is shorthand for an object with wait = false, timeout_secs = 120,
+# and the event default for on_failure (pre_create/pre_destroy = "block";
+# every other event = "warn"). `wait` is valid only for post_create.
+#
+# The repo .thegn.* [hooks] table is untrusted until approved through the
+# existing repo trust flow; its entries are omitted while pending and are
+# always warn-only after approval. The legacy [sandbox] prepare list is also
+# run as the head of global post_create (and repo sandbox.prepare as the head
+# of repo post_create), with warn/no-wait semantics.
+[hooks]
+# String shorthand:
+pre_create = ["./.thegn/pre-create.sh"]
+# Object form with explicit policy:
+post_create = [
+  { command = "pnpm install --frozen-lockfile", wait = false, timeout_secs = 120, on_failure = "warn" },
+]
+pre_destroy = ["docker compose down"]
+post_destroy = []
+session_start = []
+session_end = []
+
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
 # container/sandbox. The git worktree stays on the host and is bind-mounted in
@@ -2247,7 +2426,14 @@ max_results = 1000
 #
 # Per-repo overrides go in `.thegn.{toml,yaml,yml,json}` at the repo root
 # under a `[sandbox]` table — only the keys you set override these globals.
+# A repo with multiple `.devcontainer/<name>/devcontainer.json` variants may
+# add the top-level selector `devcontainer = "gpu"` to that same repo file;
+# it chooses a file but grants no trust for its contents.
 [sandbox]
+# Repo-authored `.devcontainer/devcontainer.json` overlay mode. `auto` reads
+# and trust-gates supported categories; `off` ignores the file before parsing.
+devcontainer = "auto"
+
 enabled = true
 
 # ── Hardening preset ─────────────────────────────────────────────────────────
@@ -2952,6 +3138,24 @@ ready_timeout_secs = 20
 # [share.iroh]    # provider = "iroh" — https://github.com/n0-computer/dumbpipe
 # extra_args = []  # extra `dumbpipe listen-tcp` flags (e.g. a self-hosted relay).
 #                  # The consumer connects with `dumbpipe connect-tcp <ticket>`.
+
+# ── Frontend preview discovery + fetch policy (`[preview]`) ─────────────────
+# Preview discovers candidate dev servers from this explicit list, bounded pane
+# output, and literal ports in package.json scripts.dev/scripts.start. `ports`
+# is a hint/allowlist only: thegn NEVER launches a process or executes a package
+# script from this section. All keys have launch-time environment equivalents.
+#
+# `preview.fetch` is an HTTP(S) GET with no cookies, authorization, browser
+# profile, or ambient proxy. By default every initial URL AND redirect must use
+# the exact authorities localhost, 127.0.0.1, or ::1. Setting
+# `allow_external_urls = true` opts out of that SSRF boundary, but timeout and
+# body limits still apply.
+[preview]
+enabled = true               # THEGN_PREVIEW_ENABLED; enable preview discovery/surfaces
+ports = []                   # THEGN_PREVIEW_PORTS (comma-separated), e.g. "3000,5173"
+fetch_timeout_ms = 3000      # THEGN_PREVIEW_FETCH_TIMEOUT_MS; clamped to 100..30000
+max_body_bytes = 1048576     # THEGN_PREVIEW_MAX_BODY_BYTES; capped at 16 MiB
+allow_external_urls = false  # THEGN_PREVIEW_ALLOW_EXTERNAL_URLS; localhost-only when false
 
 # ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
 # The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE
@@ -3798,11 +4002,28 @@ cors_origins = []
 #   override_gpg    = true                    # snapshots never wait on pinentry
 #   # (sign_commits lives under [project.acme.merge_queue], not [git].)
 #
+# A project can also choose a logical editor provider without changing
+# other repos. This trusted user-config key is intentionally unavailable to a
+# repo-local `.thegn.*`; omit it to inherit `[editor] provider`:
+#
+#   [project.acme]
+#   editor = "cursor"
+#
 # (Only the TRUSTED user-config `[project.<slug>]` layer may set `[git]` /
 # `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
 # which layer won.
+
+# Embedded and user-authored agent skills. thegn seeds these into each
+# configured harness's native project-local skill directory; it never writes
+# harness home directories. User directories are syntax-checked here and read
+# only by the host edge. Each immediate child must be `<name>/SKILL.md`.
+[skills]
+enabled = true      # preserve automatic seeding on worktree create/startup
+user_dirs = []      # e.g. ["~/.config/thegn/skills", "./team-skills"]
+exclude = []        # path-safe skill names to withhold, e.g. ["mq"]
+
 [merge_queue]
 enabled = true
 remote_mode = "route_to_host" # how a REMOTE-host (sprite) worktree lands onto the target;
@@ -4016,6 +4237,11 @@ auto_enqueue = "off"          # off | worktree — whether opening a PR from a w
                               #   Off by default: a queued PR is one thegn may write to.
 watch = ["ci", "conflict", "review"]   # which blocker classes may wake the agent. A class left out
                               #   is still tracked and displayed — it just never gets an agent.
+# On each existing poll (there is no second review timer), an explicitly queued
+# row whose `watch` includes "review" gets one durable task per unresolved
+# provider thread. The current `agent` role and `[pr_queue.prompts].review` are
+# captured in each bounded task; another comment on the same thread revises that
+# task in place. Nothing scans or watches every forge PR by default.
 #
 # The agent, exactly as in [merge_queue]: name an [[agents]] entry, or spell out
 # a command. Placeholders are shell-quoted, so write them BARE. With neither set,
@@ -4067,8 +4293,13 @@ queued_folder = "In review"   # file a worktree here when its PR is queued ("" �
 failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ leave it be)
 
 # What the agent is told, per blocker kind. Empty ⇒ thegn's built-in instructions
-# (which require a `--force-with-lease` push and forbid merging, closing, or —
-# for review feedback — resolving the reviewer's threads). Prose, not shell:
+# (which require a `--force-with-lease` push and forbid the agent from merging,
+# closing, approving, or resolving review threads itself). A queued per-thread
+# task runs only when a user chooses `handle` in the PR-queue panel or palette.
+# Afterward thegn replies and resolves through the forge provider only when the
+# agent push is verified against the task worktree and the provider implements
+# `resolve_review_thread`; unsupported, unauthenticated, stale, or rate-limited
+# resolution stays unresolved and is parked for a human. Prose, not shell:
 # these are never quoted. Placeholders are per kind, and an unknown one is a
 # `config validate` error:
 #   ci_failure — {branch} {base} {worktree} {pr_number} {pr_url} {pr_title} {checks} {log}
@@ -4153,7 +4384,10 @@ keep_hours = 24                # sweep drops older than this on the next paste (
 #   • macOS   → AppleScript via `osascript` — Music.app + Spotify.
 # Force a specific backend with `mpris` / `smtc` / `applescript`, or `mpv` to
 # drive a single mpv instance over its JSON IPC socket (see [media.mpv]).
-# `jellyfin` is reserved. A backend selected on the wrong OS is simply inert.
+# `spotify` and `jellyfin` are reserved. Spotify desktop/spotifyd control is
+# already available through MPRIS on Linux, SMTC on Windows, and AppleScript on
+# macOS; the reserved Spotify kind does not read credentials or use the network.
+# A backend selected on the wrong OS is simply inert.
 #
 # Only the selected backend's sub-table is consulted. On by default; it degrades
 # to inert (no badge, no panel section, no watcher) wherever no supported player
@@ -4161,7 +4395,7 @@ keep_hours = 24                # sweep drops older than this on the next paste (
 # make every media-* keybind inert — zero idle cost.
 [media]
 enabled = true
-# auto | none | mpris | mpv | mpd | smtc | applescript | jellyfin
+# auto | none | mpris | mpv | mpd | smtc | applescript | spotify | jellyfin
 # "auto" composes EVERY source reachable on this OS and shows whatever is actually
 # playing — on Linux that's MPRIS (browsers/Spotify/VLC/mpv-with-mpv-mpris) + native
 # MPD (mpd/mpc/rmpc/ncmpcpp, no mpd-mpris bridge needed) + a live mpv IPC socket, all
@@ -4179,10 +4413,11 @@ volume_step = 0.05
 # larger step, matching the coarser skipping people expect from a video player.
 seek_step_secs = 10
 seek_step_video_secs = 30
-# Render cover art in the Now-Playing overlay (Alt-m) when the backend exposes it
+# Render cover art in the docked Now-Playing panel (Alt-m) when the backend exposes it
 # and the terminal supports kitty/sixel graphics; otherwise a block-glyph mosaic.
 show_art = true
-# Open the Now-Playing overlay when the statusbar media badge is clicked.
+# Open/focus the docked System ▸ Media panel when the statusbar media badge is clicked.
+# (The compatibility key retains its historical name.)
 overlay_on_badge_click = true
 # Fallback poll cadence (seconds) for backends WITHOUT a push stream (a live mpv
 # IPC socket / playerctl). Native MPRIS (D-Bus signals), native MPD (`idle`),
@@ -4197,6 +4432,29 @@ poll_interval_secs = 3
 # socket = "127.0.0.1:6600"    # host:port, or an absolute path to MPD's unix socket.
                                # $MPD_HOST / $MPD_PORT override when left at default.
 # password = "hunter2"         # only if your MPD requires one
+
+# ── Experimental voice mode ─────────────────────────────────────────────────
+# Toggle-to-talk speech-to-text through two user-supplied commands. Thegn ships
+# no microphone, audio, speech model, or STT implementation. The capture
+# command writes one complete 16-bit PCM WAV to stdout; when stopped, that WAV
+# is sent to the transcription command on stdin and its UTF-8 stdout is pasted
+# into the focused pane without a newline or auto-submit. Commands are argv
+# arrays and are never run through a shell.
+#
+# This is disabled by default and remains disabled in the stable channel. An
+# arbitrary command can send audio elsewhere, so inspect both commands before
+# enabling this feature. `thegn doctor` reports missing commands and explains
+# the repair.
+[voice]
+enabled = false
+# command is the only implemented provider kind in this first slice.
+kind = "command"
+# Example: capture_command = ["my-recorder", "--wav-to-stdout"]
+capture_command = []
+# Example: command = ["my-transcriber", "--stdin-wav"]
+command = []
+# Hard capture limit in seconds; runtime clamps this to 1..=300.
+max_seconds = 30
 
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,
