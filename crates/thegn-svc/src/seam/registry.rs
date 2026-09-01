@@ -193,6 +193,7 @@ fn forge_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use crate::issue::IssueCaps;
     use thegn_core::config_issues::IssueProviderKind;
     cfg.issues
         .active_accounts()
@@ -203,9 +204,11 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                 return ProbeReport::reserved("issues", &id);
             }
             match a.provider {
-                IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready),
+                IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready)
+                    .with_caps(&IssueCaps::default()),
                 IssueProviderKind::Github => {
                     ProbeReport::new("issues", id, binary_availability("gh"))
+                        .with_caps(&IssueCaps::default())
                 }
                 IssueProviderKind::Linear | IssueProviderKind::Jira | IssueProviderKind::Kaneo => {
                     let avail =
@@ -214,7 +217,16 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                         } else {
                             Availability::Ready
                         };
+                    let caps = if a.provider == IssueProviderKind::Kaneo {
+                        IssueCaps {
+                            comments: true,
+                            labels: true,
+                        }
+                    } else {
+                        IssueCaps::default()
+                    };
                     ProbeReport::new("issues", id, avail)
+                        .with_caps(&caps)
                         .note("network provider; not probed offline")
                 }
             }
