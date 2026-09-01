@@ -87,7 +87,8 @@ impl FoldGit for PlumbingAdapter {
         match CliGit.merge_tree(&self.loc, ours, theirs)? {
             MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
             MergeTreeOutcome::Conflict { paths, .. } => {
-                Ok(self.resolve_conflict(ours, theirs, paths))
+                let base = CliGit.merge_base(&self.loc, ours, theirs)?;
+                Ok(self.resolve_conflict(base.as_deref(), ours, theirs, paths))
             }
         }
     }
@@ -102,11 +103,14 @@ impl FoldGit for PlumbingAdapter {
             // A per-commit replay conflict is never a lockfile-regeneration
             // case (that only makes sense for a whole-branch merge), so defer.
             MergeTreeOutcome::Conflict { paths, .. } => {
-                let conflicts = self.submodule_conflicts(&paths);
-                if conflicts.is_empty() {
-                    Ok(MergeOutcome::Conflict { paths })
-                } else {
-                    Ok(MergeOutcome::SubmoduleConflict { paths, conflicts })
+                match self.submodule_conflicts(Some(base), ours, theirs, &paths) {
+                    Ok(conflicts) if !conflicts.is_empty() => {
+                        Ok(MergeOutcome::SubmoduleConflict { paths, conflicts })
+                    }
+                    // Conflict metadata is safety-critical. If the object DB
+                    // cannot be read, retain the generic conflict so no later
+                    // auto-resolution path can pick a pointer implicitly.
+                    Ok(_) | Err(_) => Ok(MergeOutcome::Conflict { paths }),
                 }
             }
         }
@@ -133,11 +137,12 @@ impl FoldGit for PlumbingAdapter {
 impl PlumbingAdapter {
     fn submodule_conflicts(
         &self,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
         paths: &[String],
-    ) -> Vec<thegn_core::submodule::SubmoduleConflict> {
-        CliGit
-            .submodule_conflicts_for_paths(&self.loc, paths)
-            .unwrap_or_default()
+    ) -> Result<Vec<thegn_core::submodule::SubmoduleConflict>> {
+        CliGit.submodule_conflicts_for_paths(&self.loc, paths, base, ours, theirs)
     }
 
     /// Try to salvage a conflicting merge before deferring it. In order:
@@ -151,13 +156,25 @@ impl PlumbingAdapter {
     ///    resolution. A clean result feeds the fold; anything else defers.
     ///
     /// Clean folds never reach here, so they pay none of this cost.
-    fn resolve_conflict(&self, ours: &str, theirs: &str, paths: Vec<String>) -> MergeOutcome {
+    fn resolve_conflict(
+        &self,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        paths: Vec<String>,
+    ) -> MergeOutcome {
         // A gitlink is an atomic pointer owned by the superproject. Partition it
         // before regenerate/custom-driver/rerere handling so it can never enter
         // a throwaway real merge or the `git add -A` auto-resolution path.
-        let conflicts = self.submodule_conflicts(&paths);
-        if !conflicts.is_empty() {
-            return MergeOutcome::SubmoduleConflict { paths, conflicts };
+        match self.submodule_conflicts(base, ours, theirs, &paths) {
+            Ok(conflicts) if !conflicts.is_empty() => {
+                return MergeOutcome::SubmoduleConflict { paths, conflicts };
+            }
+            Ok(_) => {}
+            // Do not allow an unavailable object-db lookup to fall through to
+            // regeneration, custom drivers, rerere, or blanket staging. A
+            // generic conflict is the fail-closed result.
+            Err(_) => return MergeOutcome::Conflict { paths },
         }
         if !self.regenerate_command.is_empty()
             && fold::classify(&paths, &self.regenerate_paths) == fold::ConflictKind::Regenerable

@@ -117,7 +117,7 @@ impl DiffView {
     fn row_count(&self) -> usize {
         match self.open_file {
             None => self.diff.as_ref().map_or(0, |d| d.files.len()),
-            Some(i) => self.open_file_lines(i).len(),
+            Some(i) => self.file_row_count(i),
         }
     }
 
@@ -126,8 +126,23 @@ impl DiffView {
         self.diff
             .as_ref()
             .and_then(|d| d.files.get(i))
+            .filter(|f| !f.is_submodule)
             .map(|f| f.hunks.iter().flat_map(|h| &h.lines).collect())
             .unwrap_or_default()
+    }
+
+    fn file_row_count(&self, i: usize) -> usize {
+        self.diff
+            .as_ref()
+            .and_then(|d| d.files.get(i))
+            .map(|f| {
+                if f.is_submodule {
+                    1
+                } else {
+                    self.open_file_lines(i).len()
+                }
+            })
+            .unwrap_or(0)
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -376,17 +391,19 @@ impl DiffView {
             None => {
                 for (i, f) in diff.files.iter().enumerate() {
                     let selected = i == self.sel;
-                    let (adds, dels) = file_stat(f);
+                    let stats = if f.is_submodule {
+                        format!("{} pointer", crate::caps::active_glyphs().submodule)
+                    } else {
+                        let (adds, dels) = file_stat(f);
+                        format!("+{adds} -{dels}")
+                    };
                     out.push((
                         Line::split(
                             vec![
                                 seg(Tok::Slot(S::Faint), sel_marker(selected)),
                                 seg(Tok::Slot(S::Text), f.path.clone()),
                             ],
-                            vec![
-                                seg(Tok::Hue(thegn_core::theme::Hue::Green), format!("+{adds} ")),
-                                seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
-                            ],
+                            vec![seg(Tok::Slot(S::Dim), stats)],
                         ),
                         selected,
                     ));
@@ -398,19 +415,24 @@ impl DiffView {
                         Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
                         false,
                     ));
-                    let mut li = 0usize; // index into flattened selectable lines
-                    for h in &f.hunks {
-                        out.push((
-                            Line::segs(vec![seg(
-                                Tok::Hue(thegn_core::theme::Hue::Teal),
-                                trunc(&h.header, cols),
-                            )]),
-                            false,
-                        ));
-                        for dl in &h.lines {
-                            let selected = li == self.sel;
-                            out.push((diff_line(dl, selected, cols), selected));
-                            li += 1;
+                    if f.is_submodule {
+                        let selected = self.sel == 0;
+                        out.push((crate::pr_view::submodule_line(f, selected, cols), selected));
+                    } else {
+                        let mut li = 0usize; // index into flattened selectable lines
+                        for h in &f.hunks {
+                            out.push((
+                                Line::segs(vec![seg(
+                                    Tok::Hue(thegn_core::theme::Hue::Teal),
+                                    trunc(&h.header, cols),
+                                )]),
+                                false,
+                            ));
+                            for dl in &h.lines {
+                                let selected = li == self.sel;
+                                out.push((diff_line(dl, selected, cols), selected));
+                                li += 1;
+                            }
                         }
                     }
                 }
@@ -588,5 +610,41 @@ mod tests {
         // The toggle is inert (no structural render to switch to).
         v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
         assert!(!v.structural_active());
+    }
+
+    #[test]
+    fn submodule_file_is_one_atomic_pointer_row() {
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(PrDiff {
+                files: vec![DiffFile {
+                    path: "vendor/lib".into(),
+                    old_path: Some("vendor/lib".into()),
+                    is_submodule: true,
+                    hunks: vec![DiffHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![
+                            line(DiffLineKind::Del, "Subproject commit aaaaaaa"),
+                            line(DiffLineKind::Add, "Subproject commit bbbbbbb"),
+                        ],
+                    }],
+                }],
+            }),
+            structural: None,
+        });
+        assert_eq!(v.row_count(), 1);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.row_count(), 1);
+        let body = v.body_lines(80);
+        let rendered = body
+            .iter()
+            .map(|(line, _)| format!("{line:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("vendor/lib"));
+        assert!(rendered.contains("aaaaaaa"));
+        assert!(rendered.contains("bbbbbbb"));
+        assert!(!rendered.contains("Subproject commit"));
     }
 }

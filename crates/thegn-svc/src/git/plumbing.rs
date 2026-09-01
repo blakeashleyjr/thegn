@@ -133,8 +133,11 @@ pub trait PlumbingOps: GitBackend {
         &self,
         loc: &GitLoc,
         paths: &[String],
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
     ) -> Result<Vec<thegn_core::submodule::SubmoduleConflict>> {
-        GitBackend::submodule_conflicts(self, loc, paths)
+        GitBackend::submodule_conflicts(self, loc, paths, base, ours, theirs)
     }
 
     /// Create a commit object from an existing tree (`git commit-tree`). The

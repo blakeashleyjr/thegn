@@ -39,7 +39,7 @@ pub(crate) fn parse_raw_diffs(output: &str) -> Vec<SubmoduleDiff> {
         let status = header.split_whitespace().nth(4).unwrap_or_default();
         let has_second_rename_path =
             is_nul_record && matches!(status.as_bytes().first(), Some(b'R' | b'C'));
-        let Some(diff) = (|| {
+        let diff = (|| {
             let mut fields = header.split_whitespace();
             let old_mode = fields.next()?.trim_start_matches(':');
             let new_mode = fields.next()?;
@@ -276,50 +276,96 @@ pub(crate) fn init(loc: &GitLoc, recursive: bool) -> Result<()> {
     run_w(loc, &[], &args).map(|_| ())
 }
 
-/// Parse git ls-files -u -z records into the two mode-160000 conflict tips.
-pub(crate) fn parse_conflicts(output: &str, paths: &[String]) -> Vec<SubmoduleConflict> {
-    let mut found: HashMap<String, (String, String)> = HashMap::new();
-    for record in output.split('\0') {
-        let Some((meta, path)) = record.split_once('\t') else {
-            continue;
-        };
-        if !paths.iter().any(|candidate| candidate == path) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    mode: String,
+    sha: String,
+}
+
+/// Parse one `git ls-tree -z` record. A missing record is a valid tree lookup
+/// result (for example, an added path has no base entry); malformed output is
+/// an I/O/protocol error and must not be mistaken for a non-gitlink.
+fn parse_tree_entry(output: &str, expected_path: &str) -> Result<Option<TreeEntry>> {
+    let mut found = None;
+    for record in output.split('\0').filter(|record| !record.is_empty()) {
+        let (meta, path) = record
+            .split_once('\t')
+            .ok_or_else(|| anyhow::anyhow!("git ls-tree returned a malformed record"))?;
+        if path != expected_path {
             continue;
         }
         let mut fields = meta.split_whitespace();
-        if fields.next() != Some("160000") {
-            continue;
+        let mode = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git ls-tree record has no mode"))?;
+        let _kind = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git ls-tree record has no object kind"))?;
+        let sha = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("git ls-tree record has no object id"))?;
+        if found.is_some() {
+            anyhow::bail!("git ls-tree returned duplicate records for {expected_path:?}");
         }
-        let Some(sha) = fields.next() else { continue };
-        let Some(stage) = fields.next() else { continue };
-        let entry = found.entry(path.to_string()).or_default();
-        match stage {
-            "2" => entry.0 = sha.to_string(),
-            "3" => entry.1 = sha.to_string(),
-            _ => {}
-        }
+        found = Some(TreeEntry {
+            mode: mode.to_string(),
+            sha: sha.to_string(),
+        });
     }
-    found
-        .into_iter()
-        .map(|(path, (ours_sha, theirs_sha))| SubmoduleConflict {
-            path,
-            ours_sha,
-            theirs_sha,
-        })
-        .collect()
+    Ok(found)
 }
 
-pub(crate) fn conflicts(loc: &GitLoc, paths: &[String]) -> Result<Vec<SubmoduleConflict>> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
+fn tree_entry(loc: &GitLoc, tree: &str, path: &str) -> Result<Option<TreeEntry>> {
+    let output = run(loc, &["ls-tree", "-z", tree, "--", path])?;
+    parse_tree_entry(&output, path)
+}
+
+/// Resolve mode-160000 conflict tips from the merge input trees, not the
+/// current index. `merge-tree --write-tree` operates entirely in the object
+/// database and therefore does not create the unmerged index records that
+/// `git ls-files -u` would require. `base` is read when supplied so an
+/// unavailable explicit merge input fails closed just like ours/theirs.
+pub(crate) fn conflicts(
+    loc: &GitLoc,
+    paths: &[String],
+    base: Option<&str>,
+    ours: &str,
+    theirs: &str,
+) -> Result<Vec<SubmoduleConflict>> {
+    let mut conflicts = Vec::new();
+    for path in paths {
+        let base_entry = base.map(|tree| tree_entry(loc, tree, path)).transpose()?;
+        let ours_entry = tree_entry(loc, ours, path)?;
+        let theirs_entry = tree_entry(loc, theirs, path)?;
+
+        // A path is a gitlink conflict when either merge side carries the
+        // atomic gitlink mode. The base lookup above is intentionally retained
+        // for explicit merge-base validation, but is not required to be a
+        // gitlink (a gitlink may have been added or removed).
+        let _ = base_entry;
+        if ours_entry
+            .as_ref()
+            .is_none_or(|entry| entry.mode != "160000")
+            && theirs_entry
+                .as_ref()
+                .is_none_or(|entry| entry.mode != "160000")
+        {
+            continue;
+        }
+        conflicts.push(SubmoduleConflict {
+            path: path.clone(),
+            ours_sha: ours_entry.map(|entry| entry.sha).unwrap_or_default(),
+            theirs_sha: theirs_entry.map(|entry| entry.sha).unwrap_or_default(),
+        });
     }
-    let output = run(loc, &["ls-files", "-u", "-z", "--"])?;
-    Ok(parse_conflicts(&output, paths))
+    Ok(conflicts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::PlumbingOps;
+    use crate::git::testutil::{TestRepo, git_in};
 
     #[test]
     fn raw_parser_keeps_only_gitlinks_and_classifies_add_delete() {
@@ -342,10 +388,78 @@ mod tests {
     }
 
     #[test]
-    fn conflict_parser_uses_stage_two_and_three() {
-        let out = "160000 aaaaaaa 2\tvendor/lib\0160000 bbbbbbb 3\tvendor/lib\0";
-        let got = parse_conflicts(out, &["vendor/lib".into()]);
-        assert_eq!(got[0].ours_sha, "aaaaaaa");
-        assert_eq!(got[0].theirs_sha, "bbbbbbb");
+    fn tree_parser_distinguishes_missing_and_malformed_records() {
+        let got = parse_tree_entry("160000 commit aaaaaaa\tvendor/lib\0", "vendor/lib")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.mode, "160000");
+        assert_eq!(got.sha, "aaaaaaa");
+        assert!(parse_tree_entry("", "vendor/lib").unwrap().is_none());
+        assert!(parse_tree_entry("not-a-tree-record\0", "vendor/lib").is_err());
+    }
+
+    #[test]
+    fn conflicts_read_divergent_gitlinks_from_merge_input_trees() {
+        let repo = TestRepo::new("submodule-conflict-trees");
+        git_in(&repo.dir, &["config", "user.name", "t"]);
+        git_in(&repo.dir, &["config", "user.email", "t@e"]);
+        git_in(&repo.dir, &["config", "commit.gpgsign", "false"]);
+        repo.commit_file("base.txt", "base\n", "base");
+        let base = repo.head();
+
+        // Existing commit objects serve as valid gitlink targets. The
+        // superproject conflict below deliberately has no unmerged index.
+        git_in(&repo.dir, &["checkout", "-q", "-b", "target-one"]);
+        repo.commit_file("one.txt", "one\n", "target one");
+        let one = repo.head();
+        git_in(&repo.dir, &["checkout", "-q", &base]);
+        git_in(&repo.dir, &["checkout", "-q", "-b", "target-two"]);
+        repo.commit_file("two.txt", "two\n", "target two");
+        let two = repo.head();
+
+        git_in(&repo.dir, &["checkout", "-q", &base]);
+        git_in(&repo.dir, &["checkout", "-q", "-b", "ours"]);
+        git_in(
+            &repo.dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{one},vendor/lib"),
+            ],
+        );
+        git_in(&repo.dir, &["commit", "-q", "-m", "ours pointer"]);
+        let ours = repo.head();
+
+        git_in(&repo.dir, &["checkout", "-q", &base]);
+        git_in(&repo.dir, &["checkout", "-q", "-b", "theirs"]);
+        git_in(
+            &repo.dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{two},vendor/lib"),
+            ],
+        );
+        git_in(&repo.dir, &["commit", "-q", "-m", "theirs pointer"]);
+        let theirs = repo.head();
+
+        let paths = match crate::git::CliGit
+            .merge_tree(&repo.loc(), &ours, &theirs)
+            .unwrap()
+        {
+            crate::git::MergeTreeOutcome::Conflict { paths, .. } => paths,
+            other => panic!("expected a gitlink conflict, got {other:?}"),
+        };
+        let got = conflicts(&repo.loc(), &paths, Some(&base), &ours, &theirs).unwrap();
+        assert_eq!(
+            got,
+            [SubmoduleConflict {
+                path: "vendor/lib".into(),
+                ours_sha: one,
+                theirs_sha: two,
+            }]
+        );
     }
 }
