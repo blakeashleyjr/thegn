@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use termwiz::terminal::TerminalWaker;
+
 /// The counters shown by Monitor for one configured sink.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SinkDelivery {
@@ -26,9 +28,27 @@ struct DeliveryState {
 }
 
 /// A clonable handle to the current delivery counters.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub(crate) struct DeliverySnapshot {
     state: Arc<Mutex<DeliveryState>>,
+    waker: Arc<Mutex<Option<TerminalWaker>>>,
+}
+
+impl std::fmt::Debug for DeliverySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeliverySnapshot")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DeliverySnapshot {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DeliveryState::default())),
+            waker: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +62,13 @@ pub(crate) enum DeliveryEvent {
 }
 
 impl DeliverySnapshot {
+    pub(crate) fn with_waker(waker: TerminalWaker) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DeliveryState::default())),
+            waker: Arc::new(Mutex::new(Some(waker))),
+        }
+    }
+
     /// Replace the configured sink list, retaining no stale endpoint-related
     /// metadata. Counters intentionally survive a config reload only for names
     /// that remain configured, which keeps the view useful without persistence.
@@ -76,6 +103,10 @@ impl DeliverySnapshot {
             }
             DeliveryEvent::QueueDrop => row.queue_drops = row.queue_drops.saturating_add(1),
             DeliveryEvent::DeadLetter => row.dead_letters = row.dead_letters.saturating_add(1),
+        }
+        drop(state);
+        if let Some(waker) = self.waker.lock().unwrap().as_ref() {
+            let _ = waker.wake(); // best-effort: delivery repaint must not fail the worker
         }
     }
 

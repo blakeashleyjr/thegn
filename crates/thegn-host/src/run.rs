@@ -8605,7 +8605,7 @@ async fn event_loop<T: Terminal>(
                         event_bus.publish(&event);
                     }
                     notify_state.emit_sound(&dec);
-                    notify_state.emit_push(&dec, "test_failed", &msg, "", &wt);
+                    notify_state.emit_push(&dec, "test_failed", &wt, &msg, "", &wt);
                     if dec.record {
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = thegn_core::db::Db::open() else {
@@ -10150,7 +10150,14 @@ async fn event_loop<T: Terminal>(
                                 event_bus.publish(&event);
                             }
                             notify_state.emit_sound(&dec);
-                            notify_state.emit_push(&dec, "worktree_created", &msg, "", &path);
+                            notify_state.emit_push(
+                                &dec,
+                                "worktree_created",
+                                &path,
+                                &msg,
+                                "",
+                                &path,
+                            );
                             if dec.record {
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {

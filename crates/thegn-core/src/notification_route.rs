@@ -85,7 +85,12 @@ pub fn decide(
     let mut toast = false;
     // Push defaults eligible for every effective sink; each sink's floor is
     // applied below after the final effective priority is known.
-    let all_sinks = cfg.push.effective_sinks();
+    let all_sinks: Vec<_> = cfg
+        .push
+        .effective_sinks()
+        .into_iter()
+        .filter(crate::config_push::PushSinkConfig::is_configured)
+        .collect();
     let mut push_sinks: Vec<String> = all_sinks.iter().map(|s| s.name.clone()).collect();
     let mut sound_allowed = true;
     // A rule sound override: outer Some = overridden, inner None = explicitly off.
@@ -727,6 +732,7 @@ mod tests {
     #[test]
     fn push_defaults_eligible_above_floor_and_gated_below() {
         let mut cfg = base_cfg();
+        cfg.push.topic = "thegn-alerts".into();
         // Default floor is "notice". A notice-priority notification pushes...
         cfg.priority.insert("test_failed".into(), "notice".into());
         let d = decide(
@@ -755,6 +761,7 @@ mod tests {
     #[test]
     fn rule_route_includes_and_excludes_push() {
         let mut cfg = base_cfg();
+        cfg.push.topic = "thegn-alerts".into();
         cfg.priority.insert("test_failed".into(), "alert".into());
         cfg.rules.push(NotificationRule {
             kind: Some("test_failed".into()),
@@ -844,6 +851,7 @@ mod tests {
         // push becomes eligible — the floor is applied on the FINAL effective
         // priority, resolving the min_priority ⇄ set_priority ordering.
         let mut cfg = base_cfg();
+        cfg.push.topic = "thegn-alerts".into();
         cfg.priority.insert("test_failed".into(), "info".into());
         cfg.rules.push(NotificationRule {
             kind: Some("test_failed".into()),

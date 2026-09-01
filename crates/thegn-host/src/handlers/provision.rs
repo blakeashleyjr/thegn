@@ -175,7 +175,7 @@ pub(crate) fn note_provider_degraded(
         .unwrap_or_else(|| format!("{branch} running on host"));
     let dec = notify.decide("provider_degraded", path, &msg, path);
     notify.emit_sound(&dec);
-    notify.emit_push(&dec, "provider_degraded", &msg, "", path);
+    notify.emit_push(&dec, "provider_degraded", path, &msg, "", path);
     if dec.record {
         let path = path.to_string();
         tokio::task::spawn_blocking(move || {
