@@ -1,102 +1,120 @@
-//! `thegn theme` — preview and interactively select themes.
+//! `thegn theme` — list, select, and import themes without launching the TUI.
 
 use anyhow::Result;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+
 use thegn_core::config::Config;
 use thegn_core::theme::{self, PRESETS};
+use thegn_core::theme_contrast::{self, Bar};
+use thegn_core::theme_user::UserTheme;
 use thegn_core::{msg, outln, util};
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
-    /// List all available themes with a color preview.
+    /// List all available built-in and valid local themes.
     List,
-    /// Interactively select a theme (via FZF or gum) and write it to config.toml.
-    Set,
+    /// Select a theme by its built-in or local name.
+    Set {
+        /// Built-in preset or local theme name.
+        name: String,
+    },
+    /// Import a local Gogh YAML or JSON file as a user theme.
+    Import {
+        /// Local Gogh scheme path.
+        file: PathBuf,
+        /// Override the name in the Gogh document.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
-pub fn run(cfg: &Config, action: Action, config_path: std::path::PathBuf) -> Result<()> {
+pub fn run(_cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
     match action {
         Action::List => list(),
-        Action::Set => set(cfg, config_path),
+        Action::Set { name } => set(&name, &config_path),
+        Action::Import { file, name } => import(&file, name.as_deref()),
     }
 }
 
 fn list() -> Result<()> {
+    let users = read_user_themes();
     for name in PRESETS {
         if let Some(pal) = theme::preset(name) {
-            let bg = theme::bg(&pal.bg0);
-            let text = theme::fg(&pal.text);
-            let accent = theme::fg(&pal.accent);
-            let reset = theme::RESET;
-            outln!("{bg} {name:<22} {text} Text {accent} Accent {reset}");
+            print_preview(name, &pal);
+        }
+    }
+    for user in users {
+        // Built-ins are authoritative when a local file has the same name.
+        if PRESETS.contains(&user.meta.name.as_str()) {
+            continue;
+        }
+        if let Ok(pal) = user.palette() {
+            print_preview(&user.meta.name, &pal);
         }
     }
     Ok(())
 }
 
-fn set(_cfg: &Config, config_path: std::path::PathBuf) -> Result<()> {
-    if !util::have("fzf") && !util::have("gum") {
-        anyhow::bail!("theme set requires `fzf` or `gum` to be installed");
-    }
+fn print_preview(name: &str, pal: &theme::Palette) {
+    let bg = theme::bg(&pal.bg0);
+    let text = theme::fg(&pal.text);
+    let accent = theme::fg(&pal.accent);
+    let reset = theme::RESET;
+    outln!("{bg} {name:<22} {text} Text {accent} Accent {reset}");
+}
 
-    use std::io::Write;
-    let mut child = if util::have("fzf") {
-        Command::new("fzf")
-            .arg("--prompt=Select theme > ")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?
+fn set(name: &str, config_path: &Path) -> Result<()> {
+    let known = PRESETS.contains(&name)
+        || read_user_themes()
+            .iter()
+            .any(|theme| theme.meta.name == name);
+    if known {
+        write_selection(config_path, name)?;
     } else {
-        Command::new("gum")
-            .arg("filter")
-            .arg("--placeholder=Select theme...")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        for name in PRESETS {
-            let _ = writeln!(stdin, "{}", name); // best-effort: the preset chooser may exit early; EPIPE on its stdin is normal
-        }
+        anyhow::bail!("unknown theme `{name}`; run `thegn theme list`");
     }
-
-    // CLI path: `thegn theme` runs an interactive fzf/gum picker, no event loop.
-    #[expect(clippy::disallowed_methods)]
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Ok(()); // user cancelled
-    }
-
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if selected.is_empty() {
-        return Ok(());
-    }
-
-    // Persist via toml_edit so user comments in config.toml survive the write.
-    let toml_str = std::fs::read_to_string(&config_path).unwrap_or_else(|_| "".to_string());
-
-    // use the newer toml_edit Document parsing
-    let mut doc = toml_str
-        .parse::<toml_edit::DocumentMut>()
-        .unwrap_or_else(|_| toml_edit::DocumentMut::new());
-
-    // Ensure [theme] section exists
-    if !doc.contains_key("theme") {
-        doc["theme"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-
-    // Set theme.name
-    if let Some(theme_table) = doc["theme"].as_table_mut() {
-        theme_table["name"] = toml_edit::value(selected.clone());
-    }
-
-    std::fs::write(&config_path, doc.to_string())?;
     msg::info(&format!(
-        "theme set to `{}` in {}",
-        selected,
+        "theme set to `{name}` in {}",
         config_path.display()
     ));
-
     Ok(())
+}
+
+fn import(path: &Path, name: Option<&str>) -> Result<()> {
+    let bytes = crate::theme_store::read_bounded(path).map_err(anyhow::Error::msg)?;
+    let mut theme = thegn_core::theme_import::import_gogh(&bytes)?;
+    if let Some(name) = name {
+        theme.meta.name = name.to_owned();
+    }
+    theme.validate()?;
+    let dir = util::xdg_config_home().join("thegn/themes");
+    crate::theme_store::write_theme(&dir, &theme).map_err(anyhow::Error::msg)?;
+    report_contrast_warnings(&theme);
+    msg::info(&format!("theme imported as `{}`", theme.meta.name));
+    Ok(())
+}
+
+fn report_contrast_warnings(theme: &UserTheme) {
+    let Ok(palette) = theme.palette() else {
+        return;
+    };
+    for finding in theme_contrast::audit(&palette, Bar::Preset) {
+        msg::warn(&format!(
+            "contrast warning: {} on {} {:.2} < {:.1}",
+            finding.fg, finding.bg, finding.ratio, finding.min
+        ));
+    }
+}
+
+fn read_user_themes() -> Vec<UserTheme> {
+    let dir = util::xdg_config_home().join("thegn/themes");
+    let (themes, warnings) = crate::theme_store::scan_dir(&dir);
+    for warning in warnings {
+        msg::warn(&warning);
+    }
+    themes
+}
+
+fn write_selection(path: &Path, preset: &str) -> Result<()> {
+    crate::theme_store::write_theme_selection(path, preset, None).map_err(anyhow::Error::msg)
 }

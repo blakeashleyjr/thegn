@@ -142,6 +142,10 @@ crates/thegn-host/src/connectivity_gate.rs
 crates/thegn-host/src/daemon/agent_error_cache.rs
 crates/thegn-host/src/daemon/client.rs
 crates/thegn-host/src/daemon/inbox.rs
+# THE-29: fork cache persistence and handoff cleanup are best-effort; a cache
+# failure cannot invalidate a successfully spawned child, and cleanup retries
+# are not allowed to turn child teardown into a failure.
+crates/thegn-host/src/daemon/fork.rs
 crates/thegn-host/src/daemon/mod.rs
 crates/thegn-host/src/daemon/record.rs
 crates/thegn-host/src/daemon/service.rs
@@ -184,6 +188,10 @@ crates/thegn-host/src/handlers/sidebar_keys.rs
 crates/thegn-host/src/handlers/sidebar_mouse.rs
 crates/thegn-host/src/handlers/sidebar_persist.rs
 crates/thegn-host/src/handlers/sidebar_reorder.rs
+# THE-29: the async pane-fork request pulses the compositor waker best-effort;
+# the daemon result remains authoritative and a failed pulse only delays UI
+# refresh.
+crates/thegn-host/src/handlers/session_fork.rs
 crates/thegn-host/src/handlers/startup.rs
 crates/thegn-host/src/handlers/status.rs
 crates/thegn-host/src/handlers/switch_cache.rs
@@ -238,6 +246,9 @@ crates/thegn-host/src/monitor.rs
 crates/thegn-host/src/monitor/state.rs
 crates/thegn-host/src/mq_assets.rs
 crates/thegn-host/src/notify.rs
+# THE-35: config reload and legacy command playback are advisory; failures leave
+# the prior snapshot or simply omit the optional sound.
+crates/thegn-host/src/notification_sound.rs
 crates/thegn-host/src/palette.rs
 crates/thegn-host/src/panel_util.rs
 crates/thegn-host/src/pane_pty.rs

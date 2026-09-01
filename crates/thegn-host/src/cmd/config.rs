@@ -1,9 +1,9 @@
 //! `thegn config <action>` — inspect/edit the effective (layered) config.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use thegn_core::config::{self, Config};
+use thegn_core::config::Config;
 use thegn_core::{msg, outln, util};
 
 /// The committed example, seeded on first `config edit`.
@@ -30,8 +30,14 @@ pub enum Action {
     /// Set one dotted key (`config set sandbox.backend docker`) in the config
     /// file, preserving comments/formatting. The write counterpart to `get`.
     Set { key: String, value: String },
-    /// Strictly validate the config file; non-zero exit on any problem.
-    Validate,
+    /// Strictly validate the config file and active overlays; non-zero exit on
+    /// any problem.
+    Validate {
+        /// Validate the repo-local overlay for this repository instead of the
+        /// repository containing the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Print the JSON schema for editor autocomplete and validation.
     Schema,
     /// Explain how a key resolves: effective value, which layer set it, and (for
@@ -46,11 +52,16 @@ pub enum Action {
     },
 }
 
-pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    action: Action,
+    path: PathBuf,
+    repo_context: Option<PathBuf>,
+) -> Result<()> {
     match action {
         Action::Path => outln!("{}", path.display()),
         Action::Show { json } => show(cfg, json)?,
-        Action::Get { key, json } => get(cfg, &key, json)?,
+        Action::Get { key, json } => get(cfg, &key, json, &path)?,
         Action::Edit => edit(cfg, &path)?,
         Action::Set { key, value } => {
             // Capture the prior file so a bad write can be rolled back: a mistyped
@@ -58,7 +69,8 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
             // unparseable, silently reverting every setting to defaults on the
             // next load. Re-validate after writing and restore on failure.
             let prior = std::fs::read(&path).ok(); // best-effort: optional input: a missing file just means nothing to roll back
-            thegn_core::config_write::set_key(&path, &key, &value)?;
+            thegn_core::config_write::set_key(&path, &key, &value)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             let written = std::fs::read_to_string(&path).unwrap_or_default();
             let parse_err = toml::from_str::<Config>(&written)
                 .err()
@@ -94,15 +106,17 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
                 }
                 if let Some(e) = parse_err {
                     anyhow::bail!(
-                        "{key} = {value:?} would make the config unparseable ({e}); not written"
+                        "{}: {key} = {value:?} would make the config unparseable ({e}); not written",
+                        path.display()
                     );
                 }
                 for e in &new_enum_errs {
-                    msg::error(e);
+                    msg::error(&format!("{}: {e}", path.display()));
                 }
                 anyhow::bail!(
-                    "{key} = {value:?} is invalid ({} problem(s)); not written",
-                    new_enum_errs.len()
+                    "{}: {key} = {value:?} is invalid ({} problem(s)); not written",
+                    path.display(),
+                    new_enum_errs.len(),
                 );
             }
             // Echo what was actually WRITTEN, not the raw argument: an array
@@ -130,7 +144,10 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
                 ));
             }
         }
-        Action::Validate => validate(&path)?,
+        Action::Validate { repo } => validate(
+            &path,
+            repo.or_else(|| repo_context.as_deref().map(Path::to_path_buf)),
+        )?,
         Action::Schema => {
             let schema = schemars::schema_for!(Config);
             outln!("{}", serde_json::to_string_pretty(&schema).unwrap());
@@ -283,7 +300,7 @@ fn show(cfg: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn get(cfg: &Config, key: &str, json: bool) -> Result<()> {
+fn get(cfg: &Config, key: &str, json: bool, path: &Path) -> Result<()> {
     if json {
         // Emit the value's REAL type (number, bool, array, table) rather than a
         // stringified scalar, so `config get --json` composes with `jq`.
@@ -292,7 +309,10 @@ fn get(cfg: &Config, key: &str, json: bool) -> Result<()> {
                 outln!("{}", serde_json::to_string(&v)?);
                 Ok(())
             }
-            None => anyhow::bail!("unknown config key: {key}"),
+            None => anyhow::bail!(
+                "unknown config key: {key} (effective config: {})",
+                path.display()
+            ),
         };
     }
     match cfg.get_dotted(key) {
@@ -300,7 +320,10 @@ fn get(cfg: &Config, key: &str, json: bool) -> Result<()> {
             outln!("{v}");
             Ok(())
         }
-        None => anyhow::bail!("unknown config key: {key}"),
+        None => anyhow::bail!(
+            "unknown config key: {key} (effective config: {})",
+            path.display()
+        ),
     }
 }
 
@@ -335,35 +358,29 @@ fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn validate(path: &PathBuf) -> Result<()> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => {
-            outln!("no config file at {} — using defaults (ok)", path.display());
-            return Ok(());
-        }
-    };
-    // Advisory (non-failing): plaintext secrets pasted into config. These keep
-    // working — the point is to name the field + the fix, not to break a valid
-    // config (THE-66). `thegn secret migrate` moves them into the store.
-    let cfg: Config = toml::from_str(&body).unwrap_or_default();
-    for lit in thegn_core::secret_scan::literal_refs(&cfg) {
-        msg::warn(&format!(
-            "{}: holds a plaintext secret value in config. Use a `keyring:`, `env:`, or \
-             `file:` ref, or run `thegn secret migrate` to move it into the keyring.",
-            lit.path
-        ));
-    }
+fn validate(path: &Path, repo_context: Option<PathBuf>) -> Result<()> {
+    let health = super::config_health::collect(path, repo_context.as_deref());
+    super::config_health::render_findings(&health);
 
-    let errs = config::validate_str(&body);
-    if errs.is_empty() {
+    if !health.main_present {
+        outln!("no config file at {} — using defaults (ok)", path.display());
+    } else if health.main_problems == 0 {
         outln!("{} ok", path.display());
+    }
+    if let Some(profile) = &health.profile_path
+        && health.profile_problems == 0
+    {
+        outln!("{} ok", profile.display());
+    }
+    if let Some(repo) = &health.repo_path
+        && health.repo_problems == 0
+    {
+        outln!("{} ok", repo.display());
+    }
+    if health.problems() == 0 {
         Ok(())
     } else {
-        for e in &errs {
-            msg::error(e);
-        }
-        anyhow::bail!("{} problem(s) in {}", errs.len(), path.display());
+        anyhow::bail!("{} problem(s) in configuration layers", health.problems());
     }
 }
 
@@ -381,10 +398,11 @@ mod tests {
     #[test]
     fn get_known_and_unknown_keys() {
         let cfg = Config::default();
-        assert!(get(&cfg, "picker", false).is_ok());
-        assert!(get(&cfg, "picker", true).is_ok());
-        assert!(get(&cfg, "nonexistent.key", false).is_err());
-        assert!(get(&cfg, "nonexistent.key", true).is_err());
+        let path = PathBuf::from("/tmp/config.toml");
+        assert!(get(&cfg, "picker", false, &path).is_ok());
+        assert!(get(&cfg, "picker", true, &path).is_ok());
+        assert!(get(&cfg, "nonexistent.key", false, &path).is_err());
+        assert!(get(&cfg, "nonexistent.key", true, &path).is_err());
     }
 
     #[test]
@@ -401,10 +419,13 @@ mod tests {
             "ui.language",
         ] {
             assert!(
-                get(&cfg, key, false).is_ok(),
+                get(&cfg, key, false, &PathBuf::from("/tmp/config.toml")).is_ok(),
                 "config get {key} should resolve"
             );
-            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+            assert!(
+                get(&cfg, key, true, &PathBuf::from("/tmp/config.toml")).is_ok(),
+                "config get --json {key}"
+            );
         }
     }
 
@@ -429,7 +450,10 @@ mod tests {
             "pipeline.stages.0.concurrency",
             "pipeline.stages.0.on_blocked",
         ] {
-            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+            assert!(
+                get(&cfg, key, true, &PathBuf::from("/tmp/config.toml")).is_ok(),
+                "config get --json {key}"
+            );
         }
         // The JSON form is the real shape (an object with an array), not a
         // stringified scalar — that is what makes it consumable by an agent.
@@ -441,8 +465,24 @@ mod tests {
         assert_eq!(stages[0]["timeout_secs"], 3600);
         assert_eq!(stages[0]["on_blocked"], "park");
         // An empty pipeline still resolves (an inert section, not an error).
-        assert!(get(&Config::default(), "pipeline", true).is_ok());
-        assert!(get(&cfg, "pipeline.nope", true).is_err());
+        assert!(
+            get(
+                &Config::default(),
+                "pipeline",
+                true,
+                &PathBuf::from("/tmp/config.toml")
+            )
+            .is_ok()
+        );
+        assert!(
+            get(
+                &cfg,
+                "pipeline.nope",
+                true,
+                &PathBuf::from("/tmp/config.toml")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -455,8 +495,14 @@ mod tests {
             "pr_queue.own_prs_only",
             "pr_queue.prompts.ci_failure",
         ] {
-            assert!(get(&cfg, key, false).is_ok(), "config get {key}");
-            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+            assert!(
+                get(&cfg, key, false, &PathBuf::from("/tmp/config.toml")).is_ok(),
+                "config get {key}"
+            );
+            assert!(
+                get(&cfg, key, true, &PathBuf::from("/tmp/config.toml")).is_ok(),
+                "config get --json {key}"
+            );
         }
     }
 

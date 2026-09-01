@@ -325,6 +325,67 @@ impl CacheStore for Db {
         Ok(())
     }
 
+    fn get_pr_review_cache(
+        &self,
+        worktree: &str,
+    ) -> Result<Option<crate::review::PrReviewSnapshot>> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT branch, pr_number, head_oid, json, fetched_at
+                 FROM pr_review_cache WHERE worktree=?1",
+                params![worktree],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .ok(); // best-effort: a corrupt/missing cache row is a miss; the forge repopulates
+        let Some((branch, pr_number, head_oid, json, fetched_at)) = row else {
+            return Ok(None);
+        };
+        let Ok(mut snapshot) = serde_json::from_str::<crate::review::PrReviewSnapshot>(&json)
+        else {
+            return Ok(None);
+        };
+        if snapshot.worktree_key != worktree
+            || snapshot.branch != branch
+            || u64::try_from(pr_number).ok() != Some(snapshot.pr_number)
+            || snapshot.head_oid != head_oid
+        {
+            return Ok(None);
+        }
+        snapshot.fetched_at = fetched_at;
+        Ok(Some(snapshot))
+    }
+
+    fn put_pr_review_cache(&self, snapshot: &crate::review::PrReviewSnapshot) -> Result<()> {
+        let fetched_at = util::now();
+        let mut cached = snapshot.clone();
+        cached.fetched_at = fetched_at;
+        let json = serde_json::to_string(&cached)?;
+        self.conn().execute(
+            r#"INSERT INTO pr_review_cache(worktree,branch,pr_number,head_oid,json,fetched_at)
+               VALUES(?1,?2,?3,?4,?5,?6)
+               ON CONFLICT(worktree) DO UPDATE SET
+                 branch=?2, pr_number=?3, head_oid=?4, json=?5, fetched_at=?6"#,
+            params![
+                cached.worktree_key,
+                cached.branch,
+                cached.pr_number as i64,
+                cached.head_oid,
+                json,
+                fetched_at
+            ],
+        )?;
+        Ok(())
+    }
+
     fn get_loc_cache_entry(&self, worktree: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
@@ -371,6 +432,28 @@ impl CacheStore for Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_cache_round_trips_as_one_identity_bearing_snapshot() {
+        let db = Db::open_memory().unwrap();
+        let snapshot = crate::review::PrReviewSnapshot {
+            worktree_key: "/wt/review".into(),
+            branch: "feature".into(),
+            pr_number: 27,
+            head_oid: "abc".into(),
+            ..Default::default()
+        };
+        db.put_pr_review_cache(&snapshot).unwrap();
+        let got = db
+            .get_pr_review_cache("/wt/review")
+            .unwrap()
+            .expect("cached snapshot");
+        assert_eq!(got.worktree_key, snapshot.worktree_key);
+        assert_eq!(got.branch, snapshot.branch);
+        assert_eq!(got.pr_number, snapshot.pr_number);
+        assert_eq!(got.head_oid, snapshot.head_oid);
+        assert!(got.fetched_at > 0);
+    }
 
     #[test]
     fn list_pr_cache_returns_every_row() {

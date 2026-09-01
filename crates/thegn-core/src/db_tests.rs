@@ -5,8 +5,203 @@ use crate::store::{
 };
 use rusqlite::params;
 
+/// An EXISTING database (`observed > 0`) is the contended case the policy is for.
+const UPGRADE: i64 = 62;
+
+#[test]
+fn migration_authority_is_fail_closed_for_clients_and_pins() {
+    use crate::config::MigrationAuthority;
+
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Client,
+            true,
+            UPGRADE
+        ),
+        Some("ordinary CLI processes are not database migration controllers")
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Controller,
+            false,
+            UPGRADE
+        ),
+        Some("this executable is not the configured migration executable")
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Disabled,
+            MigrationActor::Controller,
+            true,
+            UPGRADE
+        ),
+        Some("automatic database migrations are disabled")
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Controller,
+            true,
+            UPGRADE
+        ),
+        None
+    );
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Any,
+            MigrationActor::Client,
+            true,
+            UPGRADE
+        ),
+        None
+    );
+}
+
+#[test]
+fn creating_a_fresh_database_is_not_advancing_one() {
+    use crate::config::MigrationAuthority;
+
+    // At user_version 0 there is nothing on disk for another process to hold a
+    // stale view of, and no controller has been elected yet — so applying the
+    // authority to bootstrap would make a fresh install unusable by every
+    // ordinary CLI, and every isolated test that spawns one. A client may
+    // create; only UPGRADES are contended.
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Client,
+            true,
+            0
+        ),
+        None
+    );
+    // Even a pin does not block bootstrap: the pin exists to elect one upgrader
+    // among several, which is meaningless when there is nothing to upgrade.
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Controller,
+            MigrationActor::Client,
+            false,
+            0
+        ),
+        None
+    );
+    // `disabled` is the one authority that still means what it says.
+    assert_eq!(
+        migration_refusal(
+            MigrationAuthority::Disabled,
+            MigrationActor::Controller,
+            true,
+            0
+        ),
+        Some("automatic database migrations are disabled")
+    );
+}
+
 fn db() -> Db {
     Db::open_memory().unwrap()
+}
+
+#[test]
+fn read_only_open_does_not_create_or_migrate_state_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent.db");
+    assert!(Db::open_read_only_at(&absent).unwrap().is_none());
+    assert!(!absent.exists());
+
+    let stale = dir.path().join("stale.db");
+    {
+        let conn = Connection::open(&stale).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 5;
+             CREATE TABLE marker(value TEXT NOT NULL);",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&stale).unwrap();
+    let db = Db::open_read_only_at(&stale).unwrap().unwrap();
+    assert!(
+        db.conn
+            .execute("CREATE TABLE should_not_exist(value TEXT)", [])
+            .is_err(),
+        "the dry-run connection must reject writes"
+    );
+    drop(db);
+
+    assert_eq!(std::fs::read(&stale).unwrap(), before);
+    for suffix in ["-wal", "-journal", "-shm"] {
+        assert!(
+            !dir.path().join(format!("stale.db{suffix}")).exists(),
+            "read-only open created stale.db{suffix}"
+        );
+    }
+
+    let wal = dir.path().join("wal.db");
+    {
+        let conn = Connection::open(&wal).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE marker(value TEXT NOT NULL);
+             INSERT INTO marker(value) VALUES ('kept');
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&wal).unwrap();
+    let db = Db::open_read_only_at(&wal).unwrap().unwrap();
+    let value: String = db
+        .conn
+        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "kept");
+    drop(db);
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    for suffix in ["-wal", "-journal", "-shm"] {
+        assert!(
+            !dir.path().join(format!("wal.db{suffix}")).exists(),
+            "immutable read-only open created wal.db{suffix}"
+        );
+    }
+}
+
+#[test]
+fn wal_aware_read_only_open_sees_uncheckpointed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.db");
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE marker(value TEXT NOT NULL);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO marker(value) VALUES ('in-wal');",
+        )
+        .unwrap();
+
+    let reader = Db::open_read_only_wal_at(&path).unwrap().unwrap();
+    let value: String = reader
+        .conn
+        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "in-wal");
+}
+
+#[test]
+fn explicit_db_open_restricts_created_state_to_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("profile/state/thegn");
+    let path = state.join("thegn.db");
+    drop(Db::open_at(&path).unwrap());
+
+    if let Some(mode) = crate::fsperm::mode_bits(&state).unwrap() {
+        assert_eq!(mode, 0o700);
+    }
+    if let Some(mode) = crate::fsperm::mode_bits(&path).unwrap() {
+        assert_eq!(mode, 0o600);
+    }
 }
 
 #[test]
@@ -3031,6 +3226,284 @@ fn open_mode_is_fast_on_current_or_newer_schema() {
     );
 }
 
+/// A pipeline-shaped dispatch for the claim tests.
+fn claim_new<'a>(
+    issue: &'a str,
+    wt: &'a str,
+    stage: &'a str,
+    artifact: &'a str,
+) -> crate::issue::NewDispatch<'a> {
+    let mut n = crate::issue::NewDispatch::new(issue, wt, "coder");
+    n.stage = Some(stage);
+    n.artifact_path = Some(artifact);
+    n
+}
+
+#[test]
+fn only_one_monitor_can_hold_the_pipeline_lease() {
+    let db = Db::open_memory().unwrap();
+    assert!(
+        db.acquire_pipeline_lease("lead", "monitor-a", 300)
+            .unwrap()
+            .is_ok()
+    );
+    // A second monitor is refused and told who holds it — the check that stops
+    // two Leads filling the same slots.
+    let who = db
+        .acquire_pipeline_lease("lead", "monitor-b", 300)
+        .unwrap()
+        .expect_err("a live lease must not be stealable");
+    assert_eq!(who, "monitor-a");
+    // The holder may renew its own lease (heartbeat).
+    assert!(
+        db.acquire_pipeline_lease("lead", "monitor-a", 300)
+            .unwrap()
+            .is_ok()
+    );
+    let (owner, remaining) = db.pipeline_lease_holder("lead").unwrap().unwrap();
+    assert_eq!(owner, "monitor-a");
+    assert!(remaining > 0);
+    // Releasing is owner-scoped: monitor-b cannot drop someone else's lease.
+    assert!(!db.release_pipeline_lease("lead", "monitor-b").unwrap());
+    assert!(db.release_pipeline_lease("lead", "monitor-a").unwrap());
+    // Now it is free.
+    assert!(db.pipeline_lease_holder("lead").unwrap().is_none());
+    assert!(
+        db.acquire_pipeline_lease("lead", "monitor-b", 300)
+            .unwrap()
+            .is_ok()
+    );
+}
+
+#[test]
+fn an_expired_lease_is_taken_over_without_a_human() {
+    // A crashed monitor must not wedge the pipeline forever: its claim lapses.
+    let db = Db::open_memory().unwrap();
+    // A zero TTL is already expired by the time the next call reads it.
+    db.acquire_pipeline_lease("lead", "crashed-monitor", 0)
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.pipeline_lease_holder("lead").unwrap().is_none(),
+        "an expired lease belongs to nobody"
+    );
+    assert!(
+        db.acquire_pipeline_lease("lead", "fresh-monitor", 300)
+            .unwrap()
+            .is_ok(),
+        "an expired lease must be takeable"
+    );
+    assert_eq!(
+        db.pipeline_lease_holder("lead").unwrap().unwrap().0,
+        "fresh-monitor"
+    );
+}
+
+#[test]
+fn claim_refuses_a_second_row_for_work_already_open() {
+    let db = Db::open_memory().unwrap();
+    let first = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 3, None)
+        .unwrap()
+        .expect("first claim is granted");
+    // The same work again — the read-modify-write a supervisor would otherwise
+    // race on. Refused, naming the row to reconcile.
+    let again = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 3, None)
+        .unwrap();
+    match again {
+        Err(crate::pipeline_claim::ClaimDecision::DuplicateOf { id, .. }) => assert_eq!(id, first),
+        other => panic!("expected a duplicate refusal, got {other:?}"),
+    }
+    // Refusing must not have written a row.
+    assert_eq!(db.list_dispatches().unwrap().len(), 1);
+}
+
+#[test]
+fn claim_allows_parallel_chunks_but_enforces_the_stage_budget() {
+    let db = Db::open_memory().unwrap();
+    for c in ["c1.md", "c2.md", "c3.md"] {
+        db.claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", c), 3, None)
+            .unwrap()
+            .unwrap_or_else(|d| panic!("chunk {c} should be granted: {}", d.reason()));
+    }
+    // Budget of 3 is now full; a fourth distinct chunk is refused on capacity,
+    // not on duplication.
+    let d = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c4.md"), 3, None)
+        .unwrap()
+        .expect_err("the stage is full");
+    assert!(
+        matches!(
+            d,
+            crate::pipeline_claim::ClaimDecision::AtCapacity { limit: 3, .. }
+        ),
+        "{d:?}"
+    );
+    assert_eq!(db.list_dispatches().unwrap().len(), 3);
+}
+
+#[test]
+fn an_exited_unclosed_row_keeps_holding_its_slot_across_a_monitor_restart() {
+    // The runaway in miniature. A monitor dispatches, the worker exits, the
+    // monitor dies before closing the row, and a NEW monitor comes up with no
+    // memory. Reading live sessions it would see a free stage; reading the
+    // roster through `claim_dispatch` it is correctly refused.
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 1, None)
+        .unwrap()
+        .unwrap();
+    db.stamp_dispatch_exit(id, Some(0)).unwrap();
+    let d = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 1, None)
+        .unwrap()
+        .expect_err("an exited-but-open row must still refuse a re-dispatch");
+    assert!(
+        matches!(
+            d,
+            crate::pipeline_claim::ClaimDecision::DuplicateOf { exited: true, .. }
+        ),
+        "{d:?}"
+    );
+    // Closing it is what frees the slot — the supervisor's decision, not a
+    // side effect of the worker exiting.
+    db.update_dispatch_status(id, crate::issue::AgentDispatchStatus::Done)
+        .unwrap();
+    db.claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 1, None)
+        .unwrap()
+        .expect("once reconciled, the slot is free again");
+}
+
+#[test]
+fn an_authorized_duplicate_is_recorded_rather_than_refused() {
+    let db = Db::open_memory().unwrap();
+    db.claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 3, None)
+        .unwrap()
+        .unwrap();
+    let id = db
+        .claim_dispatch(
+            claim_new("linear:A-1", "/wt/a", "code", "c1.md"),
+            3,
+            Some("re-running chunk 1 after a corrupted commit"),
+        )
+        .unwrap()
+        .expect("an explicit override is granted");
+    // The override leaves an audit trail on the new row.
+    let notes = db.dispatch_notes(id, None, 0).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].text.contains("explicitly authorized"),
+        "{:?}",
+        notes[0].text
+    );
+    assert!(notes[0].text.contains("corrupted commit"), "{:?}", notes[0]);
+}
+
+#[test]
+fn stamping_an_exit_makes_a_running_row_read_as_exited_unverified() {
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 3, None)
+        .unwrap()
+        .unwrap();
+    // Before the stamp: status alone says `running`, and liveness agrees.
+    let row = db.get_dispatch(id).unwrap().unwrap();
+    assert_eq!(
+        crate::pipeline_run::row_liveness(&row, crate::util::now_ms()),
+        crate::pipeline_run::RowLiveness::Live
+    );
+    db.stamp_dispatch_exit(id, Some(0)).unwrap();
+    let row = db.get_dispatch(id).unwrap().unwrap();
+    assert_eq!(row.exit_code, Some(0));
+    assert!(row.exited_at_ms.is_some());
+    assert!(
+        matches!(
+            crate::pipeline_run::row_liveness(&row, crate::util::now_ms()),
+            crate::pipeline_run::RowLiveness::ExitedUnverified { .. }
+        ),
+        "the row must now be distinguishable from a live worker"
+    );
+}
+
+#[test]
+fn worktrees_with_active_dispatch_lists_only_unclosed_work() {
+    let db = Db::open_memory().unwrap();
+    let open = db
+        .claim_dispatch(
+            claim_new("linear:A-1", "/wt/open", "code", "c1.md"),
+            3,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    let closed = db
+        .claim_dispatch(
+            claim_new("linear:A-2", "/wt/closed", "code", "c2.md"),
+            3,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    db.update_dispatch_status(closed, crate::issue::AgentDispatchStatus::Done)
+        .unwrap();
+    let got = db.worktrees_with_active_dispatch().unwrap();
+    assert_eq!(got, vec!["/wt/open".to_string()], "{got:?}");
+    // An exited-but-open row still counts — that is the whole point of the
+    // disk reclaimer's exemption.
+    db.stamp_dispatch_exit(open, Some(0)).unwrap();
+    assert_eq!(db.worktrees_with_active_dispatch().unwrap().len(), 1);
+}
+
+#[test]
+fn schema_refusal_blocks_an_older_build_against_a_newer_database() {
+    use crate::db::{ALLOW_OLD_BUILD_ENV, schema_refusal};
+    // Equal or older on-disk: nothing to refuse.
+    assert!(schema_refusal(57, 57, false).is_none());
+    assert!(schema_refusal(50, 57, false).is_none());
+    // The incident shape: build v57, database v62.
+    let msg = schema_refusal(62, 57, false).expect("a newer database must be refused");
+    assert!(msg.contains("v62"), "{msg}");
+    assert!(msg.contains("v57"), "{msg}");
+    // The message must be actionable, not just a diagnosis: it names the fix
+    // AND the daemon/CLI same-build requirement that made the incident hard to
+    // see from `--version` alone.
+    assert!(msg.contains("Refusing to run"), "{msg}");
+    assert!(msg.contains("rebuild") || msg.contains("Rebuild"), "{msg}");
+    assert!(msg.contains("daemon"), "{msg}");
+    assert!(msg.contains(ALLOW_OLD_BUILD_ENV), "{msg}");
+    // The override is the only way through, and it is explicit.
+    assert!(schema_refusal(62, 57, true).is_none());
+}
+
+#[test]
+fn opening_a_newer_database_fails_with_the_actionable_error() {
+    // End-to-end over a real file: stamp a user_version past this build and
+    // prove `Db::open_at` refuses rather than returning a tolerant handle.
+    let dir = std::env::temp_dir().join(format!("thegn-newerdb-{}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("thegn.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 5))
+            .unwrap();
+    }
+    // `Db` is not `Debug`, so unwrap the error by hand rather than `expect_err`.
+    let msg = match Db::open_at(&path) {
+        Ok(_) => panic!("a newer on-disk schema must refuse the open"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("Refusing to run"), "{msg}");
+    assert!(
+        msg.contains(&format!("v{}", SCHEMA_VERSION + 5)),
+        "the error must name the on-disk version: {msg}"
+    );
+    // best-effort: test cleanup
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fast_reopen_round_trips_and_reports_no_mismatch() {
     // First open of a file-backed DB runs the full init (fresh file, ver 0);
@@ -3073,7 +3546,10 @@ fn fast_reopen_round_trips_and_reports_no_mismatch() {
 
 #[test]
 fn newer_db_takes_the_tolerant_read_only_path() {
-    // A newer-schema DB (a different-branch build sharing the file) must:
+    // A newer-schema DB is REFUSED by default (see
+    // `opening_a_newer_database_fails_with_the_actionable_error`). Behind the
+    // explicit override it still behaves as it always did, and this pins that
+    // fallback:
     // - take the tolerant fast path (no migration or open-time write)
     // - serve reads while refusing writes from this older build
     // - report `schema_mismatch() == Some(on_disk_version)` on every open
@@ -3096,9 +3572,9 @@ fn newer_db_takes_the_tolerant_read_only_path() {
             .unwrap();
     }
 
-    // Reopen: must take the tolerant fast path and serve reads without writes.
+    // Reopen under the override: tolerant fast path, reads without writes.
     {
-        let db = Db::open_at(&path).unwrap();
+        let db = Db::open_at_allowing_older_build(&path).unwrap();
         assert_eq!(
             db.schema_mismatch(),
             Some(SCHEMA_VERSION + 1),
@@ -3118,7 +3594,7 @@ fn newer_db_takes_the_tolerant_read_only_path() {
     // Second reopen: mismatch stays reported and the rejected write did not
     // leave a row behind.
     {
-        let db = Db::open_at(&path).unwrap();
+        let db = Db::open_at_allowing_older_build(&path).unwrap();
         assert_eq!(
             db.schema_mismatch(),
             Some(SCHEMA_VERSION + 1),
@@ -3495,7 +3971,13 @@ fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
     }
-    let db = Db::open_at(&path).unwrap();
+    // Default behaviour is a refusal; the override is what reaches the
+    // tolerant path this test is about.
+    assert!(
+        Db::open_at(&path).is_err(),
+        "a newer on-disk schema is refused unless the override is set"
+    );
+    let db = Db::open_at_allowing_older_build(&path).unwrap();
     assert_eq!(db.schema_mismatch, Some(SCHEMA_VERSION + 1));
     // The stamp is never LOWERED by the older build (ver < SCHEMA_VERSION is
     // false), so the newer build keeps fast-pathing its own file later.

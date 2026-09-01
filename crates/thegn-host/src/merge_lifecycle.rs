@@ -9,15 +9,25 @@
 //! `apply` runs OFF the event loop — the CLI subcommands (`merge add/drain/land`,
 //! `integrate`) and the fold's `spawn_blocking` are its callers. When a removed
 //! worktree is open as a live tab in a running instance, the in-app fold-result
-//! handler reaps the orphaned tab via [`reconcile_removed_tabs`] (which runs ON
-//! the loop, so it can tear down panes) — nothing in `apply` touches the session.
+//! handler reaps the orphaned tab via the typed, off-loop reconciliation result
+//! — nothing in `apply` touches the session.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
 use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+
+/// Paths identified by the off-loop vanished-tab probe. The compositor applies
+/// this result without re-checking disk or SQLite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VanishedTabs {
+    pub paths: Vec<String>,
+}
+
+static RECONCILIATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Apply the lifecycle policy for one worktree branch in response to `event`.
 /// A no-op unless `[merge_queue] organize_folders` is on. Never fails.
@@ -159,6 +169,18 @@ pub(crate) fn remove_landed(
     branch: &str,
     delete_branch: bool,
 ) {
+    // Merge reclaim shares the same process as interactive deletion in the TUI.
+    // Serialize it with sidebar/workspace destroy workers so hooks, provider
+    // teardown, and git removal cannot run twice for one physical path.
+    let Some(_destroy_claim) =
+        crate::worktree_lifecycle::try_scoped_destroy_path(Path::new(worktree))
+    else {
+        thegn_core::msg::warn(&format!(
+            "{branch} landed, but cleanup for {worktree} is already in progress"
+        ));
+        let _ = db.remove_merge_entry(worktree); // best-effort: landing still completes the queue transition
+        return;
+    };
     // `worktree::remove` escalates to `git worktree remove --force`, which
     // discards uncommitted work. That is fine for an explicit `wt rm`, but this
     // path is automatic — it fires on a clean land, with no prompt — so a
@@ -172,8 +194,29 @@ pub(crate) fn remove_landed(
         let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
         return;
     }
-    let removed =
-        thegn_core::worktree::remove(repo_root, Path::new(worktree), branch, delete_branch);
+    // Automatic reclaim is unattended: the shared transaction runs the hook,
+    // runtime teardown, removal, and post-hook in order, but a repository-
+    // authored failure can never wedge the queue.
+    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let workspace = thegn_core::repo::repo_slug(repo_root);
+    let (removed, message) = crate::worktree_lifecycle::destroy_one(
+        &cfg,
+        repo_root,
+        Path::new(worktree),
+        branch,
+        &workspace,
+        false,
+        delete_branch,
+        thegn_core::hooks::HookExecutionMode::Unattended,
+        Some(db),
+    );
+    if !removed {
+        // Landing completes the queue transition even when physical cleanup
+        // fails; retain the worktree row so the sidebar can report/retry it.
+        let _ = db.remove_merge_entry(worktree); // best-effort: cache write
+        thegn_core::msg::warn(&format!("merge cleanup: {message}"));
+        return;
+    }
     // The branch landed, so it's no longer a queue entry regardless.
     let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
     // Only drop the worktree's cache row (its folder assignment) when the dir
@@ -186,37 +229,71 @@ pub(crate) fn remove_landed(
     }
 }
 
-/// After an in-app fold, tear down any live tab whose worktree dir was just
-/// removed by an `on_landed = remove/detach` land — panes + session group +
-/// focus — exactly as a manual close does (`delete_groups`). That primitive
-/// never deletes the branch, so `detach` (keep-branch) is preserved. Remote
-/// worktrees (a non-local path) are exempt. Returns whether anything was torn
-/// down. Runs ON the loop; cheap (one `is_dir` stat per group) and the caller
-/// gates it to real fold completions, so it never touches the idle path.
-pub(crate) fn reconcile_removed_tabs(
-    session: &mut crate::session::Session,
-    panes: &mut crate::panes::Panes,
-    waker: &termwiz::terminal::TerminalWaker,
-) -> bool {
-    let remote: std::collections::HashSet<String> = Db::open()
-        .ok()
-        .and_then(|db| db.worktrees().ok())
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|w| !w.location.is_empty())
-                .map(|w| w.worktree)
-                .collect()
-        })
-        .unwrap_or_default();
-    let gone: Vec<usize> = session
+/// Probe local session groups for out-of-band removals on a worker. SQLite and
+/// filesystem access, including the cache/session writes, stay off the loop.
+/// The next refresh carries the typed result back to the compositor.
+pub(crate) fn spawn_reconcile_removed_tabs(
+    session: &crate::session::Session,
+    waker: Option<termwiz::terminal::TerminalWaker>,
+) {
+    if RECONCILIATION_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let paths: Vec<String> = session
         .worktrees
         .iter()
-        .enumerate()
-        .filter(|(_, g)| {
-            !g.path.is_empty() && !remote.contains(&g.path) && !Path::new(&g.path).is_dir()
-        })
-        .map(|(i, _)| i)
+        .filter(|g| !g.path.is_empty())
+        .map(|g| g.path.clone())
         .collect();
+    let spawned = std::thread::Builder::new()
+        .name("thegn-vanished-tab-reconcile".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let db = Db::open().ok();
+            let remote: std::collections::HashSet<String> = db
+                .as_ref()
+                .and_then(|db| db.worktrees().ok())
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter(|w| !w.location.is_empty())
+                        .map(|w| w.worktree)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let gone: Vec<String> = paths
+                .into_iter()
+                .filter(|path| !remote.contains(path) && !Path::new(path).is_dir())
+                .collect();
+            if let Some(db) = db {
+                for path in &gone {
+                    let _ = db.del_worktree(path); // best-effort: git is the source of truth
+                }
+            }
+            RECONCILIATION_IN_FLIGHT.store(false, Ordering::Release);
+            if !gone.is_empty() {
+                crate::worktree_lifecycle::send_refresh(
+                    crate::hydrate::RefreshKind::VanishedTabs(Box::new(VanishedTabs {
+                        paths: gone,
+                    })),
+                    waker,
+                );
+            }
+        })
+        .is_ok();
+    if !spawned {
+        RECONCILIATION_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Apply an off-loop vanished-tab result. This is intentionally pure with
+/// respect to the filesystem and SQLite: it only removes pane/session objects,
+/// queues the resulting layout cache write, and restores focus by group name.
+pub(crate) fn apply_vanished_tabs(
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    paths: &[String],
+) -> bool {
+    let gone = vanished_group_indices(session, paths);
     if gone.is_empty() {
         return false;
     }
@@ -228,13 +305,34 @@ pub(crate) fn reconcile_removed_tabs(
     // was itself reaped), mirroring the user-initiated delete
     // (`handlers::worktree_delete`).
     let prior = session.active_group().map(|g| g.name.clone());
-    let _ = crate::run::delete_groups(session, panes, gone, false, Some(waker.clone())); // best-effort: reap: the next hydration re-runs it; a failed delete cannot take down the loop
+    for gi in gone.into_iter().rev() {
+        for id in crate::run::prune_vanished_group(session, gi) {
+            panes.table.remove(&id);
+        }
+    }
     if let Some(name) = prior
         && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
     {
         session.switch_to(idx);
     }
+    let snapshot = session.layout_snapshot(&session.id, crate::run::now_secs());
+    crate::db_task::persist(move |db| {
+        let _ = crate::session::Session::write_layout(db, &snapshot); // best-effort: cache write: the DB is a cache
+    });
     true
+}
+
+/// Select only groups named by the worker's completion. Keeping this as a
+/// pure seam makes it impossible for loop-side reconciliation to silently
+/// reintroduce a disk or SQLite probe.
+fn vanished_group_indices(session: &crate::session::Session, paths: &[String]) -> Vec<usize> {
+    session
+        .worktrees
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| paths.iter().any(|path| path == &g.path))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[cfg(test)]
@@ -344,6 +442,31 @@ mod tests {
             workspace_repo_path(&db, Path::new("/repos/none"), None),
             "/repos/none"
         );
+    }
+
+    #[test]
+    fn vanished_indices_use_only_worker_reported_paths() {
+        let session = crate::session::Session {
+            id: "s".into(),
+            worktrees: vec![
+                crate::session::WorktreeGroup::new(
+                    "repo/home",
+                    crate::session::GroupKind::Home,
+                    "/repo",
+                ),
+                crate::session::WorktreeGroup::new(
+                    "repo/feature",
+                    crate::session::GroupKind::Branch,
+                    "/repo-feature",
+                ),
+            ],
+            active: 0,
+        };
+        assert_eq!(
+            vanished_group_indices(&session, &["/repo-feature".into()]),
+            vec![1]
+        );
+        assert!(vanished_group_indices(&session, &[]).is_empty());
     }
 
     #[test]
@@ -462,6 +585,45 @@ mod tests {
                 .all(|r| r.worktree != feat_s)
         );
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn landed_remove_does_not_overlap_an_existing_destroy() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "rm-claimed");
+        let feat_s = feat.to_string_lossy().to_string();
+        db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+        let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat)
+            .expect("test should own the first destroy claim");
+
+        apply(
+            &cfg(OnLanded::Remove),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::Landed,
+        );
+
+        assert!(feat.is_dir(), "overlapping cleanup must not remove files");
+        assert!(
+            util::git_ok(
+                &root,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+            ),
+            "overlapping cleanup must not delete the branch"
+        );
+        assert!(
+            db.list_merge_queue()
+                .unwrap()
+                .iter()
+                .all(|row| row.worktree != feat_s),
+            "landing still completes the queue transition"
+        );
+
+        drop(claim);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // Regression: when the worktree can't be removed (read-only sandbox mount,

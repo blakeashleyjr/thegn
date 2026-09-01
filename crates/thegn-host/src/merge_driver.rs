@@ -410,6 +410,7 @@ fn run_agent(
         vars: &vars,
         timeout_secs: cfg.agent_timeout_secs,
         sandbox,
+        credential_free: false,
     })
 }
 
@@ -774,6 +775,8 @@ mod tests {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 }],
                 ..Config::default()
             };

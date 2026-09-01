@@ -134,6 +134,7 @@ pub(crate) fn handle_key_event(
     ob: &mut OnboardingUi,
     model: &mut FrameModel,
     cfg: &mut Config,
+    user_themes: &[thegn_core::theme_user::UserTheme],
     session: &mut Session,
     panes: &mut Panes,
     center: Rect,
@@ -151,6 +152,7 @@ pub(crate) fn handle_key_event(
             &mut ob.wait,
             model,
             cfg,
+            user_themes,
             session,
             panes,
             center,
@@ -164,6 +166,7 @@ pub(crate) fn handle_key_event(
                 &mut ob.wait,
                 model,
                 cfg,
+                user_themes,
                 session,
                 panes,
                 center,
@@ -177,7 +180,7 @@ pub(crate) fn handle_key_event(
             // live preview matches it, and the config watcher reconciles the
             // in-memory `cfg`), so leave the previewed palette in place.
             if !completed {
-                crate::chrome::set_palette(cfg.palette());
+                crate::chrome::set_palette(onboarding_palette(cfg, &cfg.theme.preset, user_themes));
             }
             persist_done();
             model.status = if completed {
@@ -219,6 +222,7 @@ fn run_effects(
     wait: &mut Option<(u32, bool)>,
     model: &mut FrameModel,
     cfg: &mut Config,
+    user_themes: &[thegn_core::theme_user::UserTheme],
     session: &mut Session,
     panes: &mut Panes,
     center: Rect,
@@ -294,9 +298,9 @@ fn run_effects(
     // Live theme preview: apply the previewed preset to the runtime palette
     // (colors land on the next repaint; the caller sets `dirty`). Not persisted
     // — the actual `theme.preset` write rides `leave_writes` on step advance,
-    // and a dismissed wizard reverts via `chrome::set_palette(cfg.palette())`.
+    // and a dismissed wizard reverts through the same loaded-catalog resolver.
     if let Some(name) = effects.preview_theme {
-        crate::chrome::set_palette(cfg.palette_with_preset(&name));
+        crate::chrome::set_palette(onboarding_palette(cfg, &name, user_themes));
     }
     if let Some(req) = effects.probe {
         spawn_probe(req, refresh_tx.clone(), waker.clone());
@@ -313,6 +317,14 @@ fn run_effects(
             applied,
         );
     }
+}
+
+fn onboarding_palette(
+    cfg: &Config,
+    preset: &str,
+    user_themes: &[thegn_core::theme_user::UserTheme],
+) -> thegn_core::theme::Palette {
+    cfg.palette_with_user_themes(preset, user_themes)
 }
 
 /// Spawn `command` into a new center tab and suspend the wizard until the
@@ -458,5 +470,24 @@ fn probe_host(name: String, ssh: &str) -> ProbeResult {
             ok: false,
             detail: "ssh probe failed (BatchMode; check keys/agent)".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dismissed_onboarding_restores_a_loaded_user_theme() {
+        let mut cfg = Config::default();
+        cfg.theme.preset = "local-paper".into();
+        let expected = cfg.palette_with_preset("light");
+        let user = thegn_core::theme_user::UserTheme::from_palette("local-paper", &expected);
+
+        let restored = onboarding_palette(&cfg, &cfg.theme.preset, &[user]);
+
+        assert_eq!(restored.bg0, expected.bg0);
+        assert_eq!(restored.text, expected.text);
+        assert_ne!(restored.bg0, cfg.palette().bg0);
     }
 }

@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::caps::Capabilities;
@@ -27,9 +27,7 @@ use crate::compositor::Rect;
 use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
-pub(crate) use crate::drawer_state::{
-    DrawerPool, hide_drawer_into_pool, show_drawer, sync_drawer_persistence,
-};
+pub(crate) use crate::drawer_state::DrawerRuntime;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
     ProvisionProgress, SpecBatch, SpecDrainCtx, SpecError, drain_provision, drain_specs,
@@ -65,6 +63,66 @@ pub fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Mirror the scope-aware drawer runtime into the geometry locals. The
+/// layout/compositor still deals in a pane id; ownership, pooling, and stale
+/// result handling remain in [`DrawerRuntime`].
+fn sync_drawer_runtime_mirror(
+    runtime: &DrawerRuntime,
+    drawer: &mut Option<u32>,
+    drawer_home: &mut Option<std::path::PathBuf>,
+) -> bool {
+    let next = runtime.visible.as_ref().map(|visible| visible.pane_id);
+    let home = runtime
+        .visible
+        .as_ref()
+        .map(|visible| visible.worktree.clone());
+    let changed = *drawer != next || *drawer_home != home;
+    *drawer = next;
+    *drawer_home = home;
+    changed
+}
+
+/// Reconcile the one drawer runtime after any active-directory mutation. The
+/// pane-id locals are only a layout mirror; they never own drawer lifecycle.
+pub(crate) fn reconcile_drawer_runtime(
+    session: &crate::session::Session,
+    panes: &mut Panes,
+    drawer: &mut Option<u32>,
+    drawer_runtime: &mut DrawerRuntime,
+    drawer_home: &mut Option<std::path::PathBuf>,
+    cfg: &thegn_core::config::Config,
+    center: Rect,
+) {
+    if let Some(dir) = active_cwd(session) {
+        drawer_runtime.reconcile(cfg, &dir, panes, center);
+    }
+    sync_drawer_runtime_mirror(drawer_runtime, drawer, drawer_home);
+}
+
+/// Build the pure statusbar snapshot for the drawer widget. The built-in files
+/// occupant is always counted, even when no configured tool is valid.
+fn drawer_bar_state(
+    cfg: &thegn_core::config::Config,
+    runtime: &DrawerRuntime,
+    legacy_drawer: Option<u32>,
+) -> crate::chrome::DrawerBarState {
+    let policy = thegn_core::config_drawer::drawer_policy(cfg);
+    let visible = runtime.visible.as_ref();
+    let open = visible.is_some() || legacy_drawer.is_some();
+    let scope = visible
+        .map(|drawer| drawer.scope)
+        .unwrap_or(thegn_core::config::DrawerScope::Worktree);
+    let occupant = visible
+        .and_then(|drawer| policy.occupant(&drawer.key.occupant_id))
+        .map(|occupant| occupant.name.clone())
+        .unwrap_or_else(|| "files".into());
+    crate::chrome::DrawerBarState {
+        open,
+        occupant,
+        occupant_count: policy.occupants_for(scope).len(),
+    }
 }
 
 /// The focused workspace's repo root + slug for per-workspace keybind layering.
@@ -181,23 +239,11 @@ fn apply_mode_status(
     // The mode chip always shows.
     crate::handlers::status_line::apply_mode(model, mode);
 
-    if config.ui.full_mode_chip {
-        model.mode_chip = match mode {
-            crate::keymap::Mode::Normal => "NORMAL",
-            crate::keymap::Mode::VimNormal => "VIM NORMAL",
-            crate::keymap::Mode::VimInsert => "VIM INSERT",
-            crate::keymap::Mode::Emacs => "EMACS",
-        }
-        .into();
+    model.mode_chip = if config.ui.full_mode_chip {
+        crate::i18n_surface::mode(mode, crate::i18n_surface::ModeStyle::Full)
     } else {
-        model.mode_chip = match mode {
-            crate::keymap::Mode::Normal => "N",
-            crate::keymap::Mode::VimNormal => "V",
-            crate::keymap::Mode::VimInsert => "I",
-            crate::keymap::Mode::Emacs => "E",
-        }
-        .into();
-    }
+        crate::i18n_surface::mode(mode, crate::i18n_surface::ModeStyle::Compact)
+    };
 }
 
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
@@ -232,7 +278,7 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
 /// queued chunk, so a congestion drop ([`crate::pane_writer::StdinSendError::Full`]) can never
 /// leave the app inside an open paste bracket, and no keystroke can land
 /// between the markers.
-fn paste_text_into_pane(
+pub(crate) fn paste_text_into_pane(
     pane: &mut crate::pane::PtyPane,
     text: &str,
 ) -> Result<(), crate::pane_writer::StdinSendError> {
@@ -553,10 +599,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // Establish schema ownership before `load_or_seed_session` (the first DB
+    // consumer). This explicit open is a preflight: migration refusal must
+    // abort startup and restore the terminal, never be swallowed by the
+    // session loader's cache-unavailable fallback (the failure mode that made
+    // most workspaces, git state, disk size, and LOC appear to vanish).
+    thegn_core::db::install_migration_policy(
+        &cfg.database,
+        thegn_core::db::MigrationActor::Controller,
+    )?;
+    drop(thegn_core::db::Db::open()?);
     // Off-loop hydration loads must build the SAME config (overrides + DB
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
+    crate::automation_runtime::install(&cfg);
     // Register the installation identity (version/channel/build/OS) and the
     // crash-report policy now that the channel + `[diagnostics]` config are
     // known — a crash after this point stamps the resolved channel. Reconcile
@@ -578,6 +635,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         thegn_core::log_trace::reload_level(cfg.log.level);
     }
     crate::e2e_freeze::apply_to_config(&mut cfg);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(thegn_core::config::Config::path);
+    // Start the bounded catalog scan as soon as config identifies the selected
+    // preset. It overlaps the remaining startup work and is awaited only at
+    // the palette chokepoint, so filesystem I/O never runs on this thread.
+    let mut theme_store = crate::theme_store::ThemeStore::spawn(waker.clone(), config_path.clone());
     crate::forge_handle::install(&cfg);
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
@@ -634,7 +699,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `cfg` was loaded above (before the session reconcile); augment it with
     // DB-stored hosts now that we're past session load.
     thegn_core::host_config::merge_db_hosts(&mut cfg);
-    thegn_core::i18n::init(&cfg.ui.language);
+    crate::e2e_freeze::pin_locale(&mut cfg.ui.language);
+    let lc_all = std::env::var("LC_ALL").ok();
+    let lang = std::env::var("LANG").ok();
+    let pseudolocale_requested = cfg!(debug_assertions)
+        && std::env::var_os("THEGN_PSEUDOLOCALE")
+            .is_some_and(|value| !value.is_empty() && value != "0");
+    thegn_core::i18n::init(
+        &cfg.ui.language,
+        lc_all.as_deref(),
+        lang.as_deref(),
+        crate::e2e_freeze::active(),
+        pseudolocale_requested,
+    );
 
     tracing::info!(
         target: "thegn::startup",
@@ -674,12 +751,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             ),
         }
     }
-    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
-    // into persisted local worktrees so agents launched there discover them —
-    // this is also how worktrees created by an older build pick up newly bundled
-    // assets. (Best-effort; new worktrees seeded on create — see
-    // `cmd/wt.rs`/`wizard.rs`.) Gated on `[merge_queue] enabled`.
-    crate::mq_assets::seed_persisted_worktrees(&cfg);
+    // Reconcile configured skills into persisted local worktrees. The adapter
+    // immediately hands the bounded filesystem work to a Background thread;
+    // this call never blocks the compositor loop.
+    crate::skill_seed::seed_persisted_worktrees(&cfg);
     // Embedded host nix cache: when any env opts into `[env.<name>.provider]
     // host_cache`, serve the host /nix/store on an ephemeral loopback port for the
     // whole session. Each provider worktree's reverse tunnel then forwards a fixed
@@ -715,8 +790,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         }
     }
     // Resolve the configurable chrome palette ([theme] / [theme.colors]) before
-    // the first frame; the config fs-watch re-resolves it live.
-    crate::chrome::set_palette(cfg.palette());
+    // the first frame, including a configured user theme from the off-loop scan.
+    let (theme_users, theme_warnings) = theme_store.initial_catalog().await;
+    for warning in theme_warnings {
+        tracing::warn!(target: "thegn::theme", "{warning}");
+    }
+    crate::chrome::set_palette(cfg.palette_with_user_themes(&cfg.theme.preset, &theme_users));
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
     crate::caps::install_themed(&cfg, resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
@@ -824,7 +903,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (config_tx, config_rx) =
         tokio_mpsc::unbounded_channel::<Result<thegn_core::config::Config, String>>();
 
-    let config_path = thegn_core::config::Config::path();
     let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
@@ -1073,6 +1151,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         pane_pids,
         daemon_pid_atomic,
         waker,
+        theme_store,
+        theme_users,
         start,
         shutdown,
         event_bus,
@@ -1597,6 +1677,53 @@ fn current_forward_views(
         .unwrap_or_default()
 }
 
+/// URL ordering shared by the Forward section renderer and its Enter/`o`
+/// affordances: selected preview first, then existing sandbox forwards.
+fn forward_url_at(model: &FrameModel, index: usize) -> Option<&str> {
+    match (&model.preview, index) {
+        (Some(preview), 0) => Some(preview.url.as_str()),
+        (Some(_), index) => model
+            .forwards
+            .get(index - 1)
+            .map(|forward| forward.url.as_str()),
+        (None, index) => model
+            .forwards
+            .get(index)
+            .map(|forward| forward.url.as_str()),
+    }
+}
+
+/// Kick one event-driven preview discovery pass for the active branch
+/// worktree. The worker reads `package.json` once and reports by channel+waker;
+/// no timer or idle probe is installed.
+fn request_preview_scan(
+    supervisor: &mut crate::preview::PreviewSupervisor,
+    session: &crate::session::Session,
+    cfg: &thegn_core::config::Config,
+    tx: &tokio_mpsc::UnboundedSender<crate::preview_watch::ScanResult>,
+    waker: &TerminalWaker,
+) {
+    use crate::session::GroupKind;
+    if !cfg.preview.enabled {
+        return;
+    }
+    let Some(worktree) = session
+        .active_group()
+        .filter(|group| group.kind == GroupKind::Branch && !group.path.is_empty())
+        .map(|group| std::path::PathBuf::from(&group.path))
+    else {
+        return;
+    };
+    let generation = supervisor.next_scan_generation();
+    crate::preview_watch::spawn_scan(
+        generation,
+        worktree,
+        cfg.preview.ports.clone(),
+        tx.clone(),
+        waker.clone(),
+    );
+}
+
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     use crate::share::ShareEvent;
@@ -1670,6 +1797,7 @@ pub(crate) fn forget_worktree_group(
     db: &thegn_core::db::Db,
     session_id: &str,
     group: &crate::session::WorktreeGroup,
+    cleanup_runtime: bool,
 ) {
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
@@ -1691,6 +1819,13 @@ pub(crate) fn forget_worktree_group(
     // everything under `pin:{name}/`, NOT the bare `pin:{name}` prefix — a raw
     // `LIKE 'pin:myrepo/fix%'` also wipes an unrelated sibling `myrepo/fixup`.
     crate::handlers::workspace_remove::del_ui_state_segment(db, SIDEBAR_SCOPE, "pin", &group.name);
+    // A lifecycle destroy transaction already performed runtime teardown before
+    // it called this cache-prune helper. Only the non-destructive close path
+    // needs the legacy background cleanup here; never run it twice after a
+    // successful physical removal.
+    if !cleanup_runtime {
+        return;
+    }
     // Tear down any sandbox container for this worktree in the background
     // (best-effort: we fire-and-forget on a dedicated thread so the event loop
     // is never blocked by a slow container runtime).
@@ -1812,30 +1947,18 @@ fn connect_worktree_bridge(
     });
 }
 
-pub(crate) fn delete_groups(
+pub(crate) fn delete_groups_with_mode(
     session: &mut crate::session::Session,
-    panes: &mut Panes,
+    _panes: &mut Panes,
     mut targets: Vec<usize>,
     keep_files: bool,
+    mode: thegn_core::hooks::HookExecutionMode,
     waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
-    let db = match thegn_core::db::Db::open() {
-        Ok(db) => Some(db),
-        Err(e) => {
-            tracing::warn!(target: "thegn::worktree", error = %e, "DB unavailable while resolving delete targets; sandbox teardown may be degraded");
-            None
-        }
-    };
-    // by the SAME precedence launch uses (DB selection → repo `.thegn.toml`
-    // `env=` → global default), not just the DB — a repo-selected provider env
-    // (e.g. thegn's `env = "sprites"`) isn't stored in the DB, so a DB-only
-    // lookup returned None and LEAKED the sprite on delete.
-    let mut del_cfg =
-        thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-    thegn_core::host_config::merge_db_hosts(&mut del_cfg);
-    let (mut deleted, mut skipped) = (0usize, 0usize);
+    let (mut deleted, mut skipped, mut already_deleting) = (0usize, 0usize, 0usize);
+    let mut spawn_errors = Vec::new();
     for gi in targets {
         if gi >= session.worktrees.len() {
             continue;
@@ -1846,112 +1969,36 @@ pub(crate) fn delete_groups(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
-            // Tear down the per-worktree provider sandbox (sprite/…) if this env
-            // has one. Resolve the env name from the DB NOW (before
-            // `forget_worktree_group` below removes the worktree's rows), then
-            // destroy off-thread (a network DELETE; idempotent on 404). No-op for
-            // local/ssh/k8s envs or an unconfigured/tokenless provider.
-            if let Some(db) = &db {
-                // repo_root by the same fallback launch uses (DB → climb from path).
-                let repo_root = db
-                    .repo_root_for(&path)
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        thegn_core::repo::main_worktree(Path::new(&path))
-                            .map(|p| p.to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_else(|| path.clone());
-                // Resolve the env NOW (path still on disk; the git-remove thread runs
-                // below) by full precedence, so a repo-selected provider env is found.
-                let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(&path));
-                let selected = db.effective_env(&path, &repo_root);
-                let env = del_cfg.resolve_env(
-                    Path::new(&repo_root),
-                    &loc,
-                    Path::new(&path),
-                    selected.as_deref(),
-                );
-                // Only provider placements have a sandbox to destroy (no-op for
-                // local/ssh/k8s — destroy_provider_sandbox also guards internally).
-                if !env.placement.is_local() {
-                    let (p, env_name) = (path.clone(), env.name.clone());
-                    std::thread::spawn(move || {
-                        crate::agent::destroy_provider_sandbox(&p, &env_name);
-                    });
-                }
-                // A deleted worktree frees its placement-engine slot (own
-                // thread: keep DB writes off the loop).
-                let freed = path.clone();
-                std::thread::spawn(move || crate::placement_flow::release(&freed));
+            if !crate::worktree_lifecycle::try_claim_destroy_path(Path::new(&path)) {
+                already_deleting += 1;
+                continue;
             }
-            if let Some(waker) = waker.clone() {
-                let path_clone = path.clone();
-                std::thread::spawn(move || {
-                    if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path_clone)) {
-                        // Remove from git, keeping files if requested.
-                        // git worktree remove does both.
-                        if keep_files {
-                            // git does not have a "keep files" flag for `worktree remove`.
-                            // We must delete the files ourselves if we don't want them, but if we DO want them,
-                            // we cannot run `git worktree remove` as it destroys the files.
-                            // Instead, we just delete the .git file so it becomes a plain directory.
-                            // We will need to run `git worktree prune` in the main repo to clean up the metadata.
-                            let _ = std::fs::remove_file(Path::new(&path_clone).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                            thegn_core::util::git_ok(&root, &["worktree", "prune"]);
-                        } else {
-                            thegn_core::worktree::remove(&root, Path::new(&path_clone), "", false);
-                        }
-                    }
-                    if !keep_files {
-                        // git is the source of truth, but `git worktree remove` leaves the
-                        // dir behind if it ever fails (locked, detached, prune races); a
-                        // lingering dir is re-adopted on the next launch and looks like a
-                        // failed delete. Purge it — locally AND on the remote box.
-                        thegn_core::worktree::purge_worktree_files(Path::new(&path_clone));
-                    }
-                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                });
-            } else {
-                if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path)) {
-                    // Remove from git, keeping files if requested.
-                    // git worktree remove does both.
-                    if keep_files {
-                        let _ = std::fs::remove_file(Path::new(&path).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-                        thegn_core::util::git_ok(&root, &["worktree", "prune"]);
-                    } else {
-                        thegn_core::worktree::remove(&root, Path::new(&path), "", false);
-                    }
-                }
-                if !keep_files {
-                    thegn_core::worktree::purge_worktree_files(Path::new(&path));
-                }
+            let group_name = session.worktrees[gi].name.clone();
+            if let Err(error) = crate::worktree_lifecycle::spawn_worktree_destroy(
+                PathBuf::from(&path),
+                group_name,
+                session.id.clone(),
+                keep_files,
+                mode,
+                waker.clone(),
+            ) {
+                spawn_errors.push(format!("{path}: {error}"));
+                continue;
             }
         }
-        if let Some(db) = &db {
-            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
-        }
-        for tab in &session.worktrees[gi].tabs {
-            for id in tab.center.pane_ids() {
-                panes.table.remove(&id);
-            }
-        }
-        session.switch_to(gi);
-        session.close_active_group();
+        // The group and its cache rows remain available until the worker reports
+        // that pre_destroy and the requested disk operation both succeeded.
         deleted += 1;
     }
-    // Persist the trimmed layout: without this the closed groups survive in the
-    // `tab_groups` table and `Session::resurrect` brings the "deleted" worktrees
-    // back on the next launch.
-    if deleted > 0
-        && let Some(db) = &db
-    {
-        let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the DB is a cache; the session rows are resurrection state
-    }
-    let mut status = format!("Deleted {deleted} worktree(s) from disk");
+    let mut status = format!("Deleting {deleted} worktree(s) from disk…");
     if skipped > 0 {
         status.push_str(" (home checkout skipped)");
+    }
+    if already_deleting > 0 {
+        status.push_str(&format!(" ({already_deleting} already deleting)"));
+    }
+    if !spawn_errors.is_empty() {
+        status.push_str(&format!(" (failed to start: {})", spawn_errors.join("; ")));
     }
     status
 }
@@ -1960,7 +2007,7 @@ pub(crate) fn delete_groups(
 /// externally); returns its pane ids for the caller to reap. Lands the user
 /// on the workspace's home group. Pure w.r.t. disk/DB so it's unit-testable;
 /// the caller handles the registry row + persist.
-fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec<u32> {
+pub(crate) fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec<u32> {
     if gi >= session.worktrees.len() {
         return Vec::new();
     }
@@ -2121,8 +2168,7 @@ pub(crate) fn switch_workspace(
 }
 
 use crate::panel_util::{
-    editor_open_command, file_entry_at, open_editor, parse_file_line, persist_panel_state,
-    toggle_files_collapse,
+    file_entry_at, open_editor, parse_file_line, persist_panel_state, toggle_files_collapse,
 };
 
 /// The docs-fetch wiring a panel transition needs: generation + channel +
@@ -5069,54 +5115,61 @@ pub(crate) fn spawn_worktree_shell_pane(
     if let Some(dir) = dir
         && dir.is_dir()
     {
-        let wt = dir.to_string_lossy().into_owned();
-        // Failover off + a non-local env that's known-down (token unset / native
-        // exec in failure cooldown): refuse to open a host-degraded pane. The
-        // `SandboxHalt` error is caught at the call site, which raises a warning
-        // modal instead of degrading silently.
-        if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
-            return Err(halt.into());
+        let session_start_claimed = crate::worktree_lifecycle::session_start_once(cfg, dir, None)?;
+        let result = (|| {
+            let wt = dir.to_string_lossy().into_owned();
+            // Failover off + a non-local env that's known-down (token unset / native
+            // exec in failure cooldown): refuse to open a host-degraded pane. The
+            // `SandboxHalt` error is caught at the call site, which raises a warning
+            // modal instead of degrading silently.
+            if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
+                return Err(halt.into());
+            }
+            // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
+            // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
+            // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
+            // relay). A normal local PTY pane.
+            if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .unwrap_or_else(|| "thegn".to_string());
+                let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
+                return panes.spawn_argv_env(&argv, Some(dir), &[], center);
+            }
+            // Native provider exec (CLI-free): when the worktree's env is a managed
+            // provider with a native exec API and `exec != cli`, attach the pane over
+            // the provider's WSS exec instead of wrapping its vendor CLI.
+            if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
+                return panes.spawn_native_shell(n, None, "sh".into(), center);
+            }
+            // `launch_spec_center_with`, not `launch_spec`: this pane goes through
+            // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
+            // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+            // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+            // not a choice of agent — recording it would clobber the wizard- /
+            // `--bind`-owned `worktrees.agent` row on every pane open.
+            let spec = crate::agent::launch_spec_center_with(
+                cfg,
+                &wt,
+                None,
+                "shell",
+                crate::agent::LaunchExtras {
+                    suppress_agent_record: true,
+                    ..Default::default()
+                },
+            )?;
+            panes.spawn_argv_env(
+                &spec.argv,
+                spec.cwd.as_deref().or(Some(dir)),
+                &spec.env,
+                center,
+            )
+        })();
+        if result.is_err() && session_start_claimed {
+            crate::worktree_lifecycle::release_session_start(dir);
         }
-        // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
-        // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
-        // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
-        // relay). A normal local PTY pane.
-        if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
-            let exe = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
-                .unwrap_or_else(|| "thegn".to_string());
-            let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
-            return panes.spawn_argv_env(&argv, Some(dir), &[], center);
-        }
-        // Native provider exec (CLI-free): when the worktree's env is a managed
-        // provider with a native exec API and `exec != cli`, attach the pane over
-        // the provider's WSS exec instead of wrapping its vendor CLI.
-        if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
-            return panes.spawn_native_shell(n, None, "sh".into(), center);
-        }
-        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
-        // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
-        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
-        // not a choice of agent — recording it would clobber the wizard- /
-        // `--bind`-owned `worktrees.agent` row on every pane open.
-        let spec = crate::agent::launch_spec_center_with(
-            cfg,
-            &wt,
-            None,
-            "shell",
-            crate::agent::LaunchExtras {
-                suppress_agent_record: true,
-                ..Default::default()
-            },
-        )?;
-        return panes.spawn_argv_env(
-            &spec.argv,
-            spec.cwd.as_deref().or(Some(dir)),
-            &spec.env,
-            center,
-        );
+        return result;
     }
     panes.spawn(cfg, dir, center)
 }
@@ -5600,6 +5653,16 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     });
 }
 
+/// Persist a layout from a loop-side reconciliation without probing live pane
+/// state. Close/delete handlers must not perform even `/proc` reads; the
+/// cached pane hints are sufficient for this best-effort cache write.
+pub(crate) fn persist_session_layout_cached(session: &crate::session::Session) {
+    let snap = session.layout_snapshot(&session.id, now_secs());
+    crate::db_task::persist(move |db| {
+        let _ = crate::session::Session::write_layout(db, &snap);
+    });
+}
+
 /// Status line for a palette command injected into the focused pane's shell:
 /// the optimistic `ok` message when the bytes queued, or a "not reading" note
 /// when the pane's bounded stdin queue was Full (a wedged / flow-stopped child)
@@ -5703,7 +5766,8 @@ async fn ensure_app_loaded(
 // `media_ctl` sibling module (run.rs is line-ratcheted); import them by name so
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
-    MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
+    MediaGeneration, MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op,
+    spawn_media_pick, spawn_media_sources,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -5740,6 +5804,8 @@ async fn event_loop<T: Terminal>(
     pane_pids: crate::hydrate::PanePids,
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
+    mut theme_store: crate::theme_store::ThemeStore,
+    mut theme_users: Vec<thegn_core::theme_user::UserTheme>,
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: thegn_core::event_bus::EventBus,
@@ -5747,6 +5813,7 @@ async fn event_loop<T: Terminal>(
     // each provider worktree's reverse tunnel forwards to it.
     host_cache_port: Option<u16>,
 ) -> Result<()> {
+    crate::worktree_lifecycle::install_refresh(refresh_tx.clone());
     let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -5869,13 +5936,11 @@ async fn event_loop<T: Terminal>(
     // as `LoadStep`s so the splash shows a rich "setting up your environment"
     // screen while a fresh provider sandbox is built. Keyed (group name, tab).
     let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
-    // Drawer cold-spawn pipeline: a cold drawer only *requests* its launch spec
-    // (`drawer_state::request_spawn` resolves it off-loop — DB opens + sandbox
-    // resolution) and the resolved spec lands here; the drain below opens the
-    // pane. The flag cache load is the one sanctioned pre-loop fs read.
-    let (drawer_tx, mut drawer_rx) =
-        tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerSpecMsg>();
-    crate::drawer_state::install_spawner(drawer_tx, waker.clone());
+    // Drawer cold-spawn pipeline: policy resolution and PATH/filesystem work
+    // run off-loop; the registry channel is the only result boundary.
+    let (drawer_registry_tx, mut drawer_registry_rx) =
+        tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerRegistryMsg>();
+    crate::drawer_state::install_registry_spawner(drawer_registry_tx, waker.clone());
     crate::drawer_state::load_flags();
     // Host-level provisioning UI events (panel/sidebar/consent), keyed by host
     // — the per-tab splash rides `provision_tx` above (see handlers::host).
@@ -6193,6 +6258,17 @@ async fn event_loop<T: Terminal>(
     // container netns. `forward_target` is the worktree the detector watches; the
     // loop updates it as the active worktree changes.
     let mut forward_supervisor = crate::forward::ForwardSupervisor::new();
+    let mut preview_supervisor = crate::preview::PreviewSupervisor::new();
+    preview_supervisor.set_enabled(keymap.config().preview.enabled);
+    let (preview_tx, mut preview_rx) =
+        tokio_mpsc::unbounded_channel::<crate::preview_watch::ScanResult>();
+    request_preview_scan(
+        &mut preview_supervisor,
+        &session,
+        keymap.config(),
+        &preview_tx,
+        &waker,
+    );
     // Reverse host→sandbox tunnels (P0b model-proxy-by-default, P1 host services):
     // per-worktree, started in `connect_worktree_bridge`, stopped on close.
     let reverse_tunnel_supervisor = crate::revtunnel::ReverseTunnelSupervisor::new();
@@ -6310,7 +6386,8 @@ async fn event_loop<T: Terminal>(
     // The toast deadline a one-shot wake is already armed for (see the prune
     // block), so repeated frames don't spawn duplicate sleepers.
     let mut toast_wake_armed: Option<std::time::Instant> = None;
-    // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
+    // Live theme-cycle position within the merged built-in/user catalog
+    // (Ctrl+Alt+t).
     let mut theme_idx: usize = thegn_core::theme::PRESETS
         .iter()
         .position(|p| *p == keymap.config().theme.preset)
@@ -6485,6 +6562,10 @@ async fn event_loop<T: Terminal>(
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // When set, `palette` is the dedicated drawer picker. Its stable
+    // `drawer:<occupant-id>` rows are consumed before generic action lookup.
+    let mut drawer_picker = false;
+    let mut drawer_focus_pending = false;
     // The workspace-wide Search & Replace surface (THE-5), a focusable layer.
     let mut search_replace: Option<crate::search_overlay::SearchReplaceOverlay> = None;
     // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
@@ -6514,29 +6595,38 @@ async fn event_loop<T: Terminal>(
     // The in-app diff viewer's async git-diff feed.
     let (diff_view_tx, mut diff_view_rx) =
         tokio_mpsc::unbounded_channel::<crate::diff_view::DiffViewData>();
+    // Editor/IDE plans and detached-launch results return here. Planning,
+    // environment lookup, filesystem checks, cap probing, and external spawn
+    // all stay on the worker side of this channel.
+    let (ide_handoff_tx, mut ide_handoff_rx) =
+        tokio_mpsc::unbounded_channel::<crate::ide_handoff::Outcome>();
     // Media (optional [media] feature): the watcher / control ops push now-playing
     // snapshots; the picker tasks push playlist/player lists. The watcher runs
     // only while `[media] enabled`; `restart_media_watch` (re)spawns it on config
     // reload and player-override changes. `media_player_override` is the runtime
     // "Select player" choice.
     let (media_tx, mut media_rx) =
-        tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaState>>();
+        tokio_mpsc::unbounded_channel::<crate::media_watch::MediaSnapshotDelivery>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
     // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
     // drops the image and sends the pane + path to paste (or a status message).
     let (paste_img_tx, mut paste_img_rx) =
         tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
-    // The Now-Playing overlay (Alt-m) + its async up-next queue and cover-art feeds.
-    let mut media_overlay: Option<crate::media_overlay::MediaOverlay> = None;
+    // The docked Media section's async up-next queue and cover-art feeds.
     let (media_queue_tx, mut media_queue_rx) =
-        tokio_mpsc::unbounded_channel::<Vec<thegn_core::media::QueueItem>>();
+        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaQueueDelivery>();
+    let (media_sources_tx, mut media_sources_rx) =
+        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaSourcesDelivery>();
+    let mut media_caps: Option<thegn_core::media::MediaCaps> = None;
     let (media_art_tx, mut media_art_rx) =
         tokio_mpsc::unbounded_channel::<crate::media_art::ArtMosaic>();
     let mut media_player_override: Option<String> = None;
+    let media_generation = MediaGeneration::new();
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
     restart_media_watch(
         &mut media_watch,
         media_effective_cfg(&keymap.config().media, &media_player_override),
+        &media_generation,
         &media_tx,
         &waker,
     );
@@ -6577,14 +6667,10 @@ async fn event_loop<T: Terminal>(
     let mut region_last_w: Option<usize> = None;
     let mut region_last_t: Option<String> = None;
     let mut drawer: Option<u32> = None;
-    // Hidden keep-alive yazi panes per worktree (instant drawer toggles).
-    let mut drawer_pool = DrawerPool::default();
-    // The dir the VISIBLE drawer was opened for (its pool key when hidden).
+    // Geometry keeps a pane-id mirror for layout/focus integration; all
+    // ownership, pooling, persistence, and transitions live in this runtime.
     let mut drawer_home: Option<std::path::PathBuf> = None;
-    // A cold ToggleDrawer / Files-reveal wants its async spawn SHOWN when the
-    // spec lands (`(dir, take_focus)`), regardless of the persisted flag — the
-    // pooled path shows synchronously. Dir-keyed so a stale spec can't show.
-    let mut drawer_show_pending: Option<(std::path::PathBuf, bool)> = None;
+    let mut drawer_runtime = DrawerRuntime::default();
     // The live corner-overlay pin pane (e.g. an `mpv --vo=tct` video player), if
     // any. A single slot, so the corner is inherently a singleton; the pin name
     // is kept so exit/toggle can drive the supervisor.
@@ -6632,15 +6718,10 @@ async fn event_loop<T: Terminal>(
         "diff watcher targeted"
     );
 
-    sync_drawer_persistence(
-        &session,
-        &mut panes,
-        &mut drawer,
-        &mut drawer_pool,
-        &mut drawer_home,
-        keymap.config(),
-        chrome.center,
-    );
+    if let Some(dir) = active_cwd(&session) {
+        drawer_runtime.reconcile(keymap.config(), &dir, &mut panes, chrome.center);
+        sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home);
+    }
     tracing::info!(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -6648,6 +6729,11 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    let mut voice = crate::voice::VoiceController::new(current_config.voice.clone());
+    let mut theme_builder: Option<crate::theme_builder::ThemeBuilder> = None;
+    panel_ui
+        .media
+        .set_art_enabled(current_config.media.show_art);
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
     // subprocesses — is spawned only AFTER the first frame flushes (see the
@@ -6678,6 +6764,7 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
+    crate::worktree_lifecycle::install_notify_state(notify_state.clone());
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
@@ -6723,26 +6810,6 @@ async fn event_loop<T: Terminal>(
                 }
                 let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 // best-effort: watcher thread: a failed spawn just disables crash-report notifications this session
-            })
-            .ok();
-    }
-    // Audible-cue subscriber: bus-published inbox notifications (the MCP
-    // router's agent needs-you / subtask requests) reach the sound engine here,
-    // off the event loop. Typed events (test/process/worktree) keep their inline
-    // emit-sound sites, so this never double-fires.
-    {
-        let sound_rx = event_bus.sound_receiver();
-        let ns = std::sync::Arc::clone(&notify_state);
-        std::thread::Builder::new()
-            .name("notify-sound".into())
-            .spawn(move || {
-                while let Ok(n) = sound_rx.recv() {
-                    let dec =
-                        ns.decide(n.kind.as_str(), &n.source_ref, &n.message, &n.worktree_path);
-                    ns.emit_sound(&dec);
-                    ns.emit_push(&dec, n.kind.as_str(), &n.message, "", &n.worktree_path);
-                }
-                // best-effort: subscriber thread: a failed spawn just disables audible cues this session
             })
             .ok();
     }
@@ -6844,19 +6911,37 @@ async fn event_loop<T: Terminal>(
         }};
     }
 
-    // Open the full Now-Playing overlay (transport/queue/art) — shared by the
-    // Alt+m action and media-badge activation (statusbar click / Enter).
-    macro_rules! open_media_overlay {
-        () => {
-            media_overlay = Some(crate::media_ctl::open_media_overlay(
-                model.panel.media.clone(),
-                &current_config.media,
-                &media_player_override,
-                &media_queue_tx,
-                &media_art_tx,
+    // Focus the canonical docked Media section and start its optional queue/art
+    // fetches off-loop. Every open gesture uses this one path.
+    macro_rules! open_media_panel {
+        () => {{
+            if chrome.panel.is_none() {
+                want_panel = true;
+                panel_forced = cols < layout::PANEL_MIN_COLS;
+                chrome = recompute_chrome!();
+                need_relayout = true;
+            }
+            focus.zone = crate::focus::Zone::Panel;
+            open_panel_section(
+                crate::panel::Section::Media,
+                &mut panel_ui,
+                &mut hydration_gen,
+                &model_tx,
+                &session,
                 &waker,
-            ))
-        };
+                PanelDocsWiring {
+                    generation: docs_gen,
+                    tx: &docs_tx,
+                },
+            );
+            panel_ui.media.begin_request(model.panel.media.as_ref());
+            if let Some(url) = panel_ui
+                .media
+                .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
+            {
+                crate::media_art::spawn_fetch(url, 18, 8, media_art_tx.clone(), waker.clone());
+            }
+        }};
     }
 
     // Activate a resolved sidebar row target (live tab or dormant-workspace
@@ -6873,9 +6958,7 @@ async fn event_loop<T: Terminal>(
                 &mut model,
                 &mut sb,
                 &mut panes,
-                &mut drawer,
-                &mut drawer_pool,
-                &mut drawer_home,
+                &mut drawer_runtime,
                 &mut workspace_pool,
                 keymap.config(),
                 chrome.center,
@@ -6998,12 +7081,11 @@ async fn event_loop<T: Terminal>(
                     need_relayout |= crate::escape::escape_to_center(
                         &mut focus,
                         &mut panel_ui,
-                        &mut drawer,
-                        &mut drawer_pool,
-                        &mut drawer_home,
+                        &mut drawer_runtime,
                         &session,
                         &mut panes,
                         keymap.config(),
+                        chrome.center,
                     );
                     // Collapse the Wide expand too (the sidebar analogue
                     // of the panel width reset in escape_to_center); the
@@ -7050,6 +7132,58 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                SidebarOutcome::OpenMergeQueue { repo_path } => {
+                    // The token/menu carries the workspace repo path, so use
+                    // the existing workspace activation seam before opening
+                    // the queue. This keeps dormant workspaces and their
+                    // scoped queue rows on the same path as Enter/click.
+                    switch_at = Some((
+                        std::time::Instant::now(),
+                        if repo_path == session.id {
+                            crate::perf::SwitchKind::Worktree
+                        } else {
+                            crate::perf::SwitchKind::Workspace
+                        },
+                    ));
+                    let activated = activate_row!(crate::sidebar::RowTarget::Workspace {
+                        repo_path: repo_path.clone(),
+                        group: None,
+                    });
+                    if !activated {
+                        // Activation reports a user-visible status on DB/path
+                        // failure. Do not replace that diagnostic with a
+                        // queue panel for the previous workspace.
+                        dirty = true;
+                        continue;
+                    }
+                    kick_model_hydration!();
+
+                    panel_auto_revealed = None;
+                    if chrome.panel.is_none() {
+                        want_panel = true;
+                        panel_forced = cols < layout::PANEL_MIN_COLS;
+                        chrome = recompute_chrome!();
+                        need_relayout = true;
+                    }
+                    panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                    open_panel_section(
+                        crate::panel::Section::MergeQueue,
+                        &mut panel_ui,
+                        &mut hydration_gen,
+                        &model_tx,
+                        &session,
+                        &waker,
+                        PanelDocsWiring {
+                            generation: docs_gen,
+                            tx: &docs_tx,
+                        },
+                    );
+                    focus.zone = crate::focus::Zone::Panel;
+                    sidebar_dirty = true;
+                    bars_dirty = true;
+                    dirty = true;
+                    continue;
+                }
                 SidebarOutcome::DeleteGroups(targets) => {
                     crate::handlers::worktree_delete::request_group_delete(
                         crate::handlers::worktree_delete::DeleteCtx {
@@ -7057,9 +7191,7 @@ async fn event_loop<T: Terminal>(
                             panes: &mut panes,
                             model: &mut model,
                             sb: &mut sb,
-                            drawer: &mut drawer,
-                            drawer_pool: &mut drawer_pool,
-                            drawer_home: &mut drawer_home,
+                            drawer_runtime: &mut drawer_runtime,
                             active_menu: &mut active_menu,
                             pending: &mut pending_confirm_delete_worktrees,
                             need_relayout: &mut need_relayout,
@@ -7096,6 +7228,7 @@ async fn event_loop<T: Terminal>(
                             &slug,
                             &display,
                             true,
+                            &current_config,
                             Some(waker.clone()),
                         );
                         crate::handlers::workspace_remove::forget_workspace_in_model(
@@ -7105,15 +7238,14 @@ async fn event_loop<T: Terminal>(
                         refresh_tab_model(&mut model, &session, &mut sb);
                         sb.focus_active_row(&mut model);
                         need_relayout = true;
-                        sync_drawer_persistence(
-                            &session,
-                            &mut panes,
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
-                            keymap.config(),
-                            chrome.center,
-                        );
+                        if let Some(dir) = active_cwd(&session) {
+                            drawer_runtime.reconcile(
+                                keymap.config(),
+                                &dir,
+                                &mut panes,
+                                chrome.center,
+                            );
+                        }
                     }
                     dirty = true;
                     continue;
@@ -7125,9 +7257,7 @@ async fn event_loop<T: Terminal>(
                             panes: &mut panes,
                             model: &mut model,
                             sb: &mut sb,
-                            drawer: &mut drawer,
-                            drawer_pool: &mut drawer_pool,
-                            drawer_home: &mut drawer_home,
+                            drawer_runtime: &mut drawer_runtime,
                             active_menu: &mut active_menu,
                             pending: &mut pending_confirm_delete_worktrees,
                             need_relayout: &mut need_relayout,
@@ -7148,9 +7278,7 @@ async fn event_loop<T: Terminal>(
                             panes: &mut panes,
                             model: &mut model,
                             sb: &mut sb,
-                            drawer: &mut drawer,
-                            drawer_pool: &mut drawer_pool,
-                            drawer_home: &mut drawer_home,
+                            drawer_runtime: &mut drawer_runtime,
                             active_menu: &mut active_menu,
                             pending: &mut pending_confirm_delete_worktrees,
                             need_relayout: &mut need_relayout,
@@ -7212,7 +7340,9 @@ async fn event_loop<T: Terminal>(
                         menu::InputOverlay::new("new folder".to_string(), String::new()),
                         HostInputKind::NewEmptyFolder { repo_path },
                     ));
-                    model.status = "New folder: type a name (Esc cancels)".into();
+                    model.status = crate::i18n_surface::status(
+                        crate::i18n_surface::StatusText::NewFolderPrompt,
+                    );
                     dirty = true;
                     continue;
                 }
@@ -7279,6 +7409,23 @@ async fn event_loop<T: Terminal>(
                     // OSC-52 to the outer terminal's clipboard (item 27).
                     writer.submit_oob(crate::copymode::osc52(&text));
                     model.status = format!("Copied: {text}");
+                    dirty = true;
+                    continue;
+                }
+                SidebarOutcome::OpenInIde {
+                    target,
+                    workspace_slug,
+                } => {
+                    crate::ide_handoff::dispatch(
+                        target,
+                        workspace_slug,
+                        "sidebar",
+                        crate::ide_handoff::PanePlacement::Tab,
+                        &current_config,
+                        &ide_handoff_tx,
+                        &waker,
+                    );
+                    model.status = "Opening selected worktree in IDE…".into();
                     dirty = true;
                     continue;
                 }
@@ -7440,6 +7587,42 @@ async fn event_loop<T: Terminal>(
         }
     }
 
+    // Every files-drawer toggle—keyboard, palette, and statusbar click—uses
+    // the same scope-aware handler. The pane-id locals are updated only as a
+    // render/geometry mirror after the transition has completed.
+    macro_rules! toggle_files_drawer {
+        () => {{
+            if let Some(dir) = active_cwd(&session) {
+                let was_open = drawer_runtime.visible.is_some()
+                    || crate::drawer_state::desired_occupant(
+                        thegn_core::config::DrawerScope::Worktree,
+                        &dir,
+                    )
+                    .is_some();
+                crate::handlers::drawer::toggle_files(
+                    &mut drawer_runtime,
+                    keymap.config(),
+                    thegn_core::config::DrawerScope::Worktree,
+                    &dir,
+                    &mut panes,
+                    chrome.center,
+                );
+                if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
+                    need_relayout = true;
+                    full_repaint = true;
+                }
+                if drawer.is_some() {
+                    focus.zone = crate::focus::Zone::Drawer;
+                    drawer_focus_pending = false;
+                } else if !was_open {
+                    drawer_focus_pending = true;
+                } else if focus.drawer() {
+                    focus.zone = crate::focus::Zone::Center;
+                }
+            }
+        }};
+    }
+
     // Start log tailing
     if let Some(log_path) = current_config.log.dir_path().join("thegn.log").to_str() {
         let p = thegn_svc::log::provider::FileLogProvider {
@@ -7498,6 +7681,28 @@ async fn event_loop<T: Terminal>(
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
             crate::handlers::daemon_lifecycle::mark_parked_panes_detached(&workspace_pool, &panes);
             return Ok(());
+        }
+        if let Some(builder) = theme_builder.as_mut() {
+            let result = crate::handlers::theme_builder::drain(
+                builder,
+                &mut theme_store,
+                &current_config,
+                &mut theme_users,
+            );
+            if result.close {
+                theme_builder = None;
+            }
+            if result.dirty {
+                dirty = true;
+            }
+        } else {
+            if crate::handlers::theme_builder::drain_catalog(&mut theme_store, &mut theme_users) {
+                crate::chrome::set_palette(
+                    current_config
+                        .palette_with_user_themes(&current_config.theme.preset, &theme_users),
+                );
+                dirty = true;
+            }
         }
         // Writer-thread health: a transient write failure means the terminal's
         // actual content is unknown — resync with a full repaint (the async
@@ -7724,6 +7929,16 @@ async fn event_loop<T: Terminal>(
             // (and `stop share` never cleans up against a stale list) while
             // the coalesced hydration is still pending.
             model.shares = current_share_views(&share_supervisor, &session);
+            model.preview = session
+                .active_group()
+                .and_then(|group| preview_supervisor.view(&group.path));
+            request_preview_scan(
+                &mut preview_supervisor,
+                &session,
+                &current_config,
+                &preview_tx,
+                &waker,
+            );
             sync_panel_docs(&mut panel_ui, &session, docs_gen, &docs_tx, &waker);
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
@@ -8034,17 +8249,14 @@ async fn event_loop<T: Terminal>(
                 model.pool = pool;
                 dirty = true;
             }
-            // And the new worktree's hidden yazi drawer, so the first toggle
-            // never waits on yazi's startup. Off by default ([drawer].prewarm)
-            // so invisible yazi instances never accumulate unbidden. Async: the
-            // spec resolves off-loop and the drawer drain stashes the pane.
-            if keymap.config().drawer.prewarm
-                && keymap.config().drawer.pool_limit > 0
-                && drawer.is_none()
-                && keymap.config().tool_command("yazi").is_some()
-                && !drawer_pool.contains(&current_worktree)
-            {
-                crate::drawer_state::request_spawn(keymap.config(), &current_worktree);
+            // Prewarm is routed through the runtime and remains files-only.
+            if keymap.config().drawer.prewarm {
+                drawer_runtime.prewarm_files(
+                    keymap.config(),
+                    &current_worktree,
+                    &mut panes,
+                    chrome.center,
+                );
             }
         }
 
@@ -8078,81 +8290,52 @@ async fn event_loop<T: Terminal>(
                     g.kind == crate::session::GroupKind::Terminal,
                 )
             };
-            // A worktree whose dir vanished (deleted externally) must never
-            // crash the loop: prune it from the session + registry, land on
-            // home, and tell the user. The stat is cheap (`active_tab_path`
-            // precedent); the DB remote-exemption check runs only on a miss.
-            let dir_missing = !path.is_empty() && !Path::new(&path).is_dir();
-            let remote = dir_missing
-                && thegn_core::db::Db::open()
-                    .and_then(|db| db.worktrees())
-                    .map(|rows| {
-                        rows.iter()
-                            .any(|w| w.worktree == path && !w.location.is_empty())
-                    })
-                    .unwrap_or(false);
-            if dir_missing && !remote && session.worktrees.len() > 1 {
-                let gi = session.active;
-                let ids = prune_vanished_group(&mut session, gi);
-                for id in ids {
-                    panes.table.remove(&id);
-                }
-                if let Ok(db) = thegn_core::db::Db::open() {
-                    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                    let _ = session.persist(&db, &session.id, now_secs());
-                }
-                model.status = format!("Worktree dir gone: {path} — removed from session");
-                refresh_tab_model(&mut model, &session, &mut sb);
-                need_relayout = true;
-                dirty = true;
-                // The landing group materializes on the next loop turn.
+            // Two-phase materialize: request launch specs off-thread (the
+            // sandbox ensure inside `launch_spec` can block on podman for
+            // seconds to minutes), spawn when they land. Extracted to
+            // `handlers::materialize` (which also streams the core's
+            // sandbox bring-up phases into the splash). Out-of-band vanished
+            // worktrees are reconciled by the worker-backed refresh path below.
+            let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
+            let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
+            // Seed the splash for THIS worktree's effective backend, not the
+            // global default: `path`/`name` are the active group, so
+            // `model.active_sandbox_backend` (hydrated for it) is the saved
+            // per-worktree `sandbox_backend` — no DB read on the loop. A
+            // session "run on host" pin overrides both.
+            let sandbox_override = if crate::agent::force_host_requested(&path) {
+                Some("none")
+            } else if !model.active_sandbox_backend.is_empty() {
+                Some(model.active_sandbox_backend.as_str())
             } else {
-                // Two-phase materialize: request launch specs off-thread (the
-                // sandbox ensure inside `launch_spec` can block on podman for
-                // seconds to minutes), spawn when they land. Extracted to
-                // `handlers::materialize` (which also streams the core's
-                // sandbox bring-up phases into the splash).
-                let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
-                let quiet = panes.tab_has_live_pane(&session.worktrees[session.active].tabs[ti]);
-                // Seed the splash for THIS worktree's effective backend, not the
-                // global default: `path`/`name` are the active group, so
-                // `model.active_sandbox_backend` (hydrated for it) is the saved
-                // per-worktree `sandbox_backend` — no DB read on the loop. A
-                // session "run on host" pin overrides both.
-                let sandbox_override = if crate::agent::force_host_requested(&path) {
-                    Some("none")
-                } else if !model.active_sandbox_backend.is_empty() {
-                    Some(model.active_sandbox_backend.as_str())
-                } else {
-                    None
-                };
-                crate::handlers::materialize::maybe_materialize(
-                    &mut crate::handlers::materialize::MaterializeCtx {
-                        materialize_inflight: &mut materialize_inflight,
-                        materialize_failed: &materialize_failed,
-                        creating_tabs: &creating_tabs,
-                        loading_retired: &mut loading_retired,
-                        loading_remote: &mut loading_remote,
-                        loading_state: &mut loading_state,
-                        dirty: &mut dirty,
-                    },
-                    keymap.config(),
-                    &crate::handlers::materialize::MaterializeTx {
-                        spec_tx: spec_tx.clone(),
-                        provision_tx: provision_tx.clone(),
-                        waker: waker.clone(),
-                        host_ui: host_ui.clone(),
-                        rt: tokio::runtime::Handle::current(),
-                    },
-                    missing,
-                    &name,
-                    &path,
-                    ti,
-                    is_terminal,
-                    quiet,
-                    sandbox_override,
-                );
-            }
+                None
+            };
+            crate::handlers::materialize::maybe_materialize(
+                &mut crate::handlers::materialize::MaterializeCtx {
+                    materialize_inflight: &mut materialize_inflight,
+                    materialize_failed: &materialize_failed,
+                    creating_tabs: &creating_tabs,
+                    loading_retired: &mut loading_retired,
+                    loading_remote: &mut loading_remote,
+                    loading_state: &mut loading_state,
+                    dirty: &mut dirty,
+                },
+                keymap.config(),
+                &crate::handlers::materialize::MaterializeTx {
+                    spec_tx: spec_tx.clone(),
+                    provision_tx: provision_tx.clone(),
+                    waker: waker.clone(),
+                    host_ui: host_ui.clone(),
+                    rt: tokio::runtime::Handle::current(),
+                },
+                missing,
+                &name,
+                &path,
+                ti,
+                is_terminal,
+                quiet,
+                sandbox_override,
+            );
         }
         // The accordion's width (Normal → Half → Full) drives the chrome
         // geometry. Keep this before the relayout gate so the resized center
@@ -8294,8 +8477,7 @@ async fn event_loop<T: Terminal>(
                 dirty: &mut dirty,
                 need_relayout: &mut need_relayout,
                 drawer: &mut drawer,
-                drawer_pool: &mut drawer_pool,
-                drawer_home: &mut drawer_home,
+                drawer_runtime: &mut drawer_runtime,
                 corner: &mut corner,
                 corner_name: &mut corner_name,
                 corner_kitty,
@@ -8312,7 +8494,9 @@ async fn event_loop<T: Terminal>(
                 shutdown: &shutdown,
                 event_bus: &event_bus,
                 notify_state: &notify_state,
+                preview: &mut preview_supervisor,
                 writer: &writer,
+                waker: &waker,
             };
             crate::pty_drain::drain(
                 &mut dctx,
@@ -8333,6 +8517,18 @@ async fn event_loop<T: Terminal>(
         }
         if drain_summary.preempted {
             loop_perf.input_preempt();
+        }
+        let next_preview = session
+            .active_group()
+            .and_then(|group| preview_supervisor.view(&group.path));
+        if model.preview != next_preview {
+            model.preview = next_preview;
+            dirty = true;
+        }
+        if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
+            need_relayout = true;
+            full_repaint = true;
+            dirty = true;
         }
         // The onboarding wizard's login/agent tab closed: resume + re-probe.
         dirty |= crate::handlers::onboarding::on_pane_exit(
@@ -8383,6 +8579,21 @@ async fn event_loop<T: Terminal>(
         // dropped — a fresh hydration is always in flight for the current one.
         // Discovery results: seed newly-found tests as Unknown (merge, not
         // replace). Stale generations / other worktrees are dropped.
+        while let Ok(outcome) = ide_handoff_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if crate::ide_handoff::apply(
+                outcome,
+                &mut session,
+                &mut panes,
+                &mut focus,
+                &mut model,
+                &mut sb,
+                chrome.center,
+            ) {
+                need_relayout = true;
+            }
+            dirty = true;
+        }
         while let Ok(d) = test_discovery_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
             if d.generation == test_generation && d.worktree == loaded_tests_worktree {
@@ -8445,9 +8656,7 @@ async fn event_loop<T: Terminal>(
                 &mut focus,
                 &mut model,
                 &mut sb,
-                &mut drawer,
-                &mut drawer_pool,
-                &mut drawer_home,
+                &mut drawer_runtime,
                 &current_config,
                 chrome.center,
             ) {
@@ -8581,7 +8790,7 @@ async fn event_loop<T: Terminal>(
                     );
                     // Route the failure: rules / DND / modes decide the desktop
                     // toast + sound; the inbox record is gated by a drop rule.
-                    let dec = notify_state.decide("test_failed", &wt, &msg, &wt);
+                    let dec = crate::notify::route(&notify_state, "test_failed", &wt, &msg, &wt);
                     let event = thegn_core::event_bus::Event::TestsFailed {
                         worktree: wt.clone(),
                         count: failed,
@@ -8593,14 +8802,22 @@ async fn event_loop<T: Terminal>(
                     } else {
                         event_bus.publish(&event);
                     }
-                    notify_state.emit_sound(&dec);
-                    notify_state.emit_push(&dec, "test_failed", &msg, "", &wt);
                     if dec.record {
+                        let routed = dec.clone();
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = thegn_core::db::Db::open() else {
                                 return;
                             };
-                            let _ = db.put_notification("test_failed", &wt, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                            let _ = crate::automation_events::insert_routed(
+                                &db,
+                                "test_failed",
+                                &wt,
+                                &msg,
+                                &wt,
+                                Default::default(),
+                                &routed,
+                                false,
+                            ); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         });
                     }
                 }
@@ -8975,69 +9192,31 @@ async fn event_loop<T: Terminal>(
             .map(|(name, _)| name.clone())
             .collect();
 
-        // Resolved drawer launch specs (the async half of a cold drawer spawn).
-        // Policy by CURRENT state, not the state at request time: show it when
-        // the active worktree still wants its drawer; otherwise keep the work —
-        // stash it as a pre-warmed pool entry for the next visit; else drop.
-        while let Ok((ddir, res)) = drawer_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Spec);
-            crate::drawer_state::request_done(&ddir);
-            let launch = match res {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::debug!(target: "thegn::drawer", dir = %ddir.display(), %e,
-                        "drawer spec resolution failed");
-                    // Only clear the user's pending show/focus intent if THIS
-                    // failure is for the dir they toggled (audit run.rs:8577):
-                    // an unrelated background prewarm's Err must not cancel a
-                    // pending show for a different worktree. Mirrors the Ok
-                    // path's dir-key filter below.
-                    if drawer_show_pending
-                        .as_ref()
-                        .is_some_and(|(d, _)| d == &ddir)
-                    {
-                        drawer_show_pending = None;
-                    }
-                    continue;
+        // Scope-aware drawer registry results. The handler drops stale results
+        // by `(scope-key, occupant-id)` and opens/restores the pane through the
+        // shared runtime transition path.
+        if let Some(dir) = active_cwd(&session) {
+            crate::handlers::drawer::drain(
+                &mut drawer_registry_rx,
+                crate::handlers::drawer::Context {
+                    runtime: &mut drawer_runtime,
+                    cfg: keymap.config(),
+                    active_dir: &dir,
+                    panes: &mut panes,
+                    rect: chrome.center,
+                },
+            );
+            if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
+                need_relayout = true;
+                full_repaint = true;
+                dirty = true;
+                if drawer.is_none() && focus.drawer() {
+                    focus.zone = crate::focus::Zone::Center;
                 }
-            };
-            let cfg = keymap.config();
-            let pending = drawer_show_pending
-                .as_ref()
-                .filter(|(d, _)| d == &ddir)
-                .map(|&(_, f)| f);
-            let want_show = drawer.is_none()
-                && (pending.is_some()
-                    || (active_cwd(&session).as_deref() == Some(ddir.as_path())
-                        && crate::drawer_state::flag(&ddir)));
-            if want_show {
-                if let Some(id) = crate::drawer_state::open_resolved(
-                    &mut panes,
-                    launch,
-                    cfg,
-                    &ddir,
-                    chrome.center,
-                ) {
-                    drawer = Some(id);
-                    drawer_home = Some(ddir.clone());
-                    if pending == Some(true) {
-                        focus.zone = crate::focus::Zone::Drawer;
-                    }
-                    need_relayout = true;
-                    dirty = true;
-                }
-                drawer_show_pending = None;
-            } else if cfg.drawer.pool_limit > 0 && !drawer_pool.contains(&ddir) {
-                let limit = cfg.drawer.pool_limit;
-                if let Some(id) = crate::drawer_state::open_resolved(
-                    &mut panes,
-                    launch,
-                    cfg,
-                    &ddir,
-                    chrome.center,
-                ) {
-                    drawer_pool.stash(&ddir, id, limit, &mut panes);
-                }
+            }
+            if drawer_focus_pending && drawer.is_some() {
+                focus.zone = crate::focus::Zone::Drawer;
+                drawer_focus_pending = false;
             }
         }
 
@@ -9131,6 +9310,9 @@ async fn event_loop<T: Terminal>(
         // ALL applied (a fan-out expects one pane per row), unlike the two
         // last-wins intents above.
         let mut pending_adopts: Vec<thegn_core::store::IntentRow> = Vec::new();
+        // `editor.open` is drain-all: separate control callers may intentionally
+        // queue several files, unlike focus/preset's last-wins semantics.
+        let mut pending_editor_opens: Vec<thegn_core::store::IntentRow> = Vec::new();
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
             // In-flight hydration landed — clear the gate (before the stale-check so
@@ -9141,19 +9323,26 @@ async fn event_loop<T: Terminal>(
                 // two carry the same gen) is free again either way.
                 switch_hydration_gen = None;
             }
+            // Intent rows are claim-and-delete carriers, not part of the model
+            // snapshot. A hydration can claim them and then become stale when
+            // the user switches worktrees before it lands; drain them before
+            // rejecting that snapshot or the acknowledged request is lost.
+            drain_hydration_intents(
+                &mut next_model,
+                &mut pending_focus,
+                &mut pending_preset,
+                &mut pending_adopts,
+                &mut pending_editor_opens,
+            );
             if generation != hydration_gen {
                 continue;
             }
-            // `thegn open` intents ride the hydration result (claimed from
-            // the DB mailbox off-loop); take them out before the model swap —
-            // last one wins, applied after the drain below.
-            if let Some(row) = next_model.intents.drain(..).next_back() {
-                pending_focus = Some(row);
-            }
-            if let Some(row) = next_model.preset_intents.drain(..).next_back() {
-                pending_preset = Some(row);
-            }
-            pending_adopts.append(&mut next_model.adopt_intents);
+            // A review snapshot may be fetched after the Changes modal opens.
+            // Deliver the accepted model's compatible snapshot directly to
+            // that view; its worktree diff must remain intact while only the
+            // review source is updated.
+            let review_for_diff_view = next_model.panel.review_snapshot.clone();
+            let review_status_for_diff_view = next_model.panel.review_snapshot_status.clone();
             // Now-playing is loop-owned (the media watcher pushes it); hydration
             // never carries it. Seed it across the swap BEFORE the equality
             // checks below, or every hydration wipes the badge (it flashes back
@@ -9349,6 +9538,14 @@ async fn event_loop<T: Terminal>(
             model.status = prev_status;
             model.masthead_sel = prev_masthead_sel;
             model.statusbar_sel = prev_statusbar_sel;
+            if let Some(view) = diff_view.as_mut() {
+                let review = review_for_diff_view.filter(|review| {
+                    crate::actions::review_snapshot_matches_panel(&model.panel, review)
+                });
+                if view.set_review(review, review_status_for_diff_view) {
+                    dirty = true;
+                }
+            }
             // Seed the stale-while-revalidate cache with this worktree's fresh
             // slice (pre LSP-merge: LSP diags live in their own per-root store
             // and are re-merged on every paint) so a later switch back paints
@@ -9377,6 +9574,9 @@ async fn event_loop<T: Terminal>(
             model.shares = current_share_views(&share_supervisor, &session);
             // Forwards likewise live on their supervisor — re-apply per worktree.
             model.forwards = current_forward_views(&forward_supervisor, &session);
+            model.preview = session
+                .active_group()
+                .and_then(|group| preview_supervisor.view(&group.path));
             // Plugin statusbar segments are loop-owned (handlers::plugins), not
             // hydrated — re-stamp them so a model swap doesn't blank the bar.
             model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
@@ -9538,6 +9738,35 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Claimed control handoffs carry targets, never commands. Revalidate
+        // each one against this compositor's fresh known-worktree projection,
+        // then resolve and launch through the same worker as every UI surface.
+        if !pending_editor_opens.is_empty() {
+            let known = crate::ide_handoff::known_worktrees(&model, &session);
+            for row in std::mem::take(&mut pending_editor_opens) {
+                match crate::ide_handoff::target_from_intent(
+                    &row,
+                    known.clone(),
+                    thegn_core::util::now(),
+                ) {
+                    Ok((target, workspace_slug, source)) => crate::ide_handoff::dispatch(
+                        target,
+                        workspace_slug,
+                        format!("editor.open ({source})"),
+                        crate::ide_handoff::PanePlacement::Tab,
+                        &current_config,
+                        &ide_handoff_tx,
+                        &waker,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(target: "thegn::editor", "{error}");
+                        model.status = error;
+                    }
+                }
+            }
+            dirty = true;
+        }
+
         // `sessions.open --adopt`: graft each daemon session nobody is showing
         // into a real pane in its worktree's tab. Applied AFTER the focus/preset
         // intents so a `thegn open` + `--adopt` pair lands in the workspace the
@@ -9683,6 +9912,21 @@ async fn event_loop<T: Terminal>(
                         ev.metric.key(),
                         &msg,
                         "",
+                    );
+                }
+                if ev.level != thegn_core::resource_alert::AlertLevel::Ok
+                    && matches!(
+                        ev.metric,
+                        thegn_core::resource_alert::AlertMetric::DiskFree
+                            | thegn_core::resource_alert::AlertMetric::DiskEta
+                    )
+                {
+                    crate::automation_events::submit_fact(
+                        thegn_core::automation::AutomationEventKind::DiskLow,
+                        format!("disk:{}", ev.metric.key()),
+                        None,
+                        Some(msg),
+                        Default::default(),
                     );
                 }
             }
@@ -10126,22 +10370,35 @@ async fn event_loop<T: Terminal>(
                             let msg = format!("worktree {} ready", branch);
                             // Route: rules / DND / modes decide the (low-urgency)
                             // desktop toast + sound; a drop rule gates the record.
-                            let dec = notify_state.decide("worktree_created", &path, &msg, &path);
+                            let dec = crate::notify::route(
+                                &notify_state,
+                                "worktree_created",
+                                &path,
+                                &msg,
+                                &path,
+                            );
                             if dec.desktop {
                                 event_bus.publish_with_notification(&event);
                             } else {
                                 event_bus.publish(&event);
                             }
-                            notify_state.emit_sound(&dec);
-                            notify_state.emit_push(&dec, "worktree_created", &msg, "", &path);
                             if dec.record {
+                                let routed = dec.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {
                                         return;
                                     };
                                     // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                                    let _ =
-                                        db.put_notification("worktree_created", &path, &msg, &path);
+                                    let _ = crate::automation_events::insert_routed(
+                                        &db,
+                                        "worktree_created",
+                                        &path,
+                                        &msg,
+                                        &path,
+                                        Default::default(),
+                                        &routed,
+                                        false,
+                                    );
                                 });
                             }
                         } else {
@@ -10337,23 +10594,52 @@ async fn event_loop<T: Terminal>(
         // the feature is enabled, so toggling `[media] enabled = false` clears the
         // badge/section without a restart. Repaint discipline (why position-only
         // ticks don't storm the chrome) is documented on `drain_snapshots`.
-        let media_position_visible = (chrome.panel.is_some()
-            && panel_ui.open == crate::panel::Section::Media)
-            || media_overlay.is_some();
+        let media_position_visible =
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
         let (media_full, media_bars) = crate::media_watch::drain_snapshots(
             &mut media_rx,
             &mut loop_perf,
             current_config.media.enabled,
-            current_config.media.show_art,
+            media_generation.current(),
             &mut model.panel.media,
-            &mut media_overlay,
-            &media_art_tx,
-            &waker,
+            &mut media_caps,
             media_position_visible,
             &mut last_media_full,
         );
+        panel_ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            media_caps,
+            media_generation.current(),
+        );
+        if media_position_visible {
+            let cfg = media_effective_cfg(&current_config.media, &media_player_override);
+            if let Some(request) = panel_ui
+                .media
+                .take_queue_request(model.panel.media.as_ref())
+            {
+                crate::media_ctl::spawn_media_queue(
+                    cfg.clone(),
+                    request,
+                    media_queue_tx.clone(),
+                    waker.clone(),
+                );
+            }
+            if let Some(request) = panel_ui
+                .media
+                .take_sources_request(model.panel.media.as_ref())
+            {
+                spawn_media_sources(cfg, request, media_sources_tx.clone(), waker.clone());
+            }
+        }
+        if let Some(url) = panel_ui
+            .media
+            .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
+        {
+            crate::media_art::spawn_fetch(url, 18, 8, media_art_tx.clone(), waker.clone());
+        }
         dirty |= media_full;
         bars_dirty |= media_bars;
+        dirty |= crate::handlers::voice::drain(&mut voice, &mut panes, focused, &mut model, &waker);
         // Media picker results: open a secondary palette of playlists / players.
         while let Ok(pick) = media_pick_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
@@ -10384,20 +10670,27 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
-        // Now-Playing overlay feeds: up-next queue + decoded cover art.
-        while let Ok(queue) = media_queue_rx.try_recv() {
+        // Docked Media section feeds: up-next queue + decoded cover art.
+        while let Ok(delivery) = media_queue_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            if let Some(ov) = &mut media_overlay {
-                ov.set_queue(queue);
-                dirty = true;
-            }
+            panel_ui
+                .media
+                .set_queue(delivery.request, model.panel.media.as_ref(), delivery.queue);
+            dirty = true;
+        }
+        while let Ok(delivery) = media_sources_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            panel_ui.media.set_sources(
+                delivery.request,
+                model.panel.media.as_ref(),
+                delivery.sources,
+            );
+            dirty = true;
         }
         while let Ok(art) = media_art_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            if let Some(ov) = &mut media_overlay {
-                ov.set_art(art);
-                dirty = true;
-            }
+            panel_ui.media.set_art(model.panel.media.as_ref(), art);
+            dirty = true;
         }
 
         // Clipboard image-paste results (THE-24): the worker resolved the drop
@@ -10453,7 +10746,13 @@ async fn event_loop<T: Terminal>(
                     model.status = keybind_conflict_summary(&new_cfg)
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
-                    crate::chrome::set_palette(new_cfg.palette());
+                    crate::chrome::set_palette(
+                        new_cfg.palette_with_user_themes(&new_cfg.theme.preset, &theme_users),
+                    );
+                    if let Some(builder) = theme_builder.as_mut() {
+                        builder.config_reloaded(&new_cfg);
+                        crate::chrome::set_palette(builder.candidate().clone());
+                    }
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
                     crate::caps::install_themed(&new_cfg, resolve_termcaps(&new_cfg));
                     wire_renderer.set_depth(crate::caps::color_depth());
@@ -10501,7 +10800,28 @@ async fn event_loop<T: Terminal>(
                     help_registry =
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
                     panel_ui.help.reg = Some(help_registry.clone());
+                    crate::handlers::voice::reconfigure(
+                        &mut voice,
+                        new_cfg.voice.clone(),
+                        &mut model,
+                        &waker,
+                    );
                     current_config = new_cfg;
+                    crate::automation_runtime::install(&current_config);
+                    preview_supervisor.set_enabled(current_config.preview.enabled);
+                    request_preview_scan(
+                        &mut preview_supervisor,
+                        &session,
+                        &current_config,
+                        &preview_tx,
+                        &waker,
+                    );
+                    model.preview = session
+                        .active_group()
+                        .and_then(|group| preview_supervisor.view(&group.path));
+                    panel_ui
+                        .media
+                        .set_art_enabled(current_config.media.show_art);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded
@@ -10515,6 +10835,7 @@ async fn event_loop<T: Terminal>(
                     restart_media_watch(
                         &mut media_watch,
                         media_effective_cfg(&current_config.media, &media_player_override),
+                        &media_generation,
                         &media_tx,
                         &waker,
                     );
@@ -10580,10 +10901,9 @@ async fn event_loop<T: Terminal>(
                 want_model_refresh: &mut want_model_refresh,
                 dirty: &mut dirty,
                 loop_perf: &mut loop_perf,
-                // Reap a tab whose worktree an `on_landed = remove/detach` land deleted.
-                session: &mut session,
-                panes: &mut panes,
-                need_relayout: &mut need_relayout,
+                // Probe a tab whose worktree an `on_landed = remove/detach`
+                // land deleted; the typed result returns through refresh_rx.
+                session: &session,
                 waker: &waker,
             };
             crate::handlers::merge_queue::drain_fold_results(&mut fold_rx, &mut mq_ctx);
@@ -10616,6 +10936,12 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         crate::handlers::plugins::flush_alerts(&mut plugins_state);
+        dirty |= crate::worktree_lifecycle::apply_completions(
+            &mut session,
+            &mut panes,
+            &mut model,
+            &mut sb,
+        );
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             // While offline, skip the network-backed refresh backstops (the
@@ -10708,6 +11034,22 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
+                RefreshKind::VanishedTabs(result) => {
+                    if crate::merge_lifecycle::apply_vanished_tabs(
+                        &mut session,
+                        &mut panes,
+                        &result.paths,
+                    ) {
+                        model.status = format!(
+                            "Worktree dir gone: {} — removed from session",
+                            result.paths.join(", ")
+                        );
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                        dirty = true;
+                        want_model_refresh = true;
+                    }
+                }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
                 RefreshKind::Onboarding(r) => {
                     dirty |=
@@ -10719,6 +11061,7 @@ async fn event_loop<T: Terminal>(
                     current_config.usage.clone(),
                     false,
                     current_config.model_proxy.enabled,
+                    current_config.model_proxy.budget.clone(),
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -10947,12 +11290,8 @@ async fn event_loop<T: Terminal>(
             // speculative-create window), and reaping on a missing dir would kill
             // the pane mid-create. Creations are short-lived, so a ghost simply
             // waits for the next tick after they settle.
-            if creating_tabs.is_empty()
-                && crate::merge_lifecycle::reconcile_removed_tabs(&mut session, &mut panes, &waker)
-            {
-                refresh_tab_model(&mut model, &session, &mut sb);
-                need_relayout = true;
-                dirty = true;
+            if creating_tabs.is_empty() {
+                crate::merge_lifecycle::spawn_reconcile_removed_tabs(&session, Some(waker.clone()));
             }
             crate::agent_output::publish(
                 &session,
@@ -11001,6 +11340,7 @@ async fn event_loop<T: Terminal>(
                 &mut pr_view_gen,
                 &pr_view_tx,
                 &waker,
+                &refresh_tx,
             );
         }
         if want_calendar_sync {
@@ -11225,6 +11565,11 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        let drawer_bar = drawer_bar_state(&current_config, &drawer_runtime, drawer);
+        if model.drawer_bar != drawer_bar {
+            model.drawer_bar = drawer_bar;
+            bars_dirty = true;
+        }
         // Keep the per-bar selection valid as items appear/disappear between
         // frames (a badge turning on/off, a widget gaining data): clamp to the
         // current item count so the cursor never dangles past the last item.
@@ -11236,6 +11581,8 @@ async fn event_loop<T: Terminal>(
         model.zoomed = zoom.is_some();
         model.maximized = maximized;
         model.sync_panes = sync_panes;
+        model.mode_chip =
+            crate::voice::mode_chip(mode, current_config.ui.full_mode_chip, voice.is_recording());
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
         model.sidebar_hints =
             crate::sidebar_keytable::footer_hints(keymap.config(), model.ctrl_digits_reportable);
@@ -11438,6 +11785,7 @@ async fn event_loop<T: Terminal>(
                 // resurrection rows); they re-detect if we switch back.
                 if let Some(prev) = &last_forward_target {
                     for port in forward_supervisor.stop_all_on(prev) {
+                        let _ = preview_supervisor.provider_down(prev, port);
                         if let Ok(db) = thegn_core::db::Db::open() {
                             let _ = db.delete_forward(prev, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
@@ -11445,6 +11793,9 @@ async fn event_loop<T: Terminal>(
                     // Tear down the reverse model-proxy/host tunnels too.
                     reverse_tunnel_supervisor.stop_worktree(prev);
                     model.forwards = current_forward_views(&forward_supervisor, &session);
+                    model.preview = session
+                        .active_group()
+                        .and_then(|group| preview_supervisor.view(&group.path));
                     dirty = true;
                 }
                 last_forward_target = target.clone();
@@ -11476,6 +11827,11 @@ async fn event_loop<T: Terminal>(
                             &runtime,
                         ) {
                             Ok(started) => {
+                                let preview_changed = preview_supervisor.provider_up(
+                                    &worktree,
+                                    container_port,
+                                    started.url.clone(),
+                                );
                                 if let Ok(db) = thegn_core::db::Db::open() {
                                     let _ = db.upsert_forward(
                                         // best-effort: cache write: the forward state row feeds the UI/`share list`; the forward itself is already up
@@ -11498,6 +11854,11 @@ async fn event_loop<T: Terminal>(
                                 }
                                 model.forwards =
                                     current_forward_views(&forward_supervisor, &session);
+                                if preview_changed {
+                                    model.preview = session
+                                        .active_group()
+                                        .and_then(|group| preview_supervisor.view(&group.path));
+                                }
                                 dirty = true;
                             }
                             Err(e) => {
@@ -11512,13 +11873,34 @@ async fn event_loop<T: Terminal>(
                     container_port,
                 } => {
                     if forward_supervisor.stop(&worktree, container_port) {
+                        let preview_changed =
+                            preview_supervisor.provider_down(&worktree, container_port);
                         if let Ok(db) = thegn_core::db::Db::open() {
                             let _ = db.delete_forward(&worktree, container_port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
                         model.forwards = current_forward_views(&forward_supervisor, &session);
+                        if preview_changed {
+                            model.preview = session
+                                .active_group()
+                                .and_then(|group| preview_supervisor.view(&group.path));
+                        }
                         dirty = true;
                     }
                 }
+            }
+        }
+
+        // One-shot package/config discovery results. Stale generations (rapid
+        // switch/reload) are rejected by the supervisor.
+        while let Ok(scan) = preview_rx.try_recv() {
+            let worktree = scan.worktree.clone();
+            if preview_supervisor.apply_scan(scan)
+                && session
+                    .active_group()
+                    .is_some_and(|group| group.path == worktree)
+            {
+                model.preview = preview_supervisor.view(&worktree);
+                dirty = true;
             }
         }
 
@@ -11721,6 +12103,7 @@ async fn event_loop<T: Terminal>(
                 && !app_tile_active
                 && mouse_sel.is_some()
                 && palette.is_none()
+                && theme_builder.is_none()
                 && monitor.is_none()
                 && board.is_none()
                 && active_menu.is_none()
@@ -11747,6 +12130,7 @@ async fn event_loop<T: Terminal>(
                 && drawer.is_none()
                 && mouse_sel.is_none()
                 && palette.is_none()
+                && theme_builder.is_none()
                 && monitor.is_none()
                 && board.is_none()
                 && active_menu.is_none()
@@ -12259,9 +12643,8 @@ async fn event_loop<T: Terminal>(
             if let Some(v) = &diff_view {
                 v.render(&mut scratch, screen);
             }
-            // The Now-Playing media control overlay (centered modal).
-            if let Some(ov) = &media_overlay {
-                ov.render(&mut scratch, screen);
+            if let Some(builder) = &theme_builder {
+                crate::handlers::theme_builder::render(builder, &mut scratch, screen);
             }
             if let Some(h) = help_overlay.as_mut() {
                 h.render(&mut scratch, screen);
@@ -12619,13 +13002,9 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
                 let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 if keymap.config().drawer.prewarm
-                    && keymap.config().drawer.pool_limit > 0
-                    && drawer.is_none()
-                    && keymap.config().tool_command("yazi").is_some()
                     && let Some(dir) = active_cwd(&session)
-                    && !drawer_pool.contains(&dir)
                 {
-                    crate::drawer_state::request_spawn(keymap.config(), &dir);
+                    drawer_runtime.prewarm_files(keymap.config(), &dir, &mut panes, chrome.center);
                 }
             }
         }
@@ -12656,6 +13035,23 @@ async fn event_loop<T: Terminal>(
                 let mx = (m.x as usize).saturating_sub(1);
                 let my = (m.y as usize).saturating_sub(1);
                 let left = m.mouse_buttons.contains(MouseButtons::LEFT);
+                if let Some(builder) = theme_builder.as_mut() {
+                    let keep = crate::handlers::theme_builder::mouse(
+                        builder,
+                        &theme_store,
+                        &m,
+                        mx,
+                        my,
+                        Rect::full(cols, rows),
+                        current_config.ui.dismiss_overlay_on_click_outside,
+                        &mut mouse_left_down,
+                    );
+                    if !keep {
+                        theme_builder = None;
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Front-matter: modal detail-popup capture (outside-click
                 // dismiss), hit-test, and forward into a mouse-reporting pane
                 // app. Consumes the event or hands back the resolved pane.
@@ -13341,6 +13737,17 @@ async fn event_loop<T: Terminal>(
                             mouse_left_down = left;
                             continue;
                         }
+                        if let Some((crate::chrome::BarItemId::Widget(id), _)) = &left_hit
+                            && id == crate::statusbar_left::DRAWER_ID
+                        {
+                            // The indicator is intentionally not a focus zone:
+                            // clicking it invokes the same files-drawer toggle
+                            // as the keyboard action.
+                            toggle_files_drawer!();
+                            dirty = true;
+                            mouse_left_down = left;
+                            continue;
+                        }
                         // Click a statusbar item/badge to focus it + open its
                         // detail (notifications list, agent detail, …).
                         let hit = crate::chrome::statusbar_item_spans(&model, chrome.statusbar)
@@ -13352,8 +13759,9 @@ async fn event_loop<T: Terminal>(
                             model.statusbar_sel = idx;
                             if id == BarItemId::Badge(BarBadge::Media)
                                 && current_config.media.enabled
+                                && current_config.media.overlay_on_badge_click
                             {
-                                open_media_overlay!();
+                                open_media_panel!();
                             } else if id.has_detail() {
                                 crate::handlers::status::probe_sessions(
                                     &id,
@@ -13386,11 +13794,11 @@ async fn event_loop<T: Terminal>(
                             focus.zone = crate::focus::Zone::Center;
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
-                            sync_drawer_persistence(
+                            reconcile_drawer_runtime(
                                 &session,
                                 &mut panes,
                                 &mut drawer,
-                                &mut drawer_pool,
+                                &mut drawer_runtime,
                                 &mut drawer_home,
                                 keymap.config(),
                                 chrome.center,
@@ -13547,6 +13955,22 @@ async fn event_loop<T: Terminal>(
                                 );
                                 need_relayout = true;
                             }
+                            Some(crate::panel::PanelHit::MediaAction(action)) => {
+                                if current_config.media.enabled {
+                                    crate::media_ctl::spawn_media_action(
+                                        media_effective_cfg(
+                                            &current_config.media,
+                                            &media_player_override,
+                                        ),
+                                        action,
+                                        &media_generation,
+                                        media_tx.clone(),
+                                        waker.clone(),
+                                    );
+                                } else {
+                                    model.status = "Media is off ([media] enabled = false)".into();
+                                }
+                            }
                             Some(crate::panel::PanelHit::Row(sec, i)) => {
                                 // A click can land on a NON-open section's rows
                                 // (the Full git frame renders all four lists at
@@ -13573,7 +13997,37 @@ async fn event_loop<T: Terminal>(
                                 // without this, click + `d` deleted a DIFFERENT
                                 // branch/commit/stash than the highlighted one.
                                 panel_ui.sync_section_cursors();
-                                if sec == crate::panel::Section::Changes {
+                                if sec == crate::panel::Section::Media {
+                                    if let Some(item) = panel_ui.media.queue_at(i) {
+                                        if current_config.media.enabled {
+                                            spawn_media_op(
+                                                media_effective_cfg(
+                                                    &current_config.media,
+                                                    &media_player_override,
+                                                ),
+                                                MediaOp::PlayQueueItem(item.id.clone()),
+                                                &media_generation,
+                                                media_tx.clone(),
+                                                waker.clone(),
+                                            );
+                                        } else {
+                                            model.status =
+                                                "Media is off ([media] enabled = false)".into();
+                                        }
+                                    } else if let Some(source) = panel_ui.media.source_at(i) {
+                                        media_player_override = Some(source.to_string());
+                                        restart_media_watch(
+                                            &mut media_watch,
+                                            media_effective_cfg(
+                                                &current_config.media,
+                                                &media_player_override,
+                                            ),
+                                            &media_generation,
+                                            &media_tx,
+                                            &waker,
+                                        );
+                                    }
+                                } else if sec == crate::panel::Section::Changes {
                                     let deep = panel_ui.width != crate::layout::PanelWidth::Normal;
                                     let visible =
                                         crate::panel::visible_change_files(&model.panel, deep);
@@ -13825,6 +14279,15 @@ async fn event_loop<T: Terminal>(
                 }
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
                 let k = normalize_key(k);
+                // Escape cancels an active utterance before any modal or pane
+                // sees it. While idle it remains available to every existing
+                // overlay, preserving their established behavior.
+                if voice.is_recording() && crate::input::is_escape_key(&k.key) {
+                    model.status = crate::handlers::voice::cancel(&mut voice, &waker);
+                    keymap.reset();
+                    dirty = true;
+                    continue;
+                }
                 // The help overlay is modal: it owns every key while open.
                 if let Some(h) = help_overlay.as_mut() {
                     match h.handle_key(&k.key, k.modifiers) {
@@ -13857,6 +14320,21 @@ async fn event_loop<T: Terminal>(
                             focus.zone = crate::focus::Zone::Panel;
                         }
                         crate::help::HelpOutcome::Pending => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
+                if let Some(builder) = theme_builder.as_mut() {
+                    let keep = crate::handlers::theme_builder::key(
+                        builder,
+                        &theme_store,
+                        &k.key,
+                        k.modifiers,
+                    );
+                    if !keep {
+                        theme_builder = None;
+                    } else {
+                        crate::chrome::set_palette(builder.candidate().clone());
                     }
                     dirty = true;
                     continue;
@@ -14193,15 +14671,20 @@ async fn event_loop<T: Terminal>(
                 // The full-screen PR view is a top-priority modal (like the
                 // detail overlay): it owns every key while open. Actions run off
                 // the loop and the view stays open (only Close dismisses it).
-                if pr_view.is_some() {
+                if pr_view.is_some() && active_menu.is_none() {
                     crate::actions::dispatch_pr_view_key(
                         &mut pr_view,
                         &k.key,
                         k.modifiers,
-                        &session,
+                        &mut session,
+                        &mut panes,
+                        &mut focus,
+                        keymap.config(),
                         &refresh_tx,
                         &waker,
                         &mut model,
+                        &mut active_menu,
+                        &ide_handoff_tx,
                     );
                     dirty = true;
                     continue;
@@ -14209,23 +14692,16 @@ async fn event_loop<T: Terminal>(
                 // The in-app diff viewer is a top-priority read-only modal: it
                 // owns every key while open (Esc/q dismiss).
                 if diff_view.is_some() {
-                    crate::actions::dispatch_diff_view_key(&mut diff_view, &k.key, k.modifiers);
-                    dirty = true;
-                    continue;
-                }
-                // The Now-Playing overlay owns every key while open: transport ops
-                // run off the loop (overlay stays open); Esc/Ctrl-C dismiss it.
-                if let Some(ov) = &mut media_overlay {
-                    match ov.handle_key(&k.key, k.modifiers) {
-                        crate::media_overlay::MediaOverlayOutcome::Close => media_overlay = None,
-                        crate::media_overlay::MediaOverlayOutcome::Pending => {}
-                        crate::media_overlay::MediaOverlayOutcome::Op(op) => spawn_media_op(
-                            media_effective_cfg(&current_config.media, &media_player_override),
-                            MediaOp::from(op),
-                            media_tx.clone(),
-                            waker.clone(),
-                        ),
-                    }
+                    crate::actions::dispatch_diff_view_key(
+                        &mut diff_view,
+                        &k.key,
+                        k.modifiers,
+                        &session,
+                        keymap.config(),
+                        &mut model,
+                        &ide_handoff_tx,
+                        &waker,
+                    );
                     dirty = true;
                     continue;
                 }
@@ -14327,6 +14803,7 @@ async fn event_loop<T: Terminal>(
                 let no_modal_owns_esc = active_menu.is_none()
                     && palette.is_none()
                     && host_input.is_none()
+                    && theme_builder.is_none()
                     && git_input.is_none()
                     && rollback.is_none()
                     && wizard_ui.is_none()
@@ -14496,6 +14973,7 @@ async fn event_loop<T: Terminal>(
                         &mut onboarding,
                         &mut model,
                         &mut current_config,
+                        &theme_users,
                         &mut session,
                         &mut panes,
                         chrome.center,
@@ -14598,9 +15076,7 @@ async fn event_loop<T: Terminal>(
                         &mut focus,
                         &mut model,
                         &mut sb,
-                        &mut drawer,
-                        &mut drawer_pool,
-                        &mut drawer_home,
+                        &mut drawer_runtime,
                         &current_config,
                         chrome.center,
                     ) {
@@ -15001,6 +15477,9 @@ async fn event_loop<T: Terminal>(
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
                             active_menu = None;
+                            if let Some(v) = pr_view.as_mut() {
+                                v.pending_handoff = None;
+                            }
                             pending_confirm_op = None;
                             pending_undo = None;
                             pending_delete_workspace = None;
@@ -15011,6 +15490,31 @@ async fn event_loop<T: Terminal>(
                             // dismissal below must be gated on this being one.
                             let was_halt = m.tag == menu::MenuKindTag::SandboxHalt;
                             active_menu = None;
+                            if matches!(
+                                &choice,
+                                menu::MenuChoice::Confirm {
+                                    tag: "pr-review-handoff",
+                                    ..
+                                }
+                            ) {
+                                if let Some(selection) =
+                                    pr_view.as_mut().and_then(|v| v.pending_handoff.take())
+                                {
+                                    crate::actions::dispatch_pr_handoff(
+                                        &mut pr_view,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut focus,
+                                        keymap.config(),
+                                        &mut model,
+                                        &refresh_tx,
+                                        &waker,
+                                        selection,
+                                    );
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             // Sandbox-halt/ask modal `[r] retry` / `[h] run on host`.
                             {
                                 let active_wt = active_cwd(&session);
@@ -15038,6 +15542,11 @@ async fn event_loop<T: Terminal>(
                             {
                                 halt_dismissed.insert((g.name.clone(), g.active_tab));
                             }
+                            if matches!(&choice, menu::MenuChoice::Dismiss)
+                                && let Some(v) = pr_view.as_mut()
+                            {
+                                v.pending_handoff = None;
+                            }
                             if let menu::MenuChoice::ConfirmCloseWorktrees = choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
                             {
@@ -15053,9 +15562,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -15119,9 +15626,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -15136,7 +15641,8 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
+                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files, force } =
+                                choice
                                 && let Some(names) = pending_confirm_delete_worktrees.take()
                             {
                                 // Re-resolve the stashed names to current indices so a
@@ -15154,9 +15660,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -15167,6 +15671,7 @@ async fn event_loop<T: Terminal>(
                                     },
                                     targets,
                                     keep_files,
+                                    force,
                                 );
                                 dirty = true;
                                 continue;
@@ -15200,9 +15705,7 @@ async fn event_loop<T: Terminal>(
                                         &mut focus,
                                         &mut model,
                                         &mut sb,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
+                                        &mut drawer_runtime,
                                         &current_config,
                                         chrome.center,
                                     ) {
@@ -15231,9 +15734,7 @@ async fn event_loop<T: Terminal>(
                                             &mut focus,
                                             &mut model,
                                             &mut sb,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
+                                            &mut drawer_runtime,
                                             &current_config,
                                             chrome.center,
                                         ) {
@@ -15259,20 +15760,23 @@ async fn event_loop<T: Terminal>(
                                     &slug,
                                     &display,
                                     keep_files,
+                                    &current_config,
                                     Some(waker.clone()),
                                 );
-                                crate::handlers::workspace_remove::forget_workspace_in_model(
-                                    &mut model, &slug, &repo_path,
-                                );
+                                if keep_files {
+                                    crate::handlers::workspace_remove::forget_workspace_in_model(
+                                        &mut model, &slug, &repo_path,
+                                    );
+                                }
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
                                 need_relayout = true;
-                                sync_drawer_persistence(
+                                reconcile_drawer_runtime(
                                     &session,
                                     &mut panes,
                                     &mut drawer,
-                                    &mut drawer_pool,
+                                    &mut drawer_runtime,
                                     &mut drawer_home,
                                     keymap.config(),
                                     chrome.center,
@@ -15719,24 +16223,23 @@ async fn event_loop<T: Terminal>(
                         }
                         crate::search_overlay::Outcome::OpenEditor => {
                             if let Some((rel_path, line_no)) = o.selected_location() {
-                                let worktree_root = active_tab_path(&session);
-                                let abs_path = worktree_root.join(&rel_path);
-                                let editor = std::env::var("EDITOR")
-                                    .or_else(|_| std::env::var("VISUAL"))
-                                    .unwrap_or_else(|_| "vi".into());
-                                let queued = if let Some(fp) = panes.table.get_mut(&focused) {
-                                    let cmd = format!(
-                                        "{editor} +{line_no} {}\n",
-                                        thegn_core::util::sh_quote(&abs_path.display().to_string())
-                                    );
-                                    fp.write_input(cmd.as_bytes()).is_ok()
-                                } else {
-                                    false
-                                };
-                                model.status = injected_command_status(
-                                    queued,
-                                    format!("Opening {rel_path}:{line_no}"),
-                                );
+                                match crate::ide_handoff::dispatch_active(
+                                    &session,
+                                    Some(&rel_path),
+                                    Some(line_no),
+                                    None,
+                                    "search and replace",
+                                    crate::ide_handoff::PanePlacement::Split(focused),
+                                    &current_config,
+                                    &ide_handoff_tx,
+                                    &waker,
+                                ) {
+                                    Ok(()) => {
+                                        model.status =
+                                            format!("Opening {rel_path}:{line_no} in IDE…")
+                                    }
+                                    Err(error) => model.status = error,
+                                }
                             }
                         }
                         crate::search_overlay::Outcome::Search
@@ -15748,6 +16251,60 @@ async fn event_loop<T: Terminal>(
 
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
+                    // The drawer picker is a pending selection gate, not a
+                    // command-palette action list. Consume its stable row key
+                    // before the generic prefix/action dispatch below.
+                    if drawer_picker {
+                        match k.key {
+                            KeyCode::Escape => {
+                                palette = None;
+                                drawer_picker = false;
+                                dirty = true;
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                let selected = p.selected_key().and_then(|key| {
+                                    crate::palette::drawer_picker_occupant(&key).map(str::to_string)
+                                });
+                                palette = None;
+                                drawer_picker = false;
+                                if let Some(id) = selected
+                                    && let Some(dir) = active_cwd(&session)
+                                {
+                                    if !crate::handlers::drawer::select(
+                                        &mut drawer_runtime,
+                                        keymap.config(),
+                                        thegn_core::config::DrawerScope::Worktree,
+                                        &id,
+                                        &dir,
+                                        &mut panes,
+                                        chrome.center,
+                                    ) {
+                                        model.status = format!("Drawer occupant unavailable: {id}");
+                                    }
+                                    if sync_drawer_runtime_mirror(
+                                        &drawer_runtime,
+                                        &mut drawer,
+                                        &mut drawer_home,
+                                    ) {
+                                        need_relayout = true;
+                                        full_repaint = true;
+                                    }
+                                    if drawer.is_some() {
+                                        focus.zone = crate::focus::Zone::Drawer;
+                                    } else {
+                                        // A cold result needs to focus the
+                                        // drawer when it is opened, including
+                                        // when it replaces a visible drawer.
+                                        drawer_focus_pending = true;
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     // Agent-picker mode: the palette is choosing what to run in a
                     // just-created worktree tab. The tab already materialized a
                     // shell, so "shell" (and Escape) keep the live pane —
@@ -15801,32 +16358,23 @@ async fn event_loop<T: Terminal>(
                                                 rel_path,
                                             );
                                         }
-                                        let abs_path = worktree_root.join(rel_path);
-                                        let editor = std::env::var("EDITOR")
-                                            .or_else(|_| std::env::var("VISUAL"))
-                                            .unwrap_or_else(|_| "vi".into());
-                                        let line_arg = format!("+{line_no}");
-                                        let queued = if let Some(focused_pane) =
-                                            panes.table.get_mut(&focused)
-                                        {
-                                            // Shell-quote the path: it's written into
-                                            // the pane's live shell, and a filename
-                                            // with a space or metacharacter would
-                                            // otherwise break the command or inject.
-                                            let cmd = format!(
-                                                "{editor} {line_arg} {}\n",
-                                                thegn_core::util::sh_quote(
-                                                    &abs_path.display().to_string()
-                                                )
-                                            );
-                                            focused_pane.write_input(cmd.as_bytes()).is_ok()
-                                        } else {
-                                            false
-                                        };
-                                        model.status = injected_command_status(
-                                            queued,
-                                            format!("Opening {}:{line_no}", rel_path),
-                                        );
+                                        match crate::ide_handoff::dispatch_active(
+                                            &session,
+                                            Some(rel_path),
+                                            Some(line_no as usize),
+                                            None,
+                                            "search palette",
+                                            crate::ide_handoff::PanePlacement::Split(focused),
+                                            &current_config,
+                                            &ide_handoff_tx,
+                                            &waker,
+                                        ) {
+                                            Ok(()) => {
+                                                model.status =
+                                                    format!("Opening {rel_path}:{line_no} in IDE…")
+                                            }
+                                            Err(error) => model.status = error,
+                                        }
                                     }
                                     palette = None;
                                     dirty = true;
@@ -16249,11 +16797,11 @@ async fn event_loop<T: Terminal>(
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
                                         need_relayout = true;
-                                        sync_drawer_persistence(
+                                        reconcile_drawer_runtime(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
-                                            &mut drawer_pool,
+                                            &mut drawer_runtime,
                                             &mut drawer_home,
                                             keymap.config(),
                                             chrome.center,
@@ -16280,11 +16828,11 @@ async fn event_loop<T: Terminal>(
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
                                         need_relayout = true;
-                                        sync_drawer_persistence(
+                                        reconcile_drawer_runtime(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
-                                            &mut drawer_pool,
+                                            &mut drawer_runtime,
                                             &mut drawer_home,
                                             keymap.config(),
                                             chrome.center,
@@ -16301,11 +16849,11 @@ async fn event_loop<T: Terminal>(
                                     session.switch_to(i);
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -16373,23 +16921,13 @@ async fn event_loop<T: Terminal>(
                                             &current_config.media,
                                             &media_player_override,
                                         );
-                                        let id = id.to_string();
-                                        let tx = media_tx.clone();
-                                        let w = waker.clone();
-                                        tokio::spawn(async move {
-                                            if let Some(client) =
-                                                thegn_media::client_for(&cfg.resolve_opts()).await
-                                            {
-                                                if let Err(e) = client.activate_playlist(&id).await
-                                                {
-                                                    tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
-                                                }
-                                                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                                let _ = tx
-                                                    .send(client.snapshot().await.unwrap_or(None));
-                                                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                            }
-                                        });
+                                        crate::media_ctl::spawn_media_playlist(
+                                            cfg,
+                                            id.to_string(),
+                                            &media_generation,
+                                            media_tx.clone(),
+                                            waker.clone(),
+                                        );
                                     }
                                 } else if let Some(p) = key.strip_prefix("media-player:") {
                                     // Switch which player we control + restart the watcher.
@@ -16400,6 +16938,7 @@ async fn event_loop<T: Terminal>(
                                             &current_config.media,
                                             &media_player_override,
                                         ),
+                                        &media_generation,
                                         &media_tx,
                                         &waker,
                                     );
@@ -16413,8 +16952,9 @@ async fn event_loop<T: Terminal>(
                                             ),
                                             HostInputKind::FileWorktreeNewFolder,
                                         ));
-                                        model.status =
-                                            "New folder: type a name (Esc cancels)".into();
+                                        model.status = crate::i18n_surface::status(
+                                            crate::i18n_surface::StatusText::NewFolderPrompt,
+                                        );
                                     } else {
                                         let r = match pending_file_target.take() {
                                             Some((wt, repo)) => {
@@ -16613,12 +17153,11 @@ async fn event_loop<T: Terminal>(
                         need_relayout |= crate::escape::escape_to_center(
                             &mut focus,
                             &mut panel_ui,
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
+                            &mut drawer_runtime,
                             &session,
                             &mut panes,
                             keymap.config(),
+                            chrome.center,
                         );
                     } else if k.key == KeyCode::Enter {
                         let hit = if focus.masthead() {
@@ -16633,8 +17172,9 @@ async fn event_loop<T: Terminal>(
                         if let Some((id, rect)) = hit {
                             if id == BarItemId::Badge(BarBadge::Media)
                                 && current_config.media.enabled
+                                && current_config.media.overlay_on_badge_click
                             {
-                                open_media_overlay!();
+                                open_media_panel!();
                             } else if id.has_detail() {
                                 crate::handlers::status::probe_sessions(
                                     &id,
@@ -16947,12 +17487,11 @@ async fn event_loop<T: Terminal>(
                                     need_relayout |= crate::escape::escape_to_center(
                                         &mut focus,
                                         &mut panel_ui,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
+                                        &mut drawer_runtime,
                                         &session,
                                         &mut panes,
                                         keymap.config(),
+                                        chrome.center,
                                     );
                                 }
                             }
@@ -17117,6 +17656,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut pr_view_gen,
                                                 &pr_view_tx,
                                                 &waker,
+                                                &refresh_tx,
                                             ) {
                                                 Some(v) => pr_view = Some(v),
                                                 None => model.status = "No pull request".into(),
@@ -17354,11 +17894,10 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Forward => {
-                                            // Enter copies the focused forward's preview URL.
-                                            if let Some(url) = model
-                                                .forwards
-                                                .get(panel_ui.cursor)
-                                                .map(|f| f.url.clone())
+                                            // Enter copies the focused preview/forward URL.
+                                            if let Some(url) =
+                                                forward_url_at(&model, panel_ui.cursor)
+                                                    .map(str::to_owned)
                                             {
                                                 writer.submit_oob(crate::copymode::osc52(&url));
                                                 crate::clipboard::copy(&url);
@@ -17383,12 +17922,40 @@ async fn event_loop<T: Terminal>(
                                             .open_view_at(panel_ui.cursor, &mut bar_detail);
                                         }
                                         Section::Media => {
-                                            // Enter opens the control overlay —
-                                            // the section's own hint promised
-                                            // "↵ panel" while Enter fell into
-                                            // the read-only catch-all.
+                                            // Enter selects a source or queue row;
+                                            // it never opens a second surface.
                                             if current_config.media.enabled {
-                                                open_media_overlay!();
+                                                if let Some(source) =
+                                                    panel_ui.media.source_at(panel_ui.cursor)
+                                                {
+                                                    media_player_override =
+                                                        Some(source.to_string());
+                                                    restart_media_watch(
+                                                        &mut media_watch,
+                                                        media_effective_cfg(
+                                                            &current_config.media,
+                                                            &media_player_override,
+                                                        ),
+                                                        &media_generation,
+                                                        &media_tx,
+                                                        &waker,
+                                                    );
+                                                    model.status =
+                                                        format!("Media: selected {source}");
+                                                } else if let Some(item) =
+                                                    panel_ui.media.queue_at(panel_ui.cursor)
+                                                {
+                                                    spawn_media_op(
+                                                        media_effective_cfg(
+                                                            &current_config.media,
+                                                            &media_player_override,
+                                                        ),
+                                                        MediaOp::PlayQueueItem(item.id.clone()),
+                                                        &media_generation,
+                                                        media_tx.clone(),
+                                                        waker.clone(),
+                                                    );
+                                                }
                                             } else {
                                                 model.status =
                                                     "Media is off ([media] enabled = false)".into();
@@ -17831,42 +18398,20 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- files / changes: yazi reveal + editor open ------
                         (Section::Files, KeyCode::Char('y')) => {
-                            // Yazi drawer anchored at the selection's dir.
-                            let wt = active_tab_path(&session);
-                            let dir = file_entry_at(
-                                &model,
-                                &panel_ui.files_collapsed,
-                                &panel_ui.files_filter,
-                                panel_ui.cursor,
-                            )
-                            .map(|e| {
-                                if e.is_dir {
-                                    wt.join(&e.path)
-                                } else {
-                                    wt.join(&e.path)
-                                        .parent()
-                                        .map(|d| d.to_path_buf())
-                                        .unwrap_or_else(|| wt.clone())
-                                }
-                            })
-                            .unwrap_or_else(|| wt.clone());
                             if let Some(cwd) = active_cwd(&session) {
-                                hide_drawer_into_pool(
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
-                                    &cwd,
+                                // File-manager control remains a runtime
+                                // transition; its provider-specific reveal
+                                // channel is handled by the pane itself.
+                                let _ = crate::handlers::drawer::select(
+                                    &mut drawer_runtime,
                                     keymap.config(),
+                                    thegn_core::config::DrawerScope::Worktree,
+                                    thegn_core::config_drawer::FILES_OCCUPANT_ID,
+                                    &cwd,
                                     &mut panes,
+                                    chrome.center,
                                 );
-                            } else if let Some(id) = drawer.take() {
-                                panes.table.remove(&id);
                             }
-                            // Async: the drawer drain shows the pane at `dir`
-                            // when its spec lands (no focus steal — parity with
-                            // the old synchronous reveal).
-                            crate::drawer_state::request_spawn(keymap.config(), &dir);
-                            drawer_show_pending = Some((dir, false));
                             true
                         }
                         (Section::Files, KeyCode::Char('o')) => {
@@ -18003,14 +18548,20 @@ async fn event_loop<T: Terminal>(
                                     .map(|c| c.path.clone())
                             };
                             if let Some(path) = path {
-                                let wt = active_tab_path(&session);
-                                let abs_path = wt.join(path);
-                                let cmd = editor_open_command(
-                                    keymap.config(),
-                                    &abs_path.to_string_lossy(),
+                                match crate::ide_handoff::dispatch_active(
+                                    &session,
+                                    Some(&path),
                                     None,
-                                );
-                                crate::panel_util::spawn_editor_detached(&cmd, None);
+                                    None,
+                                    "panel Ctrl-O",
+                                    crate::ide_handoff::PanePlacement::Tab,
+                                    &current_config,
+                                    &ide_handoff_tx,
+                                    &waker,
+                                ) {
+                                    Ok(()) => model.status = format!("Opening {path} in IDE…"),
+                                    Err(error) => model.status = error,
+                                }
                             }
                             true
                         }
@@ -18068,21 +18619,23 @@ async fn event_loop<T: Terminal>(
                         }
                         // -- forward: open the focused preview in the browser --
                         (Section::Forward, KeyCode::Char('o')) => {
-                            if let Some(f) = model.forwards.get(panel_ui.cursor) {
+                            if let Some(url) =
+                                forward_url_at(&model, panel_ui.cursor).map(str::to_owned)
+                            {
                                 let cmd = current_config.forward.browser.trim();
                                 if cmd.is_empty() {
-                                    open_url_detached(&f.url);
+                                    open_url_detached(&url);
                                 } else {
                                     let mut c = std::process::Command::new(cmd);
-                                    c.arg(&f.url)
+                                    c.arg(&url)
                                         .stdin(std::process::Stdio::null())
                                         .stdout(std::process::Stdio::null())
                                         .stderr(std::process::Stdio::null());
                                     crate::actions::spawn_detached_reaped(c);
                                 }
-                                model.status = format!("Opened {} in browser", f.url);
+                                model.status = format!("Opened {url} in browser");
                             } else {
-                                model.status = "No forward selected".into();
+                                model.status = "No preview selected".into();
                             }
                             true
                         }
@@ -18654,11 +19207,12 @@ async fn event_loop<T: Terminal>(
                             },
                         ),
                         // -- PR queue: add (a), remove (x), re-watch (r), clear
-                        // (c), refresh (D), open in browser (o). Mutations run
+                        // (c), refresh (D), open in browser (o), handle a
+                        // selected review task (h). Mutations run
                         // off-loop; outcomes ride the prq channel as toasts.
                         (
                             Section::PrQueue,
-                            KeyCode::Char(c @ ('a' | 'x' | 'r' | 'c' | 'D' | 'o')),
+                            KeyCode::Char(c @ ('a' | 'x' | 'r' | 'c' | 'D' | 'o' | 'h')),
                         ) => crate::handlers::pr_queue::section_key(
                             c,
                             panel_ui.cursor,
@@ -18716,25 +19270,19 @@ async fn event_loop<T: Terminal>(
                                 &mut host_input,
                             )
                         }
-                        // -- media: the transport keys the section advertises.
-                        // These were `nav()`-tagged (i.e. "the accordion
-                        // handles them") but the accordion never did — every
-                        // advertised keystroke was silently dead.
+                        // -- media: keyboard transport keys use the same intent
+                        // mapping as the frame's mouse hit targets.
                         (Section::Media, KeyCode::Char(c @ (' ' | 'n' | 'p' | 's' | 'L'))) => {
+                            let action = crate::media_panel::action_for_key(&KeyCode::Char(c))
+                                .expect("media key table and handler must agree");
                             if current_config.media.enabled {
-                                let op = match c {
-                                    'n' => MediaOp::Next,
-                                    'p' => MediaOp::Previous,
-                                    's' => MediaOp::ShuffleToggle,
-                                    'L' => MediaOp::LoopCycle,
-                                    _ => MediaOp::PlayPause,
-                                };
-                                spawn_media_op(
+                                crate::media_ctl::spawn_media_action(
                                     media_effective_cfg(
                                         &current_config.media,
                                         &media_player_override,
                                     ),
-                                    op,
+                                    action,
+                                    &media_generation,
                                     media_tx.clone(),
                                     waker.clone(),
                                 );
@@ -18743,6 +19291,7 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        (Section::Media, _) => false,
                         // -- usage: force a re-gather now, rather than waiting
                         // out the rest of `[usage] poll_interval_secs`.
                         (Section::Usage, KeyCode::Char('r')) => {
@@ -18753,6 +19302,7 @@ async fn event_loop<T: Terminal>(
                                     current_config.usage.clone(),
                                     true,
                                     current_config.model_proxy.enabled,
+                                    current_config.model_proxy.budget.clone(),
                                 );
                                 model.status = "Refreshing AI account usage\u{2026}".into();
                             } else {
@@ -18922,6 +19472,21 @@ async fn event_loop<T: Terminal>(
                             };
                         }
                         match action {
+                            Action::VoiceToggle => {
+                                model.status = crate::handlers::voice::toggle(
+                                    &mut voice,
+                                    focused,
+                                    panes.table.contains_key(&focused),
+                                    start.elapsed().as_millis() as u64,
+                                    &waker,
+                                );
+                            }
+                            Action::VoiceCancel => {
+                                let note = crate::handlers::voice::cancel(&mut voice, &waker);
+                                if !note.is_empty() {
+                                    model.status = note;
+                                }
+                            }
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();
@@ -19282,62 +19847,49 @@ async fn event_loop<T: Terminal>(
                                 ps.profile_reorder = true;
                                 palette = Some(ps);
                             }
-                            // Both `Ctrl+Alt+f` and `Alt+y` are the same pooled
-                            // toggle: hide-to-pool when open (position survives),
-                            // pool-or-spawn when closed — fast and consistent.
+                            // Both `Ctrl+Alt+f` and `Alt+y` are the same
+                            // worktree-scoped toggle. The handler remembers the
+                            // last occupant, including configured tools.
                             Action::ToggleDrawer | Action::Yazi => {
-                                // The reserved-geometry reflow + PTY resize are
-                                // owned by the top-of-loop drawer sync; here we
-                                // just open/close the pane (sized to its rect) and
-                                // move focus.
-                                if drawer.is_some() {
-                                    // Reap the drawer pane
-                                    if let Some(cwd) = active_cwd(&session) {
-                                        // Keep-alive: hide, don't kill — the
-                                        // yazi position survives reopening.
-                                        hide_drawer_into_pool(
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &cwd,
-                                            keymap.config(),
-                                            &mut panes,
-                                        );
-                                        crate::drawer_state::set_flag(&cwd, false);
-                                    } else if let Some(id) = drawer.take() {
-                                        panes.table.remove(&id);
+                                toggle_files_drawer!();
+                            }
+                            Action::DrawerCycle => {
+                                if let Some(dir) = active_cwd(&session) {
+                                    let next = crate::handlers::drawer::cycle(
+                                        &mut drawer_runtime,
+                                        keymap.config(),
+                                        thegn_core::config::DrawerScope::Worktree,
+                                        &dir,
+                                        &mut panes,
+                                        chrome.center,
+                                    );
+                                    if sync_drawer_runtime_mirror(
+                                        &drawer_runtime,
+                                        &mut drawer,
+                                        &mut drawer_home,
+                                    ) {
+                                        need_relayout = true;
+                                        full_repaint = true;
                                     }
-                                    drawer_show_pending = None;
-                                    // The bottom slice is relinquished: drop focus
-                                    // back to the center.
-                                    if focus.drawer() {
-                                        focus.zone = crate::focus::Zone::Center;
-                                    }
-                                } else {
-                                    // Show the worktree's drawer: pooled pane
-                                    // when pre-warmed (instant), else an async
-                                    // spec request — the drawer drain opens the
-                                    // pane (and takes focus) when it lands.
-                                    let cwd = active_cwd(&session);
-                                    if let Some(d) = cwd.as_deref() {
-                                        show_drawer(
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            keymap.config(),
-                                            d,
-                                        );
-                                        // Auto-focus so yazi is live immediately.
+                                    if let Some(next) = next {
+                                        model.status = format!("Drawer: {next}");
                                         if drawer.is_some() {
                                             focus.zone = crate::focus::Zone::Drawer;
+                                            drawer_focus_pending = false;
                                         } else {
-                                            drawer_show_pending = Some((d.to_path_buf(), true));
+                                            drawer_focus_pending = true;
                                         }
                                     }
-                                    if let Some(dir) = cwd {
-                                        crate::drawer_state::set_flag(&dir, true);
-                                    }
                                 }
+                            }
+                            Action::DrawerPick => {
+                                drawer_picker = true;
+                                palette = Some(crate::search_everywhere::PaletteSession::new(
+                                    crate::palette::build_drawer_palette(
+                                        keymap.config(),
+                                        thegn_core::config::DrawerScope::Worktree,
+                                    ),
+                                ));
                             }
                             Action::ToggleCorner => {
                                 // Summon-or-dismiss the corner overlay pin (the
@@ -19701,6 +20253,46 @@ async fn event_loop<T: Terminal>(
                                     );
                                 }
                             }
+                            Action::PrReviewTaskHandle => {
+                                let selected = (panel_ui.open
+                                    == crate::panel::Section::PrQueue)
+                                    .then(|| {
+                                        crate::handlers::pr_queue::selected_review_task(
+                                            &model.panel,
+                                            panel_ui.cursor,
+                                        )
+                                    })
+                                    .flatten()
+                                    .filter(|task| {
+                                        task.status
+                                            == thegn_core::issue::AgentDispatchStatus::Queued
+                                    })
+                                    .or_else(|| {
+                                        model
+                                            .panel
+                                            .review_tasks
+                                            .iter()
+                                            .find(|task| {
+                                                task.status
+                                                    == thegn_core::issue::AgentDispatchStatus::Queued
+                                            })
+                                            .cloned()
+                                    });
+                                if let Some(task) = selected {
+                                    crate::handlers::pr_queue::spawn_handle(
+                                        &prq_tx,
+                                        &waker,
+                                        current_config.clone(),
+                                        task,
+                                    );
+                                } else {
+                                    toasts.info_ttl(
+                                        "No queued watched-review task to handle".to_string(),
+                                        std::time::Instant::now(),
+                                        std::time::Duration::from_secs(4),
+                                    );
+                                }
+                            }
                             Action::ShareWorktreePort => {
                                 // Intent-first: when ≥2 reaches are configured,
                                 // pick public/team/peer first; otherwise go
@@ -19808,6 +20400,7 @@ async fn event_loop<T: Terminal>(
                                     current_config.usage.clone(),
                                     true,
                                     current_config.model_proxy.enabled,
+                                    current_config.model_proxy.budget.clone(),
                                 );
                             }
                             Action::OpenShares => {
@@ -19880,9 +20473,7 @@ async fn event_loop<T: Terminal>(
                                     &mut model,
                                     &mut sb,
                                     &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
+                                    &mut drawer_runtime,
                                     keymap.config(),
                                     chrome.center,
                                 );
@@ -19960,9 +20551,7 @@ async fn event_loop<T: Terminal>(
                                     &mut model,
                                     &mut sb,
                                     &mut panes,
-                                    &mut drawer,
-                                    &mut drawer_pool,
-                                    &mut drawer_home,
+                                    &mut drawer_runtime,
                                     keymap.config(),
                                     chrome.center,
                                 ));
@@ -20048,11 +20637,11 @@ async fn event_loop<T: Terminal>(
                                                 // workspace/folder was collapsed.
                                                 sb.reveal_active_worktree(&mut model, &session);
                                                 need_relayout = true;
-                                                sync_drawer_persistence(
+                                                reconcile_drawer_runtime(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
-                                                    &mut drawer_pool,
+                                                    &mut drawer_runtime,
                                                     &mut drawer_home,
                                                     keymap.config(),
                                                     chrome.center,
@@ -20084,11 +20673,11 @@ async fn event_loop<T: Terminal>(
                                                 sb.reveal_active_worktree(&mut model, &session);
                                                 kick_model_hydration!();
                                                 need_relayout = true;
-                                                sync_drawer_persistence(
+                                                reconcile_drawer_runtime(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
-                                                    &mut drawer_pool,
+                                                    &mut drawer_runtime,
                                                     &mut drawer_home,
                                                     keymap.config(),
                                                     chrome.center,
@@ -20159,11 +20748,11 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -20241,11 +20830,11 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -20269,11 +20858,11 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -20365,18 +20954,34 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&new);
                                 }
                             }
-                            Action::CycleTheme => {
-                                // Live theme cycle: presets resolve through
-                                // the config so [theme.colors] customizations
-                                // ride along. Set `[theme] preset` to persist.
-                                let presets = thegn_core::theme::PRESETS;
-                                theme_idx = (theme_idx + 1) % presets.len();
-                                let name = presets[theme_idx];
-                                crate::chrome::set_palette(
-                                    current_config.palette_with_preset(name),
+                            Action::ForkSession => {
+                                model.status = crate::handlers::session_fork::request(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                    &waker,
                                 );
-                                model.status =
-                                    format!("Theme: {name} (set [theme] preset to keep)");
+                            }
+                            Action::CycleTheme => {
+                                let themes = crate::theme_builder::cycle_catalog(
+                                    &current_config,
+                                    &theme_users,
+                                );
+                                if !themes.is_empty() {
+                                    theme_idx = (theme_idx + 1) % themes.len();
+                                    let (name, palette) = &themes[theme_idx];
+                                    crate::chrome::set_palette(palette.clone());
+                                    model.status = format!("Theme: {name}");
+                                }
+                            }
+                            Action::ThemeBuilderOpen => {
+                                let builder = crate::handlers::theme_builder::open(
+                                    &current_config,
+                                    &theme_users,
+                                    &theme_store,
+                                );
+                                crate::chrome::set_palette(builder.candidate().clone());
+                                theme_builder = Some(builder);
                             }
                             Action::ToggleZoom => {
                                 // On the center, cycle tiled → maximize-in-chrome
@@ -20855,11 +21460,11 @@ async fn event_loop<T: Terminal>(
                                         session.switch_to(i);
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
-                                        sync_drawer_persistence(
+                                        reconcile_drawer_runtime(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
-                                            &mut drawer_pool,
+                                            &mut drawer_runtime,
                                             &mut drawer_home,
                                             keymap.config(),
                                             chrome.center,
@@ -20889,11 +21494,11 @@ async fn event_loop<T: Terminal>(
                                             refresh_tab_model(&mut model, &session, &mut sb);
                                             kick_model_hydration!();
                                             need_relayout = true;
-                                            sync_drawer_persistence(
+                                            reconcile_drawer_runtime(
                                                 &session,
                                                 &mut panes,
                                                 &mut drawer,
-                                                &mut drawer_pool,
+                                                &mut drawer_runtime,
                                                 &mut drawer_home,
                                                 keymap.config(),
                                                 chrome.center,
@@ -20956,8 +21561,9 @@ async fn event_loop<T: Terminal>(
                                     crate::workspace_picker::WorkspacePicker::new(seed, excluded);
                                 p.spawn_discovery(current_config.clone(), waker.clone());
                                 workspace_picker = Some(p);
-                                model.status =
-                                    "New workspace: type to filter · Tab for manual entry".into();
+                                model.status = crate::i18n_surface::status(
+                                    crate::i18n_surface::StatusText::NewWorkspacePrompt,
+                                );
                             }
                             Action::DeleteWorkspace => {
                                 // Remove the *active* workspace. Same modal + path
@@ -20997,20 +21603,18 @@ async fn event_loop<T: Terminal>(
                                             &slug,
                                             &display,
                                             false,
+                                            &current_config,
                                             Some(waker.clone()),
                                         );
-                                    crate::handlers::workspace_remove::forget_workspace_in_model(
-                                        &mut model, &slug, &repo_path,
-                                    );
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);
                                     need_relayout = true;
-                                    sync_drawer_persistence(
+                                    reconcile_drawer_runtime(
                                         &session,
                                         &mut panes,
                                         &mut drawer,
-                                        &mut drawer_pool,
+                                        &mut drawer_runtime,
                                         &mut drawer_home,
                                         keymap.config(),
                                         chrome.center,
@@ -21156,6 +21760,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                 );
                             }
@@ -21168,6 +21774,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                     &mut crate::handlers::tab_keys::TabScopedState {
                                         loading_state: &mut loading_state,
@@ -21199,6 +21807,8 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                        lifecycle_cfg: &current_config,
+                                        waker: &waker,
                                     },
                                     &mut crate::handlers::tab_keys::TabScopedState {
                                         loading_state: &mut loading_state,
@@ -21245,9 +21855,7 @@ async fn event_loop<T: Terminal>(
                                         panes: &mut panes,
                                         model: &mut model,
                                         sb: &mut sb,
-                                        drawer: &mut drawer,
-                                        drawer_pool: &mut drawer_pool,
-                                        drawer_home: &mut drawer_home,
+                                        drawer_runtime: &mut drawer_runtime,
                                         active_menu: &mut active_menu,
                                         pending: &mut pending_confirm_delete_worktrees,
                                         need_relayout: &mut need_relayout,
@@ -21360,6 +21968,24 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 }
                             }
+                            Action::OpenInIde => {
+                                match crate::ide_handoff::dispatch_active(
+                                    &session,
+                                    None,
+                                    None,
+                                    None,
+                                    "command palette",
+                                    crate::ide_handoff::PanePlacement::Tab,
+                                    &current_config,
+                                    &ide_handoff_tx,
+                                    &waker,
+                                ) {
+                                    Ok(()) => {
+                                        model.status = "Opening focused worktree in IDE…".into()
+                                    }
+                                    Err(error) => model.status = error,
+                                }
+                            }
                             Action::Diff => {
                                 let cfg = keymap.config();
                                 // `[git] structural_diff != off` opts into the
@@ -21392,6 +22018,7 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     diff_view = Some(crate::actions::open_diff_view(
                                         cfg,
+                                        &model,
                                         &session,
                                         &mut diff_view_gen,
                                         &diff_view_tx,
@@ -21626,6 +22253,7 @@ async fn event_loop<T: Terminal>(
                                             &media_player_override,
                                         ),
                                         op,
+                                        &media_generation,
                                         media_tx.clone(),
                                         waker.clone(),
                                     );
@@ -21635,7 +22263,7 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::MediaOpenPanel => {
                                 if current_config.media.enabled {
-                                    open_media_overlay!();
+                                    open_media_panel!();
                                 } else {
                                     model.status = "Media is off ([media] enabled = false)".into();
                                 }
@@ -21951,6 +22579,11 @@ async fn event_loop<T: Terminal>(
             }
             Ok(Some(InputEvent::Paste(s))) => {
                 input_at = Some(std::time::Instant::now()); // input-latency stamp
+                if let Some(builder) = theme_builder.as_mut() {
+                    builder.handle_paste(&s);
+                    dirty = true;
+                    continue;
+                }
                 // A modal that collects text owns the paste — inject it into
                 // the field (workspace picker, new-worktree wizard) rather than
                 // leaking it into the pane behind the overlay.
@@ -22091,6 +22724,29 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         tab.focused_pane = *map.values().next().unwrap_or(&0);
     }
     true
+}
+
+/// Preserve claim-and-delete mailbox rows independently of model freshness.
+///
+/// Hydration snapshots are generation-scoped, but intents are global transient
+/// deliveries. Once `build_model` has claimed a row, even a stale snapshot must
+/// hand it to the loop or the row has already been deleted with no consumer.
+fn drain_hydration_intents(
+    model: &mut crate::chrome::FrameModel,
+    pending_focus: &mut Option<thegn_core::store::IntentRow>,
+    pending_preset: &mut Option<thegn_core::store::IntentRow>,
+    pending_adopts: &mut Vec<thegn_core::store::IntentRow>,
+    pending_editor_opens: &mut Vec<thegn_core::store::IntentRow>,
+) {
+    // Focus and preset are last-wins; adopt and editor-open are drain-all.
+    if let Some(row) = model.intents.drain(..).next_back() {
+        *pending_focus = Some(row);
+    }
+    if let Some(row) = model.preset_intents.drain(..).next_back() {
+        *pending_preset = Some(row);
+    }
+    pending_adopts.append(&mut model.adopt_intents);
+    pending_editor_opens.append(&mut model.open_editor_intents);
 }
 
 #[cfg(test)]

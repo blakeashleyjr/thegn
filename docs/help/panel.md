@@ -309,8 +309,11 @@ env to this worktree, `t` tests its token, `n` adds, `x` removes
 
 **share** and **forward** list the worktree's tunnels and port forwards
 (`↵` copy · `o` browser · share's `x` stops) — see [[share-and-forward]].
-**media** is the now-playing view ([[media]]). **telemetry** is the live
-stats/loop-profiler view. **keys** is the generated cheatsheet of the
+**media** is the docked now-playing view ([[media]]): `Alt-m` and the media
+badge focus the same System section. Its Normal/Half/Full widths progressively
+show the current track, source/detail controls, and queue/artwork; `j`/`k`
+select source or queue rows and `↵` activates the selected row. **telemetry** is
+the live stats/loop-profiler view. **keys** is the generated cheatsheet of the
 effective keymap.
 
 ### usage — AI-account rate-limit usage

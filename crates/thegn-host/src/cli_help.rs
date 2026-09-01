@@ -27,7 +27,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "search",
         ],
     ),
-    ("Forge", &["pr", "issue", "dispatch", "kaneo", "ci"]),
+    (
+        "Forge",
+        &["pr", "issue", "dispatch", "kaneo", "ci", "autopilot"],
+    ),
     (
         "Environments",
         &[
@@ -43,7 +46,15 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Session",
-        &["notify", "logs", "share", "forward", "sandbox-argv"],
+        &[
+            "notify",
+            "automations",
+            "logs",
+            "share",
+            "forward",
+            "sandbox-argv",
+            "events",
+        ],
     ),
     (
         "Control plane",
@@ -58,6 +69,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "secret",
             "keys",
             "theme",
+            "skills",
             "doctor",
             "setup",
             "completions",
