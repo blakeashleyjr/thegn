@@ -45,6 +45,16 @@ pub fn spawn_bg<F: FnOnce() + Send + 'static>(f: F) {
     });
 }
 
+/// Run a closure with a permit reserved by the caller. This is for producers
+/// that must acquire capacity before committing durable work; otherwise a
+/// later `spawn_bg` drop could leave that work permanently orphaned.
+pub fn spawn_bg_reserved<F: FnOnce() + Send + 'static>(permit: OwnedSemaphorePermit, f: F) {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

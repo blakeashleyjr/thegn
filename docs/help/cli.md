@@ -23,9 +23,10 @@ worktree):
 | ------------- | -------------------------------------------------------------------------------------------------------------- |
 | Workspace     | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                |
+| Automation    | `autopilot status [--repo PATH] [--json]`                                                                      |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
 | Session       | `notify` · `logs` · `share` · `forward`                                                                        |
-| Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                       |
+| Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                     |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                               |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
@@ -162,7 +163,12 @@ Most list-shaped reads accept `--json` and emit exactly one compact JSON
 document on stdout with no ANSI: `wt list`, `repo list`, `repo recent`,
 `env list`, `host list`, `host discover`, `ci runs`, `share list`,
 `forward list`, `merge list`, `session list`, `pair list`, `map`, and
-`wt new --json`. Treat those shapes as a stable API. (`notify list --json`
+`wt new --json`, and `autopilot status`. Treat those shapes as a stable API.
+`autopilot status --json` returns `{enabled, repo, runs}`; `runs` contains only
+bounded issue identity, lifecycle, worktree/branch, PR, timestamps, and reason
+fields. It never starts, stops, retries, or exposes issue bodies, commands,
+secrets, or CI logs. With autopilot disabled it reports the disabled state and
+an empty/bounded journal view. (`notify list --json`
 is NDJSON and `doctor --json` is a single object — both historical.)
 
 `thegn host discover` is the inbound tailnet path: it lists the machines

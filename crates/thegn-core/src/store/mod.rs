@@ -30,6 +30,7 @@
 
 mod account;
 mod automation;
+mod autopilot;
 mod cache;
 mod calendar;
 mod compute;
@@ -59,6 +60,7 @@ pub use account::AccountStore;
 pub use automation::{
     AutomationAdmission, AutomationRunRow, AutomationStateRow, AutomationStore, NewAutomationRun,
 };
+pub use autopilot::{AutopilotStore, ClaimOutcome};
 pub use cache::CacheStore;
 pub use calendar::{CalendarRow, CalendarStore, CalendarSyncRow};
 pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};

@@ -122,6 +122,19 @@ pub(crate) fn spawn_issue_cache_refresh(
             }
             let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             changed = true;
+            // The refresh already runs on `sched::spawn_bg`; autopilot claims
+            // here but schedules each slow agent on its own bounded background
+            // worker. It receives filter provenance rather than guessing
+            // consent from issue display fields.
+            crate::autopilot_driver::pickup(
+                &app_cfg,
+                &repo_root,
+                &cwd,
+                &account,
+                provider,
+                &issues,
+                cfg.filter_assignee_me,
+            );
         }
         if changed && let Some(w) = &waker {
             let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
