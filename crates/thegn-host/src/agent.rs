@@ -358,6 +358,7 @@ pub fn prepare_sandbox_env(
                 provider,
                 Path::new(worktree),
                 &dc.config_path,
+                &dc.config_digest,
                 &sb.passthrough_env(),
             ) {
                 Ok(session) => {
@@ -2864,7 +2865,7 @@ pub fn compose_spec(
     // the snippet loads the toolchain. Only a BARE-HOST pane (no sandbox spec,
     // `backend = none` local) keeps `${SHELL} -l` — there `$SHELL` is the user's
     // real zsh and the login files load the devShell via the rc-hook.
-    let provider_session = (sb.backend_label == "devcontainer")
+    let mut provider_session = (sb.backend_label == "devcontainer")
         .then(|| crate::devcontainer_provider::session_for(worktree))
         .flatten();
     let in_oci = sb.spec.is_some() || provider_session.is_some();
@@ -2950,12 +2951,29 @@ pub fn compose_spec(
     {
         env.extend(eff.expanded_env());
     }
+    let mut warnings = sb.warnings.clone();
+    let mut degraded = sb.degraded_from_provider;
     let argv = match (&sb.spec, &provider_session) {
-        (None, Some(session)) => thegn_core::sandbox_cpucap::wrap_provider_pane_argv(
-            session.exec_argv(&cmd),
-            &thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
-            thegn_core::sandbox_cpucap::detect_cpu_cap(),
-        ),
+        (None, Some(session)) => match session.exec_argv(&cmd) {
+            Ok(argv) => thegn_core::sandbox_cpucap::wrap_provider_pane_argv(
+                argv,
+                &thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
+                thegn_core::sandbox_cpucap::detect_cpu_cap(),
+            ),
+            Err(error) => {
+                tracing::warn!(target: "thegn::config_trust", "devcontainer session rejected: {error}");
+                provider_session = None;
+                degraded = true;
+                warnings.push(format!(
+                    "devcontainer config changed; using host fallback ({error})"
+                ));
+                thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(vec![
+                    thegn_core::util::shell(),
+                    "-lc".to_string(),
+                    cmd,
+                ])
+            }
+        },
         (Some(spec), _) => sandbox::enter_argv(spec, &cmd),
         (None, None) => {
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
@@ -2979,8 +2997,6 @@ pub fn compose_spec(
     let local =
         sb.spec.as_ref().is_none_or(|s| s.placement.is_local()) && provider_session.is_none();
     let truth = local.then(|| thegn_core::sandbox_truth::reconcile(&sb.backend_label, &argv));
-    let mut warnings = sb.warnings.clone();
-    let mut degraded = sb.degraded_from_provider;
     let backend = match truth {
         Some(t) => {
             if let Some(w) = t.warning {
