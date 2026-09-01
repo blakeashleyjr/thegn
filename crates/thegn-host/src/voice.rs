@@ -22,10 +22,12 @@ const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) enum VoiceMessage {
     CaptureComplete {
         pane_id: u32,
+        generation: u64,
         wav: Vec<u8>,
     },
     CaptureFailed {
         pane_id: u32,
+        generation: u64,
         reason: String,
     },
     TranscriptSucceeded {
@@ -98,13 +100,23 @@ impl VoiceController {
         let generation = self.capture_generation;
         let (stop_tx, stop_rx) = mpsc::channel();
         self.capture_stop = Some(stop_tx);
-        spawn_capture(
+        if !spawn_capture(
             self.cfg.clone(),
             pane_id,
+            generation,
             stop_rx,
             self.tx.clone(),
             waker.clone(),
-        );
+        ) {
+            self.capture_stop = None;
+            let _ = self.tx.send(VoiceMessage::CaptureFailed {
+                pane_id,
+                generation,
+                reason: "voice capture worker could not start".into(),
+            });
+            let _ = waker.wake();
+            return;
+        }
         spawn_max_timer(
             pane_id,
             generation,
@@ -158,7 +170,7 @@ impl VoiceController {
         let wk = waker.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.transcription_cancel = Some((request_id, cancel.clone()));
-        let _ = thread::Builder::new()
+        if thread::Builder::new()
             .name("voice-transcribe".into())
             .spawn(move || {
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
@@ -178,7 +190,17 @@ impl VoiceController {
                 };
                 let _ = tx.send(msg); // best-effort: loop may have exited
                 let _ = wk.wake(); // best-effort: waker pulse
+            })
+            .is_err()
+        {
+            self.transcription_cancel = None;
+            let _ = self.tx.send(VoiceMessage::TranscriptFailed {
+                pane_id,
+                request_id,
+                reason: "voice transcription worker could not start".into(),
             });
+            let _ = waker.wake();
+        }
     }
 }
 
@@ -209,18 +231,15 @@ fn spawn_max_timer(
         });
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the off-loop capture worker must reap its child after a wait error"
-)]
 fn spawn_capture(
     cfg: VoiceConfig,
     pane_id: u32,
+    generation: u64,
     stop_rx: Receiver<CaptureCommand>,
     tx: Sender<VoiceMessage>,
     waker: TerminalWaker,
-) {
-    let _ = thread::Builder::new()
+) -> bool {
+    thread::Builder::new()
         .name("voice-capture".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
@@ -230,25 +249,28 @@ fn spawn_capture(
                     &waker,
                     VoiceMessage::CaptureFailed {
                         pane_id,
+                        generation,
                         reason: "no capture command configured".into(),
                     },
                 );
                 return;
             };
+            let max_duration = cfg.max_duration();
             let argv = thegn_core::sandbox_cpucap::wrap_background_argv(cfg.capture_command);
-            let mut child = match Command::new(&argv[0])
+            let mut command = Command::new(&argv[0]);
+            command
                 .args(&argv[1..])
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => child,
+                .stderr(Stdio::piped());
+            let (mut child, group) = match crate::platform::spawn_grouped(&mut command) {
+                Ok(children) => children,
                 Err(e) => {
                     send_capture(
                         &tx,
                         &waker,
                         VoiceMessage::CaptureFailed {
                             pane_id,
+                            generation,
                             reason: format!("start {program}: {e}"),
                         },
                     );
@@ -257,32 +279,89 @@ fn spawn_capture(
             };
             let stdout = child.stdout.take().expect("capture stdout was piped");
             let stderr = child.stderr.take().expect("capture stderr was piped");
-            let output_thread = thread::spawn(move || read_capped(stdout, MAX_CAPTURE_BYTES));
-            let error_thread = thread::spawn(move || read_capped(stderr, MAX_CAPTURE_BYTES));
+            let (output_tx, output_rx) = mpsc::channel();
+            let output_thread = thread::spawn(move || {
+                let _ = output_tx.send(read_capped(stdout, MAX_CAPTURE_BYTES));
+            });
+            let (error_tx, error_rx) = mpsc::channel();
+            let error_thread = thread::spawn(move || {
+                let _ = error_tx.send(read_capped(stderr, MAX_CAPTURE_BYTES));
+            });
             let mut requested_stop = false;
+            let deadline = std::time::Instant::now() + max_duration;
+            let mut output = None;
+            let mut error = None;
             let status = loop {
                 match stop_rx.try_recv() {
                     Ok(CaptureCommand::Stop) => {
                         requested_stop = true;
-                        let _ = child.kill();
+                        kill_capture_child(&mut child, &group);
                     }
                     Err(TryRecvError::Disconnected) => {
                         requested_stop = true;
-                        let _ = child.kill();
+                        kill_capture_child(&mut child, &group);
                     }
                     Err(TryRecvError::Empty) => {}
                 }
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => thread::sleep(Duration::from_millis(5)),
-                    Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                if !requested_stop && std::time::Instant::now() >= deadline {
+                    requested_stop = true;
+                    kill_capture_child(&mut child, &group);
+                }
+                if output.is_none() {
+                    output = output_rx.try_recv().ok();
+                    if matches!(&output, Some(Err(_))) {
+                        terminate_capture_child(&mut child, &group);
+                        let _ = output_thread.join();
+                        let _ = error_thread.join();
+                        let reason = output
+                            .and_then(Result::err)
+                            .unwrap_or_else(|| "capture output reader failed".into());
                         send_capture(
                             &tx,
                             &waker,
                             VoiceMessage::CaptureFailed {
                                 pane_id,
+                                generation,
+                                reason,
+                            },
+                        );
+                        return;
+                    }
+                }
+                if error.is_none() {
+                    error = error_rx.try_recv().ok();
+                    if matches!(&error, Some(Err(_))) {
+                        terminate_capture_child(&mut child, &group);
+                        let _ = output_thread.join();
+                        let _ = error_thread.join();
+                        let reason = error
+                            .and_then(Result::err)
+                            .unwrap_or_else(|| "capture error reader failed".into());
+                        send_capture(
+                            &tx,
+                            &waker,
+                            VoiceMessage::CaptureFailed {
+                                pane_id,
+                                generation,
+                                reason,
+                            },
+                        );
+                        return;
+                    }
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => thread::sleep(Duration::from_millis(5)),
+                    Err(e) => {
+                        terminate_capture_child(&mut child, &group);
+                        let _ = output_thread.join();
+                        let _ = error_thread.join();
+                        send_capture(
+                            &tx,
+                            &waker,
+                            VoiceMessage::CaptureFailed {
+                                pane_id,
+                                generation,
                                 reason: format!("wait for capture: {e}"),
                             },
                         );
@@ -290,29 +369,55 @@ fn spawn_capture(
                     }
                 }
             };
-            let wav = match output_thread.join() {
-                Ok(Ok(wav)) => wav,
-                Ok(Err(reason)) => {
-                    send_capture(&tx, &waker, VoiceMessage::CaptureFailed { pane_id, reason });
-                    let _ = error_thread.join();
-                    return;
-                }
-                Err(_) => {
+            // A child can exit while a descendant still owns one of the
+            // pipes. Kill the grouped process tree before joining helpers so
+            // no reader survives the utterance.
+            if output.is_none() || error.is_none() {
+                terminate_capture_child(&mut child, &group);
+            }
+            let output_joined = output_thread.join().is_ok();
+            let error_joined = error_thread.join().is_ok();
+            if !output_joined || !error_joined {
+                send_capture(
+                    &tx,
+                    &waker,
+                    VoiceMessage::CaptureFailed {
+                        pane_id,
+                        generation,
+                        reason: "capture pipe reader panicked".into(),
+                    },
+                );
+                return;
+            }
+            let wav = match output.or_else(|| output_rx.recv().ok()) {
+                Some(Ok(wav)) => wav,
+                Some(Err(reason)) => {
                     send_capture(
                         &tx,
                         &waker,
                         VoiceMessage::CaptureFailed {
                             pane_id,
-                            reason: "capture output reader panicked".into(),
+                            generation,
+                            reason,
                         },
                     );
-                    let _ = error_thread.join();
+                    return;
+                }
+                None => {
+                    send_capture(
+                        &tx,
+                        &waker,
+                        VoiceMessage::CaptureFailed {
+                            pane_id,
+                            generation,
+                            reason: "capture output reader did not report".into(),
+                        },
+                    );
                     return;
                 }
             };
-            let stderr = error_thread
-                .join()
-                .ok()
+            let stderr = error
+                .or_else(|| error_rx.recv().ok())
                 .and_then(Result::ok)
                 .unwrap_or_default();
             if !status.success() && (!requested_stop || wav.is_empty()) {
@@ -322,6 +427,7 @@ fn spawn_capture(
                     &waker,
                     VoiceMessage::CaptureFailed {
                         pane_id,
+                        generation,
                         reason: if detail.is_empty() {
                             format!("capture exited with {status}")
                         } else {
@@ -330,9 +436,32 @@ fn spawn_capture(
                     },
                 );
             } else {
-                send_capture(&tx, &waker, VoiceMessage::CaptureComplete { pane_id, wav });
+                send_capture(
+                    &tx,
+                    &waker,
+                    VoiceMessage::CaptureComplete {
+                        pane_id,
+                        generation,
+                        wav,
+                    },
+                );
             }
-        });
+        })
+        .is_ok()
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the off-loop capture worker must reap its child after termination"
+)]
+fn terminate_capture_child(child: &mut std::process::Child, group: &crate::platform::GroupHandle) {
+    kill_capture_child(child, group);
+    let _ = child.wait(); // best-effort: reap after termination
+}
+
+fn kill_capture_child(child: &mut std::process::Child, group: &crate::platform::GroupHandle) {
+    group.kill();
+    let _ = child.kill(); // best-effort: the child may have exited already
 }
 
 fn send_capture(tx: &Sender<VoiceMessage>, waker: &TerminalWaker, msg: VoiceMessage) {

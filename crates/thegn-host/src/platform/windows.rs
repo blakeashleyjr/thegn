@@ -203,6 +203,11 @@ impl GroupHandle {
             None => terminate_pid(self.pid),
         }
     }
+
+    /// Best-effort hard termination of the whole process job.
+    pub fn kill(&self) {
+        self.terminate();
+    }
 }
 
 /// Spawn `cmd` and assign it to a fresh kill-on-close Job Object. Best-effort:

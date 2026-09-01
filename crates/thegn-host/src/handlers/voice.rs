@@ -95,6 +95,12 @@ pub(crate) fn drain(
         {
             continue;
         }
+        if let VoiceMessage::CaptureComplete { generation, .. }
+        | VoiceMessage::CaptureFailed { generation, .. } = &message
+            && *generation != voice.capture_generation()
+        {
+            continue;
+        }
         if matches!(
             &message,
             VoiceMessage::CaptureComplete { .. } | VoiceMessage::CaptureFailed { .. }
@@ -107,12 +113,12 @@ pub(crate) fn drain(
             voice.transcription_finished(*request_id);
         }
         let event = match message {
-            VoiceMessage::CaptureComplete { pane_id, wav } => {
+            VoiceMessage::CaptureComplete { pane_id, wav, .. } => {
                 VoiceEvent::CaptureComplete { pane_id, wav }
             }
-            VoiceMessage::CaptureFailed { pane_id, reason } => {
-                VoiceEvent::CaptureFailed { pane_id, reason }
-            }
+            VoiceMessage::CaptureFailed {
+                pane_id, reason, ..
+            } => VoiceEvent::CaptureFailed { pane_id, reason },
             VoiceMessage::TranscriptSucceeded {
                 pane_id,
                 request_id,

@@ -201,7 +201,7 @@ pub fn spawn_ndjson(
 }
 
 #[cfg(unix)]
-pub(super) fn set_process_group(cmd: &mut Command) {
+pub(crate) fn set_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // 0 = become the leader of a new group, so `killpg` below reaches every
     // descendant rather than just the script we started.
@@ -209,10 +209,10 @@ pub(super) fn set_process_group(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-pub(super) fn set_process_group(_cmd: &mut Command) {}
+pub(crate) fn set_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
-fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) {
     // Negative pid targets the whole group.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
@@ -220,7 +220,7 @@ fn kill_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) {
     // No process groups here; `taskkill /T` walks the tree instead.
     let _ = Command::new("taskkill") // best-effort: kill failure surfaces via the next poll of the child
         .args(["/PID", &pid.to_string(), "/T", "/F"])
