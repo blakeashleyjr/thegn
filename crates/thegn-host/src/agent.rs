@@ -227,7 +227,9 @@ pub fn prepare_sandbox_env(
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
     use crate::handlers::repo_trust::resolve_env_trusted;
-    let environment = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
+    let trusted = resolve_env_trusted(cfg, repo_root, loc, worktree, selected_env);
+    let environment = trusted.environment;
+    let devcontainer = trusted.devcontainer;
     let mut placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
     // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or
@@ -339,6 +341,48 @@ pub fn prepare_sandbox_env(
     let mut explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
+    // The CLI provider is an optional, host-owned execution adapter. It is
+    // considered only after core selection/trust and only for local, unprojected
+    // worktrees. Its raw config path is never handed to the process when the
+    // inventory contains a refused/reserved/unknown key (see repo_trust).
+    if placement.is_local()
+        && projection.is_none()
+        && !unresolved_selection
+        && crate::devcontainer_provider::can_honor_sandbox(&sb)
+        && let Some(dc) = &devcontainer
+        && dc.provider_eligible
+    {
+        let provider = crate::devcontainer_provider::provider();
+        if provider.probe().ready() {
+            match crate::devcontainer_provider::DevcontainerSession::start(
+                provider,
+                Path::new(worktree),
+                &dc.config_path,
+                &dc.config_digest,
+                &dc.config_content,
+                &sb.passthrough_env(),
+            ) {
+                Ok(session) => {
+                    crate::devcontainer_provider::publish_session(worktree, session);
+                    return Ok(SandboxOutcome {
+                        spec: None,
+                        backend_label: "devcontainer".to_string(),
+                        warnings,
+                        shell: env_shell,
+                        is_remote: false,
+                        cwd_override: None,
+                        location: None,
+                        degraded_from_provider: false,
+                    });
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                            "devcontainer CLI could not start the container ({error}); using OCI fallback"
+                        ));
+                }
+            }
+        }
+    }
     // Selection dropped: the user asked for a non-default env that isn't defined
     // under `[env.<name>]`, so `resolve_env` fell back to Local. The Provider/ssh
     // bring-up degrade blocks below never fire (placement is already Local), so
@@ -2822,7 +2866,10 @@ pub fn compose_spec(
     // the snippet loads the toolchain. Only a BARE-HOST pane (no sandbox spec,
     // `backend = none` local) keeps `${SHELL} -l` — there `$SHELL` is the user's
     // real zsh and the login files load the devShell via the rc-hook.
-    let in_oci = sb.spec.is_some();
+    let mut provider_session = (sb.backend_label == "devcontainer")
+        .then(|| crate::devcontainer_provider::session_for(worktree))
+        .flatten();
+    let in_oci = sb.spec.is_some() || provider_session.is_some();
     let cmd = if let Some(over) = extras.cmd_override {
         // An agent launched on a task: the caller already rendered the command.
         over.to_string()
@@ -2876,6 +2923,12 @@ pub fn compose_spec(
     if let Some(jobs) = thegn_core::sandbox_cpucap::cargo_jobs_for(&cap_limits) {
         env.push(("CARGO_BUILD_JOBS".to_string(), jobs.to_string()));
     }
+    // A provider exec is a host-side CLI process. Pass only the same explicit
+    // local-env values admitted to `devcontainer up`; `pane_pty` supplies the
+    // safe runtime base environment independently.
+    if let Some(session) = &provider_session {
+        env.extend(session.exec_env().iter().cloned());
+    }
     // Local bwrap gets its passthrough env (tokens, API keys) via the pane's
     // process env, not world-readable `--setenv` argv (enter_argv skips those).
     if let Some(spec) = &sb.spec
@@ -2885,34 +2938,66 @@ pub fn compose_spec(
         env.extend(spec.env.iter().cloned());
     }
     // Opt-in model-proxy routing (`route_via_proxy`): probe-before-inject so a
-    // down proxy can never strand the agent on a dead loopback endpoint.
-    match crate::model_proxy_daemon::agent_proxy_env(cfg, choice, worktree) {
-        crate::model_proxy_daemon::ProxyEnvDecision::Inject(vars) => env.extend(vars),
-        crate::model_proxy_daemon::ProxyEnvDecision::Skipped(why) => {
-            tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
+    // down proxy can never strand the agent on a dead loopback endpoint. A
+    // provider session is a host-side CLI process that re-reads raw repo JSON;
+    // do not expose proxy credentials or agent env to that parser. The provider
+    // handle already carries the only local-env values it is allowed to see.
+    if provider_session.is_none() {
+        match crate::model_proxy_daemon::agent_proxy_env(cfg, choice, worktree) {
+            crate::model_proxy_daemon::ProxyEnvDecision::Inject(vars) => env.extend(vars),
+            crate::model_proxy_daemon::ProxyEnvDecision::Skipped(why) => {
+                tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
+            }
+            crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
         }
-        crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
     }
     // `[[agents]].env` (+ the stage's overlay, key by key): the operator's own
     // per-entry environment — an account's `CLAUDE_CONFIG_DIR`, a pi home —
     // applied LAST so it wins over the composed identity env. Secrets expand
     // here (`env:`/`file:`); an unresolvable value is dropped, never exported
-    // as its literal ref.
-    if let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage) {
+    // as its literal ref. Keep it out of a provider CLI's host environment:
+    // that process parses raw repo JSON and must not gain a new localEnv read.
+    if provider_session.is_none()
+        && let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage)
+    {
         env.extend(eff.expanded_env());
     }
-    let argv = match &sb.spec {
-        Some(spec) => sandbox::enter_argv(spec, &cmd),
-        // Host fallback: a login shell so PATH/env expand — still CAPPED. There
-        // is no sandbox spec here (no container runtime, or one turned off), but
-        // capping is not sandboxing: this pane runs the same builds as any other
-        // and needs the same ceiling. Without the wrap it escaped `thegn.slice`
-        // entirely, which is how the aggregate cap came to govern nothing.
-        None => thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(vec![
-            thegn_core::util::shell(),
-            "-lc".to_string(),
-            cmd,
-        ]),
+    let mut warnings = sb.warnings.clone();
+    let mut degraded = sb.degraded_from_provider;
+    let argv = match (&sb.spec, &provider_session) {
+        (None, Some(session)) => match session.exec_argv(&cmd) {
+            Ok(argv) => thegn_core::sandbox_cpucap::wrap_provider_pane_argv(
+                argv,
+                &thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
+                thegn_core::sandbox_cpucap::detect_cpu_cap(),
+            ),
+            Err(error) => {
+                tracing::warn!(target: "thegn::config_trust", "devcontainer session rejected: {error}");
+                provider_session = None;
+                degraded = true;
+                warnings.push(format!(
+                    "devcontainer config changed; using host fallback ({error})"
+                ));
+                thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(vec![
+                    thegn_core::util::shell(),
+                    "-lc".to_string(),
+                    cmd,
+                ])
+            }
+        },
+        (Some(spec), _) => sandbox::enter_argv(spec, &cmd),
+        (None, None) => {
+            // Host fallback: a login shell so PATH/env expand — still CAPPED. There
+            // is no sandbox spec here (no container runtime, or one turned off), but
+            // capping is not sandboxing: this pane runs the same builds as any other
+            // and needs the same ceiling. Without the wrap it escaped `thegn.slice`
+            // entirely, which is how the aggregate cap came to govern nothing.
+            thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(vec![
+                thegn_core::util::shell(),
+                "-lc".to_string(),
+                cmd,
+            ])
+        }
     };
     // The label must describe the argv, not the resolver's intent. For a LOCAL
     // placement the argv is authoritative, so reconcile against it: a resolver
@@ -2920,10 +3005,9 @@ pub fn compose_spec(
     // false containment claim, and this is where it stops being one. A remote
     // placement keeps the resolver's label — its runtime lives behind a
     // transport whose argv shape can't be read from here (see `sandbox_truth`).
-    let local = sb.spec.as_ref().is_none_or(|s| s.placement.is_local());
+    let local =
+        sb.spec.as_ref().is_none_or(|s| s.placement.is_local()) && provider_session.is_none();
     let truth = local.then(|| thegn_core::sandbox_truth::reconcile(&sb.backend_label, &argv));
-    let mut warnings = sb.warnings.clone();
-    let mut degraded = sb.degraded_from_provider;
     let backend = match truth {
         Some(t) => {
             if let Some(w) = t.warning {
@@ -3337,14 +3421,19 @@ pub fn launch_spec_full(
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
-    // On the host path (no sandbox spec) the bundle identity + build env ride
-    // the pane env (layered on the curated base in `spawn_with_env`).
-    if outcome.spec.is_none() {
+    // On the bare-host path (no sandbox spec and no provider session) the bundle
+    // identity + build env ride the pane env (layered on the curated base in
+    // `spawn_with_env`). A provider CLI is also host-side, but its environment
+    // must remain limited to the provider handle's safe runtime + allowlist.
+    let provider_active = outcome.backend_label == "devcontainer"
+        && crate::devcontainer_provider::session_for(worktree).is_some();
+    if outcome.spec.is_none() && !provider_active {
         extend_reserving(&mut spec.env, resolved.env_pairs(), agent_env_keys);
         extend_reserving(&mut spec.env, build_env, agent_env_keys);
     }
     // Host (no-sandbox) devShell injection rides the pane env directly.
     if outcome.spec.is_none()
+        && !provider_active
         && let Some(dev) = &devshell
     {
         inject_devshell_host(&mut spec, dev);

@@ -876,9 +876,11 @@ mod tests {
         // process kind may advance the shared state schema. Added after an
         // unlanded branch's worker migrated the live database out from under
         // main and locked the supervisor's own CLI out of the roster.
+        // 93 → 94 (THE-23): `[sandbox] devcontainer`
+        // (DevcontainerMode) — repo-authored devcontainer overlay mode.
         assert_eq!(
             defs.len(),
-            93,
+            94,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

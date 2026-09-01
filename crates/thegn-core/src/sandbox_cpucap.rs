@@ -491,6 +491,17 @@ pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<Strin
     )
 }
 
+/// Wrap a provider-backed pane argv with the same CPU/memory policy used by a
+/// local host-toolchain pane. Provider implementations must use this narrow
+/// pure adapter instead of inventing a second resource-limit path.
+pub fn wrap_provider_pane_argv(
+    argv: Vec<String>,
+    limits: &SandboxLimits,
+    mechanism: CpuCap,
+) -> Vec<String> {
+    cap_prefix(Backend::None, true, limits, argv, mechanism, CapRole::Pane)
+}
+
 /// How many parallel build jobs a pane should ask for, from its own CPU ceiling.
 ///
 /// `CARGO_BUILD_JOBS` is per-INVOCATION, so N worktrees each claim the whole

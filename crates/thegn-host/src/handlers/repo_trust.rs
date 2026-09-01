@@ -14,14 +14,34 @@ use std::path::Path;
 use thegn_core::config::{Config, SandboxConfig};
 use thegn_core::config_resolve::{Approvals, ClampEvent, GatedRequest, summarize_events};
 use thegn_core::db::Db;
-use thegn_core::devcontainer::{self, SubstCtx};
+use thegn_core::devcontainer::{self, ImageSource, SubstCtx};
 use thegn_core::devcontainer_overlay;
+use thegn_core::devcontainer_select;
 use thegn_core::env::Environment;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{NotificationStore, RepoTrustStore, ZoneStore};
 
 /// Notification kind for a clamped/pending repo overlay request.
 pub(crate) const CLAMP_KIND: &str = "repo_config_trust";
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrustedEnvironment {
+    pub environment: Environment,
+    pub devcontainer: Option<TrustedDevcontainer>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrustedDevcontainer {
+    pub config_path: std::path::PathBuf,
+    /// Digest of the parsed config content. The provider rechecks this before
+    /// every use so a later repo-file replacement cannot bypass this trust
+    /// decision while preserving config-relative path resolution.
+    pub config_digest: [u8; 32],
+    /// Exact bytes parsed and trust-gated. The provider runs against a
+    /// snapshot of these bytes, never a later reopen of the repository path.
+    pub config_content: Vec<u8>,
+    pub provider_eligible: bool,
+}
 
 /// The approvals a repo currently has (from the `repo_trust` table). Empty
 /// (fail-closed) on any DB error.
@@ -45,9 +65,12 @@ pub(crate) fn resolve_env_trusted(
     loc: &GitLoc,
     worktree: &str,
     selected_env: Option<&str>,
-) -> Environment {
+) -> TrustedEnvironment {
     let Ok(db) = Db::open() else {
-        return cfg.resolve_env(repo_root, loc, Path::new(worktree), selected_env);
+        return TrustedEnvironment {
+            environment: cfg.resolve_env(repo_root, loc, Path::new(worktree), selected_env),
+            devcontainer: None,
+        };
     };
     let root_s = repo_root.to_string_lossy().to_string();
     let approvals = approvals_for(&db, &root_s);
@@ -63,21 +86,24 @@ pub(crate) fn resolve_env_trusted(
     // exactly like the `.thegn.toml` overlay above. The worktree is bind-
     // mounted at its real path, so the devcontainer's workspace folder is that
     // same path. No-op without a devcontainer.json.
-    overlay_devcontainer(repo_root, worktree, &mut env.sandbox);
+    let devcontainer = overlay_devcontainer(cfg, repo_root, worktree, &mut env.sandbox);
     apply_zone(&db, cfg, worktree, &mut env);
-    env
+    TrustedEnvironment {
+        environment: env,
+        devcontainer,
+    }
 }
 
 /// A [`SubstCtx`] for a worktree that thegn bind-mounts at its **real path**
 /// (the local-sandbox invariant): the host and in-container workspace folders
 /// are the same path, so devcontainer `${localWorkspaceFolder}` and
 /// `${containerWorkspaceFolder}` both resolve to `worktree`.
-fn subst_ctx(worktree: &str) -> SubstCtx<'static> {
+fn subst_ctx<'a>(worktree: &str, local_env: &'a dyn Fn(&str) -> Option<String>) -> SubstCtx<'a> {
     let wt = worktree.to_string();
     SubstCtx {
         local_workspace_folder: wt.clone(),
         container_workspace_folder: wt,
-        local_env: &|k| std::env::var(k).ok(),
+        local_env,
         container_env: &|_| None,
     }
 }
@@ -86,24 +112,108 @@ fn subst_ctx(worktree: &str) -> SubstCtx<'static> {
 /// Mutates `sb` (image/build/compose/mounts/ports/env/init_script/prepare),
 /// logs any warnings, and surfaces pending `devcontainer.*` approvals the same
 /// way a `.thegn.toml` overlay does. No-op when there's no devcontainer.json.
-fn overlay_devcontainer(repo_root: &Path, worktree: &str, sb: &mut SandboxConfig) {
-    let dc = match devcontainer::detect_and_parse(Path::new(worktree)) {
-        Some(Ok(dc)) => dc,
-        Some(Err(e)) => {
-            tracing::warn!(target: "thegn::config_trust", "devcontainer.json ignored: {e}");
-            return;
+fn overlay_devcontainer(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &str,
+    sb: &mut SandboxConfig,
+) -> Option<TrustedDevcontainer> {
+    if sb.devcontainer == thegn_core::config::DevcontainerMode::Off {
+        return None;
+    }
+    let selected = devcontainer_select::select_and_parse(
+        Path::new(worktree),
+        Some(&cfg.repo_devcontainer_selector(repo_root)),
+    );
+    if selected.candidates.is_empty() {
+        return None;
+    }
+    let dc = match selected.config.as_ref() {
+        Some(dc) => dc,
+        None => {
+            if let Some(error) = selected.error.as_ref() {
+                tracing::warn!(target: "thegn::config_trust", "devcontainer.json ignored: {error}");
+            }
+            return None;
         }
-        None => return,
     };
-    let Ok(db) = Db::open() else { return };
+    let Ok(db) = Db::open() else { return None };
     let root_s = repo_root.to_string_lossy().to_string();
     let approvals = approvals_for(&db, &root_s);
-    let ctx = subst_ctx(worktree);
-    let outcome = devcontainer_overlay::apply_gated(&dc, sb, &ctx, worktree, &approvals);
+    // A user-pinned source is authoritative. The provider consumes the raw
+    // devcontainer file and cannot reproduce that image/build/compose choice,
+    // so retain the native OCI path rather than silently replacing it.
+    let user_source_pinned = !sb.image.is_empty() || sb.build.is_some() || sb.compose.is_some();
+    let allowed = sb.env_passthrough.clone();
+    let local_env = |key: &str| {
+        allowed
+            .iter()
+            .any(|allowed_key| allowed_key == key)
+            .then(|| std::env::var(key).ok())
+            .flatten()
+    };
+    let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
+    let ctx = subst_ctx(worktree, &local_env);
+    let outcome = devcontainer_overlay::apply_gated_with_policy(
+        dc,
+        sb,
+        &ctx,
+        worktree,
+        &approvals,
+        &allow_local_env,
+    );
     for w in &outcome.warnings {
         tracing::warn!(target: "thegn::config_trust", "{w}");
     }
     surface(&db, &root_s, worktree, &[], &outcome.pending);
+    for key in &outcome.substitution.blocked_local_env {
+        tracing::warn!(
+            target: "thegn::config_trust",
+            "devcontainer: localEnv:{key} blocked (not in sandbox.env_passthrough)"
+        );
+    }
+    let source_present = match &dc.source {
+        ImageSource::Image(image) => !image.is_empty(),
+        ImageSource::Build(_) | ImageSource::Compose(_) => true,
+    };
+    let inventory = devcontainer::recognized_unapplied(dc);
+    // The CLI consumes the original repo file, so it is only safe when every
+    // execution-affecting key is in the applied subset. Otherwise refused,
+    // reserved, or unknown keys could reach the vendor process despite the
+    // core overlay correctly dropping them on the OCI fallback path.
+    let provider_eligible = source_present
+        && !user_source_pinned
+        && outcome.pending.is_empty()
+        && outcome.substitution.blocked_local_env.is_empty()
+        && inventory.refused.is_empty()
+        && inventory.reserved.is_empty()
+        && inventory.unknown.is_empty();
+    let config_path = selected.selected.unwrap_or_default();
+    let Some(config_content) = selected.raw_content.as_ref() else {
+        tracing::warn!(
+            target: "thegn::config_trust",
+            path = %config_path.display(),
+            "selected devcontainer config has no parsed source snapshot"
+        );
+        return None;
+    };
+    let config_digest = match crate::devcontainer_provider::config_digest(&config_path) {
+        Ok(digest) => digest,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::config_trust",
+                path = %config_path.display(),
+                "devcontainer config could not be verified: {error}"
+            );
+            return None;
+        }
+    };
+    Some(TrustedDevcontainer {
+        config_path,
+        config_digest,
+        config_content: config_content.as_bytes().to_vec(),
+        provider_eligible,
+    })
 }
 
 /// The trust-gated devcontainer one-time lifecycle steps
@@ -115,14 +225,29 @@ pub(crate) fn devcontainer_lifecycle_steps(
     worktree: &str,
     workdir: &str,
 ) -> Vec<thegn_core::envplan::ProvisionStep> {
-    let Some(Ok(dc)) = devcontainer::detect_and_parse(Path::new(worktree)) else {
+    let cfg = crate::hydrate::load_hydration_config();
+    let sb = cfg.repo_sandbox(repo_root);
+    if sb.devcontainer == thegn_core::config::DevcontainerMode::Off {
+        return Vec::new();
+    }
+    let selector = cfg.repo_devcontainer_selector(repo_root);
+    let selected = devcontainer_select::select_and_parse(Path::new(worktree), Some(&selector));
+    let Some(dc) = selected.config else {
         return Vec::new();
     };
     let Ok(db) = Db::open() else {
         return Vec::new();
     };
     let approvals = approvals_for(&db, &repo_root.to_string_lossy());
-    let ctx = subst_ctx(worktree);
+    let allowed = sb.env_passthrough.clone();
+    let local_env = |key: &str| {
+        allowed
+            .iter()
+            .any(|allowed_key| allowed_key == key)
+            .then(|| std::env::var(key).ok())
+            .flatten()
+    };
+    let ctx = subst_ctx(worktree, &local_env);
     devcontainer_overlay::gated_steps(&dc, workdir, &ctx, &approvals)
 }
 
@@ -133,7 +258,14 @@ pub(crate) fn devcontainer_feature_steps(
     repo_root: &Path,
     worktree: &str,
 ) -> Vec<thegn_core::envplan::ProvisionStep> {
-    let Some(Ok(dc)) = devcontainer::detect_and_parse(Path::new(worktree)) else {
+    let cfg = crate::hydrate::load_hydration_config();
+    let sb = cfg.repo_sandbox(repo_root);
+    if sb.devcontainer == thegn_core::config::DevcontainerMode::Off {
+        return Vec::new();
+    }
+    let selector = cfg.repo_devcontainer_selector(repo_root);
+    let selected = devcontainer_select::select_and_parse(Path::new(worktree), Some(&selector));
+    let Some(dc) = selected.config else {
         return Vec::new();
     };
     let Ok(db) = Db::open() else {

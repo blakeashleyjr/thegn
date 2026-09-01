@@ -174,6 +174,186 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+fn devcontainer_json(cfg: &Config) -> serde_json::Value {
+    let Some(root) = current_repo_root() else {
+        return serde_json::json!({
+            "mode": cfg.sandbox.devcontainer.as_str(),
+            "repo": null,
+            "candidates": [],
+            "selected": null,
+        });
+    };
+    let worktree = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    if cfg.sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
+        return serde_json::json!({
+            "mode": "off",
+            "repo": root.display().to_string(),
+            "candidates": [],
+            "selected": null,
+            "status": { "variant": "", "state": "off", "reason": "disabled by [sandbox] devcontainer = off" },
+        });
+    }
+    let db = thegn_core::db::Db::open().ok();
+    let approvals = db
+        .as_ref()
+        .map(|db| crate::handlers::repo_trust::approvals_for(db, &root.to_string_lossy()))
+        .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
+    let sandbox = cfg.repo_sandbox_resolved(&root, &approvals).sandbox;
+    if sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
+        return serde_json::json!({
+            "mode": "off",
+            "repo": root.display().to_string(),
+            "candidates": [],
+            "selected": null,
+            "status": { "variant": "", "state": "off", "reason": "disabled by repo sandbox policy" },
+        });
+    }
+    let selection = thegn_core::devcontainer_select::select_and_parse(
+        &worktree,
+        Some(&cfg.repo_devcontainer_selector(&root)),
+    );
+    let candidates: Vec<String> = selection
+        .candidates
+        .iter()
+        .map(|p| {
+            thegn_core::devcontainer_select::relative_path(&worktree, p)
+                .display()
+                .to_string()
+        })
+        .collect();
+    let selected = selection.selected.as_ref().map(|p| {
+        thegn_core::devcontainer_select::relative_path(&worktree, p)
+            .display()
+            .to_string()
+    });
+    let error = selection.error.as_ref().map(ToString::to_string);
+    let probe = crate::devcontainer_provider::probe();
+    let provider = serde_json::json!({
+        "state": format!("{:?}", probe.state).to_lowercase(),
+        "executable": probe.executable.clone(),
+        "version": probe.version.clone(),
+        "reason": probe.reason.clone(),
+    });
+    let Some(config) = selection.config.as_ref() else {
+        return serde_json::json!({
+            "mode": cfg.sandbox.devcontainer.as_str(),
+            "repo": root.display().to_string(),
+            "candidates": candidates,
+            "selected": selected,
+            "error": error,
+            "provider": provider,
+        });
+    };
+    let allowed = sandbox.env_passthrough.clone();
+    let local_env = |key: &str| {
+        allowed
+            .iter()
+            .any(|allowed_key| allowed_key == key)
+            .then(|| std::env::var(key).ok())
+            .flatten()
+    };
+    let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
+    let ctx = thegn_core::devcontainer::SubstCtx {
+        local_workspace_folder: worktree.to_string_lossy().into_owned(),
+        container_workspace_folder: worktree.to_string_lossy().into_owned(),
+        local_env: &local_env,
+        container_env: &|_| None,
+    };
+    let mut folded = sandbox.clone();
+    let gated = thegn_core::devcontainer_overlay::apply_gated_with_policy(
+        config,
+        &mut folded,
+        &ctx,
+        &worktree.to_string_lossy(),
+        &approvals,
+        &allow_local_env,
+    );
+    let inventory = thegn_core::devcontainer::recognized_unapplied(config);
+    let honorability = Backend::from_config(folded.backend).map(|backend| {
+        format!(
+            "{:?}",
+            thegn_core::devcontainer_overlay::backend_honorability_for(config, backend)
+        )
+    });
+    let status = crate::devcontainer_provider::status_for_selected(
+        config, &selection, &worktree, &sandbox, &approvals, &probe,
+    );
+    serde_json::json!({
+        "mode": cfg.sandbox.devcontainer.as_str(),
+        "repo": root.display().to_string(),
+        "candidates": candidates,
+        "selected": selected,
+        "error": error,
+        "status": { "variant": status.variant, "state": status.state_label(), "reason": status.reason },
+        "provider": provider,
+        "trust": {
+            "approved": inventory.applied,
+            "pending": gated.pending.iter().map(|p| p.key.clone()).collect::<Vec<_>>(),
+            "refused": inventory.refused,
+            "reserved": inventory.reserved,
+            "editor_only": inventory.editor_only,
+            "unknown": inventory.unknown,
+        },
+        "backend_honorability": honorability,
+    })
+}
+
+fn devcontainer_report(cfg: &Config) {
+    let report = devcontainer_json(cfg);
+    outln!("Devcontainer support");
+    outln!(
+        "  mode          {}",
+        report["mode"].as_str().unwrap_or("unknown")
+    );
+    if let Some(repo) = report["repo"].as_str() {
+        outln!("  repo          {repo}");
+    } else {
+        outln!("  repo          (not inside a repository)");
+    }
+    let candidates = report["candidates"].as_array().cloned().unwrap_or_default();
+    let candidate_text = candidates
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    outln!(
+        "  candidates    {}",
+        if candidate_text.is_empty() {
+            "(none)"
+        } else {
+            &candidate_text
+        }
+    );
+    outln!(
+        "  selected      {}",
+        report["selected"].as_str().unwrap_or("(none)")
+    );
+    if let Some(error) = report["error"].as_str() {
+        outln!("  selection     {error}");
+    }
+    let provider = &report["provider"];
+    outln!(
+        "  provider      {}",
+        provider["state"].as_str().unwrap_or("unknown")
+    );
+    if let Some(status) = report["status"]["state"].as_str() {
+        outln!(
+            "  status        {status} ({})",
+            report["status"]["variant"].as_str().unwrap_or("default")
+        );
+    }
+    outln!(
+        "  trust         {} pending, {} refused/reserved/unknown",
+        report["trust"]["pending"].as_array().map_or(0, Vec::len),
+        report["trust"]["refused"].as_array().map_or(0, Vec::len)
+            + report["trust"]["reserved"].as_array().map_or(0, Vec::len)
+            + report["trust"]["unknown"].as_array().map_or(0, Vec::len)
+    );
+    if let Some(honor) = report["backend_honorability"].as_str() {
+        outln!("  backend       {honor}");
+    }
+}
+
 /// The derived enforcement matrix for the running host, as JSON — one object per
 /// reachable backend with its honest cells. Aggregation-only (see
 /// [`enforcement_matrix_report`]).
@@ -1235,6 +1415,7 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
             "ctrl_digits_reportable": probe.as_ref().and_then(|p| p.ctrl_digit_reportable()),
         },
         "sandbox": sandbox_json(cfg),
+        "devcontainer": devcontainer_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
         "managed_tools": managed_tools_json(cfg),
@@ -1610,6 +1791,9 @@ pub fn run(
 
     outln!("");
     sandbox_report(cfg);
+
+    outln!("");
+    devcontainer_report(cfg);
 
     outln!("");
     hosts_report(cfg);

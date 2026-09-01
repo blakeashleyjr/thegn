@@ -144,6 +144,9 @@ pub(crate) struct RepoConfigFile {
     pub(crate) issues: crate::config_issues::IssuesOverlay,
     /// Selects a named environment for every worktree of this repo.
     pub(crate) env: String,
+    /// Selects a `.devcontainer/<name>/devcontainer.json` variant. This is a
+    /// preference only; it grants no trust for the selected file's contents.
+    pub(crate) devcontainer: String,
     /// Metrics are present only so command collectors can be detected and
     /// refused; their targets never reach the running scraper.
     pub(crate) metrics: RepoMetricsOverlay,

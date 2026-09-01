@@ -244,6 +244,8 @@ pub struct SidebarRow {
     /// The env is a managed provider but content resolved local (degraded to the
     /// host) — renders the `«env»` badge as `«env ✗»`.
     pub env_degraded: bool,
+    /// Read-only devcontainer variant/provider status from hydration.
+    pub devcontainer_status: Option<String>,
     pub activity: ActivityState,
     /// Render/navigation visibility: false when hidden by a collapsed parent or
     /// filtered out.
@@ -333,6 +335,7 @@ impl SidebarRow {
             sandbox_backend: None,
             env_name: None,
             env_degraded: false,
+            devcontainer_status: None,
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
@@ -404,6 +407,8 @@ pub struct SidebarStatus {
     /// worktree), so the displayed branch must come from here or it goes stale
     /// forever. Absent for a detached HEAD or a worktree never scanned.
     pub branches: std::collections::BTreeMap<String, String>,
+    /// Read-only devcontainer variant/provider status, keyed by worktree path.
+    pub devcontainer_status: std::collections::BTreeMap<String, String>,
     pub agent: std::collections::BTreeMap<String, String>,
     pub activity: std::collections::BTreeMap<String, ActivityState>,
     /// Badge: open PR count per worktree (item 28).
@@ -760,6 +765,9 @@ pub(crate) fn compose_detail_line(
         && backend != "host"
     {
         segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
+    }
+    if let Some(devcontainer) = &row.devcontainer_status {
+        segs.push(seg(Tok::Slot(S::Faint), format!("{devcontainer} ")));
     }
     if row
         .worktree_path
@@ -1573,6 +1581,10 @@ fn worktree_row(
         .as_deref()
         .and_then(|p| status.branches.get(p))
         .cloned();
+    let devcontainer_status = wt_path
+        .as_deref()
+        .and_then(|p| status.devcontainer_status.get(p))
+        .cloned();
     SidebarRow {
         tab_target: Some(gr.target.clone()),
         active: gr.active,
@@ -1583,6 +1595,7 @@ fn worktree_row(
         sandbox_backend: gr.sandbox_backend.clone(),
         env_name: gr.env_name.clone(),
         env_degraded: gr.env_degraded,
+        devcontainer_status,
         activity: gr.activity,
         visible,
         pr_count,
