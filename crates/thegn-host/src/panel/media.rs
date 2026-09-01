@@ -12,6 +12,7 @@ pub(crate) type MediaIdentity = (String, Option<String>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MediaRequest {
     pub(crate) generation: u64,
+    pub(crate) watcher_generation: u64,
     pub(crate) identity: Option<MediaIdentity>,
 }
 
@@ -36,6 +37,7 @@ pub(crate) struct MediaPanelState {
     pub(crate) art: Option<ArtMosaic>,
     caps: Option<MediaCaps>,
     generation: u64,
+    watcher_generation: u64,
     snapshot_identity: Option<MediaIdentity>,
     queue_identity: Option<MediaIdentity>,
     queue_request: Option<MediaRequest>,
@@ -53,7 +55,25 @@ impl MediaPanelState {
         )
     }
 
-    pub(crate) fn sync_snapshot(&mut self, state: Option<&MediaState>, caps: Option<MediaCaps>) {
+    pub(crate) fn sync_snapshot(
+        &mut self,
+        state: Option<&MediaState>,
+        caps: Option<MediaCaps>,
+        watcher_generation: u64,
+    ) {
+        let watcher_changed = self.watcher_generation != watcher_generation;
+        if watcher_changed {
+            // A config/player restart invalidates requests even when the old
+            // snapshot is still displayed and compares equal to the next one.
+            self.watcher_generation = watcher_generation;
+            self.generation = self.generation.wrapping_add(1);
+            self.queue.clear();
+            self.queue_identity = None;
+            self.queue_request = state
+                .map(Self::identity)
+                .map(|identity| self.request_for(Some(identity)));
+            self.sources_stale = true;
+        }
         let Some(state) = state else {
             self.sources.clear();
             self.queue.clear();
@@ -90,6 +110,7 @@ impl MediaPanelState {
     fn request_for(&self, identity: Option<MediaIdentity>) -> MediaRequest {
         MediaRequest {
             generation: self.generation,
+            watcher_generation: self.watcher_generation,
             identity,
         }
     }
@@ -121,6 +142,7 @@ impl MediaPanelState {
     ) -> Option<MediaRequest> {
         let request = self.queue_request.take()?;
         if request.generation == self.generation
+            && request.watcher_generation == self.watcher_generation
             && request.identity.as_ref() == state.map(Self::identity).as_ref()
         {
             Some(request)
@@ -148,6 +170,7 @@ impl MediaPanelState {
     ) {
         let Some(state) = state else { return };
         if request.generation == self.generation
+            && request.watcher_generation == self.watcher_generation
             && request.identity.as_ref() == Some(&Self::identity(state))
         {
             self.queue_identity = Some(Self::identity(state));
@@ -162,6 +185,7 @@ impl MediaPanelState {
         sources: Vec<String>,
     ) {
         if request.generation != self.generation
+            || request.watcher_generation != self.watcher_generation
             || request.identity.as_ref() != state.map(Self::identity).as_ref()
         {
             return;
@@ -251,14 +275,14 @@ mod tests {
     fn queue_request_is_single_flight_per_snapshot_identity() {
         let mut panel = MediaPanelState::default();
         let current = state();
-        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()));
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 0);
         assert!(panel.needs_queue(Some(&current)));
         panel.begin_request(Some(&current));
         let _ = panel.take_queue_request(Some(&current));
         assert!(!panel.needs_queue(Some(&current)));
         let mut changed = current.clone();
         changed.track_id = Some("next".into());
-        panel.sync_snapshot(Some(&changed), Some(MediaCaps::default()));
+        panel.sync_snapshot(Some(&changed), Some(MediaCaps::default()), 0);
         assert!(panel.needs_queue(Some(&changed)));
     }
 
@@ -288,7 +312,7 @@ mod tests {
     fn source_delivery_is_deduplicated_and_is_identity_checked() {
         let mut panel = MediaPanelState::default();
         let first = state();
-        panel.sync_snapshot(Some(&first), Some(MediaCaps::default()));
+        panel.sync_snapshot(Some(&first), Some(MediaCaps::default()), 0);
         let request = panel.take_sources_request(Some(&first)).unwrap();
         panel.set_sources(
             request.clone(),
@@ -299,7 +323,7 @@ mod tests {
 
         let mut returned = first.clone();
         returned.track_id = Some("next".into());
-        panel.sync_snapshot(Some(&returned), Some(MediaCaps::default()));
+        panel.sync_snapshot(Some(&returned), Some(MediaCaps::default()), 0);
         let current = panel.take_sources_request(Some(&returned)).unwrap();
         panel.set_sources(request, Some(&returned), vec!["stale".into()]);
         assert_eq!(panel.sources, ["one", "two"]);
@@ -311,7 +335,7 @@ mod tests {
     fn same_identity_after_generation_change_rejects_old_queue_delivery() {
         let mut panel = MediaPanelState::default();
         let current = state();
-        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()));
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 0);
         let old = panel.take_queue_request(Some(&current)).unwrap();
         panel.begin_request(Some(&current));
         let fresh = panel.take_queue_request(Some(&current)).unwrap();
@@ -333,5 +357,29 @@ mod tests {
             }],
         );
         assert_eq!(panel.queue[0].title, "fresh");
+    }
+
+    #[test]
+    fn watcher_restart_rejects_old_queue_and_source_deliveries() {
+        let mut panel = MediaPanelState::default();
+        let current = state();
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 1);
+        let old_queue = panel.take_queue_request(Some(&current)).unwrap();
+        let old_sources = panel.take_sources_request(Some(&current)).unwrap();
+
+        // The displayed snapshot has not changed yet, but the selected
+        // provider/config has restarted the watcher.
+        panel.sync_snapshot(Some(&current), Some(MediaCaps::default()), 2);
+        panel.set_queue(
+            old_queue,
+            Some(&current),
+            vec![QueueItem {
+                title: "stale".into(),
+                ..Default::default()
+            }],
+        );
+        panel.set_sources(old_sources, Some(&current), vec!["stale".into()]);
+        assert!(panel.queue.is_empty());
+        assert!(panel.sources.is_empty());
     }
 }

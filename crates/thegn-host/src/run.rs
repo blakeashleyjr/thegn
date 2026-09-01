@@ -10409,9 +10409,11 @@ async fn event_loop<T: Terminal>(
             media_position_visible,
             &mut last_media_full,
         );
-        panel_ui
-            .media
-            .sync_snapshot(model.panel.media.as_ref(), media_caps);
+        panel_ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            media_caps,
+            media_generation.current(),
+        );
         if media_position_visible {
             let cfg = media_effective_cfg(&current_config.media, &media_player_override);
             if let Some(request) = panel_ui

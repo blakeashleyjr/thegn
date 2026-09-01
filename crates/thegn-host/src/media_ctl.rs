@@ -7,6 +7,19 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
+async fn snapshot_or_log(
+    client: &thegn_media::MediaClient,
+    operation: &'static str,
+) -> Option<thegn_core::media::MediaSnapshot> {
+    match client.snapshot_with_caps().await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::debug!(target: "thegn::media", error = %e, operation, "media snapshot failed after operation");
+            None
+        }
+    }
+}
+
 /// Identifies one live media watcher/config/player selection. Snapshot
 /// producers capture the value before doing any async work so a result from an
 /// operation that began before a restart can never replace the new selection.
@@ -130,7 +143,7 @@ pub(crate) fn spawn_media_op(
         let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
-        let cur = client.snapshot_with_caps().await.unwrap_or(None);
+        let cur = snapshot_or_log(&client, "preflight").await;
         let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
         let res = match op {
             MediaOp::PlayPause => client.play_pause().await,
@@ -164,7 +177,7 @@ pub(crate) fn spawn_media_op(
         }
         let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
             generation,
-            snapshot: client.snapshot_with_caps().await.unwrap_or(None),
+            snapshot: snapshot_or_log(&client, "transport").await,
         }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
@@ -213,7 +226,7 @@ pub(crate) fn spawn_media_playlist(
             }
             let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
                 generation,
-                snapshot: client.snapshot_with_caps().await.unwrap_or(None),
+                snapshot: snapshot_or_log(&client, "playlist").await,
             }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -252,7 +265,13 @@ pub(crate) fn spawn_media_queue(
         let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
-        let q = client.queue().await.unwrap_or_default();
+        let q = match client.queue().await {
+            Ok(queue) => queue,
+            Err(e) => {
+                tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
+                Vec::new()
+            }
+        };
         let _ = tx.send(MediaQueueDelivery { request, queue: q }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
