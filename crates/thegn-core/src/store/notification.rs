@@ -27,6 +27,17 @@ pub trait NotificationStore {
         worktree_path: &str,
     ) -> Result<bool>;
 
+    /// Emit-once variant returning the inserted row identity. `None` means an
+    /// identical row already existed. Normalized automation events use this id
+    /// so repeated appends can never collide at whole-second resolution.
+    fn put_notification_once_id(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<Option<i64>>;
+
     /// Whether a notification with this `(kind, issue_id)` already exists.
     ///
     /// `put_notification` is a plain insert, so a producer that can be re-run

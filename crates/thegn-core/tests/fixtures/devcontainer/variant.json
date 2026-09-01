@@ -1,0 +1,7 @@
+{
+  "image": "rust:latest",
+  "remoteUser": "vscode",
+  "customizations": { "vscode": { "settings": { "editor.formatOnSave": true } } },
+  "privileged": true,
+  "hostRequirements": { "cpus": 4 }
+}

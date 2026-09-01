@@ -103,7 +103,25 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
 
             // REVIEW — decision + unresolved threads.
             let unresolved = data.threads.iter().filter(|t| !t.resolved).count();
-            if !data.threads.is_empty() || pr.review_decision.is_some() {
+            let top_level = data.review_snapshot.as_ref().map_or(0, |snapshot| {
+                snapshot.conversation.comments.len()
+                    + snapshot
+                        .conversation
+                        .reviews
+                        .iter()
+                        .filter(|review| !review.body.trim().is_empty())
+                        .count()
+            });
+            let mut per_file: Vec<(String, usize)> = Vec::new();
+            for thread in data.threads.iter().filter(|thread| !thread.resolved) {
+                if let Some((_, count)) = per_file.iter_mut().find(|(path, _)| *path == thread.path)
+                {
+                    *count += 1;
+                } else {
+                    per_file.push((thread.path.clone(), 1));
+                }
+            }
+            if !data.threads.is_empty() || pr.review_decision.is_some() || top_level > 0 {
                 let decision = pr
                     .review_decision
                     .as_deref()
@@ -115,10 +133,31 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                     seg(g(), format!("  {decision}")),
                 ];
                 if unresolved > 0 {
-                    l.push(seg(g(), " · "));
+                    l.push(seg(
+                        g(),
+                        format!(" {} ", crate::caps::active_glyphs().middot),
+                    ));
                     l.push(seg(hue(Hue::Amber), format!("⊘{unresolved} unresolved")));
                 }
+                if top_level > 0 {
+                    l.push(seg(g(), " · "));
+                    l.push(seg(g(), format!("{top_level} top-level")));
+                }
                 rows.push(PanelRow::plain(Line::segs(l)));
+                if !per_file.is_empty() {
+                    rows.push(PanelRow::plain(Line::segs(vec![
+                        seg(g2(), "files: "),
+                        seg(
+                            g(),
+                            per_file
+                                .iter()
+                                .take(6)
+                                .map(|(path, count)| format!("{path} x{count}"))
+                                .collect::<Vec<_>>()
+                                .join(&format!(" {} ", crate::caps::active_glyphs().middot)),
+                        ),
+                    ])));
+                }
                 for (i, th) in visible_threads(data, deep).enumerate() {
                     let mark = if th.resolved {
                         seg(hue(Hue::Green), "✓ ")

@@ -16,6 +16,7 @@ use thegn_core::plugin_api::{
     IoRequest, NegotiatedManifest, PluginApiError, PluginId, PluginRuntime, PluginSpec, RpcError,
     RpcErrorCode, RpcMessage, RpcResponse, SurfaceId, View,
 };
+use thegn_svc::issue::IssueCaps;
 use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -179,7 +180,22 @@ fn sync_provider_registry(state: &PluginsState) {
                 .find(|c| c.extension_point == ExtensionPoint::IssueProvider)
                 .map(|c| c.label.clone())
                 .unwrap_or_else(|| id.clone());
-            Some((id.clone(), label, bridge))
+            let caps = e
+                .contributions
+                .iter()
+                .find(|c| c.extension_point == ExtensionPoint::IssueProvider)
+                .map(|c| {
+                    IssueCaps::from_json(&c.caps).unwrap_or_else(|error| {
+                        tracing::warn!(
+                            plugin = %id,
+                            error = %error,
+                            "invalid issue provider caps; treating optional operations as unsupported"
+                        );
+                        IssueCaps::default()
+                    })
+                })
+                .unwrap_or_default();
+            Some((id.clone(), label, bridge, caps))
         })
         .collect();
     crate::plugin_providers::set_issue_providers(rows);
@@ -309,12 +325,12 @@ pub(crate) fn invoke_palette_action(
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
     for (plugin, alert) in state.pending_alerts.drain(..) {
         tokio::task::spawn_blocking(move || {
-            use thegn_core::store::NotificationStore;
             let Ok(db) = thegn_core::db::Db::open() else {
                 return;
             };
             // best-effort: the inbox is a cache; the audit log has the record.
-            let _ = db.put_notification(
+            let _ = crate::automation_events::emit(
+                &db,
                 "plugin",
                 &plugin,
                 &format!("{}: {}", alert.source, alert.message),

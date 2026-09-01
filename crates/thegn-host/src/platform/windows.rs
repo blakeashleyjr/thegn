@@ -150,6 +150,40 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
     std::fs::File::create(path)
 }
 
+/// The state directory is under the user's profile; Windows ACLs are inherited
+/// from that directory, so use the same append semantics as the Unix seam.
+pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Windows ACLs are inherited from the per-profile state directory.
+pub fn restrict_dir_owner_only_checked(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Open an existing path without traversing a final-component reparse point.
+/// `FILE_FLAG_OPEN_REPARSE_POINT` is kept local to the platform seam rather
+/// than enabling another windows-sys feature for one constant.
+pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(test)]
+pub fn symlink_file_for_test(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}
+
 /// No-op on Windows (no unix mode bits to tighten).
 pub fn restrict_dir_owner_only(_path: &std::path::Path) {}
 
@@ -203,8 +237,7 @@ impl GroupHandle {
             None => terminate_pid(self.pid),
         }
     }
-
-    /// Best-effort hard termination of the whole process job.
+    /// Forcefully terminate the whole Job Object.
     pub fn kill(&self) {
         self.terminate();
     }
@@ -346,4 +379,15 @@ pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
 #[allow(dead_code)] // test support: the dispatch done-gate tests build a symlinked artifact
 pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
+}
+
+/// Open a regular-file candidate without following a final reparse point.
+/// `FILE_FLAG_OPEN_REPARSE_POINT` is the Windows equivalent of Unix
+/// `O_NOFOLLOW`; callers still validate the opened descriptor's metadata.
+pub fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0020_0000)
+        .open(path)
 }

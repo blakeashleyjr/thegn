@@ -1,128 +1,314 @@
-//! The Media section (optional `[media]` feature): now-playing, a progress bar,
-//! and the transport/shuffle/loop/volume state of the controlled player. Hidden
-//! unless `[media] enabled`; empty when nothing is loaded.
+//! The docked Media section.  It is deliberately a projection of plain model
+//! data: provider work, queue reads, and cover-art decoding remain in the
+//! off-loop media tasks.
 
-use thegn_core::media::{LoopMode, MediaKind, PlaybackState};
+use thegn_core::media::{MediaRenderPolicy, MediaState, MediaWidth};
 use thegn_core::theme::Hue;
 
-use crate::seg::{Line, seg, sp};
+use crate::seg::{Line, seg};
 
-use super::{PanelRow, SectionCtx, bar_segs, d, g, g2, hint_row, hue, rule, t};
+use super::{PanelRow, SectionCtx, d, g, g2, hue, rule, t};
+use crate::panel::{MediaAction, PanelHit, Section};
 
-pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let mut rows: Vec<PanelRow> = Vec::new();
-    // The full-width body leads with a seam, like the other full section bodies,
-    // so the three width tiers render distinctly.
-    if ctx.full() {
-        rows.push(rule());
+const ART_COLS: usize = 18;
+const ART_ROWS: usize = 8;
+
+fn width(ctx: &SectionCtx<'_>) -> MediaWidth {
+    match ctx.ui.width {
+        crate::layout::PanelWidth::Normal => MediaWidth::Normal,
+        crate::layout::PanelWidth::Half => MediaWidth::Half,
+        crate::layout::PanelWidth::Full => MediaWidth::Full,
     }
-    let Some(m) = &ctx.model.panel.media else {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no player")])));
-        rows.push(hint_row(&[
-            ("⏯", "play/pause"),
-            ("⏭", "next"),
-            ("↵", "panel"),
-        ]));
-        if ctx.deep() {
-            rows.push(PanelRow::plain(Line::segs(vec![seg(
-                g2(),
-                "start a player (Spotify, mpv, VLC…); Alt-m ↵ opens the control panel".to_string(),
-            )])));
-        }
-        return rows;
-    };
+}
 
-    // Now-playing: ▶/❚❚ glyph + Artist — Title.
-    let glyph_fg = match m.state {
-        PlaybackState::Playing => hue(Hue::Green),
-        PlaybackState::Paused => hue(Hue::Amber),
-        PlaybackState::Stopped => g2(),
-    };
+fn marker(state: thegn_core::media::PlaybackState) -> (&'static str, Hue) {
+    let glyphs = crate::caps::active_glyphs();
+    match state {
+        thegn_core::media::PlaybackState::Playing => (glyphs.dot_filled, Hue::Green),
+        thegn_core::media::PlaybackState::Paused => (glyphs.dot_hollow, Hue::Amber),
+        thegn_core::media::PlaybackState::Stopped => (glyphs.cross, Hue::Purple),
+    }
+}
+
+fn action(label: &str, key: &str, op: MediaAction) -> PanelRow {
+    PanelRow::plain(Line::segs(vec![
+        seg(hue(Hue::Amber), format!("[{key}] ")),
+        seg(t(), label),
+    ]))
+    .with_hit(PanelHit::MediaAction(op))
+}
+
+fn detail_rows(
+    ctx: &SectionCtx<'_>,
+    state: &MediaState,
+    policy: MediaRenderPolicy,
+) -> Vec<PanelRow> {
+    let mut rows = Vec::new();
+    let (glyph, tone) = marker(state.state);
     rows.push(PanelRow::plain(Line::segs(vec![
-        seg(glyph_fg, format!("{} ", m.state.glyph())),
-        seg(t(), m.now_playing()),
+        seg(hue(tone), format!("{glyph} ")),
+        seg(t(), state.now_playing()),
     ])));
-
-    if !m.album.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(d(), m.album.clone())])));
+    if !state.album.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            d(),
+            state.album.clone(),
+        )])));
     }
-
-    // Progress bar + position stamp, when the player exposes a position.
-    if let (Some(pos), Some(len)) = (m.position, m.length)
+    if let (Some(pos), Some(len)) = (state.position, state.length)
         && len.as_secs() > 0
     {
         let frac = (pos.as_secs_f32() / len.as_secs_f32()).clamp(0.0, 1.0);
-        let w = ctx.cols.saturating_sub(14).clamp(6, 24);
-        let mut line = bar_segs(frac, w, hue(Hue::Green));
-        line.insert(0, sp(0));
-        if let Some(stamp) = m.position_stamp() {
-            line.push(seg(g(), format!("  {stamp}")));
-        }
+        let mut line = super::bar_segs(
+            frac,
+            ctx.cols.saturating_sub(14).clamp(6, 24),
+            hue(Hue::Green),
+        );
+        line.push(seg(
+            g(),
+            format!("  {}", state.position_stamp().unwrap_or_default()),
+        ));
         rows.push(PanelRow::plain(Line::segs(line)));
     }
-
-    // Status line: shuffle / loop / volume, only the parts the backend reports.
-    let mut status: Vec<crate::seg::Seg> = Vec::new();
-    if let Some(on) = m.shuffle {
-        status.push(seg(if on { hue(Hue::Green) } else { g() }, "🔀"));
-        status.push(seg(g(), if on { " on" } else { " off" }));
+    rows.push(action("play/pause", "space", MediaAction::PlayPause));
+    if state.can_go_next {
+        rows.push(action("next", "n", MediaAction::Next));
     }
-    if let Some(lm) = m.loop_mode {
-        if !status.is_empty() {
-            status.push(seg(g(), "  ·  "));
-        }
-        let label = match lm {
-            LoopMode::None => "loop off",
-            LoopMode::Track => "loop track",
-            LoopMode::Playlist => "loop all",
-        };
-        status.push(seg(
-            if matches!(lm, LoopMode::None) {
-                g()
-            } else {
-                hue(Hue::Green)
-            },
-            "🔁",
-        ));
-        status.push(seg(g(), format!(" {label}")));
+    if state.can_go_previous {
+        rows.push(action("previous", "p", MediaAction::Previous));
     }
-    if let Some(v) = m.volume {
-        if !status.is_empty() {
-            status.push(seg(g(), "  ·  "));
-        }
-        status.push(seg(g(), format!("vol {v}%")));
+    if policy.show_seek {
+        rows.push(action("seek forward", "right", MediaAction::SeekForward));
+        rows.push(action("seek back", "left", MediaAction::SeekBack));
     }
-    if !status.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(status)));
+    if policy.show_shuffle {
+        rows.push(action("shuffle", "s", MediaAction::Shuffle));
     }
-
-    // Video sources get a dedicated affordance row (chapters + fullscreen).
-    if matches!(m.kind, MediaKind::Video) {
-        rows.push(hint_row(&[("⏮⏭", "chapter"), ("⛶", "fullscreen")]));
+    if policy.show_loop {
+        rows.push(action("repeat", "L", MediaAction::Loop));
     }
-
-    // Transport hints: seek is offered only when the backend can seek.
-    if m.can_seek {
-        rows.push(hint_row(&[
-            ("⏯", "play/pause"),
-            ("⏪⏩", "seek"),
-            ("↵", "panel"),
-        ]));
-    } else {
-        rows.push(hint_row(&[
-            ("⏯", "play/pause"),
-            ("⏭", "next"),
-            ("↵", "panel"),
-        ]));
+    if policy.show_volume {
+        rows.push(action("volume up", "+", MediaAction::VolumeUp));
+        rows.push(action("volume down", "-", MediaAction::VolumeDown));
     }
-    // Wider tiers add a dim source footer (also makes the three widths distinct).
-    if ctx.deep() {
-        let mut foot = vec![seg(g2(), format!("via {}", m.player))];
-        if matches!(m.kind, MediaKind::Video) {
-            foot.push(seg(g(), "  ·  "));
-            foot.push(seg(hue(Hue::Purple), "video"));
-        }
-        rows.push(PanelRow::plain(Line::segs(foot)));
+    if policy.show_chapters {
+        rows.push(action("next chapter", "]", MediaAction::ChapterNext));
+        rows.push(action("previous chapter", "[", MediaAction::ChapterPrev));
+    }
+    if policy.show_fullscreen {
+        rows.push(action("fullscreen", "f", MediaAction::Fullscreen));
     }
     rows
+}
+
+pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
+    let mut rows = Vec::new();
+    let Some(state) = &ctx.model.panel.media else {
+        let hint = if ctx.full() {
+            "no provider snapshot; controls will appear when a player is active"
+        } else if ctx.deep() {
+            "enable a local player for source and detail controls"
+        } else {
+            "enable a local media player to use this panel"
+        };
+        return vec![
+            PanelRow::plain(Line::segs(vec![seg(g2(), "no player")])),
+            PanelRow::plain(Line::segs(vec![seg(d(), hint)])),
+        ];
+    };
+    let media = &ctx.ui.media;
+    let policy = MediaRenderPolicy::project(state, media.caps().unwrap_or_default(), width(ctx));
+    if policy.show_sources {
+        rows.push(rule());
+        for (i, source) in media.sources.iter().enumerate() {
+            rows.push(
+                PanelRow::plain(Line::segs(vec![
+                    seg(
+                        if source == &state.player {
+                            hue(Hue::Green)
+                        } else {
+                            g()
+                        },
+                        format!("{} ", crate::caps::active_glyphs().dot_filled),
+                    ),
+                    seg(t(), source.clone()),
+                ]))
+                .with_hit(PanelHit::Row(Section::Media, i)),
+            );
+        }
+    }
+    rows.extend(detail_rows(ctx, state, policy));
+    if policy.show_queue {
+        rows.push(rule());
+        rows.push(PanelRow::plain(Line::segs(vec![seg(d(), "up next")])));
+        let offset = media.sources.len();
+        for (i, item) in media.queue.iter().enumerate() {
+            let current = if item.is_current {
+                crate::caps::active_glyphs().caret_open
+            } else {
+                " "
+            };
+            rows.push(
+                PanelRow::plain(Line::segs(vec![
+                    seg(g(), format!("{current} ")),
+                    seg(t(), item.label()),
+                ]))
+                .with_hit(PanelHit::Row(Section::Media, offset + i)),
+            );
+        }
+    }
+    if policy.show_art && media.art_visible() {
+        // Art is optional decoration and is intentionally not a hit target.
+        if let Some(art) = &media.art {
+            rows.extend(art.lines.iter().cloned().map(PanelRow::plain));
+        } else {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                format!("art {ART_COLS}x{ART_ROWS}"),
+            )])));
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panel::media::MediaPanelState;
+    use thegn_core::media::{MediaCaps, QueueItem};
+
+    fn state() -> MediaState {
+        MediaState {
+            player: "player".into(),
+            title: "track".into(),
+            state: thegn_core::media::PlaybackState::Playing,
+            can_go_next: true,
+            can_go_previous: true,
+            can_seek: true,
+            volume: Some(50),
+            shuffle: Some(false),
+            loop_mode: Some(thegn_core::media::LoopMode::None),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn late_queue_and_art_deliveries_are_identity_checked() {
+        let mut panel = MediaPanelState::default();
+        let first = state();
+        panel.begin_request(Some(&first));
+        let first_request = panel.take_queue_request(Some(&first)).unwrap();
+        panel.set_queue(
+            first_request.clone(),
+            Some(&first),
+            vec![QueueItem {
+                title: "one".into(),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(panel.queue.len(), 1);
+        let mut changed = first.clone();
+        changed.track_id = Some("new".into());
+        let stale_request = panel
+            .take_sources_request(Some(&first))
+            .unwrap_or_else(|| panic!("source request expected"));
+        panel.sync_snapshot(Some(&changed), None, 0);
+        panel.set_queue(first_request, Some(&changed), vec![QueueItem::default()]);
+        assert!(panel.queue.is_empty());
+        panel.set_sources(stale_request, Some(&changed), vec!["stale".into()]);
+        assert!(panel.sources.is_empty());
+    }
+
+    #[test]
+    fn action_targets_are_distinct_from_source_and_queue_rows() {
+        assert_eq!(
+            PanelHit::MediaAction(MediaAction::Next),
+            PanelHit::MediaAction(MediaAction::Next)
+        );
+        assert_ne!(
+            PanelHit::Row(Section::Media, 0),
+            PanelHit::MediaAction(MediaAction::Next)
+        );
+    }
+
+    #[test]
+    fn width_projection_adds_source_and_queue_rows_progressively() {
+        let mut model = crate::chrome::FrameModel::default();
+        model.panel.media = Some(state());
+        let mut ui = crate::panel::PanelUi::default();
+        ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            Some(MediaCaps {
+                queue: true,
+                ..MediaCaps::default()
+            }),
+            1,
+        );
+        let source_request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_sources(
+            source_request,
+            model.panel.media.as_ref(),
+            vec!["player".into()],
+        );
+        ui.media.begin_request(model.panel.media.as_ref());
+        let request = ui
+            .media
+            .take_queue_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_queue(
+            request,
+            model.panel.media.as_ref(),
+            vec![QueueItem {
+                id: "next".into(),
+                title: "next track".into(),
+                ..Default::default()
+            }],
+        );
+        let mut rows = |width| {
+            ui.width = width;
+            let ctx = SectionCtx {
+                model: &model,
+                ui: &ui,
+                cols: 40,
+                rows: 30,
+            };
+            content(&ctx)
+        };
+        let normal = rows(crate::layout::PanelWidth::Normal);
+        let half = rows(crate::layout::PanelWidth::Half);
+        let full = rows(crate::layout::PanelWidth::Full);
+        assert!(
+            !normal
+                .iter()
+                .any(|r| r.hit == Some(PanelHit::Row(Section::Media, 0)))
+        );
+        assert!(
+            half.iter()
+                .any(|r| r.hit == Some(PanelHit::Row(Section::Media, 0)))
+        );
+        assert!(
+            full.iter()
+                .any(|r| r.hit == Some(PanelHit::Row(Section::Media, 1)))
+        );
+    }
+
+    #[test]
+    fn keyboard_and_mouse_transport_intents_converge() {
+        for (key, action) in [
+            (' ', MediaAction::PlayPause),
+            ('n', MediaAction::Next),
+            ('p', MediaAction::Previous),
+            ('s', MediaAction::Shuffle),
+            ('L', MediaAction::Loop),
+        ] {
+            assert_eq!(
+                crate::media_panel::action_for_key(&termwiz::input::KeyCode::Char(key)),
+                Some(action)
+            );
+            assert_eq!(PanelHit::MediaAction(action), PanelHit::MediaAction(action));
+        }
+    }
 }

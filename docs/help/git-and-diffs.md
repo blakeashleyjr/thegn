@@ -58,6 +58,11 @@ structural render and the internal unified view. Setting `structural_diff`
 also makes `Alt-/` open this native view even when a `[[tools]] diff` is
 seeded — an explicit opt-in wins over the default.
 
+In the internal full-screen diff, **`e`** opens the selected file in your IDE;
+on an added or context line it includes that new-side line number. A deleted
+line has no new-side location, so thegn opens the file and says why. The flat
+structural rendering has no stable selected file—press `t` first.
+
 Structural output is **read-only**: it is never fed to `git apply`, and
 every _stageable_ diff (inline hunks, line staging) keeps the sanitized
 flags regardless of this setting. Acquire/inspect `difft` via

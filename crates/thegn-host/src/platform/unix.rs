@@ -164,13 +164,57 @@ pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::F
         .open(path)
 }
 
+/// Open a log for owner-only append. Hook output can contain credentials even
+/// when the hook itself was configured by a trusted user, so do not rely on
+/// the process umask for this file.
+pub fn append_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    // Tighten logs created by older versions too.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// Restrict a directory to owner-only access and preserve any chmod failure for
+/// callers that need to report an incomplete security boundary.
+pub fn restrict_dir_owner_only_checked(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Open an existing path without following a symlink in its final component.
+/// Callers must validate the returned handle's metadata before consuming it.
+pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        // A metadata check after `open` is too late for FIFOs: opening one for
+        // reading can block forever before the caller can reject it as a
+        // non-regular file. `O_NONBLOCK` is inert for regular files and keeps
+        // hostile/racy special files on the normal error path.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(test)]
+pub fn symlink_file_for_test(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
 /// Restrict a directory to owner-only access (mode `0700`). Best-effort — a
 /// failure hardens less but must not stop recording.
 pub fn restrict_dir_owner_only(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
     // best-effort: 0700 is defence-in-depth; the dir is already under the
     // per-profile state root.
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)); // best-effort: hardening: a failed chmod must never block the caller
+    let _ = restrict_dir_owner_only_checked(path); // best-effort: hardening: a failed chmod must never block the caller
 }
 
 /// A spawned child's process group — what [`GroupHandle::terminate`] reaps
@@ -198,9 +242,9 @@ impl GroupHandle {
         )
         .ok();
     }
-
-    /// Best-effort hard termination of the whole process group.
+    /// Forcefully terminate the whole process group.
     pub fn kill(&self) {
+        // best-effort: signal: the process may already be gone
         nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(self.pgid),
             nix::sys::signal::Signal::SIGKILL,
@@ -296,4 +340,14 @@ pub fn max_files_per_proc() -> Option<u64> {
 #[allow(dead_code)] // test support: the dispatch done-gate tests build a symlinked artifact
 pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
+}
+
+/// Open a regular-file candidate without following a final symlink. Callers
+/// still validate the opened descriptor's metadata before consuming it.
+pub fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }

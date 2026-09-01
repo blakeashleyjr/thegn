@@ -135,6 +135,44 @@ programs.thegn = {
 
 Or just the binary: `nix profile install github:blakeashleyjr/thegn`.
 
+For a dedicated, pinned terminal and font composition, run:
+
+```sh
+nix run github:blakeashleyjr/thegn#batteries
+```
+
+This launches the stable wrapped `thegn` in Alacritty with FiraCode Nerd Font,
+all from the flake's pinned Nixpkgs. The font is visible only through the
+launcher-scoped fontconfig file; it is not installed globally. On first launch,
+the launcher copies the bundled profile to
+`$XDG_CONFIG_HOME/thegn/alacritty.toml` (or
+`~/.config/thegn/alacritty.toml`) if that file does not exist. Later launches
+reuse your copy. Run `thegn doctor` inside the opened terminal to verify the
+resolved terminal capabilities.
+
+Home-manager can compose this without another module option: keep the stable
+package as `programs.thegn.package` so it owns the generated thegn config, and
+add the batteries launcher with the existing `home.packages` mechanism:
+
+```nix
+programs.thegn = {
+  enable = true;
+  package = inputs.thegn.packages.${pkgs.stdenv.hostPlatform.system}.default;
+};
+home.packages = [
+  inputs.thegn.packages.${pkgs.stdenv.hostPlatform.system}.batteries
+];
+```
+
+Invoke that installed launcher as `thegn-batteries`. The derivation is
+build-tested on x86_64 Linux; a clean-host interactive rehearsal remains an
+entry criterion before this path is listed as verified on additional hosts.
+The batteries scope deliberately stops here: there is no
+`install.sh --batteries`, distro package-manager mutation, Homebrew cask,
+downloadable unsigned macOS app, Windows Terminal profile, or
+Flatpak/AppImage/nix-bundle. Each needs its relevant host, signing, or driver
+rehearsal before it becomes an install instruction.
+
 ### nix-darwin (macOS)
 
 The home-manager module above works on darwin unchanged. nix-darwin has no
