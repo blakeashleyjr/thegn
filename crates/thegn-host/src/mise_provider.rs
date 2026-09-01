@@ -30,6 +30,7 @@ use thegn_core::toolchain_activation::{
 
 const ORIGIN: &str = "mise";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -108,6 +109,83 @@ fn shims_dir() -> Option<PathBuf> {
 
 fn executable_available() -> bool {
     thegn_core::util::which_path("mise").is_some()
+}
+
+/// Install the active worktree's declared tools after the user has explicitly
+/// approved its current config set. This is intentionally the only install
+/// entry point: launch activation uses shims/cache and never calls it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the bounded install child runs on an explicit off-loop worker"
+)]
+pub(crate) fn install(cfg: &Config, worktree: &Path, repo_root: &Path) -> Result<(), String> {
+    if !worktree.is_dir() {
+        return Err("active worktree is unavailable".into());
+    }
+    if GitLoc::for_worktree(worktree).is_remote() {
+        return Err("selected worktree is remote; install its toolchain there".into());
+    }
+    if cfg.toolchain.mise.inject == MiseInject::Off {
+        return Err("toolchain activation is off ([toolchain.mise] inject = \"off\")".into());
+    }
+    let (detected, identity) = config_set(worktree);
+    if detected.is_empty() {
+        return Err("no declared worktree toolchain found".into());
+    }
+    let Some(identity) = identity else {
+        return Err("worktree toolchain config changed; retry install".into());
+    };
+    let db = thegn_core::db::Db::open()
+        .map_err(|_| "repo trust state is unavailable; install refused".to_string())?;
+    let approved = db
+        .repo_trust_approved(&repo_root.to_string_lossy())
+        .map_err(|_| "repo trust state is unavailable; install refused".to_string())?;
+    let request = mise_env_request(&identity);
+    if !repo_trust::is_approved(&request, &approved) {
+        return Err("worktree toolchain config is not approved; review `thegn repo trust`".into());
+    }
+    if !executable_available() {
+        return Err("toolchain executable is not installed".into());
+    }
+
+    let mut child = Command::new("mise")
+        .arg("install")
+        .current_dir(worktree)
+        .env_clear()
+        .envs(std::env::vars().filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "PATH" | "HOME" | "USER" | "LANG" | "MISE_DATA_DIR" | "XDG_DATA_HOME" | "MISE_ENV"
+            )
+        }))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start toolchain install: {e}"))?;
+    let deadline = Instant::now() + INSTALL_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|e| format!("toolchain install failed: {e}"))?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("toolchain install timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("toolchain install failed: {e}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "toolchain install failed".into())
 }
 
 fn read_cache(identity: &ConfigSetIdentity) -> Option<ActivationLayer> {
@@ -190,11 +268,10 @@ fn parse_env_output(raw: &str) -> Option<ActivationLayer> {
             if let Some(value) = value {
                 env.insert(key.clone(), value.to_string());
             }
-        } else if key == "PATH" {
-            if let Some(value) = value {
-                paths
-                    .extend(std::env::split_paths(value).map(|p| p.to_string_lossy().into_owned()));
-            }
+        } else if key == "PATH"
+            && let Some(value) = value
+        {
+            paths.extend(std::env::split_paths(value).map(|p| p.to_string_lossy().into_owned()));
         }
     }
     Some(ActivationLayer::ready(
@@ -204,6 +281,10 @@ fn parse_env_output(raw: &str) -> Option<ActivationLayer> {
     ))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the bounded resolver child runs on an explicit off-loop worker"
+)]
 fn run_env(worktree: &Path) -> Result<String, String> {
     let mut child = Command::new("mise")
         .args(["env", "-s", "json"])
@@ -258,6 +339,10 @@ fn run_env(worktree: &Path) -> Result<String, String> {
 
 /// Run a bounded, non-interactive informational query. This is used only by
 /// the CLI doctor path; hydration and launch use `status`/the cache above.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the bounded doctor child runs on an explicit off-loop worker"
+)]
 fn run_info(worktree: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut child = Command::new("mise")
         .args(args)
@@ -425,11 +510,11 @@ impl ToolchainProvider for MiseProvider {
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let mut env = Vec::new();
-        if context.policy == ActivationPolicy::Environment {
-            if let Some(layer) = &self.cached {
-                paths.extend(layer.path_entries.iter().cloned());
-                env.extend(layer.env.iter().cloned());
-            }
+        if context.policy == ActivationPolicy::Environment
+            && let Some(layer) = &self.cached
+        {
+            paths.extend(layer.path_entries.iter().cloned());
+            env.extend(layer.env.iter().cloned());
         }
         ProviderAnswer::Ready(ActivationLayer::ready(ORIGIN, paths, env))
     }
@@ -461,16 +546,16 @@ pub(crate) fn activation_for_launch(
     };
     let detected = requirements.toolchain_files.clone();
     let identity = (!loc.is_remote())
-        .then(|| config_set_identity(&worktree.to_string(), Path::new(worktree), &detected))
+        .then(|| config_set_identity(worktree, Path::new(worktree), &detected))
         .flatten();
     let desired = policy(cfg, approved);
     let cached = identity.as_ref().and_then(read_cache);
-    if desired == ActivationPolicy::Environment && approved {
-        if let Some(identity) = &identity {
-            if cached.is_none() {
-                prewarm(Path::new(worktree), identity);
-            }
-        }
+    if desired == ActivationPolicy::Environment
+        && approved
+        && let Some(identity) = &identity
+        && cached.is_none()
+    {
+        prewarm(Path::new(worktree), identity);
     }
     let provider = MiseProvider {
         binary: executable_available(),

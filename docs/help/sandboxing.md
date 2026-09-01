@@ -4,7 +4,7 @@ title: Sandboxing
 parent: workflows
 order: 3
 contexts: [panel:sandbox, panel:environments]
-actions: [warm-pool-increment, warm-pool-decrement]
+actions: [warm-pool-increment, warm-pool-decrement, toolchain-install]
 ---
 
 # Sandboxing
@@ -176,6 +176,17 @@ Pool state shows on the sidebar's workspace chip, not in this section.
 An environment can keep a **warm spare pool** so new worktrees start
 instantly; the warm-pool actions raise and lower the active workspace's
 target (palette-runnable and bindable).
+
+### Worktree toolchains
+
+When a worktree declares a mise or asdf toolchain, thegn adds its safe shims to
+the pane `PATH`. The optional mise environment layer is lower precedence than
+an environment bundle or devshell and is applied only after the current repo
+config set is approved. Use the command-palette action `toolchain-install` to
+run the bounded, explicit install operation; opening a pane never downloads
+tools. A `(mise ~)` token means approval is pending, while `(mise !)` means
+the provider or shims are unavailable. Remote worktrees remain responsible
+for installing their tools on the remote target.
 
 ## Remote worktrees
 
