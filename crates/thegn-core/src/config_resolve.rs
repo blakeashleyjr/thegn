@@ -1106,6 +1106,11 @@ impl Config {
                     was |= self.issues.issue_accounts.len() != before;
                     was
                 }
+                Feature::Voice => {
+                    let was = self.voice.enabled;
+                    self.voice.enabled = false;
+                    was
+                }
             };
             if changed {
                 clamped.push(feat);

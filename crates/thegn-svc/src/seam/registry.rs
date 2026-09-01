@@ -37,7 +37,28 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(push_probes(cfg));
     out.extend(structural_probes(cfg));
     out.extend(host_discovery_probes(cfg));
+    out.extend(voice_probes(cfg));
     out
+}
+
+fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use thegn_core::config::VoiceKind;
+    let v = &cfg.voice;
+    if !v.enabled && v.capture_command.is_empty() && v.command.is_empty() {
+        return Vec::new();
+    }
+    if v.kind.is_reserved() {
+        return vec![ProbeReport::reserved("voice", v.kind.as_str())];
+    }
+    match v.kind {
+        VoiceKind::Command => {
+            let mut report = crate::voice::CommandVoiceProvider::new(v.clone()).probe();
+            if !v.enabled {
+                report = report.note("[voice] enabled = false; explicit consent is off");
+            }
+            vec![report]
+        }
+    }
 }
 
 /// The push-to-phone channel: the outbound provider (`ntfy` / reserved kinds)

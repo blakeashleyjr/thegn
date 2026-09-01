@@ -237,7 +237,6 @@ impl GroupHandle {
             None => terminate_pid(self.pid),
         }
     }
-
     /// Forcefully terminate the whole Job Object.
     pub fn kill(&self) {
         self.terminate();

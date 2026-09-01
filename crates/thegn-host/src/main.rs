@@ -240,6 +240,7 @@ mod testkit;
 mod theme_builder;
 mod theme_store;
 mod toast;
+mod voice;
 mod usage_budget;
 mod vps_bridge;
 mod vps_reaper;

@@ -242,7 +242,6 @@ impl GroupHandle {
         )
         .ok();
     }
-
     /// Forcefully terminate the whole process group.
     pub fn kill(&self) {
         // best-effort: signal: the process may already be gone
