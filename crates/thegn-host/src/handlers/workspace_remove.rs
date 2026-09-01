@@ -149,15 +149,15 @@ pub(crate) fn workspace_removed_status(
 ) -> String {
     if keep_files {
         match orphan_count {
-            0 => format!("Removed workspace '{display}' (files kept on disk)"),
-            1 => format!("Removed workspace '{display}' (1 worktree remains on disk)"),
-            n => format!("Removed workspace '{display}' ({n} worktrees remain on disk)"),
+            0 => format!("Removed project '{display}' (files kept on disk)"),
+            1 => format!("Removed project '{display}' (1 worktree remains on disk)"),
+            n => format!("Removed project '{display}' ({n} worktrees remain on disk)"),
         }
     } else {
         match orphan_count {
-            0 => format!("Removed workspace '{display}'"),
-            1 => format!("Deleting workspace '{display}' (removing 1 worktree from disk…)"),
-            n => format!("Deleting workspace '{display}' (removing {n} worktrees from disk…)"),
+            0 => format!("Removed project '{display}'"),
+            1 => format!("Deleting project '{display}' (removing 1 worktree from disk…)"),
+            n => format!("Deleting project '{display}' (removing {n} worktrees from disk…)"),
         }
     }
 }
@@ -430,23 +430,23 @@ mod tests {
         // Keep-files reports survivors; destructive reports the background job.
         assert_eq!(
             workspace_removed_status("lib", true, 0),
-            "Removed workspace 'lib' (files kept on disk)"
+            "Removed project 'lib' (files kept on disk)"
         );
         assert_eq!(
             workspace_removed_status("lib", true, 1),
-            "Removed workspace 'lib' (1 worktree remains on disk)"
+            "Removed project 'lib' (1 worktree remains on disk)"
         );
         assert_eq!(
             workspace_removed_status("lib", true, 3),
-            "Removed workspace 'lib' (3 worktrees remain on disk)"
+            "Removed project 'lib' (3 worktrees remain on disk)"
         );
         assert_eq!(
             workspace_removed_status("lib", false, 0),
-            "Removed workspace 'lib'"
+            "Removed project 'lib'"
         );
         assert_eq!(
             workspace_removed_status("lib", false, 3),
-            "Deleting workspace 'lib' (removing 3 worktrees from disk…)"
+            "Deleting project 'lib' (removing 3 worktrees from disk…)"
         );
     }
 

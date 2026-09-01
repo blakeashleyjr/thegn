@@ -2421,7 +2421,7 @@ fn merge_total(
 /// rather than rendered stale.
 pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for id in ["palette", "new-worktree", "switch-workspace", "quit"] {
+    for id in ["palette", "new-worktree", "switch-project", "quit"] {
         let (Some(chord), Some(spec)) = (
             crate::keymap::chord_hint_for(cfg, id),
             crate::keymap::action_spec(id),
@@ -4207,9 +4207,9 @@ pub(crate) fn toggle_across_scope(
         None,
     );
     if all {
-        "Across: all workspaces".into()
+        "Across: all projects".into()
     } else {
-        "Across: this workspace".into()
+        "Across: this project".into()
     }
 }
 
@@ -4237,9 +4237,9 @@ pub(crate) fn toggle_merge_scope(
         None,
     );
     if all {
-        "Merge queue: all workspaces".into()
+        "Merge queue: all projects".into()
     } else {
-        "Merge queue: this workspace".into()
+        "Merge queue: this project".into()
     }
 }
 

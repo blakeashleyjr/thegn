@@ -91,7 +91,7 @@ pub(crate) fn activate_row_target(
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
             let Ok(db) = thegn_core::db::Db::open() else {
-                model.status = "Can't switch workspace — the state DB is unavailable".into();
+                model.status = "Can't switch project — the state DB is unavailable".into();
                 return false;
             };
             // Park the outgoing workspace's panes (kept alive) and restore the
@@ -112,7 +112,7 @@ pub(crate) fn activate_row_target(
                 // The cold resurrect refused (checkout deleted outside thegn,
                 // `.git` unreadable). Absolutely nothing happening on Enter is
                 // the one outcome the user can't diagnose — say why.
-                model.status = format!("Can't open workspace — {repo_path} is gone or unreadable");
+                model.status = format!("Can't open project — {repo_path} is gone or unreadable");
                 return false;
             }
             workspace_switched = true;

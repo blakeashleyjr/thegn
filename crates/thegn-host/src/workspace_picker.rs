@@ -573,7 +573,7 @@ impl WorkspacePicker {
         };
         let rows = if err.is_some() { 4 } else { 3 }; // input (+err) + rule + footer
         let spec = LayerSpec {
-            title: "new workspace".into(),
+            title: "new project".into(),
             badge: Some(" tab: fuzzy ".into()),
             cols: COLS,
             rows,
@@ -626,7 +626,7 @@ impl WorkspacePicker {
             fg: Tok::Slot(S::Ghost3),
         };
         let spec = LayerSpec {
-            title: "new workspace".into(),
+            title: "new project".into(),
             badge: Some(" cloning ".into()),
             cols: COLS,
             rows: 4, // title + rule + progress + footer
@@ -677,7 +677,7 @@ impl WorkspacePicker {
         {
             let shown = self.matches.len().min(MAX_ITEMS);
             let spec = LayerSpec {
-                title: "new workspace".into(),
+                title: "new project".into(),
                 badge: Some(" tab: manual ".into()),
                 cols: COLS,
                 rows: shown + 4, // prompt + rule + items + rule + footer
