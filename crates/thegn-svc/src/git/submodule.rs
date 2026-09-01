@@ -136,7 +136,11 @@ pub(crate) fn states(loc: &GitLoc) -> Result<Vec<SubmoduleState>> {
         loc,
         &["status", "--porcelain=v1", "-z", "--no-renames"],
     )?);
-    let recorded = recorded_gitlinks(loc).unwrap_or_default();
+    // The recorded pointer is part of the state read. If it cannot be read,
+    // fail the submodule field so the host can retain its last-known value;
+    // treating the missing map as empty would misclassify every initialized
+    // submodule as moved/dirty.
+    let recorded = recorded_gitlinks(loc)?;
     let mut states = parse_submodule_status(&status_output)
         .map_err(|e| anyhow::anyhow!("parse submodule status: {e}"))?;
     for state in &mut states {
