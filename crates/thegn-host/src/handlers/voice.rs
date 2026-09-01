@@ -51,6 +51,7 @@ pub(crate) fn cancel(voice: &mut VoiceController, waker: &TerminalWaker) -> Stri
     if !voice.is_recording() && !matches!(voice.state, VoiceState::Transcribing { .. }) {
         return "".into();
     }
+    voice.cancel_transcription();
     apply_event(voice, VoiceEvent::Cancel, waker, None, None, 0);
     "Voice cancelled".into()
 }
@@ -64,13 +65,14 @@ pub(crate) fn reconfigure(
     model: &mut FrameModel,
     waker: &TerminalWaker,
 ) {
-    if !cfg.enabled && !matches!(voice.state, VoiceState::Idle) {
+    if cfg != *voice.config() && !matches!(voice.state, VoiceState::Idle) {
         let pane_id = match voice.state {
             VoiceState::Recording { pane_id, .. } | VoiceState::Transcribing { pane_id, .. } => {
                 pane_id
             }
             VoiceState::Idle => 0,
         };
+        voice.cancel_transcription();
         apply_event(voice, VoiceEvent::Cancel, waker, Some(model), None, pane_id);
     }
     voice.configure(cfg);
@@ -98,6 +100,11 @@ pub(crate) fn drain(
             VoiceMessage::CaptureComplete { .. } | VoiceMessage::CaptureFailed { .. }
         ) {
             voice.capture_finished();
+        }
+        if let VoiceMessage::TranscriptSucceeded { request_id, .. }
+        | VoiceMessage::TranscriptFailed { request_id, .. } = &message
+        {
+            voice.transcription_finished(*request_id);
         }
         let event = match message {
             VoiceMessage::CaptureComplete { pane_id, wav } => {
