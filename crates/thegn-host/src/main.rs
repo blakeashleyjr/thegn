@@ -16,6 +16,10 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod automation_events;
+mod automation_executor;
+mod automation_runtime;
+mod autopilot_driver;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
@@ -30,12 +34,12 @@ mod caret;
 mod caret_ratchet_tests;
 mod center;
 mod channel_state;
-mod chime;
 mod chrome;
 mod ci_refresh;
 mod cli_help;
 mod clipboard;
 mod cmd;
+mod compat;
 mod complete;
 mod completions_health;
 mod compositor;
@@ -46,6 +50,7 @@ mod daemon;
 mod db_task;
 mod desktop_notify;
 mod detail;
+mod devcontainer_provider;
 mod diag;
 mod diff_view;
 mod direnv_warm;
@@ -76,6 +81,7 @@ mod graphics;
 mod handlers;
 mod help;
 mod hibernator;
+mod hook_run;
 mod host_flow;
 mod host_provision;
 mod host_ui;
@@ -88,6 +94,8 @@ mod hydrate_terminal;
 mod hydrate_tracker;
 mod hydrate_tuning;
 mod hydrate_weather;
+mod i18n_surface;
+mod ide_handoff;
 mod idle_poll;
 mod input;
 mod integrate;
@@ -114,7 +122,8 @@ mod mcp_proxy;
 mod measure;
 mod media_art;
 mod media_ctl;
-mod media_overlay;
+#[path = "handlers/media_panel.rs"]
+mod media_panel;
 mod media_watch;
 mod mem;
 mod menu;
@@ -130,11 +139,11 @@ mod monitor;
 mod monitor_action;
 mod monitor_pipeline;
 mod mousefilter;
-mod mq_assets;
 mod naming;
 mod nav;
 mod nixcache;
 mod notification_delivery;
+mod notification_sound;
 mod notify;
 mod onboarding;
 mod owl;
@@ -161,9 +170,12 @@ mod plugins;
 mod pr_driver;
 mod pr_view;
 mod predict;
+mod preview;
+mod preview_fetch;
 mod preview_gfx;
 mod preview_pane;
 mod preview_render;
+mod preview_watch;
 mod probe;
 mod profile;
 mod provider_factory;
@@ -181,6 +193,9 @@ mod render_plan;
 mod replay;
 mod replay_overlay;
 mod repo_index;
+mod review_handoff;
+mod review_rows;
+mod review_task_handoff;
 mod revtunnel;
 mod run;
 mod sandbox_events;
@@ -202,9 +217,11 @@ mod sidebar;
 mod sidebar_help;
 mod sidebar_keytable;
 mod sidebar_legend;
+mod sidebar_mq;
 mod sidebar_order;
 mod sidebar_pipeline;
 mod sidebar_view;
+mod skill_seed;
 mod snapshot;
 mod sprite_bridge;
 mod ssh_shim;
@@ -223,7 +240,11 @@ mod terminal_wizard;
 #[cfg(test)]
 mod testenv;
 mod testkit;
+mod theme_builder;
+mod theme_store;
 mod toast;
+mod usage_budget;
+mod voice;
 mod vps_bridge;
 mod vps_reaper;
 mod warmcache;
@@ -232,6 +253,7 @@ mod wizard;
 mod workspace_create;
 mod workspace_picker;
 mod workspace_pool;
+mod worktree_lifecycle;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -268,6 +290,11 @@ pub struct Cli {
 /// `thegn` (no subcommand) launches the interactive compositor.
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Inspect trusted automation rules or dry-run an event fixture.
+    Automations {
+        #[command(subcommand)]
+        action: cmd::automations::Action,
+    },
     /// GitHub PR data + actions for a worktree.
     Pr {
         #[command(subcommand)]
@@ -288,6 +315,11 @@ pub enum Command {
     Dispatch {
         #[command(subcommand)]
         action: cmd::dispatch::Action,
+    },
+    /// Opt-in issue-to-PR supervisor; `status` is read-only and never starts work.
+    Autopilot {
+        #[command(subcommand)]
+        action: cmd::autopilot::Action,
     },
     /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
     Ci {
@@ -458,8 +490,9 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::zone::Action,
     },
-    /// Manage projects (multi-repo workspace groups — grouping only, no policy;
-    /// distinct from tracker `[issues] project_key`).
+    /// Manage programs (multi-repo groups — grouping only, no policy; distinct
+    /// from the one-repo project UI and tracker `[issues] project_key`).
+    #[command(name = "program", visible_alias = "project")]
     Project {
         #[command(subcommand)]
         action: cmd::project::Action,
@@ -494,6 +527,11 @@ pub enum Command {
     Agent {
         #[command(subcommand)]
         action: cmd::agent::Action,
+    },
+    /// Embedded and configured agent skills: list, show, and seed worktrees.
+    Skills {
+        #[command(subcommand)]
+        action: cmd::skills::Action,
     },
     /// The capability catalog as a generic client: `list`, `schema`,
     /// `call <cap>` (catalog-driven HTTP over the control socket).
@@ -578,6 +616,11 @@ pub enum Command {
     Session {
         #[command(subcommand)]
         action: cmd::session::SessionAction,
+    },
+    /// Stream the daemon's filtered live event feed (`events tail`).
+    Events {
+        #[command(subcommand)]
+        action: cmd::events::Action,
     },
     /// Attach to a running local session over the pane daemon's unix socket —
     /// the local thin client. With no argument, lists live sessions to pick
@@ -799,6 +842,7 @@ fn main() -> anyhow::Result<()> {
     // Parse through the grouped-help wrapper (cli_help) so top-level --help
     // renders commands under semantic headings; behavior is otherwise
     // identical to `Cli::parse()`.
+    compat::warn_legacy_argv(&std::env::args().collect::<Vec<_>>());
     let matches = cli_help::attach(<Cli as clap::CommandFactory>::command())
         .try_get_matches()
         .unwrap_or_else(|e| e.exit());
@@ -871,6 +915,13 @@ fn main() -> anyhow::Result<()> {
                 &cli.overrides,
                 cli.config.clone(),
             );
+            // `open` may fall through and become the interactive controller.
+            // Install its schema authority before `merge_db_hosts` performs the
+            // first best-effort DB open.
+            thegn_core::db::install_migration_policy(
+                &cfg.database,
+                thegn_core::db::MigrationActor::Controller,
+            )?;
             thegn_core::host_config::merge_db_hosts(&mut cfg);
             let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
             match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
@@ -905,16 +956,24 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Per-profile advisory singleton (H): one interactive window per named
-    // profile. Advisory only — if the profile is already running we warn and
-    // continue (per-profile DBs are separate + WAL-safe; a hard refusal would
-    // break running thegn inside thegn). No-op for the default profile. The
-    // guard is held for the whole process (released on exit/death, never stale).
+    // Per-profile advisory singleton (H): one interactive window per profile.
+    // Advisory only — if the profile is already running we warn for named
+    // profiles and continue (per-profile DBs are separate + WAL-safe; a hard
+    // refusal would break running thegn inside thegn). The default profile is
+    // silent for compatibility. The guard is held for the whole process
+    // (released on exit/death, never stale).
     let _profile_lock = thegn_core::profile::acquire_singleton();
     if matches!(
         _profile_lock,
-        thegn_core::profile::Singleton::AlreadyRunning
+        thegn_core::profile::Singleton::MigrationInProgress
     ) {
+        anyhow::bail!("the active profile is migrating a session; retry after it completes");
+    }
+    if matches!(
+        _profile_lock,
+        thegn_core::profile::Singleton::AlreadyRunning(_)
+    ) && !thegn_core::profile::active().is_default()
+    {
         thegn_core::msg::warn(&format!(
             "profile {:?} appears to be already running in another window; \
              continuing (windows share the profile's WAL database)",
@@ -1030,6 +1089,33 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // Install before `merge_db_hosts` (the first DB consumer on this path).
+    // Only processes that actually own long-lived shared state are controllers;
+    // a worktree-resolved `thegn dispatch report` is always a client.
+    let migration_actor = if matches!(
+        &command,
+        Command::Serve { .. } | Command::Daemon { action: None, .. }
+    ) {
+        thegn_core::db::MigrationActor::Controller
+    } else {
+        thegn_core::db::MigrationActor::Client
+    };
+    thegn_core::db::install_migration_policy(&cfg.database, migration_actor)?;
+    // The dry-run is store-free by contract: dispatch it before host merging,
+    // diagnostics, provider installation, and the automation runtime. Config
+    // loading itself reads only the caller-selected files.
+    if let Command::Automations {
+        action: cmd::automations::Action::Test { .. },
+    } = &command
+    {
+        return cmd::automations::run(
+            &cfg,
+            match &command {
+                Command::Automations { action } => action.clone(),
+                _ => unreachable!(),
+            },
+        );
+    }
     // Remember where it came from: a long-lived process (the daemon) re-reads
     // the same source per agent launch instead of serving a startup snapshot.
     crate::config_source::install(cli.overrides.clone(), cli.config.clone());
@@ -1071,15 +1157,25 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     thegn_core::sandbox_cpucap::publish_background_limits(
         thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
     );
+    crate::automation_runtime::install(&cfg);
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(thegn_core::config::Config::path);
-    match command {
+    let repo_context = std::env::current_dir().ok();
+    let transient_notification = matches!(
+        &command,
+        Command::Notify {
+            action: cmd::notify::Action::Push { .. }
+        }
+    );
+    let result = match command {
+        Command::Automations { action } => cmd::automations::run(&cfg, action),
         Command::Pr { action } => cmd::pr::run(&cfg, action),
         Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
         Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
+        Command::Autopilot { action } => cmd::autopilot::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
         Command::Search(args) => cmd::search::run(&cfg, args),
         Command::Theme { action } => {
@@ -1117,7 +1213,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             revoke,
         } => cmd::repos::trust(&cfg, path, approve, revoke),
         Command::Recent { count, json } => cmd::repos::recent(count, json),
-        Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::Config { action } => {
+            cmd::config::run(&cfg, action, config_path, repo_context.clone())
+        }
         Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
         Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Env { action } => cmd::env::run(&cfg, action),
@@ -1130,13 +1228,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
         Command::Agent { action } => cmd::agent::run(&cfg, action),
+        Command::Skills { action } => cmd::skills::run(&cfg, action),
         Command::Api { action } => cmd::api::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),
         Command::Doctor { json, action } => match action {
-            Some(DoctorAction::Bundle { args }) => cmd::bundle::run(&cfg, args),
-            None => cmd::doctor::run(&cfg, json),
+            Some(DoctorAction::Bundle { args }) => {
+                cmd::bundle::run(&cfg, args, config_path, repo_context.clone())
+            }
+            None => cmd::doctor::run(&cfg, json, config_path, repo_context),
         },
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
@@ -1174,6 +1275,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             daemon::serve_blocking(&cfg, daemon::ServeOpts { bind, no_pair_url })
         }
         Command::Session { action } => cmd::session::run(&cfg, action),
+        Command::Events { action } => cmd::events::run(&cfg, action),
         Command::Attach { session } => cmd::attach::run(&cfg, session),
         Command::Pair { action } => cmd::pair::run(&cfg, action),
         Command::Daemon { socket, action } => match action {
@@ -1247,7 +1349,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    };
+    if result.is_ok()
+        && transient_notification
+        && !crate::automation_runtime::drain(std::time::Duration::from_secs(
+            cfg.automations.action_timeout_secs.saturating_add(10),
+        ))
+    {
+        anyhow::bail!("timed out draining accepted automation events");
     }
+    result
 }
 
 // cache probe

@@ -156,6 +156,14 @@ fn template_for(kind: NotificationKind) -> BuiltinTemplate {
             title: "PR queue needs you",
             prefix: "PR queue needs you",
         },
+        NotificationKind::PrReviewTaskQueued => BuiltinTemplate {
+            title: "PR review task queued",
+            prefix: "PR review task queued",
+        },
+        NotificationKind::PrReviewThreadResolved => BuiltinTemplate {
+            title: "PR review thread resolved",
+            prefix: "PR review thread resolved",
+        },
         NotificationKind::CalendarReminder => BuiltinTemplate {
             title: "Event starting soon",
             prefix: "Event starting soon",
@@ -175,6 +183,14 @@ fn template_for(kind: NotificationKind) -> BuiltinTemplate {
         NotificationKind::UsageLimit => BuiltinTemplate {
             title: "Usage limit",
             prefix: "Usage limit approaching",
+        },
+        NotificationKind::Automation => BuiltinTemplate {
+            title: "Automation",
+            prefix: "Automation",
+        },
+        NotificationKind::AutomationFailed => BuiltinTemplate {
+            title: "Automation failed",
+            prefix: "Automation failed",
         },
     }
 }

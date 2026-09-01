@@ -35,6 +35,31 @@ The degradation ladder is a CI gate, not a promise: `just term-check` runs
 256-color, and the glyph/color overrides) and fails the build if any resolves
 differently from the table above.
 
+## Nix batteries terminal
+
+`nix run github:blakeashleyjr/thegn#batteries` is a composed Nix launch path:
+it runs stable thegn inside the flake's pinned Alacritty with FiraCode Nerd
+Font supplied through launcher-scoped fontconfig. It does not install the font
+globally. The launcher creates
+`$XDG_CONFIG_HOME/thegn/alacritty.toml` (defaulting to
+`~/.config/thegn/alacritty.toml`) from the shipped profile only when the file is
+absent, then preserves that user-owned copy. `THEGN_ALACRITTY_CONFIG` points the
+font picker at the same file.
+
+Run `thegn doctor` in that window to verify the terminal and resolved
+capabilities. The derivation is build-tested on x86_64 Linux; clean-host
+interactive evidence is still required before additional hosts are called
+verified. Ghostty remains a shipped profile (`config/ghostty.config`), but it
+is not the emulator pinned by the batteries package. macOS font-picker and
+alternate-emulator parity remain deferred until they have a macOS host
+rehearsal.
+
+The same evidence rule keeps broader distribution work out of this path: no
+`install.sh --batteries`, distro package-manager mutation, Homebrew cask,
+downloadable unsigned macOS app, Windows Terminal profile, or
+Flatpak/AppImage/nix-bundle is promised. Those require their relevant host,
+signing, or driver rehearsal before they become install instructions.
+
 ## Color
 
 `[theme] color` — `auto` (default) sniffs `COLORTERM` / `TERM` /
@@ -104,7 +129,7 @@ correctly, so it is the one thegn relies on.
 
 Two chord families depend on it:
 
-- `Ctrl-1..9` — jump to a workspace ([[workspaces-and-worktrees]]).
+- `Ctrl-1..9` — jump to a project ([[workspaces-and-worktrees]]).
 - `Ctrl-Alt-1..9` — launch or focus a pinned program ([[drawer-and-corner]]).
 
 `Alt-1..9` (jump to a worktree) does **not** — `Alt` has a legacy encoding
@@ -144,7 +169,7 @@ The broken state prints the remedy next to it. **Unknown always means
 said no, so nothing is taken away.
 
 When the answer is a definite no, the [[sidebar]] stops painting the
-`Ctrl-<digit>` workspace hints. The digits do not renumber and the layout
+`Ctrl-<digit>` project hints. The digits do not renumber and the layout
 does not shift; thegn just stops advertising a chord your terminal cannot
 send. Everything else is unaffected — `Alt-<digit>`, the arrows, `Alt-o`,
 and the [[command-palette]] all reach the same actions.
@@ -161,16 +186,16 @@ set -as terminal-features '*:extkeys'
 ```
 
 **Otherwise**, use a terminal that supports `modifyOtherKeys` level 2, or
-rebind the family to chords your terminal can send. The workspace and pin
+rebind the family to chords your terminal can send. The project and pin
 actions are ordinary bindable ids:
 
 ```toml
 [keybinds]
-summon-workspace-1 = "Ctrl Alt q"
+summon-project-1 = "Ctrl Alt q"
 summon-pin-1 = "Alt Shift p"
 ```
 
-`summon-workspace-1` … `-9` and `summon-pin-1` … `-9` are all bindable; see
+`summon-project-1` … `-9` and `summon-pin-1` … `-9` are all bindable; see
 [[keybindings]] for the full list and [[config-reference]] for the
 `[keybinds]` section.
 

@@ -27,6 +27,7 @@ actions:
     lazygit,
     yazi,
     editor,
+    open-in-ide,
     show-diff,
     save-layout,
     apply-layout,
@@ -82,7 +83,7 @@ you want a direct key.
   the row of panes and keeps going into tabs. Unlike `Ctrl-←/→` it never steps
   into the [[sidebar]] / [[panel]].
 - `Alt-↑/↓` — move to the pane above / below; at the top / bottom pane it
-  switches to the previous / next worktree within the current workspace. This
+  switches to the previous / next worktree within the current project. This
   never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
@@ -131,6 +132,13 @@ entry can carry `preset = "<name>"` to open with that shape at creation, and
 
 - `Alt-g` lazygit · `Alt-e` `$EDITOR` · `Alt-/` git diff
 - `Alt-y` / `Ctrl-Alt-f` — the bottom files drawer (see [[drawer-and-corner]])
+
+**Open focused worktree in IDE** (`open-in-ide`) is a separate palette action:
+it hands the whole worktree to the provider selected by `[editor] provider` (and
+the trusted `[workspace.<slug>] editor` override). Windowed providers launch
+detached; terminal providers open in a thegn tab. It has no default chord, so
+use the [[command-palette]] or bind the action id yourself. The `editor` action
+and `Alt-e` remain the terminal editor tool.
 
 ## Copy, search, replay
 

@@ -430,6 +430,10 @@ impl IssueBackend for LinearBackend {
         "linear"
     }
 
+    fn caps(&self) -> super::IssueCaps {
+        super::IssueCaps::default()
+    }
+
     fn list_issues<'a>(
         &'a self,
         filter: &'a IssueFilter,

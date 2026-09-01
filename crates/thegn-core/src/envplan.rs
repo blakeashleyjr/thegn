@@ -111,7 +111,7 @@ pub const DETECT_PROBE_SCRIPT: &str = r#"
 [ -f Gemfile ] && echo LANG_RUBY=1
 { [ -f deno.json ] || [ -f deno.jsonc ]; } && echo LANG_DENO=1
 { [ -f build.sbt ] || [ -f project/build.properties ] || [ -f .scala-version ]; } && echo LANG_JVM=1
-{ [ -f .devcontainer/devcontainer.json ] || [ -f .devcontainer.json ]; } && echo DEVCONTAINER=1
+{ [ -f .devcontainer/devcontainer.json ] || [ -f .devcontainer.json ] || find .devcontainer -mindepth 2 -maxdepth 2 -type f -name devcontainer.json -print -quit 2>/dev/null | grep -q .; } && echo DEVCONTAINER=1
 true
 "#;
 
@@ -197,7 +197,9 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
     let nix_classic =
         (exists("shell.nix") || exists("default.nix")) && !nix_flake_devshell && !devenv;
 
-    let devcontainer = exists(".devcontainer/devcontainer.json") || exists(".devcontainer.json");
+    // Keep presence detection in lockstep with devcontainer selection,
+    // including `.devcontainer/<variant>/devcontainer.json` layouts.
+    let devcontainer = !crate::devcontainer_select::candidates(worktree).is_empty();
 
     EnvRequirements {
         nix_flake_devshell,

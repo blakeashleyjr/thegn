@@ -37,11 +37,32 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(push_probes(cfg));
     out.extend(structural_probes(cfg));
     out.extend(host_discovery_probes(cfg));
+    out.extend(voice_probes(cfg));
     out
 }
 
-/// The push-to-phone channel: one offline outbound report per effective sink,
-/// plus the inbound command inbox's status. Both are cheap config checks (no
+fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use thegn_core::config::VoiceKind;
+    let v = &cfg.voice;
+    if !v.enabled && v.capture_command.is_empty() && v.command.is_empty() {
+        return Vec::new();
+    }
+    if v.kind.is_reserved() {
+        return vec![ProbeReport::reserved("voice", v.kind.as_str())];
+    }
+    match v.kind {
+        VoiceKind::Command => {
+            let mut report = crate::voice::CommandVoiceProvider::new(v.clone()).probe();
+            if !v.enabled {
+                report = report.note("[voice] enabled = false; explicit consent is off");
+            }
+            vec![report]
+        }
+    }
+}
+
+/// The push-to-phone channel: the outbound provider (`ntfy` / reserved kinds)
+/// and the inbound command inbox's status. Both are cheap config checks (no
 /// network round-trip), matching the probe contract.
 fn push_probes(cfg: &Config) -> Vec<ProbeReport> {
     let p = &cfg.notifications.push;
@@ -200,6 +221,7 @@ fn forge_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use crate::issue::IssueCaps;
     use thegn_core::config_issues::IssueProviderKind;
     cfg.issues
         .active_accounts()
@@ -210,9 +232,11 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                 return ProbeReport::reserved("issues", &id);
             }
             match a.provider {
-                IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready),
+                IssueProviderKind::None => ProbeReport::new("issues", id, Availability::Ready)
+                    .with_caps(&IssueCaps::default()),
                 IssueProviderKind::Github => {
                     ProbeReport::new("issues", id, binary_availability("gh"))
+                        .with_caps(&IssueCaps::default())
                 }
                 IssueProviderKind::Linear | IssueProviderKind::Jira | IssueProviderKind::Kaneo => {
                     let avail =
@@ -221,7 +245,16 @@ fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {
                         } else {
                             Availability::Ready
                         };
+                    let caps = if a.provider == IssueProviderKind::Kaneo {
+                        IssueCaps {
+                            comments: true,
+                            labels: true,
+                        }
+                    } else {
+                        IssueCaps::default()
+                    };
                     ProbeReport::new("issues", id, avail)
+                        .with_caps(&caps)
                         .note("network provider; not probed offline")
                 }
             }
@@ -339,14 +372,22 @@ fn git_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn editor_probes(cfg: &Config) -> Vec<ProbeReport> {
-    let editor = thegn_core::editor::editor_for(cfg);
-    let caps = editor.caps();
-    let note = format!(
-        "[editor] open_in = {}; line jump {}",
-        cfg.editor.open_in.as_str(),
-        if caps.line { "yes" } else { "no" }
-    );
-    vec![editor.probe().note(note)]
+    let selected = thegn_core::editor::editor_for(cfg);
+    let selected_id = selected.id();
+    let mut reports = thegn_core::editor::providers::probes(cfg.editor.open_in);
+    if matches!(selected_id, "template" | "tool" | "visual" | "env" | "vi") {
+        reports.push(selected.probe());
+    }
+    for report in &mut reports {
+        if report.id == selected_id {
+            report.notes.push(format!(
+                "selected; [editor] provider = {}, open_in = {}",
+                cfg.editor.provider.as_str(),
+                cfg.editor.open_in.as_str()
+            ));
+        }
+    }
+    reports
 }
 
 /// A sandbox backend's probe, enriched with the runtime-state truth
@@ -489,6 +530,7 @@ fn media_probes(cfg: &Config) -> Vec<ProbeReport> {
             },
             "",
         ),
+        MediaBackendKind::Spotify => return vec![ProbeReport::reserved("media", "spotify")],
         // Reserved kinds returned above; exhaustive so a new kind is a compile error.
         MediaBackendKind::Jellyfin => return vec![ProbeReport::reserved("media", "jellyfin")],
     };
@@ -649,7 +691,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.ci.provider = thegn_core::config::CiProviderKind::Drone;
         cfg.media.enabled = true;
-        cfg.media.backend = thegn_core::config::MediaBackendKind::Jellyfin;
+        cfg.media.backend = thegn_core::config::MediaBackendKind::Spotify;
         cfg.sandbox.enabled = true;
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Wsl;
         cfg.drawer.kind = Some(thegn_core::config::DrawerKind::Lf);
@@ -661,7 +703,7 @@ mod tests {
         let reports = probes(&cfg);
         for (seam, id) in [
             ("ci", "drone"),
-            ("media", "jellyfin"),
+            ("media", "spotify"),
             ("sandbox", "wsl"),
             ("files", "lf"),
             ("forge", "forgejo:codeberg"),

@@ -1,71 +1,54 @@
 # Tasks — complete devcontainer support
 
-## 1. Parser honesty (thegn-core, pure)
+## 1. Core contract
 
-- [ ] 1.1 `devcontainer.rs`: add `recognized_unapplied()` — parse-time
-      inventory classifying every containers.dev key as
-      applied / refused / reserved / editor-only; exhaustive test that every
-      reference key lands in exactly one class (a new field fails until
-      classified).
-- [ ] 1.2 Multi-config discovery: extend `detect_and_parse` to
-      `.devcontainer/<folder>/devcontainer.json`; return all candidates.
-- [ ] 1.3 `${devcontainerId}` substitution: stable
-      `short_hash(repo_root + config_relpath)`; unit test stability and
-      per-variant distinctness.
-- [ ] 1.4 Clamp `${localEnv:VAR}`: substitution reports which vars it looked
-      up, or takes an allowlist predicate; unit-test that a non-allowlisted
-      var resolves empty and is reported.
-- [ ] 1.5 Unit tests for parse-failure surfacing (malformed JSONC ⇒ error
-      string, no partial result).
+- [x] 1.1 Add deterministic primary/variant discovery, explicit selection,
+      ambiguity/read/parse results, and JSONC parser fixtures.
+- [x] 1.2 Add stable `${devcontainerId}` and clamp `${localEnv:NAME}` to the
+      effective `sandbox.env_passthrough` allowlist without exposing values.
+- [x] 1.3 Add the exhaustive recognized-field inventory for the supported
+      contract: applied, refused, reserved, editor-only, and unknown.
+- [x] 1.4 Reconcile trust-gated source/mount/port/lifecycle/feature folding,
+      trusted-user precedence, additive values, and backend honorability.
+- [x] 1.5 Add `sandbox.devcontainer = auto|off`, the top-level repo variant
+      selector, config round trips, and generated-reference source comments.
+- [x] 1.6 Preserve the native OCI feature planner: override ordering,
+      options-to-env, in-container oras/curl fetch, and `install.sh` execution.
 
-## 2. Overlay honesty (thegn-core, pure)
+## 2. Host integration and visibility
 
-- [ ] 2.1 `devcontainer_overlay.rs`: emit refusal warnings for
-      `privileged`/`capAdd`/`securityOpt`/`runArgs`/`init` (never applied,
-      even with approvals present) and reserved-key warnings from the 1.1
-      inventory; drop the stale `unsupported()` doc reference.
-- [ ] 2.2 Backend check: when the folded source is a container shape and the
-      effective backend family is not OCI, produce a warning naming the
-      backend; unit test per backend family.
-- [ ] 2.3 Precedence tests: user-pinned `image`/`profile`/`backend`/`network`
-      survive the fold; additive lists append.
-- [ ] 2.4 `devcontainer_features.rs`: honour `installsAfter`/`dependsOn` from
-      fetched metadata when present (topological, cycles fall back to
-      declaration order with a warning); keep
-      `overrideFeatureInstallOrder`-first; unit tests for order + cycle
-      fallback.
+- [x] 2.1 Route selection, approvals, and the effective local-env allowlist
+      through the existing off-loop repo-trust resolution path.
+- [x] 2.2 Add the host-owned optional CLI provider with bounded version probe,
+      opaque start/exec handle, safety eligibility, and native OCI fallback.
+- [x] 2.3 Keep feature and one-time lifecycle provisioning on the existing host
+      OCI path; preserve per-pane postStart/postAttach behavior and CPU caps.
+- [x] 2.4 Add read-only doctor text/JSON for selection, provider, status,
+      pending trust, field dispositions, and backend honorability.
+- [x] 2.5 Add transient path-keyed sidebar and active-tab tokens for `off`,
+      `ambiguous`, `invalid`, `pending`, `ready`, and `degraded`.
+- [x] 2.6 Keep the existing Tier 2 `devcontainer_e2e` coverage for live
+      Dockerfile build/run, image/env/lifecycle, and compose up/exec.
 
-## 3. Config (thegn-core)
+## 3. Documentation and contract
 
-- [ ] 3.1 `config_sandbox.rs`: `devcontainer = "auto" | "off"` via
-      `config_enum!`; repo-overlay classification: preference (it only
-      narrows repo-file usage); `.thegn.toml` `devcontainer = "<folder>"`
-      selector key.
-- [ ] 3.2 Document both keys in `config/config.toml.example` (the generated
-      config-reference help page picks them up).
-- [ ] 3.3 `config_enum!` round-trip + overlay clamp tests.
+- [x] 3.1 Document configuration, the untrusted-repo boundary, category TOFU,
+      absolute refusal of isolation-weakening flags, lifecycle frequency,
+      provider fallback, doctor, and sidebar vocabulary in sandbox help.
+- [x] 3.2 Reconcile this OpenSpec change with the delivered subset and remove
+      claims of complete moving-reference parity.
+- [x] 3.3 Reserve fetched feature-metadata dependency ordering,
+      generated-Dockerfile feature layering, and image-label metadata merging.
 
-## 4. Host wiring (thegn-host)
+## 4. Scoped validation
 
-- [ ] 4.1 `handlers/repo_trust.rs`: route the `env_passthrough` allowlist into
-      the `SubstCtx` `local_env` closure; surface the localEnv warnings;
-      plumb the multi-config selector; ambiguity ⇒ warn + none.
-- [ ] 4.2 Respect `[sandbox] devcontainer = "off"` before parse (one notice).
-- [ ] 4.3 `cmd/doctor.rs`: devcontainer section — presence/selected variant,
-      parse result, per-category trust state, refused/reserved keys, backend
-      honour-ability. No new catalog row (rides `doctor`).
-- [ ] 4.4 Smoke-test the doctor block (`test/smoke.sh` covers the seam; core
-      inventory logic is unit-covered).
+- [ ] 4.1 Run `just quick thegn-host`. (Blocked by pre-existing chunk-2
+      dead-code and needless-borrow diagnostics in `handlers/repo_trust.rs`.)
+- [x] 4.2 Run `cargo nextest run -p thegn-host help`.
+- [x] 4.3 Run the focused OpenSpec validation filter.
+- [x] 4.4 Verify all three help ratchets and the completion-slot,
+      control-schema, and env-overlay ratchets without modifying them.
 
-## 5. Docs + spec
-
-- [ ] 5.1 Update the sandbox help/docs pages that mention devcontainers with
-      the classification table (config-reference page is generated — do not
-      hand-write).
-- [ ] 5.2 Verify the delta spec matches implemented behaviour; adjust
-      scenarios if implementation details shifted.
-
-## 6. Gate
-
-- [ ] 6.1 Run `just ci` once (includes openspec-validate) when the
-      implementation is complete.
+Full workspace, e2e, migration, and live-state runs are intentionally excluded
+from this documentation chunk. The pre-existing Tier 2 test is recorded above,
+not rerun here.

@@ -1,0 +1,5 @@
+{
+  "image": "ubuntu:24.04",
+  "containerEnv": { "APP_ENV": "test" },
+  "forwardPorts": [3000]
+}
