@@ -2853,6 +2853,7 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     cfg.host.insert("gpu".into(), Default::default());
     cfg.issues.provider = K::Linear;
     cfg.issues.providers = vec![K::Linear, K::Github, K::Kaneo];
+    cfg.voice.enabled = true;
 
     let clamped = cfg.clamp_to_channel(Channel::Stable);
 
@@ -2864,6 +2865,7 @@ fn clamp_to_channel_neutralises_experimental_in_stable() {
     // Trackers: GitHub survives, Linear/Kaneo are dropped.
     assert_eq!(cfg.issues.provider, K::None);
     assert_eq!(cfg.issues.providers, vec![K::Github]);
+    assert!(!cfg.voice.enabled);
     // Every gated feature reports as clamped.
     assert_eq!(clamped.len(), Feature::ALL.len());
 }
@@ -2873,6 +2875,7 @@ fn clamp_to_channel_is_a_noop_in_dev() {
     use crate::channel::Channel;
     let mut cfg = Config::default();
     cfg.observe.enabled = true;
+    cfg.voice.enabled = true;
     cfg.sandbox.remote.host = "box.example".into();
     let before = cfg.clone();
 
@@ -2880,6 +2883,7 @@ fn clamp_to_channel_is_a_noop_in_dev() {
 
     assert!(clamped.is_empty(), "dev honours every feature");
     assert_eq!(cfg.observe.enabled, before.observe.enabled);
+    assert_eq!(cfg.voice.enabled, before.voice.enabled);
     assert_eq!(cfg.sandbox.remote.host, before.sandbox.remote.host);
 }
 
