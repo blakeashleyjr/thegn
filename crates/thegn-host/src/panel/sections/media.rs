@@ -212,7 +212,7 @@ mod tests {
         let stale_request = panel
             .take_sources_request(Some(&first))
             .unwrap_or_else(|| panic!("source request expected"));
-        panel.sync_snapshot(Some(&changed), None);
+        panel.sync_snapshot(Some(&changed), None, 0);
         panel.set_queue(first_request, Some(&changed), vec![QueueItem::default()]);
         assert!(panel.queue.is_empty());
         panel.set_sources(stale_request, Some(&changed), vec!["stale".into()]);
@@ -242,6 +242,7 @@ mod tests {
                 queue: true,
                 ..MediaCaps::default()
             }),
+            1,
         );
         let source_request = ui
             .media
