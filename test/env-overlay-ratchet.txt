@@ -353,6 +353,7 @@ sandbox.default_backend
 sandbox.default_env
 sandbox.devenv
 sandbox.devshell
+sandbox.devcontainer
 sandbox.env_passthrough
 sandbox.failover
 sandbox.file_access
