@@ -122,6 +122,7 @@ impl DetailOverlay {
         self.sel = 0;
         self.pending_ci = Some(run.id.clone());
         self.live_ci = None;
+        self.ci_autofix = None;
     }
 
     /// The drilled run to re-poll while it's still in flight (live drill
@@ -188,7 +189,15 @@ impl DetailOverlay {
         if !log_tail.is_empty() || !log_entries.is_empty() {
             secs.push(Section::Heading {
                 label: "log tail".into(),
-                note: Some(log_metadata(&log_entries)),
+                note: Some(
+                    if log_entries.iter().any(|entry| {
+                        !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty()
+                    }) {
+                        format!("{} · f authorize fix", log_metadata(&log_entries))
+                    } else {
+                        log_metadata(&log_entries)
+                    },
+                ),
             });
             let lines: Vec<String> = if log_entries.is_empty() {
                 log_tail
@@ -229,6 +238,16 @@ impl DetailOverlay {
             self.scroll = 0;
         }
         self.pending_ci = None;
+        // A single `f` action authorizes the first available failed-job entry;
+        // its complete candidate identity is carried into the blocking worker.
+        // Entries without text or a head SHA fail closed and never become UI
+        // actions.
+        self.ci_autofix = log_entries
+            .iter()
+            .find(|entry| !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty())
+            .map(|entry| super::DetailAction::CiAutofix {
+                candidate: entry.candidate(),
+            });
         // Keep re-polling until the run settles (live drill updates).
         self.live_ci = (!run.state.is_terminal()).then(|| run.clone());
     }
@@ -367,6 +386,7 @@ mod tests {
 
         // The matching async detail fills the same overlay in place.
         let filled = CiRun {
+            sha: "abc123".into(),
             jobs: vec![CiJob {
                 id: "j1".into(),
                 name: "build".into(),
@@ -385,16 +405,37 @@ mod tests {
             CiDetailPayload {
                 run: filled,
                 log_tail: vec!["error: boom".into()],
-                log_entries: vec![],
+                log_entries: vec![thegn_core::ci_log::CiLogEntry {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    job_name: "build".into(),
+                    text: "error: boom\n".into(),
+                    truncated: false,
+                    redacted: true,
+                    fetched_at: 7,
+                    head_sha: "abc123".into(),
+                }],
             },
         );
-        let ov = slot.expect("overlay retained after fill");
+        let mut ov = slot.expect("overlay retained after fill");
         let DetailContent::Sections(d) = &ov.content else {
             panic!("expected sections after fill");
         };
         // header + "jobs" + build heading + steps table + "log tail" + log table.
         assert!(d.sections.len() >= 5, "sparse fill: {}", d.sections.len());
         assert_eq!(ov.pending_ci, None, "pending cleared after fill");
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::CiAutofix {
+                candidate: thegn_core::ci_log::CiLogCandidate {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    head_sha: "abc123".into(),
+                },
+            })
+        );
     }
 
     #[test]

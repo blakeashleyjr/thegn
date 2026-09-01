@@ -1040,6 +1040,24 @@ impl CiActionCtx<'_> {
         );
     }
 
+    /// Re-read and authorize a cached CI-failure candidate off the compositor
+    /// thread.  The coordinator performs the provider/head/queue checks and
+    /// claims the candidate immediately before the existing agent spawn.
+    fn spawn_autofix(&mut self, candidate: thegn_core::ci_log::CiLogCandidate) {
+        self.model.status = "Authorizing CI autofix…".into();
+        let full = self.cfg.clone();
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = thegn_core::db::Db::open() {
+                crate::ci_refresh::ci_autofix::authorize(&full, &db, &candidate);
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        });
+    }
+
     /// Execute a detail-overlay row action, returning the overlay to *retain*
     /// (the CI drill keeps it open to fill in place) or `None` to close it — the
     /// loop assigns the result back to its `bar_detail` slot. Covers the CI badge
@@ -1063,6 +1081,7 @@ impl CiActionCtx<'_> {
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
+            DetailAction::CiAutofix { candidate } => self.spawn_autofix(candidate),
             DetailAction::CiRefresh => self.refresh_ci(),
             DetailAction::FetchCalendar {
                 year,
