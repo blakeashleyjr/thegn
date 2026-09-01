@@ -16,6 +16,7 @@ mod agent_teardown;
 mod alerts;
 mod apps;
 mod attention_status;
+mod autopilot_driver;
 mod autoscale;
 mod bar_nav;
 mod blast_radius;
@@ -287,6 +288,11 @@ pub enum Command {
     Dispatch {
         #[command(subcommand)]
         action: cmd::dispatch::Action,
+    },
+    /// Opt-in issue-to-PR supervisor; `status` is read-only and never starts work.
+    Autopilot {
+        #[command(subcommand)]
+        action: cmd::autopilot::Action,
     },
     /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
     Ci {
@@ -1079,6 +1085,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
         Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
+        Command::Autopilot { action } => cmd::autopilot::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
         Command::Search(args) => cmd::search::run(&cfg, args),
         Command::Theme { action } => {

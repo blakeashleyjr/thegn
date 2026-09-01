@@ -46,3 +46,20 @@ notification list.
 
 Everything above has a CLI verb, so a script or an agent can drive it
 headlessly — see [[cli]] and [[best-practices]].
+
+### Issue autopilot
+
+The opt-in `[autopilot]` policy turns a provider refresh result into one
+durable claim, one existing agent-dispatch roster row, and one linked worktree.
+Matching is limited to issues returned by the authenticated “assigned to me”
+filter with the configured label and Todo status. The worker uses the existing
+`TaskKind::Issue` prompt, commits in its worktree, and never pushes or opens a
+PR. The host validates the clean, on-branch, commit-ahead result before the
+host pushes a new branch and opens the PR.
+
+`thegn autopilot status [--repo PATH] [--json]` is a read-only, bounded audit
+view. Once opened, the existing PR queue owns review, CI, conflict, approval,
+and merge policy. Only an observed queue transition to `merged` closes the
+autopilot run; optional Done synchronization uses the configured tracker seam.
+Failures remain parked for a human with a bounded reason and do not trigger a
+second attempt automatically.
