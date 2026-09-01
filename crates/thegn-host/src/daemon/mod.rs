@@ -16,6 +16,7 @@
 pub(crate) mod agent_error_cache;
 pub(crate) mod agent_open;
 pub(crate) mod client;
+pub(crate) mod fork;
 pub(crate) mod inbox;
 pub(crate) mod pipeline_retry;
 pub(crate) mod record;
@@ -38,6 +39,11 @@ use thegn_core::store::{ControlStore, DaemonRow};
 
 use service::DaemonService;
 use session::{IdleTransition, SessionMsg};
+
+/// Registry capability marker for daemons that participate in the THE-55
+/// per-worktree open fence. A migration refuses an older daemon: it could
+/// otherwise accept a matching session after migration's initial listing.
+pub(crate) const SESSION_MIGRATION_FENCE_VERSION_SUFFIX: &str = "+session-migration-fence-v1";
 
 /// Heartbeat cadence; discovery treats rows fresher than
 /// [`thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS`] as live.
@@ -258,7 +264,11 @@ async fn run(
         endpoint: ep.display(),
         tcp_addr: None,
         hostname: hostname(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: format!(
+            "{}{}",
+            env!("CARGO_PKG_VERSION"),
+            SESSION_MIGRATION_FENCE_VERSION_SUFFIX
+        ),
         started_at: now_ms(),
         heartbeat_at: now_ms(),
     };
@@ -293,6 +303,7 @@ async fn run(
         idle_tx,
         shutdown: shutdown.clone(),
         config: std::sync::Arc::new(cfg.clone()),
+        profile_root: thegn_core::profile::active().root,
         endpoint: ep.display(),
     });
 
@@ -340,6 +351,7 @@ async fn run(
     // workers killed by a transport failure. Event-driven; zero timers while
     // idle.
     pipeline_retry::spawn(svc.clone(), svc.events.subscribe());
+    crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
 
     let state = thegn_svc::control::http::ControlState {
         api: svc.clone(),

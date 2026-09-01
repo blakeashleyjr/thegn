@@ -86,5 +86,7 @@ Q 216 "Follow-up prompt into live agent").
 - **Auto-submitting the pasted prompt.** The live-pane handoff inserts text;
   the human presses Enter. Autonomous handling of threads is THE-22
   (`add-watched-pr-comment-tasks`), not a side effect of a paste.
-- **New forge fetching.** Threads, hunks, and line anchors all already ride
-  on `PrConversation`/`PrDiff`; this is a rendering + dispatch change.
+- **New forge endpoint.** No new forge operation is introduced: the existing
+  off-loop conversation + PR-diff refresh is extended to deliver and cache one
+  complete review snapshot, preserving the last complete cache entry across
+  transient failures.

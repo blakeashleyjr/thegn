@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::config::{
     KeybindConfig, MetricsTarget, MetricsTargetKind, NotificationsOverlay, SandboxOverlay,
 };
+use crate::hooks::HooksConfig;
 
 /// The formats accepted for repo-local overlays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +135,8 @@ impl std::fmt::Display for RepoOverlayDiagnostic {
 #[serde(default)]
 pub(crate) struct RepoConfigFile {
     pub(crate) sandbox: SandboxOverlay,
+    /// Repo-authored lifecycle hooks. These are trust-gated before execution.
+    pub(crate) hooks: HooksConfig,
     pub(crate) keybinds: KeybindConfig,
     /// Per-repo notification routing overlay.
     pub(crate) notifications: NotificationsOverlay,

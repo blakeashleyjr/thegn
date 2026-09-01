@@ -19,7 +19,6 @@ use termwiz::terminal::TerminalWaker;
 use thegn_core::config::NotificationsConfig;
 use thegn_core::notification::NotificationKind;
 use thegn_core::notification_route::{RouteCtx, RouteDecision, SoundEmit, decide};
-use thegn_core::store::NotificationStore;
 
 /// Shared, thread-safe notification runtime. Cloned (as `Arc`) into the
 /// background dispatch closures and read by the event loop.
@@ -326,6 +325,26 @@ pub fn record(
     message: &str,
     worktree: &str,
 ) -> (RouteDecision, Option<i64>) {
+    record_with_facts(
+        db,
+        state,
+        kind,
+        source_ref,
+        message,
+        worktree,
+        crate::automation_events::EventFacts::default(),
+    )
+}
+
+pub(crate) fn record_with_facts(
+    db: &thegn_core::db::Db,
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+    facts: crate::automation_events::EventFacts,
+) -> (RouteDecision, Option<i64>) {
     // Burst suppression for repeat failure alerts: a crash-respawning pane on
     // a flaky remote fires an identical process_failed every few seconds; one
     // per window is signal, the rest are inbox noise.
@@ -346,20 +365,43 @@ pub fn record(
         }
     }
     let decision = state.decide(kind, source_ref, message, worktree);
-    let id = if decision.record {
-        db.put_notification(kind, source_ref, message, worktree)
-            .ok()
-    } else {
+    let id = crate::automation_events::insert_routed(
+        db, kind, source_ref, message, worktree, facts, &decision, false,
+    )
+    .unwrap_or_else(|error| {
+        tracing::debug!(target: "thegn::notify", %error, "notification cache write failed");
         None
-    };
+    });
     emit_channels(state, &decision, kind, message, worktree);
     (decision, id)
 }
 
-/// Decide + emit-once persist a re-derived notification. Transient channels
-/// are emitted only after the atomic store operation inserts a new row, so a
-/// hydration refresh cannot replay a sound for an already-observed fact.
-pub(crate) fn record_once(
+pub(crate) fn record_once_with_facts(
+    db: &thegn_core::db::Db,
+    state: &NotifyState,
+    kind: &str,
+    source_ref: &str,
+    message: &str,
+    worktree: &str,
+    facts: crate::automation_events::EventFacts,
+) -> (RouteDecision, bool) {
+    let decision = state.decide(kind, source_ref, message, worktree);
+    let inserted = crate::automation_events::insert_routed(
+        db, kind, source_ref, message, worktree, facts, &decision, true,
+    )
+    .map(|id| id.is_some())
+    .unwrap_or_else(|error| {
+        tracing::debug!(target: "thegn::notify", %error, "emit-once notification cache write failed");
+        false
+    });
+    if inserted {
+        emit_channels(state, &decision, kind, message, worktree);
+    }
+    (decision, inserted)
+}
+
+#[cfg(test)]
+fn record_once(
     db: &thegn_core::db::Db,
     state: &NotifyState,
     kind: &str,
@@ -367,22 +409,15 @@ pub(crate) fn record_once(
     message: &str,
     worktree: &str,
 ) -> (RouteDecision, bool) {
-    let decision = state.decide(kind, source_ref, message, worktree);
-    let inserted = if decision.record {
-        match db.put_notification_once(kind, source_ref, message, worktree) {
-            Ok(inserted) => inserted,
-            Err(error) => {
-                tracing::debug!(target: "thegn::notify", %error, "emit-once notification cache write failed");
-                false
-            }
-        }
-    } else {
-        false
-    };
-    if inserted {
-        emit_channels(state, &decision, kind, message, worktree);
-    }
-    (decision, inserted)
+    record_once_with_facts(
+        db,
+        state,
+        kind,
+        source_ref,
+        message,
+        worktree,
+        crate::automation_events::EventFacts::default(),
+    )
 }
 
 fn emit_channels(
@@ -403,36 +438,6 @@ fn emit_channels(
     // Push-to-phone rides the same decision. The publisher worker exists only
     // when `[notifications.push]` is configured; otherwise this is a no-op.
     state.emit_push(decision, kind, message, "", worktree);
-}
-
-/// Route a hydration/worker notification through the live host state when it
-/// exists. Returns false before startup, allowing the caller to retain its
-/// durable-only fallback without inventing a second notification path.
-pub(crate) fn record_global(
-    db: &thegn_core::db::Db,
-    kind: &str,
-    source_ref: &str,
-    message: &str,
-    worktree: &str,
-) -> bool {
-    let Some(state) = global() else { return false };
-    let _ = record(db, &state, kind, source_ref, message, worktree);
-    true
-}
-
-/// Route a re-derived hydration notification through the live host state. The
-/// caller keeps its durable-only `put_notification_once` fallback when this
-/// returns `false` because startup has not installed a live route yet.
-pub(crate) fn record_global_once(
-    db: &thegn_core::db::Db,
-    kind: &str,
-    source_ref: &str,
-    message: &str,
-    worktree: &str,
-) -> bool {
-    let Some(state) = global() else { return false };
-    let (_decision, _inserted) = record_once(db, &state, kind, source_ref, message, worktree);
-    true
 }
 
 fn parse_kind(s: &str) -> Option<NotificationKind> {
