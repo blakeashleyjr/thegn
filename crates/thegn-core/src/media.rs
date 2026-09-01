@@ -8,8 +8,8 @@
 //! here; see [`crate::config::MediaConfig::resolve_opts`] for the lowering into
 //! the leaf's `ResolveOpts`.
 
-pub use thegn_media::MediaCaps;
 pub use thegn_media::model::*;
+pub use thegn_media::{MediaCaps, MediaSnapshot};
 
 /// The width tiers shared by the right-panel sections. Keeping this small
 /// value in the substrate-free layer lets the host map its layout enum without
@@ -63,7 +63,7 @@ impl MediaRenderPolicy {
             show_volume: detailed && caps.volume,
             show_seek: detailed && caps.seek && state.can_seek,
             show_chapters: detailed && caps.chapters,
-            show_fullscreen: detailed && caps.fullscreen && state.kind.is_video(),
+            show_fullscreen: detailed && caps.fullscreen,
             animate: state.state == PlaybackState::Playing,
         }
     }
@@ -129,6 +129,16 @@ mod policy_tests {
         let p = MediaRenderPolicy::for_width(MediaWidth::Full, &s, c);
         assert!(!p.show_seek && !p.show_volume && !p.show_fullscreen);
         assert!(p.show_shuffle && p.show_loop && p.show_queue);
+    }
+
+    #[test]
+    fn video_kind_does_not_enable_provider_optional_controls() {
+        let mut c = caps();
+        c.chapters = false;
+        c.fullscreen = false;
+        let p = MediaRenderPolicy::for_width(MediaWidth::Full, &state(), c);
+        assert!(!p.show_chapters);
+        assert!(!p.show_fullscreen);
     }
 
     #[test]

@@ -117,7 +117,7 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
         ];
     };
     let media = &ctx.ui.media;
-    let policy = MediaRenderPolicy::project(state, media.caps(state), width(ctx));
+    let policy = MediaRenderPolicy::project(state, media.caps().unwrap_or_default(), width(ctx));
     if policy.show_sources {
         rows.push(rule());
         for (i, source) in media.sources.iter().enumerate() {
@@ -175,7 +175,7 @@ pub(super) fn content(ctx: &SectionCtx<'_>) -> Vec<PanelRow> {
 mod tests {
     use super::*;
     use crate::panel::media::MediaPanelState;
-    use thegn_core::media::QueueItem;
+    use thegn_core::media::{MediaCaps, QueueItem};
 
     fn state() -> MediaState {
         MediaState {
@@ -197,7 +197,9 @@ mod tests {
         let mut panel = MediaPanelState::default();
         let first = state();
         panel.begin_request(Some(&first));
+        let first_request = panel.take_queue_request(Some(&first)).unwrap();
         panel.set_queue(
+            first_request.clone(),
             Some(&first),
             vec![QueueItem {
                 title: "one".into(),
@@ -207,9 +209,14 @@ mod tests {
         assert_eq!(panel.queue.len(), 1);
         let mut changed = first.clone();
         changed.track_id = Some("new".into());
-        panel.sync_snapshot(Some(&changed));
-        panel.set_queue(Some(&changed), vec![QueueItem::default()]);
+        let stale_request = panel
+            .take_sources_request(Some(&first))
+            .unwrap_or_else(|| panic!("source request expected"));
+        panel.sync_snapshot(Some(&changed), None);
+        panel.set_queue(first_request, Some(&changed), vec![QueueItem::default()]);
         assert!(panel.queue.is_empty());
+        panel.set_sources(stale_request, Some(&changed), vec!["stale".into()]);
+        assert!(panel.sources.is_empty());
     }
 
     #[test]
@@ -229,9 +236,29 @@ mod tests {
         let mut model = crate::chrome::FrameModel::default();
         model.panel.media = Some(state());
         let mut ui = crate::panel::PanelUi::default();
-        ui.media.sync_snapshot(model.panel.media.as_ref());
+        ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            Some(MediaCaps {
+                queue: true,
+                ..MediaCaps::default()
+            }),
+        );
+        let source_request = ui
+            .media
+            .take_sources_request(model.panel.media.as_ref())
+            .unwrap();
+        ui.media.set_sources(
+            source_request,
+            model.panel.media.as_ref(),
+            vec!["player".into()],
+        );
         ui.media.begin_request(model.panel.media.as_ref());
+        let request = ui
+            .media
+            .take_queue_request(model.panel.media.as_ref())
+            .unwrap();
         ui.media.set_queue(
+            request,
             model.panel.media.as_ref(),
             vec![QueueItem {
                 id: "next".into(),

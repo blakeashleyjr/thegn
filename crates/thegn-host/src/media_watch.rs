@@ -24,13 +24,13 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::config::MediaConfig;
-use thegn_core::media::MediaState;
+use thegn_core::media::{MediaSnapshot, MediaState};
 
 /// Spawn the now-playing watcher for `cfg`. Returns the task handle so the caller
 /// can abort it on a config/player change; `None` when media is disabled.
 pub(crate) fn spawn(
     cfg: MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    tx: tokio_mpsc::UnboundedSender<Option<MediaSnapshot>>,
     waker: TerminalWaker,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.enabled {
@@ -71,8 +71,8 @@ fn flap_action(was_showing: bool, new_active: bool) -> FlapAction {
 }
 
 /// Read one snapshot, logging read errors instead of swallowing them.
-async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaState> {
-    match client.snapshot().await {
+async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaSnapshot> {
+    match client.snapshot_with_caps().await {
         Ok(snap) => snap,
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "media snapshot failed");
@@ -82,8 +82,8 @@ async fn read_snapshot(client: &thegn_media::MediaClient) -> Option<MediaState> 
 }
 
 /// Whether a snapshot would render a badge (i.e. an active player).
-fn shows_badge(snap: &Option<MediaState>) -> bool {
-    snap.as_ref().and_then(|s| s.badge()).is_some()
+fn shows_badge(snap: &Option<MediaSnapshot>) -> bool {
+    snap.as_ref().and_then(|s| s.state.badge()).is_some()
 }
 
 /// Read a snapshot and push it to the loop, suppressing a *transient*
@@ -95,7 +95,7 @@ fn shows_badge(snap: &Option<MediaState>) -> bool {
 /// gone and the task should stop.
 async fn push_snapshot(
     client: &thegn_media::MediaClient,
-    tx: &tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    tx: &tokio_mpsc::UnboundedSender<Option<MediaSnapshot>>,
     waker: &TerminalWaker,
     was_showing: bool,
 ) -> Option<bool> {
@@ -133,7 +133,7 @@ fn note_cleared(prev_active: bool, now_active: bool) {
 
 async fn run(
     cfg: MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<MediaState>>,
+    tx: tokio_mpsc::UnboundedSender<Option<MediaSnapshot>>,
     waker: TerminalWaker,
 ) {
     let period = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
@@ -223,10 +223,11 @@ async fn run(
 /// Returns `(full, bars)` repaint intent for the loop's `dirty` / `bars_dirty`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_snapshots(
-    rx: &mut tokio_mpsc::UnboundedReceiver<Option<MediaState>>,
+    rx: &mut tokio_mpsc::UnboundedReceiver<Option<MediaSnapshot>>,
     perf: &mut crate::perf::LoopPerf,
     enabled: bool,
     media: &mut Option<MediaState>,
+    caps: &mut Option<thegn_core::media::MediaCaps>,
     coalesce_full: bool,
     last_full: &mut Option<std::time::Instant>,
 ) -> (bool, bool) {
@@ -234,12 +235,15 @@ pub(crate) fn drain_snapshots(
     while let Ok(snap) = rx.try_recv() {
         perf.tick(crate::perf::WakeSource::Refresh);
         let shown = if enabled { snap } else { None };
-        if *media == shown {
+        let shown_state = shown.as_ref().map(|snapshot| snapshot.state.clone());
+        let shown_caps = shown.as_ref().map(|snapshot| snapshot.caps);
+        if *media == shown_state && *caps == shown_caps {
             continue;
         }
         let badge_changed =
-            media.as_ref().and_then(|m| m.badge()) != shown.as_ref().and_then(|m| m.badge());
-        *media = shown;
+            media.as_ref().and_then(|m| m.badge()) != shown_state.as_ref().and_then(|m| m.badge());
+        *media = shown_state;
+        *caps = shown_caps;
         if coalesce_full {
             if badge_changed
                 || last_full

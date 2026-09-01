@@ -5704,6 +5704,7 @@ async fn ensure_app_loaded(
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
     MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
+    spawn_media_sources,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -6520,7 +6521,7 @@ async fn event_loop<T: Terminal>(
     // reload and player-override changes. `media_player_override` is the runtime
     // "Select player" choice.
     let (media_tx, mut media_rx) =
-        tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaState>>();
+        tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaSnapshot>>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
     // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
     // drops the image and sends the pane + path to paste (or a status message).
@@ -6528,7 +6529,10 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
     // The docked Media section's async up-next queue and cover-art feeds.
     let (media_queue_tx, mut media_queue_rx) =
-        tokio_mpsc::unbounded_channel::<Vec<thegn_core::media::QueueItem>>();
+        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaQueueDelivery>();
+    let (media_sources_tx, mut media_sources_rx) =
+        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaSourcesDelivery>();
+    let mut media_caps: Option<thegn_core::media::MediaCaps> = None;
     let (media_art_tx, mut media_art_rx) =
         tokio_mpsc::unbounded_channel::<crate::media_art::ArtMosaic>();
     let mut media_player_override: Option<String> = None;
@@ -6850,11 +6854,6 @@ async fn event_loop<T: Terminal>(
                 },
             );
             panel_ui.media.begin_request(model.panel.media.as_ref());
-            crate::media_ctl::spawn_media_queue(
-                media_effective_cfg(&current_config.media, &media_player_override),
-                media_queue_tx.clone(),
-                waker.clone(),
-            );
             if let Some(url) = panel_ui
                 .media
                 .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
@@ -10403,17 +10402,32 @@ async fn event_loop<T: Terminal>(
             &mut loop_perf,
             current_config.media.enabled,
             &mut model.panel.media,
+            &mut media_caps,
             media_position_visible,
             &mut last_media_full,
         );
-        panel_ui.media.sync_snapshot(model.panel.media.as_ref());
-        if media_position_visible && panel_ui.media.needs_queue(model.panel.media.as_ref()) {
-            panel_ui.media.begin_request(model.panel.media.as_ref());
-            crate::media_ctl::spawn_media_queue(
-                media_effective_cfg(&current_config.media, &media_player_override),
-                media_queue_tx.clone(),
-                waker.clone(),
-            );
+        panel_ui
+            .media
+            .sync_snapshot(model.panel.media.as_ref(), media_caps);
+        if media_position_visible {
+            let cfg = media_effective_cfg(&current_config.media, &media_player_override);
+            if let Some(request) = panel_ui
+                .media
+                .take_queue_request(model.panel.media.as_ref())
+            {
+                crate::media_ctl::spawn_media_queue(
+                    cfg.clone(),
+                    request,
+                    media_queue_tx.clone(),
+                    waker.clone(),
+                );
+            }
+            if let Some(request) = panel_ui
+                .media
+                .take_sources_request(model.panel.media.as_ref())
+            {
+                spawn_media_sources(cfg, request, media_sources_tx.clone(), waker.clone());
+            }
         }
         if let Some(url) = panel_ui
             .media
@@ -10454,9 +10468,20 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // Docked Media section feeds: up-next queue + decoded cover art.
-        while let Ok(queue) = media_queue_rx.try_recv() {
+        while let Ok(delivery) = media_queue_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            panel_ui.media.set_queue(model.panel.media.as_ref(), queue);
+            panel_ui
+                .media
+                .set_queue(delivery.request, model.panel.media.as_ref(), delivery.queue);
+            dirty = true;
+        }
+        while let Ok(delivery) = media_sources_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            panel_ui.media.set_sources(
+                delivery.request,
+                model.panel.media.as_ref(),
+                delivery.sources,
+            );
             dirty = true;
         }
         while let Ok(art) = media_art_rx.try_recv() {
@@ -16477,8 +16502,12 @@ async fn event_loop<T: Terminal>(
                                                     tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
                                                 }
                                                 // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                                let _ = tx
-                                                    .send(client.snapshot().await.unwrap_or(None));
+                                                let _ = tx.send(
+                                                    client
+                                                        .snapshot_with_caps()
+                                                        .await
+                                                        .unwrap_or(None),
+                                                );
                                                 let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                                             }
                                         });

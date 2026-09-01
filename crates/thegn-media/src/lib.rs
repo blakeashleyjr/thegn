@@ -98,7 +98,7 @@ impl std::error::Error for MediaError {}
 /// Per-backend capabilities — lets the UI hide controls a backend can't do
 /// (e.g. `playerctl`/mpv have no MPRIS Playlists; SMTC has no volume). Mirrors
 /// `ci::CiCaps`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MediaCaps {
     pub shuffle: bool,
     pub loop_mode: bool,
@@ -120,6 +120,16 @@ pub struct MediaCaps {
     pub fullscreen: bool,
 }
 
+/// A now-playing snapshot together with the capabilities of the backend that
+/// produced it. Keeping these values together prevents a later backend switch
+/// (or an aggregate's active-child change) from making the panel infer
+/// capabilities from incidental track metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaSnapshot {
+    pub state: MediaState,
+    pub caps: MediaCaps,
+}
+
 /// A media-control backend for one player protocol. Read (`snapshot`) first;
 /// the mutations mirror MPRIS's `Player` interface. Methods take `&self` so a
 /// caller can hold one connection.
@@ -131,6 +141,21 @@ pub struct MediaCaps {
 pub trait MediaBackend: Send + Sync {
     /// The current now-playing snapshot, or `None` when nothing is loaded.
     fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>>;
+
+    /// Read the current snapshot and its provider capabilities as one host
+    /// delivery. Backends keep the normalized read operation above; the
+    /// default is sufficient because [`MediaBackend::caps`] is synchronous and
+    /// the aggregate updates its active child during `snapshot`.
+    fn snapshot_with_caps(&self) -> BoxFuture<'_, Result<Option<MediaSnapshot>, MediaError>> {
+        Box::pin(async move {
+            self.snapshot().await.map(|state| {
+                state.map(|state| MediaSnapshot {
+                    state,
+                    caps: self.caps(),
+                })
+            })
+        })
+    }
 
     /// Toggle play/pause.
     fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>>;
