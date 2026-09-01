@@ -622,7 +622,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
            text           TEXT    NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_dispatch_notes_dispatch
-           ON agent_dispatch_notes (dispatch_id, created_at_ms);",
+         ON agent_dispatch_notes (dispatch_id, created_at_ms);",
     );
     // v63: one complete PR review snapshot per canonical worktree key. The
     // identity columns are deliberately duplicated outside the JSON so a
@@ -798,6 +798,41 @@ pub(crate) fn migrate_v64(conn: &Connection) -> Result<()> {
            ON automation_runs (rule_id, started_at DESC, id DESC);
          CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
            ON automation_runs (outcome, started_at DESC);",
+    )?;
+    Ok(())
+}
+
+/// v66: durable issue-autopilot claim/correlation journal. The unique
+/// provider/account/issue key makes concurrent refreshes lose a claim race;
+/// the existing dispatch roster remains the worker ledger.
+pub(crate) fn migrate_v66(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS autopilot_runs (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           provider TEXT NOT NULL,
+           account TEXT NOT NULL,
+           issue_id TEXT NOT NULL,
+           repo_root TEXT NOT NULL,
+           worktree TEXT,
+           branch TEXT,
+           base_branch TEXT,
+           state TEXT NOT NULL,
+           attempt INTEGER NOT NULL DEFAULT 1,
+           dispatch_id INTEGER,
+           pr_number INTEGER,
+           pr_head TEXT,
+           pr_url TEXT,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           claimed_at INTEGER,
+           finished_at INTEGER,
+           last_reason TEXT,
+           UNIQUE(provider, account, issue_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_autopilot_runs_repo_state
+           ON autopilot_runs (repo_root, state, updated_at);
+         CREATE INDEX IF NOT EXISTS idx_autopilot_runs_repo_pr
+           ON autopilot_runs (repo_root, pr_number);",
     )?;
     Ok(())
 }
@@ -982,10 +1017,54 @@ pub(crate) fn verify_v65_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Verify THE-56's additive autopilot journal before stamping schema v66.
+/// Chaining through v65 keeps every previously landed migration contract
+/// checked during a reconciled upgrade.
+pub(crate) fn verify_v66_schema(conn: &Connection) -> Result<()> {
+    verify_v65_schema(conn)?;
+    conn.prepare("SELECT provider, account, issue_id, state FROM autopilot_runs LIMIT 0")?;
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='autopilot_runs'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if table.as_deref() != Some("table") {
+        anyhow::bail!("schema v66 migration did not create autopilot_runs");
+    }
+    let unique: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name LIKE 'sqlite_autoindex_autopilot_runs_%' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if unique.is_none() {
+        anyhow::bail!("schema v66 migration did not create the autopilot claim index");
+    }
+    for index in [
+        "idx_autopilot_runs_repo_state",
+        "idx_autopilot_runs_repo_pr",
+    ] {
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                [index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if present.is_none() {
+            anyhow::bail!("schema v66 migration did not create {index}");
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
+    use crate::autopilot::AutopilotIssueKey;
     use crate::db::Db;
-    use crate::store::{SessionForkStore, WorkspaceStore};
+    use crate::store::{AutopilotStore, ClaimOutcome, SessionForkStore, WorkspaceStore};
 
     #[test]
     fn detect_newer_schema_flags_only_a_newer_db() {
@@ -1003,6 +1082,55 @@ mod tests {
             .unwrap();
         let err = super::verify_v61_schema(&conn).unwrap_err();
         assert!(err.to_string().contains("agent_dispatch_notes"), "{err}");
+    }
+
+    #[test]
+    fn pre_v66_db_gains_autopilot_journal_without_dropping_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE repos (path TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO repos (path,name) VALUES ('/repo/a', 'a');
+                 PRAGMA user_version = 65;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        let claim = db
+            .claim_autopilot(
+                &AutopilotIssueKey::new("linear", "work", "THE-56"),
+                "/repo/a",
+                1,
+                1,
+                66,
+            )
+            .unwrap();
+        let id = match claim {
+            ClaimOutcome::Claimed(row) => row.id,
+            other => panic!("expected first autopilot claim, got {other:?}"),
+        };
+        assert!(db.get_autopilot_run(id).unwrap().is_some());
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM repos WHERE path='/repo/a'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "a");
+        let version: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
+        drop(db);
+
+        let reopened = Db::open_at(&path).unwrap();
+        assert!(reopened.get_autopilot_run(id).unwrap().is_some());
+        super::migrate_v66(reopened.conn()).unwrap();
+        super::verify_v66_schema(reopened.conn()).unwrap();
     }
 
     #[test]

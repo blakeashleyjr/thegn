@@ -213,6 +213,7 @@ pub(crate) fn dispatch(
                     vars: &vars,
                     timeout_secs: queue.agent_timeout_secs,
                     sandbox,
+                    credential_free: false,
                 });
                 if !ok {
                     thegn_core::msg::warn("PR review agent handoff failed");

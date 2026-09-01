@@ -46,6 +46,10 @@ pub(crate) struct AgentTaskRun<'a> {
     /// slice posture. The floor decision itself is made by [`agent_floor_gate`]
     /// before this run — a fail-closed miss never reaches here.
     pub sandbox: Option<thegn_core::sandbox::SandboxSpec>,
+    /// Run with a credential-free environment. Autopilot issue content is
+    /// untrusted, so its worker must not inherit the launcher's credentials.
+    /// Queue agents retain the historical credentialed behavior explicitly.
+    pub credential_free: bool,
 }
 
 /// How a queue's opt-in agent floor resolves for one dispatch — the attribution
@@ -145,6 +149,16 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
         .env("THEGN_TASK_KIND", task.kind.as_str())
         .env("THEGN_TASK_PROMPT", task.prompt)
         .env("THEGN_WORKTREE", task.worktree);
+    if task.credential_free {
+        cmd.env_clear();
+        for (key, value) in credential_free_env(std::env::vars()) {
+            cmd.env(key, value);
+        }
+        // Re-add the task context after clearing the inherited environment.
+        cmd.env("THEGN_TASK_KIND", task.kind.as_str())
+            .env("THEGN_TASK_PROMPT", task.prompt)
+            .env("THEGN_WORKTREE", task.worktree);
+    }
     for (k, v) in legacy_env(task) {
         cmd.env(k, v);
     }
@@ -238,6 +252,40 @@ fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
     out
 }
 
+/// Environment passed to an untrusted issue worker. Keep the same harmless
+/// infrastructure allowlist used by fresh panes, then apply the stricter hook
+/// boundary's credential-name filter as defense in depth. In particular this
+/// removes token/key/secret/password/auth/socket/agent variables even when a
+/// future infrastructure allowlist grows.
+fn credential_free_env<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    thegn_core::util::filter_host_env(vars, &[])
+        .into_iter()
+        .filter(|(key, _)| !credential_shaped(key))
+        .collect()
+}
+
+fn credential_shaped(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "_TOKEN",
+        "_SECRET",
+        "_PASSWORD",
+        "_PRIVATE_KEY",
+        "_KEY",
+        "_API_KEY",
+        "_ACCESS_KEY",
+        "_AUTH",
+        "_CREDENTIAL",
+        "_SOCK",
+        "_AGENT",
+    ]
+    .iter()
+    .any(|suffix| upper.ends_with(suffix))
+}
+
 /// Windows stub: the command template is composed with POSIX `sh_quote` and run
 /// through `$SHELL -lc`, neither of which maps onto pwsh/cmd. Port the quoting
 /// before enabling this path on Windows.
@@ -270,6 +318,7 @@ mod tests {
             vars,
             timeout_secs: 0,
             sandbox: None,
+            credential_free: false,
         }
     }
 
@@ -305,5 +354,21 @@ mod tests {
         let v = TaskVars::new().set("branch", "tg/fix");
         let env = legacy_env(&task(TaskKind::MergeConflict, &v));
         assert!(env.iter().all(|(k, _)| *k != "THEGN_MERGE_TARGET"));
+    }
+
+    #[test]
+    fn credential_free_environment_drops_credential_shaped_variables() {
+        let env = credential_free_env([
+            ("PATH".into(), "/bin".into()),
+            ("GH_TOKEN".into(), "secret".into()),
+            ("GITHUB_TOKEN".into(), "secret".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+            ("SSH_AUTH_SOCK".into(), "/run/agent.sock".into()),
+            ("LANG".into(), "C".into()),
+        ]);
+        assert_eq!(
+            env,
+            vec![("PATH".into(), "/bin".into()), ("LANG".into(), "C".into())]
+        );
     }
 }

@@ -2340,6 +2340,10 @@ pub struct WorkspaceConfig {
     /// conventions are repository facts, exactly like the merge queue's gate.
     #[serde(skip_serializing_if = "PrQueueOverlay::is_empty")]
     pub pr_queue: PrQueueOverlay,
+    /// Trusted per-repo issue autopilot policy (`[workspace.<slug>.autopilot]`).
+    /// This is the only repo-scoped layer allowed to enable the supervisor.
+    #[serde(skip_serializing_if = "AutopilotOverlay::is_empty")]
+    pub autopilot: AutopilotOverlay,
     /// Per-repo `[git]` refinements (`[workspace.<slug>.git]`). The TRUSTED
     /// per-repo layer for signing / fetch / diff-view policy — a work repo that
     /// wants `structural_diff` or different `auto_fetch` behaviour than your
@@ -4725,6 +4729,7 @@ fn is_default_preset(s: &str) -> bool {
 }
 
 pub use crate::config_automations::{AutomationsConfig, AutomationsOverlay};
+pub use crate::config_autopilot::{AutopilotConfig, AutopilotOpenAs, AutopilotOverlay};
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
@@ -4908,6 +4913,10 @@ pub struct Config {
     /// blockers with an agent, and merge them once green. Off by default (it is
     /// the one part of the shell that makes network writes).
     pub pr_queue: PrQueueConfig,
+    /// `[autopilot]` — opt-in issue pickup and issue-to-PR supervisor policy.
+    /// Repo-specific values belong in the trusted `[workspace.<slug>.autopilot]`
+    /// overlay; repo-root overlays cannot enable this supervisor.
+    pub autopilot: AutopilotConfig,
     /// `[pipeline]` — the declarative `[[pipeline.stages]]` org chart a
     /// supervising agent reads (`thegn config get pipeline --json`) to run a
     /// multi-stage pipeline. **Structure, not judgment**: thegn validates and
@@ -5118,6 +5127,7 @@ impl Default for Config {
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
+            autopilot: AutopilotConfig::default(),
             pipeline: Pipeline::default(),
             skills: SkillsConfig::default(),
             replay: ReplayConfig::default(),
@@ -6444,6 +6454,19 @@ impl Config {
             ws.pr_queue.clone().apply(&mut pq);
         }
         pq
+    }
+
+    /// Effective issue-autopilot policy for a repo.  A repo-root overlay is
+    /// deliberately not consulted: enabling a process/forge supervisor is a
+    /// trusted user choice, not repository-controlled configuration.
+    pub fn repo_autopilot(&self, repo_root: &Path) -> AutopilotConfig {
+        let mut policy = self.autopilot.clone();
+        if let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.autopilot.is_empty()
+        {
+            ws.autopilot.clone().apply(&mut policy);
+        }
+        policy
     }
 
     /// The name of the env a repo's `.thegn.*` overlay selects (`env = "…"`),
