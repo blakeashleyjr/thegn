@@ -112,12 +112,18 @@ pub fn trust(
 
     // Re-resolve with the CURRENT approvals so already-approved requests don't
     // reappear as pending.
-    let approvals = Approvals::from_canonical(db.repo_trust_approved(&root_s)?);
+    let approved_canonical = db.repo_trust_approved(&root_s)?;
+    let approvals = Approvals::from_canonical(approved_canonical.clone());
     let resolved = cfg.repo_sandbox_resolved(&root, &approvals);
+    let mut pending = resolved.pending.clone();
+    if let Some(request) =
+        crate::mise_provider::pending_request(cfg, &root, &root, &approved_canonical)
+    {
+        pending.push(request);
+    }
 
     if let Some(id) = approve {
-        let req = resolved
-            .pending
+        let req = pending
             .iter()
             .find(|p| repo_trust::request_id(&p.canonical()) == id)
             .ok_or_else(|| {
@@ -134,13 +140,13 @@ pub fn trust(
 
     // List mode.
     outln!("repo: {}", root.display());
-    if resolved.events.is_empty() && resolved.pending.is_empty() {
+    if resolved.events.is_empty() && pending.is_empty() {
         outln!("  no denied or pending overlay requests");
     }
     for line in thegn_core::config_resolve::summarize_events(&resolved.events) {
         outln!("  {line}");
     }
-    for p in &resolved.pending {
+    for p in &pending {
         outln!(
             "  pending [{}] {}: {}",
             repo_trust::request_id(&p.canonical()),
@@ -155,7 +161,7 @@ pub fn trust(
             outln!("  {} {} ({})", d.decision, d.request_id, d.request_json);
         }
     }
-    if !resolved.pending.is_empty() {
+    if !pending.is_empty() {
         outln!(
             "approve with: thegn repo trust {} --approve <id>",
             root.display()

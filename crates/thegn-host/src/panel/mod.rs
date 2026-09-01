@@ -700,6 +700,9 @@ pub struct PanelData {
     /// off-loop from the config by hydration (placement kind, region/size, token
     /// presence). Empty without any `[env.*]`.
     pub environments: Vec<crate::env_ui::EnvSnapshot>,
+    /// Presence-only toolchain state for the active worktree. Hydrated from
+    /// the provider cache; no process probe occurs during rendering.
+    pub toolchain: Option<crate::toolchain_ui::ToolchainStatus>,
 }
 
 impl PanelData {
