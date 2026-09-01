@@ -19,36 +19,11 @@ pub(crate) enum MediaOp {
     /// (audio vs video) and `[media] seek_step*`.
     SeekForward,
     SeekBack,
-    /// Jump to an absolute position (scrubber release).
-    SetPosition(std::time::Duration),
-    /// Set an absolute volume percent (volume slider).
-    SetVolume(u8),
     /// Jump to a queue entry by its opaque id.
     PlayQueueItem(String),
     ChapterNext,
     ChapterPrev,
     FullscreenToggle,
-}
-
-impl From<crate::media_overlay::OverlayOp> for MediaOp {
-    fn from(op: crate::media_overlay::OverlayOp) -> MediaOp {
-        use crate::media_overlay::OverlayOp;
-        match op {
-            OverlayOp::PlayPause => MediaOp::PlayPause,
-            OverlayOp::Next => MediaOp::Next,
-            OverlayOp::Previous => MediaOp::Previous,
-            OverlayOp::SeekForward => MediaOp::SeekForward,
-            OverlayOp::SeekBack => MediaOp::SeekBack,
-            OverlayOp::SetPosition(p) => MediaOp::SetPosition(p),
-            OverlayOp::Shuffle => MediaOp::ShuffleToggle,
-            OverlayOp::Loop => MediaOp::LoopCycle,
-            OverlayOp::SetVolume(v) => MediaOp::SetVolume(v),
-            OverlayOp::ChapterNext => MediaOp::ChapterNext,
-            OverlayOp::ChapterPrev => MediaOp::ChapterPrev,
-            OverlayOp::Fullscreen => MediaOp::FullscreenToggle,
-            OverlayOp::PlayQueue(id) => MediaOp::PlayQueueItem(id),
-        }
-    }
 }
 
 /// An async result that opens a secondary media picker palette.
@@ -146,11 +121,6 @@ pub(crate) fn spawn_media_op(
                 let step = cfg.seek_step(kind);
                 client.seek(step, matches!(op, MediaOp::SeekForward)).await
             }
-            MediaOp::SetPosition(pos) => {
-                let tid = cur.as_ref().and_then(|s| s.track_id.clone());
-                client.set_position(pos, tid.as_deref()).await
-            }
-            MediaOp::SetVolume(level) => client.set_volume(level).await,
             MediaOp::PlayQueueItem(ref id) => client.play_queue_item(id).await,
             MediaOp::ChapterNext => client.chapter_next().await,
             MediaOp::ChapterPrev => client.chapter_prev().await,
@@ -162,6 +132,31 @@ pub(crate) fn spawn_media_op(
         let _ = tx.send(client.snapshot().await.unwrap_or(None)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
+}
+
+/// Map a panel hit to the same off-loop operation used by keyboard actions.
+/// Keeping this conversion here means the panel never learns provider details.
+pub(crate) fn spawn_media_action(
+    cfg: thegn_core::config::MediaConfig,
+    action: crate::panel::MediaAction,
+    tx: tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaState>>,
+    waker: TerminalWaker,
+) {
+    let op = match action {
+        crate::panel::MediaAction::PlayPause => MediaOp::PlayPause,
+        crate::panel::MediaAction::Next => MediaOp::Next,
+        crate::panel::MediaAction::Previous => MediaOp::Previous,
+        crate::panel::MediaAction::Shuffle => MediaOp::ShuffleToggle,
+        crate::panel::MediaAction::Loop => MediaOp::LoopCycle,
+        crate::panel::MediaAction::VolumeUp => MediaOp::VolumeUp,
+        crate::panel::MediaAction::VolumeDown => MediaOp::VolumeDown,
+        crate::panel::MediaAction::SeekForward => MediaOp::SeekForward,
+        crate::panel::MediaAction::SeekBack => MediaOp::SeekBack,
+        crate::panel::MediaAction::ChapterNext => MediaOp::ChapterNext,
+        crate::panel::MediaAction::ChapterPrev => MediaOp::ChapterPrev,
+        crate::panel::MediaAction::Fullscreen => MediaOp::FullscreenToggle,
+    };
+    spawn_media_op(cfg, op, tx, waker);
 }
 
 /// Fetch the playlist / player list off-thread for the secondary picker.
@@ -185,34 +180,7 @@ pub(crate) fn spawn_media_pick(
     });
 }
 
-/// Open the Now-Playing overlay and eagerly kick its up-next queue and cover-art
-/// fetches — shared by the `MediaOpenPanel` action (Alt+m) and media-badge
-/// activation (statusbar click / Enter), so the badge opens the full transport
-/// surface, not just the one-line detail popup.
-pub(crate) fn open_media_overlay(
-    snapshot: Option<thegn_core::media::MediaState>,
-    base_cfg: &thegn_core::config::MediaConfig,
-    player_override: &Option<String>,
-    queue_tx: &tokio_mpsc::UnboundedSender<Vec<thegn_core::media::QueueItem>>,
-    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
-    waker: &TerminalWaker,
-) -> crate::media_overlay::MediaOverlay {
-    let ov = crate::media_overlay::MediaOverlay::open(snapshot);
-    let cfg = media_effective_cfg(base_cfg, player_override);
-    spawn_media_queue(cfg, queue_tx.clone(), waker.clone());
-    if let Some(url) = ov.wants_art(base_cfg.show_art) {
-        crate::media_art::spawn_fetch(
-            url,
-            crate::media_overlay::ART_COLS,
-            crate::media_overlay::ART_ROWS,
-            art_tx.clone(),
-            waker.clone(),
-        );
-    }
-    ov
-}
-
-/// Fetch the play queue / up-next list off-thread for the Now-Playing overlay.
+/// Fetch the play queue / up-next list off-thread for the docked Media panel.
 pub(crate) fn spawn_media_queue(
     cfg: thegn_core::config::MediaConfig,
     tx: tokio_mpsc::UnboundedSender<Vec<thegn_core::media::QueueItem>>,

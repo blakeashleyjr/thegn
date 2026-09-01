@@ -214,8 +214,8 @@ async fn run(
 /// Repaint discipline: a `Playing` snapshot ticks its position several times a
 /// second, and a full chrome recompose per tick is a self-sustaining flicker
 /// storm (and an idle-CPU violation). So repaint only what the snapshot moves
-/// on screen: while the Media panel section or Now-Playing overlay is open
-/// (`coalesce_full` — they show the live position stamp) coalesce full frames
+/// on screen: while the Media panel section is open (`coalesce_full` — it shows
+/// the live position stamp) coalesce full frames
 /// to ~1/s, repainting immediately only when the statusbar badge text changed;
 /// with both closed, a badge change takes the cheap bars path and a
 /// position-only change repaints nothing.
@@ -226,11 +226,7 @@ pub(crate) fn drain_snapshots(
     rx: &mut tokio_mpsc::UnboundedReceiver<Option<MediaState>>,
     perf: &mut crate::perf::LoopPerf,
     enabled: bool,
-    show_art: bool,
     media: &mut Option<MediaState>,
-    overlay: &mut Option<crate::media_overlay::MediaOverlay>,
-    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
-    waker: &TerminalWaker,
     coalesce_full: bool,
     last_full: &mut Option<std::time::Instant>,
 ) -> (bool, bool) {
@@ -244,18 +240,6 @@ pub(crate) fn drain_snapshots(
         let badge_changed =
             media.as_ref().and_then(|m| m.badge()) != shown.as_ref().and_then(|m| m.badge());
         *media = shown;
-        if let Some(ov) = overlay.as_mut() {
-            ov.snapshot = media.clone();
-            if let Some(url) = ov.wants_art(show_art) {
-                crate::media_art::spawn_fetch(
-                    url,
-                    crate::media_overlay::ART_COLS,
-                    crate::media_overlay::ART_ROWS,
-                    art_tx.clone(),
-                    waker.clone(),
-                );
-            }
-        }
         if coalesce_full {
             if badge_changed
                 || last_full

@@ -113,7 +113,8 @@ mod mcp_proxy;
 mod measure;
 mod media_art;
 mod media_ctl;
-mod media_overlay;
+#[path = "handlers/media_panel.rs"]
+mod media_panel;
 mod media_watch;
 mod mem;
 mod menu;
