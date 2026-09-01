@@ -177,6 +177,7 @@ fn overlay_devcontainer(
     let provider_eligible = source_present
         && !user_source_pinned
         && outcome.pending.is_empty()
+        && outcome.substitution.blocked_local_env.is_empty()
         && inventory.refused.is_empty()
         && inventory.reserved.is_empty()
         && inventory.unknown.is_empty();
