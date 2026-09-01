@@ -1714,6 +1714,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "dispatches.report",
         "dispatches.note",
         "dispatches.status",
+        "autopilot.status",
     ]);
     v.sort_unstable();
     v.dedup();

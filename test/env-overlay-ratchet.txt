@@ -13,6 +13,20 @@
 accounts.dir
 accounts.name
 accounts.provider
+autopilot.agent
+autopilot.agent_command
+autopilot.agent_timeout_secs
+autopilot.assignee
+autopilot.done_on_merge
+autopilot.enabled
+autopilot.max_attempts
+autopilot.max_concurrent
+autopilot.open_as
+autopilot.pickup_status
+autopilot.trigger_label
+# autopilot.* — issue pickup is a trusted file/workspace policy, not a
+# launcher/environment switch; enabling it can run commands and make forge
+# writes, so every key stays file-only.
 actions.action
 actions.close_on_exit
 actions.floating

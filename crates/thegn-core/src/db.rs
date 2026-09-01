@@ -164,7 +164,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// `pipeline_leases` table: the worker's recorded exit (so a row still
 /// `running` because nobody closed it is distinguishable from one whose worker
 /// is alive — the 2026-08-29 conflation) and monitor ownership.
-pub const SCHEMA_VERSION: i64 = 65;
+///
+/// v66 adds `autopilot_runs`, the provider-qualified issue claim/correlation
+/// journal. It is additive and never replaces the existing dispatch roster or
+/// issue cache.
+pub const SCHEMA_VERSION: i64 = 66;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -795,7 +799,8 @@ impl Db {
 
     /// Read-only counterpart to [`Db::open`] for dry-run command paths.
     pub fn open_read_only() -> Result<Option<Db>> {
-        Self::open_read_only_at(&db_path())    }
+        Self::open_read_only_at(&db_path())
+    }
 
     /// Open a state DB read-only when it was written by a newer build. The
     /// initial connection is only used to read `user_version`; reopening with
@@ -1523,11 +1528,13 @@ impl Db {
         crate::db_migrate::migrate_v62(&conn)?;
         crate::db_migrate::migrate_v63_leases(&conn)?;
         crate::db_migrate::migrate_v64(&conn)?;
+        crate::db_migrate::migrate_v66(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
             crate::db_migrate::verify_v64_schema(&conn)?;
             crate::db_migrate::verify_v65_schema(&conn)?;
+            crate::db_migrate::verify_v66_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

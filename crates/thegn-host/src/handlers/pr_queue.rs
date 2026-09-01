@@ -174,6 +174,12 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
                 status: s.status.to_string(),
                 detail: s.detail.to_string(),
             });
+            // `drive_queue` invokes this callback on the blocking worker. Only
+            // an observed `merged` row closes an autopilot run; the transient
+            // "merge requested"/ready states do not.
+            if s.status == "merged" {
+                crate::autopilot_driver::on_pr_merged(&cfg, &root, s.number);
+            }
         });
         for (event, revised) in &out.review_events {
             send(PrqMsg::ReviewTask {
