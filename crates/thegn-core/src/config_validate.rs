@@ -878,9 +878,11 @@ mod tests {
         // main and locked the supervisor's own CLI out of the roster.
         // 93 → 94 (THE-23): `[sandbox] devcontainer`
         // (DevcontainerMode) — repo-authored devcontainer overlay mode.
+        // 94 → 95 (THE-59): `[voice] kind` (VoiceKind — generic command
+        // provider).
         assert_eq!(
             defs.len(),
-            94,
+            95,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

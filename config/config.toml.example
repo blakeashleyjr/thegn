@@ -4427,6 +4427,29 @@ poll_interval_secs = 3
                                # $MPD_HOST / $MPD_PORT override when left at default.
 # password = "hunter2"         # only if your MPD requires one
 
+# ── Experimental voice mode ─────────────────────────────────────────────────
+# Toggle-to-talk speech-to-text through two user-supplied commands. Thegn ships
+# no microphone, audio, speech model, or STT implementation. The capture
+# command writes one complete 16-bit PCM WAV to stdout; when stopped, that WAV
+# is sent to the transcription command on stdin and its UTF-8 stdout is pasted
+# into the focused pane without a newline or auto-submit. Commands are argv
+# arrays and are never run through a shell.
+#
+# This is disabled by default and remains disabled in the stable channel. An
+# arbitrary command can send audio elsewhere, so inspect both commands before
+# enabling this feature. `thegn doctor` reports missing commands and explains
+# the repair.
+[voice]
+enabled = false
+# command is the only implemented provider kind in this first slice.
+kind = "command"
+# Example: capture_command = ["my-recorder", "--wav-to-stdout"]
+capture_command = []
+# Example: command = ["my-transcriber", "--stdin-wav"]
+command = []
+# Hard capture limit in seconds; runtime clamps this to 1..=300.
+max_seconds = 30
+
 [usage]
 # AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,
 # and a detail overlay (Alt-u, or the palette's "AI account usage") showing every
