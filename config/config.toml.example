@@ -50,7 +50,7 @@ projects_dir = "~/code"
 # win when both spellings are present; removal is planned for the fourth stable
 # release after introduction.
 
-# Roots scanned by the workspace repo picker (new-workspace / bare `thegn`).
+# Roots scanned by the project repo picker (new-project / bare `thegn`).
 # Defaults to [projects_dir] if omitted.
 repo_roots = ["~/code", "~/src"]
 repo_scan_depth = 5
@@ -85,8 +85,8 @@ confirm_delete = true
 [ui]
 # UI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto" to detect.
 language = "auto"
-# Ask before removing a workspace (Alt+Shift+X, or the sidebar "Remove
-# workspace" action — both share one modal). The modal pre-selects the safe
+# Ask before removing a project (Alt+Shift+X, or the sidebar "Remove
+# project" action — both share one modal). The modal pre-selects the safe
 # "remove from thegn — keep all files"; deleting the branch worktree dirs
 # from disk is the explicit second choice. Set false to skip the prompt
 # (removal then keeps files; it never silently deletes from disk).
@@ -97,11 +97,11 @@ full_mode_chip = true
 # disk-usage popup) to dismiss it, just like pressing Escape. Set false to
 # require Esc.
 dismiss_overlay_on_click_outside = true
-# Sidebar workspace (repo) ordering: "manual" keeps your persisted order
-# (Ctrl+Alt+↑/↓); "attention" bubbles the workspace whose worktrees most need
-# you to the top (stable within a tier — equal-urgency workspaces keep their
+# Sidebar project (repo) ordering: "manual" keeps your persisted order
+# (Ctrl+Alt+↑/↓); "attention" bubbles the project whose worktrees most need
+# you to the top (stable within a tier — equal-urgency projects keep their
 # manual order, so rows only move on a real state change). Worktree ordering
-# *within* a workspace is the separate sidebar sort mode (`s` opens the sort
+# *within* a project is the separate sidebar sort mode (`s` opens the sort
 # menu: manual/name/recent/attention; manual — rows stay where you put them —
 # is the default).
 sidebar_project_sort = "manual"
@@ -109,15 +109,15 @@ sidebar_project_sort = "manual"
 # "no terminals" hint when empty) so the entry point never vanishes;
 # "nonempty" hides the whole section until a terminal exists.
 sidebar_terminals_section = "always"
-# Shift+Alt+↑/↓ (previous/next workspace) steps one ring: every workspace in
+# Shift+Alt+↑/↓ (previous/next project) steps one ring: every project in
 # sidebar order, then every terminal host. By default the ring steps *past* any
-# workspace or host you have collapsed — a folded group is one you are not
+# project or host you have collapsed — a folded group is one you are not
 # working in, so navigation neither stops on it nor expands it. Set false to
 # visit every group, folded or not (the old behaviour, which un-collapsed the
 # group it landed on). When every other stop is collapsed the step still lands
 # on the immediate neighbour, so the keybind never goes dead.
 sidebar_nav_skips_collapsed = true
-sidebar_dividers = true  # blank separator row above each workspace header (off = the old dense layout)
+sidebar_dividers = true  # blank separator row above each project header (off = the old dense layout)
 # Pane fullscreen (Ctrl+Alt+z cycles tiled → maximize-in-chrome → full-window):
 # in the full-window stop the sidebar/panel/strip are hidden. These keep the
 # top masthead and bottom status bars respectively — set either false for a
@@ -861,7 +861,7 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 #              `Ctrl w` stays free for the shell (delete-word).
 #   Alt      — object lifecycle + tools; create = `Alt <letter>`
 #              (`Alt w` worktree, `Alt t` tab, `Alt p` pane).
-#   Alt+Shift— one level up (`Alt w`→`Alt W` workspace; smart-close `Alt x`
+#   Alt+Shift— one level up (`Alt w`→`Alt W` project; smart-close `Alt x`
 #              → `Alt X` remove-worktree).
 #   Ctrl+Alt — chrome/UI toggles (sidebar, panel, zoom, theme, notifications…).
 # `Alt x` is a smart "close this": the focused pane if the tab is split, else
@@ -890,29 +890,29 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # new-worktree = "Space g w"   # press Space, then g, then w
 # Sidebar navigation (global):
 #   Alt ↑/↓        move to the pane above/below; at the top/bottom pane, cycle
-#                  worktrees WITHIN the current workspace (in the TERMINALS
+#                  worktrees WITHIN the current project (in the TERMINALS
 #                  region, cycles terminals within the host). Never focuses
 #                  chrome — that is Ctrl ↑/↓.
 #   Alt ←/→        move to the pane left/right; at the pane edge, cycle tabs
 #                  within the active worktree. Never focuses chrome (Ctrl ←/→).
-#   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context
+#   Shift+Alt ↑/↓  switch to the previous/next *project* (a real context
 #                  switch); at the boundary it overflows into the TERMINALS
 #                  region (and its host groups) and wraps back around
-#   Alt+`          toggle between the workspaces and TERMINALS regions, restoring
+#   Alt+`          toggle between the projects and TERMINALS regions, restoring
 #                  the last item you were on in each
 #   Alt+1..9       jump straight to the worktree at that slot in visible order
-#   Ctrl+1..9      jump straight to the workspace at that slot in visible order
+#   Ctrl+1..9      jump straight to the project at that slot in visible order
 #                  (the Alt/Ctrl digit hints are revealed on the rows while the
 #                  sidebar is focused — Alt+s — and shown in the Ctrl+K menu)
-#   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the workspace under the
+#   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the project under the
 #                  sidebar cursor if the sidebar is focused, else the active
-#                  worktree within its workspace
-# Workspaces and worktrees keep the order you set; cycle worktree sort modes
+#                  worktree within its project
+# Projects and worktrees keep the order you set; cycle worktree sort modes
 # with `s` while the sidebar is focused.
-# prev-workspace = "Shift Alt Up"
-# next-workspace = "Shift Alt Down"
-# toggle-region = "Alt `"          # bounce between workspaces and terminals
-# summon-workspace-1 = "Ctrl 1"    # …through summon-workspace-9 = "Ctrl 9"
+# prev-project = "Shift Alt Up"
+# next-project = "Shift Alt Down"
+# toggle-region = "Alt `"          # bounce between projects and terminals
+# summon-project-1 = "Ctrl 1"      # …through summon-project-9 = "Ctrl 9"
 # summon-worktree-1 = "Alt 1"      # …through summon-worktree-9 = "Alt 9"
 # summon-pin-1 = "Ctrl Alt 1"      # …through summon-pin-9 = "Ctrl Alt 9"
 # move-item-up = "Ctrl Alt Up"     # (legacy id move-worktree-up still works)
@@ -1083,7 +1083,7 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 #                                        #   historic single key for every managed
 #                                        #   remote (a leak of one file grants all).
 
-# Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
+# Per-project overrides, keyed by repo slug (the project tab prefix). Applied
 # above [keybinds] but below a repo-root `.thegn.{toml,yaml,json}` overlay,
 # which may also carry its own [keybinds] table — the most specific layer wins.
 # [project.my-repo.keybinds]
@@ -1271,8 +1271,8 @@ command = "aider --model sonnet"
 # `thegn mcp serve` exposes thegn's docs + live-state tools to a coding agent.
 # `[mcp.serve] scopes` is the GLOBAL ceiling on what those state tools may do,
 # resolved clamp-only: this ceiling, narrowed by the active profile overlay
-# (`[profiles.<p>.mcp_serve] scopes`), narrowed by the workspace overlay
-# (`[workspace.<slug>.mcp_serve] scopes`), with the `--scopes` flag intersecting
+# (`[profiles.<p>.mcp_serve] scopes`), narrowed by the project overlay
+# (`[project.<slug>.mcp_serve] scopes`), with the `--scopes` flag intersecting
 # last. An inner level may only NARROW the outer one — a repo-local overlay can
 # never widen what you granted globally. Omit the key for no clamp (the `--scopes`
 # flag, defaulting to `read`, decides); an unknown/empty list serves docs only.
@@ -2063,14 +2063,14 @@ max_results = 1000
 # Tab cycles modes; Esc closes.
 #
 # Navigation (no config needed):
-# - `~` lists workspaces + worktrees ranked by frecency (open count × recency
+# - `~` lists projects + worktrees ranked by frecency (open count × recency
 #   decay, 7-day half-life) — type a fragment, Enter lands in that worktree's
 #   tab. Every palette pick feeds the ranking.
 # - "Connect to root" (palette command) jumps from the focused pane's cwd —
 #   however deeply nested — to the tab of the worktree that owns it; a cwd
-#   outside any registered workspace offers to add it.
+#   outside any registered project offers to add it.
 # - "Clone and open" (palette command) takes a git URL, clones it off the
-#   event loop into `workspaces_dir`, registers the workspace, and opens its
+#   event loop into `projects_dir`, registers the project, and opens its
 #   first worktree tab. (Alt+W manual entry does the same.)
 # - Layout import: tmuxinator projects (`~/.config/tmuxinator/*.yml`) and sesh
 #   sessions (`~/.config/sesh/sesh.toml`) appear automatically as templates in
@@ -2389,8 +2389,8 @@ auto_caches = true
 # inode. Only a NON-existent path can't be carved (bwrap can't create the
 # mount-point under the read-only $HOME). A read-only FILE (e.g.
 # "~/.gitconfig:ro") is served read-only by the $HOME bind.
-# This is the GLOBAL ("all workspaces") scope for default bind dirs. For a
-# single workspace, add `sandbox_mounts` under `[workspace.<slug>]` (see above);
+# This is the GLOBAL ("all projects") scope for default bind dirs. For a
+# single project, add `sandbox_mounts` under `[project.<slug>]` (see above);
 # those extend this list. A repo-root `.thegn.toml` `[sandbox] mounts` can
 # also override per repo.
 mounts = ["~/.gitconfig:ro"]
@@ -3778,27 +3778,27 @@ cors_origins = []
 # the command, panel section, and badge entirely.
 # PER-REPO: every interesting key below describes a *repository* — its build
 # tool, its integration branch, its lockfiles — so a repo that differs from your
-# defaults belongs in a `[workspace.<slug>.merge_queue]` block rather than in
+# defaults belongs in a `[project.<slug>.merge_queue]` block rather than in
 # `--set` flags on every invocation. The slug is the repo directory name,
 # slugified. It overrides the global table for that repo only:
 #
-#   [workspace.datahub.merge_queue]
+#   [project.datahub.merge_queue]
 #   target_branch      = "ba/rearch"          # this repo integrates elsewhere
 #   gate_setup_command = "pnpm install --frozen-lockfile"
 #   gate_command       = "pnpm test"          # not the global "just test"
 #   land_strategy      = "squash"             # this repo prefers a squashed history
 #
-# The `[git]` table is per-repo the same way, via `[workspace.<slug>.git]`, so
+# The `[git]` table is per-repo the same way, via `[project.<slug>.git]`, so
 # signing / fetch / diff-view policy can differ between a work repo and a
 # personal one (resolved by Config::repo_git):
 #
-#   [workspace.acme.git]
+#   [project.acme.git]
 #   structural_diff = "difft"                 # structural diffs only for acme
 #   auto_fetch      = false                   # and no background fetch here
 #   override_gpg    = true                    # snapshots never wait on pinentry
-#   # (sign_commits lives under [workspace.acme.merge_queue], not [git].)
+#   # (sign_commits lives under [project.acme.merge_queue], not [git].)
 #
-# (Only the TRUSTED user-config `[workspace.<slug>]` layer may set `[git]` /
+# (Only the TRUSTED user-config `[project.<slug>]` layer may set `[git]` /
 # `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
@@ -3980,7 +3980,7 @@ failed_folder = "Needs attention"  # folder for a branch that fails to land ("" 
 conflict = ""                 # "" ⇒ thegn's built-in conflict instructions
 gate_failure = ""             # "" ⇒ thegn's built-in red-gate instructions
 # A repo can carry its own, alongside its own gate:
-#   [workspace.datahub.merge_queue.prompts]
+#   [project.datahub.merge_queue.prompts]
 #   gate_failure = """
 #   The gate is red on `{branch}`. Tail:
 #
@@ -4007,7 +4007,7 @@ gate_failure = ""             # "" ⇒ thegn's built-in red-gate instructions
 #
 # PER-REPO: like [merge_queue], these describe a *repository* — its review rules,
 # its merge style — so a repo that differs belongs in a
-# `[workspace.<slug>.pr_queue]` block (same all-Option overlay shape).
+# `[project.<slug>.pr_queue]` block (same all-Option overlay shape).
 [pr_queue]
 enabled = false               # master switch; false ⇒ no polling, no command, no panel section
 poll_interval_secs = 60       # how often a queued PR's remote state is refreshed (floored at 15s

@@ -1547,16 +1547,17 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "secret.audit",
         "secret.ssh.rotate",
     ]);
-    // Project verbs (THE-33): local `thegn project …` / `thegn wt new --project`
+    // Program verbs (THE-33): local `thegn program …` / `thegn wt new --program`
     // subcommands touching the per-profile DB + git, covering the CLI surface
-    // directly rather than via a control route.
+    // directly rather than via a control route. The deprecated `project`
+    // spelling is accepted by the same command implementation.
     v.extend([
-        "project.list",
-        "project.create",
-        "project.rename",
-        "project.rm",
-        "project.assign",
-        "project.new_feature",
+        "program.list",
+        "program.create",
+        "program.rename",
+        "program.rm",
+        "program.assign",
+        "program.new_feature",
     ]);
     // CLI-local reads that resolve through the catalog but not the control
     // socket (no HTTP route): `thegn host discover` shells out to the local
