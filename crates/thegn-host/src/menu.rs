@@ -600,7 +600,7 @@ pub fn delete_worktree_menu_dirty(dirty: usize, dirty_csv: &str) -> MenuOverlay 
 /// directories is the explicit danger arm. The home checkout is never deleted
 /// either way.
 pub fn delete_workspace_menu(display: &str) -> MenuOverlay {
-    let title = format!("Remove workspace '{display}'?");
+    let title = format!("Remove project '{display}'?");
     MenuOverlay::new_with_default(
         MenuKindTag::Confirm,
         title,

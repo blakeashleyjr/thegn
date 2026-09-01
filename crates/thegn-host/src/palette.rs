@@ -1014,8 +1014,8 @@ mod tests {
     fn items() -> Vec<PaletteItem> {
         vec![
             PaletteItem::new("new-worktree", "New worktree"),
-            PaletteItem::new("new-workspace", "New workspace"),
-            PaletteItem::new("switch", "Switch workspace"),
+            PaletteItem::new("new-project", "New project"),
+            PaletteItem::new("switch", "Switch project"),
             PaletteItem::new("diff", "Show diff"),
         ]
     }
@@ -1300,7 +1300,7 @@ mod tests {
     fn empty_query_shows_all_in_order() {
         let p = Palette::new(items());
         let m: Vec<&str> = p.matches().iter().map(|i| i.key.as_str()).collect();
-        assert_eq!(m, vec!["new-worktree", "new-workspace", "switch", "diff"]);
+        assert_eq!(m, vec!["new-worktree", "new-project", "switch", "diff"]);
     }
 
     #[test]
@@ -1337,7 +1337,7 @@ mod tests {
         p.move_down();
         assert_eq!(
             p.selected_item().map(|i| i.key.as_str()),
-            Some("new-workspace")
+            Some("new-project")
         );
         for _ in 0..20 {
             p.move_down(); // clamps at the end
@@ -1597,7 +1597,9 @@ mod tests {
         assert!(text.contains("New work"), "a matching label drawn");
         assert!(text.contains("jump"), "layer title drawn");
         assert!(text.contains("menu"), "badge drawn");
-        assert!(text.contains("matches"), "footer count drawn");
+        // One fixture label still matches "work" ("New worktree") since the
+        // project rename retired "New workspace", so the footer is singular.
+        assert!(text.contains("1 match"), "footer count drawn: {text:?}");
     }
 
     #[test]

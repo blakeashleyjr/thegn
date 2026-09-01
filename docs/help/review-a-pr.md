@@ -12,7 +12,7 @@ actions: [pr-open, pr-create]
 1. The status bar's CI/notification cluster (see [[bars]]) surfaces PRs that
    need you; `↵` on the item shows the detail popup.
 2. Check out the branch as its own worktree: `Alt-w` in the repo's
-   workspace, or the palette's `@` git mode to pick the branch. The
+   project, or the palette's `@` git mode to pick the branch. The
    worktree is isolated — your own work stays untouched.
 3. The right [[panel]]'s **work** tab tracks the branch's PR: state, CI
    check rollup, review decision. The **git** tab's _changes_ section is

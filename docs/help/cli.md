@@ -16,12 +16,13 @@ works everywhere.
 
 ## The grammar
 
-Noun-verb namespaces mirror the domain model (repo → workspace →
+Noun-verb namespaces mirror the domain model (repo → project →
 worktree):
 
 | Group         | Commands                                                                                                       |
 | ------------- | -------------------------------------------------------------------------------------------------------------- |
-| Workspace     | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
+| Project       | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
+| Program       | `program list/create/rename/rm/assign` · `wt new --program`                                                    |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                |
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                      |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
@@ -39,6 +40,12 @@ capability (scope, surfaces), `api schema` the control wire contract, and
 `api call <cap> --params '{…}'` performs any routed capability over the
 control socket — a newly routed verb is callable with no CLI change.
 `thegn plugin list|check` inspects the configured [[plugins]].
+
+The multi-repo group commands use the canonical `thegn program` namespace.
+`thegn project` remains a deprecated, behavior-identical alias for three
+stable releases and warns with the replacement. Likewise, `wt new --program`
+is canonical while `wt new --project` remains accepted as a deprecated alias;
+the warning is kept off JSON stdout.
 
 ### Tailing the event feed
 
