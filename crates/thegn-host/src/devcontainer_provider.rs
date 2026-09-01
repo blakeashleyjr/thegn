@@ -5,6 +5,7 @@
 //! discovery, bounded version probing, `up`, and `exec` argv construction.
 //! Callers receive an opaque session and never need to know CLI-specific flags.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -136,6 +137,10 @@ pub(crate) struct DevcontainerHandle {
     workspace_folder: PathBuf,
     config_path: PathBuf,
     config_digest: [u8; 32],
+    /// Keeps the immutable provider config alive for the lifetime of the
+    /// session. It is created beside the original config so relative paths in
+    /// Dockerfile/Compose/mount fields retain devcontainer semantics.
+    config_snapshot: Arc<tempfile::NamedTempFile>,
     /// Values explicitly admitted by `[sandbox].env_passthrough`. The provider
     /// CLI receives these values for `${localEnv:...}` expansion; all other
     /// host variables are deliberately absent from its environment.
@@ -160,6 +165,7 @@ pub(crate) trait DevcontainerProvider: Send + Sync {
         workspace_folder: &Path,
         config_path: &Path,
         config_digest: &[u8; 32],
+        config_content: &[u8],
         env: &[(String, String)],
     ) -> anyhow::Result<DevcontainerHandle>;
     fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> anyhow::Result<Vec<String>>;
@@ -187,9 +193,16 @@ impl DevcontainerSession {
         workspace_folder: &Path,
         config_path: &Path,
         config_digest: &[u8; 32],
+        config_content: &[u8],
         env: &[(String, String)],
     ) -> anyhow::Result<Self> {
-        let handle = provider.start(workspace_folder, config_path, config_digest, env)?;
+        let handle = provider.start(
+            workspace_folder,
+            config_path,
+            config_digest,
+            config_content,
+            env,
+        )?;
         Ok(Self { provider, handle })
     }
 
@@ -457,16 +470,18 @@ impl DevcontainerProvider for CliProvider {
         workspace_folder: &Path,
         config_path: &Path,
         config_digest: &[u8; 32],
+        config_content: &[u8],
         env: &[(String, String)],
     ) -> anyhow::Result<DevcontainerHandle> {
         let executable = self.executable()?.to_path_buf();
-        verify_config_digest(config_path, config_digest)?;
+        let snapshot = snapshot_config(config_path, config_digest, config_content)?;
+        let provider_config_path = snapshot.path().to_path_buf();
         let mut command = Command::new(&executable);
         command
             .args(["up", "--workspace-folder"])
             .arg(workspace_folder)
             .args(["--config"])
-            .arg(config_path)
+            .arg(&provider_config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -484,6 +499,9 @@ impl DevcontainerProvider for CliProvider {
         // Keep the final check adjacent to the child spawn. The earlier check
         // rejects a stale path before any provider setup; this one closes the
         // setup window immediately before the CLI reads the config.
+        // The child receives the immutable snapshot, so a repository edit
+        // after this check cannot change what the provider parses. Keep the
+        // check for the expected stale-session behavior.
         verify_config_digest(config_path, config_digest)?;
         let output = run_bounded(&mut command, START_TIMEOUT)?;
         anyhow::ensure!(
@@ -497,6 +515,7 @@ impl DevcontainerProvider for CliProvider {
             workspace_folder: workspace_folder.to_path_buf(),
             config_path: config_path.to_path_buf(),
             config_digest: *config_digest,
+            config_snapshot: snapshot,
             env: allowlisted_env,
         })
     }
@@ -512,7 +531,7 @@ impl DevcontainerProvider for CliProvider {
             "--workspace-folder".into(),
             handle.workspace_folder.display().to_string(),
             "--config".into(),
-            handle.config_path.display().to_string(),
+            handle.config_snapshot.path().display().to_string(),
             "sh".into(),
             "-lc".into(),
             command.into(),
@@ -520,16 +539,43 @@ impl DevcontainerProvider for CliProvider {
     }
 }
 
-/// Hash the selected file's bytes for the provider trust boundary. Keeping the
-/// original path (rather than copying the JSON elsewhere) is intentional: the
-/// devcontainer CLI resolves Dockerfile, Compose, and mount paths relative to
-/// the config directory.
+/// Hash the selected file's bytes for the provider trust boundary. The
+/// provider snapshot is kept beside the original so the devcontainer CLI
+/// resolves Dockerfile, Compose, and mount paths relative to the same
+/// directory.
 pub(crate) fn config_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
     let bytes = std::fs::read(path)
         .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?;
+    Ok(config_digest_bytes(&bytes))
+}
+
+fn config_digest_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Ok(hasher.finalize().into())
+    hasher.finalize().into()
+}
+
+fn snapshot_config(
+    path: &Path,
+    expected: &[u8; 32],
+    content: &[u8],
+) -> anyhow::Result<Arc<tempfile::NamedTempFile>> {
+    anyhow::ensure!(
+        config_digest_bytes(content) == *expected,
+        "parsed devcontainer config content no longer matches its trust digest"
+    );
+    // Reject an already-observed repository change, but never pass this
+    // mutable path to the provider. A later replacement is harmless because
+    // the child only receives the snapshot below.
+    verify_config_digest(path, expected)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".thegn-devcontainer-")
+        .suffix(".json")
+        .tempfile_in(parent)?;
+    file.write_all(content)?;
+    file.flush()?;
+    Ok(Arc::new(file))
 }
 
 fn verify_config_digest(path: &Path, expected: &[u8; 32]) -> anyhow::Result<()> {
@@ -606,14 +652,17 @@ mod tests {
     fn cli_exec_argv_keeps_provider_flags_inside_the_seam_for_verified_config() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("devcontainer.json");
-        std::fs::write(&config_path, "{\"image\":\"repo\"}").unwrap();
+        let content = b"{\"image\":\"repo\"}";
+        std::fs::write(&config_path, content).unwrap();
         let digest = config_digest(&config_path).unwrap();
+        let snapshot = snapshot_config(&config_path, &digest, content).unwrap();
         let provider = CliProvider::with_executable("/bin/devcontainer");
         let handle = DevcontainerHandle {
             executable: "/bin/devcontainer".into(),
             workspace_folder: "/repo/worktree".into(),
             config_path: config_path.clone(),
             config_digest: digest,
+            config_snapshot: snapshot,
             env: Vec::new(),
         };
         assert_eq!(
@@ -624,7 +673,7 @@ mod tests {
                 "--workspace-folder".into(),
                 "/repo/worktree".into(),
                 "--config".into(),
-                config_path.display().to_string(),
+                handle.config_snapshot.path().display().to_string(),
                 "sh".into(),
                 "-lc".into(),
                 "printf ok".into(),
@@ -636,13 +685,14 @@ mod tests {
     fn provider_rejects_config_changed_after_trust() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("devcontainer.json");
-        std::fs::write(&config_path, "{\"image\":\"approved\"}").unwrap();
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::write(&config_path, content).unwrap();
         let digest = config_digest(&config_path).unwrap();
         std::fs::write(&config_path, "{\"image\":\"changed\"}").unwrap();
 
         let provider = CliProvider::with_executable("/bin/devcontainer");
         let error = provider
-            .start(dir.path(), &config_path, &digest, &[])
+            .start(dir.path(), &config_path, &digest, content, &[])
             .expect_err("changed config must not reach the provider");
         assert!(error.to_string().contains("changed after trust approval"));
     }
@@ -651,13 +701,16 @@ mod tests {
     fn provider_rejects_config_changed_before_exec() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("devcontainer.json");
-        std::fs::write(&config_path, "{\"image\":\"approved\"}").unwrap();
+        let content = b"{\"image\":\"approved\"}";
+        std::fs::write(&config_path, content).unwrap();
         let digest = config_digest(&config_path).unwrap();
+        let snapshot = snapshot_config(&config_path, &digest, content).unwrap();
         let handle = DevcontainerHandle {
             executable: "/bin/devcontainer".into(),
             workspace_folder: dir.path().into(),
             config_path: config_path.clone(),
             config_digest: digest,
+            config_snapshot: snapshot,
             env: Vec::new(),
         };
         std::fs::write(&config_path, "{\"image\":\"changed\"}").unwrap();
@@ -666,6 +719,39 @@ mod tests {
             .exec_argv(&handle, "printf ok")
             .expect_err("changed config must not produce an exec command");
         assert!(error.to_string().contains("changed after trust approval"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_up_reads_the_approved_snapshot_after_original_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("provider-config");
+        let script = dir.path().join("devcontainer");
+        let config_path = dir.path().join("devcontainer.json");
+        let approved = b"{\"image\":\"approved\"}";
+        std::fs::write(&config_path, approved).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '{{\"image\":\"changed\"}}' > '{}'\ncat \"$5\" > '{}'\n",
+                config_path.display(),
+                report.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let digest = config_digest(&config_path).unwrap();
+
+        let handle = CliProvider::with_executable(script)
+            .start(dir.path(), &config_path, &digest, approved, &[])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(report).unwrap(),
+            String::from_utf8_lossy(approved)
+        );
+        assert!(handle.config_snapshot.path().exists());
     }
 
     #[test]
@@ -719,7 +805,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let config_path = dir.path().join("devcontainer.json");
-        std::fs::write(&config_path, "{\"image\":\"repo\"}").unwrap();
+        let content = b"{\"image\":\"repo\"}";
+        std::fs::write(&config_path, content).unwrap();
         let config_digest = config_digest(&config_path).unwrap();
 
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -735,6 +822,7 @@ mod tests {
                 dir.path(),
                 &config_path,
                 &config_digest,
+                content,
                 &[("DC_PROVIDER_ALLOWED".into(), "yes".into())],
             )
             .unwrap();
@@ -771,11 +859,12 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let config_path = dir.path().join("devcontainer.json");
-        std::fs::write(&config_path, "{\"image\":\"repo\"}").unwrap();
+        let content = b"{\"image\":\"repo\"}";
+        std::fs::write(&config_path, content).unwrap();
         let config_digest = config_digest(&config_path).unwrap();
 
         let error = CliProvider::with_executable(script)
-            .start(dir.path(), &config_path, &config_digest, &[])
+            .start(dir.path(), &config_path, &config_digest, content, &[])
             .expect_err("failed provider start must be reported");
         let message = error.to_string();
         assert!(message.contains("failed with"), "{message}");
