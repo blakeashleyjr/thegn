@@ -91,7 +91,7 @@ fn repo_root_arg(path: Option<String>) -> PathBuf {
 /// remote row and otherwise use the first remote row registered for the repo.
 /// The target-side bytes are resolved by the provider below; this helper never
 /// treats the placeholder as the source of truth.
-fn trust_target(start: &std::path::Path, root: &PathBuf, db: &Db) -> (PathBuf, GitLoc) {
+fn trust_target(start: &std::path::Path, root: &std::path::Path, db: &Db) -> (PathBuf, GitLoc) {
     let direct = GitLoc::for_worktree(start);
     if direct.is_remote() {
         return (start.to_path_buf(), direct);
@@ -106,7 +106,7 @@ fn trust_target(start: &std::path::Path, root: &PathBuf, db: &Db) -> (PathBuf, G
         let loc = GitLoc::for_worktree(&worktree);
         return (worktree, loc);
     }
-    (root.clone(), direct)
+    (root.to_path_buf(), direct)
 }
 
 /// `thegn repos trust [path] [--approve <id>] [--revoke <id>]` — review and
