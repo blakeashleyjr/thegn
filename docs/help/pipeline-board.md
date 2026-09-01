@@ -84,7 +84,7 @@ wheel scrolls, and a click outside the box closes the board.
 
 `↵` on a row lands you in that dispatch's worktree, exactly as pressing `↵` on
 its [[sidebar]] row would, and closes the board. If the worktree isn't open as
-a tab but is registered here, this **switches to its workspace and opens it**;
+a tab but is registered here, this **switches to its project and opens it**;
 only a worktree thegn has no record of at all reports a miss in the footer.
 
 ## Freezing and hiding

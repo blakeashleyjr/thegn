@@ -191,7 +191,7 @@ The `✋` chip, the "Needs you" list, and `Alt a` (jump to next) are **scoped
 to the active worktree's repo**, like the notification inbox — a sibling
 repo's failing CI shouldn't nag you in the repo you're working in. Nothing is
 hidden: worktrees elsewhere are counted as a dim `+N` beside the chip and
-listed under **Other repos**, still one `↵` away (which switches workspace if
+listed under **Other repos**, still one `↵` away (which switches project if
 the worktree's tab isn't open). A terminal tab scopes to its session's repo.
 Press `g` in the panel's System ▸ Notifications section to widen every scoped
 view to all worktrees, and again to narrow back.

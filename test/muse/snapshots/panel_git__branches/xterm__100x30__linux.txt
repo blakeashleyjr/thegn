@@ -1,6 +1,6 @@
  þ thegn v0.0.0-e2e  work                     12% ·  4.0/16G ·  50% ·  45°C · Thu Jan 1 · 12:00
 ────────────────────────────────────────────────────────────────────────────────────────────────────
- WORKSPACES                       REPO ▸ home      git  work  system
+ PROJECTS                       REPO ▸ home      git  work  system
                                  ╭─ e2esh · h… ─╮  main
  ▾ repo                          │$             │ ──────────────────────────────────────────────────
 ▐   └   home                     │              │  1 changes                                  clean
