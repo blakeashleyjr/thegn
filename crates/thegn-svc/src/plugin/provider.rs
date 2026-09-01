@@ -338,7 +338,7 @@ done
     fn issue_ops_round_trip_through_a_scripted_plugin() {
         let (_session, bridge) = live_bridge();
         let backend = PluginIssueBackend::new(
-            bridge,
+            bridge.clone(),
             "demo",
             IssueCaps {
                 comments: true,
@@ -356,6 +356,7 @@ done
         assert_eq!(issues[0].title, "from plugin");
         assert_eq!(issues[0].provider, "plugin:demo");
         // An unsupported op surfaces as a classified error.
+        let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
         let err = rt
             .block_on(backend.add_comment("plugin:demo:1", "hi"))
             .unwrap_err();
@@ -363,6 +364,32 @@ done
             panic!("{err:?}")
         };
         assert_eq!(*op, "add_comment");
+        // comments=true means the request reached the plugin, which then
+        // exercised the second (upstream unsupported) degradation boundary.
+        assert_eq!(
+            bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn omitted_caps_refuse_optional_ops_without_a_bridge_round_trip() {
+        let (_session, bridge) = live_bridge();
+        let backend = PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default());
+        let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(backend.add_comment("plugin:legacy:1", "hi"))
+            .unwrap_err();
+        assert!(matches!(err, IssueError::Unsupported("add_comment")));
+        // Omitted caps are the old-manifest all-false default; the adapter
+        // must reject locally before allocating a provider request id.
+        assert_eq!(
+            bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
     }
 
     #[test]
