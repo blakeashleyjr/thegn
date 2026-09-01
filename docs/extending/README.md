@@ -13,6 +13,7 @@ answer. Architecture context: [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 | a CLI subcommand                                       | [cli-subcommand.md](cli-subcommand.md)       |
 | a completion value source (`<TAB>` on an argument)     | [completion-source.md](completion-source.md) |
 | a provider (forge / CI / tracker / …)                  | [provider-impl.md](provider-impl.md)         |
+| an issue tracker provider                              | [tracker-provider.md](tracker-provider.md)   |
 | a plugin (out of process, or a plugin-backed provider) | [plugin.md](plugin.md)                       |
 | a host capability (API / MCP / plugin verb)            | [capability.md](capability.md)               |
 | a coding-agent harness (Claude Code / Codex / …)       | [harness.md](harness.md)                     |
