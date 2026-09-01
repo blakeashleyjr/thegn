@@ -4299,7 +4299,7 @@ failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ 
 # owns review, CI, and merge decisions. This supervisor is disabled by default.
 #
 # Repo-specific trusted settings belong under:
-#   [workspace.my-repo.autopilot]
+#   [project.my-repo.autopilot]
 # A repository's `.thegn.*` overlay cannot enable or configure this section.
 [autopilot]
 enabled = false
@@ -4315,7 +4315,7 @@ open_as = "ready"              # ready | draft
 done_on_merge = false           # update only this run's issue after a real merge
 
 # Example trusted per-repository refinement:
-# [workspace.my-repo.autopilot]
+# [project.my-repo.autopilot]
 # enabled = true
 # trigger_label = "agent-ready"
 # assignee = "me"
