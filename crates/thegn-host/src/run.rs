@@ -20936,7 +20936,14 @@ async fn event_loop<T: Terminal>(
                                     Some(crate::env_wizard::EnvWizard::new(keymap.config()));
                             }
                             Action::InstallToolchain => {
-                                let worktree = active_tab_path(&session);
+                                // Do not fall back from a registered remote or
+                                // missing worktree to the compositor cwd: that
+                                // could install a different repository.
+                                let worktree = session
+                                    .active_group()
+                                    .map(|group| std::path::PathBuf::from(&group.path))
+                                    .filter(|path| !path.as_os_str().is_empty())
+                                    .unwrap_or_else(|| active_tab_path(&session));
                                 if !worktree.is_dir() {
                                     model.status = "Toolchain install: no active worktree".into();
                                 } else {

@@ -60,12 +60,14 @@ pub(crate) fn resolve_env_trusted(
         &approvals,
     );
     let mut pending = resolved.pending.clone();
-    if let Some(request) = crate::mise_provider::pending_request(
-        cfg,
-        Path::new(worktree),
-        repo_root,
-        &approved_canonical,
-    ) {
+    if !loc.is_remote()
+        && let Some(request) = crate::mise_provider::pending_request(
+            cfg,
+            Path::new(worktree),
+            repo_root,
+            &approved_canonical,
+        )
+    {
         pending.push(request);
     }
     surface(&db, &root_s, worktree, &resolved.events, &pending);
