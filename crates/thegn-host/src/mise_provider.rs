@@ -25,13 +25,14 @@ use thegn_core::toolchain::MiseInject;
 use thegn_core::toolchain_activation::{
     ActivationLayer, ActivationPlan, ActivationPolicy, ConfigSetIdentity, DetectedToolchainFiles,
     ProviderAnswer, ProviderContext, ProviderProbe, ProviderState, ToolchainProvider,
-    compose_activation, config_set_identity, mise_env_request,
+    compose_activation, config_set_identity, config_set_identity_from_bytes, mise_env_request,
 };
 
 const ORIGIN: &str = "mise";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OUTPUT: usize = 1024 * 1024;
+const TARGET_DETECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CachedActivation {
@@ -109,6 +110,303 @@ fn shims_dir() -> Option<PathBuf> {
 
 fn executable_available() -> bool {
     thegn_core::util::which_path("mise").is_some()
+}
+
+/// Run a target command with a deadline and a bounded stdout capture. This is
+/// the common transport for SSH/provider detection and activation; the launch
+/// path therefore never falls back to an unbounded `Command::output` call.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "target command execution is bounded and only used by off-loop launch resolution"
+)]
+fn run_target_command(
+    mut command: Command,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<(bool, String), String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start target toolchain command: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("target toolchain command stdout unavailable")?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 8192];
+        while bytes.len() < max_output {
+            let n = stdout.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n.min(max_output - bytes.len())]);
+        }
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("target toolchain command failed: {e}"))?
+        {
+            let bytes = reader
+                .join()
+                .map_err(|_| "target toolchain output reader panicked")?;
+            let output = String::from_utf8(bytes)
+                .map_err(|_| "target toolchain command returned invalid UTF-8")?;
+            return Ok((status.success(), output));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err("target toolchain command timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn target_script(
+    loc: &GitLoc,
+    script: &str,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<(bool, String), String> {
+    run_target_command(loc.sh_command(script), timeout, max_output)
+}
+
+fn remote_requirements(loc: &GitLoc) -> Result<EnvRequirements, String> {
+    let (ok, output) = target_script(
+        loc,
+        thegn_core::envplan::DETECT_PROBE_SCRIPT,
+        TARGET_DETECT_TIMEOUT,
+        64 * 1024,
+    )?;
+    ok.then(|| thegn_core::envplan::detect_from_probe(&output))
+        .ok_or_else(|| "remote toolchain detection failed".into())
+}
+
+fn remote_file(loc: &GitLoc, relative: &str) -> Option<Vec<u8>> {
+    let quoted = thegn_core::util::sh_quote(relative);
+    let script =
+        format!("if [ -f {quoted} ] && [ ! -L {quoted} ]; then cat {quoted}; else exit 42; fi");
+    let (ok, output) = target_script(loc, &script, TARGET_DETECT_TIMEOUT, MAX_OUTPUT).ok()?;
+    ok.then(|| output.into_bytes())
+}
+
+/// Derive trust from the files on the remote target, not from a local
+/// placeholder worktree. The request remains the normal core `mise.env`
+/// request, so local and remote approvals share one canonical identity format.
+fn remote_identity(
+    loc: &GitLoc,
+    worktree_identity: &str,
+    detected: &DetectedToolchainFiles,
+) -> Option<ConfigSetIdentity> {
+    let mut contents = detected
+        .all_files()
+        .into_iter()
+        .map(|relative| Some((relative.clone(), remote_file(loc, &relative)?)))
+        .collect::<Option<Vec<_>>>()?;
+    if let Some(lock) = remote_file(loc, "mise.lock") {
+        contents.push(("mise.lock".into(), lock));
+    }
+    config_set_identity_from_bytes(worktree_identity, &contents)
+}
+
+fn approved_identity(identity: Option<&ConfigSetIdentity>, approved: &[String]) -> bool {
+    identity
+        .map(mise_env_request)
+        .is_some_and(|request| repo_trust::is_approved(&request, approved))
+}
+
+fn remote_binary_available(loc: &GitLoc) -> bool {
+    target_script(
+        loc,
+        "command -v mise >/dev/null 2>&1",
+        Duration::from_secs(5),
+        1,
+    )
+    .is_ok_and(|(ok, _)| ok)
+}
+
+fn remote_shims_dir(loc: &GitLoc) -> Option<PathBuf> {
+    let script = r#"
+d="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}/shims"
+[ -d "$d" ] && printf '%s' "$d"
+"#;
+    let (ok, output) = target_script(loc, script, Duration::from_secs(5), 4096).ok()?;
+    (ok && !output.trim().is_empty()).then(|| PathBuf::from(output.trim()))
+}
+
+fn remote_env(loc: &GitLoc) -> Result<ActivationLayer, String> {
+    let output = r#"
+env -i \
+  PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}" \
+  HOME="${HOME:-/root}" USER="${USER:-}" LANG="${LANG:-C}" \
+  MISE_DATA_DIR="${MISE_DATA_DIR:-}" XDG_DATA_HOME="${XDG_DATA_HOME:-}" \
+  MISE_ENV="${MISE_ENV:-}" mise env -s json
+"#;
+    let (ok, output) = target_script(loc, output, RESOLVE_TIMEOUT, MAX_OUTPUT)?;
+    if !ok {
+        return Err("remote toolchain environment resolver failed".into());
+    }
+    parse_env_output(&output).ok_or_else(|| "invalid remote resolver JSON".into())
+}
+
+fn remote_activation(
+    cfg: &Config,
+    loc: &GitLoc,
+    worktree_identity: &str,
+    repo_root: &Path,
+    db: Option<&thegn_core::db::Db>,
+    requirements: &EnvRequirements,
+) -> ProviderAnswer {
+    if requirements.toolchain_files.is_empty() {
+        return ProviderAnswer::Reserved {
+            origin: ORIGIN.into(),
+            reason: "remote target has no declared toolchain".into(),
+        };
+    }
+    if !remote_binary_available(loc) {
+        return ProviderAnswer::Unavailable {
+            origin: ORIGIN.into(),
+            reason: "toolchain executable is not installed on the target".into(),
+        };
+    }
+    let approved = db
+        .map(|db| approvals_for(Some(db), repo_root))
+        .unwrap_or_default();
+    let identity = remote_identity(loc, worktree_identity, &requirements.toolchain_files);
+    let allowed = approved_identity(identity.as_ref(), &approved);
+    let desired = policy(cfg, allowed);
+    let cached = (desired == ActivationPolicy::Environment && allowed)
+        .then(|| remote_env(loc).ok())
+        .flatten();
+    let provider = MiseProvider {
+        binary: true,
+        shims: remote_shims_dir(loc),
+        cached,
+    };
+    provider.activate(&ProviderContext {
+        worktree_identity: worktree_identity.into(),
+        detected: requirements.toolchain_files.clone(),
+        policy: desired,
+        config_approved: allowed,
+    })
+}
+
+/// Detect the declarations in the selected OCI/provider target. This keeps
+/// target-local facts together with the provider operation and is also used by
+/// host provisioning, where the host worktree may only be a placeholder.
+pub(crate) fn detect_on_target(
+    runner: &thegn_svc::host::OciRunner,
+    container: &str,
+    target_worktree: &str,
+) -> Result<EnvRequirements, String> {
+    let script = format!(
+        "cd {} 2>/dev/null && {}",
+        thegn_core::util::sh_quote(target_worktree),
+        thegn_core::envplan::DETECT_PROBE_SCRIPT
+    );
+    let (ok, output, _) = runner.exec_in_container(container, &script, TARGET_DETECT_TIMEOUT)?;
+    ok.then(|| thegn_core::envplan::detect_from_probe(&output))
+        .ok_or_else(|| "target toolchain detection failed".into())
+}
+
+fn target_file(
+    runner: &thegn_svc::host::OciRunner,
+    container: &str,
+    target_worktree: &str,
+    relative: &str,
+) -> Option<Vec<u8>> {
+    let quoted = thegn_core::util::sh_quote(relative);
+    let script = format!(
+        "cd {} 2>/dev/null && if [ -f {quoted} ] && [ ! -L {quoted} ]; then cat {quoted}; else exit 42; fi",
+        thegn_core::util::sh_quote(target_worktree),
+    );
+    let (ok, output, _) = runner
+        .exec_in_container(container, &script, TARGET_DETECT_TIMEOUT)
+        .ok()?;
+    ok.then(|| output.into_bytes())
+}
+
+fn target_identity(
+    runner: &thegn_svc::host::OciRunner,
+    container: &str,
+    target_worktree: &str,
+    worktree_identity: &str,
+    detected: &DetectedToolchainFiles,
+) -> Option<ConfigSetIdentity> {
+    let mut contents = detected
+        .all_files()
+        .into_iter()
+        .map(|relative| {
+            Some((
+                relative.clone(),
+                target_file(runner, container, target_worktree, &relative)?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if let Some(lock) = target_file(runner, container, target_worktree, "mise.lock") {
+        contents.push(("mise.lock".into(), lock));
+    }
+    config_set_identity_from_bytes(worktree_identity, &contents)
+}
+
+/// Run the provider-owned install inside the selected target. This is the
+/// explicit host-provisioning operation; normal launch activation never calls
+/// it. Trust is checked against target-side bytes before any install command.
+pub(crate) fn install_on_target(
+    cfg: &Config,
+    worktree_identity: &str,
+    target_worktree: &str,
+    repo_root: &Path,
+    runner: &thegn_svc::host::OciRunner,
+    container: &str,
+    requirements: &EnvRequirements,
+) -> Result<(), String> {
+    if cfg.toolchain.mise.inject == MiseInject::Off {
+        return Err("toolchain activation is off ([toolchain.mise] inject = \"off\")".into());
+    }
+    let Some(identity) = target_identity(
+        runner,
+        container,
+        target_worktree,
+        worktree_identity,
+        &requirements.toolchain_files,
+    ) else {
+        return Err("target toolchain config changed or could not be read; install refused".into());
+    };
+    let db = thegn_core::db::Db::open()
+        .map_err(|_| "repo trust state is unavailable; install refused".to_string())?;
+    let approved = db
+        .repo_trust_approved(&repo_root.to_string_lossy())
+        .map_err(|_| "repo trust state is unavailable; install refused".to_string())?;
+    if !approved_identity(Some(&identity), &approved) {
+        return Err("target toolchain config is not approved; review `thegn repo trust`".into());
+    }
+    let (available, _, _) = runner
+        .exec_in_container(
+            container,
+            "command -v mise >/dev/null 2>&1",
+            Duration::from_secs(5),
+        )
+        .map_err(|_| "toolchain executable is not installed on the target".to_string())?;
+    if !available {
+        return Err("toolchain executable is not installed on the target".into());
+    }
+    let script = format!(
+        "cd {} 2>/dev/null && env -i PATH=\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\" HOME=\"${{HOME:-/root}}\" USER=\"${{USER:-}}\" LANG=\"${{LANG:-C}}\" MISE_DATA_DIR=\"${{MISE_DATA_DIR:-}}\" XDG_DATA_HOME=\"${{XDG_DATA_HOME:-}}\" MISE_ENV=\"${{MISE_ENV:-}}\" mise install",
+        thegn_core::util::sh_quote(target_worktree),
+    );
+    let (ok, _, _) = runner
+        .exec_in_container(container, &script, INSTALL_TIMEOUT)
+        .map_err(|e| format!("target toolchain install failed: {e}"))?;
+    ok.then_some(())
+        .ok_or_else(|| "target toolchain install failed".into())
 }
 
 /// Install the active worktree's declared tools after the user has explicitly
@@ -535,24 +833,27 @@ pub(crate) fn activation_for_launch(
     let approved = db
         .map(|db| approvals_for(Some(db), repo_root))
         .unwrap_or_default();
+    if loc.is_remote() {
+        let answer = match remote_requirements(loc) {
+            Ok(requirements) => remote_activation(cfg, loc, worktree, repo_root, db, &requirements),
+            Err(reason) => ProviderAnswer::Reserved {
+                origin: ORIGIN.into(),
+                reason,
+            },
+        };
+        return compose_activation(bundle, devshell, &[answer], None);
+    }
     // A remote/provider worktree's path is target-local (or may merely be a
     // registry placeholder on this host). Never inspect that host path to
     // derive a mise trust decision; the remote target must provide its own
     // detection/identity through the provider boundary.
-    let approved = loc.is_remote()
-        || pending_request(cfg, Path::new(worktree), repo_root, &approved).is_none();
-    let requirements = if loc.is_remote() {
-        EnvRequirements::default()
-    } else {
-        thegn_core::envplan::detect_with_mise_env(
-            Path::new(worktree),
-            std::env::var("MISE_ENV").ok().as_deref(),
-        )
-    };
+    let approved = pending_request(cfg, Path::new(worktree), repo_root, &approved).is_none();
+    let requirements = thegn_core::envplan::detect_with_mise_env(
+        Path::new(worktree),
+        std::env::var("MISE_ENV").ok().as_deref(),
+    );
     let detected = requirements.toolchain_files.clone();
-    let identity = (!loc.is_remote())
-        .then(|| config_set_identity(worktree, Path::new(worktree), &detected))
-        .flatten();
+    let identity = config_set_identity(worktree, Path::new(worktree), &detected);
     let desired = policy(cfg, approved);
     let cached = identity.as_ref().and_then(read_cache);
     if desired == ActivationPolicy::Environment
@@ -573,14 +874,7 @@ pub(crate) fn activation_for_launch(
         policy: desired,
         config_approved: approved,
     };
-    let answer = if loc.is_remote() {
-        ProviderAnswer::Reserved {
-            origin: ORIGIN.into(),
-            reason: "target resolves outside the local host".into(),
-        }
-    } else {
-        provider.activate(&context)
-    };
+    let answer = provider.activate(&context);
     compose_activation(bundle, devshell, &[answer], None)
 }
 
@@ -759,5 +1053,18 @@ mod tests {
         assert_eq!(restored.identity, identity);
         assert_eq!(restored.path_entries, layer.path_entries);
         assert_eq!(restored.env, layer.env);
+    }
+
+    #[test]
+    fn target_detection_and_identity_use_target_worktree_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mise.toml"), "[tools]\nnode='20'\n").unwrap();
+        let loc = GitLoc::Local(dir.path().to_path_buf());
+        let requirements = remote_requirements(&loc).unwrap();
+        assert_eq!(requirements.toolchain_files.all_files(), vec!["mise.toml"]);
+        let identity = remote_identity(&loc, "host-placeholder", &requirements.toolchain_files)
+            .expect("target files should produce an identity");
+        assert_eq!(identity.files, vec!["mise.toml"]);
+        assert!(!identity.hash.is_empty());
     }
 }

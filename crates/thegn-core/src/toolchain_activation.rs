@@ -228,29 +228,61 @@ pub fn config_set_identity(
     worktree: &Path,
     detected: &DetectedToolchainFiles,
 ) -> Option<ConfigSetIdentity> {
-    if detected.is_empty() {
+    let mut contents = detected
+        .all_files()
+        .into_iter()
+        .map(|relative| {
+            let bytes = readable_regular_file(worktree, &relative)?;
+            Some((relative, bytes))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if readable_regular_file(worktree, "mise.lock").is_some() {
+        contents.push((
+            "mise.lock".to_string(),
+            readable_regular_file(worktree, "mise.lock")?,
+        ));
+    }
+
+    config_set_identity_from_bytes(worktree_identity, &contents)
+}
+
+/// Build the same identity as [`config_set_identity`] from declaration bytes
+/// obtained through a provider target. The host adapter uses this when the
+/// worktree is not present on the local filesystem; keeping the hash format in
+/// core prevents remote trust requests from becoming a second identity scheme.
+pub fn config_set_identity_from_bytes(
+    worktree_identity: &str,
+    contents: &[(String, Vec<u8>)],
+) -> Option<ConfigSetIdentity> {
+    if contents.is_empty() {
         return None;
     }
-    let mut files = detected.all_files();
-    if readable_regular_file(worktree, "mise.lock").is_some() {
-        files.push("mise.lock".to_string());
-        files.sort();
+    let mut contents = contents.to_vec();
+    contents.sort_by(|a, b| a.0.cmp(&b.0));
+    if contents
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 || !safe_relative(&pair[0].0))
+        || !safe_relative(&contents.last()?.0)
+    {
+        return None;
     }
 
     let mut hasher = Sha256::new();
     hash_part(&mut hasher, b"thegn-toolchain-config-v1");
     hash_part(&mut hasher, worktree_identity.as_bytes());
-    for relative in &files {
-        let bytes = readable_regular_file(worktree, relative)?;
+    for (relative, bytes) in &contents {
         hash_part(&mut hasher, relative.as_bytes());
-        hash_part(&mut hasher, &bytes);
+        hash_part(&mut hasher, bytes);
     }
     let hash = hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    Some(ConfigSetIdentity { hash, files })
+    Some(ConfigSetIdentity {
+        hash,
+        files: contents.into_iter().map(|(name, _)| name).collect(),
+    })
 }
 
 fn hash_part(hasher: &mut Sha256, part: &[u8]) {
@@ -650,6 +682,34 @@ mod tests {
         assert_ne!(config_edit.hash, lock_one.hash);
         assert_ne!(lock_one.hash, lock_two.hash);
         assert!(lock_two.files.contains(&"mise.lock".to_string()));
+    }
+
+    #[test]
+    fn target_bytes_identity_matches_local_identity_and_rejects_unsafe_names() {
+        let dir = temp("target-identity");
+        write(dir.path(), "mise.toml", "[tools]\nnode='20'\n");
+        write(dir.path(), ".tool-versions", "node 20\n");
+        let detected = DetectedToolchainFiles::detect(dir.path(), None);
+        let local = config_set_identity("repo/worktree", dir.path(), &detected).unwrap();
+        let contents = detected
+            .all_files()
+            .into_iter()
+            .map(|name| {
+                let bytes = std::fs::read(dir.path().join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            config_set_identity_from_bytes("repo/worktree", &contents),
+            Some(local)
+        );
+        assert!(
+            config_set_identity_from_bytes(
+                "repo/worktree",
+                &[("../mise.toml".into(), b"unsafe".to_vec())]
+            )
+            .is_none()
+        );
     }
 
     #[test]
