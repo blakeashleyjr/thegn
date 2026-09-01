@@ -47,7 +47,10 @@ use super::tombstone::{TOMBSTONE_HISTORY_LINES, Tombstone};
 const SUB_CHANNEL_CAP: usize = 256;
 
 /// History lines folded into a warm-attach snapshot (scrollback context).
-const SNAPSHOT_HISTORY_LINES: usize = 2_000;
+/// Shared bound for live snapshots and fork handoff context. Tombstones keep
+/// their smaller forensic tail, but a fork must receive the same context a
+/// fresh warm attach would see.
+pub(crate) const SNAPSHOT_HISTORY_LINES: usize = 2_000;
 
 /// The actor's control mailbox.
 pub(crate) enum SessionMsg {
@@ -92,6 +95,9 @@ pub(crate) enum SessionMsg {
     WatchOutput {
         re: Box<regex::Regex>,
         reply: oneshot::Sender<u64>,
+    },
+    HistoryTail {
+        reply: oneshot::Sender<String>,
     },
     /// Start/stop/query this session's asciicast recording. The actor owns the
     /// recorder, so recording continues while every client is detached.
@@ -140,6 +146,7 @@ pub(crate) struct SessionMeta {
     /// The PTY child's pid, exposed in listings so a same-host compositor can
     /// capture the pane's live cwd/foreground command from `/proc`.
     pub pid: Option<u32>,
+    pub forked_from: Option<String>,
 }
 
 impl SessionMeta {
@@ -160,6 +167,7 @@ impl SessionMeta {
             exit_code: None,
             final_state: None,
             recording: live.recording.clone(),
+            forked_from: self.forked_from.clone(),
         }
     }
 }
@@ -254,6 +262,7 @@ pub(crate) struct SessionActor {
     /// Why the last recording could not be finalized cleanly, if it couldn't:
     /// the `.cast` on disk is truncated and must not be reported as saved.
     record_truncated: Option<String>,
+    fork_handoff: Option<std::path::PathBuf>,
 
     // ── harness-failure classification (THE-89) ─────────────────────────────
     /// The session's current harness-failure state. Set when a completed
@@ -285,6 +294,7 @@ impl SessionActor {
         tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
         db: super::service::SharedDb,
         cfg: Arc<Config>,
+        fork_handoff: Option<std::path::PathBuf>,
     ) -> Self {
         let has_agent = is_agent_program(&meta.program, &cfg);
         let error_signatures = AgentErrorSignatures {
@@ -317,6 +327,7 @@ impl SessionActor {
             record_last_path: None,
             record_capped: false,
             record_truncated: None,
+            fork_handoff,
             error_state: AgentErrorState::default(),
             error_signatures,
             last_published_error_active: false,
@@ -409,6 +420,16 @@ impl SessionActor {
                         });
                     }
                     Some(SessionMsg::WatchOutput { re, reply }) => self.on_watch(*re, reply),
+                    Some(SessionMsg::HistoryTail { reply }) => {
+                        let len = self.history.len();
+                        let start = len.saturating_sub(SNAPSHOT_HISTORY_LINES);
+                        let tail = (start..len)
+                            .filter_map(|i| self.history.get(i))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        // best-effort: the fork request may have timed out.
+                        let _ = reply.send(tail);
+                    }
                     Some(SessionMsg::Record { spec, reply }) => {
                         let _ = reply.send(self.on_record(spec)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     }
@@ -481,6 +502,7 @@ impl SessionActor {
         // effort: the lock is short, and a stale entry costs only one
         // false-positive pass until the next session-list refresh drops it.
         super::agent_error_cache::clear(&self.meta.id);
+        super::fork::cleanup_handoff(self.fork_handoff.as_deref());
         tracing::debug!(target: "thegn::daemon", session = %self.meta.id, code = ?exit_code, "session ended");
     }
 
@@ -909,8 +931,13 @@ impl SessionActor {
                         tracing::warn!(target: "thegn::daemon", "attention row retire failed: {e}");
                     }
                 }
-                if let Err(e) = db.put_notification("agent_attention", &source, &message, &worktree)
-                {
+                if let Err(e) = crate::automation_events::emit(
+                    &db,
+                    "agent_attention",
+                    &source,
+                    &message,
+                    &worktree,
+                ) {
                     tracing::warn!(target: "thegn::daemon", "attention notification failed: {e}");
                 }
             }
@@ -1288,6 +1315,7 @@ mod tests {
             cwd: None,
             created_at_ms: 0,
             pid: None,
+            forked_from: None,
         }
     }
 
@@ -1369,6 +1397,7 @@ mod tests {
             tombs.clone(),
             db.clone(),
             Arc::new(cfg),
+            None,
         );
         if let Some(cap) = sub_cap {
             actor.set_sub_cap(cap);

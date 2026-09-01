@@ -107,8 +107,16 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         AttemptOutcome::Conflict { paths } => {
             anyhow::bail!("{branch} conflicts with {target}: {}", paths.join(", "));
         }
-        AttemptOutcome::GateFailed { .. } => {
-            anyhow::bail!("{branch} breaks the build (gate red); not landed.");
+        AttemptOutcome::GateFailed { log } => {
+            // Name what failed. The gate already captured its log; discarding it
+            // meant every gate-red land sent the operator to re-run the suite by
+            // hand in the gate worktree just to learn which test broke — which
+            // happened for THE-11, THE-19, THE-7, THE-22 and THE-51 in one drain.
+            let failures = gate_failure_digest(&log);
+            if failures.is_empty() {
+                anyhow::bail!("{branch} breaks the build (gate red); not landed.");
+            }
+            anyhow::bail!("{branch} breaks the build (gate red); not landed:\n{failures}");
         }
         AttemptOutcome::GateError { reason, .. } => {
             // The gate never ran, so this says nothing about the branch. Naming
@@ -128,4 +136,75 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pull the actionable lines out of a gate log: nextest `FAIL [...]` rows,
+/// compiler `error[EXXXX]` lines, and panic sites. Bounded, because a gate log
+/// can be tens of thousands of lines and the point is to name the failure, not
+/// to reprint the run.
+fn gate_failure_digest(log: &str) -> String {
+    const MAX: usize = 12;
+    let mut seen: Vec<&str> = Vec::new();
+    for line in log.lines() {
+        let t = line.trim();
+        let interesting = t.starts_with("FAIL [")
+            || t.starts_with("error[")
+            || (t.starts_with("error:") && !t.contains("test run failed"))
+            || t.contains("panicked at");
+        if interesting && !seen.contains(&t) {
+            seen.push(t);
+            if seen.len() == MAX {
+                break;
+            }
+        }
+    }
+    seen.iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod land_digest_tests {
+    use super::gate_failure_digest;
+
+    #[test]
+    fn digest_names_failing_tests_and_skips_the_noise() {
+        let log = "\
+   Compiling thegn-core v0.1.0
+        PASS [   0.01s] (1/2) thegn-core a::b
+        FAIL [   0.03s] (2/2) thegn-core notification::tests::as_str_matches_serde_snake_case
+    thread 'x' panicked at crates/thegn-core/src/notification.rs:440:9:
+     Summary [  9.2s] 2 tests run: 1 passed, 1 failed
+error: test run failed
+";
+        let d = gate_failure_digest(log);
+        assert!(d.contains("as_str_matches_serde_snake_case"), "{d}");
+        assert!(d.contains("panicked at"), "{d}");
+        // "test run failed" is the exit banner, not the cause — it would push a
+        // real failure out of a bounded digest.
+        assert!(!d.contains("test run failed"), "{d}");
+        assert!(!d.contains("PASS ["), "{d}");
+        assert!(!d.contains("Compiling"), "{d}");
+    }
+
+    #[test]
+    fn digest_is_bounded_and_deduplicated() {
+        let mut log = String::new();
+        for _ in 0..50 {
+            log.push_str("        FAIL [ 0.01s] (1/1) same::test\n");
+        }
+        for i in 0..50 {
+            log.push_str(&format!("error[E0{i:03}]: distinct compile error {i}\n"));
+        }
+        let d = gate_failure_digest(&log);
+        assert_eq!(d.lines().count(), 12, "digest must stay bounded: {d}");
+        assert_eq!(d.matches("same::test").count(), 1, "duplicates collapse: {d}");
+    }
+
+    #[test]
+    fn an_empty_or_clean_log_yields_nothing_to_report() {
+        assert!(gate_failure_digest("").is_empty());
+        assert!(gate_failure_digest("     Summary [ 1s] 10 tests run: 10 passed\n").is_empty());
+    }
 }

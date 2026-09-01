@@ -34,6 +34,7 @@ use crate::config::{
     FileAccess, Network, OnMissing, SandboxConfig, SandboxLimits, SandboxOverlay, SandboxProfile,
     WarmDirenv,
 };
+use crate::hooks::{HookEvent, HookSpec};
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -190,6 +191,20 @@ impl Approvals {
     /// [`crate::repo_trust`]).
     pub fn is_approved(&self, req: &GatedRequest) -> bool {
         self.approved.contains(&req.canonical())
+    }
+}
+
+/// Build the single trust-on-first-use request for one repo hook event.
+///
+/// The normalized list is serialized as the request value, so changing any
+/// command or execution policy produces a new canonical approval. Keeping this
+/// beside the other gated-request helpers makes hook trust use the same storage
+/// and matching machinery as the sandbox overlay.
+pub fn repo_hooks_request(event: HookEvent, hooks: &[HookSpec]) -> GatedRequest {
+    GatedRequest {
+        key: format!("hooks.{}", event.as_str()),
+        value: serde_json::to_value(hooks).unwrap_or_else(|_| serde_json::json!([])),
+        summary: format!("run {} repo lifecycle hook(s)", hooks.len()),
     }
 }
 
@@ -397,7 +412,7 @@ pub fn classify_repo_overlay(
         auto_caches,
         mounts,
         init_script,
-        prepare,
+        prepare: _,
         warm_direnv,
         devenv,
         inject_devshell,
@@ -754,24 +769,10 @@ pub fn classify_repo_overlay(
         approvals,
         |s| format!("run init_script ({} chars)", s.len()),
     );
-    if let Some(list) = prepare {
-        let mut granted = Vec::new();
-        for cmd in list {
-            let gr = GatedRequest {
-                key: "sandbox.prepare".to_string(),
-                value: json!(cmd),
-                summary: format!("prepare: {cmd}"),
-            };
-            if approvals.is_approved(&gr) {
-                granted.push(cmd);
-            } else {
-                pending.push(gr);
-            }
-        }
-        if !granted.is_empty() {
-            out.prepare = Some(granted);
-        }
-    }
+    // `sandbox.prepare` is the legacy spelling for the head of the new
+    // `post_create` hook event. It is deliberately not classified as a
+    // sandbox field here: the host's config boundary emits one canonical
+    // `hooks.post_create` trust request containing both forms together.
     gated_scalar_string(
         &mut out.image,
         &mut pending,

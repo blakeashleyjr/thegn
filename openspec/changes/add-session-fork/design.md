@@ -18,6 +18,18 @@ The result is a **new process** with a **new session id** and a **new pid** —
 the spec has a scenario pinning that honesty. The source session is untouched
 (fork never pauses, signals, or shares the source's PTY).
 
+### Native recorded-harness source
+
+When `harness` is present, `ForkSpec.session` is the native id selected from
+`agent.sessions`, not a daemon id. Core validates that id and the closed
+harness registry's `FORK` capability, then obtains the vendor command through
+`Harness::fork_command`. If `agent` is also supplied, its configured provider
+must match the recorded harness; otherwise the request is rejected rather than
+silently launching a different provider. The selected command remains
+authoritative while the host composes the configured agent's current
+credentials, sandbox, and other launch context. Harnesses without `FORK`
+remain explicitly reserved and never fall back to a guessed command.
+
 ### Recipe retention
 
 Today `SessionMeta` keeps only `id/worktree/program/cwd/created_at/pid`; the
@@ -66,6 +78,22 @@ exists in the daemon — visible in `thegn session list`, adoptable later.
 After add-runtime-session-split lands, adoption becomes an `apply_layout`
 mutation; fork itself does not change.
 
+## Surface and wire contract
+
+The catalog has exactly one row, `sessions.fork`, mapped to
+`Verb::ForkSession`, the same write scope as `sessions.open`, and
+`SurfaceSet::ALL`. The operation is non-streaming and is projected by HTTP
+(`POST /v1/sessions/fork`), gRPC (`ForkSession`), the CLI, the MCP tool
+`sessions_fork`, and the plugin generic capability route. MCP uses flat,
+scope-checked arguments and adds no raw `argv` or arbitrary `env`.
+
+The final request fields are `session`, optional `harness`, `agent`, `cwd`, and
+`worktree`, plus boolean `scrollback`, `adopt`, and `tab`. `session` is a live
+daemon id when `harness` is absent and a native harness id otherwise. The
+response is `SessionInfo` with additive optional `forked_from`; it never
+contains a recipe, environment, prompt, transcript, or credentials. The
+control-schema JSON snapshot is generated from these wire types.
+
 ## Event-loop / render impact
 
 None on the fork path itself: fork is a daemon-side operation reached over
@@ -113,9 +141,9 @@ frame (the sanctioned path). No new polling anywhere.
   fresh open (`already_capped` reset); a sandboxed source cannot fork into an
   unsandboxed sibling.
 - **Blast radius:** one new write surface (spawn a process), identical in
-  power to the existing `sessions.open`; not exposed on MCP/plugin in v1
-  (matching the open verb's posture there is a separate, deliberate
-  decision).
+  power to the existing `sessions.open`; `sessions.fork` is exposed on HTTP,
+  gRPC, CLI, MCP, and plugin generic calls through the single catalog row and
+  uses the same scope/auth gates as `sessions.open`.
 
 ## Open questions
 

@@ -38,9 +38,7 @@ pub(crate) struct DeleteCtx<'a> {
     pub panes: &'a mut crate::panes::Panes,
     pub model: &'a mut crate::chrome::FrameModel,
     pub sb: &'a mut crate::run::SidebarState,
-    pub drawer: &'a mut Option<u32>,
-    pub drawer_pool: &'a mut crate::run::DrawerPool,
-    pub drawer_home: &'a mut Option<std::path::PathBuf>,
+    pub drawer_runtime: &'a mut crate::run::DrawerRuntime,
     pub active_menu: &'a mut Option<MenuOverlay>,
     /// Targets stashed across the confirm modal as **stable group names**, not
     /// indices: a background reap/prune can shift `session.worktrees` indices
@@ -100,7 +98,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     // index will shift as groups below it are removed.
     let active_group_name = cx.session.active_group().map(|g| g.name.clone());
 
-    // Capture the worktree paths being closed BEFORE the loop shifts indices, so
+    // Capture the groups and worktree paths being closed BEFORE the loop shifts indices, so
     // we can optimistically drop their merge-queue rows from the in-memory model
     // (the authoritative DB delete happens in `forget_worktree_group`; this keeps
     // the MQ badge correct on the same frame instead of next hydration tick).
@@ -110,14 +108,41 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         .filter(|p| !p.is_empty())
         .collect();
 
+    let removed_groups: Vec<crate::session::WorktreeGroup> = targets
+        .iter()
+        .filter_map(|&gi| cx.session.worktrees.get(gi).cloned())
+        .collect();
+    let session_id = cx.session.id.clone();
+
+    // Closing a group keeps its checkout, so the destroy worker cannot own
+    // the session boundary. Release any live session latch before removing
+    // the group; otherwise reopening it in this process suppresses the next
+    // session_start and session_end never runs for an explicit close.
+    let mut session_end_errors = Vec::new();
+    for group in &removed_groups {
+        if !group.path.is_empty()
+            && let Err(error) = crate::worktree_lifecycle::session_end_once(
+                cx.cfg,
+                std::path::Path::new(&group.path),
+                Some(cx.waker.clone()),
+            )
+        {
+            session_end_errors.push(format!("{}: {error}", group.path));
+        }
+    }
+
+    // Cache pruning is a worker operation. Close from the highest index down so
+    // earlier in-memory indices stay valid without opening SQLite on the loop.
+    crate::db_task::persist(move |db| {
+        for group in &removed_groups {
+            crate::run::forget_worktree_group(db, &session_id, group, true);
+        }
+    });
+
     // Close from the highest index down so earlier indices stay valid.
-    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: deletion proceeds on disk/git; a failed open just leaves stale rows
     targets.sort_unstable_by(|a, b| b.cmp(a));
     for gi in targets {
         if gi < cx.session.worktrees.len() {
-            if let Some(db) = &db {
-                crate::run::forget_worktree_group(db, &cx.session.id, &cx.session.worktrees[gi]);
-            }
             for tab in &cx.session.worktrees[gi].tabs {
                 for id in tab.center.pane_ids() {
                     cx.panes.table.remove(&id);
@@ -148,20 +173,21 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     if skipped_home > 0 {
         cx.model.status = "The home worktree can't be closed".into();
     }
-    crate::run::persist_session_layout(cx.session, cx.panes);
+    crate::run::persist_session_layout_cached(cx.session);
     cx.sb.marked.clear();
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
+    if !session_end_errors.is_empty() {
+        cx.model.status = format!(
+            "Closed worktree; session_end failed to start: {}",
+            session_end_errors.join("; ")
+        );
+    }
     cx.sb.focus_active_row(cx.model);
     *cx.need_relayout = true;
-    crate::run::sync_drawer_persistence(
-        cx.session,
-        cx.panes,
-        cx.drawer,
-        cx.drawer_pool,
-        cx.drawer_home,
-        cx.cfg,
-        cx.center,
-    );
+    if let Some(dir) = crate::run::active_cwd(cx.session) {
+        cx.drawer_runtime
+            .reconcile(cx.cfg, &dir, cx.panes, cx.center);
+    }
 }
 
 /// Names for the menu body + the dirty subset, from the cached sidebar status
@@ -253,7 +279,7 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
 /// only the last-resort fallback for edge cases where that neighbor can't be
 /// resolved (collapsed workspace, terminal-active, cross-workspace).
 fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
-    confirm_delete_worktrees(cx, targets, false);
+    confirm_delete_worktrees(cx, targets, false, false);
 }
 
 /// The `ConfirmDeleteWorktrees` menu-Pick path from `run.rs`: same body as
@@ -265,6 +291,7 @@ pub(crate) fn confirm_delete_worktrees(
     cx: &mut DeleteCtx<'_>,
     targets: Vec<usize>,
     keep_files: bool,
+    force: bool,
 ) {
     // Remember the active group's name AND workspace slug up front: `delete_groups`
     // removes groups and leaves `session.active` pointing at whatever slid into the
@@ -299,28 +326,14 @@ pub(crate) fn confirm_delete_worktrees(
             .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
     };
 
-    // Capture the worktree paths being deleted BEFORE `delete_groups` shifts
-    // indices, so we can optimistically drop their merge-queue rows from the
-    // in-memory model (the authoritative DB delete happens in
-    // `forget_worktree_group`; this just updates the MQ badge on the same frame).
-    let removed_paths: Vec<String> = targets
-        .iter()
-        .filter_map(|&gi| cx.session.worktrees.get(gi).map(|g| g.path.clone()))
-        .filter(|p| !p.is_empty())
-        .collect();
-
-    cx.model.status = crate::run::delete_groups(
+    cx.model.status = crate::run::delete_groups_with_mode(
         cx.session,
         cx.panes,
         targets,
         keep_files,
+        crate::worktree_lifecycle::mode_for_user(force, false),
         Some(cx.waker.clone()),
     );
-    cx.model
-        .panel
-        .merge_queue
-        .retain(|r| !removed_paths.contains(&r.worktree));
-
     // Restore focus: (a) keep the still-living active group (it survived the
     // delete); (b) if it was deleted, land on the next/prev worktree in the same
     // workspace (sidebar-visual order); (c) fall back to the workspace home, then
@@ -342,15 +355,10 @@ pub(crate) fn confirm_delete_worktrees(
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
     cx.sb.focus_active_row(cx.model);
     *cx.need_relayout = true;
-    crate::run::sync_drawer_persistence(
-        cx.session,
-        cx.panes,
-        cx.drawer,
-        cx.drawer_pool,
-        cx.drawer_home,
-        cx.cfg,
-        cx.center,
-    );
+    if let Some(dir) = crate::run::active_cwd(cx.session) {
+        cx.drawer_runtime
+            .reconcile(cx.cfg, &dir, cx.panes, cx.center);
+    }
 }
 
 /// Given worktree group indices in sidebar-visual order (`order`), the position
