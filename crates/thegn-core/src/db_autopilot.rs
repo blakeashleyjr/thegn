@@ -1,6 +1,8 @@
 //! SQLite implementation of the issue-autopilot claim journal.
 
-use crate::autopilot::{AutopilotIssueKey, AutopilotState, AutopilotSummary, bounded_reason};
+use crate::autopilot::{
+    AutopilotIssueKey, AutopilotState, AutopilotSummary, bounded_reason, transition,
+};
 use crate::db::Db;
 use crate::store::{AutopilotStore, ClaimOutcome};
 use anyhow::Result;
@@ -47,12 +49,6 @@ impl AutopilotStore for Db {
     ) -> Result<ClaimOutcome> {
         self.conn().execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<ClaimOutcome> {
-            let active: i64 = self.conn().query_row(
-                &format!("SELECT COUNT(*) FROM autopilot_runs WHERE repo_root=?1 AND state IN {ACTIVE_STATES}"),
-                [repo_root], |row| row.get(0))?;
-            if active >= max_concurrent as i64 {
-                return Ok(ClaimOutcome::AtCapacity);
-            }
             let prior: Option<i64> = self.conn().query_row(
                 "SELECT attempt FROM autopilot_runs WHERE provider=?1 AND account=?2 AND issue_id=?3",
                 params![key.provider, key.account, key.issue_id], |row| row.get(0)).optional()?;
@@ -62,6 +58,12 @@ impl AutopilotStore for Db {
                 } else {
                     ClaimOutcome::AlreadyClaimed
                 });
+            }
+            let active: i64 = self.conn().query_row(
+                &format!("SELECT COUNT(*) FROM autopilot_runs WHERE repo_root=?1 AND state IN {ACTIVE_STATES}"),
+                [repo_root], |row| row.get(0))?;
+            if active >= max_concurrent as i64 {
+                return Ok(ClaimOutcome::AtCapacity);
             }
             let inserted = self.conn().execute(
                 "INSERT INTO autopilot_runs (provider,account,issue_id,repo_root,state,attempt,created_at,updated_at,claimed_at) VALUES (?1,?2,?3,?4,'claimed',1,?5,?5,?5) ON CONFLICT(provider,account,issue_id) DO NOTHING",
@@ -109,6 +111,11 @@ impl AutopilotStore for Db {
         pr_number: Option<u64>,
         now: i64,
     ) -> Result<bool> {
+        // Keep the durable seam subject to the same state machine as the pure
+        // policy. The expected-state predicate prevents stale writers; this
+        // check also prevents a fresh writer from skipping lifecycle stages.
+        transition(expected, next, 1, pr_number, reason)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let reason = bounded_reason(reason);
         let finished = next.is_terminal().then_some(now);
         let changed = self.conn().execute(
