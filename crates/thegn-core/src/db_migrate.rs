@@ -684,7 +684,6 @@ fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
 /// Verify that contract before `Db::init` stamps the schema version; otherwise
 /// a disk/lock/schema error swallowed by the historical ladder would make a
 /// broken upgrade look complete on the next open.
-#[cfg(test)]
 pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
     // Preparing the projection catches a missing `report` column without
     // reading any user payload.
@@ -718,6 +717,7 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
 /// version. The unique index is part of the claim contract: without it a
 /// concurrent refresh could start two runs for one issue.
 pub(crate) fn verify_v63_schema(conn: &Connection) -> Result<()> {
+    verify_v61_schema(conn)?;
     conn.prepare("SELECT provider, account, issue_id, state FROM autopilot_runs LIMIT 0")?;
     let table: Option<String> = conn
         .query_row(

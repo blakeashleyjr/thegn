@@ -142,7 +142,7 @@ fn drive_claim(
 
     // This edge is best-effort and never releases the durable claim.  A
     // provider outage must leave the run visible for a human to inspect.
-    let tracker_cfg = cfg.issues.clone();
+    let tracker_cfg = cfg.repo_issues(Some(repo_root));
     let router = thegn_svc::issue::IssueRouter::from_config_at(&tracker_cfg, Some(cwd));
     if router.is_configured()
         && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
