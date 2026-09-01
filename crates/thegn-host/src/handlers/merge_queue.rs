@@ -487,7 +487,7 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
     }
     ctx.notify_state.emit_sound(&dec);
     ctx.notify_state
-        .emit_push(&dec, kind.as_str(), &message, "", worktree);
+        .emit_push(&dec, kind.as_str(), worktree, &message, "", worktree);
     if dec.record {
         let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
         tokio::task::spawn_blocking(move || {

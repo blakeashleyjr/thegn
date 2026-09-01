@@ -85,7 +85,7 @@ impl NotifyState {
             toast_tx: Mutex::new(None),
             push_tx: Mutex::new(None),
             push_dropped: std::sync::atomic::AtomicU64::new(0),
-            delivery: crate::notification_delivery::DeliverySnapshot::default(),
+            delivery: crate::notification_delivery::DeliverySnapshot::with_waker(waker.clone()),
             waker,
         })
     }
@@ -116,6 +116,7 @@ impl NotifyState {
         &self,
         decision: &RouteDecision,
         kind: &str,
+        source_ref: &str,
         title: &str,
         body: &str,
         worktree: &str,
@@ -161,7 +162,7 @@ impl NotifyState {
                     notification_kind,
                     decision.effective_priority,
                     &content,
-                    "",
+                    source_ref,
                     worktree,
                     thegn_core::util::now(),
                     flavor,
@@ -384,7 +385,7 @@ pub fn record(
     }
     // Push-to-phone rides the same decision. The publisher worker exists only
     // when `[notifications.push]` is configured; otherwise this is a no-op.
-    state.emit_push(&decision, kind, message, "", worktree);
+    state.emit_push(&decision, kind, source_ref, message, "", worktree);
     (decision, id)
 }
 
