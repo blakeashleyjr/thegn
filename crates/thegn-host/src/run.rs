@@ -5703,8 +5703,8 @@ async fn ensure_app_loaded(
 // `media_ctl` sibling module (run.rs is line-ratcheted); import them by name so
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
-    MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
-    spawn_media_sources,
+    MediaGeneration, MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op,
+    spawn_media_pick, spawn_media_sources,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -6521,7 +6521,7 @@ async fn event_loop<T: Terminal>(
     // reload and player-override changes. `media_player_override` is the runtime
     // "Select player" choice.
     let (media_tx, mut media_rx) =
-        tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaSnapshot>>();
+        tokio_mpsc::unbounded_channel::<crate::media_watch::MediaSnapshotDelivery>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
     // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
     // drops the image and sends the pane + path to paste (or a status message).
@@ -6536,10 +6536,12 @@ async fn event_loop<T: Terminal>(
     let (media_art_tx, mut media_art_rx) =
         tokio_mpsc::unbounded_channel::<crate::media_art::ArtMosaic>();
     let mut media_player_override: Option<String> = None;
+    let media_generation = MediaGeneration::new();
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
     restart_media_watch(
         &mut media_watch,
         media_effective_cfg(&keymap.config().media, &media_player_override),
+        &media_generation,
         &media_tx,
         &waker,
     );
@@ -10401,6 +10403,7 @@ async fn event_loop<T: Terminal>(
             &mut media_rx,
             &mut loop_perf,
             current_config.media.enabled,
+            media_generation.current(),
             &mut model.panel.media,
             &mut media_caps,
             media_position_visible,
@@ -10608,6 +10611,7 @@ async fn event_loop<T: Terminal>(
                     restart_media_watch(
                         &mut media_watch,
                         media_effective_cfg(&current_config.media, &media_player_override),
+                        &media_generation,
                         &media_tx,
                         &waker,
                     );
@@ -13645,6 +13649,7 @@ async fn event_loop<T: Terminal>(
                                             &media_player_override,
                                         ),
                                         action,
+                                        &media_generation,
                                         media_tx.clone(),
                                         waker.clone(),
                                     );
@@ -13687,6 +13692,7 @@ async fn event_loop<T: Terminal>(
                                                     &media_player_override,
                                                 ),
                                                 MediaOp::PlayQueueItem(item.id.clone()),
+                                                &media_generation,
                                                 media_tx.clone(),
                                                 waker.clone(),
                                             );
@@ -13702,6 +13708,7 @@ async fn event_loop<T: Terminal>(
                                                 &current_config.media,
                                                 &media_player_override,
                                             ),
+                                            &media_generation,
                                             &media_tx,
                                             &waker,
                                         );
@@ -16490,27 +16497,13 @@ async fn event_loop<T: Terminal>(
                                             &current_config.media,
                                             &media_player_override,
                                         );
-                                        let id = id.to_string();
-                                        let tx = media_tx.clone();
-                                        let w = waker.clone();
-                                        tokio::spawn(async move {
-                                            if let Some(client) =
-                                                thegn_media::client_for(&cfg.resolve_opts()).await
-                                            {
-                                                if let Err(e) = client.activate_playlist(&id).await
-                                                {
-                                                    tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
-                                                }
-                                                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                                let _ = tx.send(
-                                                    client
-                                                        .snapshot_with_caps()
-                                                        .await
-                                                        .unwrap_or(None),
-                                                );
-                                                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                            }
-                                        });
+                                        crate::media_ctl::spawn_media_playlist(
+                                            cfg,
+                                            id.to_string(),
+                                            &media_generation,
+                                            media_tx.clone(),
+                                            waker.clone(),
+                                        );
                                     }
                                 } else if let Some(p) = key.strip_prefix("media-player:") {
                                     // Switch which player we control + restart the watcher.
@@ -16521,6 +16514,7 @@ async fn event_loop<T: Terminal>(
                                             &current_config.media,
                                             &media_player_override,
                                         ),
+                                        &media_generation,
                                         &media_tx,
                                         &waker,
                                     );
@@ -17518,6 +17512,7 @@ async fn event_loop<T: Terminal>(
                                                             &current_config.media,
                                                             &media_player_override,
                                                         ),
+                                                        &media_generation,
                                                         &media_tx,
                                                         &waker,
                                                     );
@@ -17532,6 +17527,7 @@ async fn event_loop<T: Terminal>(
                                                             &media_player_override,
                                                         ),
                                                         MediaOp::PlayQueueItem(item.id.clone()),
+                                                        &media_generation,
                                                         media_tx.clone(),
                                                         waker.clone(),
                                                     );
@@ -18871,6 +18867,7 @@ async fn event_loop<T: Terminal>(
                                         &media_player_override,
                                     ),
                                     action,
+                                    &media_generation,
                                     media_tx.clone(),
                                     waker.clone(),
                                 );
@@ -21763,6 +21760,7 @@ async fn event_loop<T: Terminal>(
                                             &media_player_override,
                                         ),
                                         op,
+                                        &media_generation,
                                         media_tx.clone(),
                                         waker.clone(),
                                     );

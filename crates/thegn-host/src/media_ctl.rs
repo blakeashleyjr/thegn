@@ -7,6 +7,26 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
 
+/// Identifies one live media watcher/config/player selection. Snapshot
+/// producers capture the value before doing any async work so a result from an
+/// operation that began before a restart can never replace the new selection.
+#[derive(Clone, Debug)]
+pub(crate) struct MediaGeneration(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl MediaGeneration {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    pub(crate) fn current(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance(&self) -> u64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+    }
+}
+
 /// A media transport op dispatched from a keybind / palette row / panel control.
 #[derive(Debug, Clone)]
 pub(crate) enum MediaOp {
@@ -54,12 +74,13 @@ pub(crate) fn media_effective_cfg(
 /// media is disabled.
 fn spawn_media_watch(
     cfg: thegn_core::config::MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaSnapshot>>,
+    generation: u64,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Body lives in `media_watch`; it resolves the backend, streams snapshots,
     // self-heals, and respawns on stream end.
-    crate::media_watch::spawn(cfg, tx, waker)
+    crate::media_watch::spawn(cfg, generation, tx, waker)
 }
 
 /// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
@@ -67,9 +88,11 @@ fn spawn_media_watch(
 pub(crate) fn restart_media_watch(
     handle: &mut Option<tokio::task::JoinHandle<()>>,
     cfg: thegn_core::config::MediaConfig,
-    tx: &tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaSnapshot>>,
+    generation: &MediaGeneration,
+    tx: &tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: &TerminalWaker,
 ) {
+    let generation_value = generation.advance();
     if let Some(h) = handle.take() {
         h.abort();
     }
@@ -78,12 +101,18 @@ pub(crate) fn restart_media_watch(
         // push it here, or the last ▶ badge / Media section stick for the rest
         // of the session after `[media] enabled = false` (and activating the
         // badge opened a popup for a stale track).
-        if tx.send(None).is_ok() {
+        if tx
+            .send(crate::media_watch::MediaSnapshotDelivery {
+                generation: generation_value,
+                snapshot: None,
+            })
+            .is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
         return;
     }
-    *handle = spawn_media_watch(cfg, tx.clone(), waker.clone());
+    *handle = spawn_media_watch(cfg, generation_value, tx.clone(), waker.clone());
 }
 
 /// Fire a transport op off-thread, then push the resulting snapshot so the badge/
@@ -91,10 +120,12 @@ pub(crate) fn restart_media_watch(
 pub(crate) fn spawn_media_op(
     cfg: thegn_core::config::MediaConfig,
     op: MediaOp,
-    tx: tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaSnapshot>>,
+    generation: &MediaGeneration,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) {
     use thegn_core::media::LoopMode;
+    let generation = generation.current();
     tokio::spawn(async move {
         let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
             return;
@@ -131,7 +162,10 @@ pub(crate) fn spawn_media_op(
         if let Err(e) = res {
             tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
         }
-        let _ = tx.send(client.snapshot_with_caps().await.unwrap_or(None)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
+            generation,
+            snapshot: client.snapshot_with_caps().await.unwrap_or(None),
+        }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
@@ -141,7 +175,8 @@ pub(crate) fn spawn_media_op(
 pub(crate) fn spawn_media_action(
     cfg: thegn_core::config::MediaConfig,
     action: crate::panel::MediaAction,
-    tx: tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaSnapshot>>,
+    generation: &MediaGeneration,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) {
     let op = match action {
@@ -158,7 +193,31 @@ pub(crate) fn spawn_media_action(
         crate::panel::MediaAction::ChapterPrev => MediaOp::ChapterPrev,
         crate::panel::MediaAction::Fullscreen => MediaOp::FullscreenToggle,
     };
-    spawn_media_op(cfg, op, tx, waker);
+    spawn_media_op(cfg, op, generation, tx, waker);
+}
+
+/// Activate a playlist off-loop and publish its result under the generation
+/// that was current when the request was made.
+pub(crate) fn spawn_media_playlist(
+    cfg: thegn_core::config::MediaConfig,
+    id: String,
+    generation: &MediaGeneration,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    waker: TerminalWaker,
+) {
+    let generation = generation.current();
+    tokio::spawn(async move {
+        if let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await {
+            if let Err(e) = client.activate_playlist(&id).await {
+                tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+            }
+            let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
+                generation,
+                snapshot: client.snapshot_with_caps().await.unwrap_or(None),
+            }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
+    });
 }
 
 /// Fetch the playlist / player list off-thread for the secondary picker.
