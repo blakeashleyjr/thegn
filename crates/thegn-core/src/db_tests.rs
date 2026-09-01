@@ -3255,6 +3255,9 @@ fn del_worktree_cascades_to_session_attention() {
 
 #[test]
 fn del_worktrees_for_repo_cascades_to_session_attention() {
+    use crate::ci_log::CiLogEntry;
+    use crate::store::CacheStore;
+
     let db = db();
     db.put_worktree("a", "/repo/x", "/wt/x1", "tg/x1", None, None)
         .unwrap();
@@ -3264,10 +3267,24 @@ fn del_worktrees_for_repo_cascades_to_session_attention() {
         .unwrap();
     db.put_session_attention(&hand("s2", "/wt/y1", "b", 100))
         .unwrap();
+    db.put_ci_cache("/wt/x1", "main", "[]").unwrap();
+    db.put_ci_cache("/wt/y1", "main", "[]").unwrap();
+    db.put_ci_log(&CiLogEntry::new(
+        "/wt/x1", "run", "job", "tests", "failed\n", 10, 1024, 1,
+    ))
+    .unwrap();
+    db.put_ci_log(&CiLogEntry::new(
+        "/wt/y1", "run", "job", "tests", "failed\n", 10, 1024, 1,
+    ))
+    .unwrap();
     db.del_worktrees_for_repo("/repo/x").unwrap();
     let rows = db.list_session_attention().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].worktree_path, "/wt/y1");
+    assert!(db.get_ci_cache("/wt/x1").unwrap().is_none());
+    assert!(db.get_ci_log("/wt/x1", "run", "job").unwrap().is_none());
+    assert!(db.get_ci_cache("/wt/y1").unwrap().is_some());
+    assert!(db.get_ci_log("/wt/y1", "run", "job").unwrap().is_some());
 }
 
 /// The v57 one-time cleanup: the `agent_attention` pile that accrued while

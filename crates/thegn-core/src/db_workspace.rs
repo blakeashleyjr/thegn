@@ -405,6 +405,21 @@ impl WorkspaceStore for Db {
             params![repo_path],
         )?;
         self.conn().execute(
+            "DELETE FROM ci_runs_cache WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
+            params![repo_path],
+        )?;
+        self.conn().execute(
+            "DELETE FROM ci_log_cache WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
+            params![repo_path],
+        )?;
+        self.conn().execute(
+            "DELETE FROM ci_autofix_dedupe WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
+            params![repo_path],
+        )?;
+        self.conn().execute(
             "DELETE FROM worktrees WHERE repo_path=?1",
             params![repo_path],
         )?;
@@ -434,6 +449,21 @@ impl WorkspaceStore for Db {
     /// delete operations cannot be undone by a stale row whose path was moved or
     /// normalized differently than the live session group.
     fn del_worktree_for_tab(&self, repo_root: &str, tab: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM ci_runs_cache WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2)",
+            params![repo_root, tab],
+        )?;
+        self.conn().execute(
+            "DELETE FROM ci_log_cache WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2)",
+            params![repo_root, tab],
+        )?;
+        self.conn().execute(
+            "DELETE FROM ci_autofix_dedupe WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1 AND tab_name=?2)",
+            params![repo_root, tab],
+        )?;
         self.conn().execute(
             "DELETE FROM worktrees WHERE repo_path=?1 AND tab_name=?2",
             params![repo_root, tab],
