@@ -60,3 +60,35 @@ pub fn redirect_stderr_to_logfile() -> Option<StderrGuard> {
         .ok()?;
     redirect_stderr_to(file)
 }
+
+/// Whether a cached state file is restricted to its owner. Unix checks the
+/// mode bits; Windows has no portable Unix-mode equivalent and relies on the
+/// per-user state directory ACL.
+pub fn is_owner_only(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o077 == 0)
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// Tighten a cache file's permissions after an atomic temporary write. Unix
+/// uses `0600`; Windows relies on the per-user state directory ACL.
+pub fn restrict_file_owner_only(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+    }
+}

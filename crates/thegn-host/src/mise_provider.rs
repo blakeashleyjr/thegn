@@ -477,13 +477,8 @@ fn cached_layer(layer: Option<CachedLayer>) -> Option<ActivationLayer> {
 
 fn read_cache_record(identity: &ConfigSetIdentity) -> Option<CachedActivation> {
     let path = cache_path(identity);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).ok()?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return None;
-        }
+    if !crate::platform::is_owner_only(&path) {
+        return None;
     }
     let raw = std::fs::read_to_string(path).ok()?;
     let cached = serde_json::from_str::<CachedActivation>(&raw).ok()?;
@@ -492,13 +487,8 @@ fn read_cache_record(identity: &ConfigSetIdentity) -> Option<CachedActivation> {
 
 fn read_remote_cache(worktree: &str, loc: &GitLoc) -> Option<CachedRemote> {
     let path = remote_cache_path(worktree, loc);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).ok()?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return None;
-        }
+    if !crate::platform::is_owner_only(&path) {
+        return None;
     }
     let raw = std::fs::read_to_string(path).ok()?;
     let cached = serde_json::from_str::<CachedRemote>(&raw).ok()?;
@@ -508,22 +498,12 @@ fn read_remote_cache(worktree: &str, loc: &GitLoc) -> Option<CachedRemote> {
 fn write_remote_cache(worktree: &str, loc: &GitLoc, cached: &CachedRemote) -> Result<(), String> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-    }
+    crate::platform::restrict_dir_owner_only(&dir);
     let path = remote_cache_path(worktree, loc);
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_vec(cached).map_err(|e| e.to_string())?;
     std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
+    crate::platform::restrict_file_owner_only(&tmp);
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
 
@@ -777,12 +757,7 @@ fn write_cache(
 ) -> Result<(), String> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-    }
+    crate::platform::restrict_dir_owner_only(&dir);
     let path = cache_path(identity);
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_vec(&CachedActivation {
@@ -797,12 +772,7 @@ fn write_cache(
     })
     .map_err(|e| e.to_string())?;
     std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
+    crate::platform::restrict_file_owner_only(&tmp);
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
 
