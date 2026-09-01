@@ -1,9 +1,8 @@
 //! Off-loop issue-autopilot supervisor.
 //!
-//! This module is intentionally a synchronous driver.  The tracker refresh and
-//! PR queue already run on background/blocking workers; the driver is called
-//! from those workers and therefore may use the existing blocking tracker,
-//! git, forge, and process seams without ever touching the compositor loop.
+//! The driver runs on bounded blocking workers. Tracker refresh only claims
+//! matching issues and schedules the actual work, so one slow agent cannot
+//! hold the refresh worker hostage.
 
 use std::path::Path;
 
@@ -59,10 +58,33 @@ pub(crate) fn pickup(
                 continue;
             }
         };
-        drive_claim(&db, cfg, &policy, repo_root, cwd, account, issue, claim.id);
+        let cfg = cfg.clone();
+        let policy = policy.clone();
+        let repo_root = repo_root.to_path_buf();
+        let cwd = cwd.to_path_buf();
+        let account = account.to_owned();
+        let issue = issue.clone();
+        let run_id = claim.id;
+        crate::sched::spawn_bg(move || {
+            let Ok(db) = Db::open() else {
+                tracing::warn!(
+                    target: "thegn::autopilot",
+                    run_id,
+                    "autopilot worker could not open the durable database"
+                );
+                return;
+            };
+            drive_claim(
+                &db, &cfg, &policy, &repo_root, &cwd, &account, &issue, run_id,
+            );
+        });
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the worker receives the complete claimed issue context"
+)]
 fn drive_claim(
     db: &Db,
     cfg: &Config,
@@ -73,17 +95,7 @@ fn drive_claim(
     issue: &Issue,
     run_id: i64,
 ) {
-    let fail = |reason: &str| {
-        let reason = bounded_reason(Some(reason)).unwrap_or_default();
-        let _ = db.transition_autopilot(
-            run_id,
-            AutopilotState::Claimed,
-            AutopilotState::NeedsHuman,
-            Some(&reason),
-            None,
-            thegn_core::util::now_ms(),
-        );
-    };
+    let fail = |reason: &str| mark_needs_human(db, run_id, AutopilotState::Claimed, None, reason);
 
     let branch_seed =
         thegn_core::issue::issue_branch_seed(issue.branch_hint.as_deref(), &issue.number);
@@ -110,8 +122,21 @@ fn drive_claim(
         fail(&format!("worktree registration failed: {e}"));
         return;
     }
-    let _ = db.link_issue(&wt, &issue.id);
-    let _ = db.set_autopilot_worktree(run_id, &wt, &branch, &base, thegn_core::util::now_ms());
+    if let Err(e) = db.link_issue(&wt, &issue.id) {
+        fail(&format!("issue linkage failed: {e}"));
+        return;
+    }
+    match db.set_autopilot_worktree(run_id, &wt, &branch, &base, thegn_core::util::now_ms()) {
+        Ok(true) => {}
+        Ok(false) => {
+            fail("autopilot worktree journal row disappeared");
+            return;
+        }
+        Err(e) => {
+            fail(&format!("autopilot worktree journal update failed: {e}"));
+            return;
+        }
+    }
 
     let agent = policy.agent.trim();
     let role = if agent.is_empty() {
@@ -139,7 +164,29 @@ fn drive_claim(
             return;
         }
     };
-    let _ = db.attach_autopilot_dispatch(run_id, dispatch_id, thegn_core::util::now_ms());
+    match db.attach_autopilot_dispatch(run_id, dispatch_id, thegn_core::util::now_ms()) {
+        Ok(true) => {}
+        Ok(false) => {
+            mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::Claimed,
+                Some(dispatch_id),
+                "autopilot dispatch journal row disappeared",
+            );
+            return;
+        }
+        Err(e) => {
+            mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::Claimed,
+                Some(dispatch_id),
+                &format!("autopilot dispatch journal update failed: {e}"),
+            );
+            return;
+        }
+    }
 
     // This edge is best-effort and never releases the durable claim.  A
     // provider outage must leave the run visible for a human to inspect.
@@ -155,32 +202,46 @@ fn drive_claim(
             ..Default::default()
         };
         if let Err(e) = rt.block_on(router.update_issue(&issue.id, &patch)) {
-            let _ = db.transition_autopilot(
+            mark_needs_human(
+                db,
                 run_id,
                 AutopilotState::Claimed,
-                AutopilotState::NeedsHuman,
-                Some(&format!("issue status update failed: {e}")),
-                None,
-                thegn_core::util::now_ms(),
+                Some(dispatch_id),
+                &format!("issue status update failed: {e}"),
             );
-            let _ = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::WaitingHuman);
             return;
         }
     }
 
-    if !db
-        .transition_autopilot(
-            run_id,
-            AutopilotState::Claimed,
-            AutopilotState::Working,
-            Some("worker started"),
-            None,
-            thegn_core::util::now_ms(),
-        )
-        .unwrap_or(false)
-    {
-        fail("claim changed before worker started");
-        return;
+    match db.transition_autopilot(
+        run_id,
+        AutopilotState::Claimed,
+        AutopilotState::Working,
+        Some("worker started"),
+        None,
+        thegn_core::util::now_ms(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::Claimed,
+                Some(dispatch_id),
+                "claim changed before worker started",
+            );
+            return;
+        }
+        Err(e) => {
+            mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::Claimed,
+                Some(dispatch_id),
+                &format!("worker start journal update failed: {e}"),
+            );
+            return;
+        }
     }
     let vars = TaskVars::new()
         .set("issue_number", &issue.number)
@@ -219,6 +280,13 @@ fn drive_claim(
             }
         }
     };
+    let sandbox = match sealed_autopilot_sandbox(cfg, repo_root, &worktree) {
+        Ok(spec) => spec,
+        Err(reason) => {
+            mark_worker_failed(db, run_id, dispatch_id, &reason);
+            return;
+        }
+    };
     let ran = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
         kind: TaskKind::Issue,
         worktree: &wt,
@@ -226,16 +294,25 @@ fn drive_claim(
         command_template: &template,
         vars: &vars,
         timeout_secs: policy.agent_timeout_secs,
-        sandbox: None,
+        sandbox: Some(sandbox),
+        credential_free: true,
     });
-    let _ = db.update_dispatch_status(
+    if let Err(e) = db.update_dispatch_status(
         dispatch_id,
         if ran {
             AgentDispatchStatus::Done
         } else {
             AgentDispatchStatus::Failed
         },
-    );
+    ) {
+        mark_worker_failed(
+            db,
+            run_id,
+            dispatch_id,
+            &format!("worker result journal update failed: {e}"),
+        );
+        return;
+    }
 
     let loc = GitLoc::for_worktree(&worktree);
     let current = crate::git_handle::get()
@@ -313,33 +390,71 @@ fn drive_claim(
             return;
         }
     };
-    let _ = db.set_autopilot_pr(
+    match db.set_autopilot_pr(
         run_id,
         pr.number,
         &pr.head_ref_name,
         &url,
         thegn_core::util::now_ms(),
-    );
-    if !db
-        .transition_autopilot(
-            run_id,
-            AutopilotState::Working,
-            AutopilotState::PrOpened,
-            Some("pull request opened"),
-            Some(pr.number),
-            thegn_core::util::now_ms(),
-        )
-        .unwrap_or(false)
-    {
-        mark_worker_failed(
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            mark_worker_failed(
+                db,
+                run_id,
+                dispatch_id,
+                "autopilot PR journal row disappeared",
+            );
+            return;
+        }
+        Err(e) => {
+            mark_worker_failed(
+                db,
+                run_id,
+                dispatch_id,
+                &format!("autopilot PR journal update failed: {e}"),
+            );
+            return;
+        }
+    }
+    match db.transition_autopilot(
+        run_id,
+        AutopilotState::Working,
+        AutopilotState::PrOpened,
+        Some("pull request opened"),
+        Some(pr.number),
+        thegn_core::util::now_ms(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            mark_worker_failed(
+                db,
+                run_id,
+                dispatch_id,
+                "worker result changed before PR transition",
+            );
+            return;
+        }
+        Err(e) => {
+            mark_worker_failed(
+                db,
+                run_id,
+                dispatch_id,
+                &format!("PR transition journal update failed: {e}"),
+            );
+            return;
+        }
+    }
+    if let Err(e) = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::PrOpen) {
+        mark_needs_human(
             db,
             run_id,
-            dispatch_id,
-            "worker result changed before PR transition",
+            AutopilotState::PrOpened,
+            Some(dispatch_id),
+            &format!("PR dispatch status update failed: {e}"),
         );
         return;
     }
-    let _ = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::PrOpen);
     if cfg.repo_pr_queue(repo_root).enabled {
         if let Err(e) = db.enqueue_pr(
             &root_s,
@@ -349,24 +464,39 @@ fn drive_claim(
             &pr.base_ref_name,
             forge.id(),
         ) {
-            let _ = db.transition_autopilot(
+            mark_needs_human(
+                db,
                 run_id,
                 AutopilotState::PrOpened,
-                AutopilotState::NeedsHuman,
-                Some(&format!("PR queue insert failed: {e}")),
-                Some(pr.number),
-                thegn_core::util::now_ms(),
+                Some(dispatch_id),
+                &format!("PR queue insert failed: {e}"),
             );
             return;
         }
-        let _ = db.transition_autopilot(
+        match db.transition_autopilot(
             run_id,
             AutopilotState::PrOpened,
             AutopilotState::Shepherding,
             Some("queued for PR shepherding"),
             Some(pr.number),
             thegn_core::util::now_ms(),
-        );
+        ) {
+            Ok(true) => {}
+            Ok(false) => mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::PrOpened,
+                Some(dispatch_id),
+                "autopilot shepherding journal row disappeared",
+            ),
+            Err(e) => mark_needs_human(
+                db,
+                run_id,
+                AutopilotState::PrOpened,
+                Some(dispatch_id),
+                &format!("autopilot shepherding journal update failed: {e}"),
+            ),
+        }
     }
 }
 
@@ -388,6 +518,114 @@ fn tracker_config_for_account(
     tracker_cfg
 }
 
+/// Resolve the issue worker's isolation boundary independently of the normal
+/// interactive sandbox posture. Autopilot receives untrusted tracker text, so
+/// it must fail closed when no real sandbox backend is available and must not
+/// inherit configured credentials, home mounts, caches, or network access.
+fn sealed_autopilot_sandbox(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+) -> Result<thegn_core::sandbox::SandboxSpec, String> {
+    let mut sandbox = cfg.repo_sandbox(repo_root);
+    sandbox.profile = thegn_core::config::SandboxProfile::Sealed;
+    sandbox.file_access = thegn_core::config::FileAccess::Worktree;
+    sandbox.mounts.clear();
+    sandbox.volumes.clear();
+    sandbox.env_passthrough.clear();
+    sandbox.auto_caches = false;
+    sandbox.inject_devshell = false;
+    sandbox.devshell.clear();
+    sandbox.nix_daemon = false;
+    sandbox.devenv = false;
+    sandbox.prepare.clear();
+    sandbox.init_script.clear();
+    sandbox.warm_direnv = thegn_core::config::WarmDirenv::Off;
+    sandbox.ports.clear();
+    sandbox.gpu = None;
+    sandbox.compose = None;
+    sandbox.network_allow.clear();
+    sandbox.network_block.clear();
+    sandbox.vpn = thegn_core::config::VpnConfig::default();
+
+    let loc = GitLoc::for_worktree(worktree);
+    let name = format!(
+        "autopilot-{}",
+        thegn_core::util::slugify(&worktree.to_string_lossy())
+    );
+    let mut spec = thegn_core::sandbox::resolve_scoped(
+        &sandbox,
+        &loc,
+        &name,
+        thegn_core::config::SandboxProfile::Sealed,
+    )
+    .ok_or_else(|| "no usable sandbox backend for autopilot worker".to_string())?;
+    // The resolver normally forwards configured env values. Keep only the
+    // worktree mounts it generated and explicitly suppress image-provided
+    // credential-shaped names as well.
+    spec.env.clear();
+    spec.env_overrides.clear();
+    spec.env_block.extend(
+        [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    spec.network = thegn_core::config::Network::None;
+    Ok(spec)
+}
+
+fn mark_needs_human(
+    db: &Db,
+    run_id: i64,
+    expected: AutopilotState,
+    dispatch_id: Option<i64>,
+    reason: &str,
+) {
+    if let Some(dispatch_id) = dispatch_id
+        && let Err(e) = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::WaitingHuman)
+    {
+        tracing::warn!(
+            target: "thegn::autopilot",
+            run_id,
+            dispatch_id,
+            error = %e,
+            "failed to record autopilot dispatch needs-human status"
+        );
+    }
+    let reason = bounded_reason(Some(reason)).unwrap_or_else(|| "autopilot failure".to_string());
+    match db.transition_autopilot(
+        run_id,
+        expected,
+        AutopilotState::NeedsHuman,
+        Some(&reason),
+        None,
+        thegn_core::util::now_ms(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            target: "thegn::autopilot",
+            run_id,
+            ?expected,
+            "autopilot failure could not claim the expected journal state"
+        ),
+        Err(e) => tracing::warn!(
+            target: "thegn::autopilot",
+            run_id,
+            ?expected,
+            error = %e,
+            "failed to record autopilot needs-human state"
+        ),
+    }
+}
+
 fn worker_failure(current: &str, expected: &str, clean: bool, ahead: u64) -> String {
     format!(
         "worker result rejected: branch={current:?} expected={expected:?}, clean={clean}, commits_ahead={ahead}"
@@ -395,14 +633,12 @@ fn worker_failure(current: &str, expected: &str, clean: bool, ahead: u64) -> Str
 }
 
 fn mark_worker_failed(db: &Db, run_id: i64, dispatch_id: i64, reason: &str) {
-    let _ = db.update_dispatch_status(dispatch_id, AgentDispatchStatus::WaitingHuman);
-    let _ = db.transition_autopilot(
+    mark_needs_human(
+        db,
         run_id,
         AutopilotState::Working,
-        AutopilotState::NeedsHuman,
-        Some(reason),
-        None,
-        thegn_core::util::now_ms(),
+        Some(dispatch_id),
+        reason,
     );
 }
 
@@ -427,13 +663,12 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
                 ..Default::default()
             };
             if let Err(e) = rt.block_on(router.update_issue(&run.key.issue_id, &patch)) {
-                let _ = db.transition_autopilot(
+                mark_needs_human(
+                    &db,
                     run.id,
                     run.state,
-                    AutopilotState::NeedsHuman,
-                    Some(&format!("done sync failed: {e}")),
-                    Some(number),
-                    thegn_core::util::now_ms(),
+                    run.dispatch_id,
+                    &format!("done sync failed: {e}"),
                 );
                 return;
             }
@@ -443,14 +678,29 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
         AutopilotState::PrOpened | AutopilotState::Shepherding => AutopilotState::Done,
         _ => return,
     };
-    let _ = db.transition_autopilot(
+    match db.transition_autopilot(
         run.id,
         run.state,
         next,
         Some("PR queue observed merged"),
         Some(number),
         thegn_core::util::now_ms(),
-    );
+    ) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            target: "thegn::autopilot",
+            run_id = run.id,
+            number,
+            "autopilot merge completion found no expected journal state"
+        ),
+        Err(e) => tracing::warn!(
+            target: "thegn::autopilot",
+            run_id = run.id,
+            number,
+            error = %e,
+            "failed to record autopilot merge completion"
+        ),
+    }
 }
 
 #[cfg(test)]
