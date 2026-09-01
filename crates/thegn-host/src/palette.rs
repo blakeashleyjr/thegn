@@ -1597,7 +1597,9 @@ mod tests {
         assert!(text.contains("New work"), "a matching label drawn");
         assert!(text.contains("jump"), "layer title drawn");
         assert!(text.contains("menu"), "badge drawn");
-        assert!(text.contains("matches"), "footer count drawn");
+        // One fixture label still matches "work" ("New worktree") since the
+        // project rename retired "New workspace", so the footer is singular.
+        assert!(text.contains("1 match"), "footer count drawn: {text:?}");
     }
 
     #[test]
