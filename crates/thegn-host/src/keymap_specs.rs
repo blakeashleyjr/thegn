@@ -228,7 +228,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "new-project",
         label: "New project",
-        message_key: "action-new-workspace",
+        message_key: "action-new-project",
         hint: "project",
         default_chords: &["Alt W"],
         palette: true,
@@ -245,7 +245,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "delete-project",
         label: "Delete project",
-        message_key: "action-delete-workspace",
+        message_key: "action-delete-project",
         hint: "remove the active project",
         // No default chord — `Alt X` / `Space X` belong to close-worktree, so
         // this action is palette-driven + user-bindable (also reachable from the
@@ -627,7 +627,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "switch-project",
         label: "Switch project",
-        message_key: "action-switch-workspace",
+        message_key: "action-switch-project",
         hint: "switch",
         default_chords: &["Alt o"],
         palette: true,
@@ -774,7 +774,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "prev-project",
         label: "Previous project",
-        message_key: "action-prev-workspace",
+        message_key: "action-prev-project",
         hint: "prev ws",
         default_chords: &["Shift Alt Up"],
         palette: true,
@@ -788,7 +788,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     ActionSpec {
         id: "next-project",
         label: "Next project",
-        message_key: "action-next-workspace",
+        message_key: "action-next-project",
         hint: "next ws",
         default_chords: &["Shift Alt Down"],
         palette: true,
