@@ -8,7 +8,8 @@
 //! the surfaces the capability is (or must be) exposed on, and a one-line
 //! summary. Per-surface coverage tests in `thegn-svc`/`thegn-host` assert
 //! every surface either implements each row it is listed on or excuses it
-//! in [`SURFACE_GAPS`] — which only shrinks.
+//! in [`SURFACE_GAPS`] — which only shrinks. Compatibility aliases are rows in
+//! the same catalog, so every surface projects the canonical and legacy ids.
 //!
 //! The catalog never restates *policy*: the scope a capability needs is
 //! [`required_scope`]`(row.verb)`, so control tokens, MCP tool scopes and plugin
@@ -180,7 +181,22 @@ const fn stub_cap(
     }
 }
 
-/// The catalog. One row per [`Verb`]; `every_verb_has_exactly_one_row` pins it.
+/// A deprecated catalog row that projects exactly like its canonical alias.
+const fn deprecated_cap(
+    id: &'static str,
+    verb: Verb,
+    surfaces: SurfaceSet,
+    summary: &'static str,
+    replacement: &'static str,
+) -> HostCapability {
+    HostCapability {
+        deprecated: Some(replacement),
+        ..cap(id, verb, surfaces, summary)
+    }
+}
+
+/// The catalog. One non-deprecated canonical row per [`Verb`], plus any
+/// deprecated compatibility aliases for that row.
 pub const CATALOG: &[HostCapability] = &[
     // --- sessions -----------------------------------------------------------
     cap(
@@ -190,10 +206,22 @@ pub const CATALOG: &[HostCapability] = &[
         "List daemon sessions (worktree hints, geometry, lease state)",
     ),
     cap(
+        "sessions.migrate",
+        Verb::MigrateSession,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Move a persisted worktree session presentation to an existing profile",
+    ),
+    cap(
         "sessions.open",
         Verb::OpenSession,
         SurfaceSet::ALL,
         "Open a session: argv, cwd, env, rows/cols, optional worktree",
+    ),
+    cap(
+        "sessions.fork",
+        Verb::ForkSession,
+        SurfaceSet::ALL,
+        "Fork a live daemon or recorded harness session",
     ),
     cap(
         "sessions.attach",
@@ -266,10 +294,22 @@ pub const CATALOG: &[HostCapability] = &[
         "Open/focus a worktree in the owning instance",
     ),
     cap(
+        "editor.open",
+        Verb::OpenEditor,
+        SurfaceSet::ALL,
+        "Queue a worktree or worktree-relative file for local editor handoff",
+    ),
+    cap(
         "launch.preset",
         Verb::LaunchPreset,
         SurfaceSet::ALL,
         "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
+    ),
+    cap(
+        "preview.fetch",
+        Verb::PreviewFetch,
+        SurfaceSet::ALL,
+        "Fetch a preview URL with bounded, credential-free HTTP",
     ),
     stub_cap(
         "browser.drive",
@@ -346,6 +386,25 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Push a notification into the tray",
     ),
+    // --- trusted automation -------------------------------------------------
+    cap(
+        "automations.list",
+        Verb::AutomationsList,
+        SurfaceSet::ALL,
+        "List trusted automation rules and recent audited outcomes",
+    ),
+    cap(
+        "automations.test",
+        Verb::AutomationsTest,
+        SurfaceSet::ALL,
+        "Purely evaluate one automation rule against an event fixture",
+    ),
+    cap(
+        "tools.run",
+        Verb::ToolsRun,
+        SurfaceSet::ALL,
+        "Run one trusted configured tool by name in a worktree",
+    ),
     // --- agents --------------------------------------------------------------
     cap(
         "agent.sessions",
@@ -359,11 +418,24 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Cli]),
         "Effective harness/model/env/permissions of every agent entry and pipeline stage",
     ),
+    // --- skills --------------------------------------------------------------
+    cap(
+        "skills.list",
+        Verb::SkillsList,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
+        "List embedded and configured skill metadata",
+    ),
+    cap(
+        "skills.seed",
+        Verb::SkillsSeed,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Seed skills into a worktree for every configured harness",
+    ),
     // --- feed / leases / identity -------------------------------------------
     cap(
         "events.subscribe",
         Verb::Events,
-        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Plugin]),
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Plugin]),
         "The live event feed",
     ),
     cap(
@@ -501,49 +573,91 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Rotate a managed SSH key across its scope's live instances",
     ),
-    // --- projects (multi-repo workspace groups, THE-33) ----------------------
+    // --- programs (multi-repo groups, THE-33) --------------------------------
     // OPERATOR surfaces (control API + CLI). Implemented locally as `thegn
-    // project …` / `thegn wt new --project …` subcommands (they touch the local
+    // program …` / `thegn wt new --program …` subcommands (they touch the local
     // per-profile DB + git, not the daemon), so the CLI surface covers them
     // directly; the HTTP/gRPC routes are deferred (excused in SURFACE_GAPS).
     // MCP/plugin exposure waits on the in-flight write-tool scope-gating work —
     // the CATALOG rows below do not depend on it. Grouping only: no policy, so
     // no secret/egress custody rides on these.
     cap(
+        "program.list",
+        Verb::ProjectList,
+        SurfaceSet::OPERATOR,
+        "List programs (multi-repo groups) with member counts",
+    ),
+    cap(
+        "program.create",
+        Verb::ProjectCreate,
+        SurfaceSet::OPERATOR,
+        "Create a program",
+    ),
+    cap(
+        "program.rename",
+        Verb::ProjectRename,
+        SurfaceSet::OPERATOR,
+        "Rename a program",
+    ),
+    cap(
+        "program.rm",
+        Verb::ProjectRemove,
+        SurfaceSet::OPERATOR,
+        "Delete a program (refused while it has members unless forced)",
+    ),
+    cap(
+        "program.assign",
+        Verb::ProjectAssign,
+        SurfaceSet::OPERATOR,
+        "Assign or unassign a workspace's program membership",
+    ),
+    cap(
+        "program.new_feature",
+        Verb::ProjectNewFeature,
+        SurfaceSet::OPERATOR,
+        "Create a feature across a program's repos: one linked branch + a worktree in each member",
+    ),
+    deprecated_cap(
         "project.list",
         Verb::ProjectList,
         SurfaceSet::OPERATOR,
-        "List projects (multi-repo workspace groups) with member counts",
+        "List programs (multi-repo groups) with member counts",
+        "program.list",
     ),
-    cap(
+    deprecated_cap(
         "project.create",
         Verb::ProjectCreate,
         SurfaceSet::OPERATOR,
-        "Create a project",
+        "Create a program",
+        "program.create",
     ),
-    cap(
+    deprecated_cap(
         "project.rename",
         Verb::ProjectRename,
         SurfaceSet::OPERATOR,
-        "Rename a project",
+        "Rename a program",
+        "program.rename",
     ),
-    cap(
+    deprecated_cap(
         "project.rm",
         Verb::ProjectRemove,
         SurfaceSet::OPERATOR,
-        "Delete a project (refused while it has members unless forced)",
+        "Delete a program (refused while it has members unless forced)",
+        "program.rm",
     ),
-    cap(
+    deprecated_cap(
         "project.assign",
         Verb::ProjectAssign,
         SurfaceSet::OPERATOR,
-        "Assign or unassign a workspace's project membership",
+        "Assign or unassign a workspace's program membership",
+        "program.assign",
     ),
-    cap(
+    deprecated_cap(
         "project.new_feature",
         Verb::ProjectNewFeature,
         SurfaceSet::OPERATOR,
-        "Create a feature across a project's repos: one linked branch + a worktree in each member",
+        "Create a feature across a program's repos: one linked branch + a worktree in each member",
+        "program.new_feature",
     ),
     // --- agent orchestration (THE-57) ---------------------------------------
     // The hands a supervisor agent drives: read the board and the durable
@@ -704,6 +818,15 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Stop the model proxy daemon",
     ),
+    // The supervisor's status view is intentionally local and read-only. A
+    // remote control route would need a process/session handle and an
+    // authenticated repository scope that do not exist in this surface.
+    cap(
+        "autopilot.status",
+        Verb::AutopilotStatus,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Report bounded issue-autopilot run summaries for a repository",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
@@ -828,16 +951,36 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
-    // -- projects (THE-33): CLI-implemented locally; control-API routes deferred.
+    // -- programs (THE-33): CLI-implemented locally; control-API routes deferred.
     // The verbs run against the local per-profile DB + git, so the CLI covers
     // them directly; HTTP/gRPC routes for a remote operator are future work.
     (
+        "program.list",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.list",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
         "project.list",
         Surface::Http,
         "control-API route deferred; CLI-only for now",
     ),
     (
         "project.list",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.create",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.create",
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
@@ -852,12 +995,32 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "control-API route deferred; CLI-only for now",
     ),
     (
+        "program.rename",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.rename",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
         "project.rename",
         Surface::Http,
         "control-API route deferred; CLI-only for now",
     ),
     (
         "project.rename",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.rm",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.rm",
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
@@ -872,12 +1035,32 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "control-API route deferred; CLI-only for now",
     ),
     (
+        "program.assign",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.assign",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
         "project.assign",
         Surface::Http,
         "control-API route deferred; CLI-only for now",
     ),
     (
         "project.assign",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.new_feature",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "program.new_feature",
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
@@ -1199,9 +1382,11 @@ pub fn lookup(id: &str) -> Option<&'static HostCapability> {
     CATALOG.iter().find(|c| c.id.0 == id)
 }
 
-/// The row for a verb (every verb has exactly one).
+/// The canonical, non-deprecated row for a verb.
 pub fn for_verb(verb: Verb) -> Option<&'static HostCapability> {
-    CATALOG.iter().find(|c| c.verb == verb)
+    CATALOG
+        .iter()
+        .find(|c| c.verb == verb && c.deprecated.is_none())
 }
 
 /// The scope a capability requires — always via the verb policy table.
@@ -1231,7 +1416,7 @@ pub fn required_for(s: Surface) -> impl Iterator<Item = &'static HostCapability>
 pub fn coverage_problems(s: Surface, implemented: &[&str]) -> Vec<String> {
     let mut problems = Vec::new();
     for c in for_surface(s) {
-        let done = implemented.contains(&c.id.0);
+        let done = implemented_contains(c, implemented);
         let excused = is_gap(c.id.0, s);
         match (done, excused) {
             (false, false) => problems.push(format!(
@@ -1263,6 +1448,19 @@ pub fn coverage_problems(s: Surface, implemented: &[&str]) -> Vec<String> {
     problems
 }
 
+/// Existing surface implementation tables may still use a legacy id while a
+/// catalog rename is in flight. Treat a canonical row and its deprecated alias
+/// as one implementation for coverage, while retaining both rows in all
+/// projections and ledgers.
+fn implemented_contains(c: &HostCapability, implemented: &[&str]) -> bool {
+    implemented.contains(&c.id.0)
+        || c.deprecated
+            .is_some_and(|replacement| implemented.contains(&replacement))
+        || CATALOG
+            .iter()
+            .any(|alias| alias.deprecated == Some(c.id.0) && implemented.contains(&alias.id.0))
+}
+
 /// One surface's coverage ledger, computed by pure logic from the catalog and
 /// the surface's own implementation table — what `thegn api coverage` prints.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1288,7 +1486,7 @@ pub fn ledger(surface: Surface, implemented_ids: &[&str]) -> SurfaceLedger {
     let mut implemented = 0;
     let mut stub = 0;
     for c in for_surface(surface) {
-        if implemented_ids.contains(&c.id.0) {
+        if implemented_contains(c, implemented_ids) {
             if c.stub.is_some() {
                 stub += 1;
             } else {
@@ -1324,13 +1522,67 @@ mod tests {
     use std::collections::{BTreeSet, HashSet};
 
     #[test]
-    fn every_verb_has_exactly_one_row() {
+    fn every_verb_has_exactly_one_canonical_row() {
         for v in Verb::ALL {
-            let n = CATALOG.iter().filter(|c| c.verb == *v).count();
-            assert_eq!(n, 1, "{v:?} has {n} catalog rows");
+            let n = CATALOG
+                .iter()
+                .filter(|c| c.verb == *v && c.deprecated.is_none())
+                .count();
+            assert_eq!(n, 1, "{v:?} has {n} canonical catalog rows");
             assert_eq!(for_verb(*v).unwrap().verb, *v);
         }
-        assert_eq!(CATALOG.len(), Verb::ALL.len());
+    }
+
+    #[test]
+    fn program_rows_have_exact_project_alias_parity() {
+        for verb in [
+            Verb::ProjectList,
+            Verb::ProjectCreate,
+            Verb::ProjectRename,
+            Verb::ProjectRemove,
+            Verb::ProjectAssign,
+            Verb::ProjectNewFeature,
+        ] {
+            let canonical = for_verb(verb).unwrap();
+            let alias = CATALOG
+                .iter()
+                .find(|c| c.deprecated == Some(canonical.id.0))
+                .unwrap_or_else(|| panic!("missing alias for {}", canonical.id));
+            assert_eq!(canonical.surfaces, alias.surfaces);
+            assert_eq!(canonical.summary, alias.summary);
+            assert_eq!(canonical.since, alias.since);
+            assert_eq!(canonical.verb, alias.verb);
+            assert_eq!(lookup(canonical.id.0), Some(canonical));
+            assert_eq!(lookup(alias.id.0), Some(alias));
+        }
+    }
+
+    #[test]
+    fn coverage_treats_catalog_aliases_as_one_implementation() {
+        let cli = [
+            "program.list",
+            "program.create",
+            "program.rename",
+            "program.rm",
+            "program.assign",
+            "program.new_feature",
+        ];
+        for id in cli {
+            let row = lookup(id).unwrap();
+            assert!(implemented_contains(row, &cli));
+        }
+        let cli_legacy = [
+            "project.list",
+            "project.create",
+            "project.rename",
+            "project.rm",
+            "project.assign",
+            "project.new_feature",
+        ];
+        for id in cli_legacy {
+            let row = lookup(id).unwrap();
+            assert!(implemented_contains(row, &cli_legacy));
+        }
     }
 
     #[test]

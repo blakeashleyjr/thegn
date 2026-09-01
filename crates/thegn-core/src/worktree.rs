@@ -212,6 +212,15 @@ pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) -> 
     true
 }
 
+/// Details from a failed worktree add. `branch_created` is measured while the
+/// repository mutation lock is held, so rollback can avoid deleting a branch
+/// that pre-dated this attempt (including a concurrent add race).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddError {
+    pub message: String,
+    pub branch_created: bool,
+}
+
 /// [`add`] with the failure reason returned instead of warned, for callers
 /// that surface errors in their own UI (the new-worktree progress overlay).
 pub fn add_checked(
@@ -221,6 +230,18 @@ pub fn add_checked(
     path: &Path,
     cfg: &Config,
 ) -> Result<(), String> {
+    add_checked_with_state(root, branch, base, path, cfg).map_err(|error| error.message)
+}
+
+/// Like [`add_checked`], but preserves whether this failed attempt created the
+/// branch. The check and `git worktree add` share one mutation lock.
+pub fn add_checked_with_state(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    path: &Path,
+    cfg: &Config,
+) -> Result<(), AddError> {
     if cfg.worktree_mode == WorktreeMode::InRepo {
         // Keep .worktrees out of git locally without touching tracked .gitignore.
         let excl = root.join(".git/info/exclude");
@@ -239,6 +260,7 @@ pub fn add_checked(
     // Serialize against other thegn/agent git mutations on this repo's shared
     // `.git` (held until the subprocess returns).
     let _lock = util::lock_git_mutations(root);
+    let branch_preexisted = branch_exists(root, branch);
     let out = util::git_cmd(root)
         .args(["worktree", "add", "--quiet", "-b", branch])
         .arg(path)
@@ -248,12 +270,18 @@ pub fn add_checked(
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            Err(format!(
-                "git worktree add failed (branch={branch} base={base}): {}",
-                stderr.trim()
-            ))
+            Err(AddError {
+                message: format!(
+                    "git worktree add failed (branch={branch} base={base}): {}",
+                    stderr.trim()
+                ),
+                branch_created: !branch_preexisted && branch_exists(root, branch),
+            })
         }
-        Err(e) => Err(format!("could not run git worktree add: {e}")),
+        Err(e) => Err(AddError {
+            message: format!("could not run git worktree add: {e}"),
+            branch_created: !branch_preexisted && branch_exists(root, branch),
+        }),
     }
 }
 
@@ -482,6 +510,18 @@ mod tests {
         assert!(util::git_ok(&repo, &["branch", &first]));
         assert_eq!(branch_name(&repo, Some("dup"), &cfg), format!("{first}-1"));
         // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn failed_add_reports_preexisting_branch_without_claiming_it() {
+        let repo = temp_repo("add-state");
+        let path = repo.join(".wt-existing-branch");
+        let error = add_checked_with_state(&repo, "main", "main", &path, &Config::default())
+            .expect_err("git must reject creating an existing branch");
+        assert!(!error.branch_created);
+        assert!(branch_exists(&repo, "main"));
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&repo);
     }
 

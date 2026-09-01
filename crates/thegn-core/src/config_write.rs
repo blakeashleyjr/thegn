@@ -185,6 +185,7 @@ fn typed_value(val: &str) -> Item {
 /// integers/floats are written with their native TOML type, everything else as a
 /// string. The general `config set` counterpart to `config get`.
 pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
+    let dotted = crate::config_compat::canonical_key(dotted);
     let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty key");
     let mut doc = read_doc(config_path)?;
@@ -199,6 +200,7 @@ pub fn set_key(config_path: &Path, dotted: &str, val: &str) -> Result<()> {
 /// Set one dotted key to a string **array** (`repo_roots = ["a", "b"]`),
 /// creating intermediate tables. The array-valued sibling of [`set_key`].
 pub fn set_string_array(config_path: &Path, dotted: &str, items: &[String]) -> Result<()> {
+    let dotted = crate::config_compat::canonical_key(dotted);
     let parts: Vec<&str> = dotted.split('.').filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!parts.is_empty(), "empty key");
     let mut doc = read_doc(config_path)?;
@@ -650,6 +652,20 @@ mod tests {
             .unwrap();
         assert_eq!(doc["sandbox"]["backend"].as_str(), Some("docker"));
         // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_key_writes_canonical_names_for_legacy_keys() {
+        let p = tmp("set-canonical.toml");
+        let _ = std::fs::remove_file(&p);
+        set_key(&p, "workspaces_dir", "/projects").unwrap();
+        let doc = std::fs::read_to_string(&p)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["projects_dir"].as_str(), Some("/projects"));
+        assert!(doc.get("workspaces_dir").is_none());
         let _ = std::fs::remove_file(&p);
     }
 

@@ -6,8 +6,8 @@ use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 use crate::panes::Panes;
 use crate::run::{
-    DrawerPool, SidebarState, WorkspacePool, persist_active_focus, persist_session_layout,
-    refresh_tab_model, switch_workspace, sync_drawer_persistence,
+    DrawerRuntime, SidebarState, WorkspacePool, persist_active_focus, persist_session_layout,
+    refresh_tab_model, switch_workspace,
 };
 
 /// Activate a sidebar row target: focus a live `(group, tab)` in the session,
@@ -20,9 +20,7 @@ pub(crate) fn activate_row_target(
     model: &mut FrameModel,
     sb: &mut SidebarState,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    pool: &mut DrawerPool,
-    home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut DrawerRuntime,
     workspace_pool: &mut WorkspacePool,
     cfg: &thegn_core::config::Config,
     center: Rect,
@@ -91,7 +89,7 @@ pub(crate) fn activate_row_target(
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
             let Ok(db) = thegn_core::db::Db::open() else {
-                model.status = "Can't switch workspace — the state DB is unavailable".into();
+                model.status = "Can't switch project — the state DB is unavailable".into();
                 return false;
             };
             // Park the outgoing workspace's panes (kept alive) and restore the
@@ -112,7 +110,7 @@ pub(crate) fn activate_row_target(
                 // The cold resurrect refused (checkout deleted outside thegn,
                 // `.git` unreadable). Absolutely nothing happening on Enter is
                 // the one outcome the user can't diagnose — say why.
-                model.status = format!("Can't open workspace — {repo_path} is gone or unreadable");
+                model.status = format!("Can't open project — {repo_path} is gone or unreadable");
                 return false;
             }
             workspace_switched = true;
@@ -146,7 +144,9 @@ pub(crate) fn activate_row_target(
     } else {
         refresh_tab_model(model, session, sb);
     }
-    sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
+    if let Some(dir) = crate::run::active_cwd(session) {
+        drawer_runtime.reconcile(cfg, &dir, panes, center);
+    }
     // Persist the new active worktree/tab so it survives a non-graceful exit.
     // Only a structural change (the terminal-materialize arm, which pushes a
     // new group) needs the full layout rewrite; the Workspace arm already

@@ -7,18 +7,41 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — projects are the one-repo product concept
+
+- One-repo sidebar, picker, navigation, and help surfaces now say
+  **project**. The stable action ids are `new-project`, `delete-project`,
+  `switch-project`, `next-project`, `prev-project`, and `summon-project`;
+  the former `*-workspace` ids remain accepted as compatibility aliases.
+- The multi-repo grouping commands are now `thegn program …` and
+  `wt new --program`. `thegn project …` and `wt new --project` remain
+  behavior-identical deprecated aliases for three stable releases and warn
+  with their replacements. The `projects_dir` config key and `THEGN_PROJECTS_DIR`
+  environment variable are canonical; their old spellings remain accepted
+  with the same bounded warning window.
+
+### Changed — merge queue lives in scoped surfaces
+
+- The default bottom bar no longer emits a merge-queue badge. Add `"mq"` to
+  `[bars] bottom_right` to opt into its compact scoped summary; activating it
+  opens the existing unified merge-queue detail.
+- Full-mode project headers now show the highest active queue tier and count
+  before the warm-pool token, with the right-panel Work ▸ Merge queue section
+  as the activation destination. Empty and landed-only queues stay quiet.
+- E2E baselines were not re-recorded for this change.
+
 ### Changed — the sidebar reads in tiers, and repos no longer run together
 
-- **A workspace header now looks like a workspace header.** Every structural
+- **A project header now looks like a project header.** Every structural
   row in the sidebar used to get the identical bold-text-on-a-band treatment,
   so several open repos stacked into one undifferentiated column (THE-64).
-  Workspace and terminal-host headers are now the loudest tier — bold, in the
+  Project and terminal-host headers are now the loudest tier — bold, in the
   accent color, marked `◆` (or `⌂` / the host glyph) and the only rows on a
   recessed band. Folder headers drop the bold and the band, and their filed
   count is grayed: a drawer inside the repo, not a repo itself. The ladder
   survives mono/16-color quantization — weight, glyph and indent carry it,
   not color alone.
-- **A blank separator row now sits above each workspace header**, so adjacent
+- **A blank separator row now sits above each project header**, so adjacent
   repos read as separate blocks. Opt out with `[ui] sidebar_dividers = false`
   (the old dense layout, byte-identical). Separators are suppressed in the
   rail and while a `/` filter is active; scrolling and the "N more" chips
@@ -66,7 +89,7 @@ All notable changes to **thegn** are documented here. The format follows
   final state word — so a supervisor greps a fixed column; `--live` filters
   to non-exited rows before serialization.
 
-### Added — the pipeline board is its own surface, and the sidebar files pipelines under their workspace
+### Added — the pipeline board is its own surface, and the sidebar files pipelines under their project
 
 - **The agent-dispatch roster gets a dedicated board** (`Alt b`, or **Pipeline
   board** from the command palette — the old monitor tab is gone): stages laid
@@ -79,8 +102,8 @@ All notable changes to **thegn** are documented here. The format follows
   worktree even when it is not open as a tab. The board re-reads the roster
   only while it is open and unfrozen; nothing here advances, starts or stops
   a stage.
-- **The sidebar files pipeline worktrees under their workspace by default**:
-  inside every workspace a pipeline has spawned worktrees in, a derived
+- **The sidebar files pipeline worktrees under their project by default**:
+  inside every project a pipeline has spawned worktrees in, a derived
   `Pipelines` folder holds one folder per pipeline (named from the roster's
   issue id) with every worktree that pipeline's roster rows reference inside
   it. The folders come from the roster's rows of any status, so they survive
@@ -336,13 +359,13 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   at all. Rows are one cell whenever the sidebar is unfocused (which is where a
   drag starts if you were typing in a pane), under `sidebar_focus_detail =
 "cursor"`/`"off"`, for a worktree with no detail line, for the row clipped by
-  the bottom of the window — and **always** for workspace and folder headers, so
+  the bottom of the window — and **always** for project and folder headers, so
   those two could never be moved to the last position by anyone.
   - **Behaviour change:** if you had learned to aim one slot low to compensate,
     you will now overshoot the other way.
   - The tail of a run you are not already in is reached through that run's
     header, as before: drop on a folder header to file at its end, or on the
-    workspace header to unfile at the end of the loose list.
+    project header to unfile at the end of the loose list.
 - **Rows no longer move under a held pointer.** Pressing a row can change sidebar
   focus, which grows or shrinks every worktree row by a line (the focused detail
   tier) — so a perfectly still pointer used to resolve to a different row on the
@@ -358,11 +381,11 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   the edge scrolled a single row. It is now proportional to how far past the edge
   the pointer is (and capped), and it writes the scroll position back.
 - **The insertion rule paints where the drop will land.** For folder and
-  workspace drags it was drawn under the _header_ while the drop landed after
+  project drags it was drawn under the _header_ while the drop landed after
   that header's whole subtree.
-- **A workspace drop is atomic.** It used to step-swap its way to the target, one
+- **A project drop is atomic.** It used to step-swap its way to the target, one
   rebuild and one database write per step, and could bail out half way on a
-  pinned neighbour — leaving the workspace parked between where it started and
+  pinned neighbour — leaving the project parked between where it started and
   where you aimed. Every drop is now one resolved order, applied once; a refused
   drop changes nothing.
 
@@ -947,7 +970,7 @@ mascot design-exploration scripts.
 
 ## [0.1.0-alpha.1] — 2026-08-18
 
-The first public release: the AI-free workspace shell. Everything below is the
+The first public release: the AI-free terminal shell. Everything below is the
 initial feature set rather than a delta.
 
 ### Platforms
@@ -967,7 +990,7 @@ shell (the `openspec` derivation's `pnpm install` is OOM-killed on the runner).
 
 ### The shell
 
-- **Worktree-native multiplexing** — each repo is a workspace, each git
+- **Worktree-native multiplexing** — each repo is a project, each git
   worktree is a tab; panes, splits, zoom, copy mode, scrollback search, and a
   command palette, all rendered in-process (no tmux/zellij underneath).
 - **Pane daemon** — PTYs are owned by a background `thegn daemon` process

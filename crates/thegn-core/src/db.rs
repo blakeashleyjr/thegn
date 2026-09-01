@@ -12,7 +12,8 @@
 use crate::util;
 use anyhow::Result;
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Schema version. v3: workspace / worktree remap. v4 (native host): adds
 /// `tab_layout` + `session_state` for DB-driven session resurrect (the native
@@ -133,8 +134,425 @@ use std::path::PathBuf;
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-pub const SCHEMA_VERSION: i64 = 61;
+///
+/// v62: adds `session_forks`, a credential-free lineage cache. Live fork
+/// recipes remain daemon memory only; the cache cannot resurrect a process.
+///
+/// v63: adds `pr_review_cache`, one complete PR review snapshot per canonical
+/// worktree key. It is a best-effort cache; the branch, PR number, and head OID
+/// are retained beside the JSON so stale feedback cannot silently attach to a
+/// different PR.
+///
+/// v64: adds trusted automation throttle/override state and a bounded audit
+/// log (THE-21). Both are cache/audit data; action truth remains in catalog
+/// providers.
+///
+/// v65: adds nullable review-task identity/revision/prompt metadata and durable
+/// forge-action retry bookkeeping to `agent_dispatches`, and freezes active
+/// review-task inputs so one newer snapshot is retained on the same row until
+/// the active handoff can safely finish or promote it (THE-22). A partial
+/// unique index makes `(task_kind, source_key)` one durable task even under
+/// concurrent refreshes.
+///
+/// THE-21 and THE-22 both originally claimed v64 while in flight; THE-22 takes
+/// 65 because its columns are additive on top of THE-21's tables. A single
+/// racing integer is the wrong allocation mechanism — see the pipeline
+/// follow-ups.
+///
+/// This build also adds, as guarded idempotent ALTERs rather than a version of
+/// their own, `agent_dispatches.exit_code` / `.exited_at_ms` and the
+/// `pipeline_leases` table: the worker's recorded exit (so a row still
+/// `running` because nobody closed it is distinguishable from one whose worker
+/// is alive — the 2026-08-29 conflation) and monitor ownership.
+///
+/// v66 adds `autopilot_runs`, the provider-qualified issue claim/correlation
+/// journal. It is additive and never replaces the existing dispatch roster or
+/// issue cache.
+pub const SCHEMA_VERSION: i64 = 66;
 
+/// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
+/// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
+/// the tolerant open is a debugging affordance now, not a default.
+pub const ALLOW_OLD_BUILD_ENV: &str = "THEGN_ALLOW_SCHEMA_DOWNGRADE";
+
+/// Whether this build must refuse to operate a database at `on_disk`.
+///
+/// # Why refusing beats tolerating
+///
+/// The schema is additive, so an older build's *named-column* reads still
+/// work — which is what made tolerance look safe. What it cannot do is see
+/// columns and tables the newer build writes, and the pipeline roster is
+/// exactly that kind of state: on 2026-08-29 a v57 daemon drove a v62 roster
+/// for hours, could not see the `report` column the newer build gated
+/// completion on, and re-dispatched work it believed unfinished — while
+/// emitting 326,912 identical mismatch warnings. A build that cannot see the
+/// state it is deciding on must not decide.
+///
+/// Pure, so the policy is unit-testable without a database or an environment.
+pub fn schema_refusal(on_disk: i64, build: i64, allow_override: bool) -> Option<String> {
+    if on_disk <= build || allow_override {
+        return None;
+    }
+    Some(format!(
+        "database schema v{on_disk} was written by a newer thegn than this build (v{build}).\n\
+         Refusing to run: this build cannot see the columns the newer one writes, so it would \
+         mis-read live state (a pipeline roster, a merge queue) and act on the gap.\n\
+         Fix: rebuild or reinstall thegn so the binary matches the database \
+         (`just build` in a checkout, `nix profile upgrade` for an installed copy), and make \
+         sure the daemon is restarted from the same build as the CLI \
+         (`thegn doctor` prints both).\n\
+         Override (read-only, for debugging only): {ALLOW_OLD_BUILD_ENV}=1"
+    ))
+}
+
+/// The state DB's on-disk `user_version`, read through a read-only connection.
+///
+/// Deliberately independent of [`Db::open`]: when the schema is NEWER than this
+/// build, `open` refuses — and that is exactly the moment `thegn doctor` most
+/// needs to print the two numbers. `None` when there is no database yet or it
+/// cannot be read at all.
+pub fn on_disk_schema_version() -> Option<i64> {
+    let path = db_path();
+    if !path.exists() {
+        return None;
+    }
+    let conn =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()
+}
+
+/// Read the [`ALLOW_OLD_BUILD_ENV`] escape hatch.
+fn schema_downgrade_allowed() -> bool {
+    matches!(
+        std::env::var(ALLOW_OLD_BUILD_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// The process kind presented to `[database].migration_authority`.
+///
+/// A controller is a long-lived owner of the shared state (the interactive
+/// compositor, bare pane daemon, or `serve`). Everything else is a client — in
+/// particular, worker-side CLI commands found through a worktree's `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationActor {
+    Controller,
+    Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MigrationPolicy {
+    authority: crate::config::MigrationAuthority,
+    actor: MigrationActor,
+    pinned_executable: Option<PathBuf>,
+    current_executable: Option<PathBuf>,
+}
+
+struct MigrationLease {
+    database: PathBuf,
+    file: std::fs::File,
+}
+
+struct MigrationRuntime {
+    policy: MigrationPolicy,
+    /// Once this process has opened the shared DB, keep a shared schema lease
+    /// for its lifetime. A migrator needs the exclusive side of the same lock,
+    /// so a rebuilt controller cannot advance the schema underneath an older
+    /// controller that is still making decisions from it.
+    lease: Mutex<Option<MigrationLease>>,
+}
+
+static MIGRATION_RUNTIME: OnceLock<MigrationRuntime> = OnceLock::new();
+
+fn canonical_executable(path: &str) -> Result<PathBuf> {
+    let expanded = PathBuf::from(util::expand_tilde(path.trim()));
+    if !expanded.is_absolute() {
+        anyhow::bail!(
+            "[database] migration_executable must be an absolute path (got {})",
+            expanded.display()
+        );
+    }
+    std::fs::canonicalize(&expanded).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot resolve [database] migration_executable {}: {e}",
+            expanded.display()
+        )
+    })
+}
+
+/// Install the startup-only migration policy before the first shared DB open.
+///
+/// Re-installing the identical policy is harmless (`open` can fall through to
+/// the compositor after first trying delivery). A different second install is
+/// refused: changing schema authority live would make the process-lifetime
+/// lease ambiguous.
+pub fn install_migration_policy(
+    cfg: &crate::config::DatabaseConfig,
+    actor: MigrationActor,
+) -> Result<()> {
+    let pinned_executable = if cfg.migration_executable.trim().is_empty() {
+        None
+    } else {
+        Some(canonical_executable(&cfg.migration_executable)?)
+    };
+    let current_executable = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    let policy = MigrationPolicy {
+        authority: cfg.migration_authority,
+        actor,
+        pinned_executable,
+        current_executable,
+    };
+    if let Some(existing) = MIGRATION_RUNTIME.get() {
+        if existing.policy == policy {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "database migration policy was already installed for this process and cannot be changed live"
+        );
+    }
+    MIGRATION_RUNTIME
+        .set(MigrationRuntime {
+            policy,
+            lease: Mutex::new(None),
+        })
+        .map_err(|_| anyhow::anyhow!("database migration policy was installed concurrently"))
+}
+
+/// Pure authority decision, split out so all policy modes are exhaustively
+/// testable without touching a process-global config or a file lock.
+pub fn migration_refusal(
+    authority: crate::config::MigrationAuthority,
+    actor: MigrationActor,
+    executable_matches: bool,
+    observed: i64,
+) -> Option<&'static str> {
+    // Creating a database is not advancing one. At `user_version == 0` there is
+    // nothing on disk for another process to be holding a stale view of, and —
+    // decisively — there is no controller yet either: the whole point of the
+    // policy is to elect one, so applying it to bootstrap makes a fresh install
+    // unusable by every ordinary CLI, and every isolated test that spawns one.
+    // Authority governs UPGRADES; `disabled` still means disabled.
+    if observed == 0 && authority != crate::config::MigrationAuthority::Disabled {
+        return None;
+    }
+    if !executable_matches {
+        return Some("this executable is not the configured migration executable");
+    }
+    match authority {
+        crate::config::MigrationAuthority::Any => None,
+        crate::config::MigrationAuthority::Controller if actor == MigrationActor::Controller => {
+            None
+        }
+        crate::config::MigrationAuthority::Controller => {
+            Some("ordinary CLI processes are not database migration controllers")
+        }
+        crate::config::MigrationAuthority::Disabled => {
+            Some("automatic database migrations are disabled")
+        }
+    }
+}
+
+fn schema_lock_path(database: &Path) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(".schema.lock");
+    PathBuf::from(path)
+}
+
+fn open_schema_lock(database: &Path) -> Result<std::fs::File> {
+    let path = schema_lock_path(database);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("open schema lease {}: {e}", path.display()))
+}
+
+fn try_shared_lock(file: &std::fs::File, database: &Path) -> Result<()> {
+    match file.try_lock_shared() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "database schema migration is currently in progress for {}; retry shortly",
+            database.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!("take shared schema lease for {}: {e}", database.display())
+        }
+    }
+}
+
+fn try_exclusive_lock(file: &std::fs::File, database: &Path) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "refusing database schema migration for {}: another thegn process is still using the old schema. Stop/restart the running host and daemon after rebuilding, then retry",
+            database.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!(
+                "take exclusive schema lease for {}: {e}",
+                database.display()
+            )
+        }
+    }
+}
+
+fn query_user_version(conn: &Connection) -> i64 {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Holds both the in-process lease slot and the cross-process exclusive lock
+/// throughout the entire migration batch. A successful migration calls
+/// [`MigrationGuard::finish`] to join the lifetime shared lease and re-check the
+/// version before the new DB handle can escape. An error simply drops/unlocks
+/// the guard; no partially initialized `Db` is returned.
+struct MigrationGuard {
+    slot: MutexGuard<'static, Option<MigrationLease>>,
+    database: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl MigrationGuard {
+    fn finish(mut self, conn: &Connection) -> Result<()> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("database migration lease disappeared"))?;
+        file.unlock()
+            .map_err(|e| anyhow::anyhow!("release exclusive schema lease: {e}"))?;
+        // Do not leave a check/use gap after the final version stamp. If a
+        // still-newer authorized controller wins the unlock race, wait for it,
+        // then observe its version below and refuse this now-older process.
+        file.lock_shared()
+            .map_err(|e| anyhow::anyhow!("join shared schema lease: {e}"))?;
+        let observed = query_user_version(conn);
+        if let Some(msg) = schema_refusal(observed, SCHEMA_VERSION, false) {
+            let _ = file.unlock();
+            anyhow::bail!(msg);
+        }
+        *self.slot = Some(MigrationLease {
+            database: self.database.clone(),
+            file,
+        });
+        Ok(())
+    }
+}
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        let _ = file.unlock();
+    }
+}
+
+struct SchemaAccess {
+    version: i64,
+    _migration: Option<MigrationGuard>,
+}
+
+/// Join the process-lifetime shared schema lease, or (only when authorized)
+/// take its exclusive side for a pending migration. Re-read `user_version`
+/// after the lock is held to close the check/lock race.
+fn prepare_schema_access(conn: &Connection, database: &Path, initial: i64) -> Result<SchemaAccess> {
+    let Some(runtime) = MIGRATION_RUNTIME.get() else {
+        // Library/tests that do not install a production policy retain the
+        // explicit-path API's historical behavior.
+        return Ok(SchemaAccess {
+            version: initial,
+            _migration: None,
+        });
+    };
+    let mut slot = runtime
+        .lease
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database schema lease was poisoned"))?;
+
+    if let Some(lease) = slot.as_ref()
+        && lease.database == database
+    {
+        return Ok(SchemaAccess {
+            version: query_user_version(conn),
+            _migration: None,
+        });
+    }
+    if let Some(lease) = slot.take() {
+        let _ = lease.file.unlock();
+    }
+
+    let mut observed = initial;
+    if observed >= SCHEMA_VERSION {
+        let file = open_schema_lock(database)?;
+        try_shared_lock(&file, database)?;
+        observed = query_user_version(conn);
+        if observed >= SCHEMA_VERSION {
+            *slot = Some(MigrationLease {
+                database: database.to_path_buf(),
+                file,
+            });
+            return Ok(SchemaAccess {
+                version: observed,
+                _migration: None,
+            });
+        }
+        // A migration/downgrade landed between the first version read and our
+        // shared lock. Release and make the authority decision under exclusive.
+        let _ = file.unlock();
+    }
+
+    let executable_matches = match &runtime.policy.pinned_executable {
+        None => true,
+        Some(pin) => runtime.policy.current_executable.as_ref() == Some(pin),
+    };
+    if let Some(reason) = migration_refusal(
+        runtime.policy.authority,
+        runtime.policy.actor,
+        executable_matches,
+        observed,
+    ) {
+        let pin = runtime
+            .policy
+            .pinned_executable
+            .as_ref()
+            .map(|p| format!(" (configured executable: {})", p.display()))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "refusing to migrate database schema v{observed} to v{SCHEMA_VERSION}: {reason}{pin}. Launch the configured controller after rebuilding it"
+        );
+    }
+
+    let file = open_schema_lock(database)?;
+    try_exclusive_lock(&file, database)?;
+    observed = query_user_version(conn);
+    if observed >= SCHEMA_VERSION {
+        // Another authorized controller completed the migration before this
+        // process won the lock. Join as a normal lifetime reader.
+        let _ = file.unlock();
+        try_shared_lock(&file, database)?;
+        *slot = Some(MigrationLease {
+            database: database.to_path_buf(),
+            file,
+        });
+        return Ok(SchemaAccess {
+            version: observed,
+            _migration: None,
+        });
+    }
+
+    Ok(SchemaAccess {
+        version: observed,
+        _migration: Some(MigrationGuard {
+            slot,
+            database: database.to_path_buf(),
+            file: Some(file),
+        }),
+    })
+}
 pub struct Db {
     conn: Connection,
     /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
@@ -288,7 +706,7 @@ impl Db {
             // `kaneo_auth` row now holds only a `file:`/`env:` SecretRef.)
             let _ = crate::fsperm::restrict_dir_to_owner(dir); // best-effort: hardening: a failed chmod must never block DB open
         }
-        let db = Self::init(Self::open_connection(&path)?)?;
+        let db = Self::init_shared(Self::open_connection(&path)?, &path)?;
         let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the
         // startup prunes so a plain open takes NO write lock. Run them once
@@ -314,8 +732,74 @@ impl Db {
     pub fn open_at(path: &std::path::Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        Self::init(Self::open_connection(path)?)
+        if path == db_path() {
+            let db = Self::init_shared(Self::open_connection(path)?, path)?;
+            let _ = crate::fsperm::restrict_to_owner(path); // best-effort: hardening: a failed chmod must never block DB open
+            Ok(db)
+        } else {
+            let db = Self::init(Self::open_connection(path)?)?;
+            let _ = crate::fsperm::restrict_to_owner(path); // best-effort: hardening: a failed chmod must never block DB open
+            Ok(db)
+        }
+    }
+
+    /// Open an existing DB read-only while participating in its WAL locking.
+    ///
+    /// Unlike [`Self::open_read_only_at`], this may use existing WAL/SHM
+    /// sidecars so a real migration preflight sees the latest target rows. It
+    /// still performs no schema initialization, migration, or startup prune.
+    pub fn open_read_only_wal_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Open an existing state DB without creating, migrating, pruning, or
+    /// changing its journal mode. This is the only safe opener for commands
+    /// whose dry-run contract is strictly read-only. An absent file is
+    /// represented as `None` so callers can inspect an empty, not-yet-created
+    /// target without manufacturing a database.
+    pub fn open_read_only_at(path: &std::path::Path) -> Result<Option<Db>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        // A plain read-only open of a WAL-mode database is still allowed to
+        // create `-wal`/`-shm` sidecars. `immutable=1` is SQLite's explicit
+        // no-write/no-lock URI mode, which is required by dry-run callers.
+        let uri = util::immutable_sqlite_uri(&path.canonicalize()?);
+        let conn = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Some(Db {
+            conn,
+            schema_mismatch: crate::db_migrate::detect_newer_schema(ver, SCHEMA_VERSION),
+        }))
+    }
+
+    /// Read-only counterpart to [`Db::open`] for dry-run command paths.
+    pub fn open_read_only() -> Result<Option<Db>> {
+        Self::open_read_only_at(&db_path())
     }
 
     /// Open a state DB read-only when it was written by a newer build. The
@@ -339,23 +823,66 @@ impl Db {
 
     /// Apply pragmas, migration, and schema to a fresh connection.
     fn init(conn: Connection) -> Result<Db> {
+        Self::init_with(conn, schema_downgrade_allowed(), None)
+    }
+
+    fn init_shared(conn: Connection, path: &Path) -> Result<Db> {
+        Self::init_with(conn, schema_downgrade_allowed(), Some(path))
+    }
+
+    /// Open at an explicit path, tolerating a newer on-disk schema (read-only)
+    /// instead of refusing it — the programmatic form of the
+    /// [`ALLOW_OLD_BUILD_ENV`] escape hatch, so the tolerant branch is
+    /// reachable (and testable) without mutating process-global environment.
+    pub fn open_at_allowing_older_build(path: &std::path::Path) -> Result<Db> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        Self::init_with(Self::open_connection(path)?, true, None)
+    }
+
+    fn init_with(
+        conn: Connection,
+        allow_downgrade: bool,
+        shared_path: Option<&Path>,
+    ) -> Result<Db> {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        let ver: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
+        let initial_ver = query_user_version(&conn);
+        // The returned exclusive guard (when any) stays in scope until the
+        // final `user_version` stamp and every gated migration are complete.
+        // Fast/current opens retain a process-lifetime shared lease instead.
+        let schema_access = if let Some(path) = shared_path {
+            prepare_schema_access(&conn, path, initial_ver)?
+        } else {
+            SchemaAccess {
+                version: initial_ver,
+                _migration: None,
+            }
+        };
+        let ver = schema_access.version;
+        let mut migration_guard = schema_access._migration;
 
         // A newer DB is opened read-only. In particular, do not change its
         // journal mode or run the startup prune: those are writes even though
         // the schema/migration ladder is being skipped.
         if ver > SCHEMA_VERSION {
+            // One actionable error, not a warning repeated per open. The old
+            // behaviour (warn + carry on read-only) is what let a v57 runtime
+            // drive a v62 roster; it survives only behind the explicit
+            // `ALLOW_OLD_BUILD_ENV` override, which still warns exactly once.
+            if let Some(msg) = schema_refusal(ver, SCHEMA_VERSION, allow_downgrade) {
+                anyhow::bail!(msg);
+            }
             static MISMATCH_WARNED: std::sync::Once = std::sync::Once::new();
             MISMATCH_WARNED.call_once(|| {
                 tracing::warn!(
                     target: "thegn::db",
                     on_disk = ver,
                     build = SCHEMA_VERSION,
+                    override_env = ALLOW_OLD_BUILD_ENV,
                     "database schema v{ver} is newer than this build (v{SCHEMA_VERSION}); \
-                     data written by the newer build may be invisible"
+                     running anyway because {ALLOW_OLD_BUILD_ENV} is set — data written by \
+                     the newer build is invisible to this one"
                 );
             });
             return Ok(Db {
@@ -475,6 +1002,17 @@ impl Db {
               branch     TEXT,
               json       TEXT,
               fetched_at INTEGER
+            );
+            -- v63: complete PR review conversation + PR-head diff snapshot.
+            -- Identity columns make stale cache validation possible without
+            -- parsing the payload and the JSON is replaced atomically.
+            CREATE TABLE IF NOT EXISTS pr_review_cache (
+              worktree   TEXT PRIMARY KEY,
+              branch     TEXT NOT NULL,
+              pr_number  INTEGER NOT NULL,
+              head_oid   TEXT NOT NULL,
+              json       TEXT NOT NULL,
+              fetched_at INTEGER NOT NULL
             );
             -- CI run-history cache per worktree (TTL'd JSON `Vec<ci::CiRun>`),
             -- so the CI panel/view paint instantly from cache then hydrate live
@@ -724,7 +1262,21 @@ impl Db {
               agent_name       TEXT    NOT NULL,
               dispatched_at_ms INTEGER NOT NULL,
               status           TEXT    NOT NULL DEFAULT 'queued',
-              report           TEXT
+              report           TEXT,
+              task_kind        TEXT,
+              source_key       TEXT,
+              source_revision  TEXT,
+              content_revision TEXT,
+              prompt           TEXT,
+              expected_head_oid TEXT,
+              pending_source_revision TEXT,
+              pending_content_revision TEXT,
+              pending_prompt TEXT,
+              pending_expected_head_oid TEXT,
+              pending_role TEXT,
+              pending_worktree_path TEXT,
+              forge_action_attempts INTEGER NOT NULL DEFAULT 0,
+              next_forge_action_at_ms INTEGER
             );
             -- v61: per-row progress queue — a worker or monitor appends short
             -- notes (≤4 KiB), read newest-last by dispatch status.
@@ -926,13 +1478,43 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_session_attention_wt
               ON session_attention (worktree_path);
+            -- v64: trusted automation throttle/override state. JSON columns
+            -- hold bounded pure-engine ledgers; losing them only resets
+            -- throttles and never disables configured rules.
+            CREATE TABLE IF NOT EXISTS automation_state (
+              rule_id           TEXT PRIMARY KEY,
+              enabled_override  INTEGER,
+              last_fired_at     INTEGER,
+              recent_fires_json TEXT NOT NULL DEFAULT '[]',
+              action_fires_json TEXT NOT NULL DEFAULT '{}',
+              once_keys_json    TEXT NOT NULL DEFAULT '[]',
+              updated_at        INTEGER NOT NULL
+            );
+            -- v64: metadata-only action audit. Summaries are bounded by the
+            -- runtime; full prompts, event bodies, and secrets never land here.
+            CREATE TABLE IF NOT EXISTS automation_runs (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              rule_id        TEXT NOT NULL,
+              event_id       TEXT NOT NULL,
+              event_key      TEXT NOT NULL,
+              trigger_kind   TEXT NOT NULL,
+              event_summary  TEXT NOT NULL DEFAULT '',
+              action_cap     TEXT NOT NULL,
+              action_summary TEXT NOT NULL DEFAULT '',
+              outcome        TEXT NOT NULL,
+              skip_reason    TEXT,
+              error          TEXT,
+              started_at     INTEGER NOT NULL,
+              finished_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_time
+              ON automation_runs (rule_id, started_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_outcome_time
+              ON automation_runs (outcome, started_at DESC);
             COMMIT;
             "#,
         )?;
         crate::db_migrate::additive_schema(&conn);
-        if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v61_schema(&conn)?;
-        }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);
         crate::host_db::migrate_v30(&conn)?;
@@ -943,6 +1525,17 @@ impl Db {
         crate::db_control::migrate_v40(&conn)?;
         crate::db_calendar::migrate_v52(&conn)?;
         crate::db_model_proxy::migrate_v54(&conn)?;
+        crate::db_migrate::migrate_v62(&conn)?;
+        crate::db_migrate::migrate_v63_leases(&conn)?;
+        crate::db_migrate::migrate_v64(&conn)?;
+        crate::db_migrate::migrate_v66(&conn)?;
+        if ver < SCHEMA_VERSION {
+            crate::db_migrate::verify_v62_schema(&conn)?;
+            crate::db_migrate::verify_v63_schema(&conn)?;
+            crate::db_migrate::verify_v64_schema(&conn)?;
+            crate::db_migrate::verify_v65_schema(&conn)?;
+            crate::db_migrate::verify_v66_schema(&conn)?;
+        }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
         // relay-lost `None` exits) were mis-classified as failures — see
@@ -993,6 +1586,9 @@ impl Db {
         // instead of skipping a migration that never completed.
         if ver < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        if let Some(guard) = migration_guard.take() {
+            guard.finish(&conn)?;
         }
         let db = Db {
             conn,

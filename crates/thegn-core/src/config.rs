@@ -22,6 +22,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) use crate::config_repo::lenient_env_selector;
+pub(crate) use crate::config_repo::{RepoConfigFile, reject_overlay_command_collectors};
+pub use crate::hooks::HooksConfig;
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
 pub fn config_warn(msg: &str) {
@@ -267,11 +274,20 @@ pub use crate::config_theme::{
 // The file-manager seam's `[drawer] kind` enum lives with the seam in
 // `file_manager`; re-exported so `config::DrawerKind` keeps working.
 pub use crate::file_manager::DrawerKind;
+// The editor seam owns its logical provider enum; re-export it beside the
+// other config-selected provider kinds.
+pub use crate::editor::EditorProvider;
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
 pub use crate::config_activity::ActivityConfig;
 pub use crate::config_daemon::{DaemonConfig, ServeConfig};
+pub use crate::config_drawer::{DrawerOccupant, DrawerPolicy, DrawerScope};
+pub use crate::config_notifications::{
+    DndConfig, NotificationMode, NotificationRule, NotificationsConfig, NotificationsOverlay,
+    SoundConfig, SoundMode,
+};
+pub use crate::config_voice::{VoiceConfig, VoiceKind};
 
 config_enum! {
     /// Where worktrees live on disk.
@@ -287,13 +303,14 @@ config_enum! {
     } default = Auto;
 }
 
-/// `[editor]` — how thegn opens a file (from the files tree, a diff hunk, a
-/// test failure, a problem, a search hit, `config edit`). Resolution:
-/// `command` here → the `[[tools]]` entry named `editor` → `$VISUAL` /
-/// `$EDITOR` → `vi`; the program's basename picks the line-jump syntax.
+/// `[editor]` — how thegn opens a worktree or one of its files. A non-empty
+/// `command` wins; otherwise an explicit logical `provider` wins; `auto` keeps
+/// the `[[tools]] editor` → `$VISUAL` → `$EDITOR` → `vi` ladder.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EditorConfig {
+    /// Logical provider. `auto` preserves the custom-program ladder.
+    pub provider: EditorProvider,
     /// A command template with `{path}`, `{line}` and `{col}` placeholders
     /// (`{path}` is shell-quoted for you). Empty = resolve from tools/env.
     pub command: String,
@@ -304,6 +321,15 @@ config_enum! {
     /// `[git] backend` — the read engine (writes are always the CLI).
     pub enum GitBackendKind: "git backend" {
         Auto = "auto", Gix = "gix" | "native", Cli = "cli" | "git",
+} default = Auto;
+}
+config_enum! {
+    /// Whether repo-authored `devcontainer.json` files are considered during
+    /// sandbox resolution. `off` is an explicit user opt-out and short-circuits
+    /// before the repo file is read.
+    pub enum DevcontainerMode: "devcontainer mode" {
+        Auto = "auto",
+        Off = "off" | "none" | "disabled",
     } default = Auto;
 }
 config_enum! {
@@ -1428,7 +1454,8 @@ config_enum! {
     /// Spotify desktop, mpv, ncspot, VLC, cmus, …; `"mpd"` (alias `"mpc"`) talks
     /// MPD directly (mpd/mpc/rmpc/ncmpcpp, no `mpd-mpris` bridge); `"mpv"` drives
     /// one mpv over JSON IPC. `"smtc"` = Windows SMTC; `"applescript"` = macOS
-    /// Music/Spotify. `"jellyfin"` reserved. `"auto"` composes every source on the
+    /// Music/Spotify. `"spotify"` and `"jellyfin"` are reserved. Spotify desktop
+    /// and spotifyd remain supported through MPRIS/SMTC/AppleScript. `"auto"` composes every source on the
     /// OS (Linux: MPRIS + MPD + mpv) and shows whatever is actually playing; a
     /// backend on the wrong OS is inert.
     pub enum MediaBackendKind: "media backend" {
@@ -1439,6 +1466,8 @@ config_enum! {
         Mpd = "mpd" | "mpc",
         Smtc = "smtc" | "windows" | "gsmtc",
         AppleScript = "applescript" | "macos" | "osascript",
+        // Reserved: Spotify Web API/library support is not implemented.
+        Spotify = "spotify" reserved,
         // Reserved: no Jellyfin backend exists yet.
         Jellyfin = "jellyfin" reserved,
     } default = Auto;
@@ -1485,7 +1514,7 @@ pub struct MediaConfig {
     /// Larger seek step (seconds) used when the loaded media is a video, where
     /// coarser skipping is the norm.
     pub seek_step_video_secs: u64,
-    /// Render cover art in the Now-Playing overlay when the backend + terminal
+    /// Render cover art in the docked Now-Playing panel when the backend + terminal
     /// support it (kitty/sixel graphics; falls back to blocks otherwise).
     pub show_art: bool,
     /// Open the Now-Playing overlay when the statusbar media badge is clicked.
@@ -1677,7 +1706,6 @@ impl McpServeConfig {
             .map(|v| crate::control::ScopeSet::parse(&v.join(",")))
     }
 }
-
 /// `[mcp]` — thegn's own MCP endpoint settings, distinct from the
 /// `[mcp_servers.<name>]` list of servers thegn hands to agents.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -1745,6 +1773,17 @@ pub struct NamedCommand {
     /// Off by default. See [`crate::config_model_proxy`].
     #[serde(default)]
     pub route_via_proxy: bool,
+    /// Opt this tool into the bottom drawer as a worktree- or process-global
+    /// occupant. Absent keeps the existing picker-only behavior.
+    #[serde(
+        default,
+        deserialize_with = "crate::config_drawer::deserialize_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drawer_scope: Option<DrawerScope>,
+    /// Optional scope-relative working directory for a drawer occupant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawer_cwd: Option<String>,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -1997,7 +2036,6 @@ pub struct GitCommand {
 // UI/presentation (`[ui]`) settings live in the `config_ui` sibling module;
 // re-exported so `config::UiConfig` keeps working.
 pub use crate::config_ui::{FocusDetail, TerminalsSection, UiConfig, WorkspaceSort};
-
 /// Git behavior knobs for the panel's write operations (`[git]`).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -2233,6 +2271,10 @@ pub struct ProfileConfig {
     /// per-profile rules/DND/sound take effect without touching per-repo config.
     #[serde(skip_serializing_if = "NotificationsOverlay::is_empty")]
     pub notifications: NotificationsOverlay,
+    /// Trusted automation refinements for this named profile. Repo overlays
+    /// deliberately have no corresponding field.
+    #[serde(skip_serializing_if = "AutomationsOverlay::is_empty")]
+    pub automations: AutomationsOverlay,
     /// Named identity this profile resolves its credentials from
     /// (`[profiles.<p>] identity = "washu"` → `[identities.washu]`). Each tool
     /// (git config, git SSH key, `gh` config, GnuPG home, agent accounts) the
@@ -2254,6 +2296,11 @@ pub struct ProfileConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkspaceConfig {
+    /// Trusted per-workspace logical editor provider. `None` inherits
+    /// `[editor] provider`; an explicit `auto` selects the custom-program
+    /// ladder for this workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<EditorProvider>,
     /// Keybind overrides applied when this workspace is focused.
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
@@ -2263,6 +2310,9 @@ pub struct WorkspaceConfig {
     /// global active account. See [`crate::account`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// Lifecycle hooks for worktrees in this workspace. Entries accumulate
+    /// after global hooks and before a repo overlay's hooks.
+    pub hooks: HooksConfig,
     /// Extra sandbox bind mounts for this workspace, same format as
     /// `[sandbox] mounts` (`"host"`, `"host:dest"`, `"host:dest:ro|rw|cache"`;
     /// `~` is expanded). These **extend** the global `[sandbox] mounts` (plus
@@ -2290,6 +2340,10 @@ pub struct WorkspaceConfig {
     /// conventions are repository facts, exactly like the merge queue's gate.
     #[serde(skip_serializing_if = "PrQueueOverlay::is_empty")]
     pub pr_queue: PrQueueOverlay,
+    /// Trusted per-repo issue autopilot policy (`[workspace.<slug>.autopilot]`).
+    /// This is the only repo-scoped layer allowed to enable the supervisor.
+    #[serde(skip_serializing_if = "AutopilotOverlay::is_empty")]
+    pub autopilot: AutopilotOverlay,
     /// Per-repo `[git]` refinements (`[workspace.<slug>.git]`). The TRUSTED
     /// per-repo layer for signing / fetch / diff-view policy — a work repo that
     /// wants `structural_diff` or different `auto_fetch` behaviour than your
@@ -2663,13 +2717,6 @@ impl Default for ThemeConfig {
     }
 }
 
-/// Accent/focus values treated as "not customized" when deciding whether the
-/// user's `[theme]` should clobber a preset's own accent: the current default
-/// plus the pre-prism defaults (a config that pinned the old default keeps
-/// preset-cycling behavior).
-const DEFAULTISH_ACCENTS: &[&str] = &["#6ee7d8", "#76eede"];
-const DEFAULTISH_FOCUS: &[&str] = &["#6ee7d8", "#9bd1ff"];
-
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
 /// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
@@ -2974,7 +3021,7 @@ impl Default for StatsConfig {
 /// `brand` (thegn + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
 /// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
 /// (free %), `battery`, `weather` (needs `[weather] enabled = true`), `date`,
-/// `clock` (top bar) and `keyhints`
+/// `clock` (top bar), `mq` (opt-in merge-queue summary) and `keyhints`
 /// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
 /// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -3013,7 +3060,7 @@ impl Default for BarsConfig {
             ],
             // `help` is the clickable `?` chip — the one always-visible pointer
             // at the help system. Drop it from the list to hide it.
-            bottom_left: vec!["help".into(), "keyhints".into()],
+            bottom_left: vec!["help".into(), "drawer".into(), "keyhints".into()],
             bottom_right: vec![
                 "pr".into(),
                 "tests".into(),
@@ -3677,7 +3724,6 @@ impl ShareConfig {
             .collect()
     }
 }
-
 /// `[forward]` — automatically forward dev-server ports bound *inside* a
 /// worktree's sandbox to the host's loopback for browser preview. The
 /// *outbound-localhost* sibling of [`ShareConfig`]: `[share]` exposes a port at a
@@ -3855,7 +3901,9 @@ pub struct SandboxConfig {
     /// feature branches on a remote provider. See [`Config::resolve_env`].
     pub main_env: String,
     pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
-    pub image: String,              // "" => host-toolchain mode
+    /// Whether repo-authored devcontainer files are considered.
+    pub devcontainer: DevcontainerMode,
+    pub image: String, // "" => host-toolchain mode
     /// Hardening preset for the worktree's interactive container (shell panes).
     pub profile: SandboxProfile,
     pub network: Network,
@@ -3963,6 +4011,7 @@ impl Default for SandboxConfig {
             default_env: String::new(),
             main_env: String::new(),
             backend_chain: crate::config_defaults::default_backend_chain(),
+            devcontainer: DevcontainerMode::Auto,
             image: String::new(),
             profile: SandboxProfile::Hardened,
             network: Network::Nat,
@@ -4287,6 +4336,7 @@ pub struct SandboxOverlay {
     pub default_env: Option<String>,
     pub main_env: Option<String>,
     pub backend_chain: Option<Vec<String>>,
+    pub devcontainer: Option<DevcontainerMode>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
     pub on_dormant: Option<OnDormant>,
@@ -4362,62 +4412,6 @@ impl RemoteOverlay {
     }
 }
 
-/// The shape of a repo-root `.thegn.*` file: a `[sandbox]` table overlay
-/// plus an optional `[keybinds]` table (the most-specific keybind layer).
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
-pub(crate) struct RepoConfigFile {
-    pub(crate) sandbox: SandboxOverlay,
-    keybinds: KeybindConfig,
-    /// Per-repo notification routing overlay, applied on top of global +
-    /// profile (see [`Config::effective_notifications`]).
-    #[serde(default)]
-    notifications: NotificationsOverlay,
-    /// Per-repo issue-tracker overlay (Linear team / Jira project) that scopes
-    /// this repo's "My Work" feed (see [`Config::repo_issues`]).
-    #[serde(default)]
-    issues: crate::config_issues::IssuesOverlay,
-    /// Selects a named `[env.<name>]` for every worktree of this repo (the
-    /// repo-level layer of env selection). Empty ⇒ inherit the global default.
-    #[serde(default)]
-    env: String,
-    /// A repo overlay's `[metrics]` table exists ONLY so a `kind = "command"`
-    /// collector defined here can be *detected and refused* — its targets are
-    /// never merged into the running scraper (metrics are global config only).
-    /// See [`Config::repo_command_collector_warnings`].
-    #[serde(default)]
-    metrics: RepoMetricsOverlay,
-}
-
-/// The `[metrics]` shape a repo-root `.thegn.*` might carry. Deliberately
-/// minimal: only the target list, and only so command collectors can be
-/// rejected with a warning. Nothing here reaches the live scraper.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
-#[serde(default)]
-pub(crate) struct RepoMetricsOverlay {
-    pub(crate) targets: Vec<MetricsTarget>,
-}
-
-/// Warnings for command collectors declared in an untrusted (repo/workspace)
-/// metrics overlay. A command collector is a config-driven code-execution door,
-/// so it is global config only; a repo overlay attempting one is refused here.
-/// Prometheus targets from an overlay are simply not merged (no warning) — a
-/// command target gets a loud, named warning because running it would be RCE on
-/// opening the repo.
-pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Vec<String> {
-    targets
-        .iter()
-        .filter(|t| t.kind == MetricsTargetKind::Command)
-        .map(|t| {
-            format!(
-                "ignoring metrics target '{}': command collectors are global config only \
-                 (a repo .thegn.* overlay cannot run commands)",
-                t.name
-            )
-        })
-        .collect()
-}
-
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
 /// Ctrl+Alt+f). Runs yazi by default, with its config kept separate from the
 /// system under a private `config_home`.
@@ -4483,426 +4477,6 @@ impl Default for DrawerConfig {
             cpu_quota: "200%".into(),
             pool_limit: 1,
             prewarm: true,
-        }
-    }
-}
-
-fn default_agent_error_signatures() -> Vec<String> {
-    crate::agent_error::AgentErrorSignatures::defaults().signatures
-}
-
-/// `[notifications]` — the aggregated event bus and desktop notification
-/// delivery (items 420/421/430). Events from git/agents/tests/logs are
-/// surfaced as sidebar badges and (optionally) OS desktop notifications.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct NotificationsConfig {
-    /// Whether to deliver OS desktop notifications (via `notify-send` on Linux).
-    /// When false, events still flow to the in-app inbox + sidebar badges.
-    pub desktop: bool,
-    /// Minimum urgency that triggers a desktop notification: `"low"`,
-    /// `"normal"`, or `"critical"`. Lower-urgency events are recorded in the
-    /// inbox but never pop a desktop toast.
-    pub desktop_min_urgency: String,
-    /// How non-agent pane exits route into the attention model (item 524):
-    /// `"failures_and_tasks"` (default — crashes + non-shell task completions),
-    /// `"failures"` (only non-zero exits), `"all"` (every exit incl. clean
-    /// shells), or `"off"`.
-    pub process_exit: String,
-    /// Surface thegn's own log errors as user notifications (dev flag; off by default, stays quiet Info).
-    #[serde(skip_serializing_if = "is_false")]
-    pub surface_self_log_errors: bool,
-    /// Poll GitHub's notifications API for @mentions in the active repo
-    /// (`gh api notifications`, reason == `mention`), throttled to one call
-    /// per repo per 5 minutes on the PR-refresh cadence. Feeds the
-    /// `mentioned` notification kind. On by default; requires `gh` auth.
-    pub github_mentions: bool,
-    /// Also record an OSC 9 / OSC 777 raised hand as an inbox row (an audit
-    /// trail of every time an agent asked for you). **Off by default**: the
-    /// raised hand is live state, already carried by the sidebar dot, the ✋
-    /// chip and the "Needs you" ring, and agent CLIs emit one at the end of
-    /// every turn — so the inbox filled with "Claude is waiting for your input"
-    /// and buried everything else (THE-68). When on, the write is one CURRENT
-    /// row per session (delete-then-insert), never one per turn.
-    pub agent_attention_inbox: bool,
-    /// Substrings that classify a live agent output line as a harness
-    /// failure banner. Each entry is matched case-insensitively against
-    /// individual output lines. Defaults to thegn's known harness banners;
-    /// add your harness's own to catch e.g. "your claude subscription…".
-    #[serde(default = "default_agent_error_signatures")]
-    pub agent_error_signatures: Vec<String>,
-    /// Per-kind attention priority overrides: maps a notification kind
-    /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
-    /// Unset kinds use their built-in `NotificationKind::default_priority`;
-    /// unknown keys/values are ignored. `alert` raises the red flag, `notice`
-    /// the neutral unread count, `info` is inbox-only (never counted).
-    pub priority: std::collections::BTreeMap<String, String>,
-    /// Ordered user routing rules (item 420). Each rule matches on any subset of
-    /// selectors (kind/worktree/source/message/priority/mode/profile) and acts by
-    /// overriding priority, restricting channels, muting, dropping, or setting a
-    /// sound. Evaluated top-to-bottom by [`crate::notification_route::decide`].
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub rules: Vec<NotificationRule>,
-    /// Do-not-disturb / quiet-hours (item 426): suppress ephemeral channels
-    /// (desktop/toast/sound) for notifications below `allow_priority` during a
-    /// configured window or when toggled on at runtime. The inbox always records.
-    pub dnd: DndConfig,
-    /// Audible sound/bell channel (item 429): terminal `BEL` (default), a
-    /// configured command, or off — gated by `min_priority`.
-    pub sound: SoundConfig,
-    /// Named routing modes (item 427): a rule with a `modes` selector only
-    /// applies when the active mode is listed. Values are presets you switch
-    /// between at runtime (e.g. `focus`, `away`). The map value carries an
-    /// optional human label; membership is what matters.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub modes: std::collections::BTreeMap<String, NotificationMode>,
-    /// The routing mode active at startup (`""` ⇒ no mode / the default set of
-    /// rules with an empty `modes` selector). Switchable at runtime.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub active_mode: String,
-    /// Push-to-phone (`[notifications.push]`): an outbound delivery channel
-    /// behind the push-provider seam and, off by default, a guarded inbound
-    /// command inbox. See [`crate::config_push`].
-    pub push: crate::config_push::PushConfig,
-}
-
-impl Default for NotificationsConfig {
-    fn default() -> Self {
-        NotificationsConfig {
-            desktop: true,
-            desktop_min_urgency: "normal".into(),
-            process_exit: "failures_and_tasks".into(),
-            surface_self_log_errors: false,
-            github_mentions: true,
-            agent_attention_inbox: false,
-            agent_error_signatures: default_agent_error_signatures(),
-            priority: std::collections::BTreeMap::new(),
-            rules: Vec::new(),
-            dnd: DndConfig::default(),
-            sound: SoundConfig::default(),
-            modes: std::collections::BTreeMap::new(),
-            active_mode: String::new(),
-            push: crate::config_push::PushConfig::default(),
-        }
-    }
-}
-
-impl NotificationsConfig {
-    /// Validate the live agent-output signature list for strict config
-    /// validation. Empty entries would match every line, and an unbounded
-    /// entry is both surprising and needlessly expensive to compare.
-    pub fn validate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-        if self.agent_error_signatures.len() > crate::agent_error::MAX_AGENT_ERROR_SIGNATURES {
-            errors.push(format!(
-                "notifications.agent_error_signatures: more than {} entries",
-                crate::agent_error::MAX_AGENT_ERROR_SIGNATURES
-            ));
-        }
-        for (index, signature) in self.agent_error_signatures.iter().enumerate() {
-            let key = format!("notifications.agent_error_signatures[{index}]");
-            if signature.trim().is_empty() {
-                errors.push(format!("{key}: empty (a signature must name something)"));
-            }
-            if signature.chars().count() > 256 {
-                errors.push(format!("{key}: over 256 characters"));
-            }
-        }
-        errors
-    }
-
-    /// Effective priority of a kind: a valid config override wins, else the kind's
-    /// built-in default. Garbage override values fall through to the default.
-    pub fn priority_of(
-        &self,
-        kind: crate::notification::NotificationKind,
-    ) -> crate::notification::Priority {
-        self.priority
-            .get(kind.as_str())
-            .and_then(|s| crate::notification::Priority::parse(s))
-            .unwrap_or_else(|| kind.default_priority())
-    }
-
-    /// The snake_case names of kinds whose effective priority is `>= min`.
-    pub fn kind_names_at_or_above(&self, min: crate::notification::Priority) -> Vec<&'static str> {
-        crate::notification::NotificationKind::ALL
-            .into_iter()
-            .filter(|k| self.priority_of(*k).rank() >= min.rank())
-            .map(|k| k.as_str())
-            .collect()
-    }
-
-    /// Kinds that raise the red ⚑ flag (effective priority `Alert`). Feeds the
-    /// alert-count query.
-    pub fn alert_kind_names(&self) -> Vec<&'static str> {
-        self.kind_names_at_or_above(crate::notification::Priority::Alert)
-    }
-
-    /// Kinds that count toward the neutral unread badge (effective priority
-    /// `Notice` or above — i.e. everything except `Info`). Feeds the unread-count
-    /// query so informational kinds are never counted.
-    pub fn counted_unread_kind_names(&self) -> Vec<&'static str> {
-        self.kind_names_at_or_above(crate::notification::Priority::Notice)
-    }
-
-    /// True when routing rules are present.
-    ///
-    /// NOTE: the sidebar unread/alert badge counts currently always use the
-    /// SQL kind-level queries (`get_unread_counts_by_worktree` /
-    /// `get_alert_counts_by_worktree`), which apply each kind's DEFAULT
-    /// priority — a rule's `set_priority` override does not reach those two
-    /// badges. The rule-aware aggregation this predicate was meant to gate
-    /// was never wired up; if it is, this is the switch.
-    pub fn has_rules(&self) -> bool {
-        !self.rules.is_empty()
-    }
-}
-
-/// serde `skip_serializing_if` helper for `bool` fields (skips `false`).
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-/// serde `skip_serializing_if` helper for `bool` fields (skips `true`).
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
-config_enum! {
-    /// `[notifications.sound] mode` — how the audible cue is produced. `chime`
-    /// (default) plays a bundled sound through an auto-detected system player
-    /// (falling back to the terminal `BEL`); `bell` writes a terminal `BEL` on
-    /// the next render flush; `command` runs a configured command off-thread;
-    /// `off` is silent.
-    pub enum SoundMode: "notification sound mode" {
-        Off = "off" | "none" | "silent",
-        Chime = "chime" | "sound",
-        Bell = "bell" | "beep" | "terminal",
-        Command = "command" | "cmd" | "exec",
-    } default = Chime;
-}
-
-/// One user routing rule (`[[notifications.rules]]`, item 420). All present
-/// selectors must match for the rule to fire (absent selectors are wildcards);
-/// the action then reshapes the [`crate::notification_route::RouteDecision`].
-/// Matching + regex/glob compilation live in `notification_route.rs`; this is
-/// pure config data.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct NotificationRule {
-    /// Optional human note (ignored by matching).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub name: String,
-    // --- selectors ---
-    /// Match a single kind (snake_case, e.g. `"test_failed"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// Match any of these kinds (union with `kind`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub kinds: Vec<String>,
-    /// Glob over the notification's `worktree_path` (`*` any run, `?` any char).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<String>,
-    /// Prefix match on `source_ref` (e.g. `"linear:"`, `"pr:"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Regex matched against the message text (unanchored).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// Only fire when the (base) effective priority is `>=` this
-    /// (`"info"`/`"notice"`/`"alert"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_priority: Option<String>,
-    /// Only fire when the active routing mode is one of these (empty = any mode).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub modes: Vec<String>,
-    /// Only fire under this active profile (empty = any profile).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
-    // --- actions ---
-    /// Override the effective priority (`"info"`/`"notice"`/`"alert"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub set_priority: Option<String>,
-    /// Restrict delivery to this channel subset. Values from
-    /// `inbox`/`desktop`/`toast`/`sound`. `None` ⇒ leave channels at default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub route: Option<Vec<String>>,
-    /// Suppress every ephemeral channel (desktop/toast/sound); inbox still records.
-    #[serde(skip_serializing_if = "is_false")]
-    pub mute: bool,
-    /// Drop entirely — no inbox record, no delivery.
-    #[serde(skip_serializing_if = "is_false")]
-    pub drop: bool,
-    /// Override the sound: `"bell"`, `"off"`, or a command string.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sound: Option<String>,
-    /// Stop evaluating further rules after this one matches.
-    #[serde(skip_serializing_if = "is_false")]
-    pub stop: bool,
-}
-
-/// `[notifications.dnd]` — do-not-disturb / quiet hours (item 426).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct DndConfig {
-    /// Startup state of the manual toggle. The runtime toggle overrides the
-    /// schedule; this seeds it.
-    pub enabled: bool,
-    /// Quiet windows, each `"HH:MM-HH:MM"` with an optional leading weekday token
-    /// (`"Sat"`, `"mon-fri"`); ranges may wrap past midnight (`"22:00-08:00"`).
-    /// Empty ⇒ no scheduled DND (only the manual toggle applies).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub windows: Vec<String>,
-    /// Notifications at or above this priority still deliver during DND
-    /// (`"info"`/`"notice"`/`"alert"`, default `"alert"`).
-    pub allow_priority: String,
-}
-
-impl Default for DndConfig {
-    fn default() -> Self {
-        DndConfig {
-            enabled: false,
-            windows: Vec::new(),
-            allow_priority: "alert".into(),
-        }
-    }
-}
-
-/// `[notifications.sound]` — the audible cue (item 429).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct SoundConfig {
-    /// How to produce the cue: `chime` (default), `bell`, `command`, or `off`.
-    pub mode: SoundMode,
-    /// Minimum effective priority that makes a sound (`"info"`/`"notice"`/
-    /// `"alert"`, default `"alert"`). Kinds in `always_kinds` bypass this floor.
-    pub min_priority: String,
-    /// Notification kinds that always chime regardless of `min_priority`
-    /// (snake_case, e.g. `"agent_done"`). Defaults to the agent
-    /// finished/needs-you set so a background worktree is audible out of the box.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub always_kinds: Vec<String>,
-    /// Suppress the audible cue for the currently-focused worktree (you can
-    /// already see it) — the inbox record + desktop toast still fire. Default
-    /// `true`.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub suppress_focused: bool,
-    /// Optional custom sound file for `mode = "chime"` (a `.wav` path). Empty ⇒
-    /// the bundled chime. The auto-detected player still applies.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub chime_file: String,
-    /// Command for `mode = "command"` (run best-effort, off-thread). A literal
-    /// command line, e.g. `"paplay /usr/share/sounds/alert.oga"`.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub command: String,
-    /// Optional per-priority command overrides (keys `info`/`notice`/`alert`),
-    /// consulted before `command` when `mode = "command"`.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub per_priority: std::collections::BTreeMap<String, String>,
-}
-
-impl Default for SoundConfig {
-    fn default() -> Self {
-        SoundConfig {
-            mode: SoundMode::Chime,
-            min_priority: "alert".into(),
-            always_kinds: vec![
-                "agent_done".into(),
-                "agent_attention".into(),
-                "agent_failed".into(),
-            ],
-            suppress_focused: true,
-            chime_file: String::new(),
-            command: String::new(),
-            per_priority: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
-/// `[notifications.modes.<name>]` — a named routing mode (item 427). Currently
-/// just an optional label; membership drives rule `modes` selectors.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct NotificationMode {
-    /// Human label for the status chip / palette (defaults to the map key).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub label: String,
-}
-
-/// `[profiles.<p>.notifications]` — per-profile routing overlay (item 427).
-/// Present fields replace the corresponding global `[notifications]` fields for
-/// the active profile; absent fields inherit. Mirrors [`SandboxOverlay`].
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct NotificationsOverlay {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub desktop: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub desktop_min_urgency: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub process_exit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub surface_self_log_errors: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<std::collections::BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rules: Option<Vec<NotificationRule>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dnd: Option<DndConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sound: Option<SoundConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modes: Option<std::collections::BTreeMap<String, NotificationMode>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_mode: Option<String>,
-}
-
-impl NotificationsOverlay {
-    /// True when nothing is set — lets `ProfileConfig` skip serialization.
-    pub fn is_empty(&self) -> bool {
-        self.desktop.is_none()
-            && self.desktop_min_urgency.is_none()
-            && self.process_exit.is_none()
-            && self.surface_self_log_errors.is_none()
-            && self.priority.is_none()
-            && self.rules.is_none()
-            && self.dnd.is_none()
-            && self.sound.is_none()
-            && self.modes.is_none()
-            && self.active_mode.is_none()
-    }
-
-    /// Apply present fields onto `base` (present wins, absent inherits).
-    pub fn apply(self, base: &mut NotificationsConfig) {
-        if let Some(v) = self.desktop {
-            base.desktop = v;
-        }
-        if let Some(v) = self.desktop_min_urgency {
-            base.desktop_min_urgency = v;
-        }
-        if let Some(v) = self.process_exit {
-            base.process_exit = v;
-        }
-        if let Some(v) = self.surface_self_log_errors {
-            base.surface_self_log_errors = v;
-        }
-        if let Some(v) = self.priority {
-            base.priority = v;
-        }
-        if let Some(v) = self.rules {
-            base.rules = v;
-        }
-        if let Some(v) = self.dnd {
-            base.dnd = v;
-        }
-        if let Some(v) = self.sound {
-            base.sound = v;
-        }
-        if let Some(v) = self.modes {
-            base.modes = v;
-        }
-        if let Some(v) = self.active_mode {
-            base.active_mode = v;
         }
     }
 }
@@ -5154,6 +4728,8 @@ fn is_default_preset(s: &str) -> bool {
     s.is_empty() || s == "default"
 }
 
+pub use crate::config_automations::{AutomationsConfig, AutomationsOverlay};
+pub use crate::config_autopilot::{AutopilotConfig, AutopilotOpenAs, AutopilotOverlay};
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
@@ -5170,12 +4746,54 @@ pub use crate::config_pr_queue::{
     PrAutoEnqueue, PrMergeMethod, PrMergeMode, PrQueueConfig, PrQueueOverlay, PrQueuePrompts,
     PrQueuePromptsOverlay, PrWatchKind,
 };
+pub use crate::config_preview::PreviewConfig;
+pub use crate::config_skills::SkillsConfig;
+
+config_enum! {
+    /// Which process kind may advance the shared state database schema.
+    ///
+    /// `controller` limits migrations to the interactive compositor and the
+    /// long-lived pane daemon/serve process. Ordinary CLI commands (including
+    /// commands resolved from a worktree-local `target/debug`) may still use a
+    /// database whose schema already matches, but cannot move it forward.
+    pub enum MigrationAuthority: "database migration authority" {
+        Any = "any",
+        Controller = "controller" | "host",
+        Disabled = "disabled" | "off",
+    } default = Controller;
+}
+
+/// `[database]` — ownership policy for the one shared state schema.
+///
+/// This is deliberately global/profile config, never a repo overlay: code in a
+/// worktree must not be able to grant itself migration authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DatabaseConfig {
+    /// Who may run automatic schema migrations. `controller` is the safe
+    /// default; `any` restores the legacy "first opener migrates" behavior.
+    pub migration_authority: MigrationAuthority,
+    /// Optional executable pin. When non-empty, even an otherwise-authorized
+    /// controller may migrate only when its canonical `current_exe` equals this
+    /// canonical path. Use an absolute path (a symlink is fine).
+    pub migration_executable: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            migration_authority: MigrationAuthority::Controller,
+            migration_executable: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
     // --- scalar values (must serialize before any sub-table for TOML) ---
     pub worktrees_dir: String,
+    #[serde(rename = "projects_dir", alias = "workspaces_dir")]
     pub workspaces_dir: String,
     pub base_branch: String,
     pub window_margin: usize,
@@ -5243,9 +4861,15 @@ pub struct Config {
     /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
     /// crash-forwarding sink.
     pub diagnostics: DiagnosticsConfig,
+    /// `[database]` — shared-schema migration authority and executable pin.
+    pub database: DatabaseConfig,
     pub sandbox: SandboxConfig,
-    /// `[toolchain]` — languages-only provisioning plus activation policy for
-    /// detected repo toolchain declarations.
+    /// `[hooks]` lifecycle commands. Workspace and trusted repo layers add to
+    /// these lists; repo entries are trust-gated before execution.
+    pub hooks: HooksConfig,
+    /// `[toolchain]` — the batteries-included toolchain for languages-only
+    /// repos (synthesized Nix devShell; mode + per-language package overrides)
+    /// plus activation policy for detected repo toolchain declarations.
     pub toolchain: crate::toolchain::ToolchainConfig,
     pub limits: LimitsConfig,
     /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
@@ -5259,6 +4883,8 @@ pub struct Config {
     pub activity: ActivityConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
+    /// `[automations]` — trusted global event-to-catalog-action rules.
+    pub automations: AutomationsConfig,
     pub strip: StripConfig,
     pub panel: PanelConfig,
     pub search: SearchConfig,
@@ -5288,12 +4914,19 @@ pub struct Config {
     /// blockers with an agent, and merge them once green. Off by default (it is
     /// the one part of the shell that makes network writes).
     pub pr_queue: PrQueueConfig,
+    /// `[autopilot]` — opt-in issue pickup and issue-to-PR supervisor policy.
+    /// Repo-specific values belong in the trusted `[workspace.<slug>.autopilot]`
+    /// overlay; repo-root overlays cannot enable this supervisor.
+    pub autopilot: AutopilotConfig,
     /// `[pipeline]` — the declarative `[[pipeline.stages]]` org chart a
     /// supervising agent reads (`thegn config get pipeline --json`) to run a
     /// multi-stage pipeline. **Structure, not judgment**: thegn validates and
     /// displays it and never advances a stage itself. Empty by default.
     /// See [`crate::config_pipeline`].
     pub pipeline: Pipeline,
+    /// `[skills]` — embedded and configured agent recipes seeded into native
+    /// per-project harness layouts. Discovery and path access are host-owned.
+    pub skills: SkillsConfig,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
@@ -5308,6 +4941,9 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
+    /// `[voice]` — opt-in experimental command-backed speech-to-text. No audio
+    /// worker or child process exists while this is disabled.
+    pub voice: VoiceConfig,
     /// `[usage]` — the AI-account usage tracker overlay (`open-usage`). Opt-in,
     /// additive; the shell never depends on it. See [`UsageConfig`].
     pub usage: UsageConfig,
@@ -5328,6 +4964,8 @@ pub struct Config {
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
     /// loopback for browser preview. On by default (loopback-only ⇒ safe).
     pub forward: ForwardConfig,
+    /// `[preview]` — pure frontend target discovery and bounded-fetch policy.
+    pub preview: PreviewConfig,
     /// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
     /// sandboxes (keep recently-used ones warm for fast resume; let idle ones
     /// suspend; provision ahead of focus). Budget-safe defaults.
@@ -5357,8 +4995,9 @@ pub struct Config {
     /// independently (mix-and-match). See [`crate::identity`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub identities: std::collections::BTreeMap<String, IdentityConfig>,
-    /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
+    /// Per-project (one-repo) config keyed by repo slug (`[project.<slug>]`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(rename = "project", alias = "workspace")]
     pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
     /// Named execution environments (`[env.<name>]`) — the reusable library a
     /// workspace/repo/worktree selects from. See [`Config::resolve_env`].
@@ -5467,7 +5106,9 @@ impl Default for Config {
             watch: WatchConfig::default(),
             log: LogConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            database: DatabaseConfig::default(),
             sandbox: SandboxConfig::default(),
+            hooks: HooksConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
@@ -5476,6 +5117,7 @@ impl Default for Config {
             activity: ActivityConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
+            automations: AutomationsConfig::default(),
             strip: StripConfig::default(),
             panel: PanelConfig::default(),
             search: SearchConfig::default(),
@@ -5486,11 +5128,14 @@ impl Default for Config {
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
+            autopilot: AutopilotConfig::default(),
             pipeline: Pipeline::default(),
+            skills: SkillsConfig::default(),
             replay: ReplayConfig::default(),
             recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
             media: MediaConfig::default(),
+            voice: VoiceConfig::default(),
             usage: UsageConfig::default(),
             model_proxy: crate::config_model_proxy::ModelProxyConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
@@ -5498,6 +5143,7 @@ impl Default for Config {
             host_discovery: crate::config_host_discovery::HostDiscoveryConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
+            preview: PreviewConfig::default(),
             lifecycle: LifecycleConfig::default(),
             placement: PlacementConfig::default(),
             keybinds: KeybindConfig::default(),
@@ -5562,6 +5208,7 @@ pub struct ConfigOverlay {
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
     pub git_structural_diff: Option<StructuralDiff>,
+    pub editor_provider: Option<EditorProvider>,
     pub editor_command: Option<String>,
     pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -5592,6 +5239,8 @@ pub struct ConfigOverlay {
     pub diagnostics_crash_reports: Option<bool>,
     pub diagnostics_crash_retention: Option<usize>,
     pub diagnostics_ring_size: Option<usize>,
+    pub database_migration_authority: Option<MigrationAuthority>,
+    pub database_migration_executable: Option<String>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
@@ -5611,6 +5260,10 @@ pub struct ConfigOverlay {
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
+    pub skills_enabled: Option<bool>,
+    pub skills_user_dirs: Option<Vec<String>>,
+    pub skills_exclude: Option<Vec<String>>,
+    pub preview: crate::config_preview::PreviewOverlay,
     pub sandbox: SandboxOverlay,
 }
 
@@ -5631,6 +5284,7 @@ impl ConfigOverlay {
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
         set!(base.git.structural_diff, self.git_structural_diff);
+        set!(base.editor.provider, self.editor_provider);
         set!(base.editor.command, self.editor_command);
         set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
@@ -5669,6 +5323,14 @@ impl ConfigOverlay {
             self.diagnostics_crash_retention
         );
         set!(base.diagnostics.ring_size, self.diagnostics_ring_size);
+        set!(
+            base.database.migration_authority,
+            self.database_migration_authority
+        );
+        set!(
+            base.database.migration_executable,
+            self.database_migration_executable
+        );
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(
@@ -5697,6 +5359,10 @@ impl ConfigOverlay {
             base.notifications.agent_attention_inbox,
             self.notifications_agent_attention_inbox
         );
+        set!(base.skills.enabled, self.skills_enabled);
+        set!(base.skills.user_dirs, self.skills_user_dirs);
+        set!(base.skills.exclude, self.skills_exclude);
+        self.preview.apply(&mut base.preview);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -5763,7 +5429,22 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     };
 
     o.worktrees_dir = env.get("THEGN_WORKTREES_DIR");
-    o.workspaces_dir = env.get("THEGN_WORKSPACES_DIR");
+    let canonical_projects_dir = env.get("THEGN_PROJECTS_DIR");
+    let legacy_workspaces_dir = env.get("THEGN_WORKSPACES_DIR");
+    if canonical_projects_dir.is_some() && legacy_workspaces_dir.is_some() {
+        config_warn(&format!(
+            "duplicate environment keys THEGN_PROJECTS_DIR and THEGN_WORKSPACES_DIR; using THEGN_PROJECTS_DIR (legacy accepted for {} stable releases; removal: {})",
+            crate::config_compat::LEGACY_RELEASE_WINDOW,
+            crate::config_compat::LEGACY_REMOVAL_RELEASE,
+        ));
+    } else if legacy_workspaces_dir.is_some() {
+        config_warn(&format!(
+            "THEGN_WORKSPACES_DIR is deprecated; use THEGN_PROJECTS_DIR (accepted for {} stable releases; removal: {})",
+            crate::config_compat::LEGACY_RELEASE_WINDOW,
+            crate::config_compat::LEGACY_REMOVAL_RELEASE,
+        ));
+    }
+    o.workspaces_dir = canonical_projects_dir.or(legacy_workspaces_dir);
     o.base_branch = env.get("THEGN_BASE_BRANCH");
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
     if let Some(v) = env.get("THEGN_PICKER") {
@@ -5781,6 +5462,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             v.trim(),
             "THEGN_GIT_STRUCTURAL_DIFF",
             StructuralDiff::from_str_validated,
+        );
+    }
+    if let Some(v) = env.get("THEGN_EDITOR_PROVIDER") {
+        o.editor_provider = parse_enum_env(
+            v.trim(),
+            "THEGN_EDITOR_PROVIDER",
+            EditorProvider::from_str_validated,
         );
     }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");
@@ -5897,6 +5585,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.diagnostics_ring_size = parse_num(v, "THEGN_DIAGNOSTICS_RING_SIZE").map(|n| n as usize);
     }
 
+    // [database] — startup-only schema ownership. The executable pin is an
+    // especially useful launcher override for dev/live recipes.
+    if let Some(v) = env.get("THEGN_DATABASE_MIGRATION_AUTHORITY") {
+        o.database_migration_authority = parse_enum_env(
+            v.trim(),
+            "THEGN_DATABASE_MIGRATION_AUTHORITY",
+            MigrationAuthority::from_str_validated,
+        );
+    }
+    o.database_migration_executable = env.get("THEGN_DATABASE_MIGRATION_EXECUTABLE");
+
     // [disk]
     if let Some(v) = env.get("THEGN_DISK_SHOW_SIZES") {
         o.disk_show_sizes = parse_bool(&v, "THEGN_DISK_SHOW_SIZES");
@@ -5959,6 +5658,39 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX") {
         o.notifications_agent_attention_inbox =
             parse_bool(&v, "THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX");
+    }
+
+    // [skills] — all three values are shallow, useful for isolated launches,
+    // and therefore deliberately participate in the env layer.
+    if let Some(v) = env.get("THEGN_SKILLS_ENABLED") {
+        o.skills_enabled = parse_bool(&v, "THEGN_SKILLS_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_SKILLS_USER_DIRS") {
+        o.skills_user_dirs = Some(parse_list(v));
+    }
+    if let Some(v) = env.get("THEGN_SKILLS_EXCLUDE") {
+        o.skills_exclude = Some(parse_list(v));
+    }
+
+    // [preview] — all five keys are trusted launch-time knobs.
+    if let Some(v) = env.get("THEGN_PREVIEW_ENABLED") {
+        o.preview.enabled = parse_bool(&v, "THEGN_PREVIEW_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_PORTS") {
+        match crate::config_preview::parse_ports_env(&v) {
+            Ok(ports) => o.preview.ports = Some(ports),
+            Err(error) => config_warn(&format!("THEGN_PREVIEW_PORTS: {error}; ignoring")),
+        }
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_FETCH_TIMEOUT_MS") {
+        o.preview.fetch_timeout_ms = parse_num(v, "THEGN_PREVIEW_FETCH_TIMEOUT_MS");
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_MAX_BODY_BYTES") {
+        o.preview.max_body_bytes = parse_num(v, "THEGN_PREVIEW_MAX_BODY_BYTES")
+            .and_then(|value| usize::try_from(value).ok());
+    }
+    if let Some(v) = env.get("THEGN_PREVIEW_ALLOW_EXTERNAL_URLS") {
+        o.preview.allow_external_urls = parse_bool(&v, "THEGN_PREVIEW_ALLOW_EXTERNAL_URLS");
     }
 
     // [sandbox]
@@ -6090,7 +5822,11 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
         };
-        let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
+        let normalized = crate::config_compat::normalize(&s)?;
+        for diagnostic in &normalized.diagnostics {
+            config_warn(diagnostic);
+        }
+        let mut cfg: Config = toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
 
         // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
         // removed before the public alpha. A leftover section is harmless
@@ -6106,7 +5842,7 @@ impl Config {
         // this one key.
         static LEGACY_KEYS_WARNED: std::sync::Once = std::sync::Once::new();
         LEGACY_KEYS_WARNED.call_once(|| {
-            if let Ok(raw) = toml::from_str::<toml::Value>(&s)
+            if let Ok(raw) = toml::from_str::<toml::Value>(&normalized.body)
                 && raw.get("llm_proxy").is_some()
             {
                 config_warn("[llm_proxy] is no longer supported and is ignored");
@@ -6181,7 +5917,12 @@ impl Config {
     /// keys the overlay omits are preserved). The mechanism behind the profile
     /// (and later subprofile) full overlays. Pure + unit-tested.
     pub fn apply_toml_overlay(cfg: &mut Config, toml_str: &str) -> Result<(), String> {
-        let overlay: serde_json::Value = toml::from_str(toml_str).map_err(|e| format!("{e}"))?;
+        let normalized = crate::config_compat::normalize(toml_str)?;
+        for diagnostic in normalized.diagnostics {
+            config_warn(&diagnostic);
+        }
+        let overlay: serde_json::Value =
+            toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
         let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
         deep_merge_json(&mut base, overlay);
         *cfg = serde_json::from_value(base).map_err(|e| format!("{e}"))?;
@@ -6216,6 +5957,7 @@ impl Config {
     }
 
     pub(crate) fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
+        let key = crate::config_compat::canonical_key(key);
         if key == "apps.tab_order" {
             cfg.apps.tab_order = val
                 .split(',')
@@ -6268,6 +6010,8 @@ impl Config {
     }
 
     pub(crate) fn post_process(&mut self) {
+        crate::config_drawer::warn_policy_issues(self);
+        crate::config_drawer::strip_agent_metadata(&mut self.agents);
         // Install the resolved [remote] tuning into the process-global holders
         // (ssh keepalives / control-plane retry / heal cadence); first set wins.
         self.remote.install();
@@ -6285,6 +6029,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "shell".into(),
@@ -6297,6 +6043,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -6313,6 +6061,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "yazi".into(),
@@ -6325,6 +6075,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "editor".into(),
@@ -6337,6 +6089,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
                 NamedCommand {
                     name: "diff".into(),
@@ -6349,6 +6103,8 @@ impl Config {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 },
             ];
         }
@@ -6371,6 +6127,7 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        self.preview.normalize();
         // Drop unusable command collectors up front so the supervisor never has
         // to guess: a `kind = "command"` target with an empty/blank argv can
         // never run, and a `kind = "prometheus"` target with no URL can never be
@@ -6541,23 +6298,62 @@ impl Config {
             && let Some(mut overlay) = load_repo_overlay(root)
             && !overlay.notifications.is_empty()
         {
-            // A repo's `.thegn.*` is UNTRUSTED. A hostile overlay must not be able
-            // to supply a `[notifications.sound] mode = "command"` (+ a command /
-            // per-priority command / chime file it controls), which would reach
-            // `sh -c` on the next notification — RCE merely on opening the repo.
-            // De-fang the repo-supplied sound before folding it; the user's own
-            // config + profile keep the feature.
+            // A repo's `.thegn.*` is UNTRUSTED. A hostile overlay must not be
+            // able to supply executable commands or host paths that reach the
+            // playback worker merely on opening the repo.
             if let Some(s) = overlay.notifications.sound.as_mut() {
                 if s.mode == SoundMode::Command {
-                    s.mode = SoundMode::Chime;
+                    s.mode = SoundMode::Bell;
                 }
+                s.pack.clear();
+                s.per_kind.clear();
                 s.command.clear();
                 s.per_priority.clear();
                 s.chime_file.clear();
             }
+            // Rule sound overrides retain a legacy shell-command escape hatch.
+            // Keep only the non-executable aliases from an untrusted repo
+            // overlay; arbitrary values must not reach `sh -c`.
+            if let Some(rules) = overlay.notifications.rules.as_mut() {
+                for rule in rules.iter_mut() {
+                    if let Some(sound) = rule.sound.as_deref()
+                        && !matches!(
+                            sound.trim().to_ascii_lowercase().as_str(),
+                            "" | "off" | "none" | "silent" | "bell" | "beep" | "terminal"
+                        )
+                    {
+                        rule.sound = None;
+                    }
+                }
+            }
             overlay.notifications.apply(&mut n);
         }
         n
+    }
+
+    /// Trusted automation config: global rules plus the active named profile.
+    /// Repo-root `.thegn.*` files are never consulted by this path.
+    pub fn effective_automations(&self) -> AutomationsConfig {
+        let mut automations = self.automations.clone();
+        if let Some(profile) = self.active_profile() {
+            profile.automations.clone().apply(&mut automations);
+        }
+        automations
+    }
+
+    /// Warn when an untrusted repo overlay tries to install automation rules.
+    /// The raw top-level table is inspected separately because
+    /// [`RepoConfigFile`] intentionally has no `automations` field, ensuring
+    /// rule content can never enter effective config even after detection.
+    pub fn repo_automation_warnings(&self, repo_root: &std::path::Path) -> Vec<String> {
+        let Some(path) = repo_overlay_with_automations(repo_root) else {
+            return Vec::new();
+        };
+        vec![format!(
+            "ignoring automations in {}: automation rules are global/profile config only \
+             (a repo .thegn.* overlay cannot install persistent actions)",
+            path.display()
+        )]
     }
 
     /// Warnings for any `kind = "command"` metrics collector a repo-root
@@ -6661,11 +6457,31 @@ impl Config {
         pq
     }
 
+    /// Effective issue-autopilot policy for a repo.  A repo-root overlay is
+    /// deliberately not consulted: enabling a process/forge supervisor is a
+    /// trusted user choice, not repository-controlled configuration.
+    pub fn repo_autopilot(&self, repo_root: &Path) -> AutopilotConfig {
+        let mut policy = self.autopilot.clone();
+        if let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.autopilot.is_empty()
+        {
+            ws.autopilot.clone().apply(&mut policy);
+        }
+        policy
+    }
+
     /// The name of the env a repo's `.thegn.*` overlay selects (`env = "…"`),
     /// or empty. The repo-level layer of env selection.
     pub fn repo_env_name(&self, repo_root: &Path) -> String {
         load_repo_overlay(repo_root)
             .map(|r| r.env.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The repo's explicit devcontainer variant selector, if any.
+    pub fn repo_devcontainer_selector(&self, repo_root: &Path) -> String {
+        load_repo_overlay(repo_root)
+            .map(|r| r.devcontainer.trim().to_string())
             .unwrap_or_default()
     }
 
@@ -6750,59 +6566,33 @@ impl Config {
     /// uses this. Extension tokens a legacy preset leaves empty are derived
     /// last, so derivations follow any user-overridden base colors.
     pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
-        let mut p = crate::theme::preset(preset).unwrap_or_default();
-        let set = |slot: &mut String, hex: &Option<String>| {
-            if let Some(rgb) = hex.as_deref().and_then(parse_hex_rgb) {
-                *slot = rgb;
-            }
-        };
-        let c = &self.theme.colors;
-        set(&mut p.bg0, &c.bg0);
-        set(&mut p.bg1, &c.bg1);
-        set(&mut p.panel, &c.panel);
-        set(&mut p.panel2, &c.panel2);
-        set(&mut p.raise, &c.raise);
-        set(&mut p.border, &c.border);
-        set(&mut p.text, &c.text);
-        set(&mut p.dim, &c.dim);
-        set(&mut p.faint, &c.faint);
-        set(&mut p.ghost, &c.ghost);
-        set(&mut p.ghost2, &c.ghost2);
-        set(&mut p.ghost3, &c.ghost3);
-        set(&mut p.shadow_bg, &c.shadow_bg);
-        set(&mut p.shadow_fg, &c.shadow_fg);
-        set(&mut p.chip_fg, &c.chip_fg);
-        set(&mut p.activity_active, &c.activity_active);
-        set(&mut p.activity_waiting, &c.activity_waiting);
-        set(&mut p.activity_done, &c.activity_done);
-        let h = &self.theme.hues;
-        set(&mut p.hues.teal, &h.teal);
-        set(&mut p.hues.magenta, &h.magenta);
-        set(&mut p.hues.purple, &h.purple);
-        set(&mut p.hues.green, &h.green);
-        set(&mut p.hues.amber, &h.amber);
-        set(&mut p.hues.red, &h.red);
-        set(&mut p.hues.blue, &h.blue);
-        set(&mut p.hues.orange, &h.orange);
-        // Only override the preset's focus/accent when the user actually
-        // customized them (a default — current or pre-prism — would clobber
-        // presets).
-        if !DEFAULTISH_FOCUS.contains(&self.theme.focus_border.as_str()) {
-            set(&mut p.focus, &Some(self.theme.focus_border.clone()));
-        }
-        if !DEFAULTISH_ACCENTS.contains(&self.theme.accent.as_str()) {
-            p.accent = self.accent_rgb();
-        }
-        crate::theme::extend_palette(&mut p);
-        p
+        self.palette_with_user_themes(preset, &[])
+    }
+
+    /// Resolve a named built-in or loaded user theme, then apply this config's
+    /// overrides. Built-in names take precedence over user-theme collisions.
+    pub fn palette_with_user_themes(
+        &self,
+        preset: &str,
+        user_themes: &[crate::theme_user::UserTheme],
+    ) -> crate::theme::Palette {
+        crate::theme_resolve::palette_with_catalog(
+            preset,
+            user_themes,
+            &self.theme.colors,
+            &self.theme.hues,
+            &self.theme.accent,
+            &self.theme.focus_border,
+        )
     }
 
     /// Look up a dotted config key as a bare string (for `config get` and the
     /// plugin feed). `None` for an unknown key.
     pub fn get_dotted(&self, key: &str) -> Option<String> {
-        Some(match key {
+        let key = crate::config_compat::canonical_key(key);
+        Some(match key.as_str() {
             "worktrees_dir" => self.worktrees_dir.clone(),
-            "workspaces_dir" => self.workspaces_dir.clone(),
+            "projects_dir" => self.workspaces_dir.clone(),
             "base_branch" => self.base_branch.clone(),
             "branch_prefix" => self.branch_prefix.clone(),
             "picker" => self.picker.to_string(),
@@ -6867,6 +6657,7 @@ impl Config {
             "log.format" => self.log.format.to_string(),
             "sandbox.enabled" => self.sandbox.enabled.to_string(),
             "sandbox.backend" => self.sandbox.backend.to_string(),
+            "sandbox.devcontainer" => self.sandbox.devcontainer.to_string(),
             "sandbox.image" => self.sandbox.image.clone(),
             "sandbox.network" => self.sandbox.network.to_string(),
             "sandbox.on_missing" => self.sandbox.on_missing.to_string(),
@@ -6882,7 +6673,7 @@ impl Config {
             // `[ui]`, `[drawer]`, `[placement]`, … which made `config get`
             // unusable for the entire nested surface even though `config
             // explain` resolved the same dotted paths fine.
-            _ => return self.value_at(key).map(render_scalar),
+            _ => return self.value_at(&key).map(render_scalar),
         })
     }
 
@@ -6892,7 +6683,8 @@ impl Config {
     /// `Value::Null` cannot — `config get` needs that to keep reporting an
     /// unknown key as an error.
     pub fn value_at(&self, key: &str) -> Option<serde_json::Value> {
-        let ptr = crate::config_resolve::dotted_to_pointer(key);
+        let key = crate::config_compat::canonical_key(key);
+        let ptr = crate::config_resolve::dotted_to_pointer(&key);
         serde_json::to_value(self).ok()?.pointer(&ptr).cloned()
     }
 }
@@ -6916,12 +6708,17 @@ fn render_scalar(v: serde_json::Value) -> String {
 // Strict `config validate` lives in the sibling `config_validate` module
 // (schema-driven: every `config_enum!` reachable from `Config` is checked).
 // Re-exported here so callers keep the historical `config::validate_str` path.
+pub use crate::config_repo::{
+    OverlayFormat, RepoOverlayCandidate, RepoOverlayDiagnostic, RepoOverlayDiscovery,
+    RepoOverlayUnreadableCandidate, discover_repo_overlay, parse_overlay_value,
+    repo_command_collector_warnings_for_overlay, validate_repo_overlay,
+};
 pub use crate::config_validate::validate_str;
 
-/// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
-/// YAML, then JSON (first existing file wins); parse errors warn and are ignored
-/// so a malformed repo file never blocks opening a worktree.
-pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
+/// Return the first repo overlay that contains a top-level `automations` key.
+/// Parsing into a generic value is detection-only; the content is never
+/// deserialized as [`AutomationsConfig`] or merged into [`Config`].
+fn repo_overlay_with_automations(repo_root: &std::path::Path) -> Option<PathBuf> {
     for (ext, kind) in [
         ("toml", "toml"),
         ("yaml", "yaml"),
@@ -6932,20 +6729,34 @@ pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfi
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let parsed: Result<RepoConfigFile, String> = match kind {
-            "toml" => toml::from_str(&text).map_err(|e| e.to_string()),
-            "yaml" => serde_yaml::from_str(&text).map_err(|e| e.to_string()),
-            _ => serde_json::from_str(&text).map_err(|e| e.to_string()),
+        let value = match kind {
+            "toml" => toml::from_str::<toml::Value>(&text)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok()),
+            "yaml" => serde_yaml::from_str::<serde_json::Value>(&text).ok(),
+            _ => serde_json::from_str::<serde_json::Value>(&text).ok(),
         };
-        return match parsed {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                config_warn(&format!("{}: parse error: {e}; ignoring", path.display()));
-                None
-            }
-        };
+        return value
+            .and_then(|value| value.as_object().map(|map| map.contains_key("automations")))
+            .filter(|present| *present)
+            .map(|_| path);
     }
     None
+}
+
+/// Load and parse a repo-root `.thegn.*` overlay, if present. Tries TOML,
+/// YAML, then JSON (first existing file wins); parse errors warn and are ignored
+/// so a malformed repo file never blocks opening a worktree.
+pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
+    crate::config_repo::load_repo_overlay(repo_root)
+}
+
+/// Load only the lifecycle-hook portion of a repo overlay for the host
+/// orchestration boundary. The policy resolver in `hooks.rs` remains pure: it
+/// receives these typed values rather than discovering files itself.
+pub fn load_repo_hooks(repo_root: &std::path::Path) -> Option<(HooksConfig, Vec<String>)> {
+    load_repo_overlay(repo_root)
+        .map(|overlay| (overlay.hooks, overlay.sandbox.prepare.unwrap_or_default()))
 }
 
 /// A repo-root `.thegn.*` overlay that EXISTS but failed to parse. Returned by
@@ -6953,14 +6764,7 @@ pub(crate) fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfi
 /// dropped overlay can change placement (e.g. a malformed file that was selecting
 /// `env = "sprites"` → falls back to local/host), which is exactly the silent
 /// degradation a failover-off env forbids.
-#[derive(Debug, Clone)]
-pub struct RepoOverlayParseError {
-    pub path: PathBuf,
-    pub error: String,
-    /// Best-effort lenient read of the `env = "…"` selector (empty if absent), so
-    /// a parse failure elsewhere in the file doesn't hide which env it requested.
-    pub selected_env: String,
-}
+pub use crate::config_repo::RepoOverlayParseError;
 
 /// If a repo-root `.thegn.*` file exists but fails to parse, return the error
 /// (+ a lenient `env =` read). `None` when there's no file or it parses cleanly.
@@ -6969,72 +6773,13 @@ pub struct RepoOverlayParseError {
 /// the caller surface it (a visible halt/warning) so a dropped overlay that
 /// changes placement is never silent.
 pub fn repo_overlay_parse_error(repo_root: &Path) -> Option<RepoOverlayParseError> {
-    for (ext, kind) in [
-        ("toml", "toml"),
-        ("yaml", "yaml"),
-        ("yml", "yaml"),
-        ("json", "json"),
-    ] {
-        let path = repo_root.join(format!(".thegn.{ext}"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let err = match kind {
-            "toml" => toml::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-            "yaml" => serde_yaml::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-            _ => serde_json::from_str::<RepoConfigFile>(&text)
-                .err()
-                .map(|e| e.to_string()),
-        };
-        return err.map(|error| RepoOverlayParseError {
-            path,
-            error,
-            selected_env: lenient_env_selector(&text),
-        });
-    }
-    None
+    crate::config_repo::repo_overlay_parse_error(repo_root)
 }
 
-/// Best-effort extraction of a top-level `env = "VALUE"` (TOML/JSON-ish) or
-/// `env: VALUE` (YAML) selector from a repo overlay's raw text, so a parse failure
-/// elsewhere doesn't hide which env it was selecting. Empty when absent.
-fn lenient_env_selector(text: &str) -> String {
-    for line in text.lines() {
-        let t = line.trim();
-        let Some(rest) = t.strip_prefix("env") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':')) else {
-            continue; // `environment = …`, `env_name = …`, `[env.x]` — not the selector
-        };
-        let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
-        if !v.is_empty() && !v.starts_with('{') && !v.starts_with('[') {
-            return v.to_string();
-        }
-    }
-    String::new()
-}
-
-/// "#rrggbb" / "#rgb" -> "R;G;B".
+// Compatibility shim for the config unit tests and existing private callers;
+// color parsing itself lives in the shared theme resolver.
 fn parse_hex_rgb(hex: &str) -> Option<String> {
-    let h = hex.trim().strip_prefix('#')?;
-    let h = match h.len() {
-        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
-        6 => h.to_string(),
-        _ => return None,
-    };
-    let n = u32::from_str_radix(&h, 16).ok()?;
-    Some(format!(
-        "{};{};{}",
-        (n >> 16) & 255,
-        (n >> 8) & 255,
-        n & 255
-    ))
+    crate::theme_resolve::parse_hex_rgb(hex)
 }
 
 #[cfg(test)]

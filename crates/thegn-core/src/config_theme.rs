@@ -77,7 +77,7 @@ config_enum! {
 
 /// `[theme.colors]` — all optional "#rrggbb" overrides; unset keys keep the
 /// built-in storm-blue defaults (src/theme.rs).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeColors {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,7 +132,7 @@ pub struct ThemeColors {
 
 /// `[theme.hues]` — all optional "#rrggbb" overrides for the eight semantic
 /// hues (identity + status colors); unset keys keep the preset's hues.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeHues {
     #[serde(skip_serializing_if = "Option::is_none")]

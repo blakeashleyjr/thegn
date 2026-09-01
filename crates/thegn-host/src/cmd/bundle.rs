@@ -2,7 +2,8 @@
 //!
 //! Contents: the extended `doctor --json`, the effective config with secret
 //! values redacted, bounded tails of every log sink (compositor, daemon, stderr
-//! capture, audit), and all retained crash reports — plus a printed `MANIFEST`
+//! capture, audit), the current-process WARN ring, and all retained crash
+//! reports — plus a printed `MANIFEST`
 //! of exactly what was included, so the user can see what they are about to
 //! share before they share it.
 //!
@@ -15,7 +16,7 @@
 #![allow(clippy::disallowed_macros)] // a CLI verb: println! is the user surface
 
 use anyhow::{Context, Result};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use thegn_core::config::Config;
 
@@ -30,7 +31,12 @@ pub struct BundleArgs {
     pub out: Option<PathBuf>,
 }
 
-pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    args: BundleArgs,
+    config_path: PathBuf,
+    repo_context: Option<PathBuf>,
+) -> Result<()> {
     let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
     let out = args
         .out
@@ -44,8 +50,10 @@ pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
     };
 
     // 1. doctor.json (extended, with the identification block).
-    let doctor = serde_json::to_vec_pretty(&crate::cmd::doctor::doctor_json(cfg))
-        .unwrap_or_else(|_| b"{}".to_vec());
+    let health = crate::cmd::config_health::collect(&config_path, repo_context.as_deref());
+    let doctor =
+        serde_json::to_vec_pretty(&crate::cmd::doctor::doctor_json_with_health(cfg, &health))
+            .unwrap_or_else(|_| b"{}".to_vec());
     add(&mut tar, &mut manifest, "doctor.json", doctor);
 
     // 2. config.redacted.toml — the effective config with secret values masked.
@@ -71,18 +79,23 @@ pub fn run(cfg: &Config, args: BundleArgs) -> Result<()> {
         );
     }
 
-    // 4. all retained crash reports (already secret-free by construction).
+    // 4. The WARN ring from this bundle process. This is not a live snapshot
+    // of another host or daemon process.
+    let ring = current_process_ring_log(&thegn_core::diagnostics::ring_snapshot());
+    add(
+        &mut tar,
+        &mut manifest,
+        "diagnostics/ring.log",
+        ring.into_bytes(),
+    );
+
+    // 5. all retained crash reports. Re-redact historical files in case they
+    // predate the serialization boundary or were written by another source.
     for report in thegn_core::diagnostics::list_reports() {
-        if let Ok(body) = std::fs::read(&report) {
-            let name = report
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "report.txt".into());
-            add(&mut tar, &mut manifest, &format!("crash/{name}"), body);
-        }
+        append_retained_report(&mut tar, &mut manifest, &report, &add);
     }
 
-    // 5. the manifest itself (also printed below).
+    // 6. the manifest itself (also printed below).
     manifest.push_str(&format!("\nwritten: {}\n", out.display()));
     tar.append("MANIFEST", manifest.as_bytes());
 
@@ -115,10 +128,8 @@ fn redact_toml(v: &mut toml::Value) {
     match v {
         toml::Value::Table(t) => {
             for (k, val) in t.iter_mut() {
-                if thegn_core::log_redact::is_sensitive_key(k)
-                    && !matches!(val, toml::Value::Table(_) | toml::Value::Array(_))
-                {
-                    *val = toml::Value::String(thegn_core::log_redact::REDACTED.to_string());
+                if thegn_core::log_redact::is_sensitive_key(k) {
+                    redact_sensitive_toml(val);
                 } else {
                     redact_toml(val);
                 }
@@ -129,9 +140,21 @@ fn redact_toml(v: &mut toml::Value) {
     }
 }
 
-/// Read the last `n` lines of a log file, running each through the redactor as a
-/// belt-and-braces pass (lines are already redacted at emit time). Missing file
-/// ⇒ empty.
+/// Redact a sensitive scalar or every scalar element below a sensitive array.
+/// The model-proxy key lanes are a real example: `api_keys` is a `Vec<String>`
+/// of SecretRefs, and leaving array elements intact would disclose those refs
+/// in the support archive even though the singular `api_key` is masked.
+fn redact_sensitive_toml(v: &mut toml::Value) {
+    match v {
+        toml::Value::Table(_) => redact_toml(v),
+        toml::Value::Array(items) => items.iter_mut().for_each(redact_sensitive_toml),
+        _ => *v = toml::Value::String(thegn_core::log_redact::REDACTED.to_string()),
+    }
+}
+
+/// Read the last `n` lines of a log file, running each through the text redactor
+/// as a belt-and-braces pass (lines are already redacted at emit time). Missing
+/// file ⇒ empty.
 fn redacted_tail(path: &std::path::Path, n: usize) -> String {
     let Ok(content) = std::fs::read_to_string(path) else {
         return String::new();
@@ -140,14 +163,76 @@ fn redacted_tail(path: &std::path::Path, n: usize) -> String {
     let start = lines.len().saturating_sub(n);
     lines[start..]
         .iter()
-        .map(|line| {
-            // Re-run the argv/env redactor over the line's tokens to catch any
-            // `--token X` / `FOO_TOKEN=x` shape a caller logged un-chokepointed.
-            let toks: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-            thegn_core::log_redact::redact_argv(&toks).join(" ")
-        })
+        .map(|line| thegn_core::log_redact::redact_text_line(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render the WARN ring captured by this bundle process. A bundle command is a
+/// separate process from a host or daemon, so this must never imply that it is
+/// a live cross-process snapshot.
+fn current_process_ring_log(lines: &[String]) -> String {
+    let mut out = String::from(
+        "thegn current-process WARN ring\n================================\nThis is the ring from the current bundle process; it does not include a separate host or daemon process.\n",
+    );
+    if lines.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for line in lines {
+            out.push_str(&thegn_core::log_redact::redact_text_line(line));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Sanitize a retained crash report before copying it into a bundle. Invalid
+/// UTF-8 is replaced rather than copied verbatim: crash reports are text and
+/// no report bytes should bypass the final redaction boundary.
+fn redacted_report_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .split_inclusive('\n')
+        .map(thegn_core::log_redact::redact_text_line)
+        .collect()
+}
+
+/// Read a retained report only while it is still a regular file. The metadata
+/// check closes the symlink inclusion boundary at the bundle read site too,
+/// covering a report replaced between enumeration and reading.
+fn read_retained_report(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    // Bind the read to a non-following open. A metadata check followed by
+    // `read(path)` still has a replacement race when the crash directory is
+    // writable by another user after permission hardening failed.
+    let mut file = crate::platform::open_read_nofollow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retained report is not a regular file",
+        ));
+    }
+    let mut body = Vec::new();
+    file.read_to_end(&mut body)?;
+    Ok(body)
+}
+
+fn append_retained_report(
+    tar: &mut TarBuilder,
+    manifest: &mut String,
+    report: &std::path::Path,
+    add: &impl Fn(&mut TarBuilder, &mut String, &str, Vec<u8>),
+) {
+    let name = report
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "report.txt".into());
+    match read_retained_report(report) {
+        Ok(body) => {
+            let body = redacted_report_text(&body);
+            add(tar, manifest, &format!("crash/{name}"), body.into_bytes());
+        }
+        Err(e) => manifest.push_str(&format!("  crash/{name:<28} omitted: {e}\n")),
+    }
 }
 
 /// gzip `data` with flate2 (pure-Rust miniz_oxide backend).
@@ -268,5 +353,91 @@ mod tests {
         assert!(!s.contains("sk-secret"));
         assert!(!s.contains("\"k\""));
         assert!(s.contains("ok")); // non-secret survives
+    }
+
+    #[test]
+    fn redact_toml_masks_sensitive_array_elements() {
+        let mut v: toml::Value =
+            toml::from_str("api_key = \"env:ONE\"\napi_keys = [\"env:TWO\", \"file:/three\"]\n")
+                .unwrap();
+        redact_toml(&mut v);
+        let s = toml::to_string(&v).unwrap();
+        assert_eq!(s.matches("***redacted***").count(), 3);
+        assert!(!s.contains("env:ONE"));
+        assert!(!s.contains("env:TWO"));
+        assert!(!s.contains("file:/three"));
+    }
+
+    #[test]
+    fn current_process_ring_entry_is_explicit_for_empty_and_non_empty_rings() {
+        let empty = current_process_ring_log(&[]);
+        assert!(empty.contains("current-process WARN ring"));
+        assert!(empty.contains("(none)"));
+
+        let non_empty = current_process_ring_log(&["WARN --token ring-secret safe".into()]);
+        assert!(non_empty.contains("current-process WARN ring"));
+        assert!(non_empty.contains("--token ***redacted*** safe"));
+        assert!(!non_empty.contains("ring-secret"));
+    }
+
+    #[test]
+    fn historical_crash_report_is_redacted_before_bundle_copy() {
+        let old = b"panic: --token old-secret\nTOKEN=older-secret safe\n";
+        let sanitized = redacted_report_text(old);
+        assert!(!sanitized.contains("old-secret"));
+        assert!(!sanitized.contains("older-secret"));
+        assert!(sanitized.contains("safe"));
+    }
+
+    #[test]
+    fn retained_report_read_failure_is_available_to_manifest() {
+        let path = std::env::temp_dir().join(format!(
+            "tg-missing-report-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut tar = TarBuilder::new();
+        let mut manifest = String::new();
+        let add = |tar: &mut TarBuilder, manifest: &mut String, name: &str, data: Vec<u8>| {
+            manifest.push_str(&format!("  {name} {} bytes\n", data.len()));
+            tar.append(name, &data);
+        };
+        append_retained_report(&mut tar, &mut manifest, &path, &add);
+        assert!(manifest.contains("crash/"));
+        assert!(manifest.contains("omitted: "));
+        assert_eq!(
+            tar.finish().len(),
+            1024,
+            "an omitted report is not archived"
+        );
+    }
+
+    #[test]
+    fn retained_report_reader_does_not_follow_symlinks() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-bundle-report-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("outside");
+        let link = dir.join("report.txt");
+        std::fs::write(&target, b"must not enter a bundle").unwrap();
+        let linked = crate::platform::symlink_file(&target, &link).is_ok();
+        if !linked {
+            let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+            return;
+        }
+
+        assert!(read_retained_report(&link).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

@@ -41,6 +41,89 @@ pub(crate) fn resolve(
     spec: &OpenSpec,
     launch: &AgentLaunch,
 ) -> Result<LaunchSpec> {
+    resolve_inner(cfg, db, spec, launch, None)
+}
+
+/// Resolve `tools.run` exclusively through a fresh trusted `[[tools]]` entry.
+/// An agent or bare harness with the same name is intentionally invisible.
+pub(crate) fn resolve_tool(
+    cfg: &Config,
+    db: &Db,
+    worktree: &str,
+    name: &str,
+) -> Result<LaunchSpec> {
+    let command = configured_tool_command(cfg, name)?;
+    let branch = db
+        .worktrees()
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|row| row.worktree == worktree)
+                .map(|row| row.branch)
+        })
+        .filter(|branch| !branch.is_empty());
+    crate::agent::launch_spec_full(
+        cfg,
+        worktree,
+        branch.as_deref(),
+        name,
+        true,
+        true,
+        LaunchExtras {
+            cmd_override: Some(command),
+            suppress_agent_record: true,
+            ..LaunchExtras::default()
+        },
+    )
+}
+
+fn configured_tool_command<'a>(cfg: &'a Config, name: &str) -> Result<&'a str> {
+    cfg.tool_command(name)
+        .with_context(|| format!("unknown configured tool `{name}`"))
+}
+
+pub(crate) fn ensure_configured_agent(cfg: &Config, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        cfg.agent_command(name).is_some(),
+        "unknown configured agent `{name}`"
+    );
+    Ok(())
+}
+
+/// Resolve a native fork while preserving the harness selected by the source
+/// row. The command is produced by the core harness seam; this function only
+/// composes the configured agent's current sandbox and credentials around it.
+pub(crate) fn resolve_fork(
+    cfg: &Config,
+    db: &Db,
+    spec: &OpenSpec,
+    launch: &AgentLaunch,
+    source_harness: &str,
+    source_command: &str,
+) -> Result<LaunchSpec> {
+    validate_fork_harness(cfg, &launch.agent, source_harness)?;
+    resolve_inner(cfg, db, spec, launch, Some(source_command))
+}
+
+fn validate_fork_harness(cfg: &Config, agent: &str, source_harness: &str) -> Result<()> {
+    let configured = harness_for_agent(cfg, agent)
+        .with_context(|| format!("unknown agent `{agent}` — cannot fork"))?;
+    if configured.id() != source_harness {
+        bail!(
+            "agent `{agent}` is configured for harness `{}`, but the source is `{source_harness}`",
+            configured.id()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_inner(
+    cfg: &Config,
+    db: &Db,
+    spec: &OpenSpec,
+    launch: &AgentLaunch,
+    fork_command: Option<&str>,
+) -> Result<LaunchSpec> {
     // NOTE: `cfg` is already per-request fresh — `service.rs` re-loads the
     // layered config through `config_source::fresh()` (the daemon records its
     // real `--set`/`--config` source at startup) and falls back to the boot
@@ -67,15 +150,28 @@ pub(crate) fn resolve(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let cmd = command_for(
-        cfg,
-        agent,
-        &launch.prompt,
-        headless,
-        launch.resume.as_deref().filter(|s| !s.is_empty()),
-        launch.continue_last,
-        stage,
-    )?;
+    let cmd = if launch.fork {
+        let native_id = launch
+            .native_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .context("a fork launch needs a native session id")?;
+        if let Some(command) = fork_command {
+            command.to_owned()
+        } else {
+            fork_command_for(cfg, agent, native_id)?
+        }
+    } else {
+        command_for(
+            cfg,
+            agent,
+            &launch.prompt,
+            headless,
+            launch.resume.as_deref().filter(|s| !s.is_empty()),
+            launch.continue_last,
+            stage,
+        )?
+    };
 
     // The branch is the worktree's registered one; a worktree thegn does not
     // know about still launches, just without the branch in its environment.
@@ -226,12 +322,63 @@ pub(crate) fn harness_for_agent(
     thegn_core::harness::harness(agent)
 }
 
+/// Resolve the vendor-owned native fork command. The generic daemon never
+/// interprets provider syntax; it only asks the harness seam for the operation.
+pub(crate) fn fork_command_for(
+    cfg: &Config,
+    agent: &str,
+    native_session_id: &str,
+) -> Result<String> {
+    if !thegn_core::harness::session_id_ok(native_session_id) {
+        bail!("invalid fork session id {native_session_id}");
+    }
+    let harness = harness_for_agent(cfg, agent)
+        .with_context(|| format!("unknown agent {agent} — cannot fork"))?;
+    harness
+        .fork_command(native_session_id)
+        .filter(|command| !command.is_empty())
+        .with_context(|| format!("agent {agent} does not support native session fork"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    fn named(name: &str, command: &str) -> thegn_core::config::NamedCommand {
+        thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
+            name: name.into(),
+            command: command.into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn action_names_are_resolved_only_in_their_declared_registry() {
+        let mut c = cfg();
+        c.agents.push(named("same", "claude"));
+        assert!(configured_tool_command(&c, "same").is_err());
+        ensure_configured_agent(&c, "same").expect("configured agent");
+
+        let mut c = cfg();
+        c.tools.push(named("same", "codex"));
+        assert!(ensure_configured_agent(&c, "same").is_err());
+        assert_eq!(configured_tool_command(&c, "same").unwrap(), "codex");
+
+        assert!(configured_tool_command(&cfg(), "claude").is_err());
+        assert!(ensure_configured_agent(&cfg(), "claude").is_err());
     }
 
     #[test]
@@ -273,6 +420,8 @@ mod tests {
             model: Some("claude-sonnet-5".into()),
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         });
         c.pipeline
             .stages
@@ -450,6 +599,7 @@ mod tests {
             agent: None,
             adopt: false,
             already_capped: false,
+            automation_origin: None,
         };
         let launch = AgentLaunch {
             agent: "claude".into(),
@@ -459,9 +609,99 @@ mod tests {
             resume: None,
             continue_last: false,
             stage: None,
+            fork: false,
+            native_session_id: None,
         };
         let db = Db::open_memory().expect("in-memory db");
         let err = resolve(&cfg(), &db, &spec, &launch).expect_err("should refuse");
         assert!(err.to_string().contains("worktree"), "got {err}");
+    }
+
+    #[test]
+    fn native_fork_requires_the_configured_agent_provider_to_match() {
+        let mut c = cfg();
+        c.agents.push(thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
+            name: "worker".into(),
+            command: "codex".into(),
+            hints: Vec::new(),
+            provider: Some("codex".into()),
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        });
+        let mismatch = validate_fork_harness(&c, "worker", "claude").expect_err("must reject");
+        assert!(
+            mismatch
+                .to_string()
+                .contains("configured for harness `codex`")
+        );
+        validate_fork_harness(&c, "worker", "codex").expect("matching native harness");
+    }
+
+    #[test]
+    fn matching_native_fork_preserves_source_command_and_fresh_launch_context() {
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let state = tempfile::tempdir().expect("isolated state dir");
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            state.path().to_str().expect("state path"),
+        )]);
+        let mut c = cfg();
+        c.sandbox.enabled = false;
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("THEGN_TEST_FORK_AGENT_ENV".into(), "fresh-context".into());
+        c.agents.push(thegn_core::config::NamedCommand {
+            drawer_scope: Default::default(),
+            drawer_cwd: Default::default(),
+            name: "worker".into(),
+            command: "codex".into(),
+            hints: Vec::new(),
+            provider: Some("codex".into()),
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env,
+            permissions: Vec::new(),
+        });
+        let db = Db::open_memory().expect("in-memory db");
+        let spec = OpenSpec {
+            cwd: Some(worktree.path().to_string_lossy().into_owned()),
+            worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let launch = AgentLaunch {
+            agent: "worker".into(),
+            prompt: String::new(),
+            headless: Some(false),
+            bind_worktree: false,
+            resume: None,
+            continue_last: false,
+            stage: None,
+            fork: true,
+            native_session_id: Some("native-codex".into()),
+        };
+        let source_command = "source-harness-command --native native-codex";
+        let resolved = resolve_fork(&c, &db, &spec, &launch, "codex", source_command)
+            .expect("matching provider resolves");
+
+        assert!(
+            resolved.argv.iter().any(|arg| arg.contains(source_command)),
+            "the source harness command must survive launch composition: {:?}",
+            resolved.argv
+        );
+        assert!(
+            resolved
+                .env
+                .iter()
+                .any(|(key, value)| key == "THEGN_TEST_FORK_AGENT_ENV" && value == "fresh-context"),
+            "configured launch context must still be composed: {:?}",
+            resolved.env
+        );
     }
 }

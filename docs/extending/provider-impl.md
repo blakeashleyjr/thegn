@@ -3,6 +3,11 @@
 The seam shape is `openspec/specs/provider-seams`; the forge is the reference
 (`crates/thegn-core/src/forge/`, `crates/thegn-svc/src/forge/`).
 
+For the account-shaped issue tracker seam, use the focused
+[tracker-provider recipe](tracker-provider.md). It documents the live
+`IssueBackend`/`IssueCaps` contract, plugin bridge, offline doctor probe, and
+CLI-backed-provider boundary.
+
 1. **Kind**: add the value to the seam's `config_enum!` (`ForgeKind`,
    `CiProviderKind`, …). If you are landing the config name before the
    implementation, mark it `reserved`. Account-shaped seams (issues,

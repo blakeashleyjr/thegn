@@ -14,7 +14,7 @@
 //! last-known-good; and the mid-creation `Loading` overlay is loop-side state
 //! the hydration thread can't see (those rows briefly score as idle).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use thegn_core::attention::{
@@ -29,6 +29,65 @@ use thegn_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeA
 fn order_memo() -> &'static Mutex<Vec<(String, AttentionTier)>> {
     static MEMO: OnceLock<Mutex<Vec<(String, AttentionTier)>>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[derive(Default)]
+struct AttentionEdgeState {
+    seeded: bool,
+    since_by_session: HashMap<String, i64>,
+}
+
+fn attention_edge_memo() -> &'static Mutex<AttentionEdgeState> {
+    static MEMO: OnceLock<Mutex<AttentionEdgeState>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(AttentionEdgeState::default()))
+}
+
+/// Return only live attention rows that represent a newly raised or changed
+/// hand. The first snapshot establishes a baseline, and vanished sessions are
+/// removed so a later re-raise is an edge again.
+fn attention_edges(
+    state: &mut AttentionEdgeState,
+    rows: &[thegn_core::osc_attention::SessionAttention],
+) -> Vec<thegn_core::osc_attention::SessionAttention> {
+    let current: HashMap<String, i64> = rows
+        .iter()
+        .map(|row| (row.session.clone(), row.since))
+        .collect();
+    if !state.seeded {
+        state.seeded = true;
+        state.since_by_session = current;
+        return Vec::new();
+    }
+    let edges = rows
+        .iter()
+        .filter(|row| state.since_by_session.get(&row.session) != Some(&row.since))
+        .cloned()
+        .collect();
+    state.since_by_session = current;
+    edges
+}
+
+fn observe_attention_edges(rows: &[thegn_core::osc_attention::SessionAttention]) {
+    let edges = attention_edges(&mut attention_edge_memo().lock().unwrap(), rows);
+    let Some(notify) = crate::notify::global() else {
+        return;
+    };
+    for row in edges {
+        let message = if row.title.trim().is_empty() {
+            row.body
+        } else {
+            format!("{}: {}", row.title.trim(), row.body)
+        };
+        // This is live state, not an inbox event: route transient channels only
+        // and never insert a duplicate notification row.
+        crate::notify::route(
+            &notify,
+            NotificationKind::AgentAttention.as_str(),
+            &row.session,
+            &message,
+            &row.worktree_path,
+        );
+    }
 }
 
 /// Compute `status.attention` / `attention_ranks` / `workspace_attention` for
@@ -213,8 +272,10 @@ pub(crate) fn collect_attention(
     // query's order: two sessions raising a hand in ONE worktree must report the
     // longest wait, which is what the tier's longest-waiting-first tie-break
     // then sorts on.
+    let attention_rows = db.list_session_attention().unwrap_or_default();
+    observe_attention_edges(&attention_rows);
     let mut raised: BTreeMap<String, i64> = BTreeMap::new();
-    for a in db.list_session_attention().unwrap_or_default() {
+    for a in attention_rows {
         raised
             .entry(a.worktree_path)
             .and_modify(|since| *since = (*since).min(a.since))
@@ -406,6 +467,26 @@ mod tests {
     use super::*;
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use thegn_core::store::WorkspaceStore;
+
+    fn hand(session: &str, since: i64) -> thegn_core::osc_attention::SessionAttention {
+        thegn_core::osc_attention::SessionAttention {
+            session: session.into(),
+            worktree_path: "/wt/hand".into(),
+            title: "Need input".into(),
+            body: "pick a branch".into(),
+            since,
+        }
+    }
+
+    #[test]
+    fn attention_edges_seed_change_and_forget_sessions() {
+        let mut state = AttentionEdgeState::default();
+        assert!(attention_edges(&mut state, &[hand("s1", 10)]).is_empty());
+        assert!(attention_edges(&mut state, &[hand("s1", 10)]).is_empty());
+        assert_eq!(attention_edges(&mut state, &[hand("s1", 11)]).len(), 1);
+        assert!(attention_edges(&mut state, &[]).is_empty());
+        assert_eq!(attention_edges(&mut state, &[hand("s1", 12)]).len(), 1);
+    }
 
     fn session_with(paths: &[(&str, &str)]) -> Session {
         Session {
