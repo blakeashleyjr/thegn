@@ -121,19 +121,19 @@ static AUTH_HEADER: Lazy<Regex> = Lazy::new(|| {
 static BEARER: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(\bbearer\s+)[^\s]+").unwrap());
 static DOUBLE_QUOTED_ASSIGNMENT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|auth|credential)[A-Za-z0-9_-]*|token|password|passwd|secret|api[_-]?key|auth|credential)\s*[=:]\s*)"[^"]*""#,
+        r#"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*(?:token|password|passwd|secret|auth|credential)[A-Za-z0-9_-]*|[A-Za-z_][A-Za-z0-9-]*[_-]key(?:[_-]id)?|token|password|passwd|secret|key|api[_-]?key|auth|credential)\s*[=:]\s*)"[^"]*""#,
     )
     .unwrap()
 });
 static SINGLE_QUOTED_ASSIGNMENT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|auth|credential)[A-Za-z0-9_-]*|token|password|passwd|secret|api[_-]?key|auth|credential)\s*[=:]\s*)'[^']*'"#,
+        r#"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*(?:token|password|passwd|secret|auth|credential)[A-Za-z0-9_-]*|[A-Za-z_][A-Za-z0-9-]*[_-]key(?:[_-]id)?|token|password|passwd|secret|key|api[_-]?key|auth|credential)\s*[=:]\s*)'[^']*'"#,
     )
     .unwrap()
 });
 static ASSIGNMENT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|auth|credential)[A-Za-z0-9_-]*|token|password|passwd|secret|api[_-]?key|auth|credential)\s*[=:]\s*)[^\s"'`,;]+"#,
+        r#"(?i)(\b(?:[A-Za-z_][A-Za-z0-9_-]*(?:token|password|passwd|secret|auth|credential)[A-Za-z0-9_-]*|[A-Za-z_][A-Za-z0-9-]*[_-]key(?:[_-]id)?|token|password|passwd|secret|key|api[_-]?key|auth|credential)\s*[=:]\s*)[^\s"'`,;]+"#,
     )
     .unwrap()
 });
@@ -221,6 +221,8 @@ mod tests {
             "Authorization: Bearer top-secret\n",
             "url=https://alice:password@example.test/x\n",
             "token=plain-secret password: other-secret\n",
+            "KEY=plain-key PRIVATE_KEY=private-key ACCESS_KEY=access-key\n",
+            "monkey=ordinary-diagnostic\n",
             "jwt eyJabcdefghijk.abcde.lmnopqrstuv\n",
             "AWS AKIA1234567890ABCDEF\n",
             "ghp_123456789012345678901234567890123456\n",
@@ -234,6 +236,9 @@ mod tests {
             "password@example",
             "plain-secret",
             "other-secret",
+            "plain-key",
+            "private-key",
+            "access-key",
             "eyJabcdefghijk.abcde.lmnopqrstuv",
             "AKIA1234567890ABCDEF",
             "ghp_123456789012345678901234567890123456",
@@ -244,6 +249,7 @@ mod tests {
         }
         assert!(out.contains(REDACTION_MARKER));
         assert!(out.contains("ordinary diagnostic"));
+        assert!(out.contains("ordinary-diagnostic"));
         assert_eq!(out.lines().count(), text.lines().count());
     }
 

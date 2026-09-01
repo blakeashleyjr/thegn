@@ -334,6 +334,20 @@ pub(crate) fn spawn_ci_detail(
             .as_ref()
             .and_then(|c| c.run_detail(&loc, &run.id).ok())
             .unwrap_or(run);
+        // `log_cache_runs = 0` is the explicit privacy/IO opt-out: refresh
+        // ingestion, CLI, and control already honor it, so the interactive
+        // drill must not bypass it by fetching provider logs on a cache miss.
+        if cfg.log_cache_runs == 0 {
+            let payload = crate::detail::CiDetailPayload {
+                run: detail,
+                log_tail: Vec::new(),
+                log_entries: Vec::new(),
+            };
+            if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
+                let _ = waker.wake();
+            }
+            return;
+        }
         // Read the cache before asking the provider.  A cache miss is fetched
         // in this blocking lane and written back through CiLogEntry, which
         // applies the same byte/line bounds and redaction as refresh ingestion.
