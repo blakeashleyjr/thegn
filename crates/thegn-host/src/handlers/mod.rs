@@ -52,6 +52,7 @@ pub(crate) mod terminal;
 pub(crate) mod theme_builder;
 pub(crate) mod tracker;
 pub(crate) mod usage_alert;
+pub(crate) mod voice;
 pub(crate) mod wizard;
 pub(crate) mod workspace_remove;
 pub(crate) mod worktree_attach;

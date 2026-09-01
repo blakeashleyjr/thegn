@@ -367,6 +367,7 @@ sandbox.default_backend
 sandbox.default_env
 sandbox.devenv
 sandbox.devshell
+sandbox.devcontainer
 sandbox.env_passthrough
 sandbox.failover
 sandbox.file_access
@@ -506,6 +507,14 @@ weather.show_forecast
 weather.stale_after_secs
 weather.timeout_secs
 weather.units
+# Voice is an explicit, structured consent surface. In particular, argv
+# arrays are config-only so a launcher cannot silently redirect microphone
+# audio or transcription through an environment alias.
+voice.capture_command
+voice.command
+voice.enabled
+voice.kind
+voice.max_seconds
 window_margin
 worktree_templates.agent
 worktree_templates.base

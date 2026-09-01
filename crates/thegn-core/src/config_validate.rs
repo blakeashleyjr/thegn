@@ -899,9 +899,13 @@ mod tests {
         // process kind may advance the shared state schema. Added after an
         // unlanded branch's worker migrated the live database out from under
         // main and locked the supervisor's own CLI out of the roster.
+        // 93 → 94 (THE-23): `[sandbox] devcontainer`
+        // (DevcontainerMode) — repo-authored devcontainer overlay mode.
+        // 94 → 95 (THE-59): `[voice] kind` (VoiceKind — generic command
+        // provider).
         assert_eq!(
             defs.len(),
-            94,
+            96,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1088,6 +1092,7 @@ pre_create = [
             ("[[forges]]\nkind = \"forgejo\"\n", true),
             ("[[forges]]\nkind = \"gitea\"\n", true),
             ("[[forges]]\nkind = \"github\"\n", false),
+            ("[media]\nbackend = \"spotify\"\n", true),
             ("[media]\nbackend = \"jellyfin\"\n", true),
             ("[media]\nbackend = \"mpv\"\n", false),
             ("[sandbox]\nbackend = \"wsl\"\n", true),

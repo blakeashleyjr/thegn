@@ -1,5 +1,6 @@
 use super::super::*;
 use super::{map_env, tmpdir};
+use crate::seam::Kind;
 
 #[test]
 fn config_enum_defaults_and_displays() {
@@ -606,6 +607,16 @@ fn media_config_defaults_and_enums() {
     assert_eq!(
         MediaBackendKind::from_str_validated("osascript").unwrap(),
         MediaBackendKind::AppleScript
+    );
+    assert!(MediaBackendKind::Spotify.is_reserved());
+    assert!(MediaBackendKind::from_str_validated("spotify").is_err());
+    let spotify_cfg = MediaConfig {
+        backend: MediaBackendKind::Spotify,
+        ..Default::default()
+    };
+    assert_eq!(
+        spotify_cfg.resolve_opts().backend,
+        thegn_media::BackendKind::Spotify
     );
 
     // Native MPD backend: alias parses, config exposes a default endpoint, and
