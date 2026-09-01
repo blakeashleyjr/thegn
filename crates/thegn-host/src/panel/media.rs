@@ -14,6 +14,7 @@ pub(crate) struct MediaPanelState {
     queue_identity: Option<(String, Option<String>)>,
     art_identity: Option<String>,
     art_requested: Option<String>,
+    art_enabled: bool,
 }
 
 impl MediaPanelState {
@@ -79,12 +80,25 @@ impl MediaPanelState {
         }
     }
 
+    pub(crate) fn set_art_enabled(&mut self, enabled: bool) {
+        self.art_enabled = enabled;
+        if !enabled {
+            self.art = None;
+            self.art_identity = None;
+            self.art_requested = None;
+        }
+    }
+
+    pub(crate) fn art_visible(&self) -> bool {
+        self.art_enabled
+    }
+
     pub(crate) fn wants_art(
         &mut self,
         state: Option<&MediaState>,
         show_art: bool,
     ) -> Option<String> {
-        if !show_art {
+        if !show_art || !self.art_enabled {
             return None;
         }
         let url = state?.art_url.as_ref()?;
@@ -160,9 +174,21 @@ mod tests {
     fn artwork_request_is_single_flight_until_delivery_or_reopen() {
         let mut panel = MediaPanelState::default();
         let current = state();
+        panel.set_art_enabled(true);
         assert!(panel.wants_art(Some(&current), true).is_some());
         assert!(panel.wants_art(Some(&current), true).is_none());
         panel.begin_request(Some(&current));
         assert!(panel.wants_art(Some(&current), true).is_some());
+    }
+
+    #[test]
+    fn disabling_art_clears_cached_art_and_hides_it() {
+        let mut panel = MediaPanelState::default();
+        assert!(!panel.art_visible());
+        panel.set_art_enabled(true);
+        assert!(panel.art_visible());
+        panel.set_art_enabled(false);
+        assert!(!panel.art_visible());
+        assert!(panel.art.is_none());
     }
 }
