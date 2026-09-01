@@ -244,7 +244,7 @@ pub enum Subsys {
     /// connect, test-cache sync, cache fill, prefetch fan-out, watcher
     /// retarget) — the switch cost `Switch` alone under-reports.
     SwitchPrep,
-    /// On-loop: `sync_drawer_persistence` on a tab/worktree switch.
+    /// On-loop: `reconcile_drawer_runtime` on a tab/worktree switch.
     Drawer,
     /// On-loop: `sidebar::build_rows` inside `SidebarState::rebuild` — the
     /// O(worktrees) sidebar-tree reconstruction (the dominant term of `Switch`

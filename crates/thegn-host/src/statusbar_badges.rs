@@ -98,7 +98,13 @@ pub(crate) fn push_network_chip(model: &FrameModel, items: &mut Vec<(BarItemId, 
     let flag = crate::caps::active_glyphs().warn;
     items.push((
         BarItemId::Badge(BarBadge::Network),
-        vec![Seg::chip(Tok::Hue(Hue::Amber), format!(" {flag} offline "))],
+        vec![Seg::chip(
+            Tok::Hue(Hue::Amber),
+            format!(
+                " {flag} {} ",
+                crate::i18n_surface::status(crate::i18n_surface::StatusText::Offline)
+            ),
+        )],
     ));
 }
 

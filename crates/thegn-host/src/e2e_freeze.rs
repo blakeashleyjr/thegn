@@ -24,6 +24,8 @@
 //! - the splash logotype's version line (`logotype.rs`);
 //! - the startup status line's build stamp (`hydrate::startup_status_line`) →
 //!   [`BUILD_TIME`], since `THEGN_BUILD_TIME` changes on every rebuild.
+//! - the UI locale → `en-US` before `i18n::init`, so host locale/config and the
+//!   developer pseudolocale cannot change snapshots.
 //!
 //! It is a test hook only: nothing else reads it, and when the variable is
 //! unset every check is one relaxed atomic load.
@@ -97,6 +99,17 @@ pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
         // Voice is an explicit microphone/process surface; deterministic runs
         // must remain idle and must never launch a user command.
         cfg.voice.enabled = false;
+    }
+}
+
+/// Pin the startup-only UI locale before `i18n::init` resolves it.
+pub fn pin_locale(language: &mut String) {
+    pin_locale_when(active(), language);
+}
+
+fn pin_locale_when(frozen: bool, language: &mut String) {
+    if frozen {
+        "en-US".clone_into(language);
     }
 }
 
@@ -175,5 +188,16 @@ mod tests {
         assert!(cfg.disk.show_sizes, "sizes stay on outside the freeze");
         assert!(cfg.loc.enabled, "LOC stays on outside the freeze");
         assert!(!cfg.voice.enabled, "voice defaults off outside the freeze");
+    }
+
+    #[test]
+    fn locale_pin_is_explicit_and_freeze_only() {
+        let mut frozen = "ja-JP".to_string();
+        pin_locale_when(true, &mut frozen);
+        assert_eq!(frozen, "en-US");
+
+        let mut live = "ja-JP".to_string();
+        pin_locale_when(false, &mut live);
+        assert_eq!(live, "ja-JP");
     }
 }

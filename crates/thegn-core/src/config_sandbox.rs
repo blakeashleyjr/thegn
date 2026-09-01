@@ -62,6 +62,9 @@ impl SandboxOverlay {
         if let Some(v) = self.backend_chain {
             base.backend_chain = v;
         }
+        if let Some(v) = self.devcontainer {
+            base.devcontainer = v;
+        }
         if let Some(v) = self.image {
             base.image = v;
         }
@@ -162,6 +165,7 @@ impl SandboxOverlay {
             && self.default_env.is_none()
             && self.main_env.is_none()
             && self.backend_chain.is_none()
+            && self.devcontainer.is_none()
             && self.image.is_none()
             && self.profile.is_none()
             && self.network.is_none()
