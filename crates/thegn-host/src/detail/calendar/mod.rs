@@ -169,6 +169,7 @@ pub(super) fn open(
         monitor_tab: None,
         pending_ci: None,
         live_ci: None,
+        ci_autofix: None,
     })
 }
 

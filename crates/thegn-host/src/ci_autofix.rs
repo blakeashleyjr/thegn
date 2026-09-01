@@ -16,6 +16,61 @@ use thegn_core::store::{CacheStore, NotificationStore, WorktreeAuxStore};
 /// surfaced as a deduplicated notification; it is never treated as permission
 /// to dispatch an agent.
 pub(crate) fn consider(full: &Config, db: &thegn_core::db::Db, entry: &CiLogEntry) {
+    consider_candidate(full, db, entry, false);
+}
+
+/// Authorize a human-requested handoff from a cached CI-log candidate.  The
+/// cache entry is re-read in the blocking action worker, then all of the same
+/// PR/head/agent gates used by automatic mode are applied before the atomic
+/// dedupe claim and spawn.
+pub(crate) fn authorize(
+    full: &Config,
+    db: &thegn_core::db::Db,
+    candidate: &thegn_core::ci_log::CiLogCandidate,
+) {
+    let Some(entry) = db
+        .get_ci_log(&candidate.worktree, &candidate.run_id, &candidate.job_id)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    if entry.candidate() != *candidate || entry.text.trim().is_empty() {
+        return;
+    }
+    consider_candidate(full, db, &entry, true);
+}
+
+/// Parse the candidate carried by a `pr_queue_needs_human` notification.  The
+/// worktree is a separate notification field, while the source reference keeps
+/// the run/job/head identity opaque to the generic notification store.
+pub(crate) fn candidate_from_notification(
+    n: &thegn_core::notification::Notification,
+) -> Option<thegn_core::ci_log::CiLogCandidate> {
+    let body = n.source_ref.strip_prefix("ci-autofix:")?;
+    let prefix = format!("{}:", n.worktree_path);
+    let fields = body.strip_prefix(&prefix)?;
+    let mut fields = fields.splitn(3, ':');
+    let run_id = fields.next()?.trim();
+    let job_id = fields.next()?.trim();
+    let head_sha = fields.next()?.trim();
+    if run_id.is_empty() || job_id.is_empty() || head_sha.is_empty() {
+        return None;
+    }
+    Some(thegn_core::ci_log::CiLogCandidate {
+        worktree: n.worktree_path.clone(),
+        run_id: run_id.to_string(),
+        job_id: job_id.to_string(),
+        head_sha: head_sha.to_string(),
+    })
+}
+
+fn consider_candidate(
+    full: &Config,
+    db: &thegn_core::db::Db,
+    entry: &CiLogEntry,
+    human_authorized: bool,
+) {
     let root = thegn_core::repo::main_worktree(Path::new(&entry.worktree))
         .unwrap_or_else(|| Path::new(&entry.worktree).to_path_buf());
     let ci = full.repo_ci(&root);
@@ -32,6 +87,14 @@ pub(crate) fn consider(full: &Config, db: &thegn_core::db::Db, entry: &CiLogEntr
         let _ =
             db.put_notification_once("pr_queue_needs_human", &ref_id, &message, &entry.worktree);
     };
+
+    if entry.text.trim().is_empty() {
+        notify(format!(
+            "CI job {} failed, but no redacted log evidence is available for autofix",
+            entry.job_name
+        ));
+        return;
+    }
 
     let Some(item) = db
         .list_pr_queue()
@@ -106,7 +169,7 @@ pub(crate) fn consider(full: &Config, db: &thegn_core::db::Db, entry: &CiLogEntr
         return;
     }
 
-    if ci.autofix.mode == CiAutofixMode::Suggest {
+    if ci.autofix.mode == CiAutofixMode::Suggest && !human_authorized {
         notify(format!(
             "CI job {} failed for PR #{}; CI log evidence is ready for a PR-agent handoff",
             entry.job_name, item.number

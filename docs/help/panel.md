@@ -206,13 +206,17 @@ header counts, so the `✓/✗` numbers always match the rows. Fan-out
 workflows (several sibling runs from one trigger) are represented by a
 failing sibling when there is one. History is behind the drill-in.
 
-Keys: `↵`/`v` drill into the run in place · `o` browser · `r`/`R` rerun (all /
+Keys: `↵`/`v` drill into the run in place · `f` authorize a verified CI-failure
+handoff when redacted evidence is available · `o` browser · `r`/`R` rerun (all /
 failed) · `c` cancel · `g` force-refresh. The drill reads bounded, redacted
 job-log tails from the CI cache first and labels their source, age, truncation,
-and redaction state while a missing or stale entry is fetched off-loop. The
-cache policy is controlled by `[ci].log_cache_runs`, `log_tail_lines`, and
-`log_max_bytes`; `[ci.autofix]` is off by default and can suggest or safely
-hand a verified failure to the existing PR-queue agent.
+and redaction state while a missing or stale entry is fetched off-loop. In
+`suggest` mode, the same `f` action is available from the actionable notification
+when its evidence-ready message appears. The cache policy is controlled by
+`[ci].log_cache_runs`, `log_tail_lines`, and `log_max_bytes`; `[ci.autofix]` is
+off by default and can suggest or safely hand a verified failure to the
+existing PR-queue agent. The action rechecks PR context, head, agent policy,
+and attempt budget off-loop, and fails closed if any check no longer holds.
 
 ### merge — the local merge queue
 
