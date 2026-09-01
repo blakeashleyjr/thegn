@@ -1921,7 +1921,10 @@ fn collect_sidebar_status(
                     let loc = GitLoc::for_worktree(wt);
                     // One batched round-trip for a bridged loc (status + ahead/
                     // behind + branch), gix/CLI reads for a local one.
-                    let reads = crate::git_handle::get().glyph_reads(&loc);
+                    let reads = crate::git_handle::get().glyph_reads_with_submodules(
+                        &loc,
+                        app_cfg.git.submodules != thegn_core::config::SubmoduleMode::Off,
+                    );
                     let dirty = reads.dirty.map_err(|_| ());
                     let ahead_behind = reads.ahead_behind.map_err(|_| ());
                     let branch = reads.branch.map(Some).map_err(|_| ());

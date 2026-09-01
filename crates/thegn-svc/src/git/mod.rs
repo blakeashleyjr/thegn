@@ -257,7 +257,14 @@ pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     /// composes this backend's reads; the native engine overrides it to ride
     /// one `exec.batch` over a bridged connection.
     fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
-        local_glyph_reads(self, loc)
+        self.glyph_reads_with_submodules(loc, true)
+    }
+    /// Sidebar reads with an explicit submodule-state policy.  The ordinary
+    /// `glyph_reads` API keeps its historical behavior for callers that do not
+    /// have config context; host hydration uses this switch so `[git]
+    /// submodules = "off"` really avoids the recursive status read.
+    fn glyph_reads_with_submodules(&self, loc: &GitLoc, include_submodules: bool) -> GlyphReads {
+        local_glyph_reads(self, loc, include_submodules)
     }
     /// Recursive gitlink state plus targeted dirty/untracked evidence. The
     /// default is the bounded CLI provider; native backends may override it
@@ -934,7 +941,7 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
 /// when the loc has no bridge (the caller composes local reads). A transport
 /// failure degrades every field to `Err` so the caller reuses its prior cached
 /// row (see the host's `merge_glyph_scan`).
-fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
+fn bridged_glyph_reads(loc: &GitLoc, include_submodules: bool) -> Option<GlyphReads> {
     // Resolved before the batch is built (cached per loc, so this is a round trip
     // only on a cache miss). `None` = no base resolvable: the diff is skipped
     // entirely rather than run against a ref that doesn't exist.
@@ -948,13 +955,20 @@ fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
             // Uncommitted working-tree stat (staged + unstaged) vs HEAD.
             vec!["diff", "--numstat", "HEAD"],
         ];
-        // Total branch change vs the repo's LOCAL default branch; a non-zero exit
-        // is "no base" — data, not an error.
-        if let Some(range) = &branch_range {
+        // Total branch change vs the repo's LOCAL default branch; a non-zero
+        // exit is "no base" — data, not an error. Keep its index explicit so
+        // the optional submodule read can be omitted without shifting it.
+        let branch_diff_idx = if let Some(range) = &branch_range {
+            let idx = specs.len();
             specs.push(vec!["diff", "--numstat", range.as_str()]);
+            Some(idx)
+        } else {
+            None
+        };
+        let submodule_status_idx = include_submodules.then_some(specs.len());
+        if include_submodules {
+            specs.push(vec!["submodule", "status", "--recursive"]);
         }
-        let submodule_status_idx = specs.len();
-        specs.push(vec!["submodule", "status", "--recursive"]);
         let want = specs.len();
         let cmds: Vec<Vec<String>> = specs
             .iter()
@@ -989,20 +1003,20 @@ fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
                     Err(anyhow::anyhow!("git diff failed: {}", r[3].stderr.trim()))
                 };
                 // Absent when no base resolved (the 5th command wasn't sent).
-                let branch_diff = if branch_range.is_some() {
-                    Ok(r.get(submodule_status_idx.saturating_sub(1))
+                let branch_diff = if let Some(idx) = branch_diff_idx {
+                    Ok(r.get(idx)
                         .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))))
                 } else {
                     Ok(None)
                 };
-                let submodule_dirty = r
-                    .get(submodule_status_idx)
+                let submodule_dirty = submodule_status_idx
+                    .and_then(|idx| r.get(idx))
                     .filter(|res| res.exit == 0)
                     .map(|res| {
                         submodule::dirty_from_outputs(&res.stdout, &r[0].stdout)
                             .map_err(|e| anyhow::anyhow!(e))
                     })
-                    .unwrap_or_else(|| Err(anyhow::anyhow!("git submodule status failed")));
+                    .unwrap_or_else(|| Ok(false));
                 return Some(GlyphReads {
                     dirty,
                     ahead_behind,
@@ -1031,7 +1045,11 @@ fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
 /// The local half of [`GitBackend::glyph_reads`]: this backend's own
 /// is_dirty / ahead_behind / current_branch plus the CLI `--numstat` diffs
 /// (cheap, and run off the loop in the host's `thread::scope` glyph scan).
-fn local_glyph_reads(git: &(impl GitBackend + ?Sized), loc: &GitLoc) -> GlyphReads {
+fn local_glyph_reads(
+    git: &(impl GitBackend + ?Sized),
+    loc: &GitLoc,
+    include_submodules: bool,
+) -> GlyphReads {
     let base = glyph_base(loc);
     GlyphReads {
         dirty: git.is_dirty(loc),
@@ -1045,9 +1063,12 @@ fn local_glyph_reads(git: &(impl GitBackend + ?Sized), loc: &GitLoc) -> GlyphRea
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
-        submodule_dirty: git
-            .submodule_states(loc)
-            .map(|states| submodule::dirty_from_states(&states)),
+        submodule_dirty: if include_submodules {
+            git.submodule_states(loc)
+                .map(|states| submodule::dirty_from_states(&states))
+        } else {
+            Ok(false)
+        },
     }
 }
 
@@ -1069,7 +1090,7 @@ fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(u32, u32)> {
 
 /// The gix backend's glyph reads: [`local_glyph_reads`]'s shape, but with the
 /// two `--numstat` diffs served natively instead of by a subprocess each.
-fn gix_glyph_reads(git: &GixGit, loc: &GitLoc) -> GlyphReads {
+fn gix_glyph_reads(git: &GixGit, loc: &GitLoc, include_submodules: bool) -> GlyphReads {
     let base = glyph_base(loc);
     GlyphReads {
         dirty: git.is_dirty(loc),
@@ -1081,9 +1102,12 @@ fn gix_glyph_reads(git: &GixGit, loc: &GitLoc) -> GlyphReads {
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
-        submodule_dirty: git
-            .submodule_states(loc)
-            .map(|states| submodule::dirty_from_states(&states)),
+        submodule_dirty: if include_submodules {
+            git.submodule_states(loc)
+                .map(|states| submodule::dirty_from_states(&states))
+        } else {
+            Ok(false)
+        },
     }
 }
 
@@ -1350,8 +1374,9 @@ impl GixGit {
 
 impl GixGit {
     /// Native reads where gix has them, the bridge batch on a bridged loc.
-    fn glyph_reads_impl(&self, loc: &GitLoc) -> GlyphReads {
-        bridged_glyph_reads(loc).unwrap_or_else(|| gix_glyph_reads(self, loc))
+    fn glyph_reads_impl(&self, loc: &GitLoc, include_submodules: bool) -> GlyphReads {
+        bridged_glyph_reads(loc, include_submodules)
+            .unwrap_or_else(|| gix_glyph_reads(self, loc, include_submodules))
     }
 }
 
@@ -1384,7 +1409,10 @@ impl thegn_core::seam::Probe for CliGit {
 
 impl GitBackend for GixGit {
     fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
-        self.glyph_reads_impl(loc)
+        self.glyph_reads_impl(loc, true)
+    }
+    fn glyph_reads_with_submodules(&self, loc: &GitLoc, include_submodules: bool) -> GlyphReads {
+        self.glyph_reads_impl(loc, include_submodules)
     }
     fn is_dirty(&self, loc: &GitLoc) -> Result<bool> {
         if loc.is_remote() {

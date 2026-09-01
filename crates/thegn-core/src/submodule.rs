@@ -48,7 +48,13 @@ pub fn validate_submodule_path(path: &str) -> Result<(), String> {
     if path.contains('\0') {
         return Err("submodule path contains NUL".into());
     }
-    if path.starts_with('/') || path.starts_with('\\') {
+    // Git repositories can be shared across platforms.  Treat Windows drive
+    // prefixes and backslash separators as absolute/traversal-capable too;
+    // accepting `C:\\...` or `vendor\\..\\outside` on Unix would make the
+    // normalized boundary mean something different on Windows.
+    let has_drive_prefix =
+        path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':';
+    if path.starts_with('/') || path.starts_with('\\') || path.contains('\\') || has_drive_prefix {
         return Err("submodule path must be relative".into());
     }
     if path
@@ -551,6 +557,8 @@ mod tests {
     fn rejects_malformed_or_escaping_gitmodules_records() {
         for input in [
             "[submodule \"x\"]\npath = /tmp/x\nurl = x",
+            "[submodule \"x\"]\npath = C:\\\\tmp\\\\x\nurl = x",
+            "[submodule \"x\"]\npath = vendor\\\\..\\\\outside\nurl = x",
             "[submodule \"x\"]\npath = ../x\nurl = x",
             "[submodule \"x\"]\npath = lib\npath = other\nurl = x",
             "[submodule \"x\"]\npath = lib",

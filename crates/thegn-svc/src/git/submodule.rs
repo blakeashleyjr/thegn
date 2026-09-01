@@ -17,11 +17,29 @@ use thegn_core::submodule::{
 use super::{FileStatus, parse_status_porcelain, run, run_w};
 
 /// Parse the mode-160000 entries from git diff --raw -z output.
+///
+/// With `-z`, Git terminates the header and pathname with NULs rather than
+/// using the tab separator used by the human-readable form: `header\0path\0`.
+/// Keep accepting the tab form for small fixture callers, but parse the real
+/// wire format as pairs so live gitlink diffs cannot disappear.
 pub(crate) fn parse_raw_diffs(output: &str) -> Vec<SubmoduleDiff> {
-    output
-        .split('\0')
-        .filter_map(|record| {
-            let (header, path) = record.split_once('\t')?;
+    let mut records = output.split('\0');
+    let mut diffs = Vec::new();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let (header, path) = if let Some((header, path)) = record.split_once('\t') {
+            (header, path)
+        } else {
+            let Some(path) = records.next() else { break };
+            (record, path)
+        };
+        let is_nul_record = record.split_once('\t').is_none();
+        let status = header.split_whitespace().nth(4).unwrap_or_default();
+        let has_second_rename_path =
+            is_nul_record && matches!(status.as_bytes().first(), Some(b'R' | b'C'));
+        let Some(diff) = (|| {
             let mut fields = header.split_whitespace();
             let old_mode = fields.next()?.trim_start_matches(':');
             let new_mode = fields.next()?;
@@ -48,8 +66,18 @@ pub(crate) fn parse_raw_diffs(output: &str) -> Vec<SubmoduleDiff> {
                 new_sha: new_sha.to_string(),
                 kind,
             })
-        })
-        .collect()
+        })();
+        // A caller that supplies the non-`--no-renames` raw format has one
+        // extra pathname for R/C records. The production command below pins
+        // rename detection off, but consume that field here to keep parsing
+        // subsequent records aligned in tests/alternate providers.
+        if has_second_rename_path {
+            let _ = records.next();
+        }
+        let Some(diff) = diff else { continue };
+        diffs.push(diff);
+    }
+    diffs
 }
 
 fn has_gitmodules(loc: &GitLoc) -> bool {
@@ -164,6 +192,7 @@ pub(crate) fn diffs(loc: &GitLoc, base: &str) -> Result<Vec<SubmoduleDiff>> {
             "diff",
             "--raw",
             "-z",
+            "--no-renames",
             "--abbrev=64",
             base,
         ],
@@ -298,6 +327,17 @@ mod tests {
         let diffs = parse_raw_diffs(out);
         assert_eq!(diffs.len(), 2);
         assert_eq!(diffs[0].kind, SubmoduleDiffKind::Added);
+        assert_eq!(diffs[1].kind, SubmoduleDiffKind::Deleted);
+    }
+
+    #[test]
+    fn raw_parser_accepts_git_real_nul_header_path_pairs() {
+        let out = ":100644 160000 0000000 bbbbbbb A\0vendor/lib\0:160000 0000000 aaaaaaa 0000000 D\0vendor/old\0";
+        let diffs = parse_raw_diffs(out);
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(diffs[0].path, "vendor/lib");
+        assert_eq!(diffs[0].kind, SubmoduleDiffKind::Added);
+        assert_eq!(diffs[1].path, "vendor/old");
         assert_eq!(diffs[1].kind, SubmoduleDiffKind::Deleted);
     }
 
