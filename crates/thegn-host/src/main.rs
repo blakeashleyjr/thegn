@@ -134,6 +134,7 @@ mod mq_assets;
 mod naming;
 mod nav;
 mod nixcache;
+mod notification_delivery;
 mod notify;
 mod onboarding;
 mod owl;
