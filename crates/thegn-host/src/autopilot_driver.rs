@@ -32,7 +32,6 @@ pub(crate) fn pickup(
     if !policy.enabled {
         return;
     }
-    let Ok(db) = Db::open() else { return };
     for issue in issues {
         if !matches_issue(
             issue,
@@ -42,40 +41,53 @@ pub(crate) fn pickup(
         ) {
             continue;
         }
-        let key = AutopilotIssueKey::new(provider, account, issue.id.clone());
-        let now = thegn_core::util::now_ms();
-        let claim = match db.claim_autopilot(
-            &key,
-            &repo_root.to_string_lossy(),
-            policy.max_concurrent,
-            policy.max_attempts,
-            now,
-        ) {
-            Ok(thegn_core::store::ClaimOutcome::Claimed(run)) => run,
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(target: "thegn::autopilot", error = %e, "autopilot claim failed");
-                continue;
-            }
+        // Reserve a background slot before claiming. `spawn_bg` deliberately
+        // drops work when the lane is full; doing that after this claim would
+        // strand the run in `claimed` forever because later refreshes see the
+        // unique issue claim and never retry it.
+        let Some(permit) = crate::sched::bg_permit() else {
+            continue;
         };
+        let key = AutopilotIssueKey::new(provider, account, issue.id.clone());
         let cfg = cfg.clone();
         let policy = policy.clone();
         let repo_root = repo_root.to_path_buf();
         let cwd = cwd.to_path_buf();
         let account = account.to_owned();
         let issue = issue.clone();
-        let run_id = claim.id;
-        crate::sched::spawn_bg(move || {
-            let Ok(db) = Db::open() else {
-                tracing::warn!(
-                    target: "thegn::autopilot",
-                    run_id,
-                    "autopilot worker could not open the durable database"
-                );
-                return;
+        let repo_root_s = repo_root.to_string_lossy().into_owned();
+        crate::sched::spawn_bg_reserved(permit, move || {
+            let db = match Db::open() {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "thegn::autopilot",
+                        error = %e,
+                        "autopilot worker could not open the durable database"
+                    );
+                    return;
+                }
+            };
+            let claim = match db.claim_autopilot(
+                &key,
+                &repo_root_s,
+                policy.max_concurrent,
+                policy.max_attempts,
+                thegn_core::util::now_ms(),
+            ) {
+                Ok(thegn_core::store::ClaimOutcome::Claimed(run)) => run,
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "thegn::autopilot",
+                        error = %e,
+                        "autopilot claim failed"
+                    );
+                    return;
+                }
             };
             drive_claim(
-                &db, &cfg, &policy, &repo_root, &cwd, &account, &issue, run_id,
+                &db, &cfg, &policy, &repo_root, &cwd, &account, &issue, claim.id,
             );
         });
     }
@@ -287,6 +299,24 @@ fn drive_claim(
             return;
         }
     };
+    if let Err(e) = thegn_core::sandbox::ensure(&sandbox) {
+        mark_worker_failed(
+            db,
+            run_id,
+            dispatch_id,
+            &format!("autopilot sandbox setup failed: {e}"),
+        );
+        return;
+    }
+    if let Err(e) = thegn_core::sandbox_preflight::preflight_exec(&sandbox) {
+        mark_worker_failed(
+            db,
+            run_id,
+            dispatch_id,
+            &format!("autopilot sandbox exec probe failed: {e}"),
+        );
+        return;
+    }
     let ran = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
         kind: TaskKind::Issue,
         worktree: &wt,
@@ -560,6 +590,18 @@ fn sealed_autopilot_sandbox(
         thegn_core::config::SandboxProfile::Sealed,
     )
     .ok_or_else(|| "no usable sandbox backend for autopilot worker".to_string())?;
+    // These backends do not provide the filesystem boundary an unattended
+    // issue worker needs: systemd protects the host home read-only (which
+    // still permits reading SSH/config credentials), while the native
+    // Windows entries currently launch a plain shell and only add process
+    // lifetime scoping. Do not let an explicit backend chain turn Sealed into
+    // a misleading label; fail closed and let the caller journal the run.
+    if !autopilot_backend_is_isolated(spec.backend) {
+        return Err(format!(
+            "sandbox backend '{}' cannot provide sealed filesystem isolation for autopilot",
+            spec.backend.label()
+        ));
+    }
     // The resolver normally forwards configured env values. Keep only the
     // worktree mounts it generated and explicitly suppress image-provided
     // credential-shaped names as well.
@@ -580,6 +622,15 @@ fn sealed_autopilot_sandbox(
     );
     spec.network = thegn_core::config::Network::None;
     Ok(spec)
+}
+
+fn autopilot_backend_is_isolated(backend: thegn_core::sandbox::Backend) -> bool {
+    !matches!(
+        backend,
+        thegn_core::sandbox::Backend::Systemd
+            | thegn_core::sandbox::Backend::WinAppContainer
+            | thegn_core::sandbox::Backend::WinJobObject
+    )
 }
 
 fn mark_needs_human(
@@ -705,12 +756,22 @@ pub(crate) fn on_pr_merged(cfg: &Config, repo_root: &Path, number: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::worker_failure;
+    use super::{autopilot_backend_is_isolated, worker_failure};
+    use thegn_core::sandbox::Backend;
 
     #[test]
     fn worker_validation_reason_is_bounded_and_actionable() {
         let text = worker_failure("HEAD", "feat", false, 0);
         assert!(text.contains("expected"));
         assert!(text.contains("commits_ahead=0"));
+    }
+
+    #[test]
+    fn autopilot_rejects_backends_without_a_filesystem_boundary() {
+        assert!(autopilot_backend_is_isolated(Backend::Bwrap));
+        assert!(autopilot_backend_is_isolated(Backend::Podman));
+        assert!(!autopilot_backend_is_isolated(Backend::Systemd));
+        assert!(!autopilot_backend_is_isolated(Backend::WinAppContainer));
+        assert!(!autopilot_backend_is_isolated(Backend::WinJobObject));
     }
 }
