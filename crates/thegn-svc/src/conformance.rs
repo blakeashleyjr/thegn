@@ -63,10 +63,13 @@ pub fn seams_of(reports: &[ProbeReport]) -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issue::{IssueBackend, IssueCaps, IssueError};
     use crate::seam::registry::{binary_availability, probes};
+    use futures_util::future::BoxFuture;
     use thegn_core::config::Config;
     use thegn_core::config_calendar::{CalendarAccount, CalendarProviderKind};
     use thegn_core::config_issues::{IssueAccount, IssueProviderKind};
+    use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
     use thegn_core::seam::Kind;
 
     #[test]
@@ -130,6 +133,34 @@ mod tests {
             4,
             "one issues report per account: {reports:?}"
         );
+        for (kind, name, caps) in [
+            (
+                "linear",
+                "lin",
+                serde_json::json!({ "comments": false, "labels": false }),
+            ),
+            (
+                "github",
+                "gh",
+                serde_json::json!({ "comments": false, "labels": false }),
+            ),
+            (
+                "jira",
+                "jira",
+                serde_json::json!({ "comments": false, "labels": false }),
+            ),
+            (
+                "kaneo",
+                "kaneo",
+                serde_json::json!({ "comments": true, "labels": true }),
+            ),
+        ] {
+            let report = reports
+                .iter()
+                .find(|r| r.id == format!("{kind}:{name}"))
+                .unwrap();
+            assert_eq!(report.caps, caps, "{kind}: {report:?}");
+        }
         assert!(
             reports.iter().filter(|r| r.seam == "calendar").count() >= 4,
             "one calendar report per account: {reports:?}"
@@ -230,5 +261,212 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(key(&a), key(&b));
+    }
+
+    fn expected_issue_caps(kind: IssueProviderKind) -> IssueCaps {
+        match kind {
+            IssueProviderKind::Kaneo => IssueCaps {
+                comments: true,
+                labels: true,
+            },
+            IssueProviderKind::None
+            | IssueProviderKind::Linear
+            | IssueProviderKind::Github
+            | IssueProviderKind::Jira => IssueCaps::default(),
+        }
+    }
+
+    #[test]
+    fn issue_capability_ledger_covers_every_provider_offline() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for kind in IssueProviderKind::ALL {
+            let backend = crate::issue::backend_from_account(
+                &IssueAccount {
+                    provider: *kind,
+                    // Keep factory construction hermetic: an empty Kaneo
+                    // token would trigger its legacy stored-token fallback,
+                    // which reads the live state DB before the offline cap
+                    // assertions even begin.
+                    token: "offline-conformance-token".into(),
+                    ..Default::default()
+                },
+                None,
+            );
+            if *kind == IssueProviderKind::None {
+                assert!(backend.is_none());
+                continue;
+            }
+            let backend = backend.expect("implemented issue kind has a backend");
+            assert_eq!(backend.caps(), expected_issue_caps(*kind), "{kind:?}");
+
+            // The false-cap path is intentionally exercised only on providers
+            // whose optional methods are inherited defaults. Kaneo's positive
+            // methods perform REST I/O and belong to its provider-local tests.
+            if !backend.caps().comments {
+                assert!(matches!(
+                    rt.block_on(backend.add_comment("issue:1", "body")),
+                    Err(IssueError::Unsupported("add_comment"))
+                ));
+            }
+            if !backend.caps().labels {
+                assert!(matches!(
+                    rt.block_on(backend.attach_label("issue:1", "label")),
+                    Err(IssueError::Unsupported("attach_label"))
+                ));
+                assert!(matches!(
+                    rt.block_on(backend.detach_label("issue:1", "label")),
+                    Err(IssueError::Unsupported("detach_label"))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn issue_error_classification_covers_seam_contract() {
+        use thegn_core::seam::{ErrorClass, SeamError};
+
+        assert_eq!(
+            IssueError::unsupported("comment").class(),
+            ErrorClass::Unsupported
+        );
+        assert_eq!(IssueError::NotConfigured.class(), ErrorClass::NotConfigured);
+        assert_eq!(
+            IssueError::Auth("bad token".into()).class(),
+            ErrorClass::Auth
+        );
+        assert_eq!(
+            IssueError::Api("bad response".into()).class(),
+            ErrorClass::Other
+        );
+        assert_eq!(
+            IssueError::Parse("bad json".into()).class(),
+            ErrorClass::Other
+        );
+        assert_eq!(
+            IssueError::Subprocess("No such file or directory".into()).class(),
+            ErrorClass::NotInstalled
+        );
+        assert_eq!(
+            IssueError::Subprocess("vendor returned exit 1".into()).class(),
+            ErrorClass::Other
+        );
+    }
+
+    /// A small offline backend makes the ledger's caps ⇔ optional-method rule
+    /// executable. Deliberate over- and underclaims must both be rejected.
+    struct LedgerBackend {
+        declared: IssueCaps,
+        implemented: IssueCaps,
+    }
+
+    impl IssueBackend for LedgerBackend {
+        fn provider_id(&self) -> &'static str {
+            "ledger"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            self.declared
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Err(IssueError::NotConfigured) })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::NotConfigured) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::NotConfigured) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::NotConfigured) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Err(IssueError::NotConfigured) })
+        }
+
+        fn add_comment<'a>(
+            &'a self,
+            _id: &'a str,
+            _body: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            if self.implemented.comments {
+                Box::pin(async { Ok(()) })
+            } else {
+                Box::pin(async { Err(IssueError::unsupported("add_comment")) })
+            }
+        }
+
+        fn attach_label<'a>(
+            &'a self,
+            _id: &'a str,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            if self.implemented.labels {
+                Box::pin(async { Ok(()) })
+            } else {
+                Box::pin(async { Err(IssueError::unsupported("attach_label")) })
+            }
+        }
+
+        fn detach_label<'a>(
+            &'a self,
+            _id: &'a str,
+            _label: &'a str,
+        ) -> BoxFuture<'a, Result<(), IssueError>> {
+            self.attach_label(_id, _label)
+        }
+    }
+
+    fn assert_optional_contract(backend: &LedgerBackend, rt: &tokio::runtime::Runtime) {
+        let comments = rt.block_on(backend.add_comment("issue:1", "body"));
+        assert_eq!(comments.is_ok(), backend.caps().comments);
+        let attach = rt.block_on(backend.attach_label("issue:1", "label"));
+        assert_eq!(attach.is_ok(), backend.caps().labels);
+        let detach = rt.block_on(backend.detach_label("issue:1", "label"));
+        assert_eq!(detach.is_ok(), backend.caps().labels);
+    }
+
+    #[test]
+    fn issue_capability_ledger_rejects_over_and_underclaims() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let overclaim = LedgerBackend {
+            declared: IssueCaps {
+                comments: true,
+                labels: false,
+            },
+            implemented: IssueCaps::default(),
+        };
+        assert!(std::panic::catch_unwind(|| assert_optional_contract(&overclaim, &rt)).is_err());
+
+        let underclaim = LedgerBackend {
+            declared: IssueCaps::default(),
+            implemented: IssueCaps {
+                comments: true,
+                labels: false,
+            },
+        };
+        assert!(std::panic::catch_unwind(|| assert_optional_contract(&underclaim, &rt)).is_err());
     }
 }

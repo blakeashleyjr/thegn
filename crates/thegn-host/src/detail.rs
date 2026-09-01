@@ -1920,6 +1920,9 @@ fn widget_detail_inner(
         // existing path rather than earning a popup of its own — the reading it
         // would show in full is already a block in this one.
         "date" | "clock" | "weather" => calendar::open(ctx, near, model),
+        // The opt-in queue widget is only a door to the existing unified
+        // surface; it must not grow a second queue-row implementation here.
+        "mq" => unified_detail(model, ctx.screen),
         "pr" => {
             let pr = model.panel.pr.as_ref()?;
             Some(keyval(
@@ -1973,7 +1976,7 @@ fn badge_detail(
 ) -> Option<DetailOverlay> {
     match b {
         // The inbox chip (⚑ / N unread), the needs-you chip (✋), and the
-        // merge-queue chip all open the single unified surface: Needs you ·
+        // merge-queue indicator all open the single unified surface: Needs you ·
         // Alerts · Merge queue · Notifications · Logs.
         BarBadge::Notifications
         | BarBadge::Attention
@@ -2224,7 +2227,7 @@ fn badge_detail(
 }
 
 /// The one unified notification surface, opened by the inbox `⚑`/unread chip,
-/// the needs-you `✋` chip, and the merge-queue chip. It folds what used to be
+/// the needs-you `✋` chip, and the merge-queue indicator. It folds what used to be
 /// three separate popups plus a logs section into a single grouped list:
 ///
 /// - **Needs you** — the live, per-worktree attention rollup (what needs a

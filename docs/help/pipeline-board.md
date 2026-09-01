@@ -34,14 +34,14 @@ up on the roster but aren't in your config follow, by name; dispatches made
 outside a pipeline (the `D` key, a hand-run agent) group last under
 `unstaged`.
 
-The Lead that drives a chart is an agent running the `/pipeline` skill, and a
-fleet over a batch of issues is `/supervise`: both are bundled in the binary
-and seeded into every worktree's `.claude/skills/` (`/pipeline` once a chart is
-configured, `/supervise` always, `/mq` when the merge queue is on), so an agent
-in any project thegn opens finds them without installing anything. Stage
-workers are launched with `thegn session open --agent <entry> --stage <stage>`,
-which applies the stage's `model` / `env` / `permissions` overrides (see
-[[configuration]]).
+The Lead that drives a chart is an agent running the `pipeline` skill, and a
+fleet over a batch of issues is `supervise`. They and `mq` are entries in the
+embedded [[skills]] registry, compiled into the binary and seeded per worktree
+into each configured harness's native project directory. Their gates are
+unchanged: `pipeline` is eligible once a chart has a stage, `supervise` is
+always eligible, and `mq` requires the merge queue. Stage workers are launched
+with `thegn session open --agent <entry> --stage <stage>`, which applies the
+stage's `model` / `env` / `permissions` overrides (see [[configuration]]).
 
 Below the rail, each row is one dispatch: a status mark, the worktree it works
 in, and how long it has been going.
@@ -110,3 +110,13 @@ agent through `thegn dispatch put` — still reaches an open board immediately.
 
 See [[configuration]] for the `[[pipeline.stages]]` keys, and
 [[workflows]] for what the stages are for.
+
+## Worktree setup in a pipeline
+
+`[[pipeline.stages]]` is a structure-only roster: it validates and describes
+the chart, but it does not create worktrees or execute lifecycle commands.
+External supervisors should create worktrees with `thegn wt new` or the
+existing `worktrees.create` control operation. Those doors use the shared
+`pre_create`/`post_create` lifecycle, and the same `pre_destroy`/
+`post_destroy` hooks apply when the worktree is later removed. There is no
+pipeline-specific hook configuration.

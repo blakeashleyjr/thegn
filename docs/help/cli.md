@@ -26,7 +26,7 @@ worktree):
 | Automation    | `autopilot status [--repo PATH] [--json]`                                                                      |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
 | Session       | `notify` · `logs` · `share` · `forward`                                                                        |
-| Control plane | `serve` · `session` · `attach` · `pair` · `api`                                                                |
+| Control plane | `serve` · `session` · `events` · `attach` · `pair` · `api`                                                     |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                               |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
@@ -39,6 +39,30 @@ capability (scope, surfaces), `api schema` the control wire contract, and
 `api call <cap> --params '{…}'` performs any routed capability over the
 control socket — a newly routed verb is callable with no CLI change.
 `thegn plugin list|check` inspects the configured [[plugins]].
+
+### Tailing the event feed
+
+`thegn events tail` is a read-only thin client for the daemon's live control
+feed. It waits on the stream; it does not poll, open a session, or enable
+`--allow-session-input`:
+
+```sh
+thegn events tail
+thegn events tail --kinds activity,exit --session "$SESSION"
+thegn events tail --signal-lag --json | jq -c 'select(.kind == "activity")'
+```
+
+`--kinds` accepts the same comma-separated frame kinds as the control API and
+`--session` narrows session-keyed frames. `--signal-lag` opts into an explicit
+`lagged` frame when the bounded feed has dropped events. JSON mode emits one
+canonical frame per line, with the daemon `hello` frame first. The feed has no
+replay: after loss or reconnect, use `sessions.list` and `worktrees.list` to
+resynchronize state.
+
+The local Unix socket uses the current same-user policy. A TCP `serve` endpoint
+uses its existing bearer token and read scope; filters only narrow an already
+authorized subscription. A missing daemon returns the usual recoverable
+no-daemon error. There is no new config key.
 
 ## Which worktree am I acting on?
 
@@ -68,9 +92,12 @@ thegn wt rm fix-parser --force                    # teardown + git + DB
 
 `wt new` reuses the TUI wizard's pipeline — branch-name templates, base
 resolution, the git-mutation lock, DB registration — but never provisions
-a sandbox; the compositor prepares that lazily on first open. `wt rm`
-tears down the sandbox, runs `git worktree remove`, and cleans every DB
-row, so a removed worktree is never resurrected at the next launch.
+a sandbox; the compositor prepares that lazily on first open. It runs
+`pre_create` before git and waits for post-create hooks before printing the
+new path. `wt rm` runs `pre_destroy` before teardown, then `git worktree
+remove`, `post_destroy`, and DB cleanup. A failed blocking destroy hook leaves
+the worktree in place and names `--force`; that existing flag is also the
+explicit confirmation and skips the veto. Repo hooks are still warn-only.
 
 To put an agent in it without a pane on screen:
 
@@ -85,6 +112,39 @@ thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
 layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
 over the agent — see [[configuration]]. The daemon composes the same
 sandbox, credentials, model flag and env overlay an interactive pane gets.
+
+`wt new --from-issue` and batched project creation use the same lifecycle
+seam. The pipeline board itself is structure-only: an external supervisor
+that creates a worktree should use `wt new` or the existing
+`worktrees.create` control operation, both of which run the shared hooks.
+
+To move a persisted session presentation between profiles, use the
+admin-only, two-store operation:
+
+```sh
+thegn --profile <source> session move <worktree> --to-profile <target>
+```
+
+`--profile` (or `THEGN_PROFILE`) selects the source; `<target>` must already
+exist. The exact stored worktree path is selected. The move carries its
+worktree registration, all matching current groups and tabs, sidebar
+collapse/pin state, and dispatch ledger (including notes and artifact/chunk
+paths). Pane commands, scrollback, reports, and notes are opaque text and are
+carried unchanged, but never printed by the audit. Named global layouts,
+global caches, transports, git files/objects, branches, and worktree disk
+locations are not moved. Neither profile configuration nor credentials,
+tokens, identities, accounts, pairings, or secrets are read or copied.
+
+The target transaction commits first and is read back using a sanitized
+fingerprint. Only after confirmation are the selected source rows deleted;
+dispatch IDs are remapped and source daemon/pane IDs are cleared. A retry
+adopts an identical target import and completes pending source cleanup. A
+target-confirmed but source-pending result is retryable (exit 2). The command
+is cold-safe. Live source daemon sessions refuse the operation unless
+`--kill` is explicit; `--kill` terminates and re-lists them before import.
+`--dry-run` prints the complete redacted plan and never kills or writes, and
+`--json` emits the audit object for scripts. A target daemon notification is
+best effort and a warning cannot undo a confirmed move.
 
 ## Landing work
 
@@ -161,7 +221,7 @@ untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
 dispatch door (`session open --stage --issue`) that creates these rows.
 
 - `thegn doctor` — resolved terminal capabilities, release channel,
-  environment. See [[terminal-compatibility]].
+  environment. See [[terminal-compatibility]] and [[debugging]].
 - `thegn keys list` — every effective binding, from all three sources.
   The same set [[keybindings]] shows.
 - `thegn keys validate` — non-zero on a chord conflict, so it works in a

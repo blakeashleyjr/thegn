@@ -51,6 +51,17 @@ impl NotificationStore for Db {
         Ok(n > 0)
     }
 
+    fn put_notification_once_id(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<Option<i64>> {
+        let inserted = self.put_notification_once(kind, issue_id, message, worktree_path)?;
+        Ok(inserted.then(|| self.conn().last_insert_rowid()))
+    }
+
     fn has_notification(&self, kind: &str, issue_id: &str) -> Result<bool> {
         let n: i64 = self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM notifications WHERE kind=?1 AND issue_id=?2)",
@@ -494,12 +505,48 @@ impl NotificationStore for Db {
     }
 }
 
+impl Db {
+    /// Once-keyed notification for one create/revision event. The revision is
+    /// included in the bounded message, so the same revision is idempotent and
+    /// a later comment re-arms the audit row.
+    pub fn put_review_task_queued_notification(
+        &self,
+        event: &crate::pr_review_tasks::ReviewTaskEvent,
+        revised: bool,
+    ) -> Result<bool> {
+        let message = crate::notification::review_task_queued_message(event, revised);
+        self.put_notification_once(
+            crate::notification::NotificationKind::PrReviewTaskQueued.as_str(),
+            &event.source_key,
+            &message,
+            &event.worktree_path,
+        )
+    }
+
+    /// Once-keyed resolution audit. Provider success can be observed more than
+    /// once during refresh; only one durable inbox row is retained per source
+    /// and resolved head/message.
+    pub fn put_review_thread_resolved_notification(
+        &self,
+        transition: &crate::pr_review_tasks::ReviewTaskResolution,
+    ) -> Result<bool> {
+        let message = crate::notification::review_thread_resolved_message(transition);
+        self.put_notification_once(
+            crate::notification::NotificationKind::PrReviewThreadResolved.as_str(),
+            &transition.source_key,
+            &message,
+            &transition.worktree_path,
+        )
+    }
+}
+
 /// The explicit column list every `AgentDispatch` read selects, paired with
 /// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
 /// apart when the roster gains a column (v56 added four at once; v59 added
-/// `note`; v60 added `chunk_path`; v61 added `report`).
+/// `note`; v60 added `chunk_path`; v61 added `report`; v63 added the exit pair).
 const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
-     stage, parent_id, session_id, artifact_path, note, chunk_path, report";
+     stage, parent_id, session_id, artifact_path, note, chunk_path, report, exit_code, \
+     exited_at_ms";
 
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
@@ -524,5 +571,7 @@ fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDi
         note: r.get(10)?,
         chunk_path: r.get(11)?,
         report: r.get(12)?,
+        exit_code: r.get(13)?,
+        exited_at_ms: r.get(14)?,
     })
 }
