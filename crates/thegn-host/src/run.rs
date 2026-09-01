@@ -5766,7 +5766,8 @@ async fn ensure_app_loaded(
 // `media_ctl` sibling module (run.rs is line-ratcheted); import them by name so
 // the event-loop call sites read unchanged.
 use crate::media_ctl::{
-    MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op, spawn_media_pick,
+    MediaGeneration, MediaOp, MediaPick, media_effective_cfg, restart_media_watch, spawn_media_op,
+    spawn_media_pick, spawn_media_sources,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -6605,23 +6606,27 @@ async fn event_loop<T: Terminal>(
     // reload and player-override changes. `media_player_override` is the runtime
     // "Select player" choice.
     let (media_tx, mut media_rx) =
-        tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaState>>();
+        tokio_mpsc::unbounded_channel::<crate::media_watch::MediaSnapshotDelivery>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
     // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
     // drops the image and sends the pane + path to paste (or a status message).
     let (paste_img_tx, mut paste_img_rx) =
         tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
-    // The Now-Playing overlay (Alt-m) + its async up-next queue and cover-art feeds.
-    let mut media_overlay: Option<crate::media_overlay::MediaOverlay> = None;
+    // The docked Media section's async up-next queue and cover-art feeds.
     let (media_queue_tx, mut media_queue_rx) =
-        tokio_mpsc::unbounded_channel::<Vec<thegn_core::media::QueueItem>>();
+        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaQueueDelivery>();
+    let (media_sources_tx, mut media_sources_rx) =
+        tokio_mpsc::unbounded_channel::<crate::panel::media::MediaSourcesDelivery>();
+    let mut media_caps: Option<thegn_core::media::MediaCaps> = None;
     let (media_art_tx, mut media_art_rx) =
         tokio_mpsc::unbounded_channel::<crate::media_art::ArtMosaic>();
     let mut media_player_override: Option<String> = None;
+    let media_generation = MediaGeneration::new();
     let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
     restart_media_watch(
         &mut media_watch,
         media_effective_cfg(&keymap.config().media, &media_player_override),
+        &media_generation,
         &media_tx,
         &waker,
     );
@@ -6725,6 +6730,9 @@ async fn event_loop<T: Terminal>(
 
     let mut current_config = keymap.config().clone();
     let mut theme_builder: Option<crate::theme_builder::ThemeBuilder> = None;
+    panel_ui
+        .media
+        .set_art_enabled(current_config.media.show_art);
     // Plugin runtime: the loop-local channel + state are allocated here (no
     // I/O), but the off-loop host — discovery is fs I/O, plugins are
     // subprocesses — is spawned only AFTER the first frame flushes (see the
@@ -6902,19 +6910,37 @@ async fn event_loop<T: Terminal>(
         }};
     }
 
-    // Open the full Now-Playing overlay (transport/queue/art) — shared by the
-    // Alt+m action and media-badge activation (statusbar click / Enter).
-    macro_rules! open_media_overlay {
-        () => {
-            media_overlay = Some(crate::media_ctl::open_media_overlay(
-                model.panel.media.clone(),
-                &current_config.media,
-                &media_player_override,
-                &media_queue_tx,
-                &media_art_tx,
+    // Focus the canonical docked Media section and start its optional queue/art
+    // fetches off-loop. Every open gesture uses this one path.
+    macro_rules! open_media_panel {
+        () => {{
+            if chrome.panel.is_none() {
+                want_panel = true;
+                panel_forced = cols < layout::PANEL_MIN_COLS;
+                chrome = recompute_chrome!();
+                need_relayout = true;
+            }
+            focus.zone = crate::focus::Zone::Panel;
+            open_panel_section(
+                crate::panel::Section::Media,
+                &mut panel_ui,
+                &mut hydration_gen,
+                &model_tx,
+                &session,
                 &waker,
-            ))
-        };
+                PanelDocsWiring {
+                    generation: docs_gen,
+                    tx: &docs_tx,
+                },
+            );
+            panel_ui.media.begin_request(model.panel.media.as_ref());
+            if let Some(url) = panel_ui
+                .media
+                .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
+            {
+                crate::media_art::spawn_fetch(url, 18, 8, media_art_tx.clone(), waker.clone());
+            }
+        }};
     }
 
     // Activate a resolved sidebar row target (live tab or dormant-workspace
@@ -10567,21 +10593,49 @@ async fn event_loop<T: Terminal>(
         // the feature is enabled, so toggling `[media] enabled = false` clears the
         // badge/section without a restart. Repaint discipline (why position-only
         // ticks don't storm the chrome) is documented on `drain_snapshots`.
-        let media_position_visible = (chrome.panel.is_some()
-            && panel_ui.open == crate::panel::Section::Media)
-            || media_overlay.is_some();
+        let media_position_visible =
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
         let (media_full, media_bars) = crate::media_watch::drain_snapshots(
             &mut media_rx,
             &mut loop_perf,
             current_config.media.enabled,
-            current_config.media.show_art,
+            media_generation.current(),
             &mut model.panel.media,
-            &mut media_overlay,
-            &media_art_tx,
-            &waker,
+            &mut media_caps,
             media_position_visible,
             &mut last_media_full,
         );
+        panel_ui.media.sync_snapshot(
+            model.panel.media.as_ref(),
+            media_caps,
+            media_generation.current(),
+        );
+        if media_position_visible {
+            let cfg = media_effective_cfg(&current_config.media, &media_player_override);
+            if let Some(request) = panel_ui
+                .media
+                .take_queue_request(model.panel.media.as_ref())
+            {
+                crate::media_ctl::spawn_media_queue(
+                    cfg.clone(),
+                    request,
+                    media_queue_tx.clone(),
+                    waker.clone(),
+                );
+            }
+            if let Some(request) = panel_ui
+                .media
+                .take_sources_request(model.panel.media.as_ref())
+            {
+                spawn_media_sources(cfg, request, media_sources_tx.clone(), waker.clone());
+            }
+        }
+        if let Some(url) = panel_ui
+            .media
+            .wants_art(model.panel.media.as_ref(), current_config.media.show_art)
+        {
+            crate::media_art::spawn_fetch(url, 18, 8, media_art_tx.clone(), waker.clone());
+        }
         dirty |= media_full;
         bars_dirty |= media_bars;
         // Media picker results: open a secondary palette of playlists / players.
@@ -10614,20 +10668,27 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
-        // Now-Playing overlay feeds: up-next queue + decoded cover art.
-        while let Ok(queue) = media_queue_rx.try_recv() {
+        // Docked Media section feeds: up-next queue + decoded cover art.
+        while let Ok(delivery) = media_queue_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            if let Some(ov) = &mut media_overlay {
-                ov.set_queue(queue);
-                dirty = true;
-            }
+            panel_ui
+                .media
+                .set_queue(delivery.request, model.panel.media.as_ref(), delivery.queue);
+            dirty = true;
+        }
+        while let Ok(delivery) = media_sources_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            panel_ui.media.set_sources(
+                delivery.request,
+                model.panel.media.as_ref(),
+                delivery.sources,
+            );
+            dirty = true;
         }
         while let Ok(art) = media_art_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
-            if let Some(ov) = &mut media_overlay {
-                ov.set_art(art);
-                dirty = true;
-            }
+            panel_ui.media.set_art(model.panel.media.as_ref(), art);
+            dirty = true;
         }
 
         // Clipboard image-paste results (THE-24): the worker resolved the drop
@@ -10750,6 +10811,9 @@ async fn event_loop<T: Terminal>(
                     model.preview = session
                         .active_group()
                         .and_then(|group| preview_supervisor.view(&group.path));
+                    panel_ui
+                        .media
+                        .set_art_enabled(current_config.media.show_art);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
                     // Live notification-routing reload: swap in the reloaded
@@ -10763,6 +10827,7 @@ async fn event_loop<T: Terminal>(
                     restart_media_watch(
                         &mut media_watch,
                         media_effective_cfg(&current_config.media, &media_player_override),
+                        &media_generation,
                         &media_tx,
                         &waker,
                     );
@@ -12568,10 +12633,6 @@ async fn event_loop<T: Terminal>(
             if let Some(v) = &diff_view {
                 v.render(&mut scratch, screen);
             }
-            // The Now-Playing media control overlay (centered modal).
-            if let Some(ov) = &media_overlay {
-                ov.render(&mut scratch, screen);
-            }
             if let Some(builder) = &theme_builder {
                 crate::handlers::theme_builder::render(builder, &mut scratch, screen);
             }
@@ -13688,8 +13749,9 @@ async fn event_loop<T: Terminal>(
                             model.statusbar_sel = idx;
                             if id == BarItemId::Badge(BarBadge::Media)
                                 && current_config.media.enabled
+                                && current_config.media.overlay_on_badge_click
                             {
-                                open_media_overlay!();
+                                open_media_panel!();
                             } else if id.has_detail() {
                                 crate::handlers::status::probe_sessions(
                                     &id,
@@ -13883,6 +13945,22 @@ async fn event_loop<T: Terminal>(
                                 );
                                 need_relayout = true;
                             }
+                            Some(crate::panel::PanelHit::MediaAction(action)) => {
+                                if current_config.media.enabled {
+                                    crate::media_ctl::spawn_media_action(
+                                        media_effective_cfg(
+                                            &current_config.media,
+                                            &media_player_override,
+                                        ),
+                                        action,
+                                        &media_generation,
+                                        media_tx.clone(),
+                                        waker.clone(),
+                                    );
+                                } else {
+                                    model.status = "Media is off ([media] enabled = false)".into();
+                                }
+                            }
                             Some(crate::panel::PanelHit::Row(sec, i)) => {
                                 // A click can land on a NON-open section's rows
                                 // (the Full git frame renders all four lists at
@@ -13909,7 +13987,37 @@ async fn event_loop<T: Terminal>(
                                 // without this, click + `d` deleted a DIFFERENT
                                 // branch/commit/stash than the highlighted one.
                                 panel_ui.sync_section_cursors();
-                                if sec == crate::panel::Section::Changes {
+                                if sec == crate::panel::Section::Media {
+                                    if let Some(item) = panel_ui.media.queue_at(i) {
+                                        if current_config.media.enabled {
+                                            spawn_media_op(
+                                                media_effective_cfg(
+                                                    &current_config.media,
+                                                    &media_player_override,
+                                                ),
+                                                MediaOp::PlayQueueItem(item.id.clone()),
+                                                &media_generation,
+                                                media_tx.clone(),
+                                                waker.clone(),
+                                            );
+                                        } else {
+                                            model.status =
+                                                "Media is off ([media] enabled = false)".into();
+                                        }
+                                    } else if let Some(source) = panel_ui.media.source_at(i) {
+                                        media_player_override = Some(source.to_string());
+                                        restart_media_watch(
+                                            &mut media_watch,
+                                            media_effective_cfg(
+                                                &current_config.media,
+                                                &media_player_override,
+                                            ),
+                                            &media_generation,
+                                            &media_tx,
+                                            &waker,
+                                        );
+                                    }
+                                } else if sec == crate::panel::Section::Changes {
                                     let deep = panel_ui.width != crate::layout::PanelWidth::Normal;
                                     let visible =
                                         crate::panel::visible_change_files(&model.panel, deep);
@@ -14575,22 +14683,6 @@ async fn event_loop<T: Terminal>(
                         &ide_handoff_tx,
                         &waker,
                     );
-                    dirty = true;
-                    continue;
-                }
-                // The Now-Playing overlay owns every key while open: transport ops
-                // run off the loop (overlay stays open); Esc/Ctrl-C dismiss it.
-                if let Some(ov) = &mut media_overlay {
-                    match ov.handle_key(&k.key, k.modifiers) {
-                        crate::media_overlay::MediaOverlayOutcome::Close => media_overlay = None,
-                        crate::media_overlay::MediaOverlayOutcome::Pending => {}
-                        crate::media_overlay::MediaOverlayOutcome::Op(op) => spawn_media_op(
-                            media_effective_cfg(&current_config.media, &media_player_override),
-                            MediaOp::from(op),
-                            media_tx.clone(),
-                            waker.clone(),
-                        ),
-                    }
                     dirty = true;
                     continue;
                 }
@@ -16810,23 +16902,13 @@ async fn event_loop<T: Terminal>(
                                             &current_config.media,
                                             &media_player_override,
                                         );
-                                        let id = id.to_string();
-                                        let tx = media_tx.clone();
-                                        let w = waker.clone();
-                                        tokio::spawn(async move {
-                                            if let Some(client) =
-                                                thegn_media::client_for(&cfg.resolve_opts()).await
-                                            {
-                                                if let Err(e) = client.activate_playlist(&id).await
-                                                {
-                                                    tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
-                                                }
-                                                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                                                let _ = tx
-                                                    .send(client.snapshot().await.unwrap_or(None));
-                                                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-                                            }
-                                        });
+                                        crate::media_ctl::spawn_media_playlist(
+                                            cfg,
+                                            id.to_string(),
+                                            &media_generation,
+                                            media_tx.clone(),
+                                            waker.clone(),
+                                        );
                                     }
                                 } else if let Some(p) = key.strip_prefix("media-player:") {
                                     // Switch which player we control + restart the watcher.
@@ -16837,6 +16919,7 @@ async fn event_loop<T: Terminal>(
                                             &current_config.media,
                                             &media_player_override,
                                         ),
+                                        &media_generation,
                                         &media_tx,
                                         &waker,
                                     );
@@ -17070,8 +17153,9 @@ async fn event_loop<T: Terminal>(
                         if let Some((id, rect)) = hit {
                             if id == BarItemId::Badge(BarBadge::Media)
                                 && current_config.media.enabled
+                                && current_config.media.overlay_on_badge_click
                             {
-                                open_media_overlay!();
+                                open_media_panel!();
                             } else if id.has_detail() {
                                 crate::handlers::status::probe_sessions(
                                     &id,
@@ -17818,12 +17902,40 @@ async fn event_loop<T: Terminal>(
                                             .open_view_at(panel_ui.cursor);
                                         }
                                         Section::Media => {
-                                            // Enter opens the control overlay —
-                                            // the section's own hint promised
-                                            // "↵ panel" while Enter fell into
-                                            // the read-only catch-all.
+                                            // Enter selects a source or queue row;
+                                            // it never opens a second surface.
                                             if current_config.media.enabled {
-                                                open_media_overlay!();
+                                                if let Some(source) =
+                                                    panel_ui.media.source_at(panel_ui.cursor)
+                                                {
+                                                    media_player_override =
+                                                        Some(source.to_string());
+                                                    restart_media_watch(
+                                                        &mut media_watch,
+                                                        media_effective_cfg(
+                                                            &current_config.media,
+                                                            &media_player_override,
+                                                        ),
+                                                        &media_generation,
+                                                        &media_tx,
+                                                        &waker,
+                                                    );
+                                                    model.status =
+                                                        format!("Media: selected {source}");
+                                                } else if let Some(item) =
+                                                    panel_ui.media.queue_at(panel_ui.cursor)
+                                                {
+                                                    spawn_media_op(
+                                                        media_effective_cfg(
+                                                            &current_config.media,
+                                                            &media_player_override,
+                                                        ),
+                                                        MediaOp::PlayQueueItem(item.id.clone()),
+                                                        &media_generation,
+                                                        media_tx.clone(),
+                                                        waker.clone(),
+                                                    );
+                                                }
                                             } else {
                                                 model.status =
                                                     "Media is off ([media] enabled = false)".into();
@@ -19134,25 +19246,19 @@ async fn event_loop<T: Terminal>(
                                 &mut host_input,
                             )
                         }
-                        // -- media: the transport keys the section advertises.
-                        // These were `nav()`-tagged (i.e. "the accordion
-                        // handles them") but the accordion never did — every
-                        // advertised keystroke was silently dead.
+                        // -- media: keyboard transport keys use the same intent
+                        // mapping as the frame's mouse hit targets.
                         (Section::Media, KeyCode::Char(c @ (' ' | 'n' | 'p' | 's' | 'L'))) => {
+                            let action = crate::media_panel::action_for_key(&KeyCode::Char(c))
+                                .expect("media key table and handler must agree");
                             if current_config.media.enabled {
-                                let op = match c {
-                                    'n' => MediaOp::Next,
-                                    'p' => MediaOp::Previous,
-                                    's' => MediaOp::ShuffleToggle,
-                                    'L' => MediaOp::LoopCycle,
-                                    _ => MediaOp::PlayPause,
-                                };
-                                spawn_media_op(
+                                crate::media_ctl::spawn_media_action(
                                     media_effective_cfg(
                                         &current_config.media,
                                         &media_player_override,
                                     ),
-                                    op,
+                                    action,
+                                    &media_generation,
                                     media_tx.clone(),
                                     waker.clone(),
                                 );
@@ -19161,6 +19267,7 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        (Section::Media, _) => false,
                         // -- usage: force a re-gather now, rather than waiting
                         // out the rest of `[usage] poll_interval_secs`.
                         (Section::Usage, KeyCode::Char('r')) => {
@@ -22107,6 +22214,7 @@ async fn event_loop<T: Terminal>(
                                             &media_player_override,
                                         ),
                                         op,
+                                        &media_generation,
                                         media_tx.clone(),
                                         waker.clone(),
                                     );
@@ -22116,7 +22224,7 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::MediaOpenPanel => {
                                 if current_config.media.enabled {
-                                    open_media_overlay!();
+                                    open_media_panel!();
                                 } else {
                                     model.status = "Media is off ([media] enabled = false)".into();
                                 }
