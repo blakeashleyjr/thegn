@@ -20942,7 +20942,6 @@ async fn event_loop<T: Terminal>(
                                 let worktree = session
                                     .active_group()
                                     .map(|group| std::path::PathBuf::from(&group.path))
-                                    .filter(|path| !path.as_os_str().is_empty())
                                     .unwrap_or_else(|| active_tab_path(&session));
                                 if !worktree.is_dir() {
                                     model.status = "Toolchain install: no active worktree".into();
