@@ -41,6 +41,14 @@ below; it never folds anything). `[ui] sidebar_dividers = false` turns the
 separators off and restores the old dense layout; they also disappear while
 a `/` filter is active and never exist in the rail.
 
+When a workspace has active merge-queue entries, its full-mode header shows a
+compact token immediately before the warm-pool token: the count followed by a
+red blocked, amber working, or dim populated marker. Landed-only and empty
+queues stay quiet. The token is a shortcut to Work ▸ Merge queue; click it, or
+choose **Open merge queue** from the workspace's `m` menu. Narrow headers drop
+the count before hiding the marker, and the token is never painted in rail
+mode.
+
 ## Navigate
 
 - `↑↓` / `j` `k` — move; `↵` opens the row (or folds a header; on the
@@ -189,7 +197,9 @@ Thresholds are tunable — see [[config-reference]] `[activity]`, and
 - `d` / `Del` — close or delete… (deleting files from disk is always the
   explicit second choice, never the default)
 - `c` — copy the worktree path
-- `m` — the full row action menu
+- `m` — the full row action menu; on a worktree row choose **Open in IDE** to
+  hand that exact worktree over without first switching to it. Dormant rows are
+  valid for a windowed IDE; a terminal-only editor asks you to focus the row.
 
 ## View
 

@@ -68,6 +68,10 @@ pub struct AdoptIntent {
     /// away from whatever the user is doing.
     #[serde(default)]
     pub focus: bool,
+    /// Open the adopted session in a fresh tab instead of splitting the
+    /// group's active tab.
+    #[serde(default)]
+    pub tab: bool,
 }
 
 /// A sandbox audit event from the `container_events` table.

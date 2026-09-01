@@ -38,6 +38,11 @@ guessed command.
      `parse_session_summary` (a credential-free one-line summary + recorded cwd).
    - `RESUME` → `resume_command(id)` returning the resume command with the id
      shell-quoted. Ids are validated by `session_id_ok` before you see them.
+   - `FORK` → `fork_command(native_session_id)` returning the vendor's native
+     new-session command with the id shell-quoted. This operation is distinct
+     from resume: only advertise it after the harness's native fork behavior
+     has been verified. Claude uses `claude --resume <id> --fork-session` and
+     Codex uses `codex fork <id>`; Pi, aider, and Antigravity remain reserved.
    - `USAGE` → `parse_usage(bytes, now)`, delegating to a pure parser in
      `thegn_core::usage` (keep the byte-level parser there, where its fixture
      tests live — the seam consolidates the dispatch, not the parsing).
@@ -55,6 +60,14 @@ are driven by `thegn-svc` / `thegn-host` from the seam's data:
 
 - **Launch / resume**: `thegn-host/src/daemon/agent_open.rs` resolves the command
   through the seam; `AgentLaunch.resume` carries an explicit session id.
+- **Fork**: `thegn_core::session_fork::plan` validates a live daemon recipe or
+  an `agent.sessions` row and selects only a harness-advertised fork command.
+  Raw recipes are daemon-memory data; `ForkRecord` stores lineage metadata
+  only, so the cache never persists argv, environment, prompts, transcripts, or
+  credentials.
+  Fork has no TOML/config key: capability support is explicit in this closed
+  registry, and an unsupported harness is reported as reserved rather than
+  guessed from a configured command.
 - **Session discovery**: the generic walker in `thegn-svc/src/sessions.rs` drives
   every `SessionLayout`; it feeds `agent.sessions` (CLI `thegn agent sessions
 --json`, MCP `agent_sessions`, HTTP `/v1/agent/sessions`).
@@ -68,6 +81,7 @@ are driven by `thegn-svc` / `thegn-host` from the seam's data:
   `HARNESSES`.
 
 **Gates:** `caps_agree_with_ops`, `every_resume_impl_quotes_its_id`,
+`every_fork_impl_quotes_its_id`,
 `session_layout_matches_its_own_fixture`, the per-impl usage/summary unit tests
 (all in `harness.rs`); `providers_projection_matches_the_pre_seam_table`
 (`account.rs`); and, for the `agent.sessions` capability, the catalog coverage

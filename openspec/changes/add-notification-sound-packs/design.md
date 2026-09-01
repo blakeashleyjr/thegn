@@ -1,121 +1,100 @@
-# Design — per-event notification sounds
+# Design — configurable notification sound effects
 
-## Where the pieces already live
+## Existing route and pure policy
 
-- **Routing (pure, core):** `notification_route.rs` resolves a
-  `RouteDecision` including `Option<SoundEmit>` (`Bell` | `Chime` |
-  `Command`) from mode, `min_priority`, `always_kinds`, rules, DND. This is
-  where the new resolution order goes — pure logic, table-testable, under
-  the 95% gate.
-- **Playback (host):** `chime.rs` finds the first system player on PATH
-  (cached), materializes the bundled synthesized WAV under the state dir on
-  first use, and hands a command line to `notify::spawn_sound_command`
-  (detached thread, best-effort, swallowed failures). `emit_sound` falls
-  back to the terminal bell when no player/file exists — a cue never
-  silently no-ops.
+`thegn_core::notification_route::decide` is the single pure route decision.
+It returns independently observable inbox, desktop, toast, push, and sound
+channels. `NotifyState::record` in the host records first and then applies
+that decision, so typed producers do not emit duplicate sounds directly.
 
-The change threads two new inputs (kind→spec map, pack dir) into the
-resolver and two new outputs (a resolved file, a volume) into the player
-command builder. No new processes, threads, or wake sources; the sound path
-never touches the event loop (bell latch on render flush; subprocess for
-files) — the wake path and render damage channels are untouched by this
-change.
+The route applies global/route mute, DND, focused-worktree suppression, and
+the sound priority floor before resolving the audible result. `always_kinds`
+bypasses only `min_priority`; it does not bypass mute, a rule that excludes
+sound, DND, or focused-worktree suppression. After those gates, precedence is:
 
-## Decisions
+1. a matched rule's `sound` action;
+2. `[notifications.sound.per_kind][<kind>]`;
+3. legacy `[notifications.sound.per_priority]` in command mode; and
+4. the generic `mode` (`bell`, legacy `chime_file`, `command`, or `off`).
 
-### Resolution order, stated once
+`SoundRef` is substrate-free. `off`/`none`, bell aliases, `builtin:bell`,
+`pack:<name>`, and absolute/tilde paths are the complete per-kind vocabulary.
+Core does not expand paths, inspect packs, read the environment, start a
+process, or know a terminal player. Unknown catalog kinds and malformed
+references are reported by config validation; runtime policy remains
+conservative and falls back to the bell for an invalid file reference.
 
-First match wins, resolved in core:
+The existing rule `sound` field remains a trusted compatibility escape hatch:
+`off` and bell aliases are policy values and other strings remain command-mode
+commands. This compatibility behavior is intentionally separate from
+`per_kind`, whose values can never become shell commands.
 
-1. A matched rule's `sound` action (existing — per-rule override).
-2. `[notifications.sound.per_kind] <kind>` (new).
-3. `[notifications.sound.per_priority] <priority>` (existing).
-4. The `mode` default (`chime`/`bell`/`command`).
+## Host snapshot and provider seam
 
-Gates apply after resolution, unchanged: `min_priority` + `always_kinds`
-decide whether anything fires; `suppress_focused` and DND can still silence
-it. This keeps exactly one gate system — the THE-35 "quiet hours" ask is
-already the DND windows, and growing a parallel schedule for sounds is how a
-user learns to trust neither (the `[usage.alerts]` precedent).
+`thegn-host/src/notification_sound.rs` owns orchestration. On startup and
+configuration reload it builds the pack/file snapshot off the compositor loop,
+then swaps it under a short lock. A `pack:<name>` lookup is a map lookup (the
+snapshot indexes a pack filename and its stem); explicit file references are
+expanded and checked while building the snapshot. No notification performs
+filesystem access.
 
-A sound _spec_ string is one vocabulary everywhere it appears (rule action,
-per_kind, per_priority): `"bell"` | `"off"` | an absolute/`~` file path | a
-bare name resolved against the pack. `per_priority` today is command-only;
-it widens to the same vocabulary with commands still accepted.
+`thegn-host/src/platform/sound.rs` is the only file that knows platform player
+names and conditionals. Its synchronous object-safe `SoundPlayer` seam reports
+an id, supported formats, volume support, and a `ProbeReport`, then plays with
+`Command::new(program).args(fixed_args)`. Provider paths never use `sh -c`.
+The legacy configured command is the separate trusted shell boundary and is
+run only by the off-loop worker.
 
-### Pack convention: filenames, not manifests
+File and command playback uses a bounded `SyncSender<SoundJob>`. Producers use
+`try_send` and drop a file job with a diagnostic counter when the queue is
+full. The `notify-sound` worker declares `Qos::Utility`; no producer or
+compositor path waits for playback. Terminal bells use the existing atomic
+latch and one loop-waker pulse, so simultaneous fallback requests coalesce.
 
-`pack = "<dir>"`; `<kind>.{wav,ogg}` wins for that kind, `default.{wav,ogg}`
-covers unmapped kinds, anything else in the directory is ignored. No
-manifest file — the Agent-of-Empires convention, chosen because it is
-already what shared CC0 packs look like and because `thegn config validate`
-can lint it (unknown-kind filenames get a did-you-mean; an empty pack dir
-warns). Pack scan happens at config load and on config reload, never per
-event — per-event cost stays one HashMap lookup.
+Missing pack/file, missing provider, unsupported format, worker/spawn failure,
+or provider failure is best-effort: the worker records a diagnostic and asks
+the terminal-bell latch to fire. No playback error reaches the compositor.
+There are no synthesized tones and no binary audio assets in the repository.
 
-### Bundled sounds stay synthesized
+## Live attention edge
 
-The bundled chime is generated (sine synthesis at first use) precisely so no
-binary asset ships in the repo; that property is worth keeping. The bundle
-becomes a small family — a sharper two-tone for Alert, the current chime for
-Notice — same synth code, different parameters, written once under the state
-dir. Anyone who wants real foley sets `pack`.
+The daemon's `session_attention` rows remain live state, not a second inbox
+trigger. The hydration worker folds the rows into the existing attention
+status and keeps `(session, since)` values for sound observation. The first
+snapshot seeds the baseline without sound. Later, a new session or changed
+`since` routes one synthetic `AgentAttention` cue through `NotifyState`; a
+cleared/removed session is forgotten. Render never performs this observation,
+and no duplicate durable row is inserted.
 
-### Volume via player flags, not an audio stack
+## Trust and configuration
 
-**rodio (rejected):** in-process playback would give sample-accurate volume
-and remove the player dependency — at the price of `cpal`→ALSA/CoreAudio C
-dependencies in a compositor process, audio-device handles owned by the UI
-binary, and a portability matrix thegn currently gets for free from
-`paplay`/`afplay`/PowerShell. The existing shell-out is fail-safe, already
-written, and its worst case (no player found) already falls back to the
-bell. Dependency weight decides this: playing a ding does not justify an
-audio stack. (Same shape as the viz decision in `expand-media-surfaces`:
-external tool over in-process capture.)
+Global and selected-profile configuration may name trusted packs and files.
+When an untrusted repository overlay is merged, sound `pack`, `per_kind`,
+`chime_file`, `command`, and `per_priority` are cleared; a command mode is
+also reduced to bell. This prevents a repository from causing host-side file
+access or command execution merely by being opened.
 
-**Chosen:** `volume` maps to the resolved player's flag —
-`paplay --volume=$((v*65536))`, `pw-play --volume=v`, `afplay -v v`,
-PowerShell `MediaPlayer.Volume` — built in `chime.rs` where the player table
-already lives (runtime PATH detection, no `#[cfg]` spread; the platform
-ratchet stays clean). A player with no volume flag (`aplay`) plays at
-default; `thegn doctor` says which player resolved and whether volume is
-honored, so "why is it loud" has a one-command answer.
+`volume` is validated as a finite `0.0..=1.0` hint and clamped at use. A
+provider without volume support receives its normal invocation and doctor
+reports that volume is unsupported. Provider availability and pack state are
+diagnostics, not failures of `thegn doctor`.
 
-### Accessibility
+## Boundaries and pruned alternatives
 
-Distinct per-kind cues are the point, not polish: `agent_attention` vs
-`queue_landed` vs `test_failed` become distinguishable without looking,
-which serves users who are heads-down in a pane, away from the screen, or
-using the terminal with a screen reader (where visually-coded badges are the
-weak channel). `suppress_focused` already prevents the cue from doubling
-what the user is watching.
+- No second event-bus sound subscriber: it would duplicate the `NotifyState`
+  route.
+- No new SQLite state: the notification database is a cache, and live
+  attention already has a source of truth.
+- No new CLI action, control snapshot field, MCP tool, completion slot, or
+  capability-catalog row: configuration and doctor reporting are sufficient.
+- No in-process audio library: fixed-argv platform players preserve the
+  existing process boundary and portability.
+- No filename-convention `default.<ext>` or kind-derived fallback: a pack
+  reference is explicit as `pack:<name>`, and an unresolved file always
+  falls back to the terminal bell.
+- No synthesized family or shipped default audio asset: the bell is the only
+  built-in sound.
 
-## Security
-
-- **No new credentials, doors, or catalog rows.** Config-driven local
-  playback only.
-- **Command execution surface (pre-existing, now wider-reaching):** sound
-  specs can be commands (`mode = "command"`, per-priority — existing;
-  per_kind inherits the vocabulary). These run via `sh -c` from the user's
-  own config, which is the same trust boundary as `[[tools]]`/`[[agents]]`
-  — but `add-config-trust-resolution` is scoping trust for exactly this
-  class of key; per_kind command specs MUST be covered by whatever
-  trust gate that change lands (noted as a soft dependency, not blocked on
-  it). Pack files and `chime_file` are data paths handed to a fixed player
-  argv — shell-quoted as today, no interpolation of file content.
-- **Blast radius:** a malicious pack dir is at worst an annoying noise; the
-  player subprocess is short-lived, unprivileged, and detached. No sandbox
-  implications (playback is host-side chrome, like the existing chime).
-
-## Open questions
-
-- Should `per_kind` accept the calendar-reminder kind's per-account colors…
-  no — but should calendar reminders (kind `calendar_reminder`) get a
-  distinct bundled tone by default? Leaning no: defaults stay minimal,
-  packs exist for taste.
-- Whether `volume` should also scale the synthesized bundle at generation
-  time (bake amplitude) as a fallback for flag-less players — cheap, but two
-  volume paths can disagree; deferred unless flag-less players prove common.
-- Windows player table: PowerShell `Media.SoundPlayer` is WAV-only; OGG in
-  packs would silently skip on Windows. Document `.wav` as the portable
-  choice, or transcode-reject at validation? Proposed: validation warns.
+The notification route, priority/DND/focus gates, trusted command worker
+boundary, terminal-bell latch, and live attention state are the branch's
+existing/landed foundations; THE-35 composes configurable references on them.

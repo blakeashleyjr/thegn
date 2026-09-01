@@ -484,6 +484,13 @@ impl IssueBackend for KaneoBackend {
         "kaneo"
     }
 
+    fn caps(&self) -> super::IssueCaps {
+        super::IssueCaps {
+            comments: true,
+            labels: true,
+        }
+    }
+
     /// The router downcasts through this for Kaneo-shaped board/project
     /// browsing (columns per project), which is not provider-agnostic.
     fn as_kaneo(&self) -> Option<&KaneoBackend> {

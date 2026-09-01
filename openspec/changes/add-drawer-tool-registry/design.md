@@ -1,142 +1,54 @@
 # Design — drawer tool registry
 
-## Registry model: references, not a second command table
+THE-11 extends the existing `[[tools]]` catalog. A tool with
+`drawer_scope = "worktree"` or `drawer_scope = "global"` becomes an eligible
+drawer occupant; `name`, `command`, and `env` remain the single launch record.
+`drawer_cwd` is optional and is relative to the worktree for worktree scope,
+or absolute/`~`-prefixed for global scope. The built-in files provider is the
+first occupant, followed by eligible tools in config order.
 
-thegn already has one program registry (`[[agents]]`/`[[tools]]`, the shared
-`NamedCommand` shape) and three composition layers over it (the wizard picker,
-pins, worktree templates). A `[[drawer.tools]]` entry is another composition
-layer, not another place a command string lives:
+There is deliberately no `[[drawer.tools]]` table, inline-command syntax, or
+repo-local command registry. This avoids duplicating the picker catalog and
+keeps command, environment, and trust handling on the existing paths. Invalid
+drawer metadata is reported by strict validation and omitted with a warning by
+normal layered loading; tools without drawer metadata remain picker-only.
 
-```toml
-[[drawer.tools]]
-tool = "atac"              # reference into [[tools]] by name (exclusive with `command`)
-# name = "api"             # display label; defaults to the tool name / command basename
-# command = "atac"         # inline one-off (exclusive with `tool`), run via the login shell
-scope = "worktree"         # "worktree" (default) | "global"
-# cwd = ".atac"            # worktree-relative (worktree scope) or absolute/~ (global)
-# env = { ATAC_MAIN_DIR = ".atac" }
-```
+## Runtime
 
-`tool` refs get the `[[tools]]` entry's command (and its statusbar `hints`);
-`command` is the pins-style escape hatch for a program not worth a `[[tools]]`
-entry. Config validation rejects an entry with both or neither of
-`tool`/`command`, warns on a `tool` naming no `[[tools]]` entry (the occupant
-is omitted at runtime), and warns on duplicate labels. All of this is pure
-`thegn-core` config logic under the 95% coverage gate.
+`DrawerRuntime` is the sole owner of drawer transitions, persistence, pooling,
+async resolution, process-exit cleanup, and geometry updates. The pool is
+keyed by `(scope-key, occupant-id)` and the configured `pool_limit` applies
+across all occupants. Worktree state uses the existing slugged directory key;
+global state uses the fixed `global` key. Legacy `true` flags decode as
+`files`, and `false` is closed.
 
-ATAC is the motivating example: `[[tools]] name = "atac" command = "atac"`
-plus a worktree-scoped drawer entry with `env = { ATAC_MAIN_DIR = ".atac" }`
-gives every worktree its own API-collection state in-repo.
+Only one occupant is visible. A destination worktree's open occupant takes
+precedence over an open global occupant; a global occupant reuses one local
+PTY across in-process worktree switches. It is not daemon-owned and does not
+survive detach or restart. Cold resolution and environment expansion happen
+off-loop through the existing channel+waker boundary. Every occupant uses
+`tool_drawer_argv`, `contain_drawer_argv`, and `spawn_argv_env_local`.
 
-## Occupant model: one visible, N registered
+`files-drawer`, `drawer-cycle`, and the dedicated `drawer-pick` palette all
+use the same runtime transition path. The picker and cycle registry contain
+both worktree and global tools. Process exit removes the pane and clears its
+matching state slot. `[drawer].prewarm` remains files-only and also goes
+through `DrawerRuntime`.
 
-The drawer region stays a single PTY rect. Occupants form an ordered list:
-`files` (built-in, occupant #0 — the file-manager drawer exactly as
-`add-file-manager-seam` specs it) followed by `[[drawer.tools]]` in config
-order. Switching swaps which pane composites into the rect; the previous
-occupant is stashed in the pool (position/state survives) under its
-(scope-key, occupant) key.
+## Indicator and scope
 
-Alternative considered — drawer-internal tabs rendered on the divider row
-(browser-devtools style). Rejected for v1: the divider is 1 row of chrome that
-the render plan treats as geometry, and an in-drawer tab strip needs its own
-hit-tables and focus rules; the picker + cycle actions deliver the same
-capability with two actions and no new chrome contract. The divider-strip can
-layer on later without config changes.
+The removable `drawer` statusbar widget is in the default `bottom_left`
+order. It uses the existing glyph/theme chokepoints, shows a dim closed state,
+or an accented active occupant label and count, and clicking it invokes the
+files-drawer toggle. It is painted and hit-tested from the same layout item.
 
-Alternative considered — folding occupants into `[[pins]]` (`location =
-"drawer"`). Rejected: pins are supervised, mostly-global singletons with
-start/restart semantics and strip presence; drawer occupants are lazy,
-worktree-keyed chrome with pool eviction. Sharing the table would force each
-side to carry the other's knobs.
+No CLI, daemon, control API, MCP, plugin, SQLite migration, or new capability
+catalog entry is added. Global panes are process-local ephemeral chrome.
 
-## Switching is chrome-level
+## Verification and follow-up
 
-While the drawer owns focus, every key goes to the occupant (the existing
-contract — that is why yazi needs an OSC channel to close the drawer). So
-`drawer-cycle` and `drawer-pick` are global chords/actions, dispatched by the
-keymap before pane forwarding, exactly like `files-drawer` today. `drawer-pick`
-opens a dedicated picker palette (the `build_agent_palette` pattern: rows keyed
-by occupant label, routed through a pending-selection gate in the Enter
-handler) — which keeps the "every palette row is an action" invariant intact,
-since the main command palette only gains the two actions, and occupant rows
-live in the dedicated picker.
-
-Occupant process exit (e.g. `q` in ATAC) closes the drawer, drops the pane
-from pool/table, and clears the persisted open state — generalizing the
-existing exited-yazi `remove_id` path.
-
-## State & persistence
-
-The per-worktree flag file (`~/.thegn/drawer/<slug>`) currently stores
-`true`/`false`. It becomes the open occupant's label (empty/absent = closed);
-`true` is read as the files occupant for back-compat, and the write path keeps
-the memory-first, write-through-off-loop contract of `FlagCache`. Global-scope
-occupants persist one global slot (a reserved key in the same store), since
-"the scratch REPL is open" is not a per-worktree fact. No DB involvement.
-
-## Spawn pipeline & event loop
-
-Cold spawns reuse `drawer_state::request_spawn`'s off-loop resolve (spawn
-request → blocking task resolves the launch via the config/tools lookup +
-containment wrap → channel send + `TerminalWaker` pulse → loop drain opens the
-pane), with the in-flight dedupe key extended from worktree to (scope-key,
-occupant). Nothing new blocks the loop; `[drawer] prewarm` continues to
-prewarm only the files occupant (registry occupants are cheap-on-demand; a
-per-entry `prewarm` is an open question below). Render damage: open/close/
-switch are geometry/chrome changes ⇒ `Full`; occupant output while open is
-`Panes`, unchanged.
-
-## Indicator
-
-A `drawer` widget joins the `[bars]` vocabulary (default appended to
-`bottom_left` after `keyhints`): closed = dim drawer glyph; open = highlighted
-glyph + active occupant label; a small `×N` count when more than one occupant
-is configured. Click toggles (bars already have clickable chips — `help` — and
-fitted hit-tables). Glyphs go through `caps::active_glyphs()`; colors through
-the theme chokepoints — no literals at the draw site (color/glyph ratchets).
-
-## Containment
-
-`contain_yazi_argv` generalizes to `contain_drawer_argv`: every occupant argv
-is wrapped in the bounded user `systemd-run --scope` under the same `[drawer]`
-caps and the same fail-safe skips (disabled, no systemd-run, already-wrapped
-sandbox argv). Registry occupants are host processes like the file manager —
-they are chrome, never daemon-routed.
-
-## Security
-
-- **What runs**: arbitrary argv from the user's trusted config. Repo-local or
-  otherwise less-trusted config layers must pass the trust gates
-  (`add-config-trust-resolution`) before their `[[drawer.tools]]`/`[[tools]]`
-  entries take effect — a hostile repo must not be able to plant a drawer
-  occupant that runs on toggle.
-- **Blast radius**: occupants run as the user on the host (not in the worktree
-  sandbox — same as the file manager today), bounded by the `[drawer]` scope
-  caps so a runaway occupant is OOM-killed in its own cgroup instead of taking
-  the terminal down. `env` values are plain config strings; secrets should use
-  the env indirection story (`add-env-setup-ux`) rather than raw values —
-  documented at the config key.
-- **No new external surface**: no CLI verb, control route, MCP tool, or plugin
-  call is added — everything is in-UI, so no capability-catalog row and no
-  scope changes.
-- **No credential handling** beyond what a configured command does itself.
-
-## Testing
-
-- `thegn-core`: `DrawerTool` parse/validate (both/neither/unknown/duplicate),
-  label resolution, cwd/env computation — pure unit tests (95% gate).
-- `thegn-host`: `FlagCache` value semantics incl. legacy `true`, pool keying/
-  eviction across occupants, exit-cleanup, containment wrap — unit tests;
-  picker/switch/indicator — e2e (baseline re-record).
-
-## Open questions
-
-- Per-entry `prewarm` (an occupant the user opens constantly)? Deferred; the
-  global `prewarm` stays files-only.
-- Default chord for `drawer-cycle`/`drawer-pick` (Ctrl-Alt-d is free today) or
-  palette-only like the wizard verbs? Implementation must pass the keymap
-  uniqueness tests either way.
-- Should the indicator be in the default `bottom_left` set, or opt-in? Default
-  proposed on (discoverability is the point of THE-11), revisit if it crowds
-  narrow terminals.
+Core policy/runtime behavior is covered by focused unit tests; host picker,
+switch, indicator, containment, and lifecycle behavior have targeted tests.
+The eight chrome snapshots listed in the architect design are a deferred
+follow-up and are not re-recorded in this coder revision. Full CI and e2e are
+also outside this revision's mandated dev loop.
