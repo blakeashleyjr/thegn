@@ -35,6 +35,7 @@ mod ci_refresh;
 mod cli_help;
 mod clipboard;
 mod cmd;
+mod compat;
 mod complete;
 mod completions_health;
 mod compositor;
@@ -458,8 +459,9 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::zone::Action,
     },
-    /// Manage projects (multi-repo workspace groups — grouping only, no policy;
-    /// distinct from tracker `[issues] project_key`).
+    /// Manage programs (multi-repo groups — grouping only, no policy; distinct
+    /// from the one-repo project UI and tracker `[issues] project_key`).
+    #[command(name = "program", visible_alias = "project")]
     Project {
         #[command(subcommand)]
         action: cmd::project::Action,
@@ -799,6 +801,7 @@ fn main() -> anyhow::Result<()> {
     // Parse through the grouped-help wrapper (cli_help) so top-level --help
     // renders commands under semantic headings; behavior is otherwise
     // identical to `Cli::parse()`.
+    compat::warn_legacy_argv(&std::env::args().collect::<Vec<_>>());
     let matches = cli_help::attach(<Cli as clap::CommandFactory>::command())
         .try_get_matches()
         .unwrap_or_else(|e| e.exit());

@@ -144,7 +144,7 @@ pub(crate) enum NewWorktreeTarget {
 
 /// The refusal message displayed when `NewWorktreeTarget::Refuse` fires.
 pub(crate) const NEW_WORKTREE_REFUSAL: &str =
-    "No repo path for this workspace yet — it registers on the next refresh";
+    "No repo path for this project yet — it registers on the next refresh";
 
 impl SidebarState {
     /// What the cursor row activates, if anything.
@@ -298,7 +298,7 @@ impl SidebarState {
                     // Essential-tier key and must never silently no-op.
                     if let Some(slug) = dormant_ws {
                         model.status = format!(
-                            "Open workspace \"{slug}\" first to close or delete this worktree"
+                            "Open project \"{slug}\" first to close or delete this worktree"
                         );
                         return Some(SidebarOutcome::Redraw);
                     }
@@ -428,8 +428,8 @@ impl SidebarState {
                     entries.push(sep());
                     entries.push(
                         e(
-                            "remove-workspace",
-                            "Remove workspace…",
+                            "remove-project",
+                            "Remove project…",
                             Some(chord_of(Id::Delete)),
                         )
                         .danger(),
@@ -764,7 +764,7 @@ impl SidebarState {
                         }
                         self.sync(model);
                     } else {
-                        model.status = "Only worktrees and workspaces can be marked".into();
+                        model.status = "Only worktrees and projects can be marked".into();
                     }
                 }
             }
@@ -809,7 +809,7 @@ impl SidebarState {
                 if let Some(out) = self.folder_outcome(model) {
                     return out;
                 }
-                model.status = "Folders apply to worktree and workspace rows".into();
+                model.status = "Folders apply to worktree and project rows".into();
             }
             Id::CopyPath => {
                 if let Some(p) = self
@@ -887,8 +887,7 @@ impl SidebarState {
                 // Dormant workspace's worktree: rename runs through the live
                 // session; surface why nothing happened instead of no-opping.
                 if let Some(slug) = dormant_ws {
-                    model.status =
-                        format!("Open workspace \"{slug}\" first to rename this worktree");
+                    model.status = format!("Open project \"{slug}\" first to rename this worktree");
                     return Some(SidebarOutcome::Redraw);
                 }
                 None
@@ -1000,7 +999,7 @@ impl SidebarState {
         let skipped = self.marked_nonworktree_count(model);
         if skipped > 0 {
             model.status =
-                format!("{skipped} workspace(s) skipped — select worktrees to close/delete");
+                format!("{skipped} project(s) skipped — select worktrees to close/delete");
         }
     }
 
@@ -1106,7 +1105,7 @@ impl SidebarState {
                 self.view.sort.as_str()
             )
         } else {
-            "Sidebar: grouped by workspace".into()
+            "Sidebar: grouped by project".into()
         };
         SidebarOutcome::Redraw
     }
@@ -1211,7 +1210,7 @@ impl SidebarState {
                     return SidebarOutcome::DeleteGroups(vec![g]);
                 }
             }
-            "remove-workspace" | "delete-folder" | "close-terminal" => {
+            "remove-project" | "remove-workspace" | "delete-folder" | "close-terminal" => {
                 if let Some(out) = self.delete_outcome(model, session) {
                     return out;
                 }

@@ -1134,7 +1134,7 @@ pub fn build_rows(
     }
 
     if rows.is_empty() {
-        rows.push(SidebarRow::base(RowKind::Workspace, 0, "no workspaces", ""));
+        rows.push(SidebarRow::base(RowKind::Workspace, 0, "no projects", ""));
     }
 
     // One compact roster rollup, only while agents are actually running. Placed
