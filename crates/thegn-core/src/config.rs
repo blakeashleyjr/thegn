@@ -284,6 +284,7 @@ pub use crate::config_notifications::{
     DndConfig, NotificationMode, NotificationRule, NotificationsConfig, NotificationsOverlay,
     SoundConfig, SoundMode,
 };
+pub use crate::config_voice::{VoiceConfig, VoiceKind};
 
 config_enum! {
     /// Where worktrees live on disk.
@@ -4841,6 +4842,9 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
+    /// `[voice]` — opt-in experimental command-backed speech-to-text. No audio
+    /// worker or child process exists while this is disabled.
+    pub voice: VoiceConfig,
     /// `[usage]` — the AI-account usage tracker overlay (`open-usage`). Opt-in,
     /// additive; the shell never depends on it. See [`UsageConfig`].
     pub usage: UsageConfig,
@@ -5024,6 +5028,7 @@ impl Default for Config {
             recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
             media: MediaConfig::default(),
+            voice: VoiceConfig::default(),
             usage: UsageConfig::default(),
             model_proxy: crate::config_model_proxy::ModelProxyConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),

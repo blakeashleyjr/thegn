@@ -768,9 +768,11 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
+        // 90 → 91 (THE-59): `[voice] kind` (VoiceKind — generic command
+        // provider).
         assert_eq!(
             defs.len(),
-            90,
+            91,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
