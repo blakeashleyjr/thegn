@@ -89,6 +89,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());
+            errs.extend(cfg.ci.validate());
         }
     }
     let root = config_schema();

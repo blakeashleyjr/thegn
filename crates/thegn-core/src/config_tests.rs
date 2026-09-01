@@ -3041,6 +3041,29 @@ fn workspace_slug_is_the_repo_directory_name_slugified() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn repo_ci_uses_only_the_trusted_workspace_overlay() {
+    let dir = tmpdir("ci-overlay");
+    let mut cfg = Config::default();
+    assert_eq!(cfg.repo_ci(&dir).autofix.mode, CiAutofixMode::Off);
+    cfg.ci.autofix.mode = CiAutofixMode::Suggest;
+    cfg.workspace.insert(
+        workspace_slug(&dir),
+        WorkspaceConfig {
+            ci: CiAutofixOverlay {
+                mode: Some(CiAutofixMode::Auto),
+            },
+            ..WorkspaceConfig::default()
+        },
+    );
+    assert_eq!(cfg.repo_ci(&dir).autofix.mode, CiAutofixMode::Auto);
+    // The repo file shape deliberately has no `ci` field, so deserializing a
+    // repo overlay cannot change this trusted setting.
+    let parsed: Config = toml::from_str("[ci.autofix]\nmode = \"suggest\"\n").unwrap();
+    assert_eq!(parsed.ci.autofix.mode, CiAutofixMode::Suggest);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- strftime validation (the render-path panic guard) ---------------------
 
 #[test]

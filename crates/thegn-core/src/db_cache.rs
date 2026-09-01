@@ -103,6 +103,31 @@ impl CacheStore for Db {
         Ok(())
     }
 
+    fn get_ci_log(
+        &self,
+        worktree: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<crate::ci_log::CiLogEntry>> {
+        self.get_ci_log_entry(worktree, run_id, job_id)
+    }
+
+    fn list_ci_logs(&self, worktree: &str) -> Result<Vec<crate::ci_log::CiLogEntry>> {
+        self.list_ci_log_entries(worktree)
+    }
+
+    fn put_ci_log(&self, entry: &crate::ci_log::CiLogEntry) -> Result<()> {
+        self.put_ci_log_entry(entry)
+    }
+
+    fn retain_ci_logs(&self, worktree: &str, run_ids: &[String]) -> Result<usize> {
+        self.retain_ci_log_runs(worktree, run_ids)
+    }
+
+    fn claim_ci_autofix(&self, candidate: &crate::ci_log::CiLogCandidate) -> Result<bool> {
+        Db::claim_ci_autofix(self, candidate)
+    }
+
     fn get_pr_branch_cache(&self, repo_root: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
@@ -361,5 +386,39 @@ mod tests {
         assert_eq!(rows[0].1, "{\"n\":3}");
         assert!(rows[0].2 > 0);
         assert_eq!(rows[1].0, "/wt/b");
+    }
+
+    #[test]
+    fn ci_log_cache_round_trips_redacts_and_dedupes() {
+        use crate::ci_log::{CiLogCandidate, CiLogEntry};
+        use crate::store::CacheStore;
+
+        let db = Db::open_memory().unwrap();
+        let mut entry = CiLogEntry::new(
+            "/wt/a",
+            "run-1",
+            "job-1",
+            "tests",
+            "token=secret\nordinary\n",
+            20,
+            1024,
+            123,
+        );
+        entry.head_sha = "abc".into();
+        db.put_ci_log(&entry).unwrap();
+        let got = db.get_ci_log("/wt/a", "run-1", "job-1").unwrap().unwrap();
+        assert!(got.redacted);
+        assert!(!got.text.contains("plain-secret"));
+        assert_eq!(db.list_ci_logs("/wt/a").unwrap().len(), 1);
+        assert!(
+            db.claim_ci_autofix(&CiLogCandidate {
+                worktree: "/wt/a".into(),
+                run_id: "run-1".into(),
+                job_id: "job-1".into(),
+                head_sha: "abc".into(),
+            })
+            .unwrap()
+        );
+        assert!(!db.claim_ci_autofix(&entry.candidate()).unwrap());
     }
 }

@@ -128,12 +128,16 @@ use std::path::PathBuf;
 /// them by 1000. See [`crate::issue::normalize_dispatch_ms`], the read-side
 /// guard for values that never pass through this migration.
 ///
+/// v62: adds the bounded CI log cache and autofix handoff dedupe table.
+/// Purely additive; CI remains a best-effort cache and the provider is the
+/// source of truth.
+///
 /// v61: adds `agent_dispatches.report` (the worker's structured handoff
 /// summary, ≤16 KiB) and the `agent_dispatch_notes` table (per-row progress
 /// queue; kept separate from `agent_dispatches.note` which is the daemon's
 /// transport-retry observer ledger). Purely additive — a pre-v61 row reads
 /// back `report = None`, which is exactly the pre-change behaviour.
-pub const SCHEMA_VERSION: i64 = 61;
+pub const SCHEMA_VERSION: i64 = 62;
 
 pub struct Db {
     conn: Connection,
@@ -484,6 +488,33 @@ impl Db {
               branch     TEXT,
               json       TEXT,
               fetched_at INTEGER
+            );
+            -- v62: bounded, redacted per-job CI log tails. The provider is
+            -- authoritative; this table only makes read paths instant and
+            -- resilient to a transient provider failure.
+            CREATE TABLE IF NOT EXISTS ci_log_cache (
+              worktree   TEXT NOT NULL,
+              run_id     TEXT NOT NULL,
+              job_id     TEXT NOT NULL,
+              job_name   TEXT NOT NULL,
+              head_sha   TEXT NOT NULL DEFAULT '',
+              text       TEXT NOT NULL,
+              truncated  INTEGER NOT NULL DEFAULT 0,
+              redacted   INTEGER NOT NULL DEFAULT 1,
+              fetched_at INTEGER NOT NULL,
+              PRIMARY KEY (worktree, run_id, job_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ci_log_cache_worktree
+              ON ci_log_cache(worktree, fetched_at);
+            -- v62: intent marker for a single `(worktree, run, job, head)`
+            -- autofix spend. It is cache-side state, never provider truth.
+            CREATE TABLE IF NOT EXISTS ci_autofix_dedupe (
+              worktree   TEXT NOT NULL,
+              run_id     TEXT NOT NULL,
+              job_id     TEXT NOT NULL,
+              head_sha   TEXT NOT NULL,
+              claimed_at INTEGER NOT NULL,
+              PRIMARY KEY (worktree, run_id, job_id, head_sha)
             );
             -- Last computed `diff --files` TSV per worktree, so the panel can
             -- paint instantly from cache (via `panel-snapshot`) and hydrate live.
@@ -931,7 +962,7 @@ impl Db {
         )?;
         crate::db_migrate::additive_schema(&conn);
         if ver < SCHEMA_VERSION {
-            crate::db_migrate::verify_v61_schema(&conn)?;
+            crate::db_migrate::verify_v62_schema(&conn)?;
         }
         // v6: flat v4/v5 `tab_layout` → worktree groups (idempotent).
         migrate_tab_layout_v6(&conn);

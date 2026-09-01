@@ -285,6 +285,10 @@ pub enum Verb {
     Shutdown,
     /// Read a worktree's cached PR status (the PR panel's header row).
     PrStatus,
+    /// Read cached CI run metadata for a worktree.
+    CiRuns,
+    /// Read bounded, redacted cached CI job logs.
+    CiLogs,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
     /// Produce a redacted debug support bundle (`thegn doctor bundle`). An
@@ -431,6 +435,8 @@ impl Verb {
         Verb::ApprovePairing,
         Verb::Shutdown,
         Verb::PrStatus,
+        Verb::CiRuns,
+        Verb::CiLogs,
         Verb::NotifyPush,
         Verb::DoctorBundle,
         Verb::SecretSet,
@@ -500,6 +506,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::CiRuns
+        | Verb::CiLogs
         | Verb::McpProxyStatus
         | Verb::ProjectList
         | Verb::IssuesList
@@ -837,6 +845,8 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            CiRuns,
+            CiLogs,
             McpProxyStatus,
             ProjectList,
             IssuesList,
