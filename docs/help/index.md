@@ -7,7 +7,7 @@ order: 0
 # thegn
 
 A terminal-native git-worktree IDE that is its own terminal multiplexer.
-One process, one session: each git repo is a **workspace**, each git
+One process, one session: each git repo is a **project**, each git
 **worktree** is a **tab**, and the chrome — the [[sidebar]] tree, the
 [[panel|diff/PR panel]], the tab bar, the status bar, and the pin strip —
 is rendered in-process.
@@ -25,7 +25,7 @@ list and the page; `↵` follows a link; `[` goes back.
 
 ## The screen, by region
 
-- [[sidebar]] — the left tree: workspaces, worktrees, terminals
+- [[sidebar]] — the left tree: projects, worktrees, terminals
 - [[terminal-and-panes]] — the center: tabs, splits, tools
 - [[panel]] — the right panel: diff, PRs, CI, the merge and PR queues, and more
 - [[drawer-and-corner]] — the bottom file drawer and the corner pin
