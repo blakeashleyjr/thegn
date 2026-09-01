@@ -28,6 +28,7 @@ pub struct SidebarDisplay {
     pub show_ahead_behind: bool,
     pub show_pr_chip: bool,
     pub show_jj: bool,
+    pub show_submodules: bool,
     pub focus_detail: thegn_core::config::FocusDetail,
     pub detail_branch: bool,
     pub detail_branch_stat: bool,
@@ -47,6 +48,7 @@ impl Default for SidebarDisplay {
             show_ahead_behind: true,
             show_pr_chip: true,
             show_jj: true,
+            show_submodules: true,
             focus_detail: thegn_core::config::FocusDetail::All,
             detail_branch: true,
             detail_branch_stat: true,
@@ -68,6 +70,7 @@ impl SidebarDisplay {
             show_ahead_behind: ui.sidebar_show_ahead_behind,
             show_pr_chip: ui.sidebar_show_pr_chip,
             show_jj: ui.sidebar_show_jj,
+            show_submodules: ui.sidebar_show_submodules,
             focus_detail: ui.sidebar_focus_detail,
             detail_branch: ui.sidebar_detail_branch,
             detail_branch_stat: ui.sidebar_detail_branch_stat,
@@ -1739,6 +1742,10 @@ fn compose_row_lines(
                 if g.dirty && disp.show_status_icon {
                     right.push(seg(Tok::Hue(theme::Hue::Amber), disp.status_glyph())); // ●
                 }
+                if g.submodule_dirty && disp.show_submodules {
+                    push_sp(&mut right);
+                    right.push(seg(Tok::Hue(theme::Hue::Purple), gl.submodule));
+                }
                 if disp.show_diff_stat {
                     if g.add > 0 {
                         push_sp(&mut right);
@@ -2382,6 +2389,36 @@ mod tests {
                 .any(|s| s.text.trim() == gl.folder && s.fg == crate::seg::Tok::Slot(S::Faint)),
             "the folder glyph dropped to faint"
         );
+    }
+
+    #[test]
+    fn submodule_indicator_is_separate_caps_safe_and_toggleable() {
+        use crate::sidebar::{GitGlyphs, SidebarRow};
+        let mut row = SidebarRow::base(RowKind::Worktree, 1, "feature", "app");
+        row.git = Some(GitGlyphs {
+            dirty: false,
+            submodule_dirty: true,
+            ..GitGlyphs::default()
+        });
+        let text = |display: &SidebarDisplay| -> String {
+            compose_row_lines(&row, None, false, false, true, None, None, display)
+                .into_iter()
+                .flat_map(|line| match line {
+                    crate::seg::Line::Segs(segments)
+                    | crate::seg::Line::Split { r: segments, .. }
+                    | crate::seg::Line::SplitMinLeft { r: segments, .. } => segments,
+                    _ => Vec::new(),
+                })
+                .map(|segment| segment.text)
+                .collect()
+        };
+        let shown = text(&SidebarDisplay::default());
+        assert!(shown.contains(crate::caps::active_glyphs().submodule));
+        let hidden = text(&SidebarDisplay {
+            show_submodules: false,
+            ..SidebarDisplay::default()
+        });
+        assert!(!hidden.contains(crate::caps::active_glyphs().submodule));
     }
 
     #[test]

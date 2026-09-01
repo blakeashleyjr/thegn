@@ -1240,6 +1240,7 @@ mod tests {
             path: path.into(),
             added: 5,
             deleted: 1,
+            submodule: None,
             incoming: false,
         }
     }

@@ -568,9 +568,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
             lifecycle(LifecycleEvent::Landed);
             outln!("{branch} already merged.");
         }
-        AttemptOutcome::Conflict { paths } => {
+        AttemptOutcome::Conflict {
+            paths,
+            submodule_conflicts,
+        } => {
             lifecycle(LifecycleEvent::Failed);
-            outln!("✗ {branch} conflicts: {}", paths.join(", "));
+            let detail =
+                crate::integrate::conflict_details(&paths, &submodule_conflicts).join(", ");
+            outln!("✗ {branch} conflicts: {detail}");
             failure = Some(format!("land failed: {branch} conflicts"));
         }
         AttemptOutcome::GateFailed { .. } => {

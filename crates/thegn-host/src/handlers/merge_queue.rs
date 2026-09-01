@@ -990,8 +990,12 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 ..DriveOutcome::default()
             })
         }
-        AttemptOutcome::Conflict { paths } => {
-            let detail = paths.join("\n");
+        AttemptOutcome::Conflict {
+            paths,
+            submodule_conflicts,
+        } => {
+            let detail =
+                crate::integrate::conflict_details(&paths, &submodule_conflicts).join("\n");
             record("deferred", None, Some(&detail));
             lifecycle(LifecycleEvent::Failed, &branch);
             DriveMsg::Failed(format!(

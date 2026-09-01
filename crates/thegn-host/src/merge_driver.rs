@@ -74,8 +74,18 @@ pub(crate) struct DriveOutcome {
 
 /// Why a branch didn't land — the material a fixing agent needs.
 enum Failure {
-    Conflict(Vec<String>),
+    Conflict {
+        paths: Vec<String>,
+        submodule_conflicts: Vec<thegn_core::submodule::SubmoduleConflict>,
+    },
     Gate(String),
+}
+
+fn conflict_detail(
+    paths: &[String],
+    conflicts: &[thegn_core::submodule::SubmoduleConflict],
+) -> String {
+    crate::integrate::conflict_details(paths, conflicts).join("\n")
 }
 
 /// Queue rows belonging to `root`'s repo (the queue is global; a drain is
@@ -257,7 +267,13 @@ pub(crate) fn drive_queue(
                     out.gate_error.push(item.branch.clone());
                     break;
                 }
-                AttemptOutcome::Conflict { paths } => Failure::Conflict(paths),
+                AttemptOutcome::Conflict {
+                    paths,
+                    submodule_conflicts,
+                } => Failure::Conflict {
+                    paths,
+                    submodule_conflicts,
+                },
                 AttemptOutcome::GateFailed { log } => Failure::Gate(log),
             };
 
@@ -325,8 +341,11 @@ pub(crate) fn drive_queue(
             // state. A branch we tried to fix and couldn't is `needs_human`;
             // one we never tried keeps the classic deferred/gate_failed status.
             match failure {
-                Failure::Conflict(paths) => {
-                    let detail = paths.join("\n");
+                Failure::Conflict {
+                    paths,
+                    submodule_conflicts,
+                } => {
+                    let detail = conflict_detail(&paths, &submodule_conflicts);
                     let status = if agent_runs > 0 {
                         "needs_human"
                     } else {
@@ -433,9 +452,15 @@ fn compose(
     use thegn_core::agent_task::{TaskKind, TaskVars, format_paths, render_prompt};
 
     let (kind, vars) = match failure {
-        Failure::Conflict(paths) => (
+        Failure::Conflict {
+            paths,
+            submodule_conflicts,
+        } => (
             TaskKind::MergeConflict,
-            TaskVars::new().set("paths", format_paths(paths)),
+            TaskVars::new().set("paths", format_paths(paths)).set(
+                "submodule_conflicts",
+                thegn_core::agent_task::format_submodule_conflicts(submodule_conflicts),
+            ),
         ),
         Failure::Gate(log) => (
             TaskKind::GateFailure,
@@ -509,7 +534,10 @@ mod tests {
             "/w/x",
             "feat-x",
             "main",
-            &Failure::Conflict(vec!["src/a.rs".into(), "src/b.rs".into()]),
+            &Failure::Conflict {
+                paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+                submodule_conflicts: Vec::new(),
+            },
         )
         .expect("built-in template renders");
         assert_eq!(kind, thegn_core::agent_task::TaskKind::MergeConflict);
@@ -546,12 +574,39 @@ mod tests {
             "/w/x",
             "feat-x",
             "main",
-            &Failure::Conflict(vec!["src/a.rs".into()]),
+            &Failure::Conflict {
+                paths: vec!["src/a.rs".into()],
+                submodule_conflicts: Vec::new(),
+            },
         )
         .unwrap();
         assert_eq!(p, "fix feat-x vs main, see:\n  - src/a.rs\n");
         // The built-in rules are gone precisely because the user replaced them.
         assert!(!p.contains("Do NOT push"));
+    }
+
+    #[test]
+    fn conflict_prompt_receives_typed_submodule_details() {
+        let mut cfg = MergeQueueConfig::default();
+        cfg.prompts.conflict = "{submodule_conflicts}".into();
+        let (_, vars, prompt) = compose(
+            &cfg,
+            "/w/x",
+            "feat-x",
+            "main",
+            &Failure::Conflict {
+                paths: vec!["vendor/lib".into()],
+                submodule_conflicts: vec![thegn_core::submodule::SubmoduleConflict {
+                    path: "vendor/lib".into(),
+                    ours_sha: "abc1234".into(),
+                    theirs_sha: "def5678".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let expected = "submodule pointer conflict: vendor/lib (abc1234 vs def5678)";
+        assert_eq!(vars.get("submodule_conflicts"), Some(expected));
+        assert_eq!(prompt, expected);
     }
 
     #[test]
@@ -569,7 +624,17 @@ mod tests {
         let mut cfg = MergeQueueConfig::default();
         cfg.prompts.conflict = "fix {branchh}".into();
         assert!(
-            compose(&cfg, "/w/x", "b", "main", &Failure::Conflict(vec![])).is_none(),
+            compose(
+                &cfg,
+                "/w/x",
+                "b",
+                "main",
+                &Failure::Conflict {
+                    paths: Vec::new(),
+                    submodule_conflicts: Vec::new(),
+                }
+            )
+            .is_none(),
             "a typo'd placeholder must not reach the agent as a blank"
         );
     }

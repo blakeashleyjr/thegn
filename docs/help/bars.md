@@ -94,6 +94,14 @@ neither widget ever prints a placeholder zero. Turn either off with
 `[loc] enabled = false` or `[disk] show_sizes = false`, which also hides
 whatever was already measured.
 
+Submodules deliberately have different disk and LOC boundaries. `disk` answers
+“how many physical apparent bytes are laid out here,” so a populated submodule
+directory is included once in its superproject. `loc` answers “how much source
+is owned by this worktree,” so it excludes every normalized submodule directory
+and recursive descendant. A gitlink never creates a synthetic second worktree
+row; if that repository is independently registered as a worktree, its own row
+may receive its own measurements.
+
 The hint strip is the quick reference; this help (`F1`) and the
 [[keybindings]] page are the complete one.
 

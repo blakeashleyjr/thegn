@@ -38,6 +38,20 @@ database only caches and resurrects what git already knows.
   project files) appear in the "what to run" picker and the
   [[command-palette]].
 
+With `[git] submodules = "auto"` (the default), a clone or newly-added
+worktree that has a root `.gitmodules` initializes its submodules recursively
+on the existing background creation worker. Provider and remote
+materialization follow the same rule. Initialization failure is non-fatal: the
+worktree stays registered and usable, and the progress/error notice says that
+submodules were not initialized. Set the mode to `"off"` to skip recursive
+clone, initialization, and deeper state reads.
+
+Before initialization, thegn normalizes the configured path/URL pairs and uses
+the repository-trust approval flow for a distinct submodule request. Denial or
+an unavailable approval never enables `protocol.file.allow` and never blocks
+the checkout itself. The mode is trusted user/workspace configuration; a repo
+cannot turn it on through its own `.thegn.toml`.
+
 ## Switching
 
 - `Alt-↑/↓` — move to the pane above/below; at the top/bottom pane, with no

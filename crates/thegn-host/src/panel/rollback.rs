@@ -294,6 +294,7 @@ mod tests {
             path: path.into(),
             added: 0,
             deleted: 0,
+            submodule: None,
             incoming: false,
         }
     }
