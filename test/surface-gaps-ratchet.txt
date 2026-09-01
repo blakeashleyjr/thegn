@@ -84,16 +84,28 @@ notify.push	mcp	MCP state tools land in the client-API phase
 pr.status	mcp	MCP state tools land in the client-API phase
 project.assign	grpc	control-API route deferred; CLI-only for now
 project.assign	http	control-API route deferred; CLI-only for now
+program.assign	grpc	control-API route deferred; CLI-only for now
+program.assign	http	control-API route deferred; CLI-only for now
 project.create	grpc	control-API route deferred; CLI-only for now
 project.create	http	control-API route deferred; CLI-only for now
+program.create	grpc	control-API route deferred; CLI-only for now
+program.create	http	control-API route deferred; CLI-only for now
 project.list	grpc	control-API route deferred; CLI-only for now
 project.list	http	control-API route deferred; CLI-only for now
+program.list	grpc	control-API route deferred; CLI-only for now
+program.list	http	control-API route deferred; CLI-only for now
 project.new_feature	grpc	control-API route deferred; CLI-only for now
 project.new_feature	http	control-API route deferred; CLI-only for now
+program.new_feature	grpc	control-API route deferred; CLI-only for now
+program.new_feature	http	control-API route deferred; CLI-only for now
 project.rename	grpc	control-API route deferred; CLI-only for now
 project.rename	http	control-API route deferred; CLI-only for now
+program.rename	grpc	control-API route deferred; CLI-only for now
+program.rename	http	control-API route deferred; CLI-only for now
 project.rm	grpc	control-API route deferred; CLI-only for now
 project.rm	http	control-API route deferred; CLI-only for now
+program.rm	grpc	control-API route deferred; CLI-only for now
+program.rm	http	control-API route deferred; CLI-only for now
 search.query	cli	local worktree-fs verb; runs in-process, not through the control API
 search.replace	cli	local worktree-fs verb; runs in-process, not through the control API
 secret.audit	grpc	control-API route deferred; CLI-only for now

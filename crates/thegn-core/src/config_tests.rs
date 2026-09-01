@@ -1502,6 +1502,7 @@ fn preview_config_layering_and_cli_array_override() {
 fn env_overlay_covers_every_knob() {
     let env = map_env(&[
         ("THEGN_WORKTREES_DIR", "/wt"),
+        ("THEGN_PROJECTS_DIR", "/ws"),
         ("THEGN_WORKSPACES_DIR", "/ws"),
         ("THEGN_BASE_BRANCH", "develop"),
         ("THEGN_BRANCH_PREFIX", "x/"),
@@ -1726,6 +1727,13 @@ exclude = ["../escape", "mq", "mq"]
             .any(|e| e.contains("skills.exclude[2]") && e.contains("duplicate")),
         "{errors:?}"
     );
+}
+
+#[test]
+fn legacy_projects_env_alias_is_still_accepted() {
+    let env = map_env(&[("THEGN_WORKSPACES_DIR", "/legacy-projects")]);
+    let c = Config::load_layered(&env, &[], None);
+    assert_eq!(c.workspaces_dir, "/legacy-projects");
 }
 
 #[test]

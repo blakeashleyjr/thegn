@@ -255,13 +255,13 @@ token (the outcome pops as a toast and is logged), `n` opens the add
 wizard, and `x`
 removes it after a confirm (removal also forgets the stored token). An
 environment can keep a **warm spare pool** so new worktrees start
-instantly; raise or lower the active workspace's pool target with the
+instantly; raise or lower the active project's pool target with the
 warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable).
-Pool state shows on the sidebar's workspace chip, not in this section.
+Pool state shows on the sidebar's project chip, not in this section.
 `[sandbox] default_env` picks the environment new worktrees use.
 
 An environment can keep a **warm spare pool** so new worktrees start
-instantly; the warm-pool actions raise and lower the active workspace's
+instantly; the warm-pool actions raise and lower the active project's
 target (palette-runnable and bindable).
 
 ## Lifecycle hooks and pane setup

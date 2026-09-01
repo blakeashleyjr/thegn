@@ -80,7 +80,7 @@ pub enum Action {
     New {
         /// Branch-name tail (the configured prefix + numbering scheme are
         /// applied); omitted = a generated candidate name. Required with
-        /// `--project` (the feature's linked branch name).
+        /// `--program` (the feature's linked branch name).
         name: Option<String>,
         /// Repo to create in (default: resolved from cwd / $THEGN_WORKTREE).
         #[arg(long)]
@@ -91,11 +91,11 @@ pub enum Action {
         /// Pin a named execution env (`[env.<name>]`) for the new worktree.
         #[arg(long)]
         env: Option<String>,
-        /// Create the feature across a project's member repos: one resolved
-        /// branch name + a worktree in each member (see `thegn project`).
-        #[arg(long)]
-        project: Option<String>,
-        /// With `--project`, restrict to a comma-separated subset of member
+        /// Create the feature across a program's member repos: one resolved
+        /// branch name + a worktree in each member (see `thegn program`).
+        #[arg(long, visible_alias = "project")]
+        program: Option<String>,
+        /// With `--program`, restrict to a comma-separated subset of member
         /// repos (by name), e.g. `--repos api,web`.
         #[arg(long)]
         repos: Option<String>,
@@ -137,11 +137,11 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             repo,
             base,
             env,
-            project,
+            program,
             repos,
             from_issue,
             json,
-        } => match project {
+        } => match program {
             Some(p) => new_batched(cfg, name, &p, repos, base, env, json),
             None => new(cfg, name, repo, base, env, from_issue, json),
         },
@@ -337,7 +337,7 @@ fn create_and_register(
     Ok(path_s)
 }
 
-/// `wt new --project <p>` — batched cross-repo feature creation. Resolves ONE
+/// `wt new --program <p>` — batched cross-repo feature creation. Resolves ONE
 /// linked branch name (prefix + slug, applied once — per-repo prefix overrides
 /// are NOT re-applied, so identity is literal) and creates that exact branch +
 /// worktree in each member repo (or a `--repos` subset), running the same
@@ -348,7 +348,7 @@ fn create_and_register(
 fn new_batched(
     cfg: &Config,
     name: Option<String>,
-    project_name: &str,
+    program_name: &str,
     repos: Option<String>,
     base: Option<String>,
     env: Option<String>,
@@ -359,7 +359,7 @@ fn new_batched(
 
     let Some(feature) = name.filter(|n| !n.trim().is_empty()) else {
         anyhow::bail!(
-            "a --project feature needs a name: `thegn wt new <name> --project {project_name}`"
+            "a --program feature needs a name: `thegn wt new <name> --program {program_name}`"
         );
     };
 
@@ -381,17 +381,17 @@ fn new_batched(
     let proj = db
         .list_projects()?
         .into_iter()
-        .find(|p| p.name == project_name)
+        .find(|p| p.name == program_name)
         .ok_or_else(|| {
             super::NotFound(format!(
-                "no project named {project_name:?} (create it with `thegn project create {project_name}`)"
+                "no program named {program_name:?} (create it with `thegn program create {program_name}`)"
             ))
         })?;
     let members = db.project_members(proj.project_id)?;
     if members.is_empty() {
         anyhow::bail!(
-            "project {project_name} has no member repos — assign some with \
-             `thegn project assign {project_name} <repo>`"
+            "program {program_name} has no member repos — assign some with \
+             `thegn program assign {program_name} <repo>`"
         );
     }
 
@@ -488,13 +488,13 @@ fn new_batched(
             unknown_repos: &'a [String],
         }
         super::emit_json(&Report {
-            project: project_name,
+            project: program_name,
             branch: &branch,
             members: &outcomes,
             unknown_repos: &plan.unknown_repos,
         })?;
     } else {
-        outln!("project {project_name}: feature branch {branch}");
+        outln!("program {program_name}: feature branch {branch}");
         for o in &outcomes {
             match (o.status, &o.path, &o.error) {
                 ("created", Some(p), _) => outln!("  {} created  {}", o.repo, p),
@@ -504,7 +504,7 @@ fn new_batched(
             }
         }
         for u in &plan.unknown_repos {
-            outln!("  (warning) --repos {u:?} matches no member of {project_name}");
+            outln!("  (warning) --repos {u:?} matches no member of {program_name}");
         }
     }
 

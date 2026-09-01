@@ -54,7 +54,7 @@ pub fn cheatsheet_groups(cfg: &thegn_core::config::Config) -> Vec<HintGroup> {
             {
                 &mut lifecycle
             }
-            id if id.starts_with("focus-") || id.ends_with("-tab") || id == "switch-workspace" => {
+            id if id.starts_with("focus-") || id.ends_with("-tab") || id == "switch-project" => {
                 &mut nav
             }
             id if id.starts_with("split-")
@@ -71,7 +71,7 @@ pub fn cheatsheet_groups(cfg: &thegn_core::config::Config) -> Vec<HintGroup> {
     }
 
     [
-        ("Workspaces & worktrees", lifecycle),
+        ("Projects & worktrees", lifecycle),
         ("Navigation", nav),
         ("Panels & layout", view),
         ("Tools", tools),

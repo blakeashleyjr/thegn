@@ -34,7 +34,7 @@ multi-tier trackers are. See [[review-a-pr]].
 
 ## What stable guarantees
 
-Everything else. The AI-free workspace shell — git, panes, the
+Everything else. The AI-free terminal shell — git, panes, the
 [[sidebar]], the [[panel]], [[daemon-and-sessions]], the merge queue and
 `land`/`integrate`, the [[sandboxing]] backends, the whole [[cli]] — is
 unconditionally stable and never channel-gated.
