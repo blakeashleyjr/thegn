@@ -277,7 +277,10 @@ mod tests {
         };
         match classify(&row(1, S::Running), &f) {
             ReapVerdict::MarkFailed { why } => {
-                assert!(why.contains("not tracked") || why.contains("NOT tracked"), "{why}");
+                assert!(
+                    why.contains("not tracked") || why.contains("NOT tracked"),
+                    "{why}"
+                );
                 assert!(why.contains("THE-91"), "{why}");
             }
             other => panic!("expected MarkFailed, got {other:?}"),
@@ -348,6 +351,10 @@ mod tests {
         assert_eq!(s.needs_decision, 1);
         assert_eq!(s.mark_failed, 1);
         assert_eq!(s.closed, 1);
-        assert_eq!(s.actionable(), 2, "only close-done and mark-failed change rows");
+        assert_eq!(
+            s.actionable(),
+            2,
+            "only close-done and mark-failed change rows"
+        );
     }
 }

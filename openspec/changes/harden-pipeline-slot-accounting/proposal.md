@@ -14,7 +14,7 @@ Four independent defects lined up. Each is individually plausible; together
 they form a runaway.
 
 1. **The handoff contract was unenforceable.** `311d7e60` (THE-88,
-   2026-08-28 19:33) made a worker *report* mandatory for `set-status done`.
+   2026-08-28 19:33) made a worker _report_ mandatory for `set-status done`.
    The deployed `[[pipeline.stages]]` prompts were never updated to ask for
    one — they never even referenced `{row}`, so a worker could not have filed
    a report if it wanted to. Every row dispatched after that commit became
@@ -24,8 +24,8 @@ they form a runaway.
 
 2. **`running` meant two opposite things.** A row's status could not
    distinguish a live worker from one that had exited hours ago into a row
-   nobody closed. The supervisor filled slots by counting *live daemon
-   sessions*, so every exited-but-open row read as free capacity — and it
+   nobody closed. The supervisor filled slots by counting _live daemon
+   sessions_, so every exited-but-open row read as free capacity — and it
    re-dispatched into it, repeatedly.
 
 3. **Slot accounting was not atomic.** `dispatch list` → judgment →
@@ -49,7 +49,7 @@ parallel work. Identity must include the artifact.
 Structure-not-judgment still holds: thegn does not gain a scheduler, does not
 advance `next`, and does not decide what to dispatch. What it gains is
 **arithmetic the supervisor could not do correctly from outside**, and the
-ability to *say* what state a row is in.
+ability to _say_ what state a row is in.
 
 - **Refuse an older build against a newer database** (`db::schema_refusal`),
   with one actionable error instead of a repeated warning. Escape hatch:
@@ -58,7 +58,7 @@ ability to *say* what state a row is in.
   path and each registered daemon's actual `/proc/<pid>/exe`. These are the
   facts `--version` could not show.
 - **Schema v63**: `agent_dispatches.exit_code` / `.exited_at_ms`, stamped on
-  pane exit *even when the status deliberately does not move*, plus
+  pane exit _even when the status deliberately does not move_, plus
   `pipeline_leases`. `pipeline_run::row_liveness` derives
   `Live | ExitedUnverified | Closed`; `dispatch list` prints `running!exited`
   and states plainly that such rows are not free capacity.
@@ -85,7 +85,7 @@ ability to *say* what state a row is in.
   lineage). This change repays reliability debt in that surface rather than
   adding a feature.
 - Schema v62 → v63, purely additive; a pre-v63 row reads `None` for the exit
-  pair, which means *unknown*, never *exited*.
+  pair, which means _unknown_, never _exited_.
 - Behavioural change with a blast radius worth naming: a build older than the
   on-disk schema now **fails to start** instead of running read-only. That is
   the point — but it means a stale checkout sharing the state dir will stop

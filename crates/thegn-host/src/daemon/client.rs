@@ -75,7 +75,12 @@ pub(crate) async fn ensure_daemon(dcfg: &DaemonConfig) -> Result<ControlClient> 
     //    not adopt the daemon on its tty) and wait for the socket. The daemon
     //    binds the socket as its lock, so a spawn race resolves itself: the
     //    loser exits 0 and both clients connect to the winner.
-    let exe = std::env::current_exe().context("current_exe for daemon spawn")?;
+    // Not `current_exe()` directly: after a rebuild-in-place it names a deleted
+    // file, and the spawn below then ENOENTs on every pane open. `self_exe`
+    // re-execs this same build through `/proc/self/exe`, which also keeps the
+    // daemon's schema/wire version matched to ours.
+    let exe = thegn_core::util::self_exe()
+        .context("resolving this executable's path for daemon spawn")?;
     let mut cmd = thegn_core::util::detached(&exe.to_string_lossy());
     cmd.arg("daemon").arg("--socket").arg(&sock);
     cmd.spawn().context("spawn pane daemon")?;

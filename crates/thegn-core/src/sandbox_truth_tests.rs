@@ -112,6 +112,67 @@ fn every_backend_round_trips() {
 }
 
 #[test]
+fn every_backend_round_trips_through_the_cpu_cap() {
+    // The gap that let the bug in: [`every_backend_round_trips`] pins
+    // `cpu_total = "off"` because a real cap makes `enter_argv` host-dependent
+    // (it probes the host's cgroup mechanism). So the ONE argv shape the cap
+    // produces — `systemd-run --scope … -- <runtime> …` — was never observed in
+    // a test, and every capped bwrap pane read as a degraded fallback to
+    // `systemd` in production.
+    //
+    // Applying the cap explicitly with a fixed mechanism keeps this
+    // host-independent, so the case can be pinned rather than skipped.
+    for b in all_backends().into_iter().filter(|b| argv_visible(*b)) {
+        let argv = enter_argv(&spec(b), "zsh");
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            memory: Some("24G".into()),
+            ..SandboxLimits::default()
+        };
+        let capped = crate::sandbox_cpucap::wrap_provider_pane_argv(
+            argv.clone(),
+            &limits,
+            crate::sandbox_cpucap::CpuCap::ScopeHard,
+        );
+        assert_eq!(
+            observed(&capped),
+            b,
+            "backend {} reads as {:?} once the CPU cap wraps it: {capped:?}",
+            b.label(),
+            observed(&capped)
+        );
+    }
+}
+
+#[test]
+fn a_merely_capped_host_shell_is_not_a_systemd_sandbox() {
+    // The inverse lie, and the one this module exists to prevent: capping an
+    // UNCONTAINED pane prepends the same `systemd-run --scope` and used to make
+    // a bare login shell claim the `systemd` backend — containment that was
+    // never there. `[env.host]` panes are exactly this shape.
+    let shell = vec![
+        "bash".to_string(),
+        "-lc".into(),
+        "cd /wt && exec bash".into(),
+    ];
+    let limits = SandboxLimits {
+        cpu: Some("8".into()),
+        ..SandboxLimits::default()
+    };
+    let capped = crate::sandbox_cpucap::wrap_provider_pane_argv(
+        shell,
+        &limits,
+        crate::sandbox_cpucap::CpuCap::ScopeHard,
+    );
+    assert_eq!(capped.first().map(String::as_str), Some("systemd-run"));
+    assert_eq!(
+        observed(&capped),
+        Backend::None,
+        "a capped host shell must read as uncontained: {capped:?}"
+    );
+}
+
+#[test]
 fn host_shell_is_never_read_as_contained() {
     // Exactly what a degraded `podman-rootless` terminal spawns today.
     let argv = vec![
