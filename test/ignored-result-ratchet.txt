@@ -59,7 +59,6 @@ crates/thegn-core/src/file_manager/yazi.rs
 crates/thegn-core/src/fsperm.rs
 crates/thegn-core/src/heal.rs
 crates/thegn-core/src/host_db.rs
-crates/thegn-core/src/i18n.rs
 crates/thegn-core/src/image.rs
 crates/thegn-core/src/jj.rs
 crates/thegn-core/src/layout_import.rs
@@ -132,7 +131,6 @@ crates/thegn-host/src/cmd/pr_queue.rs
 crates/thegn-host/src/cmd/pr.rs
 crates/thegn-host/src/cmd/session.rs
 crates/thegn-host/src/cmd/share.rs
-crates/thegn-host/src/cmd/theme.rs
 crates/thegn-host/src/cmd/wt.rs
 # THE-83 (merged to main while this gate was red): both ignores are deliberate —
 # an idempotent `OnceLock` config-source install and a discarded clamp report on
@@ -209,7 +207,6 @@ crates/thegn-host/src/handlers/workspace_remove.rs
 # thegn-attach probe tests only (`#[cfg(test)]`): scratch temp-dir teardown
 # and a socket file a fresh bind replaces. Annotated `// best-effort:` in-file.
 crates/thegn-host/src/handlers/worktree_attach.rs
-crates/thegn-host/src/handlers/worktree_delete.rs
 crates/thegn-host/src/handlers/worktree_rename.rs
 crates/thegn-host/src/help/ratchet_tests.rs
 crates/thegn-host/src/help/render.rs
@@ -239,7 +236,6 @@ crates/thegn-host/src/measure/loc.rs
 crates/thegn-host/src/measure/mod.rs
 crates/thegn-host/src/media_art.rs
 crates/thegn-host/src/media_ctl.rs
-crates/thegn-host/src/media_overlay.rs
 crates/thegn-host/src/media_watch.rs
 crates/thegn-host/src/menu.rs
 crates/thegn-host/src/merge_driver.rs
@@ -250,7 +246,6 @@ crates/thegn-host/src/model_proxy_daemon.rs
 crates/thegn-host/src/monitor_action.rs
 crates/thegn-host/src/monitor.rs
 crates/thegn-host/src/monitor/state.rs
-crates/thegn-host/src/mq_assets.rs
 crates/thegn-host/src/notify.rs
 # THE-35: config reload and legacy command playback are advisory; failures leave
 # the prior snapshot or simply omit the optional sound.
@@ -360,3 +355,63 @@ crates/thegn-svc/tests/sprites_live.rs
 crates/thegn-svc/tests/sprites_mock.rs
 crates/thegn-svc/tests/vps_do_mock.rs
 crates/thegn-svc/tests/vps_mock.rs
+
+# ── 2026-09-02 audit: the second feature-sweep wave ─────────────────────────
+# These 26 files landed during the 85-lane pipeline week while `just lint` was
+# never run by the fold gate. UNLIKE the wholesale batch above, every entry
+# below was read before it was pinned, and each group states what its ignores
+# actually are.
+#
+# Compositor plumbing — channel sends to a possibly-gone consumer, waker
+# pulses, and thread joins during teardown. The sanctioned class verbatim: a
+# failed send must never take the loop down.
+crates/thegn-host/src/automation_events.rs
+crates/thegn-host/src/automation_executor.rs
+crates/thegn-host/src/automation_runtime.rs
+crates/thegn-host/src/notification_delivery.rs
+crates/thegn-host/src/panel/media.rs
+crates/thegn-host/src/preview_watch.rs
+crates/thegn-host/src/voice.rs
+crates/thegn-host/src/worktree_lifecycle.rs
+crates/thegn-svc/src/voice.rs
+#
+# DB cache writes (`Db::open().ok()`, put/prune/del of cached rows). The DB is
+# a cache and git/the forge is the source of truth, so a failed write costs a
+# re-read, never correctness.
+crates/thegn-host/src/cmd/dispatch.rs
+crates/thegn-host/src/cmd/session_move.rs
+crates/thegn-host/src/theme_store.rs
+#
+# Rollback and cleanup on an ALREADY-failing path: `execute_batch("ROLLBACK")`
+# after a transaction error, best-effort permission hardening, cache eviction.
+# Reporting the cleanup failure would mask the original error, which is the one
+# that matters.
+crates/thegn-core/src/db_automation.rs
+crates/thegn-core/src/db_autopilot.rs
+crates/thegn-host/src/cmd/bundle.rs
+crates/thegn-host/src/cmd/repos.rs
+crates/thegn-host/src/git_worktree.rs
+crates/thegn-host/src/hook_run.rs
+crates/thegn-host/src/skill_seed.rs
+#
+# Provider/select caches — a miss re-resolves next launch.
+crates/thegn-core/src/devcontainer_select.rs
+crates/thegn-host/src/devcontainer_provider.rs
+crates/thegn-host/src/mise_provider.rs
+#
+# NOT ignored Results at all: `let _ = path;` / `let _ = status;` binding
+# discards that silence unused-parameter warnings in `#[cfg]`-gated platform
+# stubs and parser scaffolding. The ratchet's regex cannot tell these apart
+# from a real swallow; they are pinned because the pattern matches, not because
+# anything is being ignored.
+crates/thegn-host/src/cmd/automations.rs
+crates/thegn-host/src/platform/mod.rs
+crates/thegn-svc/src/git/submodule.rs
+#
+# SUSPECT — pinned to record the concern, not to bless it. `ci_autofix.rs:236`
+# drops the result of `agent_run::run(...)` immediately after stamping the row
+# `AgentRunning`. If the launch fails, the row keeps claiming a live worker —
+# the same "the row lies about being live" class the pipeline reaper was built
+# to end. Next burn-down candidate; needs the failure surfaced and the status
+# rolled back.
+crates/thegn-host/src/ci_autofix.rs

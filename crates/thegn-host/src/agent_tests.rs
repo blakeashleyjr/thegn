@@ -1200,10 +1200,8 @@ fn reserved_credential_home_is_carved_at_the_entrys_own_path() {
         permissions: vec![],
         route_via_proxy: false,
     };
-    eff.env.insert(
-        "CODEX_HOME".into(),
-        "/home/u/.superzej/codex-pipeline".into(),
-    );
+    eff.env
+        .insert("CODEX_HOME".into(), "/home/u/.thegn/codex-pipeline".into());
     // A non-home var must not produce a mount.
     eff.env.insert("RUST_LOG".into(), "debug".into());
 
@@ -1211,8 +1209,8 @@ fn reserved_credential_home_is_carved_at_the_entrys_own_path() {
     assert_eq!(
         mounts,
         vec![(
-            "/home/u/.superzej/codex-pipeline".to_string(),
-            "/home/u/.superzej/codex-pipeline".to_string()
+            "/home/u/.thegn/codex-pipeline".to_string(),
+            "/home/u/.thegn/codex-pipeline".to_string()
         )],
         "only the provider home is carved, path-preserving"
     );
