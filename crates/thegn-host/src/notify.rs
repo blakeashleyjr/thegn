@@ -109,17 +109,26 @@ impl NotifyState {
         self.delivery.clone()
     }
 
-    /// Install the bounded sender to the push publisher worker (wired at startup
-    /// only when `[notifications.push]` is configured).
-    pub fn set_push_tx(&self, tx: std::sync::mpsc::SyncSender<crate::push_notify::PushJob>) {
-        *self.push_tx.lock().unwrap() = Some(tx);
-    }
-
-    /// Stop routing to the previous worker before a config reload installs a
-    /// replacement. Dropping the sender closes the old bounded queue once the
-    /// worker drains its current job.
-    pub fn clear_push_tx(&self) {
-        *self.push_tx.lock().unwrap() = None;
+    /// Atomically publish a reloaded notification config and its matching push
+    /// sender. Producers lock these same fields in this order, so a reload
+    /// cannot expose new sink names/flavors with the previous worker (or the
+    /// reverse) in between the two assignments.
+    pub(crate) fn replace_cfg_and_push(
+        &self,
+        cfg: NotificationsConfig,
+        tx: Option<std::sync::mpsc::SyncSender<crate::push_notify::PushJob>>,
+    ) {
+        self.sound_runtime.reload(cfg.sound.clone());
+        {
+            let mut mode = self.active_mode.lock().unwrap();
+            if !mode.is_empty() && !cfg.modes.contains_key(&*mode) {
+                *mode = cfg.active_mode.clone();
+            }
+        }
+        let mut cfg_guard = self.cfg.lock().unwrap();
+        let mut tx_guard = self.push_tx.lock().unwrap();
+        *cfg_guard = cfg;
+        *tx_guard = tx;
     }
 
     /// Hand a routed notification to the push publisher worker, iff the routing
@@ -139,22 +148,23 @@ impl NotifyState {
         if decision.push_sinks.is_empty() {
             return;
         }
+        let Some(notification_kind) = parse_kind(kind) else {
+            return;
+        };
+        // Keep the config and sender locks together. Config reload publishes
+        // them in this same order, preventing a producer from enqueueing a job
+        // shaped for one provider into the other provider's worker.
+        let cfg = self.cfg.lock().unwrap();
         let guard = self.push_tx.lock().unwrap();
         let Some(tx) = guard.as_ref() else {
             return; // push unconfigured
-        };
-        let Some(notification_kind) = parse_kind(kind) else {
-            return;
         };
         let content = if body.is_empty() {
             title.to_string()
         } else {
             format!("{title}\n{body}")
         };
-        let sink_kinds: std::collections::BTreeMap<String, PushKind> = self
-            .cfg
-            .lock()
-            .unwrap()
+        let sink_kinds: std::collections::BTreeMap<String, PushKind> = cfg
             .push
             .effective_sinks()
             .into_iter()
@@ -230,20 +240,6 @@ impl NotifyState {
     /// Update the focused/visible worktree path (drives `suppress_focused`).
     pub fn set_focused_worktree(&self, worktree: String) {
         *self.focused_worktree.lock().unwrap() = worktree;
-    }
-
-    /// Replace the effective config after a live reload.
-    pub fn update_cfg(&self, cfg: NotificationsConfig) {
-        self.sound_runtime.reload(cfg.sound.clone());
-        // Keep the runtime mode if it is still a valid mode (or empty); else
-        // reset to the new config's default.
-        {
-            let mut mode = self.active_mode.lock().unwrap();
-            if !mode.is_empty() && !cfg.modes.contains_key(&*mode) {
-                *mode = cfg.active_mode.clone();
-            }
-        }
-        *self.cfg.lock().unwrap() = cfg;
     }
 
     fn route_ctx(&self) -> RouteCtx {

@@ -147,6 +147,14 @@ impl PushConfig {
             let name = sink.name.trim();
             if name.is_empty() {
                 errors.push("[notifications.push.sinks] sink name must not be empty".to_string());
+            } else if name != sink.name {
+                errors.push(format!(
+                    "[notifications.push.sinks] sink name {name:?} must not have leading or trailing whitespace"
+                ));
+            } else if name.chars().any(char::is_control) {
+                errors.push(format!(
+                    "[notifications.push.sinks] sink name {name:?} must not contain control characters"
+                ));
             } else if name.chars().count() > MAX_NAME_CHARS {
                 errors.push(format!(
                     "[notifications.push.sinks] sink {name:?} name exceeds {MAX_NAME_CHARS} characters"
@@ -491,6 +499,24 @@ mod tests {
         };
         assert!(c.validate_errors().is_empty(), "{:?}", c.validate_errors());
         assert_eq!(c.effective_sinks()[0].min_priority(), Priority::Alert);
+    }
+
+    #[test]
+    fn sink_names_cannot_inject_output_or_break_selectors() {
+        let mut c = PushConfig {
+            sinks: vec![PushSinkConfig {
+                name: " oncall".into(),
+                topic: "alerts".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let errors = c.validate_errors();
+        assert!(errors.iter().any(|e| e.contains("leading or trailing")));
+
+        c.sinks[0].name = "on\u{1b}[31mcall".into();
+        let errors = c.validate_errors();
+        assert!(errors.iter().any(|e| e.contains("control characters")));
     }
 
     #[test]

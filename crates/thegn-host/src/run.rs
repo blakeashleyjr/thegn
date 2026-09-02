@@ -171,17 +171,17 @@ fn keybind_conflict_summary(cfg: &thegn_core::config::Config) -> Option<String> 
 /// reload never leaves a half-built map visible to an emitting producer.
 fn install_push_workers(
     notify_state: &crate::notify::NotifyState,
-    push_cfg: &thegn_core::config::PushConfig,
+    notifications: thegn_core::config::NotificationsConfig,
 ) {
     let snapshot = notify_state.delivery_snapshot();
-    let (providers, rows) = crate::push_notify::providers_for(push_cfg);
+    let (providers, rows) = crate::push_notify::providers_for(&notifications.push);
     snapshot.configure(rows);
-    notify_state.clear_push_tx();
     if providers.is_empty() {
+        notify_state.replace_cfg_and_push(notifications, None);
         return;
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(crate::push_notify::QUEUE_DEPTH);
-    notify_state.set_push_tx(tx);
+    notify_state.replace_cfg_and_push(notifications, Some(tx));
     crate::push_notify::spawn(rx, providers, snapshot);
 }
 
@@ -6787,10 +6787,7 @@ async fn event_loop<T: Terminal>(
     // Push delivery is one bounded worker per effective named sink. The
     // snapshot is shared with Monitor but carries counters only — never URLs,
     // tokens, or message payloads.
-    install_push_workers(
-        &notify_state,
-        &current_config.effective_notifications(None).push,
-    );
+    install_push_workers(&notify_state, current_config.effective_notifications(None));
     // Surface any unacknowledged crash report from a previous run (this process
     // OR the daemon — the crash dir is shared) as a notification naming the
     // report path, then acknowledge it so it never re-surfaces. Entirely
@@ -10839,12 +10836,11 @@ async fn event_loop<T: Terminal>(
                         .set_art_enabled(current_config.media.show_art);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
-                    // Live notification-routing reload: swap in the reloaded
-                    // rules/DND/sound/modes (preserving the runtime mode/toggle).
-                    notify_state.update_cfg(current_config.effective_notifications(None));
+                    // Live notification-routing and push-worker reload: publish
+                    // the matching config/sender pair under one lock boundary.
                     install_push_workers(
                         &notify_state,
-                        &current_config.effective_notifications(None).push,
+                        current_config.effective_notifications(None),
                     );
                     // Live replay/daemon toggle: newly spawned panes pick up the
                     // reloaded configs (existing panes keep their transport/ring).
