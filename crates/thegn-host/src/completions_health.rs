@@ -339,7 +339,7 @@ impl Report {
 /// comparison) — and always into a `Vec<u8>`, because the `clap_complete`
 /// generators panic on a write error.
 pub fn report() -> Report {
-    let exe = std::env::current_exe()
+    let exe = thegn_core::util::self_exe_path()
         .map(|e| std::fs::canonicalize(&e).unwrap_or(e))
         .unwrap_or_default();
     report_with(&Env::from_process(), &exe, &mut generate)

@@ -74,7 +74,7 @@ pipeline's core contract — is forbidden. Row 392 said it outright:
 > this environment cannot write the shared Git metadata, so the required merge
 > commit cannot be created
 
-It presents *dishonestly*, as a "silent worker death": rows 310, 320, 323, 324,
+It presents _dishonestly_, as a "silent worker death": rows 310, 320, 323, 324,
 357, 375, 376, 377, 378, 379, 380, 381, 382, 383, 385, 386, 387, 389, 390, 391,
 392, 393 all ended with the worker gone and no report. Roughly **half of all
 rows**. In the later cases the artifact sat on disk `exists=yes tracked=no` with
@@ -108,7 +108,7 @@ the architecture ratchets. THE-19's would have shipped an example config that
 did not validate against its own new `[hooks]` schema.
 
 Fixed in-prompt: a reviewer must run the full gate before reporting PASS, and a
-red gate *is* the FAIL.
+red gate _is_ the FAIL.
 
 ### 10. …which made review a heavy stage **[fixed, partially]**
 
@@ -122,8 +122,7 @@ inside every reviewer.
 
 `sccache: Operation not permitted` killed the gate before any test ran (row 320
 reported FAIL for a branch with nothing wrong). Then `dns_filter` UDP tests,
-bridge sockets and loopback listeners failed EPERM (rows 339, 349, 351, 360,
-362) — and nextest's fail-fast cancelled **5,652** good tests behind two denied
+bridge sockets and loopback listeners failed EPERM (rows 339, 349, 351, 360, 362) — and nextest's fail-fast cancelled **5,652** good tests behind two denied
 ones, so the gate could never go green inside a sandbox.
 
 Mitigated by giving reviewers a concrete exclusion command and a documented
@@ -133,7 +132,7 @@ BLOCKED-vs-FAIL distinction. The real fix is THE-90.
 
 `background_descendant_cannot_hold_hook_completion_open` asserted wall-clock
 timing and failed at 1.42 s against a 250 ms budget under load. Replaced with a
-causality assertion, verified idle *and* under four-worker load.
+causality assertion, verified idle _and_ under four-worker load.
 
 ---
 
@@ -206,7 +205,7 @@ Fixed by `[database] migration_authority`, plus the bootstrap carve-out that
 made it usable: at `user_version == 0` there is no controller to elect, so
 authority governs **upgrades** only.
 
-Still open: `dispatch report` *must* reach the live DB, so a worker cannot be
+Still open: `dispatch report` _must_ reach the live DB, so a worker cannot be
 told to isolate `XDG_STATE_HOME` for it. That write should have a no-migrate
 open mode.
 

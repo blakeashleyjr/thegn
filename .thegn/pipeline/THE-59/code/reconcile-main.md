@@ -28,7 +28,7 @@ Named reconcile items:
   a **pinned count**. Main has advanced the ladder. Append this lane's entry
   with the next free number and set the count to main's value plus the number
   of marked enums this lane actually adds. `cargo nextest run -p thegn-core
-  marked_definition` must pass — it is the gate for this exact mistake.
+marked_definition` must pass — it is the gate for this exact mistake.
 - `platform/unix.rs` and `platform/windows.rs` are the platform-cfg chokepoint;
   keep both sides' entries and keep the two files symmetrical.
 - `run.rs` is the event loop. Both sides add to the same regions; preserve the
