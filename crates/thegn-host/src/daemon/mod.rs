@@ -18,6 +18,7 @@ pub(crate) mod agent_open;
 pub(crate) mod client;
 pub(crate) mod fork;
 pub(crate) mod inbox;
+pub(crate) mod pipeline_reaper;
 pub(crate) mod pipeline_retry;
 pub(crate) mod record;
 pub(crate) mod service;
@@ -351,6 +352,10 @@ async fn run(
     // workers killed by a transport failure. Event-driven; zero timers while
     // idle.
     pipeline_retry::spawn(svc.clone(), svc.events.subscribe());
+    // Roster self-heal: a worker that committed its handoff and died before
+    // filing its report used to leave a `running` row nobody would close until
+    // a human ran `dispatch reap`. Slow timer, blocking work off the runtime.
+    pipeline_reaper::spawn(svc.clone());
     crate::automation_runtime::subscribe_daemon_events(svc.events.subscribe(), cfg);
 
     let state = thegn_svc::control::http::ControlState {

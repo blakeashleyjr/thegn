@@ -611,18 +611,33 @@ fn is_daemon_agent_exit(daemon_backed: bool, program: &str) -> bool {
         && !crate::pane::is_runtime_wrapper(program)
 }
 
-/// A successful pane exit is not a completion permission for a pipeline row.
-/// The supervisor must still read the report and pass the artifact/report gate
-/// through `dispatch set-status done`; `None` means leave the row as-is.
+/// A pane exit is not a verdict for a pipeline row — in **either** direction.
+/// The supervisor must read the report and pass the artifact/report gate
+/// (`dispatch set-status done`, or `dispatch reap`); `None` means leave the row
+/// as-is.
+///
+/// The failure arm used to be asymmetric: a non-zero exit stamped `Failed`
+/// without consulting the handoff. An exit code is not evidence about a handoff,
+/// and a spurious one is not rare — a worker was auto-failed on an exit 127
+/// whose artifact and report were both present and verified `ok=yes`, which
+/// then drew a redundant resume that had to be abandoned in turn (roster rows
+/// 442 and 444). Two wasted rows and an agent round, from a signal that never
+/// looked at the work.
+///
+/// Nothing is lost by declining to stamp here: the caller records the exit code
+/// on the row unconditionally (`stamp_dispatch_exit`), which is what makes a
+/// dead worker read as `exited-unverified` rather than as a live one, and
+/// `pipeline_reap::classify` then decides from the artifact and report — the
+/// evidence that actually says whether the stage handed off.
 fn automatic_dispatch_exit_status(
     failed: bool,
     is_pipeline_row: bool,
 ) -> Option<thegn_core::issue::AgentDispatchStatus> {
     use thegn_core::issue::AgentDispatchStatus;
-    if failed {
-        Some(AgentDispatchStatus::Failed)
-    } else if is_pipeline_row {
+    if is_pipeline_row {
         None
+    } else if failed {
+        Some(AgentDispatchStatus::Failed)
     } else {
         Some(AgentDispatchStatus::Done)
     }
@@ -1418,8 +1433,16 @@ mod tests {
         );
         assert_eq!(
             automatic_dispatch_exit_status(true, true),
+            None,
+            "a non-zero exit is not a verdict either: roster row 442 was auto-failed \
+             on a spurious exit 127 with its artifact and report both present, which \
+             drew a redundant resume (444). The exit is still stamped by the caller; \
+             `pipeline_reap` decides from the handoff."
+        );
+        assert_eq!(
+            automatic_dispatch_exit_status(true, false),
             Some(AgentDispatchStatus::Failed),
-            "failure attribution remains recordable without a handoff"
+            "a plain (non-pipeline) dispatch keeps the legacy automatic stamp"
         );
     }
 

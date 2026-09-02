@@ -22,12 +22,21 @@
 //!   in that window is newer than the retry plan, so the row is re-read after
 //!   the sleep and only a row still `waiting_human` is relaunched.
 //!
-//! # The daemon can park a row but never finish one
+//! # This observer can park a row but never finish one
 //!
 //! Every outcome stamps `waiting_human` + a `note` on the SAME roster row —
 //! never `done`, never `failed`. A retry re-stamps the row's session and
 //! artifact (`stamp_dispatch_run`) and moves it back to `running`: one row
-//! cycling through attempts, not a chain of rows.
+//! cycling through attempts, not a chain of rows. The rule holds absolutely
+//! here, because classifying a *final screen* is inference: this task is
+//! guessing why a worker died and must never turn a guess into a verdict.
+//!
+//! The daemon as a whole now has exactly one narrow exception, in
+//! [`super::pipeline_reaper`]: it may close a row on `CloseDone`, which fires
+//! only when the artifact is committed, git-tracked, AND a report is filed —
+//! the same gate `dispatch set-status done` enforces. That is arithmetic on
+//! recorded facts rather than inference, which is precisely what separates it
+//! from this module. Everything else there is still parked, never failed.
 //!
 //! # Event-driven, zero timers while idle
 //!
