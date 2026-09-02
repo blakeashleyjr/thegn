@@ -926,17 +926,23 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
 /// safe, because a row is only ever auto-closed on a committed artifact plus a
 /// filed report. The genuinely ambiguous case (artifact committed, no report)
 /// is reported and left alone.
-fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let (live_ids, daemon_up) = rt.block_on(live_session_ids(cfg));
-    let db = Db::open()?;
+/// Plan a reap of every active row against `live_ids` and git.
+///
+/// Shared with the daemon's periodic self-heal
+/// (`crate::daemon::pipeline_reaper`) so the two can never disagree about what
+/// a row's facts are. Only the PLAN is shared: the two callers deliberately
+/// apply different policies to it — the CLI records the supervisor's verdict
+/// directly, the daemon parks rather than failing (see that module's header).
+///
+/// Blocking: reads each row's worktree and shells out to `git`, so a caller on
+/// an async runtime must run this inside `spawn_blocking`.
+pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_reap::Reap>> {
     let rows: Vec<_> = db
         .list_dispatches()?
         .into_iter()
         .filter(|r| r.status.is_active())
         .collect();
-
-    let plan = pipeline_reap::plan(&rows, |r| {
+    Ok(pipeline_reap::plan(&rows, |r| {
         let f = verify_facts(r);
         pipeline_reap::ReapFacts {
             session_live: r
@@ -947,7 +953,14 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
             artifact_tracked: f.tracked,
             report_present: f.report_present,
         }
-    });
+    }))
+}
+
+fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (live_ids, daemon_up) = rt.block_on(live_session_ids(cfg));
+    let db = Db::open()?;
+    let plan = reap_plan(&db, &live_ids)?;
     let summary = pipeline_reap::summarize(&plan);
 
     if json {
