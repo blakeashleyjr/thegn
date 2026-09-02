@@ -119,10 +119,13 @@ pub enum MonitorTab {
     /// thegn's containers across detected backends — stats + lifecycle on the
     /// owned ones. Hidden when no container engine is detected.
     Containers,
+    /// Per-sink outbound notification delivery counters. Hidden until a sink
+    /// is configured or a worker has reported a counter.
+    Notifications,
 }
 
 impl MonitorTab {
-    pub const ALL: [MonitorTab; 9] = [
+    pub const ALL: [MonitorTab; 10] = [
         MonitorTab::Cpu,
         MonitorTab::Memory,
         MonitorTab::Thermal,
@@ -132,6 +135,7 @@ impl MonitorTab {
         MonitorTab::Power,
         MonitorTab::Procs,
         MonitorTab::Containers,
+        MonitorTab::Notifications,
     ];
 
     pub fn index(self) -> usize {
@@ -149,6 +153,7 @@ impl MonitorTab {
             MonitorTab::Power => "Power",
             MonitorTab::Procs => "Processes",
             MonitorTab::Containers => "Containers",
+            MonitorTab::Notifications => "Notifications",
         }
     }
 
@@ -165,6 +170,7 @@ impl MonitorTab {
             MonitorTab::Power => "power",
             MonitorTab::Procs => "procs",
             MonitorTab::Containers => "containers",
+            MonitorTab::Notifications => "notifications",
         }
     }
 
@@ -190,6 +196,7 @@ impl MonitorTab {
             MonitorTab::Power => Some("battery"),
             MonitorTab::Procs => None,
             MonitorTab::Containers => None,
+            MonitorTab::Notifications => None,
         }
     }
 
@@ -221,7 +228,10 @@ impl MonitorTab {
     /// *work* on those tabs — they write the same per-tab prefs — but nothing
     /// on screen moves, which is the bug.
     pub fn has_graphs(self) -> bool {
-        !matches!(self, MonitorTab::Procs | MonitorTab::Containers)
+        !matches!(
+            self,
+            MonitorTab::Procs | MonitorTab::Containers | MonitorTab::Notifications
+        )
     }
 
     /// Whether this machine has anything to show on the tab. A tab with no data
@@ -237,6 +247,7 @@ impl MonitorTab {
             MonitorTab::Disk => !s.disks.is_empty(),
             MonitorTab::Network => s.net_bps.is_some() || !s.net_ifaces.is_empty(),
             MonitorTab::Containers => has_containers,
+            MonitorTab::Notifications => false,
             // CPU, Memory and Processes are always meaningful.
             _ => true,
         }
@@ -247,6 +258,18 @@ impl MonitorTab {
             .into_iter()
             .filter(|t| t.present(s, has_containers))
             .collect()
+    }
+
+    pub fn visible_for(
+        s: &StatsSnapshot,
+        has_containers: bool,
+        has_notifications: bool,
+    ) -> Vec<MonitorTab> {
+        let mut tabs = Self::visible(s, has_containers);
+        if has_notifications {
+            tabs.push(MonitorTab::Notifications);
+        }
+        tabs
     }
 }
 
@@ -451,7 +474,11 @@ impl MonitorOverlay {
         ctx: &StatusCtx,
     ) -> MonitorOverlay {
         let (cols, rows) = Self::dims(ctx.screen);
-        let tabs = MonitorTab::visible(&model.stats, !model.containers.is_empty());
+        let tabs = MonitorTab::visible_for(
+            &model.stats,
+            !model.containers.is_empty(),
+            model.notification_delivery_configured || model.notification_delivery.visible(),
+        );
         // Opening at a tab this machine can't show would present an empty box;
         // fall back to the first real one.
         let tab = if tabs.contains(&tab) {
@@ -709,7 +736,11 @@ impl MonitorOverlay {
             return false;
         }
         self.resize(ctx.screen);
-        self.tabs = MonitorTab::visible(&model.stats, !model.containers.is_empty());
+        self.tabs = MonitorTab::visible_for(
+            &model.stats,
+            !model.containers.is_empty(),
+            model.notification_delivery_configured || model.notification_delivery.visible(),
+        );
         if !self.tabs.contains(&self.tab) {
             // The metric vanished under the user (GPU driver unloaded, battery
             // removed). Fall back rather than render an empty tab.
@@ -1079,6 +1110,7 @@ impl MonitorOverlay {
             MonitorTab::Procs => self.proc_rows.len(),
             MonitorTab::Disk => self.disk_rows.len(),
             MonitorTab::Containers => self.container_rows.len(),
+            MonitorTab::Notifications => 0,
             _ => 0,
         }
     }

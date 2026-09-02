@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use termwiz::terminal::TerminalWaker;
-use thegn_core::config::NotificationsConfig;
+use thegn_core::config::{NotificationsConfig, PushKind};
 use thegn_core::notification::NotificationKind;
+use thegn_core::notification_render::{MarkdownFlavor, render};
 use thegn_core::notification_route::{RouteCtx, RouteDecision, SoundEmit, decide};
 
 /// Shared, thread-safe notification runtime. Cloned (as `Arc`) into the
@@ -55,6 +56,8 @@ pub struct NotifyState {
     push_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::push_notify::PushJob>>>,
     /// Count of push jobs dropped because the worker's queue was full.
     push_dropped: std::sync::atomic::AtomicU64,
+    /// Per-sink delivery counters shared with the loop-owned Monitor model.
+    delivery: crate::notification_delivery::DeliverySnapshot,
     /// Wakes the event loop so a latched bell (or DND/mode chip change) paints.
     waker: TerminalWaker,
 }
@@ -94,6 +97,7 @@ impl NotifyState {
             toast_tx: Mutex::new(None),
             push_tx: Mutex::new(None),
             push_dropped: std::sync::atomic::AtomicU64::new(0),
+            delivery: crate::notification_delivery::DeliverySnapshot::with_waker(waker.clone()),
             waker,
         });
         *global_slot().lock().unwrap() = Arc::downgrade(&state);
@@ -101,10 +105,30 @@ impl NotifyState {
         state
     }
 
-    /// Install the bounded sender to the push publisher worker (wired at startup
-    /// only when `[notifications.push]` is configured).
-    pub fn set_push_tx(&self, tx: std::sync::mpsc::SyncSender<crate::push_notify::PushJob>) {
-        *self.push_tx.lock().unwrap() = Some(tx);
+    pub(crate) fn delivery_snapshot(&self) -> crate::notification_delivery::DeliverySnapshot {
+        self.delivery.clone()
+    }
+
+    /// Atomically publish a reloaded notification config and its matching push
+    /// sender. Producers lock these same fields in this order, so a reload
+    /// cannot expose new sink names/flavors with the previous worker (or the
+    /// reverse) in between the two assignments.
+    pub(crate) fn replace_cfg_and_push(
+        &self,
+        cfg: NotificationsConfig,
+        tx: Option<std::sync::mpsc::SyncSender<crate::push_notify::PushJob>>,
+    ) {
+        self.sound_runtime.reload(cfg.sound.clone());
+        {
+            let mut mode = self.active_mode.lock().unwrap();
+            if !mode.is_empty() && !cfg.modes.contains_key(&*mode) {
+                *mode = cfg.active_mode.clone();
+            }
+        }
+        let mut cfg_guard = self.cfg.lock().unwrap();
+        let mut tx_guard = self.push_tx.lock().unwrap();
+        *cfg_guard = cfg;
+        *tx_guard = tx;
     }
 
     /// Hand a routed notification to the push publisher worker, iff the routing
@@ -116,29 +140,73 @@ impl NotifyState {
         &self,
         decision: &RouteDecision,
         kind: &str,
+        source_ref: &str,
         title: &str,
         body: &str,
         worktree: &str,
     ) {
-        if !decision.push {
+        if decision.push_sinks.is_empty() {
             return;
         }
+        let Some(notification_kind) = parse_kind(kind) else {
+            return;
+        };
+        // Keep the config and sender locks together. Config reload publishes
+        // them in this same order, preventing a producer from enqueueing a job
+        // shaped for one provider into the other provider's worker.
+        let cfg = self.cfg.lock().unwrap();
         let guard = self.push_tx.lock().unwrap();
         let Some(tx) = guard.as_ref() else {
             return; // push unconfigured
         };
-        let job = crate::push_notify::PushJob {
-            title: title.to_string(),
-            body: body.to_string(),
-            priority: decision.effective_priority,
-            kind: kind.to_string(),
-            worktree: worktree.to_string(),
+        let content = if body.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title}\n{body}")
         };
-        if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(job) {
-            // best-effort delivery: the inbox row is the durable record. Surface
-            // the running drop total so a stalled server is visible in the log.
-            let total = self.push_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(target: "thegn::push", dropped_total = total, "push queue full — dropped a notification");
+        let sink_kinds: std::collections::BTreeMap<String, PushKind> = cfg
+            .push
+            .effective_sinks()
+            .into_iter()
+            .map(|sink| (sink.name, sink.kind))
+            .collect();
+        for sink in &decision.push_sinks {
+            let flavor = sink_kinds
+                .get(sink)
+                .copied()
+                .map(push_flavor)
+                .unwrap_or(MarkdownFlavor::Plain);
+            let job = crate::push_notify::PushJob {
+                sink: sink.clone(),
+                title: title.to_string(),
+                body: body.to_string(),
+                priority: decision.effective_priority,
+                kind: kind.to_string(),
+                worktree: worktree.to_string(),
+                rendered: Some(render(
+                    notification_kind,
+                    decision.effective_priority,
+                    &content,
+                    source_ref,
+                    worktree,
+                    thegn_core::util::now(),
+                    flavor,
+                )),
+            };
+            match tx.try_send(job) {
+                Ok(()) => self
+                    .delivery
+                    .event(sink, crate::notification_delivery::DeliveryEvent::Queued),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    self.delivery
+                        .event(sink, crate::notification_delivery::DeliveryEvent::QueueDrop);
+                    // best-effort delivery: the inbox row is the durable record. Surface
+                    // the running drop total so a stalled server is visible in the log.
+                    let total = self.push_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(target: "thegn::push", sink = %sink, dropped_total = total, "push queue full — dropped a notification");
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+            }
         }
     }
 
@@ -174,20 +242,6 @@ impl NotifyState {
         *self.focused_worktree.lock().unwrap() = worktree;
     }
 
-    /// Replace the effective config after a live reload.
-    pub fn update_cfg(&self, cfg: NotificationsConfig) {
-        self.sound_runtime.reload(cfg.sound.clone());
-        // Keep the runtime mode if it is still a valid mode (or empty); else
-        // reset to the new config's default.
-        {
-            let mut mode = self.active_mode.lock().unwrap();
-            if !mode.is_empty() && !cfg.modes.contains_key(&*mode) {
-                *mode = cfg.active_mode.clone();
-            }
-        }
-        *self.cfg.lock().unwrap() = cfg;
-    }
-
     fn route_ctx(&self) -> RouteCtx {
         RouteCtx {
             now_local: Some(chrono::Local::now().naive_local()),
@@ -216,7 +270,7 @@ impl NotifyState {
                 toast: false,
                 // Unknown kinds don't push (conservative — a novel kind reaches
                 // the inbox + desktop, but not a phone, until it's modelled).
-                push: false,
+                push_sinks: Vec::new(),
                 sound: None,
             };
         };
@@ -310,7 +364,7 @@ pub(crate) fn route(
     if decision.toast {
         state.emit_toast(message, decision.effective_priority);
     }
-    state.emit_push(&decision, kind, message, "", worktree);
+    state.emit_push(&decision, kind, source_ref, message, "", worktree);
     decision
 }
 
@@ -357,7 +411,7 @@ pub(crate) fn record_with_facts(
                     effective_priority: thegn_core::notification::Priority::Notice,
                     desktop: false,
                     toast: false,
-                    push: false,
+                    push_sinks: Vec::new(),
                     sound: None,
                 },
                 None,
@@ -372,7 +426,7 @@ pub(crate) fn record_with_facts(
         tracing::debug!(target: "thegn::notify", %error, "notification cache write failed");
         None
     });
-    emit_channels(state, &decision, kind, message, worktree);
+    emit_channels(state, &decision, kind, source_ref, message, worktree);
     (decision, id)
 }
 
@@ -395,7 +449,7 @@ pub(crate) fn record_once_with_facts(
         false
     });
     if inserted {
-        emit_channels(state, &decision, kind, message, worktree);
+        emit_channels(state, &decision, kind, source_ref, message, worktree);
     }
     (decision, inserted)
 }
@@ -424,6 +478,7 @@ fn emit_channels(
     state: &NotifyState,
     decision: &RouteDecision,
     kind: &str,
+    source_ref: &str,
     message: &str,
     worktree: &str,
 ) {
@@ -437,13 +492,23 @@ fn emit_channels(
     }
     // Push-to-phone rides the same decision. The publisher worker exists only
     // when `[notifications.push]` is configured; otherwise this is a no-op.
-    state.emit_push(decision, kind, message, "", worktree);
+    state.emit_push(decision, kind, source_ref, message, "", worktree);
 }
 
 fn parse_kind(s: &str) -> Option<NotificationKind> {
     NotificationKind::ALL.into_iter().find(|k| k.as_str() == s)
 }
 
+fn push_flavor(kind: PushKind) -> MarkdownFlavor {
+    match kind {
+        PushKind::Webhook => MarkdownFlavor::CommonMark,
+        PushKind::Discord => MarkdownFlavor::Discord,
+        PushKind::Slack => MarkdownFlavor::Slack,
+        PushKind::Ntfy | PushKind::Telegram | PushKind::Gotify | PushKind::Pushover => {
+            MarkdownFlavor::Plain
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

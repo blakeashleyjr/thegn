@@ -143,6 +143,7 @@ mod mousefilter;
 mod naming;
 mod nav;
 mod nixcache;
+mod notification_delivery;
 mod notification_sound;
 mod notify;
 mod onboarding;
