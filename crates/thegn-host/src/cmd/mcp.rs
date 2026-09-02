@@ -465,6 +465,38 @@ async fn fetch_state(
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             c.me().await.map_err(|e| e.to_string())
         }
+        "ci.runs" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let worktree = str_arg(args, "worktree")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| super::resolve_worktree(None));
+            let limit = args
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize);
+            let reply = c
+                .ci_runs(&worktree.to_string_lossy(), limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
+        "ci.logs" => {
+            let c = client.map_err(|_| NO_DAEMON.to_string())?;
+            let worktree = str_arg(args, "worktree")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| super::resolve_worktree(None));
+            let run = str_arg(args, "run").ok_or("missing `run`")?;
+            let job = str_arg(args, "job").ok_or("missing `job`")?;
+            let tail_lines = args
+                .get("tail_lines")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize);
+            let reply = c
+                .ci_logs(&worktree.to_string_lossy(), run, job, tail_lines)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
         // A pure filesystem read of the harness session stores — answered
         // locally, no daemon required (like the worktrees.list DB fallback).
         "agent.sessions" => {
@@ -859,6 +891,8 @@ mod tests {
         "preview.fetch",
         "leases.list",
         "me",
+        "ci.runs",
+        "ci.logs",
         "agent.sessions",
         "sessions.wait",
         "semantic.map",

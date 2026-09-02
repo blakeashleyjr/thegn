@@ -8020,7 +8020,7 @@ async fn event_loop<T: Terminal>(
             // coalesced by the [ci] ttl guard, not a per-keystroke cost.
             crate::ci_refresh::spawn_ci_cache_refresh(
                 session.clone_for_hydrate(),
-                current_config.ci.clone(),
+                current_config.clone(),
                 Some(waker.clone()),
                 false, // on-switch backstop: respect the ttl guard
             );
@@ -11393,7 +11393,7 @@ async fn event_loop<T: Terminal>(
         if want_ci_refresh {
             crate::ci_refresh::on_ci_tick(
                 &session,
-                &current_config.ci,
+                &current_config,
                 &refresh_tx,
                 &waker,
                 ci_refresh_force,
@@ -17905,7 +17905,8 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Ci => {
-                                            // Enter drills into the selected run (`ci view`).
+                                            // Enter drills into the selected run in-place;
+                                            // detail/log work stays off the compositor.
                                             CiActionCtx {
                                                 session: &mut session,
                                                 panes: &mut panes,
@@ -17918,7 +17919,7 @@ async fn event_loop<T: Terminal>(
                                                 refresh_tx: &refresh_tx,
                                                 waker: &waker,
                                             }
-                                            .open_view_at(panel_ui.cursor);
+                                            .open_view_at(panel_ui.cursor, &mut bar_detail);
                                         }
                                         Section::Media => {
                                             // Enter selects a source or queue row;
@@ -19179,7 +19180,11 @@ async fn event_loop<T: Terminal>(
                                 refresh_tx: &refresh_tx,
                                 waker: &waker,
                             }
-                            .panel_key(key, panel_ui.cursor)
+                            .panel_key(
+                                key,
+                                panel_ui.cursor,
+                                &mut bar_detail,
+                            )
                         }
                         // -- merge queue: add (a/A), remove (x), land (l),
                         // retry (r), clear landed (c), drain (D). Mutations run
