@@ -2389,6 +2389,17 @@ max_results = 1000
 # ruby = ["ruby"]
 # extra = []      # nixpkgs packages appended for every language mix
 
+# Mise/asdf declarations are an activation layer even when Nix remains the
+# provisioning owner. Bundle PATH wins, followed by a Nix devShell, mise, and
+# finally the base shell PATH. Repo-authored mise environment resolution can
+# execute templates or source scripts, so it is gated by `thegn repo trust`;
+# this security decision intentionally has no ambient THEGN_* override.
+[toolchain.mise]
+# inject = "auto" # "auto"  = shims now, filtered env after repo approval;
+#                 # "shims" = shims PATH only (does not evaluate repo config);
+#                 # "env"   = filtered env after approval, shims while pending;
+#                 # "off"   = no mise activation
+
 # ── Worktree lifecycle hooks ────────────────────────────────────────────────
 # Host-side commands run at worktree/session boundaries. Lists retain their
 # declaration order and accumulate global → [project.<slug>] → repo overlay.

@@ -495,6 +495,64 @@ fn providers_json(cfg: &Config) -> serde_json::Value {
     serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default()
 }
 
+fn toolchain_json(cfg: &Config) -> serde_json::Value {
+    let worktree = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let root = thegn_core::repo::main_worktree(&worktree).unwrap_or_else(|| worktree.clone());
+    let db = thegn_core::db::Db::open().ok();
+    serde_json::to_value(crate::mise_provider::doctor_status(
+        cfg,
+        &worktree,
+        &root,
+        db.as_ref(),
+    ))
+    .unwrap_or_default()
+}
+
+fn toolchain_report(cfg: &Config) {
+    let report = toolchain_json(cfg);
+    outln!("Worktree toolchain (cached, presence-only)");
+    for key in ["provider", "tier", "inject", "state", "trust"] {
+        outln!("  {key:<13} {}", report[key].as_str().unwrap_or("unknown"));
+    }
+    let files = report["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    outln!(
+        "  files         {}",
+        if files.is_empty() { "(none)" } else { &files }
+    );
+    if let Some(shims) = report["shims"].as_str() {
+        outln!("  shims         {shims}");
+    }
+    if let Some(reason) = report["reason"].as_str() {
+        outln!("  reason        {reason}");
+    }
+    if let Some(version) = report["version"].as_str() {
+        outln!("  version       {version}");
+    }
+    let missing = report["missing_tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    outln!(
+        "  missing       {}",
+        if missing.is_empty() { "none" } else { &missing }
+    );
+}
+
 /// Text twin of [`providers_json`]. Never affects the exit status: a missing
 /// optional binary is information, not a doctor failure.
 fn providers_report(cfg: &Config) {
@@ -1424,6 +1482,7 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
             "ctrl_digits_reportable": probe.as_ref().and_then(|p| p.ctrl_digit_reportable()),
         },
         "sandbox": sandbox_json(cfg),
+        "toolchain": toolchain_json(cfg),
         "devcontainer": devcontainer_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
@@ -1731,6 +1790,9 @@ pub fn run(
 
     outln!("");
     providers_report(cfg);
+
+    outln!("");
+    toolchain_report(cfg);
 
     mcp_proxy_report(cfg);
 

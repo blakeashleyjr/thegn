@@ -308,6 +308,7 @@ pub mod theme_import;
 pub mod theme_resolve;
 pub mod theme_user;
 pub mod toolchain;
+pub mod toolchain_activation;
 pub mod transport_error;
 pub mod trust_class;
 pub mod usage;

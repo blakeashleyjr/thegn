@@ -3040,6 +3040,13 @@ pub(crate) fn build_panel(
     // Per-[env.*] display snapshots for the System ▸ Environments section (kind,
     // region/size, token presence). Cheap config walk; empty without any [env.*].
     panel.environments = crate::env_ui::env_snapshots(app_cfg);
+    let toolchain_root = thegn_core::repo::main_worktree(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    panel.toolchain = Some(crate::toolchain_ui::worktree_status(
+        app_cfg,
+        cwd,
+        &toolchain_root,
+        Some(db),
+    ));
 
     panel.files = diff_entries
         .iter()

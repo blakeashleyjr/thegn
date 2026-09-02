@@ -16,6 +16,7 @@
 
 use std::path::Path;
 
+use crate::toolchain_activation::DetectedToolchainFiles;
 use crate::util::sh_quote;
 
 /// What a repo declares about its dev environment, gleaned from common files.
@@ -31,6 +32,9 @@ pub struct EnvRequirements {
     pub direnv_uses_flake: bool,
     /// `.tool-versions` (asdf) or a `mise` config — version-pinned toolchains.
     pub tool_versions: bool,
+    /// Normalized, deterministic mise/asdf config and pin files. This retains
+    /// the names (never their contents) for trust/cache identity construction.
+    pub toolchain_files: DetectedToolchainFiles,
     /// Classic (non-flake) Nix: `shell.nix` or `default.nix`, with no flake
     /// devShell / devenv outranking it. Folded into [`Tier::Nix`]; the devShell
     /// warm uses `nix-shell --run true` instead of `nix develop`.
@@ -102,7 +106,38 @@ pub const DETECT_PROBE_SCRIPT: &str = r#"
 [ -f devenv.nix ] && echo DEVENV=1
 [ -f .envrc ] && echo DIRENV=1
 [ -f .envrc ] && grep -Eq 'use[ _]flake' .envrc && echo DIRENV_FLAKE=1
-{ [ -f .tool-versions ] || [ -f mise.toml ] || [ -f .mise.toml ] || [ -f .nvmrc ]; } && echo TOOL_VERSIONS=1
+emit_toolchain_file() {
+  kind="$1"; file="$2"
+  no_symlink_components "$file" || return 0
+  [ -f "$file" ] && [ -r "$file" ] && [ ! -L "$file" ] || return 0
+  printf 'TOOLCHAIN_%s=%s\n' "$kind" "$file"
+}
+no_symlink_components() {
+  path="$1"
+  while [ "$path" != "." ] && [ "$path" != "/" ] && [ -n "$path" ]; do
+    [ ! -L "$path" ] || return 1
+    case "$path" in
+      */*) path="${path%/*}"; [ -n "$path" ] || path="." ;;
+      *) path="." ;;
+    esac
+  done
+}
+for file in mise.toml .mise.toml mise.local.toml mise/config.toml .mise/config.toml .config/mise.toml .config/mise/config.toml; do
+  emit_toolchain_file CONFIG "$file"
+done
+if [ -d conf.d ] && [ ! -L conf.d ]; then
+  for file in conf.d/*.toml; do
+    [ -e "$file" ] || continue
+    emit_toolchain_file CONFIG "$file"
+  done
+fi
+case "${MISE_ENV:-}" in
+  ''|*[!A-Za-z0-9_-]*) ;;
+  *) emit_toolchain_file CONFIG "mise.${MISE_ENV}.toml" ;;
+esac
+for file in .tool-versions .nvmrc .node-version .python-version .ruby-version .go-version .java-version; do
+  emit_toolchain_file PIN "$file"
+done
 { [ -f shell.nix ] || [ -f default.nix ]; } && echo NIX_CLASSIC=1
 [ -f package.json ] && echo LANG_NODE=1
 { [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } && echo LANG_PYTHON=1
@@ -119,6 +154,7 @@ true
 /// shape [`detect`] produces locally. Unknown keys are ignored.
 pub fn detect_from_probe(out: &str) -> EnvRequirements {
     let has = |k: &str| out.lines().any(|l| l.trim() == format!("{k}=1"));
+    let toolchain_files = DetectedToolchainFiles::from_probe(out);
     let mut languages = Vec::new();
     for (key, lang) in [
         ("LANG_NODE", Language::Node),
@@ -138,7 +174,8 @@ pub fn detect_from_probe(out: &str) -> EnvRequirements {
         devenv: has("DEVENV"),
         direnv: has("DIRENV"),
         direnv_uses_flake: has("DIRENV_FLAKE"),
-        tool_versions: has("TOOL_VERSIONS"),
+        tool_versions: has("TOOL_VERSIONS") || !toolchain_files.is_empty(),
+        toolchain_files,
         nix_classic: has("NIX_CLASSIC"),
         languages,
         devcontainer: has("DEVCONTAINER"),
@@ -146,6 +183,13 @@ pub fn detect_from_probe(out: &str) -> EnvRequirements {
 }
 
 pub fn detect(worktree: &Path) -> EnvRequirements {
+    let mise_env = std::env::var("MISE_ENV").ok();
+    detect_with_mise_env(worktree, mise_env.as_deref())
+}
+
+/// Deterministic variant of [`detect`] for callers that already captured the
+/// target's ambient `MISE_ENV` (and for tests that must not mutate process env).
+pub fn detect_with_mise_env(worktree: &Path, mise_env: Option<&str>) -> EnvRequirements {
     let read = |name: &str| std::fs::read_to_string(worktree.join(name)).ok(); // best-effort: optional input: a missing/unreadable manifest just means 'not detected'
     let exists = |name: &str| worktree.join(name).exists();
 
@@ -160,8 +204,8 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
         .as_deref()
         .is_some_and(|s| s.contains("use flake") || s.contains("use_flake"));
 
-    let tool_versions =
-        exists(".tool-versions") || exists("mise.toml") || exists(".mise.toml") || exists(".nvmrc");
+    let toolchain_files = DetectedToolchainFiles::detect(worktree, mise_env);
+    let tool_versions = !toolchain_files.is_empty();
 
     let mut languages = Vec::new();
     let mut push = |l: Language| {
@@ -207,6 +251,7 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
         direnv,
         direnv_uses_flake,
         tool_versions,
+        toolchain_files,
         nix_classic,
         languages,
         devcontainer,
@@ -738,11 +783,8 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
             }
         }
         Tier::ToolVersions => {
-            steps.push(ProvisionStep {
-                id: "mise".into(),
-                label: "Install toolchains (mise)".into(),
-                kind: StepKind::Exec(mise_install_script(&opts.workdir)),
-            });
+            // Installation is an explicit, trust-gated provider operation.
+            // Core records the tier but never constructs a vendor command.
         }
         Tier::SynthNix => {
             // Batteries included: install Nix, then synthesize + warm a
@@ -1275,16 +1317,6 @@ fn home_profile_install_script(installs: &[String]) -> String {
     )
 }
 
-/// Install mise + the repo's pinned toolchains.
-fn mise_install_script(workdir: &str) -> String {
-    let wd = sh_quote(workdir);
-    format!(
-        "command -v mise >/dev/null 2>&1 || curl -fsSL https://mise.run | sh; \
-         export PATH=\"$HOME/.local/bin:$PATH\"; \
-         cd {wd} && mise trust 2>/dev/null; mise install 2>/dev/null || true"
-    )
-}
-
 /// Best-effort native runtimes for detected languages (Ubuntu/apt base).
 fn languages_install_script(langs: &[Language]) -> String {
     let mut pkgs: Vec<&str> = Vec::new();
@@ -1539,6 +1571,61 @@ mod tests {
         let classic = detect_from_probe("NIX_CLASSIC=1\n");
         assert!(classic.nix_classic);
         assert_eq!(classic.tier(), Tier::Nix);
+    }
+
+    #[test]
+    fn local_and_remote_toolchain_detection_have_full_name_parity() {
+        let d = tmp("toolchain_parity");
+        let config = [
+            "mise.toml",
+            ".mise.toml",
+            "mise.local.toml",
+            "mise/config.toml",
+            ".mise/config.toml",
+            ".config/mise.toml",
+            ".config/mise/config.toml",
+            "conf.d/20-last.toml",
+            "conf.d/01-first.toml",
+            "mise.ci.toml",
+        ];
+        let pins = [
+            ".tool-versions",
+            ".nvmrc",
+            ".node-version",
+            ".python-version",
+            ".ruby-version",
+            ".go-version",
+            ".java-version",
+        ];
+        for name in config.iter().chain(&pins) {
+            if let Some(parent) = d.join(name).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            write(&d, name, "declared");
+        }
+        let local = detect_with_mise_env(&d, Some("ci"));
+        let probe = config
+            .iter()
+            .map(|name| format!("TOOLCHAIN_CONFIG={name}"))
+            .chain(pins.iter().map(|name| format!("TOOLCHAIN_PIN={name}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let remote = detect_from_probe(&probe);
+        assert_eq!(local.toolchain_files, remote.toolchain_files);
+        assert!(local.tool_versions && remote.tool_versions);
+
+        // Pin the probe's discovery vocabulary beside the parity assertion so
+        // extending only the local list cannot make this test pass vacuously.
+        for name in config.iter().chain(&pins) {
+            if name.starts_with("conf.d/") || *name == "mise.ci.toml" {
+                continue;
+            }
+            assert!(DETECT_PROBE_SCRIPT.contains(name), "probe omits {name}");
+        }
+        assert!(DETECT_PROBE_SCRIPT.contains("conf.d/*.toml"));
+        assert!(DETECT_PROBE_SCRIPT.contains("MISE_ENV"));
+        // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1799,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_toolchain_mode_mise_keeps_mise_tier() {
+    fn plan_toolchain_mode_mise_keeps_tier_without_implicit_install() {
         let req = EnvRequirements {
             languages: vec![Language::Python],
             ..Default::default()
@@ -1814,7 +1901,7 @@ mod tests {
         let p = plan(&req, &opts);
         assert_eq!(p.tier, Tier::ToolVersions);
         let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"mise"), "mise step: {ids:?}");
+        assert!(!ids.contains(&"mise"), "install must be explicit: {ids:?}");
         assert!(!ids.contains(&"toolchain") && !ids.contains(&"languages"));
     }
 

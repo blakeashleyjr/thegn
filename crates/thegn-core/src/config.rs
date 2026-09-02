@@ -4874,7 +4874,8 @@ pub struct Config {
     /// these lists; repo entries are trust-gated before execution.
     pub hooks: HooksConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
-    /// repos (synthesized Nix devShell; mode + per-language package overrides).
+    /// repos (synthesized Nix devShell; mode + per-language package overrides)
+    /// plus activation policy for detected repo toolchain declarations.
     pub toolchain: crate::toolchain::ToolchainConfig,
     pub limits: LimitsConfig,
     /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.

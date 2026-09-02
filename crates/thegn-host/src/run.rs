@@ -666,6 +666,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the ticker still receives its clone at its spawn site below.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     crate::daemon::agent_error_cache::install_refresh(refresh_tx.clone(), waker.clone());
+    crate::mise_provider::install_refresh(refresh_tx.clone(), waker.clone());
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
     // read — diff panel included — at another worktree) and fast-forward a main
@@ -21538,6 +21539,46 @@ async fn event_loop<T: Terminal>(
                                 // variant — keymap.rs is a pinned god-file).
                                 env_wizard_ui =
                                     Some(crate::env_wizard::EnvWizard::new(keymap.config()));
+                            }
+                            Action::InstallToolchain => {
+                                // Do not fall back from a registered remote or
+                                // missing worktree to the compositor cwd: that
+                                // could install a different repository.
+                                let worktree = session
+                                    .active_group()
+                                    .map(|group| std::path::PathBuf::from(&group.path))
+                                    .unwrap_or_else(|| active_tab_path(&session));
+                                if !worktree.is_dir() {
+                                    model.status = "Toolchain install: no active worktree".into();
+                                } else {
+                                    let cfg = current_config.clone();
+                                    let refresh = refresh_tx.clone();
+                                    let wake = waker.clone();
+                                    model.status = "Installing worktree toolchain…".into();
+                                    task::spawn_blocking(move || {
+                                        let repo_root = thegn_core::repo::main_worktree(&worktree)
+                                            .unwrap_or_else(|| worktree.clone());
+                                        let message = match crate::mise_provider::install(
+                                            &cfg, &worktree, &repo_root,
+                                        ) {
+                                            Ok(()) => {
+                                                "Worktree toolchain installed; refreshing status"
+                                                    .to_string()
+                                            }
+                                            Err(reason) => format!("Toolchain install: {reason}"),
+                                        };
+                                        let priority = if message.starts_with("Toolchain install:")
+                                        {
+                                            thegn_core::notification::Priority::Notice
+                                        } else {
+                                            thegn_core::notification::Priority::Info
+                                        };
+                                        let _ =
+                                            refresh.send(RefreshKind::Toast { message, priority }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                        let _ = refresh.send(RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                        let _ = wake.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                                    });
+                                }
                             }
                             Action::SetupWizard => {
                                 onboarding.ui =

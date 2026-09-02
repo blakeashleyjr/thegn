@@ -115,6 +115,17 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "toolchain-install",
+        label: "Install worktree toolchain",
+        message_key: "action-toolchain-install",
+        hint: "toolchain install",
+        // Palette-only: installation is explicit and must never be bound to a
+        // normal pane-opening chord.
+        default_chords: &[],
+        palette: true,
+        keywords: &["toolchain", "mise", "install", "missing"],
+    },
+    ActionSpec {
         id: "setup-wizard",
         label: "Setup wizard… (forge / hosts / sandbox / appearance)",
         message_key: "action-setup-wizard",

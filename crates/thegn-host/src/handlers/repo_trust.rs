@@ -73,7 +73,8 @@ pub(crate) fn resolve_env_trusted(
         };
     };
     let root_s = repo_root.to_string_lossy().to_string();
-    let approvals = approvals_for(&db, &root_s);
+    let approved_canonical = db.repo_trust_approved(&root_s).unwrap_or_default();
+    let approvals = Approvals::from_canonical(approved_canonical.clone());
     let (mut env, resolved) = cfg.resolve_env_with(
         repo_root,
         loc,
@@ -81,7 +82,18 @@ pub(crate) fn resolve_env_trusted(
         selected_env,
         &approvals,
     );
-    surface(&db, &root_s, worktree, &resolved.events, &resolved.pending);
+    let mut pending = resolved.pending.clone();
+    if let Some(request) = crate::mise_provider::pending_request_for_target(
+        cfg,
+        worktree,
+        repo_root,
+        loc,
+        &approved_canonical,
+        false,
+    ) {
+        pending.push(request);
+    }
+    surface(&db, &root_s, worktree, &resolved.events, &pending);
     // Fold a repo `devcontainer.json` onto the resolved sandbox, trust-gated
     // exactly like the `.thegn.toml` overlay above. The worktree is bind-
     // mounted at its real path, so the devcontainer's workspace folder is that
