@@ -303,9 +303,13 @@ pub fn install_migration_policy(
     } else {
         Some(canonical_executable(&cfg.migration_executable)?)
     };
-    let current_executable = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok());
+    // `self_exe_path`, not `current_exe`: once the binary is rebuilt in place
+    // the raw value carries Linux's `" (deleted)"` marker, `canonicalize` then
+    // fails, and this drops to `None` — which never equals `pinned_executable`,
+    // so the configured controller silently stops being recognized as one and
+    // migrations are refused with a message about the wrong executable.
+    let current_executable =
+        crate::util::self_exe_path().and_then(|p| std::fs::canonicalize(p).ok());
     let policy = MigrationPolicy {
         authority: cfg.migration_authority,
         actor,

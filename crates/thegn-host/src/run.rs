@@ -5130,10 +5130,7 @@ pub(crate) fn spawn_worktree_shell_pane(
             // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
             // relay). A normal local PTY pane.
             if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.to_str().map(str::to_string))
-                    .unwrap_or_else(|| "thegn".to_string());
+                let exe = thegn_core::util::self_exe_str();
                 let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
                 return panes.spawn_argv_env(&argv, Some(dir), &[], center);
             }
@@ -16623,10 +16620,7 @@ async fn event_loop<T: Terminal>(
                                     if name == thegn_core::profile::name() {
                                         model.status = format!("Already on profile {name}");
                                     } else {
-                                        let exe = std::env::current_exe()
-                                            .ok()
-                                            .and_then(|p| p.to_str().map(str::to_string))
-                                            .unwrap_or_else(|| "thegn".to_string());
+                                        let exe = thegn_core::util::self_exe_str();
                                         match thegn_core::profile::launch_window_argv(
                                             None, &exe, name,
                                         ) {

@@ -33,7 +33,7 @@ fn pid_path() -> PathBuf {
 /// Resolves the `tgproxy` executable: a sibling of the running thegn binary
 /// (how nix/cargo install them together), else `tgproxy` on `PATH`.
 pub fn tgproxy_exe() -> String {
-    if let Ok(exe) = std::env::current_exe()
+    if let Some(exe) = thegn_core::util::self_exe_path()
         && let Some(dir) = exe.parent()
     {
         let sibling = dir.join("tgproxy");
