@@ -45,7 +45,7 @@ chrono.workspace = true
 toml.workspace = true
 # Control wire schema (docs/api/control-v1.json; tests/control_schema.rs).
 schemars = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 # Resident-bridge `fs.watch`: inotify in the env, streamed to the host. Matches
 # the host's pin so the workspace resolves one version.
 notify = "8"
