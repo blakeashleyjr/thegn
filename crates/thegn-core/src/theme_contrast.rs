@@ -72,20 +72,23 @@ pub fn audit(p: &Palette, bar: Bar) -> Vec<ContrastFinding> {
     let bg0 = ("bg0", p.bg0.as_str());
     let bg1 = ("bg1", p.bg1.as_str());
     let panel = ("panel", p.panel.as_str());
+    // Half the sidebar's rows sit on the alternate block tint, so it carries
+    // exactly the same text as `panel` and is gated exactly as hard.
+    let panel_alt = ("panel_alt", p.panel_alt.as_str());
     let panel2 = ("panel2", p.panel2.as_str());
     let raise = ("raise", p.raise.as_str());
 
     // Readable text sits on any surface, including selection (panel2) and hover
     // (raise) — a row stays readable when selected or hovered.
-    let all_surfaces = [bg0, bg1, panel, panel2, raise];
+    let all_surfaces = [bg0, bg1, panel, panel_alt, panel2, raise];
     // Recessive metadata and structural glyphs land on the base surfaces only;
     // panel2/raise re-tier the text riding a selection/hover.
-    let metadata_surfaces = [bg0, bg1, panel];
+    let metadata_surfaces = [bg0, bg1, panel, panel_alt];
     // UI affordances (focus frame, accent marks, activity dots) frame the tree
     // and bars, drawn on the two base backgrounds.
     let base_surfaces = [bg0, bg1];
     // Hue-as-text also has to survive a selected row, so it includes panel2.
-    let hue_surfaces = [bg0, bg1, panel, panel2];
+    let hue_surfaces = [bg0, bg1, panel, panel_alt, panel2];
 
     // text: body copy — AA (AAA on the default).
     check_set(
@@ -292,6 +295,7 @@ mod tests {
             bg0: white.clone(),
             bg1: white.clone(),
             panel: white.clone(),
+            panel_alt: white.clone(),
             panel2: white.clone(),
             // raise mid-grey: black fg still clears every floor on it, and it
             // gives the anchor test a surface to isolate a single failure on.

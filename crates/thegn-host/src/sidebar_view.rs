@@ -494,16 +494,53 @@ fn lead_gap_rows(model: &FrameModel, visible: &[&crate::sidebar::SidebarRow], i:
     }
     match visible[i].kind {
         RowKind::SectionHeading => 1, // pre-existing breathing gap
-        // THE-64: repo boundaries are the strongest break in the tree.
-        RowKind::Workspace if dividers_on(model) => 1,
+        // A workspace header used to own a blank separator row here (THE-64).
+        // The repo boundary is now carried by the alternating block tint
+        // (`block_parity` + `row_bg`), which says the same thing in colour and
+        // costs no screen rows — on a tree of a dozen-plus repos the gaps alone
+        // were eating a sixth of the column.
         _ => 0,
     }
 }
 
-/// Whether workspace separator gaps are active: config on, and not while the
-/// user is filtering (`/`) — the filtered list stays dense.
-fn dividers_on(model: &FrameModel) -> bool {
-    model.sidebar_display.dividers && !model.sidebar_filtering && model.sidebar_filter.is_empty()
+/// Whether the alternating project-block tint is active (`[ui]
+/// sidebar_dividers`). Unlike the blank row it replaced, a background fill
+/// costs no layout rows — so it stays on while filtering and in the rail,
+/// where the gap was suppressed.
+fn tint_on(model: &FrameModel) -> bool {
+    model.sidebar_display.dividers
+}
+
+/// Which body tint each visible row takes: `false` = [`S::Panel`], `true` =
+/// [`S::PanelAlt`]. Consecutive project blocks alternate so two abutting repos
+/// never read as one list.
+///
+/// A **block** is a header row (workspace or terminal-host group) plus every
+/// row under it until the next header — so a repo's worktrees, its
+/// `Merging`/`Merged` folders and its `Pipelines` folder all share one tint and
+/// read as one thing. A `SectionHeading` (the `TERMINALS` banner) resets the
+/// counter, so that section always opens on the base tint whatever the project
+/// list above it ended on.
+///
+/// Derived from the VISIBLE slice, after pins, reordering and filtering, which
+/// is the order actually painted — and computed for the whole list rather than
+/// the on-screen window, because [`build_sidebar`] paints from a scroll offset
+/// and a window-local parity would flip a block's tint as the list scrolled.
+fn block_parity(visible: &[&crate::sidebar::SidebarRow]) -> Vec<bool> {
+    use crate::sidebar::RowKind;
+    let mut out = Vec::with_capacity(visible.len());
+    let mut blocks = 0usize;
+    for row in visible {
+        match row.kind {
+            RowKind::SectionHeading => blocks = 0,
+            RowKind::Workspace | RowKind::TerminalHost => blocks += 1,
+            _ => {}
+        }
+        // `blocks` counts from 1 at the first header, so the first block takes
+        // the base tint and rows above any header (a banner) do too.
+        out.push(blocks > 0 && blocks.is_multiple_of(2));
+    }
+    out
 }
 
 /// [`sidebar_geom`] with the visible-row slice already filtered — so
@@ -671,6 +708,9 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
 
     let slots = quick_jump_slots(model, &visible);
+    // Whole-list parity, not window-local: the paint below starts at `scroll`,
+    // and a window-local count would flip a block's tint as the list scrolled.
+    let parity = block_parity(&visible);
 
     let geom = sidebar_geom_from(model, rect, &visible);
     let SidebarGeom {
@@ -768,7 +808,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             "height pass diverged from compose_row_lines for row {i} ({:?})",
             row.kind
         );
-        let bg = row_bg(row, i, cursor, model);
+        let bg = row_bg(row, i, cursor, parity[i], model);
         // The cursor row always carries the left-edge bar; focus only tints it.
         let cursor_bar = !rail && is_cursor && !matches!(row.kind, RowKind::SectionHeading);
         let height = heights[i].min(bottom - y); // clip a partly-fitting tail row
@@ -1160,13 +1200,21 @@ pub(crate) fn sidebar_window(heights: &[usize], list_rows: usize, scroll: usize)
 
 /// Background token for a row: cursor selection > active worktree > multi-select
 /// mark > the recessed band for the project tier (workspace/host headers) > the
-/// plain panel tint. Folders deliberately fall through to the panel tint — the
-/// band is what says "a repo starts here" (THE-64). Section banners never
-/// highlight — they read as titles.
+/// block tint. Folders deliberately fall through to the block tint — the band is
+/// what says "a repo starts here" (THE-64). Section banners never highlight —
+/// they read as titles.
+///
+/// `alt` is the row's project-block parity from [`block_parity`]: alternate
+/// blocks take [`S::PanelAlt`] instead of [`S::Panel`], which is what separates
+/// two abutting repos now that the blank divider row is gone. The header band
+/// stays [`S::Bg0`] on BOTH parities — `panel_alt` is derived only 35% of the
+/// way from `panel` to `bg0` precisely so a header is still the darkest row in
+/// an alt-tinted block.
 fn row_bg(
     row: &crate::sidebar::SidebarRow,
     i: usize,
     cursor: usize,
+    alt: bool,
     model: &FrameModel,
 ) -> crate::seg::Tok {
     use crate::seg::Tok;
@@ -1192,6 +1240,8 @@ fn row_bg(
         Tok::Slot(S::Raise)
     } else if header {
         Tok::Slot(S::Bg0)
+    } else if alt && tint_on(model) {
+        Tok::Slot(S::PanelAlt)
     } else {
         Tok::Slot(S::Panel)
     }
@@ -1637,31 +1687,6 @@ fn compose_row_lines(
             sp(3),
             seg(Tok::Slot(S::Faint), row.label.clone()),
         ])],
-        RowKind::PipelineSummary => {
-            let p = row.pipeline.unwrap_or_default();
-            // `Pipeline ▸ 3 running` — the caret is the same "there is more
-            // behind this" glyph a collapsed header uses, because that is
-            // exactly what `↵` does here (opens the board).
-            let mut l = vec![
-                sp(1),
-                sp(2),
-                seg(Tok::Slot(S::Text), row.label.clone()).bold(),
-                sp(1),
-                seg(Tok::Slot(S::Faint), gl.caret_closed),
-                sp(1),
-                seg(Tok::Slot(S::Dim), format!("{} running", p.active)),
-            ];
-            // The human-parked subset rides behind a separator in the attention
-            // tone: it is the half of the count that is asking for something.
-            if p.waiting_human > 0 {
-                l.push(seg(Tok::Slot(S::Dim), format!(" {} ", gl.middot)));
-                l.push(seg(
-                    Tok::Slot(S::ActivityWaiting),
-                    format!("{} {}", p.waiting_human, gl.attention),
-                ));
-            }
-            vec![Line::Segs(l)]
-        }
         // A derived `Pipelines` group under a workspace: caret + name + how
         // many lanes it holds. It reads like a folder because it behaves like
         // one (collapse/expand), and is toned plain rather than bold so a
@@ -1901,13 +1926,6 @@ fn compose_row_lines(
     }
 }
 
-/// A one-cell count for the rail: `1`–`9` verbatim, anything more as `+`.
-/// Truncating twelve to a `1` would read as one running agent, which is worse
-/// than declining to give the exact number in a column one cell wide.
-fn rail_count(n: usize) -> String {
-    if n > 9 { "+".into() } else { n.to_string() }
-}
-
 /// The slim-rail line for one row, fitted to the rail's ~4 cols. Worktrees and
 /// terminals keep their identity (activity dot + first letter); workspaces show
 /// a bold initial so repo boundaries stay legible; structural rows (folders,
@@ -1952,19 +1970,6 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
         ]),
         // Hints carry no identity worth a rail row; render an empty line.
         RowKind::EmptyHint => Line::Blank,
-        // At rail width the roster keeps only its most urgent number: the
-        // human-parked count in the attention tone if there is one, else the
-        // live count. A bare glyph would say "something is happening" without
-        // saying how much, which is the one thing this row exists to say.
-        RowKind::PipelineSummary => {
-            let p = row.pipeline.unwrap_or_default();
-            let (tok, n) = if p.waiting_human > 0 {
-                (Tok::Slot(S::ActivityWaiting), p.waiting_human)
-            } else {
-                (Tok::Slot(S::Dim), p.active)
-            };
-            Line::Segs(vec![sp(3), seg(tok, rail_count(n))])
-        }
         // Everything else (folder, host group, pipeline group) gets a dim
         // divider.
         _ => Line::Segs(vec![sp(1), seg(Tok::Slot(S::Faint), gl.box_h)]),
@@ -2628,9 +2633,10 @@ mod tests {
             ..Default::default()
         };
         // A cursor past the end, no marks, nothing active: the plain banding
-        // policy is what is under test.
+        // policy is what is under test. Parity is pinned false so this asserts
+        // the band, not the block tint (which `block_parity` covers).
         let cursor = usize::MAX;
-        let bg = |i: usize| row_bg(&model.sidebar_rows[i], i, cursor, &model);
+        let bg = |i: usize| row_bg(&model.sidebar_rows[i], i, cursor, false, &model);
         assert_eq!(bg(0), crate::seg::Tok::Slot(S::Bg0));
         assert_eq!(
             bg(1),
@@ -2644,10 +2650,34 @@ mod tests {
         );
         assert_eq!(bg(3), crate::seg::Tok::Slot(S::Panel));
         assert_eq!(bg(4), crate::seg::Tok::Slot(S::Panel));
+
+        // The header band OUTRANKS the block tint: a header on an alt-tinted
+        // block still reads as the darkest row, which is what keeps the two
+        // signals from fighting once the blank divider row is gone.
+        let alt = |i: usize| row_bg(&model.sidebar_rows[i], i, cursor, true, &model);
+        assert_eq!(alt(0), crate::seg::Tok::Slot(S::Bg0));
+        assert_eq!(alt(1), crate::seg::Tok::Slot(S::Bg0));
+        assert_eq!(alt(2), crate::seg::Tok::Slot(S::PanelAlt));
+        assert_eq!(alt(4), crate::seg::Tok::Slot(S::PanelAlt));
+    }
+
+    /// Rows for the TERMINALS banner case: the one remaining lead gap.
+    fn banner_rows() -> Vec<crate::sidebar::SidebarRow> {
+        use crate::sidebar::SidebarRow;
+        vec![
+            SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha"),
+            SidebarRow::base(RowKind::Worktree, 1, "wt0", "alpha"),
+            SidebarRow::base(RowKind::SectionHeading, 0, "TERMINALS", ""),
+            SidebarRow::base(RowKind::TerminalHost, 0, "local", "local"),
+        ]
     }
 
     #[test]
-    fn dividers_gap_the_boundary_between_workspaces() {
+    fn project_blocks_alternate_tint_instead_of_gapping() {
+        // THE-64 spent a blank ROW on each project boundary. It is now a
+        // background tint carried by the whole block, so the boundary reads the
+        // same and the list costs nothing extra: `two_ws_rows` lays out as four
+        // 1-row rows either way.
         let rect = Rect {
             x: 0,
             y: 0,
@@ -2667,35 +2697,68 @@ mod tests {
             ..Default::default()
         };
 
-        // The second workspace header owns the gap; the first (row 0) never does.
-        let frame_on = build_sidebar(&on, rect, 0);
-        let alpha = frame_on.rows.iter().find(|p| p.visible_index == 0).unwrap();
+        assert_eq!(sidebar_geom(&on, rect).heights, vec![1, 1, 1, 1]);
         assert_eq!(
-            alpha.lead_gap, 0,
-            "the first laid-out row never carries a gap"
+            sidebar_geom(&off, rect).heights,
+            vec![1, 1, 1, 1],
+            "on and off differ only in colour now"
         );
-        let beta = frame_on.rows.iter().find(|p| p.visible_index == 2).unwrap();
-        assert_eq!(beta.lead_gap, 1);
-        assert_eq!(beta.lines.first(), Some(&crate::seg::Line::Blank));
 
-        // Off ⇒ byte-identical layout: the ungapped all-ones heights.
-        let geom_on = sidebar_geom(&on, rect);
-        let geom_off = sidebar_geom(&off, rect);
-        assert_eq!(geom_off.heights, vec![1, 1, 1, 1]);
-        assert_eq!(geom_on.heights, vec![1, 1, 2, 1]);
+        let frame_on = build_sidebar(&on, rect, 0);
+        assert!(
+            frame_on.rows.iter().all(|p| p.lead_gap == 0),
+            "no project row carries a blank line any more"
+        );
+        let bg =
+            |f: &SidebarFrame, vi: usize| f.rows.iter().find(|p| p.visible_index == vi).unwrap().bg;
+        // The first block keeps the base tint; the second takes the alternate,
+        // and each block carries its own worktrees with it. (Row 0 is the
+        // cursor, which outranks both by design — see `row_bg`'s precedence.)
+        assert_eq!(bg(&frame_on, 1), crate::seg::Tok::Slot(S::Panel));
+        assert_eq!(
+            bg(&frame_on, 2),
+            crate::seg::Tok::Slot(S::Bg0),
+            "header band"
+        );
+        assert_eq!(bg(&frame_on, 3), crate::seg::Tok::Slot(S::PanelAlt));
 
+        // Off ⇒ one uniform tint, the pre-THE-64 dense look.
         let frame_off = build_sidebar(&off, rect, 0);
-        let beta_off = frame_off
-            .rows
-            .iter()
-            .find(|p| p.visible_index == 2)
-            .unwrap();
-        assert_eq!(beta_off.lead_gap, 0);
-        assert_eq!(beta.height, beta_off.height + 1, "the gap adds one row");
+        assert_eq!(bg(&frame_off, 1), crate::seg::Tok::Slot(S::Panel));
+        assert_eq!(bg(&frame_off, 3), crate::seg::Tok::Slot(S::Panel));
     }
 
     #[test]
-    fn gaps_are_suppressed_in_rail_and_while_filtering() {
+    fn block_parity_alternates_per_project_and_resets_at_a_banner() {
+        use crate::sidebar::SidebarRow;
+        let rows = vec![
+            SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha"),
+            SidebarRow::base(RowKind::Worktree, 1, "wt0", "alpha"),
+            SidebarRow::base(RowKind::Folder, 1, "Merged", "alpha"),
+            SidebarRow::base(RowKind::Workspace, 0, "beta", "beta"),
+            SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", "beta"),
+            SidebarRow::base(RowKind::Workspace, 0, "gamma", "gamma"),
+            SidebarRow::base(RowKind::SectionHeading, 0, "TERMINALS", ""),
+            SidebarRow::base(RowKind::TerminalHost, 0, "local", "local"),
+            SidebarRow::base(RowKind::Terminal, 1, "sh", "local"),
+        ];
+        let visible: Vec<&SidebarRow> = rows.iter().collect();
+        assert_eq!(
+            block_parity(&visible),
+            vec![
+                false, false, false, // alpha and everything under it
+                true, true,  // beta, its Pipelines folder riding the same tint
+                false, // gamma
+                false, false, false, // the banner resets; TERMINALS opens on the base
+            ]
+        );
+    }
+
+    #[test]
+    fn the_block_tint_survives_the_rail_and_a_filter() {
+        // Unlike the blank row it replaced, a background fill costs no layout
+        // rows — so the boundary keeps reading in the two modes where the gap
+        // had to be suppressed.
         let rect = Rect {
             x: 0,
             y: 0,
@@ -2726,86 +2789,75 @@ mod tests {
                 m.sidebar_filtering,
                 m.sidebar_filter
             );
+            let second = frame.rows.iter().find(|p| p.visible_index == 3).unwrap();
+            assert_eq!(
+                second.bg,
+                crate::seg::Tok::Slot(S::PanelAlt),
+                "the second block keeps its tint: rail={} filtering={} filter={:?}",
+                m.sidebar_rail,
+                m.sidebar_filtering,
+                m.sidebar_filter
+            );
         }
     }
 
     #[test]
-    fn gaps_count_in_scroll_geometry() {
-        // The truncation chips and scroll clamp must count gap rows, or "N
-        // more" would under-report by exactly the number of separators.
+    fn the_banner_gap_counts_in_scroll_geometry() {
+        // The truncation chips and scroll clamp must count the one remaining
+        // lead gap (the section banner's breathing row), or "N more" would
+        // under-report by exactly that.
         let rect = Rect {
             x: 0,
             y: 0,
             cols: 30,
             rows: 40,
         };
-        let on = FrameModel {
-            sidebar_rows: two_ws_rows(),
+        let model = FrameModel {
+            sidebar_rows: banner_rows(),
             ..Default::default()
         };
-        let off = FrameModel {
-            sidebar_rows: two_ws_rows(),
-            sidebar_display: SidebarDisplay {
-                dividers: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let heights_on = sidebar_geom(&on, rect).heights;
-        let heights_off = sidebar_geom(&off, rect).heights;
-        let gaps: usize = heights_on
-            .iter()
-            .zip(&heights_off)
-            .map(|(a, b)| a - b)
-            .sum();
-        assert_eq!(gaps, 1);
+        let heights = sidebar_geom(&model, rect).heights;
+        assert_eq!(heights, vec![1, 1, 2, 1], "the banner owns a leading blank");
 
-        // A 4-row window shows the whole ungapped list; the gapped one loses
-        // the last row to the separator — and needs one more scroll offset.
+        // A 4-row window shows the whole list minus the row the gap pushed out,
+        // and needs one more scroll offset than the 4 rows would suggest.
         let list_rows = 4;
+        assert_eq!(max_sidebar_scroll(&heights, list_rows), 1);
+        let w = sidebar_window(&heights, list_rows, 0);
         assert_eq!(
-            max_sidebar_scroll(&heights_on, list_rows),
-            max_sidebar_scroll(&heights_off, list_rows) + gaps
-        );
-        let w_on = sidebar_window(&heights_on, list_rows, 0);
-        let w_off = sidebar_window(&heights_off, list_rows, 0);
-        assert_eq!(w_off.hidden_below, 0, "the ungapped list fits exactly");
-        assert_eq!(
-            w_on.hidden_below,
-            w_off.hidden_below + gaps,
+            w.hidden_below, 1,
             "the gap pushed the last row out of the window"
         );
     }
 
     #[test]
-    fn a_clipped_gapped_workspace_keeps_its_label() {
-        // Mirror of the clipped section-heading rule, for THE-64 gaps: a
-        // partly-fitting workspace row drops its GAP, not its label — and the
+    fn a_clipped_banner_keeps_its_label() {
+        // A partly-fitting gapped row drops its GAP, not its label — and the
         // placement then reports lead_gap 0, so paint and the caret cell stay
         // aligned with what is actually on screen.
         let rect = Rect {
             x: 0,
             y: 0,
             cols: 30,
-            rows: 5, // header + blank ⇒ 3 list rows: alpha, wt0, then a clipped beta
+            rows: 5, // header + blank ⇒ 3 list rows: alpha, wt0, then a clipped banner
         };
         let model = FrameModel {
-            sidebar_rows: two_ws_rows(),
+            sidebar_rows: banner_rows(),
             ..Default::default()
         };
         let frame = build_sidebar(&model, rect, 0);
         let alpha = frame.rows.iter().find(|p| p.visible_index == 0).unwrap();
         assert_eq!(alpha.height, 1);
-        let beta = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
-        assert_eq!(beta.height, 1, "clipped to the last list row");
-        assert_eq!(beta.lead_gap, 0, "the gap was trimmed, not the label");
-        assert_ne!(beta.lines.first(), Some(&crate::seg::Line::Blank));
+        let banner = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
+        assert_eq!(banner.height, 1, "clipped to the last list row");
+        assert_eq!(banner.lead_gap, 0, "the gap was trimmed, not the label");
+        assert_ne!(banner.lines.first(), Some(&crate::seg::Line::Blank));
 
         let mut s = Surface::new(rect.cols, rect.rows);
         draw_sidebar(&mut s, rect, &model);
         assert!(
-            s.screen_chars_to_string().contains("beta"),
-            "a clipped workspace header is still legible on screen"
+            s.screen_chars_to_string().contains("TERMINALS"),
+            "a clipped banner is still legible on screen"
         );
     }
 

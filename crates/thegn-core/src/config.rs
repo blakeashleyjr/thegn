@@ -6654,6 +6654,7 @@ impl Config {
                     "bg0" => &c.bg0,
                     "bg1" => &c.bg1,
                     "panel" => &c.panel,
+                    "panel_alt" => &c.panel_alt,
                     "panel2" => &c.panel2,
                     "raise" => &c.raise,
                     "border" => &c.border,

@@ -176,6 +176,7 @@ pub fn convert_gogh(scheme: &GoghScheme) -> Result<UserTheme, ThemeImportError> 
         bg0: background.clone(),
         bg1: blend_over(&dark_anchor, &background, 0.20),
         panel: blend_over(&dark_anchor, &background, 0.34),
+        panel_alt: String::new(),
         panel2: blend_over(&light_anchor, &background, 0.20),
         raise: blend_over(&light_anchor, &background, 0.34),
         border: blend_over(&dark_anchor, &light_anchor, 0.50),

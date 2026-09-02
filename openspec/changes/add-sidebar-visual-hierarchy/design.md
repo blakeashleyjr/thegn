@@ -16,63 +16,70 @@ activity dots, the MQ token), no draw-site literal: everything resolves in
 `seg::Tok` → `wire.rs::color_spec`, and any glyph tweak goes through
 `GlyphSet` with a BMP width-1 + ASCII pair (the `stabilize-sidebar-internals`
 rule). In mono/16-color quantization the tiers must still differ by _weight
-and layout_ (bold + indent + gap), so the hierarchy cannot be color-alone —
+and layout_ (bold + indent + glyph), so the hierarchy cannot be color-alone —
 that is what makes the change safe under `just term-check`'s six
 environments.
 
-## The gap row is layout, not paint
+## The project boundary is a tint, not a row
 
-The spacer between workspace subtrees is emitted by the row-build/layout pass
-(`build_sidebar`), not painted ad hoc, because three consumers must agree on
-it: the renderer, `RowHit` hit-testing, and the scroll clamp
-(`max_scroll`, hidden-row counts — the "truncation is never silent"
-requirement counts laid-out rows). Deriving all three from one pass is the
-existing sidebar contract; a paint-only gap would desynchronize click
-targets from pixels, the exact bug class `fix-sidebar-drop-position-semantics`
-is burning down.
+Each project block — a header row plus every row beneath it up to the next
+block head — shares one background tint, and consecutive blocks alternate
+between `S::Panel` and a new `S::PanelAlt`. Parity is computed once per layout
+pass over the **visible** slice (`block_parity` in `sidebar_view.rs`), after
+pins, reordering and filtering, because that is the order actually painted;
+computing it over the on-screen window instead would flip a block's tint as
+the list scrolled.
 
-Interaction rules for the gap:
+Two rules make the tint compose with the header band rather than fight it:
 
-- **Clicks:** resolve as empty space (no row) — mirrors "the affordances are
-  not click targets".
-- **Cursor:** never lands on a gap; `j/k` skip it (it has no `RowKind` the
-  cursor accepts).
-- **Drag:** the spot layer treats a gap as the boundary between the runs
-  above and below it — a drop over the gap lands exactly where a drop on the
-  boundary would have landed with dividers off. This keeps
-  `add-sidebar-folder-ordering`'s run semantics untouched.
-- **Filter (`/`) and rail:** gaps are suppressed; a filtered list is dense
-  and the rail's 4 columns cannot afford blank rows.
+- **`panel_alt` is derived, never authored.** `extend_palette` blends `bg0`
+  over `panel` at 0.5, so every preset and every imported user theme gets a
+  value with no table edit, and a paper theme steps toward its own light
+  `bg0` rather than toward black. It is registered in `theme_contrast`'s
+  surface sets, so text drawn on it is gated exactly as hard as text on
+  `panel`.
+- **It never passes the midpoint.** Half the `bg0`→`panel` gap goes to the
+  block boundary and half stays under the header band, so the band is at
+  least as distinct from an alt block as the two blocks are from each other.
+  A preset sweep pins this.
 
-Cost: one row of vertical space per additional workspace. With
-`sidebar_dividers = false` layout is byte-identical to today — the key exists
-precisely so vertically-tight users (many repos, short terminals) can opt
-out, and so e2e can pin both shapes.
+The tint sits at the BOTTOM of `row_bg`'s precedence stack — under cursor,
+active, and multi-select — so it never competes with the selection vocabulary
+layered on row backgrounds. And it carries no layout: with the gap gone every
+row is a plain 1-row placement again, so hit-testing, the drag spot layer and
+the scroll clamp all see the pre-divider geometry.
 
-## Damage and perf
+## Why this replaced the separator gap
 
-Pure chrome recomposition — a `Full` frame like any sidebar change; no new
-wake path, no per-frame allocation beyond the row vector's existing growth
-(one spacer entry per workspace boundary). `render_plan` invariants and their
-tests untouched.
+The original form of this requirement laid out a one-row gap above each
+workspace header. It read correctly, and it shipped — but it costs a screen
+row per project, and on a real tree of a dozen-plus repos that is a large
+fraction of the column the change exists to make legible. The tint carries the
+same signal for no rows, which is also why it can stay on in the rail and
+under a `/` filter, where the gap had to be suppressed.
 
-## Security
-
-None — a render-only change: no new I/O, config beyond one boolean `[ui]`
-key, no new write surface, no capability-catalog row. Blast radius is a
-misdrawn frame.
+The one thing lost is that a blank row degrades perfectly in mono, where a
+tint may not. That is acceptable here because the gap was never the only
+signal: the tier ladder is carried by weight, glyph and indent
+(`header_tiers_are_distinguishable_without_color`), and the header band
+survives. The tint strengthens a hierarchy that already reads without colour;
+it does not carry it.
 
 ## Alternatives considered
 
-- **Hairline divider glyph row** (e.g. `─` across the sidebar) instead of a
-  blank gap — rejected as default: a line adds ink to remove noise, and the
-  glyph needs a degradation pair; a blank row degrades perfectly everywhere.
-  The config key is a boolean, not an enum, until someone actually asks for
-  a line style.
-- **Background banding per workspace** (alternate `Bg0`/`Panel` bands per
-  subtree) — strongest possible grouping but visually heavy, hostile to the
-  activity-dot/selection vocabulary layered on row backgrounds
-  (`row_bg`'s precedence stack), and ugly in 16-color quantization.
+- **Hairline divider glyph row** (e.g. `─` across the sidebar) — rejected: a
+  line adds ink to remove noise, it needs a degradation pair, and it costs the
+  same screen row the gap did. The config key is a boolean, not an enum, until
+  someone actually asks for a line style.
+- **Background banding per workspace** — originally rejected here as visually
+  heavy, hostile to the selection vocabulary in `row_bg`, and ugly in
+  16-color. **Adopted, in a milder form**, once the gap's cost on a large tree
+  became clear: the alternation is `panel`/`panel_alt` (a half-step inside the
+  existing surface ramp), not the `Bg0`/`Panel` banding first considered; it
+  sits below cursor/active/mark in `row_bg`'s precedence so the selection
+  vocabulary still wins every contest; and it is additive over a hierarchy
+  that already reads by weight and glyph, so a quantized terminal loses the
+  tint without losing the tiers.
 - **Uppercase folder names / prefix glyphs** — punishes user-chosen names to
   fix a styling problem.
 - **Fold into `stabilize-sidebar-internals`** — that change is scoped and

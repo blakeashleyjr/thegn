@@ -35,11 +35,14 @@ deliberately quieter: plain text, a faint `▪`, and the filed count grayed —
 a drawer inside the repo, not a repo itself. Worktree and terminal rows are
 the body of the tree.
 
-A blank separator row separates one project's block from the next, so
-two open repos never run together (a click on it just selects the header
-below; it never folds anything). `[ui] sidebar_dividers = false` turns the
-separators off and restores the old dense layout; they also disappear while
-a `/` filter is active and never exist in the rail.
+Each project's block — its header, its worktrees and its folders — shares one
+background tint, and consecutive projects alternate between two, so two open
+repos never run together. The header band stays the darkest row either way, so
+it still reads as the start of a block. `[ui] sidebar_dividers = false` turns
+the alternation off for one uniform tint. This used to be a blank separator row
+above each header, which cost a screen row per repo; the tint says the same
+thing for nothing, so unlike the gap it also applies in the rail and while a `/`
+filter is active.
 
 When a project has active merge-queue entries, its full-mode header shows a
 compact token immediately before the warm-pool token: the count followed by a
@@ -128,9 +131,7 @@ gesture below has a keyboard equivalent.
 
 ## Pipeline lanes
 
-While agents are dispatched, a compact `Pipeline ▸ N running` row sits at the
-bottom of the tree (`↵` or a click opens the pipeline board). Inside every
-project whose worktrees a pipeline has spawned, the tree also grows a
+Inside every project whose worktrees a pipeline has spawned, the tree grows a
 **`Pipelines` folder** — one per project, at the tail of that project's own
 tree — holding one folder per pipeline, named from the roster's issue id:
 
@@ -154,9 +155,14 @@ another one.
 These folders are **derived, not real folders**. They come from the dispatch
 roster — its rows of **any** status, not only the live ones — so they survive a
 restart and a finished lane stays until its rows are removed from the roster.
-A worktree no roster row references stays exactly where it was; a lane thegn
-could not tie to any project groups under the door row at the bottom of the
-tree instead. So a lane cannot be renamed, reordered, pinned, marked or filed
+A worktree no roster row references stays exactly where it was. A pipeline
+folder only ever hangs under a project: a lane whose worktree is not registered
+anywhere is filed by the directory its siblings live in, and one thegn cannot
+tie to any project at all is left out of the tree rather than opening a second,
+top-level pipeline section — the pipeline board (`Alt-b`) is the complete view
+and still lists it. For the same reason the flat layout, which has no project
+rows to nest under, grows no pipeline rows. So a lane cannot be renamed,
+reordered, pinned, marked or filed
 into, and the same worktree shows up once per lane that references it — the
 worktrees' own rows higher up the tree are untouched, a lane shows a second
 view of them, never a second identity.

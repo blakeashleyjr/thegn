@@ -132,7 +132,8 @@ sidebar_terminals_section = "always"
 # group it landed on). When every other stop is collapsed the step still lands
 # on the immediate neighbour, so the keybind never goes dead.
 sidebar_nav_skips_collapsed = true
-sidebar_dividers = true  # blank separator row above each project header (off = the old dense layout)
+sidebar_dividers = true  # alternate the background tint per project block, so two
+                         # abutting projects read as two (off = one uniform tint)
 # Pane fullscreen (Ctrl+Alt+z cycles tiled → maximize-in-chrome → full-window):
 # in the full-window stop the sidebar/panel/strip are hidden. These keep the
 # top masthead and bottom status bars respectively — set either false for a
@@ -236,6 +237,8 @@ mascot_motion = "blink"
 # bg0 = "#0b0e16"       # deepest background (sidebar + pane background)
 # bg1 = "#10141f"       # bars / surfaces (tabbar, statusbar, panel)
 # panel = "#151a28"     # panel lists
+# panel_alt = "#10141f" # alternate list tint (sidebar project blocks alternate
+#                       #   onto it; unset derives a shade of panel toward bg0)
 # panel2 = "#1a2031"    # selection / hover
 # raise = "#222942"     # raised (context menus)
 # border = "#6f788e"    # pane/edge frame lines
