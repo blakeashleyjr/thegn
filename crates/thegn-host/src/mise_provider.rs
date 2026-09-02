@@ -992,7 +992,10 @@ fn resolve_cached(worktree: &Path, identity: &ConfigSetIdentity) {
 }
 
 fn prewarm(worktree: &Path, identity: &ConfigSetIdentity) {
-    if read_cache_record(identity).is_some() || !executable_available() {
+    // A degraded record is diagnostic state, not a successful cache hit. It
+    // must remain retryable so a transient mise/plugin failure does not become
+    // permanent for this unchanged config identity.
+    if read_cache(identity).is_some() || !executable_available() {
         return;
     }
     let Ok(mut keys) = in_flight().lock() else {

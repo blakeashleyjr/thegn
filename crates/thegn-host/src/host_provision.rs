@@ -181,6 +181,7 @@ pub(crate) fn provision_worktree_on_host(
         })
         .collect();
     progress(&views);
+    let mut all_succeeded = true;
     for (i, step) in plan.steps.iter().enumerate() {
         views[i].state = ProvisionState::Active;
         progress(&views);
@@ -280,6 +281,7 @@ pub(crate) fn provision_worktree_on_host(
             Ok(()) => views[i].state = ProvisionState::Done,
             Err(e) => {
                 // Best-effort: surface, keep going — the pane still opens.
+                all_succeeded = false;
                 views[i].state = ProvisionState::Failed;
                 views[i].detail = Some(e.clone());
                 thegn_core::msg::warn(&format!(
@@ -290,8 +292,10 @@ pub(crate) fn provision_worktree_on_host(
         }
         progress(&views);
     }
-    let marker_write = format!("printf '%s\\n' {marker_version} > {marker_path}");
-    let _ = runner.exec_in_container(&container, &marker_write, secs(30)); // best-effort: marker write: a failed write just re-runs init on the next claim
+    if all_succeeded {
+        let marker_write = format!("printf '%s\\n' {marker_version} > {marker_path}");
+        let _ = runner.exec_in_container(&container, &marker_write, secs(30)); // best-effort: marker write: a failed write just re-runs init on the next claim
+    }
     init
 }
 
