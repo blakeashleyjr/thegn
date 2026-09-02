@@ -177,7 +177,12 @@ impl DiffView {
                     self.active_diff()
                         .and_then(|d| d.files.get(i))
                         .map(|file| {
-                            expanded_file_rows(file, self.anchored_review().as_ref(), false).len()
+                            if file.is_submodule {
+                                1
+                            } else {
+                                expanded_file_rows(file, self.anchored_review().as_ref(), false)
+                                    .len()
+                            }
                         })
                         .unwrap_or(0)
                 } else {
@@ -625,7 +630,10 @@ impl DiffView {
                             Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
                             false,
                         ));
-                        if self.source == DiffSource::PrReview {
+                        if self.source == DiffSource::PrReview && f.is_submodule {
+                            let selected = self.sel == 0;
+                            out.push((crate::pr_view::submodule_line(f, selected, cols), selected));
+                        } else if self.source == DiffSource::PrReview {
                             let review = self.anchored_review();
                             for (ri, row) in expanded_file_rows(f, review.as_ref(), false)
                                 .into_iter()
@@ -988,6 +996,50 @@ mod tests {
         assert!(rendered.contains("bbbbbbb"));
         assert!(!rendered.contains("Subproject commit"));
     }
+
+    #[test]
+    fn pr_review_submodule_file_is_one_atomic_pointer_row() {
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "vendor/lib".into(),
+                old_path: Some("vendor/lib".into()),
+                is_submodule: true,
+                hunks: vec![DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![
+                        line(DiffLineKind::Del, "Subproject commit aaaaaaa"),
+                        line(DiffLineKind::Add, "Subproject commit bbbbbbb"),
+                    ],
+                }],
+            }],
+        };
+        let mut v = DiffView::with_structural("t".into(), 1, false);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(diff.clone()),
+            structural: None,
+            review: Some(thegn_core::review::PrReviewSnapshot {
+                diff,
+                ..Default::default()
+            }),
+            review_status: None,
+        });
+        v.handle_key(&KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(v.row_count(), 1);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.row_count(), 1);
+        let rendered = v
+            .body_lines(80)
+            .iter()
+            .map(|(line, _)| format!("{line:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("vendor/lib"));
+        assert!(rendered.contains("aaaaaaa"));
+        assert!(rendered.contains("bbbbbbb"));
+        assert!(!rendered.contains("Subproject commit"));
+    }
+
     #[test]
     fn structural_mode_keeps_the_worktree_source_label_pair() {
         let mut v = DiffView::with_structural("t".into(), 1, true);

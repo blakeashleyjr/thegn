@@ -1945,27 +1945,26 @@ fn collect_sidebar_status(
                 s.spawn(move || {
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
+                    let repo_root =
+                        thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                    let include_submodules = app_cfg.repo_git(&repo_root).submodules
+                        != thegn_core::config::SubmoduleMode::Off;
                     // One batched round-trip for a bridged loc (status + ahead/
                     // behind + branch), gix/CLI reads for a local one.
-                    let reads = crate::git_handle::get().glyph_reads_with_submodules(
-                        &loc,
-                        app_cfg.git.submodules != thegn_core::config::SubmoduleMode::Off,
-                    );
+                    let reads = crate::git_handle::get()
+                        .glyph_reads_with_submodules(&loc, include_submodules);
                     let dirty = reads.dirty.map_err(|_| ());
                     let ahead_behind = reads.ahead_behind.map_err(|_| ());
                     let branch = reads.branch.map(Some).map_err(|_| ());
                     let uncommitted = reads.uncommitted.map_err(|_| ());
                     let branch_diff = reads.branch_diff.map_err(|_| ());
                     let submodule_dirty = reads.submodule_dirty.map_err(|_| ());
-                    let repo_root = thegn_core::repo::main_worktree(wt)
-                        .map(|r| r.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.clone());
                     let (row, clean) = merge_glyph_scan(
                         prior_for_scan.get(p),
                         dirty,
                         ahead_behind,
                         branch,
-                        repo_root,
+                        repo_root.to_string_lossy().into_owned(),
                         uncommitted,
                         branch_diff,
                         submodule_dirty,

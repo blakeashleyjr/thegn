@@ -9457,7 +9457,15 @@ async fn event_loop<T: Terminal>(
             // Typed gitlink reads arrive independently of hydration. Carry the
             // last-known payload across an ordinary model refresh so a failed
             // scan cannot make a submodule row appear clean or textual.
-            if current_config.git.submodules != thegn_core::config::SubmoduleMode::Off {
+            let active_repo_root = thegn_core::repo::main_worktree(&active_tab_path(&session));
+            let active_submodules_enabled = active_repo_root
+                .as_deref()
+                .map(|root| {
+                    current_config.repo_git(root).submodules
+                        != thegn_core::config::SubmoduleMode::Off
+                })
+                .unwrap_or(current_config.git.submodules != thegn_core::config::SubmoduleMode::Off);
+            if active_submodules_enabled {
                 for row in &mut next_model.panel.changes {
                     row.submodule = model
                         .panel
@@ -9603,9 +9611,7 @@ async fn event_loop<T: Terminal>(
             let ctrl_digits_reportable = model.ctrl_digits_reportable;
             model = next_model;
             model.ctrl_digits_reportable = ctrl_digits_reportable;
-            if current_config.git.submodules != thegn_core::config::SubmoduleMode::Off
-                && !model.panel.changes.is_empty()
-            {
+            if active_submodules_enabled && !model.panel.changes.is_empty() {
                 spawn_submodule_scan(hydration_gen, &session, &submodule_scan_tx, &waker);
             }
             // The tab strip is LOOP-owned: `build_model` derived it from the
