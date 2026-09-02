@@ -190,6 +190,7 @@ pub mod migrate_brand;
 pub mod models;
 pub mod msg;
 pub mod notification;
+pub mod notification_render;
 pub mod notification_route;
 pub mod notification_scope;
 pub mod notification_sound;

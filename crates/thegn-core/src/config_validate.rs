@@ -109,6 +109,27 @@ pub fn validate_str(body: &str) -> Vec<String> {
             if let Err(e) = cfg.diagnostics.validate_crash_sink() {
                 errs.push(e);
             }
+            errs.extend(cfg.notifications.push.validate_errors());
+            let sink_names: std::collections::BTreeSet<String> = cfg
+                .notifications
+                .push
+                .effective_sinks()
+                .into_iter()
+                .map(|sink| sink.name.trim().to_string())
+                .collect();
+            for (index, rule) in cfg.notifications.rules.iter().enumerate() {
+                for channel in rule.route.iter().flatten() {
+                    let Some(name) = channel.trim().strip_prefix("push:") else {
+                        continue;
+                    };
+                    let name = name.trim();
+                    if name.is_empty() || !sink_names.contains(name) {
+                        errs.push(format!(
+                            "notifications.rules[{index}].route names unknown push sink {name:?}"
+                        ));
+                    }
+                }
+            }
             // `[notifications]` live-agent signatures must be non-empty and
             // bounded; otherwise an empty substring would match every line.
             errs.extend(cfg.notifications.validate());
