@@ -540,24 +540,23 @@ coverage-html:
 # --- quality --------------------------------------------------------------
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
-lint:
-    @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
-    # Formatting gate (treefmt, fail-on-change) — FIRST so drift fails fast before
-    # the clippy compile. This is what makes `just lint` (and thus the merge-queue
-    # `gate_command`) reject unformatted code: the fold-actor lands via plumbing
-    # commits, so git's pre-commit/treefmt hook never fires on that path. `--ci`
-    # formats in place then exits nonzero on any change (mirrors `just fmt-check`).
-    treefmt --ci
-    cargo clippy --workspace --all-targets -- -D warnings
-    # Every tracked shell script, not a hand-kept list — the list had drifted to
-    # 9 of 20 files, silently excluding the user-facing setup-macos.sh and all
-    # of scripts/ci/. `git ls-files` keeps new scripts covered by default.
-    git ls-files -z '*.sh' | xargs -0 shellcheck -x
-    yamllint .
-    # Tracked TOML only. Bare `taplo lint` walks the whole cwd and was linting
-    # .direnv/flake-inputs (i.e. nixpkgs) and target/ — 122 files, almost none
-    # of them ours.
-    git ls-files -z '*.toml' | xargs -0 taplo lint
+# Architecture ratchets + grep guardrails. NO COMPILE — `git grep` over the
+# source and the checked-in allowlists, so this runs in seconds and its verdict
+# depends on the code alone.
+#
+# That last property is why this is a separate target. These checks used to live
+# inside `just lint`, BEHIND `cargo clippy --workspace --all-targets`, so running
+# them cost a full workspace compile — which is why nothing cheap ever ran them,
+# including the merge-queue fold gate. Over one week that let 27 unpinned
+# `ignored-result` violations and 2 `json-emit` violations reach main unseen.
+#
+# Unlike treefmt/clippy these are NOT toolchain-relative: a rustfmt or clippy
+# bump cannot retroactively fail them, so they are safe in `[merge_queue]
+# gate_command` where a formatter would wedge the whole queue.
+#
+# The Rust-side ratchets (platform-cfg, hostkey, surface-gaps, completion-slot,
+# help) are Rust tests and run in `just test`.
+ratchets:
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
@@ -604,6 +603,25 @@ lint:
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
     ! grep -rIn 'poll_input(' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -vE 'poll_input\(None\)|Duration::ZERO\)|poll_input\(timeout\)' || (echo 'ERROR: a timed poll_input outside idle_poll::poll_timeout — the idle loop must never poll (CLAUDE.md)' && exit 1)
     test "$(grep -rIn 'poll_input(timeout)' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l)" = 1 || (echo 'ERROR: expected exactly one poll_input(timeout) site (run.rs)' && exit 1)
+
+lint: ratchets
+    @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
+    # Formatting gate (treefmt, fail-on-change) — FIRST so drift fails fast before
+    # the clippy compile. This is what makes `just lint` (and thus the merge-queue
+    # `gate_command`) reject unformatted code: the fold-actor lands via plumbing
+    # commits, so git's pre-commit/treefmt hook never fires on that path. `--ci`
+    # formats in place then exits nonzero on any change (mirrors `just fmt-check`).
+    treefmt --ci
+    cargo clippy --workspace --all-targets -- -D warnings
+    # Every tracked shell script, not a hand-kept list — the list had drifted to
+    # 9 of 20 files, silently excluding the user-facing setup-macos.sh and all
+    # of scripts/ci/. `git ls-files` keeps new scripts covered by default.
+    git ls-files -z '*.sh' | xargs -0 shellcheck -x
+    yamllint .
+    # Tracked TOML only. Bare `taplo lint` walks the whole cwd and was linting
+    # .direnv/flake-inputs (i.e. nixpkgs) and target/ — 122 files, almost none
+    # of them ours.
+    git ls-files -z '*.toml' | xargs -0 taplo lint
 
 # Repair a wedged checkout: strip a stray `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared

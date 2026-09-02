@@ -12,7 +12,10 @@
 #
 # Sanctioned survivors: this script, CHANGELOG.md (history), dated design
 # records under docs/superpowers/, openspec change folders (proposals quote
-# the stale text they fix), and the openspec archive.
+# the stale text they fix), the openspec archive, and pipeline handoff
+# artifacts under .thegn/pipeline/ — an architect's design record quotes the
+# state of the world it is reasoning about, exactly as an openspec proposal
+# does, and is a dated record rather than a live claim about the system.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -23,6 +26,7 @@ allow_files=(
   ':!CHANGELOG.md'
   ':!docs/superpowers/**'
   ':!openspec/changes/**'
+  ':!.thegn/pipeline/**'
   ':!deny.toml'
   ':!crates/thegn-core/tests/crate_boundaries.rs'
 )
