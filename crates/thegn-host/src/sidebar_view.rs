@@ -393,6 +393,10 @@ pub(crate) struct SidebarPlacement {
     pub lines: Vec<crate::seg::Line>,
     pub bg: crate::seg::Tok,
     pub cursor_bar: bool,
+    /// The painted merge-queue token's half-open x-range, when this is a full
+    /// workspace row. Kept beside the composed line so mouse hits use the
+    /// exact right-aligned geometry that paint used.
+    pub mq_span: Option<(usize, usize)>,
 }
 
 /// The scroll affordance gutter: a 1-column proportional bar on the sidebar's
@@ -687,6 +691,17 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     // to a pre-scroll-model one.
     let scroll = desired_scroll.min(max_sidebar_scroll(heights, list_rows));
 
+    // Reserve the scrollbar column before composing right-aligned workspace
+    // tokens. The paint rect and the hit geometry must use the same content
+    // width, or an overflow gutter could clip a token while leaving its hit
+    // span active in the gutter.
+    let window = sidebar_window(heights, list_rows, scroll);
+    let reserve_scrollbar = !rail
+        && list_rows > 0
+        && rect.cols > SIDEBAR_OVERFLOW_COLS
+        && window.total_cells > list_rows;
+    let content_cols = rect.cols - usize::from(reserve_scrollbar);
+
     // The warm-pool chip rides the ACTIVE workspace's row — the workspace_slug of
     // the active worktree row. (Workspace rows themselves carry `active = false`.)
     let active_ws_slug: Option<String> = visible
@@ -706,6 +721,14 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         // A row is the last child at its depth when the next visible row steps
         // back up the tree (or there is none) — drives the └ vs ├ connector.
         let is_last = visible.get(i + 1).is_none_or(|n| n.depth < row.depth);
+        let pool = if row.kind == RowKind::Workspace
+            && active_ws_slug.as_deref() == Some(row.workspace_slug.as_str())
+        {
+            model.pool
+        } else {
+            None
+        };
+        let mut mq_geometry = None;
         let mut lines = if rail {
             vec![compose_rail_line(row)]
         } else {
@@ -714,24 +737,20 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
                 .as_deref()
                 .and_then(|p| model.sidebar_window_titles.get(p))
                 .map(String::as_str);
-            let pool = if row.kind == RowKind::Workspace
-                && active_ws_slug.as_deref() == Some(row.workspace_slug.as_str())
-            {
-                model.pool
-            } else {
-                None
-            };
             let show_detail = model
                 .sidebar_display
                 .show_detail(detail_focused, i == detail_cursor);
             compose_row_lines(
                 row,
                 wt,
+                model.preview.as_ref().filter(|_| row.active),
                 is_cursor,
                 show_detail,
                 is_last,
                 slots[i],
                 pool,
+                content_cols,
+                &mut mq_geometry,
                 &model.sidebar_display,
             )
         };
@@ -771,6 +790,14 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             .iter()
             .take_while(|l| matches!(l, crate::seg::Line::Blank))
             .count();
+        let mq_span = if !rail && row.kind == RowKind::Workspace {
+            mq_geometry.map(|(mq_width, right_width)| {
+                let start = rect.x + content_cols.saturating_sub(right_width);
+                (start, start + mq_width)
+            })
+        } else {
+            None
+        };
         rows.push(SidebarPlacement {
             visible_index: i,
             y,
@@ -779,6 +806,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             lines,
             bg,
             cursor_bar,
+            mq_span,
         });
         y += heights[i];
     }
@@ -811,8 +839,6 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     };
     // What this pass could and could not show. Measured from the same heights
     // the loop walked, so the two can never disagree.
-    let window = sidebar_window(heights, list_rows, scroll);
-
     // The overflow affordances. Both are pure overlays derived AFTER layout:
     // reserving budget for them would shrink `list_rows`, which is exactly the
     // shortage they exist to report. Suppressed in the rail (4 columns) and
@@ -1194,6 +1220,8 @@ pub(crate) struct RowHit {
     /// The caret cell only counts on the label lines below them — nothing is
     /// under a blank line, so a gap click must not toggle collapse.
     pub lead_gap: usize,
+    /// The exact painted merge-queue token span, when present.
+    pub mq_span: Option<(usize, usize)>,
 }
 
 /// The rendered rows resolved for mouse hit-testing (see [`RowHit`]).
@@ -1230,6 +1258,7 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
                 pin_key: row.pin_key.clone(),
                 caret_x,
                 lead_gap: p.lead_gap,
+                mq_span: p.mq_span,
             })
         })
         .collect()
@@ -1480,6 +1509,45 @@ fn stage_tag(row: &crate::sidebar::SidebarRow) -> Option<String> {
 
 /// Widest stage tag the sidebar will paint.
 const STAGE_TAG_MAX: usize = 6;
+/// Preserve the workspace header's gutter, caret, and a short identity slice
+/// before offering the optional right cluster any width.
+const WORKSPACE_LABEL_FLOOR: usize = 10;
+
+/// Compose the right-aligned cluster for a workspace header. Keeping the
+/// token width and the complete cluster width together lets `build_sidebar`
+/// copy the same geometry into the hit model without a second layout pass.
+fn workspace_right_cluster(
+    row: &crate::sidebar::SidebarRow,
+    pool: Option<(usize, usize)>,
+    content_cols: usize,
+) -> (Vec<crate::seg::Seg>, Option<usize>) {
+    use crate::seg::{seg, sp};
+
+    let warm = pool
+        .filter(|(_, target)| *target > 0)
+        .map(|(ready, target)| {
+            let tok = if ready >= target {
+                crate::seg::Tok::Slot(S::Accent)
+            } else {
+                crate::seg::Tok::Slot(S::Dim)
+            };
+            vec![seg(tok, format!("warm {ready}/{target} "))]
+        })
+        .unwrap_or_default();
+    let warm_width = crate::seg::seg_width(&warm);
+    let mq_available = content_cols
+        .saturating_sub(WORKSPACE_LABEL_FLOOR + warm_width + usize::from(!warm.is_empty()));
+    let mq = row
+        .mq_rollup
+        .and_then(|rollup| crate::sidebar_mq::token(rollup, mq_available));
+    let mq_width = mq.as_ref().map(|token| token.width);
+    let mut right = mq.map(|token| token.segments).unwrap_or_default();
+    if !right.is_empty() && !warm.is_empty() {
+        right.push(sp(1));
+    }
+    right.extend(warm);
+    (right, mq_width)
+}
 
 /// Compose the on-screen line(s) for one visible row. Workspace/host headers
 /// are the project tier (bold accent label, own lead glyph); folder headers
@@ -1494,6 +1562,7 @@ const STAGE_TAG_MAX: usize = 6;
 fn compose_row_lines(
     row: &crate::sidebar::SidebarRow,
     window_title: Option<&str>,
+    preview: Option<&crate::chrome::PreviewView>,
     is_cursor: bool,
     show_detail: bool,
     is_last: bool,
@@ -1501,6 +1570,8 @@ fn compose_row_lines(
     // Warm-spare-pool `(ready, target)` for THIS row — `Some` only on the active
     // workspace's row (pool is per-workspace); `None` hides the chip.
     pool: Option<(usize, usize)>,
+    content_cols: usize,
+    mq_geometry: &mut Option<(usize, usize)>,
     disp: &SidebarDisplay,
 ) -> Vec<crate::seg::Line> {
     use crate::seg::{Line, Seg, Tok, seg, sp};
@@ -1550,21 +1621,12 @@ fn compose_row_lines(
                 l.push(seg(Tok::Slot(S::Accent), format!("{} ", gl.diamond_filled)));
             }
             l.push(seg(Tok::Slot(S::Accent), row.label.clone()).bold());
-            // Warm-spare-pool chip, right-aligned on the active title (accent
-            // when full, dim while provisioning).
-            match pool.filter(|(_, t)| *t > 0) {
-                Some((ready, target)) => {
-                    let tok = if ready >= target {
-                        Tok::Slot(S::Accent)
-                    } else {
-                        Tok::Slot(S::Dim)
-                    };
-                    vec![Line::Split {
-                        l,
-                        r: vec![seg(tok, format!("warm {ready}/{target} "))],
-                    }]
-                }
-                None => vec![Line::Segs(l)],
+            let (right, mq_width) = workspace_right_cluster(row, pool, content_cols);
+            *mq_geometry = mq_width.map(|width| (width, crate::seg::seg_width(&right)));
+            if right.is_empty() {
+                vec![Line::Segs(l)]
+            } else {
+                vec![Line::Split { l, r: right }]
             }
         }
         RowKind::SectionHeading => vec![Line::Segs(vec![
@@ -1778,6 +1840,21 @@ fn compose_row_lines(
                     right.push(seg(Tok::Slot(S::Dim), gl.jj));
                 }
             }
+            if let Some(preview) = preview {
+                push_sp(&mut right);
+                let (tone, marker) = match preview.status {
+                    thegn_core::preview::PreviewStatus::Up => {
+                        (Tok::Hue(theme::Hue::Green), gl.dot_filled)
+                    }
+                    thegn_core::preview::PreviewStatus::Down => {
+                        (Tok::Hue(theme::Hue::Red), gl.cross)
+                    }
+                    thegn_core::preview::PreviewStatus::Unknown => {
+                        (Tok::Hue(theme::Hue::Amber), gl.dot_hollow)
+                    }
+                };
+                right.push(seg(tone, format!("{marker}:{}", preview.port)));
+            }
             // Compact open-PR chip (⬡N) — the full `PR #N` moves to the detail line.
             if disp.show_pr_chip
                 && let Some(n) = row.pr_number
@@ -1867,7 +1944,11 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
         // letter column (no dot cell — headers have no activity).
         RowKind::Workspace => Line::Segs(vec![
             sp(3),
-            seg(Tok::Slot(S::Text), initial(&row.label)).bold(),
+            seg(
+                crate::sidebar_mq::rail_tone(row.mq_rollup),
+                initial(&row.label),
+            )
+            .bold(),
         ]),
         // Hints carry no identity worth a rail row; render an empty line.
         RowKind::EmptyHint => Line::Blank,
@@ -2215,6 +2296,7 @@ mod tests {
             pin_key: String::new(),
             caret_x: None,
             lead_gap: 0,
+            mq_span: None,
         }
     }
 
@@ -2351,7 +2433,9 @@ mod tests {
 
         let mut ws = crate::sidebar::SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha");
         ws.dir = false;
-        let lines = compose_row_lines(&ws, None, false, false, true, None, None, &disp);
+        let lines = compose_row_lines(
+            &ws, None, None, false, false, true, None, None, 40, &mut None, &disp,
+        );
         let Line::Segs(segs) = &lines[0] else {
             panic!(
                 "workspace row composes to one Segs line, got {:?}",
@@ -2369,7 +2453,9 @@ mod tests {
 
         let mut folder = crate::sidebar::SidebarRow::base(RowKind::Folder, 1, "Merged", "alpha");
         folder.child_count = 3;
-        let lines = compose_row_lines(&folder, None, false, false, true, None, None, &disp);
+        let lines = compose_row_lines(
+            &folder, None, None, false, false, true, None, None, 40, &mut None, &disp,
+        );
         let Line::Segs(segs) = &lines[0] else {
             panic!("folder row composes to one Segs line, got {:?}", lines[0])
         };
@@ -2401,16 +2487,18 @@ mod tests {
             ..GitGlyphs::default()
         });
         let text = |display: &SidebarDisplay| -> String {
-            compose_row_lines(&row, None, false, false, true, None, None, display)
-                .into_iter()
-                .flat_map(|line| match line {
-                    crate::seg::Line::Segs(segments)
-                    | crate::seg::Line::Split { r: segments, .. }
-                    | crate::seg::Line::SplitMinLeft { r: segments, .. } => segments,
-                    _ => Vec::new(),
-                })
-                .map(|segment| segment.text)
-                .collect()
+            compose_row_lines(
+                &row, None, None, false, false, true, None, None, 40, &mut None, display,
+            )
+            .into_iter()
+            .flat_map(|line| match line {
+                crate::seg::Line::Segs(segments)
+                | crate::seg::Line::Split { r: segments, .. }
+                | crate::seg::Line::SplitMinLeft { r: segments, .. } => segments,
+                _ => Vec::new(),
+            })
+            .map(|segment| segment.text)
+            .collect()
         };
         let shown = text(&SidebarDisplay::default());
         assert!(shown.contains(crate::caps::active_glyphs().submodule));
@@ -2419,6 +2507,110 @@ mod tests {
             ..SidebarDisplay::default()
         });
         assert!(!hidden.contains(crate::caps::active_glyphs().submodule));
+    }
+
+    #[test]
+    fn workspace_queue_token_fits_before_warm_and_shares_its_hit_span() {
+        use crate::seg::{Line, Tok};
+        use thegn_core::merge_queue_view::{MqRollup, MqTier};
+
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha");
+        row.mq_rollup = Some(MqRollup {
+            tier: MqTier::Blocked,
+            count: 2,
+        });
+        let wide = compose_row_lines(
+            &row,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+            Some((1, 2)),
+            40,
+            &mut None,
+            &SidebarDisplay::default(),
+        );
+        let Line::Split { r, .. } = &wide[0] else {
+            panic!("queue and warm tokens must use a split line")
+        };
+        assert_eq!(
+            r[0].text,
+            format!("2 {}", crate::caps::active_glyphs().flag)
+        );
+        assert_eq!(r[0].fg, Tok::Hue(theme::Hue::Red));
+        assert_eq!(r[2].text, "warm 1/2 ");
+
+        let narrow = compose_row_lines(
+            &row,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+            None,
+            12,
+            &mut None,
+            &SidebarDisplay::default(),
+        );
+        let Line::Split { r, .. } = &narrow[0] else {
+            panic!("marker fallback still uses a split line")
+        };
+        assert_eq!(r[0].text, crate::caps::active_glyphs().flag);
+
+        let model = FrameModel {
+            sidebar_rows: vec![row],
+            sidebar_display: SidebarDisplay::default(),
+            pool: Some((1, 2)),
+            ..Default::default()
+        };
+        let rect = Rect {
+            x: 3,
+            y: 0,
+            cols: 40,
+            rows: 8,
+        };
+        let frame = build_sidebar(&model, rect, 0);
+        let painted = frame.rows[0].mq_span.expect("token hit span");
+        let hits = hit_rows(&model, rect);
+        assert_eq!(hits[0].mq_span, Some(painted));
+        assert!(painted.0 < painted.1);
+        assert!(painted.1 <= rect.x + rect.cols);
+    }
+
+    #[test]
+    fn rail_queue_rollup_tints_only_the_existing_workspace_initial() {
+        use crate::seg::{Line, Tok};
+        use thegn_core::merge_queue_view::{MqRollup, MqTier};
+
+        let mut row = crate::sidebar::SidebarRow::base(RowKind::Workspace, 0, "alpha", "alpha");
+        row.mq_rollup = Some(MqRollup {
+            tier: MqTier::Working,
+            count: 1,
+        });
+        let model = FrameModel {
+            sidebar_rows: vec![row],
+            sidebar_rail: true,
+            ..Default::default()
+        };
+        let frame = build_sidebar(
+            &model,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 4,
+                rows: 2,
+            },
+            0,
+        );
+        assert_eq!(frame.rows[0].mq_span, None);
+        let Line::Segs(segs) = &frame.rows[0].lines[0] else {
+            panic!("rail workspace must stay one line")
+        };
+        let initial = segs.iter().find(|s| s.text == "a").unwrap();
+        assert_eq!(initial.fg, Tok::Hue(theme::Hue::Amber));
     }
 
     #[test]
@@ -2629,14 +2821,16 @@ mod tests {
         let gl = crate::caps::active_glyphs();
         let disp = SidebarDisplay::default();
         let text = |row: &SidebarRow| -> String {
-            compose_row_lines(row, None, false, false, true, None, None, &disp)
-                .into_iter()
-                .flat_map(|l| match l {
-                    crate::seg::Line::Segs(v) => v,
-                    _ => Vec::new(),
-                })
-                .map(|s| s.text)
-                .collect()
+            compose_row_lines(
+                row, None, None, false, false, true, None, None, 40, &mut None, &disp,
+            )
+            .into_iter()
+            .flat_map(|l| match l {
+                crate::seg::Line::Segs(v) => v,
+                _ => Vec::new(),
+            })
+            .map(|s| s.text)
+            .collect()
         };
 
         let mut group = SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", "app");

@@ -3,7 +3,3 @@
 # This list may only SHRINK: document an action, delete its line
 # (or run `just help-ratchet-update`). New actions must be documented
 # immediately — the ratchet test refuses additions.
-#
-# Currently EMPTY. The sole former entry, `dashboard`, was not documentation
-# debt at all — it was a dead zellij-era builtin invoking a `thegn dashboard`
-# subcommand that never existed in the native host, and has been deleted.

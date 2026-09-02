@@ -9,6 +9,7 @@
 //! shared multi-user cache state. Each getter returns `(payload_json,
 //! fetched_at_secs)` so the caller can apply its own TTL.
 
+use crate::review::PrReviewSnapshot;
 use anyhow::Result;
 
 /// Persisted TTL caches. Object-safe (`&self` + concrete args), so
@@ -26,6 +27,22 @@ pub trait CacheStore {
     fn get_ci_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;
     /// Replace the CI run-history cache for a worktree.
     fn put_ci_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()>;
+
+    /// One bounded, redacted cached CI job log.
+    fn get_ci_log(
+        &self,
+        worktree: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<crate::ci_log::CiLogEntry>>;
+    /// All cached CI logs for a worktree, newest fetched entries first.
+    fn list_ci_logs(&self, worktree: &str) -> Result<Vec<crate::ci_log::CiLogEntry>>;
+    /// Upsert one bounded, redacted CI log entry.
+    fn put_ci_log(&self, entry: &crate::ci_log::CiLogEntry) -> Result<()>;
+    /// Retain only logs belonging to the supplied newest terminal run ids.
+    fn retain_ci_logs(&self, worktree: &str, run_ids: &[String]) -> Result<usize>;
+    /// Atomically claim an autofix candidate; false means another refresh won.
+    fn claim_ci_autofix(&self, candidate: &crate::ci_log::CiLogCandidate) -> Result<bool>;
 
     /// Per-repo open-PRs-by-branch cache: `(json, fetched_at)`.
     fn get_pr_branch_cache(&self, repo_root: &str) -> Result<Option<(String, i64)>>;
@@ -93,6 +110,13 @@ pub trait CacheStore {
     fn get_test_cache(&self, worktree: &str) -> Result<Option<(String, i64)>>;
     /// Replace the per-worktree latest-test cache.
     fn put_test_cache(&self, worktree: &str, json: &str) -> Result<()>;
+
+    /// Complete PR review snapshot for a worktree. A cache miss or malformed
+    /// payload is returned as `None`; the forge remains the source of truth.
+    fn get_pr_review_cache(&self, worktree: &str) -> Result<Option<PrReviewSnapshot>>;
+    /// Atomically replace a complete PR review snapshot. Callers must not use
+    /// this for a partial conversation/diff result.
+    fn put_pr_review_cache(&self, snapshot: &PrReviewSnapshot) -> Result<()>;
 
     /// Per-worktree LOC cache: the tokei report JSON + fetch timestamp (for TTL
     /// refresh); `None` if absent or pre-`report_json`.

@@ -20,7 +20,7 @@ use crate::hydrate::{RefreshKind, active_tab_path};
 use crate::panes::{Panes, tool_drawer_argv};
 use crate::run::SidebarState;
 use crate::session::Session;
-use thegn_core::store::NotificationStore;
+use thegn_core::store::{CacheStore, NotificationStore};
 
 /// Spawn `command` into a brand-new tab in the active group.
 pub(crate) fn open_command_tab(
@@ -31,6 +31,29 @@ pub(crate) fn open_command_tab(
     center: Rect,
 ) {
     let _ = open_command_tab_id(session, panes, command, cwd, center);
+}
+
+/// Spawn structured argv into a brand-new tab in the active group.
+pub(crate) fn open_argv_tab(
+    session: &mut Session,
+    panes: &mut Panes,
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) -> bool {
+    let Ok(id) = panes.spawn_argv(argv, cwd, center) else {
+        return false;
+    };
+    if let Some(group) = session.active_group_mut() {
+        group.add_tab();
+        if let Some(tab) = group.active_tab_mut() {
+            tab.center = crate::center::CenterTree::Leaf(id);
+            tab.focused_pane = id;
+            return true;
+        }
+    }
+    panes.table.remove(&id);
+    false
 }
 
 /// [`open_command_tab`], returning the spawned pane's id (the onboarding
@@ -80,6 +103,28 @@ pub(crate) fn open_command_pane(
     panes.table.remove(&id);
 }
 
+/// Spawn structured argv into a split beside the focused center pane.
+pub(crate) fn open_argv_pane(
+    session: &mut Session,
+    panes: &mut Panes,
+    focused: u32,
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) -> bool {
+    let Ok(id) = panes.spawn_argv(argv, cwd, center) else {
+        return false;
+    };
+    if let Some(tab) = session.active_tab_mut()
+        && tab.center.split(focused, crate::center::Dir::Row, id)
+    {
+        tab.focused_pane = id;
+        return true;
+    }
+    panes.table.remove(&id);
+    false
+}
+
 /// Handle a private `OSC 5379` control message the drawer's file manager
 /// emitted on its own PTY (see [`thegn_core::file_manager::DrawerCmd`]). This is
 /// how the drawer drives the host chrome while the manager keeps ownership of
@@ -90,9 +135,7 @@ pub(crate) fn dispatch_drawer_command(
     cmd: thegn_core::file_manager::DrawerCmd,
     session: &mut Session,
     panes: &mut Panes,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut crate::run::DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
+    drawer_runtime: &mut crate::run::DrawerRuntime,
     focus: &mut FocusState,
     model: &mut FrameModel,
     sb: &mut SidebarState,
@@ -103,14 +146,9 @@ pub(crate) fn dispatch_drawer_command(
         thegn_core::file_manager::DrawerCmd::Close => {
             // Hide to the keep-alive pool (position survives reopen); hand the
             // keyboard back to the center.
-            crate::escape::close_drawer_to_pool(
-                drawer,
-                drawer_pool,
-                drawer_home,
-                session,
-                panes,
-                cfg,
-            );
+            if let Some(dir) = crate::run::active_cwd(session) {
+                drawer_runtime.close_visible(cfg, &dir, panes, center);
+            }
             if focus.drawer() {
                 focus.zone = Zone::Center;
             }
@@ -203,19 +241,6 @@ pub(crate) fn open_url_detached(url: &str) {
     spawn_detached_reaped(cmd);
 }
 
-/// Build a `thegn <args>` command line rooted at this process's own binary
-/// (falling back to the `thegn` name on PATH), for spawning a subcommand pane.
-pub(crate) fn thegn_cmd(args: &[&str]) -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "thegn".to_string());
-    std::iter::once(exe.as_str())
-        .chain(args.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
 /// the badge + panel repaint. The provider is resolved inside the blocking task;
 /// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
@@ -301,48 +326,92 @@ pub(crate) fn spawn_ci_detail(
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let Some(client) = thegn_svc::ci::provider_for(&loc, &cfg) else {
-            return;
-        };
+        let key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
+        let db = thegn_core::db::Db::open().ok();
+        let client = thegn_svc::ci::provider_for(&loc, &cfg);
         // Full run (jobs/steps); on error keep the cached run so the header stays.
-        let detail = client.run_detail(&loc, &run.id).unwrap_or(run);
-        // Failing-job log tails (the "why did it fail"), each tail-capped by
-        // `log_tail_lines` and prefixed with the job name. Fetched in small
-        // concurrent batches — the provider "async" methods block on a
-        // subprocess, so a run with many failed jobs was N serial calls —
-        // scoped threads (each with a tiny current-thread runtime) buy real
-        // parallelism while chunking keeps display order + bounds the fan-out.
-        let cap = cfg.log_tail_lines;
+        let detail = client
+            .as_ref()
+            .and_then(|c| c.run_detail(&loc, &run.id).ok())
+            .unwrap_or(run);
+        // `log_cache_runs = 0` is the explicit privacy/IO opt-out: refresh
+        // ingestion, CLI, and control already honor it, so the interactive
+        // drill must not bypass it by fetching provider logs on a cache miss.
+        if cfg.log_cache_runs == 0 {
+            let payload = crate::detail::CiDetailPayload {
+                run: detail,
+                log_tail: Vec::new(),
+                log_entries: Vec::new(),
+            };
+            if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
+                let _ = waker.wake();
+            }
+            return;
+        }
+        // Read the cache before asking the provider.  A cache miss is fetched
+        // in this blocking lane and written back through CiLogEntry, which
+        // applies the same byte/line bounds and redaction as refresh ingestion.
         let failing: Vec<&thegn_core::ci::CiJob> = detail
             .jobs
             .iter()
             .filter(|j| j.state == CiState::Fail)
             .collect();
         let mut log_tail: Vec<String> = Vec::new();
-        for chunk in failing.chunks(4) {
-            let logs: Vec<Option<thegn_core::ci::CiLog>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|job| scope.spawn(|| client.logs(&loc, &detail.id, &job.id).ok()))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().ok().flatten())
-                    .collect()
-            });
-            for (job, log) in chunk.iter().zip(logs) {
-                let Some(log) = log else { continue };
-                let lines: Vec<&str> = log.text.lines().collect();
-                let start = lines
-                    .len()
-                    .saturating_sub(if cap > 0 { cap } else { lines.len() });
-                log_tail.push(format!("\u{2500}\u{2500} {} \u{2500}\u{2500}", job.name));
-                log_tail.extend(lines[start..].iter().map(|s| (*s).to_string()));
+        let mut log_entries = Vec::new();
+        // A provider can report a very large matrix. Keep detail responsive and
+        // predictable by inspecting only a bounded failed-job batch.
+        for job in failing.into_iter().take(16) {
+            let cached = (cfg.log_cache_runs > 0)
+                .then(|| {
+                    db.as_ref().and_then(|db| {
+                        use thegn_core::store::CacheStore;
+                        db.get_ci_log(&key, &detail.id, &job.id).ok().flatten()
+                    })
+                })
+                .flatten();
+            let entry = if cached.as_ref().is_some_and(|e| {
+                e.head_sha.is_empty() || detail.sha.is_empty() || e.head_sha == detail.sha
+            }) {
+                cached
+            } else {
+                client.as_ref().and_then(|c| {
+                    let log = c.logs(&loc, &detail.id, &job.id).ok()?;
+                    let mut entry = thegn_core::ci_log::CiLogEntry::new(
+                        &key,
+                        &detail.id,
+                        &job.id,
+                        &job.name,
+                        &log.text,
+                        cfg.log_tail_lines
+                            .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                        cfg.log_max_bytes
+                            .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                        thegn_core::util::now(),
+                    );
+                    entry.truncated |= log.truncated;
+                    entry.head_sha = detail.sha.clone();
+                    if cfg.log_cache_runs > 0
+                        && let Some(db) = db.as_ref()
+                    {
+                        use thegn_core::store::CacheStore;
+                        let _ = db.put_ci_log(&entry);
+                    }
+                    Some(entry)
+                })
+            };
+            if let Some(entry) = entry {
+                log_tail.push(format!(
+                    "\u{2500}\u{2500} {} \u{2500}\u{2500}",
+                    entry.job_name
+                ));
+                log_tail.extend(entry.text.lines().map(str::to_string));
+                log_entries.push(entry);
             }
         }
         let payload = crate::detail::CiDetailPayload {
             run: detail,
             log_tail,
+            log_entries,
         };
         if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -384,12 +453,62 @@ fn proxy_spend_rollup() -> Option<thegn_core::proxy::stats::Rollup> {
     Some(thegn_core::proxy::stats::rollup(&rows))
 }
 
+/// Project configured model-proxy cap breaches into the common notification
+/// route. This runs only from the usage worker, never from the event loop.
+fn notify_proxy_budget_breaches(budget: &thegn_core::config::BudgetConfig) {
+    use thegn_core::store::ModelProxyStore;
+
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::usage",
+                %error,
+                "model-proxy budget alerts unavailable: database open failed"
+            );
+            return;
+        }
+    };
+    let rows = match db.model_proxy_budget_states() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                target: "thegn::usage",
+                %error,
+                "model-proxy budget alerts unavailable: state read failed"
+            );
+            return;
+        }
+    };
+    let facts =
+        thegn_core::budget_alert::classify_breaches(budget, &rows, thegn_core::util::now_ms());
+    for fact in &facts {
+        let alert = crate::usage_budget::notification(fact);
+        if let Err(error) = crate::automation_events::emit_once(
+            &db,
+            alert.kind,
+            &alert.source_ref,
+            &alert.message,
+            &alert.worktree,
+        ) {
+            tracing::debug!(
+                target: "thegn::usage",
+                %error,
+                scope = %fact.scope,
+                dimension = fact.dimension.as_str(),
+                "model-proxy budget notification cache write failed"
+            );
+        }
+    }
+}
+
 pub(crate) fn spawn_usage(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
     interactive: bool,
     proxy_enabled: bool,
+    proxy_budget: thegn_core::config::BudgetConfig,
 ) {
     let tx = refresh_tx.clone();
     let cfg_for_rollup = cfg.clone();
@@ -429,6 +548,9 @@ pub(crate) fn spawn_usage(
             "usage gather"
         );
         let history = record_usage_history(&cfg, &accounts);
+        if proxy_enabled && proxy_budget.enabled {
+            notify_proxy_budget_breaches(&proxy_budget);
+        }
         // Proxy spend rolls up from the audit tables off-loop, on this same
         // cadence. Best-effort: a DB error just yields no block, never a stall.
         let proxy_spend = proxy_enabled.then(proxy_spend_rollup).flatten();
@@ -590,6 +712,7 @@ pub(crate) fn run_pr_view_action(
         A::Review { .. } => ("pr review", "Submitting review…"),
         A::Reply { .. } => ("pr reply", "Posting reply…"),
         A::LineComment { .. } => ("pr line-comment", "Posting line comment…"),
+        A::Handoff(_) => ("pr review handoff", "Passing review feedback…"),
         A::OpenUrl(_) => unreachable!("handled above"),
     };
     model.status = status.into();
@@ -632,6 +755,7 @@ pub(crate) fn run_pr_view_action(
                     body: &body,
                 },
             ),
+            A::Handoff(_) => Ok(()),
             A::OpenUrl(_) => Ok(()),
         };
         if let Err(e) = res {
@@ -705,20 +829,34 @@ pub(crate) fn panel_pr_action_key(
 /// loop and deliver it over `tx`. Single-flight via `generation` — the loop
 /// drops deliveries from a stale generation. Best-effort: a failed fetch leaves
 /// that half `None` (the view shows "loading" / degrades) and logs the reason.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pr_view_fetch(
     session: Session,
     owner: String,
     repo: String,
     number: u64,
+    branch: String,
+    head_oid: String,
     generation: u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) {
     let tx = tx.clone();
     let waker = waker.clone();
+    let refresh_tx = refresh_tx.clone();
     tokio::task::spawn_blocking(move || {
         let wt = active_tab_path(&session);
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let cache_key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
+        let cached = thegn_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.get_pr_review_cache(&cache_key).ok().flatten())
+            .filter(|snapshot| {
+                snapshot.branch == branch
+                    && snapshot.pr_number == number
+                    && snapshot.head_oid == head_oid
+            });
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
         let repo_ref = thegn_core::forge::RepoRef { owner, repo };
@@ -736,11 +874,53 @@ pub(crate) fn spawn_pr_view_fetch(
                 None
             }
         };
+        let live_complete = conversation.is_some() && diff.is_some();
+        let review = match (conversation, diff) {
+            (Some(conversation), Some(diff)) => {
+                let snapshot = thegn_core::review::PrReviewSnapshot {
+                    worktree_key: cache_key,
+                    branch,
+                    pr_number: number,
+                    head_oid,
+                    fetched_at: thegn_core::util::now(),
+                    conversation,
+                    diff,
+                };
+                // Branch/head are filled by the panel identity in the loop;
+                // an incomplete identity is intentionally not cached or
+                // presented as a current snapshot.
+                Some(snapshot)
+            }
+            _ => cached.clone(),
+        };
         let data = PrViewData {
             generation,
-            conversation,
-            diff,
+            conversation: review.as_ref().map(|r| r.conversation.clone()),
+            diff: review.as_ref().map(|r| r.diff.clone()),
+            review,
+            review_status: if live_complete {
+                None
+            } else if cached.is_some() {
+                Some("showing cached PR review".into())
+            } else {
+                Some("PR review unavailable or unsupported".into())
+            },
         };
+        // A complete remote result is delivered to the modal. The identity
+        // fields are stamped by the caller's current PR facts before the
+        // cache write, so a transient/partial fetch leaves the old row intact.
+        if live_complete
+            && let Some(snapshot) = data
+                .review
+                .clone()
+                .filter(|s| !s.branch.is_empty() && !s.head_oid.is_empty())
+            && let Ok(db) = thegn_core::db::Db::open()
+        {
+            let _ = db.put_pr_review_cache(&snapshot);
+            if refresh_tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake();
+            }
+        }
         if tx.send(data).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
@@ -756,6 +936,7 @@ pub(crate) fn open_pr_view(
     gen_ctr: &mut u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) -> Option<PrView> {
     let pr = model.panel.pr.as_ref()?;
     *gen_ctr += 1;
@@ -775,9 +956,12 @@ pub(crate) fn open_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.branch.clone(),
+            v.head_sha.clone(),
             *gen_ctr,
             tx,
             waker,
+            refresh_tx,
         );
     }
     Some(v)
@@ -790,6 +974,7 @@ pub(crate) fn refetch_pr_view(
     gen_ctr: &mut u64,
     tx: &UnboundedSender<PrViewData>,
     waker: &TerminalWaker,
+    refresh_tx: &UnboundedSender<RefreshKind>,
 ) {
     if let Some(v) = view
         && !v.owner.is_empty()
@@ -801,9 +986,12 @@ pub(crate) fn refetch_pr_view(
             v.owner.clone(),
             v.repo.clone(),
             v.number,
+            v.branch.clone(),
+            v.head_sha.clone(),
             *gen_ctr,
             tx,
             waker,
+            refresh_tx,
         );
     }
 }
@@ -814,16 +1002,82 @@ pub(crate) fn dispatch_pr_view_key(
     view: &mut Option<PrView>,
     key: &KeyCode,
     mods: Modifiers,
-    session: &Session,
+    session: &mut Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    cfg: &thegn_core::config::Config,
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     model: &mut FrameModel,
+    active_menu: &mut Option<crate::menu::MenuOverlay>,
+    ide_tx: &UnboundedSender<crate::ide_handoff::Outcome>,
 ) {
     let Some(v) = view.as_mut() else { return };
     match v.handle_key(key, mods) {
         PrViewOutcome::Close => *view = None,
         PrViewOutcome::Pending => {}
+        PrViewOutcome::Act(crate::pr_view::PrViewAction::Handoff(selection)) => {
+            if matches!(
+                crate::review_handoff::target(session, panes, cfg),
+                crate::review_handoff::PaneTarget::Headless { .. }
+            ) {
+                v.pending_handoff = Some(selection);
+                *active_menu = Some(headless_handoff_confirm_menu());
+                model.status = "confirm headless review handoff".into();
+            } else {
+                dispatch_pr_handoff(
+                    view, session, panes, focus, cfg, model, refresh_tx, waker, selection,
+                );
+            }
+        }
         PrViewOutcome::Act(action) => run_pr_view_action(session, refresh_tx, waker, model, action),
+        PrViewOutcome::OpenInIde { path, line, note } => {
+            dispatch_ide_location(
+                session,
+                cfg,
+                model,
+                ide_tx,
+                waker,
+                path,
+                line,
+                note,
+                "PR review",
+            );
+        }
+    }
+}
+
+fn headless_handoff_confirm_menu() -> crate::menu::MenuOverlay {
+    crate::menu::confirm_menu(
+        "send review to headless agent?",
+        "Remote review text will be sent to the configured agent.",
+        "pr-review-handoff",
+        String::new(),
+        true,
+    )
+}
+
+/// Dispatch a handoff that has already passed any required confirmation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_pr_handoff(
+    view: &mut Option<PrView>,
+    session: &mut Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    selection: crate::review_handoff::ReviewSelection,
+) {
+    let Some(v) = view.as_mut() else { return };
+    if let Some(snapshot) = v.review.clone() {
+        crate::review_handoff::dispatch(
+            session, panes, focus, cfg, model, refresh_tx, waker, snapshot, selection, &v.title,
+            &v.url, &v.base,
+        );
+    } else {
+        v.status = Some("review feedback is still loading".into());
     }
 }
 
@@ -871,6 +1125,8 @@ pub(crate) fn spawn_diff_view_fetch(
             generation,
             diff: Some(diff),
             structural,
+            review: None,
+            review_status: None,
         };
         if tx.send(data).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -883,6 +1139,7 @@ pub(crate) fn spawn_diff_view_fetch(
 /// requests a structural render (delivered alongside the internal diff).
 pub(crate) fn open_diff_view(
     cfg: &thegn_core::config::Config,
+    model: &FrameModel,
     session: &Session,
     gen_ctr: &mut u64,
     tx: &UnboundedSender<DiffViewData>,
@@ -906,15 +1163,87 @@ pub(crate) fn open_diff_view(
     });
     let want_structural = structural.is_some();
     spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker, structural);
-    DiffView::with_structural(title, *gen_ctr, want_structural)
+    let mut view = DiffView::with_structural(title, *gen_ctr, want_structural);
+    let review = model
+        .panel
+        .review_snapshot
+        .clone()
+        .filter(|snapshot| review_snapshot_matches_panel(&model.panel, snapshot));
+    view.set_review(review, model.panel.review_snapshot_status.clone());
+    view
+}
+
+/// Check that a cached deep review belongs to the panel's current PR identity.
+/// The worktree's checked-out branch is the canonical cache branch identity;
+/// the PR's remote head ref is provider metadata and may differ for forks.
+pub(crate) fn review_snapshot_matches_panel(
+    panel: &crate::panel::PanelData,
+    snapshot: &thegn_core::review::PrReviewSnapshot,
+) -> bool {
+    panel.pr.as_ref().is_some_and(|pr| {
+        snapshot.branch == panel.branch
+            && snapshot.pr_number == pr.number
+            && snapshot.head_oid == panel.pr_head_oid
+    })
 }
 
 /// Route a key to the open diff viewer: close it, or consume it (read-only).
-pub(crate) fn dispatch_diff_view_key(view: &mut Option<DiffView>, key: &KeyCode, mods: Modifiers) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_diff_view_key(
+    view: &mut Option<DiffView>,
+    key: &KeyCode,
+    mods: Modifiers,
+    session: &Session,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    ide_tx: &UnboundedSender<crate::ide_handoff::Outcome>,
+    waker: &TerminalWaker,
+) {
     let Some(v) = view.as_mut() else { return };
     match v.handle_key(key, mods) {
         DiffViewOutcome::Close => *view = None,
         DiffViewOutcome::Pending => {}
+        DiffViewOutcome::Status(status) => model.status = status,
+        DiffViewOutcome::OpenInIde { path, line, note } => dispatch_ide_location(
+            session,
+            cfg,
+            model,
+            ide_tx,
+            waker,
+            path,
+            line,
+            note,
+            "diff view",
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_ide_location(
+    session: &Session,
+    cfg: &thegn_core::config::Config,
+    model: &mut FrameModel,
+    ide_tx: &UnboundedSender<crate::ide_handoff::Outcome>,
+    waker: &TerminalWaker,
+    path: Option<String>,
+    line: Option<usize>,
+    note: Option<String>,
+    source: &'static str,
+) {
+    match crate::ide_handoff::active_target(session, path.as_deref(), line, None) {
+        Ok((target, workspace_slug)) => {
+            crate::ide_handoff::dispatch(
+                target,
+                workspace_slug,
+                source,
+                crate::ide_handoff::PanePlacement::Tab,
+                cfg,
+                ide_tx,
+                waker,
+            );
+            model.status = note.unwrap_or_else(|| "Opening selection in IDE…".into());
+        }
+        Err(error) => model.status = error,
     }
 }
 
@@ -963,28 +1292,6 @@ impl CiActionCtx<'_> {
         crate::panel::sections::ci::display_runs(&self.model.panel)
             .get(cursor)
             .map(|r| r.id.clone())
-    }
-
-    /// Spawn `thegn <args>` in a split beside the focused pane, then focus it.
-    fn open_thegn_pane(&mut self, args: &[&str]) {
-        let cmd = thegn_cmd(args);
-        let focused = self
-            .session
-            .active_tab()
-            .map(|t| t.focused_pane)
-            .unwrap_or(0);
-        let cwd = crate::run::active_cwd(self.session);
-        open_command_pane(
-            self.session,
-            self.panes,
-            focused,
-            &cmd,
-            cwd.as_deref(),
-            self.center,
-        );
-        self.focus.zone = Zone::Center;
-        crate::run::refresh_tab_model(self.model, self.session, self.sb);
-        *self.need_relayout = true;
     }
 
     /// Kick the off-loop fetch that fills a CI-run drill (the overlay already
@@ -1045,6 +1352,24 @@ impl CiActionCtx<'_> {
         );
     }
 
+    /// Re-read and authorize a cached CI-failure candidate off the compositor
+    /// thread.  The coordinator performs the provider/head/queue checks and
+    /// claims the candidate immediately before the existing agent spawn.
+    fn spawn_autofix(&mut self, candidate: thegn_core::ci_log::CiLogCandidate) {
+        self.model.status = "Authorizing CI autofix…".into();
+        let full = self.cfg.clone();
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = thegn_core::db::Db::open() {
+                crate::ci_refresh::ci_autofix::authorize(&full, &db, &candidate);
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        });
+    }
+
     /// Execute a detail-overlay row action, returning the overlay to *retain*
     /// (the CI drill keeps it open to fill in place) or `None` to close it — the
     /// loop assigns the result back to its `bar_detail` slot. Covers the CI badge
@@ -1068,6 +1393,7 @@ impl CiActionCtx<'_> {
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
+            DetailAction::CiAutofix { candidate } => self.spawn_autofix(candidate),
             DetailAction::CiRefresh => self.refresh_ci(),
             DetailAction::FetchCalendar {
                 year,
@@ -1226,20 +1552,34 @@ impl CiActionCtx<'_> {
         *self.need_relayout = true;
     }
 
-    /// Enter on a panel `Section::Ci` row: drill into the selected run.
-    pub(crate) fn open_view_at(&mut self, cursor: usize) {
-        if let Some(id) = self.run_id_at(cursor) {
-            self.open_thegn_pane(&["ci", "view", &id]);
+    /// Enter on a panel `Section::Ci` row: open the in-place run drill and
+    /// start its off-loop cache-first detail fetch.
+    pub(crate) fn open_view_at(
+        &mut self,
+        cursor: usize,
+        overlay: &mut Option<crate::detail::DetailOverlay>,
+    ) {
+        if let Some(run) = crate::panel::sections::ci::display_runs(&self.model.panel)
+            .get(cursor)
+            .map(|run| (*run).clone())
+        {
+            *overlay = Some(crate::detail::overlay_for_run(&run));
+            self.drill_ci_detail(run.clone());
         }
     }
 
     /// A `Section::Ci` action key; returns whether it was claimed. `v` drills in,
     /// `o` opens the run page, `r`/`R` re-run (all/failed), `c` cancels,
     /// `g` force-refreshes the run history.
-    pub(crate) fn panel_key(&mut self, key: KeyCode, cursor: usize) -> bool {
+    pub(crate) fn panel_key(
+        &mut self,
+        key: KeyCode,
+        cursor: usize,
+        overlay: &mut Option<crate::detail::DetailOverlay>,
+    ) -> bool {
         match key {
             KeyCode::Char('v') => {
-                self.open_view_at(cursor);
+                self.open_view_at(cursor, overlay);
                 true
             }
             KeyCode::Char('g') => {
@@ -1309,18 +1649,6 @@ mod tests {
     }
 
     #[test]
-    fn thegn_cmd_joins_args_after_the_exe() {
-        let cmd = thegn_cmd(&["pr", "list", "--json"]);
-        // The exe path varies per environment, but the argv tail is fixed and
-        // space-joined with no trailing/leading padding.
-        assert!(cmd.ends_with(" pr list --json"), "cmd: {cmd}");
-        assert!(!cmd.starts_with(' '));
-        // No args ⇒ just the exe, no trailing space.
-        let bare = thegn_cmd(&[]);
-        assert!(!bare.ends_with(' '), "bare: {bare}");
-    }
-
-    #[test]
     fn status_for_describes_ci_mutations_only() {
         assert_eq!(
             status_for(&DetailAction::CiRerun {
@@ -1342,5 +1670,60 @@ mod tests {
         );
         // A non-mutation action has no transient status.
         assert_eq!(status_for(&DetailAction::CiRefresh), "");
+    }
+
+    #[test]
+    fn headless_handoff_menu_requires_an_explicit_confirmation() {
+        let mut menu = headless_handoff_confirm_menu();
+        assert_eq!(menu.tag, crate::menu::MenuKindTag::Confirm);
+        assert!(matches!(
+            menu.handle_key(&KeyCode::Char('y'), Modifiers::NONE),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Confirm {
+                tag: "pr-review-handoff",
+                ..
+            })
+        ));
+
+        let mut cancelled = headless_handoff_confirm_menu();
+        assert_eq!(
+            cancelled.handle_key(&KeyCode::Char('n'), Modifiers::NONE),
+            crate::menu::MenuOutcome::Pick(crate::menu::MenuChoice::Dismiss)
+        );
+    }
+
+    #[test]
+    fn review_identity_uses_local_branch_when_remote_head_name_differs() {
+        let mut panel = crate::panel::PanelData {
+            branch: "local/topic".into(),
+            pr: Some(crate::panel::PrSummary {
+                number: 27,
+                title: "Review".into(),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/widget/pull/27".into(),
+                is_draft: false,
+                review_decision: None,
+            }),
+            pr_head_oid: "head-27".into(),
+            ..Default::default()
+        };
+        let local_snapshot = thegn_core::review::PrReviewSnapshot {
+            branch: "local/topic".into(),
+            pr_number: 27,
+            head_oid: "head-27".into(),
+            ..Default::default()
+        };
+        assert!(review_snapshot_matches_panel(&panel, &local_snapshot));
+
+        // A provider's remote head ref is not the local cache identity and is
+        // rejected rather than being silently attached to this checkout.
+        panel.branch = "local/topic".into();
+        let remote_named_snapshot = thegn_core::review::PrReviewSnapshot {
+            branch: "fork/topic".into(),
+            ..local_snapshot
+        };
+        assert!(!review_snapshot_matches_panel(
+            &panel,
+            &remote_named_snapshot
+        ));
     }
 }

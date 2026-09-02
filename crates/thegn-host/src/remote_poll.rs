@@ -367,8 +367,7 @@ fn notify_behind(
             return; // no DB, no inbox — nothing left to do this round
         };
         let msg = behind_message(branch, upstream, behind);
-        let (dec, _) = crate::notify::record(db, notify, KIND_UPSTREAM, upstream, &msg, wt);
-        notify.emit_sound(&dec);
+        let _ = crate::notify::record(db, notify, KIND_UPSTREAM, upstream, &msg, wt);
     }
 }
 

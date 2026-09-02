@@ -838,9 +838,9 @@ fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> R
         let repo_s = repo_root.to_string_lossy().into_owned();
         db.set_workspace_env(&repo_s, name)?;
         if name.is_empty() {
-            outln!("cleared workspace env for {repo_s}");
+            outln!("cleared project env for {repo_s}");
         } else {
-            outln!("workspace {repo_s} → env {name}");
+            outln!("project {repo_s} → env {name}");
         }
     } else {
         db.set_worktree_env(&wt, name)?;

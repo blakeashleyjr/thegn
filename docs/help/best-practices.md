@@ -46,4 +46,4 @@ container.
   reclaims `target/`-style build dirs.
 - Prune stale worktrees from the [[sidebar]] delete menu — deleting from
   disk is always the explicit second choice.
-- `attention` sort (`[ui] sidebar_workspace_sort`) bubbles what needs you.
+- `attention` sort (`[ui] sidebar_project_sort`) bubbles what needs you.

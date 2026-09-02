@@ -53,9 +53,9 @@ pub(super) fn status_glyph(status: &str) -> Seg {
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let rows = &ctx.model.panel.merge_queue;
     let scope_tail = if crate::panel::scope::merge_all() {
-        "merge queue empty (all workspaces)"
+        "merge queue empty (all projects)"
     } else {
-        "merge queue empty (this workspace · g = all)"
+        "merge queue empty (this project · g = all)"
     };
     if rows.is_empty() {
         return vec![
@@ -70,7 +70,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if crate::panel::scope::merge_all() {
         out.push(PanelRow::plain(Line::segs(vec![seg(
             g2(),
-            "all workspaces (g = this workspace)",
+            "all projects (g = this project)",
         )])));
     }
     for (i, r) in rows.iter().enumerate() {
@@ -131,9 +131,9 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
     let cols = ctx.cols;
     let mut out: Vec<PanelRow> = Vec::new();
     let scope = if crate::panel::scope::merge_all() {
-        "all workspaces (g = this workspace)"
+        "all projects (g = this project)"
     } else {
-        "this workspace (g = all)"
+        "this project (g = all)"
     };
     out.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "MERGE QUEUE"),

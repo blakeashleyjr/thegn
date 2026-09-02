@@ -437,6 +437,8 @@ mod tests {
             note: None,
             chunk_path: None,
             report: None,
+            exit_code: None,
+            exited_at_ms: None,
         }
     }
 

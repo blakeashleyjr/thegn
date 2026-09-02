@@ -117,8 +117,8 @@ pub fn page(example: &str) -> String {
     out.push_str("generated: true\n");
     out.push_str("---\n\n# Config reference\n\n");
     out.push_str(
-        "Generated from the built-in `config.toml.example` — every key with its default \
-         and inline documentation. Copy only the keys you change into \
+        "Generated from the built-in `config.toml.example` — every documented key with its \
+         example value and inline documentation. Copy only the keys you change into \
          `~/.config/thegn/config.toml`.\n\n",
     );
     for line in &intro {
@@ -160,6 +160,8 @@ pub fn page(example: &str) -> String {
 mod tests {
     use super::*;
     use crate::help::{Block, frontmatter, markdown};
+    use serde_json::Value;
+    use std::collections::BTreeSet;
 
     const EXAMPLE: &str = "\
 # thegn config — copy and edit.
@@ -298,6 +300,115 @@ name = \"x\"
             markdown::links(&blocks)
                 .iter()
                 .all(|t| !matches!(t, crate::help::LinkTarget::Page(_)))
+        );
+    }
+
+    fn resolve<'a>(defs: &'a serde_json::Map<String, Value>, mut value: &'a Value) -> &'a Value {
+        loop {
+            if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+                let name = reference.rsplit('/').next().unwrap_or_default();
+                let Some(next) = defs.get(name) else {
+                    return value;
+                };
+                value = next;
+                continue;
+            }
+            if let Some(all) = value.get("allOf").and_then(Value::as_array)
+                && all.len() == 1
+            {
+                value = &all[0];
+                continue;
+            }
+            if let Some(any) = value.get("anyOf").and_then(Value::as_array) {
+                let non_null: Vec<&Value> = any
+                    .iter()
+                    .filter(|v| v.get("type").and_then(Value::as_str) != Some("null"))
+                    .collect();
+                if non_null.len() == 1 {
+                    value = non_null[0];
+                    continue;
+                }
+            }
+            return value;
+        }
+    }
+
+    fn table_like(defs: &serde_json::Map<String, Value>, value: &Value) -> bool {
+        let value = resolve(defs, value);
+        value
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| !properties.is_empty())
+            || value
+                .get("additionalProperties")
+                .is_some_and(Value::is_object)
+            || value
+                .get("items")
+                .is_some_and(|items| table_like(defs, items))
+    }
+
+    fn schema_leaf_names(
+        defs: &serde_json::Map<String, Value>,
+        value: &Value,
+        out: &mut BTreeSet<String>,
+    ) {
+        let value = resolve(defs, value);
+        if let Some(properties) = value.get("properties").and_then(Value::as_object) {
+            for (name, child) in properties {
+                if table_like(defs, child) {
+                    schema_leaf_names(defs, child, out);
+                } else {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        if let Some(additional) = value.get("additionalProperties") {
+            schema_leaf_names(defs, additional, out);
+        }
+        if let Some(items) = value.get("items") {
+            schema_leaf_names(defs, items, out);
+        }
+    }
+
+    fn generated_key_names(source: &str) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        for line in source.lines() {
+            let line = line.trim_start().trim_start_matches('#').trim_start();
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            if key
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                keys.insert(key.trim().to_string());
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn generated_reference_covers_schema_key_set() {
+        let example = include_str!("../../../../config/config.toml.example");
+        let source = page(example);
+        assert!(source.contains("example value"));
+        let schema = schemars::schema_for!(crate::config::Config);
+        let root = serde_json::to_value(&schema).expect("schema serializes");
+        let defs = root
+            .get("definitions")
+            .and_then(Value::as_object)
+            .expect("schema definitions");
+        let mut schema_keys = BTreeSet::new();
+        schema_leaf_names(defs, &root, &mut schema_keys);
+        let example_keys = generated_key_names(&format!("```toml\n{example}\n```"));
+        let expected: BTreeSet<String> = schema_keys.intersection(&example_keys).cloned().collect();
+        let generated = generated_key_names(&source);
+        let missing: Vec<&String> = expected.difference(&generated).collect();
+        assert!(expected.len() > 100, "schema/example key walk looks broken");
+        assert!(
+            missing.is_empty(),
+            "generated reference dropped keys: {missing:?}"
         );
     }
 }

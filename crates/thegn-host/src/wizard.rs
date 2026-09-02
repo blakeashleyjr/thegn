@@ -1066,9 +1066,30 @@ pub fn run_worker(
     // overlaps the checkout with the user's wizard time).
     step(CreateStep::CreateWorktree, StepState::Running, None);
     let mut path = worktree::worktree_path(root, &branch, cfg);
-    if let Err(e) = crate::git_worktree::add_checked(root, &branch, &base, &path, cfg) {
-        crate::git_worktree::remove(root, &path, true);
-        fail(CreateStep::CreateWorktree, e);
+    let slug = repo::repo_slug(root);
+    let pre = crate::worktree_lifecycle::run_event(
+        cfg,
+        root,
+        &path,
+        &branch,
+        &slug,
+        thegn_core::hooks::HookEvent::PreCreate,
+        thegn_core::hooks::HookExecutionMode::User,
+    );
+    if pre.blocked() {
+        fail(CreateStep::CreateWorktree, pre.message());
+        return;
+    }
+    if let Err(e) = worktree::add_checked_with_state(root, &branch, &base, &path, cfg) {
+        let error = crate::worktree_lifecycle::create_failure_with_add_state(
+            e.message,
+            cfg,
+            root,
+            &path,
+            &branch,
+            e.branch_created,
+        );
+        fail(CreateStep::CreateWorktree, error);
         return;
     }
     step(CreateStep::InitSubmodules, StepState::Running, None);
@@ -1077,13 +1098,12 @@ pub fn run_worker(
         Ok(false) => step(CreateStep::InitSubmodules, StepState::Skipped, None),
         Err(e) => step(CreateStep::InitSubmodules, StepState::Done, Some(e)),
     }
-    // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
-    // for agents in this worktree (best-effort, gated on [merge_queue] enabled).
-    crate::mq_assets::seed_if_enabled(cfg, &path);
+    // Seed configured skills while still on the wizard's blocking worker.
+    // Conflicts and discovery failures stay best-effort diagnostics.
+    crate::skill_seed::seed_if_enabled(cfg, &path, thegn_core::skills::SeedPhase::Create);
     step(CreateStep::CreateWorktree, StepState::Done, None);
 
     // --- command loop: the wizard drives the rest.
-    let slug = repo::repo_slug(root);
     // Keyed on (env, backend): both the host env and the sandbox backend feed
     // the placement/isolation bring-up, so a change to either invalidates a
     // prior prep.
@@ -1114,7 +1134,11 @@ pub fn run_worker(
             // the worktree in place — resurrect picks it up next session.
             Err(_) => return,
             Ok(WizardCmd::Cancel) => {
-                crate::git_worktree::remove(root, &path, true);
+                if let Err(error) =
+                    crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch)
+                {
+                    thegn_core::msg::warn(&format!("wizard cancellation cleanup failed: {error}"));
+                }
                 tracing::info!(
                     target: "thegn::worktree_create",
                     since_ms = started.elapsed().as_millis() as u64,
@@ -1193,8 +1217,13 @@ pub fn run_worker(
                                     *outcome = redo;
                                 }
                                 Err(e) => {
-                                    crate::git_worktree::remove(root, &path, true);
-                                    fail(CreateStep::SandboxPrep, e.to_string());
+                                    let error = match crate::worktree_lifecycle::rollback_remove(
+                                        cfg, root, &path, &branch,
+                                    ) {
+                                        Ok(()) => e.to_string(),
+                                        Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
+                                    };
+                                    fail(CreateStep::SandboxPrep, error);
                                     return;
                                 }
                             }
@@ -1244,12 +1273,22 @@ pub fn run_worker(
             if let Err(e) =
                 register_worktree_row(&db, cfg, root, &tab, &branch, &path_s, &choices, None)
             {
-                fail(CreateStep::Register, e.to_string());
+                let error =
+                    match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
+                        Ok(()) => e.to_string(),
+                        Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
+                    };
+                fail(CreateStep::Register, error);
                 return;
             }
         }
         Err(e) => {
-            fail(CreateStep::Register, format!("db: {e}"));
+            let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch)
+            {
+                Ok(()) => format!("db: {e}"),
+                Err(cleanup) => format!("db: {e}; rollback failed: {cleanup}"),
+            };
+            fail(CreateStep::Register, error);
             return;
         }
     }
@@ -1283,11 +1322,16 @@ pub fn run_worker(
                     halted(halt);
                     return;
                 }
-                crate::git_worktree::remove(root, &path, true);
+                let primary = e.to_string();
+                let cleanup = crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch);
                 if let Ok(db) = open_db() {
                     let _ = db.del_worktree(&path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
-                fail(CreateStep::SandboxPrep, e.to_string());
+                let error = match cleanup {
+                    Ok(()) => primary,
+                    Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
+                };
+                fail(CreateStep::SandboxPrep, error);
                 return;
             }
         }
@@ -1310,13 +1354,23 @@ pub fn run_worker(
                 &choices,
                 sandbox.location.as_deref(),
             ) {
-                fail(CreateStep::Register, e.to_string());
+                let error =
+                    match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
+                        Ok(()) => e.to_string(),
+                        Err(cleanup) => format!("{e}; rollback failed: {cleanup}"),
+                    };
+                fail(CreateStep::Register, error);
                 return;
             }
             step(CreateStep::Register, StepState::Done, None);
         }
         Err(e) => {
-            fail(CreateStep::Register, format!("db: {e}"));
+            let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch)
+            {
+                Ok(()) => format!("db: {e}"),
+                Err(cleanup) => format!("db: {e}; rollback failed: {cleanup}"),
+            };
+            fail(CreateStep::Register, error);
             return;
         }
     }
@@ -1334,8 +1388,32 @@ pub fn run_worker(
     // (devShell already realized ⇒ warm is a fast store-hit) opens on a warm cache
     // and replays instantly; a genuinely cold build that overruns the timeout falls
     // through to the in-pane eval, which the ~/.cache/nix carve now makes succeed.
-    thegn_core::sandbox::run_prepare(&path, &cfg.sandbox.prepare);
     crate::direnv_warm::warm_direnv_now(cfg, &path);
+
+    // Lifecycle post-create owns the legacy sandbox.prepare alias too. It runs
+    // after the existing built-in provisioning and before the first pane is
+    // allowed to consume this worker's Done event.
+    let lifecycle_db = open_db().ok();
+    if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
+        cfg,
+        root,
+        &path,
+        &branch,
+        &slug,
+        lifecycle_db.as_ref(),
+        None,
+    ) {
+        let primary = format!("post_create: {}", report.message());
+        let error = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, &branch) {
+            Ok(()) => primary,
+            Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
+        };
+        if let Ok(db) = open_db() {
+            let _ = db.del_worktree(&path_s);
+        }
+        fail(CreateStep::Register, error);
+        return;
+    }
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     let loc = GitLoc::from_db(&path_s, None);
@@ -1371,6 +1449,7 @@ pub fn run_worker(
 mod tests {
     use super::*;
     use thegn_core::config::WorktreeMode;
+    use thegn_core::store::RepoTrustStore;
 
     fn key(w: &mut NewWorktreeWizard, k: KeyCode) -> WizardOutcome {
         w.handle_key(&k, Modifiers::NONE)
@@ -1718,6 +1797,66 @@ mod tests {
         assert_eq!(row.branch, "tg/test-one");
         // The implicit "default" host is stored as NULL (not a literal).
         assert_eq!(row.env_name, None);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn approved_repo_post_create_waits_before_done() {
+        let repo = temp_repo("repo-post-wait");
+        let marker = repo.join("post-create.done");
+        std::fs::write(
+            repo.join(".thegn.toml"),
+            format!(
+                "[hooks]\npost_create = [{{ command = \"printf done > '{}'\", wait = true }}]\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let db_path = repo.join("state/thegn.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (repo_hooks, repo_prepare) = thegn_core::config::load_repo_hooks(&repo).unwrap();
+        let pending = thegn_core::hooks::resolve(
+            &thegn_core::hooks::HooksConfig::default(),
+            None,
+            Some(&repo_hooks),
+            &[],
+            &repo_prepare,
+            &thegn_core::config_resolve::Approvals::deny_all(),
+        )
+        .pending;
+        assert_eq!(pending.len(), 1);
+        let request = &pending[0];
+        let canonical = request.canonical();
+        db.repo_trust_decide(
+            &repo.to_string_lossy(),
+            &thegn_core::repo_trust::request_id(&canonical),
+            &canonical,
+            "approved",
+            util::now(),
+        )
+        .unwrap();
+        drop(db);
+
+        let events = drive_worker(
+            &repo,
+            "tg/repo-post-wait-2",
+            vec![
+                WizardCmd::PrepChosen {
+                    env: "default".into(),
+                    sandbox: "host".into(),
+                },
+                WizardCmd::Submit(WizardChoices {
+                    name: NameChoice::Generated,
+                    env: "default".into(),
+                    sandbox: "host".into(),
+                    agent: "shell".into(),
+                }),
+            ],
+            &db_path,
+        );
+        let p = done_payload(&events).expect("Done event");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
+        assert!(Path::new(&p.path).is_dir());
         let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 

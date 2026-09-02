@@ -20,10 +20,7 @@ use super::mcp::{PresetAction, SecretAction};
 /// The command an agent runs for the proxy — the current executable's path (so
 /// a wired agent finds thegn even without it on PATH), falling back to `thegn`.
 fn proxy_command() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "thegn".to_string())
+    thegn_core::util::self_exe_str()
 }
 
 /// The `emit --proxy` block: the single secret-free proxy entry, in the same

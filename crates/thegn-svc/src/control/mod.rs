@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use thegn_core::control::Scope;
+pub use thegn_core::control_error::ControlErrorCode;
 use thegn_core::control_wire::{EventFrame, PairingState};
 use thegn_core::store::LeaseRow;
 
@@ -28,6 +29,7 @@ pub mod client;
 #[cfg(feature = "control-grpc")]
 pub mod grpc;
 pub mod http;
+pub mod http_ci;
 pub mod routes;
 #[cfg(test)]
 mod tests;
@@ -46,6 +48,61 @@ pub struct WorktreeInfo {
     pub location: String,
     /// Unix seconds (the DB's `created_at`).
     pub created_at: i64,
+}
+
+/// Metadata-only description of one embedded or configured skill. The control
+/// API never returns target paths and never exposes a seed operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub harnesses: Vec<String>,
+    pub gate: String,
+    pub when: Vec<String>,
+    pub source: thegn_core::skills::SkillSource,
+}
+
+/// The bounded registry projection returned by `GET /v1/skills`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SkillsList {
+    pub skills: Vec<SkillInfo>,
+    pub diagnostics: Vec<String>,
+}
+
+/// A safe editor-handoff request (`editor.open`).
+///
+/// The caller selects only a worktree and an optional relative file location;
+/// provider choice, executable argv and environment stay local to the owning
+/// compositor. [`EditorOpenRequest::target`] applies the core target policy at
+/// every transport boundary before the request reaches [`ControlApi`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditorOpenRequest {
+    /// Absolute worktree path on the daemon/compositor host.
+    pub worktree: String,
+    /// File path relative to `worktree`; omitted to open the project itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 1-based line number; requires `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// 1-based column number; requires `path` and `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub col: Option<usize>,
+}
+
+impl EditorOpenRequest {
+    /// Validate this wire request through the core editor target policy.
+    pub fn target(
+        &self,
+    ) -> Result<thegn_core::editor::EditorTarget, thegn_core::editor::EditorError> {
+        thegn_core::editor::EditorTarget::new(
+            &self.worktree,
+            self.path.as_deref(),
+            self.line,
+            self.col,
+        )
+    }
 }
 
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
@@ -98,6 +155,10 @@ pub struct SessionInfo {
     /// contents. `None` when nothing is being recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<String>,
+    /// Stable display form of the source session when this session was forked.
+    /// This is lineage metadata only; no launch recipe is included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -135,6 +196,11 @@ pub struct OpenSpec {
     /// leaves this `false` and gets the cap applied for them.
     #[serde(default)]
     pub already_capped: bool,
+    /// Automation ancestry for sessions opened by a rule. Daemons preserve
+    /// this on activity/exit facts so generated sessions cannot re-trigger
+    /// their own rule chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_origin: Option<AutomationOrigin>,
 }
 
 /// Launch a configured agent in a worktree.
@@ -184,6 +250,48 @@ pub struct AgentLaunch {
     /// Unknown stage ⇒ error. See `thegn_core::agent_task::effective_agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// Ask the selected harness to create a native child session rather than
+    /// resume the source in place. The daemon validates and resolves this
+    /// operation through the harness seam.
+    #[serde(default)]
+    pub fork: bool,
+    /// Native session id passed to the harness fork operation. It is kept
+    /// separate from `resume` so a fork cannot silently become an in-place
+    /// resume when the two launch forms are composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+}
+
+/// Intent for creating a new session from a live daemon or recorded harness
+/// session. `harness` discriminates the source: absent means `session` is a
+/// live daemon id; present means it is a native id discovered from
+/// `agent.sessions`. No process recipe, environment, prompt, or transcript
+/// data crosses the control boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ForkSpec {
+    /// Live daemon id, or native harness id when `harness` is set.
+    pub session: String,
+    /// Harness id for a recorded native session source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Configured agent name used to resolve the child launch context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Optional child working-directory override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Optional child worktree override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Request a bounded plain-text scrollback handoff file.
+    #[serde(default)]
+    pub scrollback: bool,
+    /// Ask a connected compositor to adopt the child.
+    #[serde(default)]
+    pub adopt: bool,
+    /// Adopt the child in a new tab instead of beside the source.
+    #[serde(default)]
+    pub tab: bool,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
@@ -221,6 +329,41 @@ pub enum BrowserAction {
     Navigate { url: String },
     Reload,
     Back,
+}
+
+/// A bounded, credential-free preview fetch request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreviewFetchRequest {
+    /// Absolute `http`/`https` URL. The host applies its loopback policy before
+    /// connecting and again after every redirect.
+    pub url: String,
+    /// Optional worktree identity used only to select pane diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Include bounded, redacted dev-server pane error lines. This is not a
+    /// browser JavaScript-console claim.
+    #[serde(default)]
+    pub include_console: bool,
+}
+
+/// The bounded, JSON-safe result of [`PreviewFetchRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PreviewFetchReply {
+    /// Final URL after validated redirects.
+    pub url: String,
+    /// Origin server HTTP status, preserved as data (including non-2xx).
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Lossy UTF-8 rendering of at most `[preview] max_body_bytes` bytes.
+    pub body: String,
+    pub truncated: bool,
+    /// Bounded, redacted error-shaped lines from the associated dev-server pane.
+    #[serde(default)]
+    pub console_errors: Vec<String>,
+    /// `dev-server-pane` when those diagnostics were available, otherwise
+    /// `unavailable`.
+    pub diagnostics_source: String,
 }
 
 /// The payload of an [`EventFrame::Activity`] frame: one session's agent state
@@ -375,6 +518,32 @@ pub struct PrStatusRow {
     pub fetched_at: i64,
 }
 
+/// Cached CI run history projected through the control plane. `runs` is kept
+/// as JSON because the provider-neutral CI model intentionally belongs to
+/// `thegn-core` without a control-wire schema dependency; the response still
+/// carries the cache source and timestamp explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CiRunsReply {
+    pub worktree: String,
+    pub runs: serde_json::Value,
+    pub source: String,
+    pub fetched_at: i64,
+}
+
+/// One cache-first CI log projection. Entries contain only the bounded,
+/// redacted cache shape; the response metadata makes a provider fill explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CiLogsReply {
+    pub worktree: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub logs: Vec<serde_json::Value>,
+    pub source: String,
+    pub fetched_at: i64,
+    pub truncated: bool,
+    pub redacted: bool,
+}
+
 /// The `notify.push` verb payload — a desktop-notification-shaped note pushed
 /// into the tray over the API (the wire mirror of `thegn notify push`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -391,6 +560,59 @@ pub struct PushedNote {
     /// Opaque source reference stored on the row; defaults to `"api"`.
     #[serde(default)]
     pub source: Option<String>,
+    /// Automation ancestry for loop prevention; absent for human/API pushes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_origin: Option<AutomationOrigin>,
+}
+
+/// Wire-safe automation ancestry shared by generated sessions and notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationOrigin {
+    pub root_event_id: String,
+    pub rule_id: String,
+    pub run_id: String,
+}
+
+/// One trusted automation rule projected for control clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationRuleInfo {
+    pub name: String,
+    pub enabled: bool,
+    pub trusted_layer: String,
+    pub event: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inert_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_outcome: Option<String>,
+}
+
+/// Pure `automations.test` input. `event` is decoded as the core normalized
+/// event by the implementation so the transport schema stays substrate-free.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationTestRequest {
+    pub rule: String,
+    pub event: serde_json::Value,
+    #[serde(default)]
+    pub at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationTestReply {
+    pub rule: String,
+    pub decisions: serde_json::Value,
+    pub executed: bool,
+}
+
+/// Name-only configured-tool request. The daemon resolves the command,
+/// sandbox, environment, and resource limits from its trusted config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolRunRequest {
+    pub name: String,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_origin: Option<AutomationOrigin>,
 }
 
 /// One upstream instance in the mcp-proxy hub, as `mcp_proxy.status` reports.
@@ -507,24 +729,63 @@ pub struct DispatchPutReq {
 #[derive(Debug)]
 pub enum ControlError {
     NotFound(String),
+    InvalidArgument(String),
     /// The caller's token lacks the required scope. Produced by adapters (the
     /// trait impl never sees an under-scoped call).
     NoScope {
         need: Scope,
     },
     Conflict(String),
+    FailedPrecondition(String),
+    ResourceExhausted(String),
+    Unavailable(String),
     Unimplemented(&'static str),
     Internal(anyhow::Error),
+}
+
+impl ControlError {
+    /// The stable machine-readable code for this control error.
+    pub fn code(&self) -> ControlErrorCode {
+        match self {
+            Self::NotFound(_) => ControlErrorCode::NotFound,
+            // `InvalidArgument` reuses the existing `BadRequest` identifier
+            // rather than adding a synonym for the same condition.
+            Self::InvalidArgument(_) => ControlErrorCode::BadRequest,
+            Self::NoScope { .. } => ControlErrorCode::NoScope,
+            Self::Conflict(_) => ControlErrorCode::Conflict,
+            Self::FailedPrecondition(_) => ControlErrorCode::FailedPrecondition,
+            Self::ResourceExhausted(_) => ControlErrorCode::ResourceExhausted,
+            Self::Unavailable(_) => ControlErrorCode::Unavailable,
+            Self::Unimplemented(_) => ControlErrorCode::Unimplemented,
+            Self::Internal(_) => ControlErrorCode::Internal,
+        }
+    }
+}
+
+/// The additive HTTP error envelope. `error` retains the existing human
+/// message; `code` is stable for machine-readable branching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ErrorBody {
+    pub error: String,
+    pub code: ControlErrorCode,
 }
 
 impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ControlError::NotFound(what) => write!(f, "not found: {what}"),
+            ControlError::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             ControlError::NoScope { need } => {
                 write!(f, "missing required scope: {}", need.as_str())
             }
             ControlError::Conflict(what) => write!(f, "conflict: {what}"),
+            ControlError::FailedPrecondition(what) => {
+                write!(f, "failed precondition: {what}")
+            }
+            ControlError::ResourceExhausted(what) => {
+                write!(f, "resource exhausted: {what}")
+            }
+            ControlError::Unavailable(what) => write!(f, "unavailable: {what}"),
             ControlError::Unimplemented(what) => write!(f, "not implemented: {what}"),
             ControlError::Internal(e) => write!(f, "{e:#}"),
         }
@@ -559,8 +820,24 @@ pub trait ControlApi: Send + Sync + 'static {
         })
     }
 
+    /// Embedded and configured skill metadata (`skills.list`). Read-only and
+    /// path-free; seeding remains a local CLI operation.
+    fn list_skills(&self) -> BoxFuture<'_, ControlResult<SkillsList>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "skill listing is not available",
+            ))
+        })
+    }
+
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
+
+    /// Fork a live daemon or recorded harness session. The default keeps
+    /// transport-only adapters honest until they implement the spawn owner.
+    fn fork(&self, _spec: ForkSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async { Err(ControlError::Unimplemented("session fork is not available")) })
+    }
 
     /// Warm-attach: registers `client_id` as a subscriber and returns the
     /// current screen snapshot + live stream. An `Interactive` attach cancels
@@ -612,8 +889,26 @@ pub trait ControlApi: Send + Sync + 'static {
         branch: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<()>>;
 
+    /// Queue a validated editor target for the owning compositor. The daemon
+    /// acknowledges the mailbox write only; it never resolves or launches an
+    /// editor itself.
+    fn open_editor(
+        &self,
+        _target: thegn_core::editor::EditorTarget,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async { Err(ControlError::Unimplemented("open_editor")) })
+    }
+
     /// Command the preview browser. v1: always `Err(Unimplemented)`.
     fn drive_browser(&self, cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>>;
+
+    /// Perform one bounded, credential-free HTTP GET for `preview.fetch`.
+    fn preview_fetch(
+        &self,
+        _req: PreviewFetchRequest,
+    ) -> BoxFuture<'_, ControlResult<PreviewFetchReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("preview_fetch")) })
+    }
 
     /// Block until `session` reaches `cond` (or `timeout_ms` elapses). The
     /// default answers `Unimplemented`; the daemon overrides it to implement the
@@ -734,9 +1029,45 @@ pub trait ControlApi: Send + Sync + 'static {
     /// each row's `fetched_at` carries its staleness.
     fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<PrStatusRow>>>;
 
+    /// Cached CI run history, filled from the provider only on a cache miss.
+    fn ci_runs<'a>(
+        &'a self,
+        _worktree: &'a str,
+        _limit: usize,
+    ) -> BoxFuture<'a, ControlResult<CiRunsReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("CI runs are not available")) })
+    }
+
+    /// One bounded CI job-log entry, filled from the provider only on a cache
+    /// miss. `tail_lines` may narrow an already cached entry.
+    fn ci_logs<'a>(
+        &'a self,
+        _worktree: &'a str,
+        _run_id: &'a str,
+        _job_id: &'a str,
+        _tail_lines: Option<usize>,
+    ) -> BoxFuture<'a, ControlResult<CiLogsReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("CI logs are not available")) })
+    }
+
     /// Push a notification into the tray (the `notify.push` verb). Returns
     /// the stored notification's row id.
     fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
+
+    fn automations_list(&self) -> BoxFuture<'_, ControlResult<Vec<AutomationRuleInfo>>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.list")) })
+    }
+
+    fn automations_test(
+        &self,
+        _request: AutomationTestRequest,
+    ) -> BoxFuture<'_, ControlResult<AutomationTestReply>> {
+        Box::pin(async { Err(ControlError::Unimplemented("automations.test")) })
+    }
+
+    fn tools_run(&self, _request: ToolRunRequest) -> BoxFuture<'_, ControlResult<SessionInfo>> {
+        Box::pin(async { Err(ControlError::Unimplemented("tools.run")) })
+    }
 
     // --- agent orchestration (THE-57) ---------------------------------------
     // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
@@ -870,4 +1201,46 @@ pub trait ControlApi: Send + Sync + 'static {
 
     /// Graceful daemon shutdown (admin).
     fn shutdown(&self) -> BoxFuture<'_, ()>;
+}
+
+#[cfg(test)]
+mod editor_open_request_tests {
+    use super::EditorOpenRequest;
+
+    #[test]
+    fn wire_shape_rejects_unknown_fields() {
+        let err =
+            serde_json::from_str::<EditorOpenRequest>(r#"{"worktree":"/w","provider":"cursor"}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn target_policy_rejects_unsafe_shapes() {
+        for json in [
+            r#"{"worktree":"relative"}"#,
+            r#"{"worktree":"/w","path":"../escape"}"#,
+            r#"{"worktree":"/w","line":1}"#,
+            r#"{"worktree":"/w","path":"src/lib.rs","col":1}"#,
+            r#"{"worktree":"/w","path":"src/lib.rs","line":0}"#,
+        ] {
+            let request: EditorOpenRequest = serde_json::from_str(json).unwrap();
+            assert!(request.target().is_err(), "accepted unsafe shape: {json}");
+        }
+    }
+
+    #[test]
+    fn valid_wire_shape_builds_the_core_target() {
+        let request: EditorOpenRequest =
+            serde_json::from_str(r#"{"worktree":"/w","path":"src/./lib.rs","line":12,"col":4}"#)
+                .unwrap();
+        let target = request.target().unwrap();
+        assert_eq!(target.worktree(), std::path::Path::new("/w"));
+        assert_eq!(
+            target.relative_file(),
+            Some(std::path::Path::new("src/lib.rs"))
+        );
+        assert_eq!(target.line(), Some(12));
+        assert_eq!(target.col(), Some(4));
+    }
 }

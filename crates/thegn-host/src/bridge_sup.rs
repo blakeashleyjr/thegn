@@ -191,7 +191,11 @@ pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(exe) = std::env::current_exe()
+    // `self_exe_path`: a rebuilt-in-place binary reads back as `<path>
+    // (deleted)`, whose `.parent()` is the right directory only by accident of
+    // the marker containing no separator — and whose sibling probe below then
+    // still works, but on a path we never validated. Resolve it properly.
+    if let Some(exe) = thegn_core::util::self_exe_path()
         && let Some(dir) = exe.parent()
     {
         let cand = dir.join("thegn-musl");

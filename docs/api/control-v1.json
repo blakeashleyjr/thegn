@@ -18,11 +18,23 @@
           "description": "Continue the harness's own most recent session in the worktree — the id-free relaunch form the transport-retry observer uses (THE-86). Resolved through [`thegn_core::harness::Harness::continue_command`]; a harness without a continue form refuses, exactly like an unsupported `resume`. Wire-additive with a `false` default: older clients are unaffected.",
           "type": "boolean"
         },
+        "fork": {
+          "default": false,
+          "description": "Ask the selected harness to create a native child session rather than resume the source in place. The daemon validates and resolves this operation through the harness seam.",
+          "type": "boolean"
+        },
         "headless": {
           "default": null,
           "description": "Run headlessly (`claude -p …`) rather than as an interactive TUI. Defaults to headless exactly when a prompt is given.",
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "native_session_id": {
+          "description": "Native session id passed to the harness fork operation. It is kept separate from `resume` so a fork cannot silently become an in-place resume when the two launch forms are composed.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -58,6 +70,105 @@
         "observer"
       ],
       "type": "string"
+    },
+    "AutomationOrigin": {
+      "description": "Wire-safe automation ancestry shared by generated sessions and notes.",
+      "properties": {
+        "root_event_id": {
+          "type": "string"
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root_event_id",
+        "rule_id",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "AutomationRuleInfo": {
+      "description": "One trusted automation rule projected for control clients.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "event": {
+          "type": "string"
+        },
+        "inert_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "recent_outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trusted_layer": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "enabled",
+        "event",
+        "name",
+        "trusted_layer"
+      ],
+      "type": "object"
+    },
+    "AutomationTestReply": {
+      "properties": {
+        "decisions": true,
+        "executed": {
+          "type": "boolean"
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "decisions",
+        "executed",
+        "rule"
+      ],
+      "type": "object"
+    },
+    "AutomationTestRequest": {
+      "description": "Pure `automations.test` input. `event` is decoded as the core normalized event by the implementation so the transport schema stays substrate-free.",
+      "properties": {
+        "at": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "event": true,
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "rule"
+      ],
+      "type": "object"
     },
     "BrowserAction": {
       "oneOf": [
@@ -107,6 +218,87 @@
         "action"
       ],
       "type": "object"
+    },
+    "CiLogsReply": {
+      "description": "One cache-first CI log projection. Entries contain only the bounded, redacted cache shape; the response metadata makes a provider fill explicit.",
+      "properties": {
+        "fetched_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "logs": {
+          "items": true,
+          "type": "array"
+        },
+        "redacted": {
+          "type": "boolean"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fetched_at",
+        "job_id",
+        "logs",
+        "redacted",
+        "run_id",
+        "source",
+        "truncated",
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "CiRunsReply": {
+      "description": "Cached CI run history projected through the control plane. `runs` is kept as JSON because the provider-neutral CI model intentionally belongs to `thegn-core` without a control-wire schema dependency; the response still carries the cache source and timestamp explicitly.",
+      "properties": {
+        "fetched_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "runs": true,
+        "source": {
+          "type": "string"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fetched_at",
+        "runs",
+        "source",
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "ControlErrorCode": {
+      "description": "The closed set of machine-readable control-plane error identifiers.",
+      "enum": [
+        "not_found",
+        "no_scope",
+        "conflict",
+        "unimplemented",
+        "internal",
+        "unauthorized",
+        "bad_request",
+        "failed_precondition",
+        "resource_exhausted",
+        "unavailable"
+      ],
+      "type": "string"
     },
     "DispatchPutReq": {
       "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.\n\nThe four pipeline fields (v56) are optional and default-absent, so a caller written against the three-string version keeps working unchanged. `put` carries them all: the roster gains columns, not verbs — there is deliberately no `dispatches.update`, because a mutable stage field invites thegn to become the thing that advances it.",
@@ -161,6 +353,145 @@
       ],
       "type": "object"
     },
+    "EditorOpenRequest": {
+      "additionalProperties": false,
+      "description": "A safe editor-handoff request (`editor.open`).\n\nThe caller selects only a worktree and an optional relative file location; provider choice, executable argv and environment stay local to the owning compositor. [`EditorOpenRequest::target`] applies the core target policy at every transport boundary before the request reaches [`ControlApi`].",
+      "properties": {
+        "col": {
+          "description": "1-based column number; requires `path` and `line`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based line number; requires `path`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "File path relative to `worktree`; omitted to open the project itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "Absolute worktree path on the daemon/compositor host.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "ErrorBody": {
+      "description": "The additive HTTP error envelope. `error` retains the existing human message; `code` is stable for machine-readable branching.",
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/ControlErrorCode"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "error"
+      ],
+      "type": "object"
+    },
+    "FeedFilter": {
+      "description": "Per-connection narrowing options for the control event feed.\n\nAn absent `kinds` or `session` field means no narrowing. The transport adapters parse their query/request representation through [`Self::parse`] or [`Self::from_parts`] before creating a subscription.",
+      "properties": {
+        "kinds": {
+          "description": "A subset of [`FEED_KINDS`]. `None` means every kind.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "session": {
+          "description": "Limit session-keyed frames to this session. Unkeyed frames still pass.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signal_lag": {
+          "default": false,
+          "description": "Emit [`EventFrame::Lagged`] when the bounded broadcast reports loss.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ForkSpec": {
+      "description": "Intent for creating a new session from a live daemon or recorded harness session. `harness` discriminates the source: absent means `session` is a live daemon id; present means it is a native id discovered from `agent.sessions`. No process recipe, environment, prompt, or transcript data crosses the control boundary.",
+      "properties": {
+        "adopt": {
+          "default": false,
+          "description": "Ask a connected compositor to adopt the child.",
+          "type": "boolean"
+        },
+        "agent": {
+          "description": "Configured agent name used to resolve the child launch context.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Optional child working-directory override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harness": {
+          "description": "Harness id for a recorded native session source.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scrollback": {
+          "default": false,
+          "description": "Request a bounded plain-text scrollback handoff file.",
+          "type": "boolean"
+        },
+        "session": {
+          "description": "Live daemon id, or native harness id when `harness` is set.",
+          "type": "string"
+        },
+        "tab": {
+          "default": false,
+          "description": "Adopt the child in a new tab instead of beside the source.",
+          "type": "boolean"
+        },
+        "worktree": {
+          "description": "Optional child worktree override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
     "GitFileStatus": {
       "description": "One changed file in a worktree (the mobile stage/commit contract).",
       "properties": {
@@ -208,6 +539,17 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "automation_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutomationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automation ancestry for sessions opened by a rule. Daemons preserve this on activity/exit facts so generated sessions cannot re-trigger their own rule chain."
         },
         "cols": {
           "format": "uint16",
@@ -305,9 +647,93 @@
       ],
       "type": "object"
     },
+    "PreviewFetchReply": {
+      "description": "The bounded, JSON-safe result of [`PreviewFetchRequest`].",
+      "properties": {
+        "body": {
+          "description": "Lossy UTF-8 rendering of at most `[preview] max_body_bytes` bytes.",
+          "type": "string"
+        },
+        "console_errors": {
+          "default": [],
+          "description": "Bounded, redacted error-shaped lines from the associated dev-server pane.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostics_source": {
+          "description": "`dev-server-pane` when those diagnostics were available, otherwise `unavailable`.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Origin server HTTP status, preserved as data (including non-2xx).",
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "url": {
+          "description": "Final URL after validated redirects.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "body",
+        "diagnostics_source",
+        "status",
+        "truncated",
+        "url"
+      ],
+      "type": "object"
+    },
+    "PreviewFetchRequest": {
+      "description": "A bounded, credential-free preview fetch request.",
+      "properties": {
+        "include_console": {
+          "default": false,
+          "description": "Include bounded, redacted dev-server pane error lines. This is not a browser JavaScript-console claim.",
+          "type": "boolean"
+        },
+        "url": {
+          "description": "Absolute `http`/`https` URL. The host applies its loopback policy before connecting and again after every redirect.",
+          "type": "string"
+        },
+        "worktree": {
+          "description": "Optional worktree identity used only to select pane diagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
     "PushedNote": {
       "description": "The `notify.push` verb payload — a desktop-notification-shaped note pushed into the tray over the API (the wire mirror of `thegn notify push`).",
       "properties": {
+        "automation_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutomationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automation ancestry for loop prevention; absent for human/API pushes."
+        },
         "body": {
           "default": "",
           "description": "Longer detail, appended to the inbox message when non-empty.",
@@ -479,6 +905,13 @@
             "null"
           ]
         },
+        "forked_from": {
+          "description": "Stable display form of the source session when this session was forked. This is lineage metadata only; no launch recipe is included.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -572,6 +1005,107 @@
       ],
       "type": "object"
     },
+    "SkillInfo": {
+      "description": "Metadata-only description of one embedded or configured skill. The control API never returns target paths and never exposes a seed operation.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "gate": {
+          "type": "string"
+        },
+        "harnesses": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/SkillSource"
+        },
+        "when": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "description",
+        "gate",
+        "harnesses",
+        "name",
+        "source",
+        "when"
+      ],
+      "type": "object"
+    },
+    "SkillSource": {
+      "description": "Where a parsed skill came from. The origin is diagnostic metadata only and is never interpreted as a filesystem path by core.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "embedded"
+              ],
+              "type": "string"
+            },
+            "origin": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "origin"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "user"
+              ],
+              "type": "string"
+            },
+            "origin": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "origin"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SkillsList": {
+      "description": "The bounded registry projection returned by `GET /v1/skills`.",
+      "properties": {
+        "diagnostics": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/definitions/SkillInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "diagnostics",
+        "skills"
+      ],
+      "type": "object"
+    },
     "SplitDir": {
       "description": "Where a `split` places the new pane relative to the target session. Mirrors the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does not depend on `thegn-host`.",
       "oneOf": [
@@ -590,6 +1124,35 @@
           "type": "string"
         }
       ]
+    },
+    "ToolRunRequest": {
+      "description": "Name-only configured-tool request. The daemon resolves the command, sandbox, environment, and resource limits from its trusted config.",
+      "properties": {
+        "automation_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutomationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "worktree": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
     },
     "WaitCondition": {
       "description": "A condition for the agent-driving `wait` verb: block until a session reaches a state instead of polling it.\n\nThe activity-derived conditions (`Idle`/`Blocked`/`Done`) are the pane daemon's per-session observer of the activity FSM, projected through `thegn_core::attention::pane_agent_state`; `OutputMatches` scans the session's ANSI-stripped scrollback. **A session that has exited resolves every condition** as `exited` with its code rather than hanging or 404ing — nothing ever waits on a corpse (see the daemon's tombstones).",
@@ -780,6 +1343,11 @@
       "path": "/v1/sessions"
     },
     {
+      "cap": "sessions.fork",
+      "method": "POST",
+      "path": "/v1/sessions/fork"
+    },
+    {
       "cap": "sessions.snapshot",
       "method": "GET",
       "path": "/v1/sessions/{s}/snapshot"
@@ -850,6 +1418,16 @@
       "path": "/v1/worktrees/open"
     },
     {
+      "cap": "skills.list",
+      "method": "GET",
+      "path": "/v1/skills"
+    },
+    {
+      "cap": "editor.open",
+      "method": "POST",
+      "path": "/v1/editor/open"
+    },
+    {
       "cap": "issues.list",
       "method": "GET",
       "path": "/v1/issues"
@@ -890,6 +1468,11 @@
       "path": "/v1/browser"
     },
     {
+      "cap": "preview.fetch",
+      "method": "POST",
+      "path": "/v1/preview/fetch"
+    },
+    {
       "cap": "git.status",
       "method": "GET",
       "path": "/v1/git/status"
@@ -925,6 +1508,16 @@
       "path": "/v1/pr/status"
     },
     {
+      "cap": "ci.runs",
+      "method": "GET",
+      "path": "/v1/ci/runs"
+    },
+    {
+      "cap": "ci.logs",
+      "method": "GET",
+      "path": "/v1/ci/logs"
+    },
+    {
       "cap": "agent.sessions",
       "method": "GET",
       "path": "/v1/agent/sessions"
@@ -933,6 +1526,21 @@
       "cap": "notify.push",
       "method": "POST",
       "path": "/v1/notify"
+    },
+    {
+      "cap": "automations.list",
+      "method": "GET",
+      "path": "/v1/automations"
+    },
+    {
+      "cap": "automations.test",
+      "method": "POST",
+      "path": "/v1/automations/test"
+    },
+    {
+      "cap": "tools.run",
+      "method": "POST",
+      "path": "/v1/tools/run"
     },
     {
       "cap": "mcp_proxy.status",
@@ -989,14 +1597,44 @@
     "AttachKind": {
       "$ref": "#/definitions/AttachKind"
     },
+    "AutomationOrigin": {
+      "$ref": "#/definitions/AutomationOrigin"
+    },
+    "AutomationRuleInfo": {
+      "$ref": "#/definitions/AutomationRuleInfo"
+    },
+    "AutomationTestReply": {
+      "$ref": "#/definitions/AutomationTestReply"
+    },
+    "AutomationTestRequest": {
+      "$ref": "#/definitions/AutomationTestRequest"
+    },
     "BrowserAction": {
       "$ref": "#/definitions/BrowserAction"
     },
     "BrowserCommand": {
       "$ref": "#/definitions/BrowserCommand"
     },
+    "CiLogsReply": {
+      "$ref": "#/definitions/CiLogsReply"
+    },
+    "CiRunsReply": {
+      "$ref": "#/definitions/CiRunsReply"
+    },
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"
+    },
+    "EditorOpenRequest": {
+      "$ref": "#/definitions/EditorOpenRequest"
+    },
+    "ErrorBody": {
+      "$ref": "#/definitions/ErrorBody"
+    },
+    "FeedFilter": {
+      "$ref": "#/definitions/FeedFilter"
+    },
+    "ForkSpec": {
+      "$ref": "#/definitions/ForkSpec"
     },
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"
@@ -1006,6 +1644,12 @@
     },
     "PrStatusRow": {
       "$ref": "#/definitions/PrStatusRow"
+    },
+    "PreviewFetchReply": {
+      "$ref": "#/definitions/PreviewFetchReply"
+    },
+    "PreviewFetchRequest": {
+      "$ref": "#/definitions/PreviewFetchRequest"
     },
     "PushedNote": {
       "$ref": "#/definitions/PushedNote"
@@ -1022,8 +1666,17 @@
     "SessionRecord": {
       "$ref": "#/definitions/SessionRecord"
     },
+    "SkillInfo": {
+      "$ref": "#/definitions/SkillInfo"
+    },
+    "SkillsList": {
+      "$ref": "#/definitions/SkillsList"
+    },
     "SplitDir": {
       "$ref": "#/definitions/SplitDir"
+    },
+    "ToolRunRequest": {
+      "$ref": "#/definitions/ToolRunRequest"
     },
     "WaitCondition": {
       "$ref": "#/definitions/WaitCondition"

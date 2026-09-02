@@ -26,13 +26,13 @@ use std::sync::{Arc, Mutex};
 
 use thegn_core::control::{ScopeSet, TokenKind, Verb, required_scope};
 use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
-use thegn_core::control_wire::{EventFrame, Hello, PROTO_VERSION, PairingState};
+use thegn_core::control_wire::{EventFrame, FeedFilter, Hello, PROTO_VERSION, PairingState};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, RecordSpec, SplitDir,
-    WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, ControlErrorCode, EditorOpenRequest,
+    ForkSpec, OpenSpec, PreviewFetchRequest, RecordSpec, SplitDir, WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -102,8 +102,15 @@ fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
-fn error_json(status: StatusCode, message: &str) -> Response {
-    (status, axum::Json(json!({ "error": message }))).into_response()
+fn error_json(status: StatusCode, code: ControlErrorCode, message: &str) -> Response {
+    (
+        status,
+        axum::Json(super::ErrorBody {
+            error: message.to_string(),
+            code,
+        }),
+    )
+        .into_response()
 }
 
 /// Maximum bytes read back from an in-process dispatch response body — the same
@@ -139,7 +146,11 @@ pub async fn dispatch_local(
     let Ok(request) = request else {
         return (
             StatusCode::BAD_REQUEST,
-            json!({ "error": "could not build request" }),
+            serde_json::to_value(super::ErrorBody {
+                error: "could not build request".into(),
+                code: ControlErrorCode::BadRequest,
+            })
+            .expect("ErrorBody serialization is infallible"),
         );
     };
     let response = match router(state).oneshot(request).await {
@@ -149,7 +160,11 @@ pub async fn dispatch_local(
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": "dispatch failed" }),
+                serde_json::to_value(super::ErrorBody {
+                    error: "dispatch failed".into(),
+                    code: ControlErrorCode::Internal,
+                })
+                .expect("ErrorBody serialization is infallible"),
             );
         }
     };
@@ -165,12 +180,16 @@ impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let status = match &self {
             ControlError::NotFound(_) => StatusCode::NOT_FOUND,
+            ControlError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             ControlError::NoScope { .. } => StatusCode::FORBIDDEN,
             ControlError::Conflict(_) => StatusCode::CONFLICT,
+            ControlError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
+            ControlError::ResourceExhausted(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ControlError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ControlError::Unimplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ControlError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        error_json(status, &self.to_string())
+        error_json(status, self.code(), &self.to_string())
     }
 }
 
@@ -205,7 +224,7 @@ fn authed(state: &ControlState, headers: &HeaderMap, verb: Verb) -> Result<AuthC
 /// pairing id) for the audit record. Every mutating verb (write/git/admin) and
 /// every auth/scope rejection emits one record on `thegn::control::audit`.
 #[allow(clippy::result_large_err)]
-fn authed_target(
+pub(super) fn authed_target(
     state: &ControlState,
     headers: &HeaderMap,
     verb: Verb,
@@ -216,7 +235,11 @@ fn authed_target(
     } else {
         let Some(token) = bearer(headers) else {
             audit_anon(verb, target, AuditOutcome::Unauthorized);
-            return Err(error_json(StatusCode::UNAUTHORIZED, "missing bearer token"));
+            return Err(error_json(
+                StatusCode::UNAUTHORIZED,
+                ControlErrorCode::Unauthorized,
+                "missing bearer token",
+            ));
         };
         let store = state.store.lock().expect("control store lock");
         match auth::verify(&*store, &token, now_ms()) {
@@ -226,6 +249,7 @@ fn authed_target(
                 audit_anon(verb, target, AuditOutcome::Unauthorized);
                 return Err(error_json(
                     StatusCode::UNAUTHORIZED,
+                    ControlErrorCode::Unauthorized,
                     "invalid or revoked token",
                 ));
             }
@@ -242,6 +266,15 @@ fn authed_target(
         audit(&ctx, verb, target, AuditOutcome::Ok);
     }
     Ok(ctx)
+}
+
+/// Small adapter helper shared by the split-out CI handlers.
+pub(super) fn bad_request(message: &str) -> Response {
+    error_json(
+        StatusCode::BAD_REQUEST,
+        ControlErrorCode::BadRequest,
+        message,
+    )
 }
 
 /// Emit one audit record for an authenticated caller.
@@ -434,6 +467,7 @@ pub(super) async fn pair(
         }
         Ok(None) => error_json(
             StatusCode::UNAUTHORIZED,
+            ControlErrorCode::Unauthorized,
             "invalid, expired, or already-redeemed pairing code",
         ),
         Err(e) => ControlError::Internal(e).into_response(),
@@ -627,6 +661,16 @@ pub(super) async fn list_worktrees(
     }
 }
 
+pub(super) async fn list_skills(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authed(&state, &headers, Verb::SkillsList) {
+        return response;
+    }
+    match state.api.list_skills().await {
+        Ok(skills) => axum::Json(skills).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 pub(super) async fn leases(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::LeaseStatus) {
         return r;
@@ -667,6 +711,20 @@ pub(super) async fn open_session(
         return r;
     }
     match state.api.open(body.0).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn fork_session(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<ForkSpec>,
+) -> Response {
+    if let Err(r) = authed_target(&state, &headers, Verb::ForkSession, &body.session) {
+        return r;
+    }
+    match state.api.fork(body.0).await {
         Ok(info) => axum::Json(info).into_response(),
         Err(e) => e.into_response(),
     }
@@ -723,12 +781,19 @@ pub(super) async fn send_input(
     let mut bytes = match (&body.b64, &body.text) {
         (Some(b64), None) => match base64::engine::general_purpose::STANDARD.decode(b64) {
             Ok(b) => b,
-            Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid base64"),
+            Err(_) => {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    ControlErrorCode::BadRequest,
+                    "invalid base64",
+                );
+            }
         },
         (None, Some(text)) => text.clone().into_bytes(),
         _ => {
             return error_json(
                 StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
                 "exactly one of `b64` or `text` is required",
             );
         }
@@ -934,6 +999,30 @@ pub(super) async fn open_worktree(
     }
 }
 
+pub(super) async fn open_editor(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<EditorOpenRequest>,
+) -> Response {
+    if let Err(r) = authed_target(&state, &headers, Verb::OpenEditor, &body.worktree) {
+        return r;
+    }
+    let target = match body.target() {
+        Ok(target) => target,
+        Err(e) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                &e.to_string(),
+            );
+        }
+    };
+    match state.api.open_editor(target).await {
+        Ok(()) => axum::Json(json!({ "queued": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 pub(super) async fn browser(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -944,6 +1033,36 @@ pub(super) async fn browser(
     }
     match state.api.drive_browser(body.0).await {
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn preview_fetch(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::PreviewFetch) {
+        return r;
+    }
+    const REQUEST_LIMIT: usize = 32 * 1024;
+    if body.len() > REQUEST_LIMIT {
+        return ControlError::ResourceExhausted(format!(
+            "preview fetch request exceeds {REQUEST_LIMIT} bytes"
+        ))
+        .into_response();
+    }
+    let request: PreviewFetchRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ControlError::InvalidArgument(format!(
+                "invalid preview fetch request: {error}"
+            ))
+            .into_response();
+        }
+    };
+    match state.api.preview_fetch(request).await {
+        Ok(reply) => axum::Json(reply).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -1339,6 +1458,47 @@ pub(super) async fn notify_push(
     }
 }
 
+pub(super) async fn automations_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AutomationsList) {
+        return r;
+    }
+    match state.api.automations_list().await {
+        Ok(rules) => axum::Json(json!({ "rules": rules })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn automations_test(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::AutomationTestRequest>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AutomationsTest) {
+        return r;
+    }
+    match state.api.automations_test(body.0).await {
+        Ok(reply) => axum::Json(reply).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn tools_run(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::ToolRunRequest>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::ToolsRun) {
+        return r;
+    }
+    match state.api.tools_run(body.0).await {
+        Ok(session) => axum::Json(session).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── mcp proxy hub ────────────────────────────────────────────────────────────
 
 pub(super) async fn mcp_proxy_status(
@@ -1405,19 +1565,55 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
 
 /// The broadcast event feed over WebSocket: one binary message per encoded
 /// [`EventFrame`]. Read scope.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct EventsQuery {
+    /// Comma-separated [`thegn_core::control_wire::FEED_KINDS`].
+    kinds: Option<String>,
+    session: Option<String>,
+    /// `1`, `true`, `0`, or `false`; omitted means false.
+    signal_lag: Option<String>,
+}
+
+impl EventsQuery {
+    fn into_filter(self) -> Result<FeedFilter, String> {
+        let signal_lag = match self.signal_lag.as_deref() {
+            None | Some("0") | Some("false") => false,
+            Some("1") | Some("true") => true,
+            Some(value) => {
+                return Err(format!(
+                    "invalid signal_lag {value:?}; expected 0, 1, true, or false"
+                ));
+            }
+        };
+        FeedFilter::parse(self.kinds.as_deref(), self.session.as_deref(), signal_lag)
+            .map_err(|e| e.to_string())
+    }
+}
+
 pub(super) async fn events_ws(
     State(state): State<ControlState>,
     headers: HeaderMap,
+    Query(q): Query<EventsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let ctx = match authed(&state, &headers, Verb::Events) {
         Ok(c) => c,
         Err(r) => return r,
     };
-    ws.on_upgrade(move |socket| pump_events(socket, state, ctx))
+    let filter = match q.into_filter() {
+        Ok(filter) => filter,
+        Err(message) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                &message,
+            );
+        }
+    };
+    ws.on_upgrade(move |socket| pump_events(socket, state, ctx, filter))
 }
 
-async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
+async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, filter: FeedFilter) {
     let hello = hello_frame(&state, &ctx);
     if socket
         .send(Message::Binary(hello.encode().into()))
@@ -1430,17 +1626,29 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
     loop {
         match rx.recv().await {
             Ok(frame) => {
-                if socket
-                    .send(Message::Binary(frame.encode().into()))
-                    .await
-                    .is_err()
+                if filter.matches(&frame)
+                    && socket
+                        .send(Message::Binary(frame.encode().into()))
+                        .await
+                        .is_err()
                 {
                     return;
                 }
             }
             // Slow consumer skipped `n` events — that's fine for a monitor
             // feed (pane bytes ride attach streams, not this one).
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                if filter.signal_lag {
+                    let frame = EventFrame::Lagged { missed };
+                    if socket
+                        .send(Message::Binary(frame.encode().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
@@ -1448,19 +1656,46 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
 
 /// The same feed as JSON server-sent events (curl-friendly; pane bytes as
 /// base64). WS is the primary transport — this is a convenience surface.
-pub(super) async fn events_sse(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn events_sse(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<EventsQuery>,
+) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::Events) {
         return r;
     }
+    let filter = match q.into_filter() {
+        Ok(filter) => filter,
+        Err(message) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                &message,
+            );
+        }
+    };
     let rx = state.api.subscribe();
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    let stream = futures_util::stream::unfold((rx, filter), |(mut rx, filter)| async move {
         loop {
             match rx.recv().await {
                 Ok(frame) => {
-                    let ev = sse::Event::default().data(frame_json(&frame).to_string());
-                    return Some((Ok::<_, std::convert::Infallible>(ev), rx));
+                    if !filter.matches(&frame) {
+                        continue;
+                    }
+                    let ev = sse::Event::default()
+                        .event(frame.kind())
+                        .data(frame_json(&frame).to_string());
+                    return Some((Ok::<_, std::convert::Infallible>(ev), (rx, filter)));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    if filter.signal_lag {
+                        let frame = EventFrame::Lagged { missed };
+                        let ev = sse::Event::default()
+                            .event(frame.kind())
+                            .data(frame_json(&frame).to_string());
+                        return Some((Ok::<_, std::convert::Infallible>(ev), (rx, filter)));
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -1469,62 +1704,134 @@ pub(super) async fn events_sse(State(state): State<ControlState>, headers: Heade
 }
 
 /// The JSON envelope of an [`EventFrame`] for SSE / `--json` consumers.
-pub fn frame_json(frame: &EventFrame) -> serde_json::Value {
-    match frame {
-        EventFrame::Hello(h) => json!({
-            "kind": "hello", "proto": h.proto, "server": h.server,
-            "scopes": h.scopes,
-        }),
-        EventFrame::PaneSnapshot {
-            session,
-            seq,
-            cols,
-            rows,
-            bytes,
-        } => json!({
-            "kind": "snapshot", "session": session, "seq": seq,
-            "cols": cols, "rows": rows,
-            "ansi_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }),
-        EventFrame::PaneDelta {
-            session,
-            seq,
-            bytes,
-        } => json!({
-            "kind": "delta", "session": session, "seq": seq,
-            "b64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }),
-        EventFrame::Activity { json: j } => json!({
-            "kind": "activity",
-            "event": serde_json::from_str::<serde_json::Value>(j)
-                .unwrap_or_else(|_| serde_json::Value::String(j.clone())),
-        }),
-        EventFrame::Lease {
-            session,
-            kind,
-            expires_at,
-        } => json!({
-            "kind": "lease", "session": session, "event": kind,
-            "expires_at": expires_at,
-        }),
-        EventFrame::Pairing {
-            pairing_id,
-            label,
-            scope,
-            state,
-        } => json!({
-            "kind": "pairing", "pairing_id": pairing_id, "label": label,
-            "scopes": scope, "state": state,
-        }),
-        EventFrame::Sessions => json!({ "kind": "sessions" }),
-        EventFrame::SessionExit { session, code } => json!({
-            "kind": "exit", "session": session, "code": code,
-        }),
-    }
-}
+pub use super::client::frame_json;
 
 fn default_history() -> bool {
     true
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn control_error_http_envelope_preserves_status_message_and_code() {
+        let cases = [
+            (
+                ControlError::NotFound("session s1".into()),
+                StatusCode::NOT_FOUND,
+                ControlErrorCode::NotFound,
+                "not found: session s1",
+            ),
+            (
+                ControlError::NoScope {
+                    need: thegn_core::control::Scope::Read,
+                },
+                StatusCode::FORBIDDEN,
+                ControlErrorCode::NoScope,
+                "missing required scope: read",
+            ),
+            (
+                ControlError::Conflict("session s1".into()),
+                StatusCode::CONFLICT,
+                ControlErrorCode::Conflict,
+                "conflict: session s1",
+            ),
+            (
+                ControlError::Unimplemented("wait"),
+                StatusCode::NOT_IMPLEMENTED,
+                ControlErrorCode::Unimplemented,
+                "not implemented: wait",
+            ),
+            (
+                ControlError::Internal(anyhow::anyhow!("database failed")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ControlErrorCode::Internal,
+                "database failed",
+            ),
+        ];
+
+        for (error, status, code, message) in cases {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: super::super::ErrorBody = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.error, message);
+            assert_eq!(body.code, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_error_codes_are_structured() {
+        for (status, code, message) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                ControlErrorCode::Unauthorized,
+                "missing bearer token",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                ControlErrorCode::BadRequest,
+                "invalid base64",
+            ),
+        ] {
+            let response = error_json(status, code, message);
+            assert_eq!(response.status(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: super::super::ErrorBody = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.error, message);
+            assert_eq!(body.code, code);
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_events {
+    use super::*;
+
+    #[test]
+    fn event_query_uses_the_bounded_core_filter() {
+        let filter = EventsQuery {
+            kinds: Some("activity, exit".into()),
+            session: Some("s1".into()),
+            signal_lag: Some("1".into()),
+        }
+        .into_filter()
+        .unwrap();
+        assert_eq!(filter.kinds, Some(vec!["activity".into(), "exit".into()]));
+        assert_eq!(filter.session.as_deref(), Some("s1"));
+        assert!(filter.signal_lag);
+    }
+
+    #[test]
+    fn event_query_rejects_typos_and_bad_lag_values() {
+        let typo = EventsQuery {
+            kinds: Some("activty".into()),
+            ..Default::default()
+        }
+        .into_filter()
+        .unwrap_err();
+        assert!(typo.contains("unknown event kind"));
+
+        let bad_lag = EventsQuery {
+            signal_lag: Some("sometimes".into()),
+            ..Default::default()
+        }
+        .into_filter()
+        .unwrap_err();
+        assert!(bad_lag.contains("invalid signal_lag"));
+    }
+
+    #[test]
+    fn json_formatter_uses_frame_kind_and_lag_count() {
+        let json = frame_json(&EventFrame::Lagged { missed: 12 });
+        assert_eq!(json["kind"], "lagged");
+        assert_eq!(json["missed"], 12);
+    }
 }
 
 #[derive(Deserialize)]

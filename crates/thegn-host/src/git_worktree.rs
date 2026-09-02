@@ -13,6 +13,7 @@ use thegn_core::store::RepoTrustStore;
 /// Create a linked worktree through the service seam. Directory preparation and
 /// the in-repo exclude are host policy; the git mutation is never a core
 /// subprocess at this call site.
+#[allow(dead_code)]
 pub(crate) fn add_checked(
     root: &Path,
     branch: &str,
@@ -44,6 +45,7 @@ pub(crate) fn add_checked(
         })
 }
 
+#[allow(dead_code)]
 pub(crate) fn remove(root: &Path, path: &Path, delete_branch: bool) -> bool {
     let removed = crate::git_handle::get()
         .remove_worktree(root, path, delete_branch)

@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use termwiz::terminal::TerminalWaker;
 use thegn_core::db::Db;
 use thegn_core::scan_sched;
-use thegn_core::store::{NotificationStore, WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 
 use super::LOG;
 
@@ -176,6 +176,13 @@ fn reclaim(
     let now = thegn_core::util::now().max(0) as u64;
     let idle_threshold = rc::idle_threshold_secs(policy);
 
+    // Worktrees whose pipeline work nobody has closed yet. Reclaiming one costs
+    // the next stage a cold rebuild of work that is still mid-flight, so they
+    // are exempt from both rules. One query for the whole round.
+    // best-effort: a roster read failure must not disable the whole reclaim —
+    // it only means this round loses the exemption, so fall back to "none".
+    let awaiting = db.worktrees_with_active_dispatch().unwrap_or_default();
+
     let candidates: Vec<rc::Candidate> = fresh
         .iter()
         .map(|(path, usage)| {
@@ -195,6 +202,8 @@ fn reclaim(
                 active: active == Some(path.as_str()),
                 building: crate::task::slot_active(p),
                 dirty,
+                awaiting_verification: awaiting.iter().any(|w| w == path),
+                reclaimed_secs_ago: last_reclaim_secs_ago(db, path, now),
             }
         })
         .collect();
@@ -220,6 +229,11 @@ fn reclaim(
                 // best-effort: the size cache is a cache; a failed delete just
                 // means the badge shows a stale number until the next round.
                 let _ = db.delete_worktree_disk(&item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                // Stamp the reclaim so the cooldown can see it next round. Without
+                // this the pressure rule re-picks the same worktree as soon as a
+                // build repopulates `target/` — delete, rebuild, delete.
+                // best-effort: losing the stamp costs hysteresis, never correctness.
+                let _ = db.set_ui_state(RECLAIM_SCOPE, &item.path, &now.to_string()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let branch = branch_of(db, &item.path);
                 let msg = format!(
                     "target/ reclaimed ({} — {})",
@@ -230,7 +244,8 @@ fn reclaim(
                 // and this says why rather than looking like a broken cache.
                 // best-effort: the reclaim already happened and is logged; a
                 // failed insert must not abort the rest of the round.
-                let _ = db.put_notification("disk_cleaned", &branch, &msg, &item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                let _ =
+                    crate::automation_events::emit(db, "disk_cleaned", &branch, &msg, &item.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 tracing::info!(
                     target: LOG,
                     worktree = %item.path,
@@ -246,6 +261,20 @@ fn reclaim(
         }
     }
     total
+}
+
+/// `ui_state` scope holding the last-reclaim timestamp per worktree. A
+/// `ui_state` row rather than a schema column: it is pure hysteresis bookkeeping
+/// that may be lost without consequence, so it does not earn a migration.
+const RECLAIM_SCOPE: &str = "disk_reclaim_at";
+
+/// Seconds since thegn last reclaimed this worktree, or `None` if it never has
+/// (or the stamp is unreadable/corrupt — in which case the worktree is simply
+/// treated as never reclaimed, the pre-hysteresis behaviour).
+fn last_reclaim_secs_ago(db: &Db, path: &str, now: u64) -> Option<u64> {
+    let raw = db.get_ui_state(RECLAIM_SCOPE, path).ok()??;
+    let then: u64 = raw.trim().parse().ok()?;
+    Some(now.saturating_sub(then))
 }
 
 /// Branch label for the reclaim notification; empty when the path is not a

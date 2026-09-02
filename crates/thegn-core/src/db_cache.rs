@@ -103,6 +103,31 @@ impl CacheStore for Db {
         Ok(())
     }
 
+    fn get_ci_log(
+        &self,
+        worktree: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<crate::ci_log::CiLogEntry>> {
+        self.get_ci_log_entry(worktree, run_id, job_id)
+    }
+
+    fn list_ci_logs(&self, worktree: &str) -> Result<Vec<crate::ci_log::CiLogEntry>> {
+        self.list_ci_log_entries(worktree)
+    }
+
+    fn put_ci_log(&self, entry: &crate::ci_log::CiLogEntry) -> Result<()> {
+        self.put_ci_log_entry(entry)
+    }
+
+    fn retain_ci_logs(&self, worktree: &str, run_ids: &[String]) -> Result<usize> {
+        self.retain_ci_log_runs(worktree, run_ids)
+    }
+
+    fn claim_ci_autofix(&self, candidate: &crate::ci_log::CiLogCandidate) -> Result<bool> {
+        Db::claim_ci_autofix(self, candidate)
+    }
+
     fn get_pr_branch_cache(&self, repo_root: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
@@ -300,6 +325,67 @@ impl CacheStore for Db {
         Ok(())
     }
 
+    fn get_pr_review_cache(
+        &self,
+        worktree: &str,
+    ) -> Result<Option<crate::review::PrReviewSnapshot>> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT branch, pr_number, head_oid, json, fetched_at
+                 FROM pr_review_cache WHERE worktree=?1",
+                params![worktree],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .ok(); // best-effort: a corrupt/missing cache row is a miss; the forge repopulates
+        let Some((branch, pr_number, head_oid, json, fetched_at)) = row else {
+            return Ok(None);
+        };
+        let Ok(mut snapshot) = serde_json::from_str::<crate::review::PrReviewSnapshot>(&json)
+        else {
+            return Ok(None);
+        };
+        if snapshot.worktree_key != worktree
+            || snapshot.branch != branch
+            || u64::try_from(pr_number).ok() != Some(snapshot.pr_number)
+            || snapshot.head_oid != head_oid
+        {
+            return Ok(None);
+        }
+        snapshot.fetched_at = fetched_at;
+        Ok(Some(snapshot))
+    }
+
+    fn put_pr_review_cache(&self, snapshot: &crate::review::PrReviewSnapshot) -> Result<()> {
+        let fetched_at = util::now();
+        let mut cached = snapshot.clone();
+        cached.fetched_at = fetched_at;
+        let json = serde_json::to_string(&cached)?;
+        self.conn().execute(
+            r#"INSERT INTO pr_review_cache(worktree,branch,pr_number,head_oid,json,fetched_at)
+               VALUES(?1,?2,?3,?4,?5,?6)
+               ON CONFLICT(worktree) DO UPDATE SET
+                 branch=?2, pr_number=?3, head_oid=?4, json=?5, fetched_at=?6"#,
+            params![
+                cached.worktree_key,
+                cached.branch,
+                cached.pr_number as i64,
+                cached.head_oid,
+                json,
+                fetched_at
+            ],
+        )?;
+        Ok(())
+    }
+
     fn get_loc_cache_entry(&self, worktree: &str) -> Result<Option<(String, i64)>> {
         let r = self
             .conn()
@@ -348,6 +434,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_cache_round_trips_as_one_identity_bearing_snapshot() {
+        let db = Db::open_memory().unwrap();
+        let snapshot = crate::review::PrReviewSnapshot {
+            worktree_key: "/wt/review".into(),
+            branch: "feature".into(),
+            pr_number: 27,
+            head_oid: "abc".into(),
+            ..Default::default()
+        };
+        db.put_pr_review_cache(&snapshot).unwrap();
+        let got = db
+            .get_pr_review_cache("/wt/review")
+            .unwrap()
+            .expect("cached snapshot");
+        assert_eq!(got.worktree_key, snapshot.worktree_key);
+        assert_eq!(got.branch, snapshot.branch);
+        assert_eq!(got.pr_number, snapshot.pr_number);
+        assert_eq!(got.head_oid, snapshot.head_oid);
+        assert!(got.fetched_at > 0);
+    }
+
+    #[test]
     fn list_pr_cache_returns_every_row() {
         let db = Db::open_memory().unwrap();
         assert!(db.list_pr_cache().unwrap().is_empty());
@@ -361,5 +469,39 @@ mod tests {
         assert_eq!(rows[0].1, "{\"n\":3}");
         assert!(rows[0].2 > 0);
         assert_eq!(rows[1].0, "/wt/b");
+    }
+
+    #[test]
+    fn ci_log_cache_round_trips_redacts_and_dedupes() {
+        use crate::ci_log::{CiLogCandidate, CiLogEntry};
+        use crate::store::CacheStore;
+
+        let db = Db::open_memory().unwrap();
+        let mut entry = CiLogEntry::new(
+            "/wt/a",
+            "run-1",
+            "job-1",
+            "tests",
+            "token=secret\nordinary\n",
+            20,
+            1024,
+            123,
+        );
+        entry.head_sha = "abc".into();
+        db.put_ci_log(&entry).unwrap();
+        let got = db.get_ci_log("/wt/a", "run-1", "job-1").unwrap().unwrap();
+        assert!(got.redacted);
+        assert!(!got.text.contains("plain-secret"));
+        assert_eq!(db.list_ci_logs("/wt/a").unwrap().len(), 1);
+        assert!(
+            db.claim_ci_autofix(&CiLogCandidate {
+                worktree: "/wt/a".into(),
+                run_id: "run-1".into(),
+                job_id: "job-1".into(),
+                head_sha: "abc".into(),
+            })
+            .unwrap()
+        );
+        assert!(!db.claim_ci_autofix(&entry.candidate()).unwrap());
     }
 }

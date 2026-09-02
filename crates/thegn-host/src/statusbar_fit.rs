@@ -33,6 +33,9 @@ fn priority(id: &BarItemId) -> u8 {
             "pr" => 2,
             "disk" => 3,
             "status" => 4,
+            // The queue summary is useful when explicitly enabled, but it is
+            // still an ordinary optional widget and yields to fixed alarms.
+            "mq" => 5,
             _ => 5,
         },
         BarItemId::Badge(b) => match b {
@@ -178,6 +181,25 @@ mod tests {
         let pos = |b| out.iter().position(|i| *i == BarItemId::Badge(b)).unwrap();
         assert!(pos(BarBadge::Attention) < pos(BarBadge::Lock));
         assert!(pos(BarBadge::Lock) < pos(BarBadge::Persist));
+    }
+
+    #[test]
+    fn merge_queue_widget_has_an_explicit_optional_widget_priority() {
+        let items = vec![
+            widget("loc", "12.3k LOC"),
+            widget("mq", " 1 MQ "),
+            badge(BarBadge::Persist, " ◆ "),
+        ];
+        let out = fit(items, 15);
+        assert!(
+            out.iter()
+                .any(|(id, _)| *id == BarItemId::Widget("mq".into())),
+            "the opt-in queue widget should outlive lower-priority LOC: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|(id, _)| *id == BarItemId::Widget("loc".into()))
+        );
     }
 
     /// A long status message is clipped (with the ellipsis) before anything

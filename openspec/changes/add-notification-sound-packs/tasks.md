@@ -1,44 +1,53 @@
-# Tasks — per-event notification sounds
+# Tasks — configurable notification sound effects
 
-## 1. Core resolution (pure)
+## 1. Pure core policy — complete in chunk 1
 
-- [ ] 1.1 One `SoundSpec` parse (`bell` | `off` | path | pack name | command)
-      shared by rule actions, `per_kind`, and `per_priority`; unit tests.
-- [ ] 1.2 `notification_route.rs`: resolution order rule→per_kind→
-      per_priority→mode-default, gates applied after; exhaustive table tests
-      to the 95% gate (every order pair, gate interaction, DND).
-- [ ] 1.3 `config_notifications.rs`: `per_kind` table, `pack`, `volume`
-      (clamped 0.0..=1.0); validation — unknown kind did-you-mean, missing/
-      empty pack dir warning, unmatched pack filename warning, OGG-on-Windows
-      portability warning.
-- [ ] 1.4 Document the new keys in `config/config.toml.example`
-      (`per_kind`, `pack` layout, `volume` best-effort caveat).
+- [x] 1.1 Add `SoundRef` parsing for bell aliases, `off`/`none`,
+      `builtin:bell`, `pack:<name>`, and absolute/tilde file paths. Reject
+      relative paths, bare pack names, and command strings for `per_kind`.
+- [x] 1.2 Resolve sound after the existing mute, route, DND, focus, and
+      priority gates with rule → per-kind → legacy priority command → mode
+      precedence. Preserve the terminal-bell default and command compatibility.
+- [x] 1.3 Validate volume, pack syntax, kind names, per-kind references, and
+      legacy chime-file syntax against `NotificationKind::ALL`.
+- [x] 1.4 Add pure tests for aliases/rejection, precedence, gates, defaults,
+      volume bounds, malformed kinds, and trusted repository overlays.
 
-## 2. Playback (host)
+## 2. Host provider and playback — complete in chunk 2
 
-- [ ] 2.1 `chime.rs`: pack scan at load/reload → kind→path map (per-event
-      cost stays a lookup); resolve spec → file; fall-through chain
-      per_kind → pack → default.<ext> → bundled → bell.
-- [ ] 2.2 Volume flags in the player command builder (`paplay --volume`,
-      `pw-play --volume`, `afplay -v`, PowerShell) — runtime detection,
-      no new `#[cfg]` (platform ratchet clean); shell-quoting unchanged.
-- [ ] 2.3 Synthesized bundle family: distinct alert/notice tones, generated
-      at first use under the state dir (still no repo audio asset).
-- [ ] 2.4 Confirm zero-default-overhead: unconfigured tables short-circuit;
-      no audio init in-process; sound path stays off-loop (bell latch +
-      detached subprocess) — no event-loop or render-plan change.
+- [x] 2.1 Add a platform-owned synchronous provider seam with fixed argv,
+      format/volume capabilities, and `ProbeReport` output.
+- [x] 2.2 Build immutable pack/file snapshots off-loop and resolve references
+      without per-event filesystem access.
+- [x] 2.3 Add the bounded `notify-sound` utility worker, `try_send` drop
+      behavior, provider/file fallbacks, and the existing coalesced bell latch.
+- [x] 2.4 Route all eligible host producers through `NotifyState`; remove
+      duplicate direct sound emissions and preserve record-first ordering.
+- [x] 2.5 Observe live attention edges during hydration with startup baseline,
+      changed-session cues, and clear/remove handling.
+- [x] 2.6 Add sound provider, pack, capability, and fallback data to doctor;
+      do not add a control, database, command, or capability surface.
 
-## 3. Diagnostics + docs
+## 3. Configuration reference and openspec — complete in chunk 3
 
-- [ ] 3.1 `cmd/doctor.rs`: report resolved player, volume support, pack dir
-      resolution (found/missing/empty, mapped-kind count).
-- [ ] 3.2 Update the help page that claims the notification surface with
-      per-kind/pack/volume prose (help-prose ratchet identifies the page);
-      note the trust boundary for command specs (see
-      `add-config-trust-resolution`).
+- [x] 3.1 Document every sound key, accepted value, default, trust boundary,
+      provider capability, and terminal-bell fallback in the config example.
+- [x] 3.2 Document per-kind references, event catalog names, gates, pack/file
+      behavior, doctor diagnostics, and the absence of a sound control action
+      in the notifications help page.
+- [x] 3.3 Reconcile this proposal, design, tasks, and notifications delta
+      with the compiled APIs: bell default, no synthesized family, explicit
+      `pack:<name>`, fixed-argv platform provider, bounded queue, live edge,
+      trusted overlays, and no DB/control/capability additions.
 
-## 4. Wrap-up
+## 4. Scoped verification
 
-- [ ] 4.1 Smoke: a fake `paplay` on PATH in the hermetic smoke env asserts
-      the argv (file + volume flag) without playing audio.
-- [ ] 4.2 Run `just ci` once (includes openspec validate).
+- [x] 4.1 Run the targeted core/host/svc tests and quick checks required by the
+      implementation loop, plus the help, completion, platform, and schema
+      ratchet checks.
+- [ ] 4.2 The ignored-result ratchet still reports the sibling-owned
+      `crates/thegn-host/src/notification_sound.rs`; this chunk does not alter
+      that implementation or add a new ratchet entry.
+- [ ] 4.3 Full-workspace CI, coverage, and e2e remain deferred to the normal
+      pre-PR gate; they are explicitly outside this issue's implementation
+      loop.

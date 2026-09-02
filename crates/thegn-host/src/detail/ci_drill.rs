@@ -19,6 +19,9 @@ use thegn_core::theme::Hue;
 pub struct CiDetailPayload {
     pub run: thegn_core::ci::CiRun,
     pub log_tail: Vec<String>,
+    /// Cache metadata for each displayed failed-job excerpt.  The text is
+    /// already bounded and redacted by the producer.
+    pub log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
 }
 
 /// Glyph + marker tone for a CI state — caps-routed so it degrades to ASCII.
@@ -58,9 +61,10 @@ pub(crate) fn ci_fmt_secs(s: i64) -> String {
 
 /// The drilled CI view's title: `CI ▸ <name> #<run>`.
 fn ci_drill_title(run: &thegn_core::ci::CiRun) -> String {
+    let arrow = crate::caps::active_glyphs().arrow_right;
     match run.run_number {
-        Some(n) => format!("CI \u{25b8} {} #{n}", run.name),
-        None => format!("CI \u{25b8} {}", run.name),
+        Some(n) => format!("CI {arrow} {} #{n}", run.name),
+        None => format!("CI {arrow} {}", run.name),
     }
 }
 
@@ -119,6 +123,7 @@ impl DetailOverlay {
         self.sel = 0;
         self.pending_ci = Some(run.id.clone());
         self.live_ci = None;
+        self.ci_autofix = None;
     }
 
     /// The drilled run to re-poll while it's still in flight (live drill
@@ -138,7 +143,12 @@ impl DetailOverlay {
     /// Replace the drilled CI view with the fully-fetched run: header + per-job
     /// headings, each job's steps as a table (first failure highlighted), and a
     /// failing-log tail. Clears `pending_ci` (the fetch is done).
-    pub(crate) fn set_ci_detail(&mut self, run: &thegn_core::ci::CiRun, log_tail: Vec<String>) {
+    pub(crate) fn set_ci_detail(
+        &mut self,
+        run: &thegn_core::ci::CiRun,
+        log_tail: Vec<String>,
+        log_entries: Vec<thegn_core::ci_log::CiLogEntry>,
+    ) {
         let now = thegn_core::util::now();
         let mut secs = vec![ci_header_section(run)];
         if run.jobs.is_empty() {
@@ -177,12 +187,34 @@ impl DetailOverlay {
                 }
             }
         }
-        if !log_tail.is_empty() {
+        if !log_tail.is_empty() || !log_entries.is_empty() {
             secs.push(Section::Heading {
                 label: "log tail".into(),
-                note: None,
+                note: Some(
+                    if log_entries.iter().any(|entry| {
+                        !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty()
+                    }) {
+                        format!("{} · f authorize fix", log_metadata(&log_entries))
+                    } else {
+                        log_metadata(&log_entries)
+                    },
+                ),
             });
-            let rows: Vec<Vec<Cell>> = log_tail
+            let lines: Vec<String> = if log_entries.is_empty() {
+                log_tail
+            } else {
+                log_entries
+                    .iter()
+                    .flat_map(|entry| {
+                        let hline = crate::caps::active_glyphs().box_h;
+                        let heading = format!("{hline}{hline} {} {hline}{hline}", entry.job_name);
+                        std::iter::once(heading)
+                            .chain(entry.text.lines().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            let rows: Vec<Vec<Cell>> = lines
                 .iter()
                 .map(|line| {
                     let tone = if thegn_core::ci::line_is_failure(line) {
@@ -208,9 +240,45 @@ impl DetailOverlay {
             self.scroll = 0;
         }
         self.pending_ci = None;
+        // A single `f` action authorizes the first available failed-job entry;
+        // its complete candidate identity is carried into the blocking worker.
+        // Entries without text or a head SHA fail closed and never become UI
+        // actions.
+        self.ci_autofix = log_entries
+            .iter()
+            .find(|entry| !entry.text.trim().is_empty() && !entry.head_sha.trim().is_empty())
+            .map(|entry| super::DetailAction::CiAutofix {
+                candidate: entry.candidate(),
+            });
         // Keep re-polling until the run settles (live drill updates).
         self.live_ci = (!run.state.is_terminal()).then(|| run.clone());
     }
+}
+
+fn log_metadata(entries: &[thegn_core::ci_log::CiLogEntry]) -> String {
+    let truncated = entries.iter().filter(|e| e.truncated).count();
+    let redacted = entries.iter().filter(|e| e.redacted).count();
+    let source = if entries.is_empty() {
+        "fallback"
+    } else {
+        "cached"
+    };
+    let mut note = source.to_string();
+    if truncated > 0 {
+        note.push_str(" · tail/truncated");
+    }
+    if redacted > 0 || !entries.is_empty() {
+        note.push_str(" · redacted");
+    }
+    note
+}
+
+/// Build an in-place CI detail overlay for a panel row.  The initial header is
+/// painted immediately; the caller starts the blocking fill afterwards.
+pub(crate) fn overlay_for_run(run: &thegn_core::ci::CiRun) -> DetailOverlay {
+    let mut overlay = super::list("CI run", Vec::new(), "fetching jobs…", 76, 12);
+    overlay.enter_ci_view(run);
+    overlay
 }
 
 /// Deliver an async CI-drill result into the live overlay, iff it's still the
@@ -222,7 +290,7 @@ pub fn apply_ci_detail(slot: &mut Option<DetailOverlay>, payload: CiDetailPayloa
     if let Some(ov) = slot.as_mut()
         && ov.pending_ci.as_deref() == Some(payload.run.id.as_str())
     {
-        ov.set_ci_detail(&payload.run, payload.log_tail);
+        ov.set_ci_detail(&payload.run, payload.log_tail, payload.log_entries);
         return true;
     }
     false
@@ -309,6 +377,7 @@ mod tests {
                     ..run.clone()
                 },
                 log_tail: vec![],
+                log_entries: vec![],
             },
         );
         assert_eq!(
@@ -319,6 +388,7 @@ mod tests {
 
         // The matching async detail fills the same overlay in place.
         let filled = CiRun {
+            sha: "abc123".into(),
             jobs: vec![CiJob {
                 id: "j1".into(),
                 name: "build".into(),
@@ -337,15 +407,37 @@ mod tests {
             CiDetailPayload {
                 run: filled,
                 log_tail: vec!["error: boom".into()],
+                log_entries: vec![thegn_core::ci_log::CiLogEntry {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    job_name: "build".into(),
+                    text: "error: boom\n".into(),
+                    truncated: false,
+                    redacted: true,
+                    fetched_at: 7,
+                    head_sha: "abc123".into(),
+                }],
             },
         );
-        let ov = slot.expect("overlay retained after fill");
+        let mut ov = slot.expect("overlay retained after fill");
         let DetailContent::Sections(d) = &ov.content else {
             panic!("expected sections after fill");
         };
         // header + "jobs" + build heading + steps table + "log tail" + log table.
         assert!(d.sections.len() >= 5, "sparse fill: {}", d.sections.len());
         assert_eq!(ov.pending_ci, None, "pending cleared after fill");
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::CiAutofix {
+                candidate: thegn_core::ci_log::CiLogCandidate {
+                    worktree: "/wt/repo".into(),
+                    run_id: "42".into(),
+                    job_id: "j1".into(),
+                    head_sha: "abc123".into(),
+                },
+            })
+        );
     }
 
     #[test]
@@ -375,20 +467,20 @@ mod tests {
         // While the first fetch is in flight, no repoll piles on.
         assert!(ov.live_ci_repoll().is_none());
         // A fill that's still running arms the live repoll…
-        ov.set_ci_detail(&running, vec![]);
+        ov.set_ci_detail(&running, vec![], vec![]);
         ov.scroll = 3;
         let again = ov.live_ci_repoll().expect("running run repolls");
         assert_eq!(again.id, "7");
         assert_eq!(ov.pending_ci.as_deref(), Some("7"), "pending re-armed");
         // …a live re-fill of the same run preserves the scroll position…
-        ov.set_ci_detail(&running, vec![]);
+        ov.set_ci_detail(&running, vec![], vec![]);
         assert_eq!(ov.scroll, 3);
         // …and a terminal fill stops the polling.
         let done = CiRun {
             state: CiState::Pass,
             ..running
         };
-        ov.set_ci_detail(&done, vec![]);
+        ov.set_ci_detail(&done, vec![], vec![]);
         assert!(
             ov.live_ci_repoll().is_none(),
             "terminal run stops repolling"

@@ -5,6 +5,41 @@
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::panel::media::{MediaQueueDelivery, MediaRequest, MediaSourcesDelivery};
+
+async fn snapshot_or_log(
+    client: &thegn_media::MediaClient,
+    operation: &'static str,
+) -> Option<thegn_core::media::MediaSnapshot> {
+    match client.snapshot_with_caps().await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::debug!(target: "thegn::media", error = %e, operation, "media snapshot failed after operation");
+            None
+        }
+    }
+}
+
+/// Identifies one live media watcher/config/player selection. Snapshot
+/// producers capture the value before doing any async work so a result from an
+/// operation that began before a restart can never replace the new selection.
+#[derive(Clone, Debug)]
+pub(crate) struct MediaGeneration(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl MediaGeneration {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    pub(crate) fn current(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance(&self) -> u64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+    }
+}
+
 /// A media transport op dispatched from a keybind / palette row / panel control.
 #[derive(Debug, Clone)]
 pub(crate) enum MediaOp {
@@ -19,36 +54,11 @@ pub(crate) enum MediaOp {
     /// (audio vs video) and `[media] seek_step*`.
     SeekForward,
     SeekBack,
-    /// Jump to an absolute position (scrubber release).
-    SetPosition(std::time::Duration),
-    /// Set an absolute volume percent (volume slider).
-    SetVolume(u8),
     /// Jump to a queue entry by its opaque id.
     PlayQueueItem(String),
     ChapterNext,
     ChapterPrev,
     FullscreenToggle,
-}
-
-impl From<crate::media_overlay::OverlayOp> for MediaOp {
-    fn from(op: crate::media_overlay::OverlayOp) -> MediaOp {
-        use crate::media_overlay::OverlayOp;
-        match op {
-            OverlayOp::PlayPause => MediaOp::PlayPause,
-            OverlayOp::Next => MediaOp::Next,
-            OverlayOp::Previous => MediaOp::Previous,
-            OverlayOp::SeekForward => MediaOp::SeekForward,
-            OverlayOp::SeekBack => MediaOp::SeekBack,
-            OverlayOp::SetPosition(p) => MediaOp::SetPosition(p),
-            OverlayOp::Shuffle => MediaOp::ShuffleToggle,
-            OverlayOp::Loop => MediaOp::LoopCycle,
-            OverlayOp::SetVolume(v) => MediaOp::SetVolume(v),
-            OverlayOp::ChapterNext => MediaOp::ChapterNext,
-            OverlayOp::ChapterPrev => MediaOp::ChapterPrev,
-            OverlayOp::Fullscreen => MediaOp::FullscreenToggle,
-            OverlayOp::PlayQueue(id) => MediaOp::PlayQueueItem(id),
-        }
-    }
 }
 
 /// An async result that opens a secondary media picker palette.
@@ -77,12 +87,13 @@ pub(crate) fn media_effective_cfg(
 /// media is disabled.
 fn spawn_media_watch(
     cfg: thegn_core::config::MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaState>>,
+    generation: u64,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Body lives in `media_watch`; it resolves the backend, streams snapshots,
     // self-heals, and respawns on stream end.
-    crate::media_watch::spawn(cfg, tx, waker)
+    crate::media_watch::spawn(cfg, generation, tx, waker)
 }
 
 /// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
@@ -90,9 +101,11 @@ fn spawn_media_watch(
 pub(crate) fn restart_media_watch(
     handle: &mut Option<tokio::task::JoinHandle<()>>,
     cfg: thegn_core::config::MediaConfig,
-    tx: &tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaState>>,
+    generation: &MediaGeneration,
+    tx: &tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: &TerminalWaker,
 ) {
+    let generation_value = generation.advance();
     if let Some(h) = handle.take() {
         h.abort();
     }
@@ -101,12 +114,18 @@ pub(crate) fn restart_media_watch(
         // push it here, or the last ▶ badge / Media section stick for the rest
         // of the session after `[media] enabled = false` (and activating the
         // badge opened a popup for a stale track).
-        if tx.send(None).is_ok() {
+        if tx
+            .send(crate::media_watch::MediaSnapshotDelivery {
+                generation: generation_value,
+                snapshot: None,
+            })
+            .is_ok()
+        {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
         return;
     }
-    *handle = spawn_media_watch(cfg, tx.clone(), waker.clone());
+    *handle = spawn_media_watch(cfg, generation_value, tx.clone(), waker.clone());
 }
 
 /// Fire a transport op off-thread, then push the resulting snapshot so the badge/
@@ -114,26 +133,28 @@ pub(crate) fn restart_media_watch(
 pub(crate) fn spawn_media_op(
     cfg: thegn_core::config::MediaConfig,
     op: MediaOp,
-    tx: tokio_mpsc::UnboundedSender<Option<thegn_core::media::MediaState>>,
+    generation: &MediaGeneration,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
     waker: TerminalWaker,
 ) {
     use thegn_core::media::LoopMode;
+    let generation = generation.current();
     tokio::spawn(async move {
         let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
-        let cur = client.snapshot().await.unwrap_or(None);
+        let cur = snapshot_or_log(&client, "preflight").await;
+        let cur_state = cur.as_ref().map(|snapshot| &snapshot.state);
         let res = match op {
             MediaOp::PlayPause => client.play_pause().await,
             MediaOp::Next => client.next().await,
             MediaOp::Previous => client.previous().await,
             MediaOp::ShuffleToggle => {
-                let on = cur.as_ref().and_then(|s| s.shuffle).unwrap_or(false);
+                let on = cur_state.and_then(|s| s.shuffle).unwrap_or(false);
                 client.set_shuffle(!on).await
             }
             MediaOp::LoopCycle => {
-                let next = cur
-                    .as_ref()
+                let next = cur_state
                     .and_then(|s| s.loop_mode)
                     .unwrap_or(LoopMode::None)
                     .cycle();
@@ -142,15 +163,10 @@ pub(crate) fn spawn_media_op(
             MediaOp::VolumeUp => client.volume_step(cfg.volume_step).await,
             MediaOp::VolumeDown => client.volume_step(-cfg.volume_step).await,
             MediaOp::SeekForward | MediaOp::SeekBack => {
-                let kind = cur.as_ref().map(|s| s.kind).unwrap_or_default();
+                let kind = cur_state.map(|s| s.kind).unwrap_or_default();
                 let step = cfg.seek_step(kind);
                 client.seek(step, matches!(op, MediaOp::SeekForward)).await
             }
-            MediaOp::SetPosition(pos) => {
-                let tid = cur.as_ref().and_then(|s| s.track_id.clone());
-                client.set_position(pos, tid.as_deref()).await
-            }
-            MediaOp::SetVolume(level) => client.set_volume(level).await,
             MediaOp::PlayQueueItem(ref id) => client.play_queue_item(id).await,
             MediaOp::ChapterNext => client.chapter_next().await,
             MediaOp::ChapterPrev => client.chapter_prev().await,
@@ -159,8 +175,61 @@ pub(crate) fn spawn_media_op(
         if let Err(e) = res {
             tracing::warn!(target: "thegn::media", error = %e, "media op {op:?} failed");
         }
-        let _ = tx.send(client.snapshot().await.unwrap_or(None)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
+            generation,
+            snapshot: snapshot_or_log(&client, "transport").await,
+        }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    });
+}
+
+/// Map a panel hit to the same off-loop operation used by keyboard actions.
+/// Keeping this conversion here means the panel never learns provider details.
+pub(crate) fn spawn_media_action(
+    cfg: thegn_core::config::MediaConfig,
+    action: crate::panel::MediaAction,
+    generation: &MediaGeneration,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    waker: TerminalWaker,
+) {
+    let op = match action {
+        crate::panel::MediaAction::PlayPause => MediaOp::PlayPause,
+        crate::panel::MediaAction::Next => MediaOp::Next,
+        crate::panel::MediaAction::Previous => MediaOp::Previous,
+        crate::panel::MediaAction::Shuffle => MediaOp::ShuffleToggle,
+        crate::panel::MediaAction::Loop => MediaOp::LoopCycle,
+        crate::panel::MediaAction::VolumeUp => MediaOp::VolumeUp,
+        crate::panel::MediaAction::VolumeDown => MediaOp::VolumeDown,
+        crate::panel::MediaAction::SeekForward => MediaOp::SeekForward,
+        crate::panel::MediaAction::SeekBack => MediaOp::SeekBack,
+        crate::panel::MediaAction::ChapterNext => MediaOp::ChapterNext,
+        crate::panel::MediaAction::ChapterPrev => MediaOp::ChapterPrev,
+        crate::panel::MediaAction::Fullscreen => MediaOp::FullscreenToggle,
+    };
+    spawn_media_op(cfg, op, generation, tx, waker);
+}
+
+/// Activate a playlist off-loop and publish its result under the generation
+/// that was current when the request was made.
+pub(crate) fn spawn_media_playlist(
+    cfg: thegn_core::config::MediaConfig,
+    id: String,
+    generation: &MediaGeneration,
+    tx: tokio_mpsc::UnboundedSender<crate::media_watch::MediaSnapshotDelivery>,
+    waker: TerminalWaker,
+) {
+    let generation = generation.current();
+    tokio::spawn(async move {
+        if let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await {
+            if let Err(e) = client.activate_playlist(&id).await {
+                tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+            }
+            let _ = tx.send(crate::media_watch::MediaSnapshotDelivery {
+                generation,
+                snapshot: snapshot_or_log(&client, "playlist").await,
+            }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+        }
     });
 }
 
@@ -185,45 +254,44 @@ pub(crate) fn spawn_media_pick(
     });
 }
 
-/// Open the Now-Playing overlay and eagerly kick its up-next queue and cover-art
-/// fetches — shared by the `MediaOpenPanel` action (Alt+m) and media-badge
-/// activation (statusbar click / Enter), so the badge opens the full transport
-/// surface, not just the one-line detail popup.
-pub(crate) fn open_media_overlay(
-    snapshot: Option<thegn_core::media::MediaState>,
-    base_cfg: &thegn_core::config::MediaConfig,
-    player_override: &Option<String>,
-    queue_tx: &tokio_mpsc::UnboundedSender<Vec<thegn_core::media::QueueItem>>,
-    art_tx: &tokio_mpsc::UnboundedSender<crate::media_art::ArtMosaic>,
-    waker: &TerminalWaker,
-) -> crate::media_overlay::MediaOverlay {
-    let ov = crate::media_overlay::MediaOverlay::open(snapshot);
-    let cfg = media_effective_cfg(base_cfg, player_override);
-    spawn_media_queue(cfg, queue_tx.clone(), waker.clone());
-    if let Some(url) = ov.wants_art(base_cfg.show_art) {
-        crate::media_art::spawn_fetch(
-            url,
-            crate::media_overlay::ART_COLS,
-            crate::media_overlay::ART_ROWS,
-            art_tx.clone(),
-            waker.clone(),
-        );
-    }
-    ov
-}
-
-/// Fetch the play queue / up-next list off-thread for the Now-Playing overlay.
+/// Fetch the play queue / up-next list off-thread for the docked Media panel.
 pub(crate) fn spawn_media_queue(
     cfg: thegn_core::config::MediaConfig,
-    tx: tokio_mpsc::UnboundedSender<Vec<thegn_core::media::QueueItem>>,
+    request: MediaRequest,
+    tx: tokio_mpsc::UnboundedSender<MediaQueueDelivery>,
     waker: TerminalWaker,
 ) {
     tokio::spawn(async move {
         let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
-        let q = client.queue().await.unwrap_or_default();
-        let _ = tx.send(q); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let q = match client.queue().await {
+            Ok(queue) => queue,
+            Err(e) => {
+                tracing::debug!(target: "thegn::media", error = %e, "media queue fetch failed");
+                Vec::new()
+            }
+        };
+        let _ = tx.send(MediaQueueDelivery { request, queue: q }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+    });
+}
+
+/// Fetch the provider's source/player list off-loop for the docked panel.
+/// Request tagging lets the panel reject a response from an obsolete source
+/// selection or snapshot generation.
+pub(crate) fn spawn_media_sources(
+    cfg: thegn_core::config::MediaConfig,
+    request: MediaRequest,
+    tx: tokio_mpsc::UnboundedSender<MediaSourcesDelivery>,
+    waker: TerminalWaker,
+) {
+    tokio::spawn(async move {
+        let Some(client) = thegn_media::client_for(&cfg.resolve_opts()).await else {
+            return;
+        };
+        let sources = client.players().await;
+        let _ = tx.send(MediaSourcesDelivery { request, sources });
+        let _ = waker.wake();
     });
 }

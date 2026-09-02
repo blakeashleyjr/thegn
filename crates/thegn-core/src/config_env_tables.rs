@@ -359,10 +359,7 @@ impl EnvProviderConfig {
             return self.exec_command.clone();
         }
         if vps_provider_kind(&self.provider) {
-            let exe = std::env::current_exe()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "thegn".to_string());
+            let exe = crate::util::self_exe_str();
             return vec![exe, "vps-ssh".into(), "{id}".into(), "--".into()];
         }
         if self.provider.trim() == "machine0" {
@@ -370,10 +367,7 @@ impl EnvProviderConfig {
             // plane) — the same self-bridge role `vps-ssh` plays, but IP + ssh
             // user are resolved via the machine0 provider (`vm_get`), not the VPS
             // registry API. Panes AND chrome reads run through it.
-            let exe = std::env::current_exe()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "thegn".to_string());
+            let exe = crate::util::self_exe_str();
             return vec![exe, "machine0-ssh".into(), "{id}".into(), "--".into()];
         }
         if wss_native_provider_kind(&self.provider) {
@@ -387,10 +381,7 @@ impl EnvProviderConfig {
             // an empty prefix, `GitLoc::from_db` fell back to Local, and every
             // read ran `git -C /workspace` on the HOST (no such dir) → blank
             // branch / ahead-behind / a stale panel.
-            let exe = std::env::current_exe()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "thegn".to_string());
+            let exe = crate::util::self_exe_str();
             return vec![exe, "sprite-exec".into(), "{id}".into(), "--".into()];
         }
         Vec::new()

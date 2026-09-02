@@ -64,8 +64,8 @@ an under-scoped request is rejected **before any action runs** (403 /
 | `POST /v1/sessions/{s}/detach`                                                        | write      | `{client_id}`; last client out opens a relay lease                                                                  |
 | `GET /v1/sessions/{s}/attach`                                                         | write      | WS upgrade (`?client_id&rows&cols&observer`); binary `EventFrame`s down, raw-binary stdin / JSON `{type:resize}` up |
 | `DELETE /v1/sessions/{s}`                                                             | write      | kill the PTY                                                                                                        |
-| `GET /v1/events`                                                                      | read       | WS: the broadcast feed (activity/lease/pairing/session-list)                                                        |
-| `GET /v1/events/sse`                                                                  | read       | same feed, JSON envelopes                                                                                           |
+| `GET /v1/events`                                                                      | read       | WS: the broadcast feed; optional `kinds=activity,exit&session=<id>&signal_lag=1` narrowing                          |
+| `GET /v1/events/sse`                                                                  | read       | same filtered feed, JSON envelopes with SSE `event:` kind                                                           |
 | `GET /v1/leases`                                                                      | read       | relay leases (detached sessions kept warm)                                                                          |
 | `GET /v1/worktrees`                                                                   | read       | worktrees registered with thegn: `{path, branch, repo_root, location, created_at}`                                  |
 | `POST /v1/worktrees/open`                                                             | write      | `{repo, branch?}` → the running compositor's intent mailbox                                                         |
@@ -85,7 +85,18 @@ WS binary messages carry `thegn_core::control_wire::EventFrame`
 (`[tag:u8][len:u32 BE][payload]`, 1 MiB cap): `Hello` (proto version, server,
 your scopes), `PaneSnapshot` (ANSI repaint at `seq`), `PaneDelta` (raw PTY
 bytes, `seq`), `Activity` (JSON), `Lease` (opened/refreshed/released/reaped),
-`Pairing` (requested/approved/revoked), `Sessions` (re-list), `SessionExit`.
+`Pairing` (requested/approved/revoked), `Sessions` (re-list), `SessionExit`,
+and opt-in `Lagged { missed }`.
+
+Event subscriptions accept the same bounded `kinds` vocabulary (`hello`,
+`snapshot`, `delta`, `activity`, `lease`, `pairing`, `sessions`, `exit`,
+`lagged`) and an optional session id. Filters are applied independently after
+the shared broadcast and can only narrow the read-scoped feed; omitted filters
+retain the legacy full feed. Unknown or empty kinds and overlong session ids
+are rejected as `bad_request` (or gRPC `invalid_argument`). A connection that
+sets `signal_lag=1` receives a `Lagged` marker with the count skipped and then
+continues; connections that omit it retain the legacy silent skip. These are
+additive v1 fields and do not change `PROTO_VERSION`.
 
 Warm-attach contract: the snapshot at `seq` folds all output through `seq`;
 the first live delta carries `seq + 1` — no gap, no overlap. A slow consumer
@@ -113,3 +124,13 @@ reflects the presented token. Push: reserved (`/v1/push/register`), not in v1.
 The scope-enforcement guarantees are pinned by
 `crates/thegn-svc/src/control/tests.rs` (router-level, with a recording
 fake proving rejected requests perform zero actions).
+
+## Error responses
+
+HTTP errors use the additive envelope `{ "error": "<message>", "code":
+"<code>" }`. The `error` message and HTTP status retain their existing
+behavior; `code` is a stable identifier from the closed vocabulary
+`not_found`, `no_scope`, `conflict`, `unimplemented`, `internal`,
+`unauthorized`, or `bad_request`. Clients should branch on `code` rather than
+human-readable prose. Older servers that omit `code` remain readable by
+clients, which treat it as absent.
