@@ -676,6 +676,7 @@ fn sidebar_worktree_row_shows_diff_stat_pr_chip_and_focus_detail() {
         add: 42,
         del: 7,
         branch_diff: Some((310, 84)),
+        submodule_dirty: false,
         jj: false,
     });
     wt.pr_number = Some(123);

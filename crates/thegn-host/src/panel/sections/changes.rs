@@ -305,6 +305,9 @@ fn impact_counts_segs(
 }
 
 fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> PanelRow {
+    if let Some(submodule) = &c.submodule {
+        return submodule_change_row(c, submodule, i, on, cols);
+    }
     let (glyph, glyph_tok) = match c.stage {
         Stage::Staged => ("●", hue(Hue::Green)),
         Stage::Conflict => ("!", hue(Hue::Red)),
@@ -354,6 +357,90 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
         row = row.with_bg(crate::seg::Tok::SelAccent);
     }
     row
+}
+
+/// An atomic gitlink row: pointer IDs and relationship replace text diffstat.
+/// Every glyph comes from the active capability set, including the ASCII
+/// fallback, and the core row policy owns abbreviation/state wording.
+fn submodule_change_row(
+    c: &ChangeRow,
+    submodule: &crate::panel::SubmoduleChange,
+    i: usize,
+    on: bool,
+    cols: usize,
+) -> PanelRow {
+    let gl = crate::caps::active_glyphs();
+    let policy = thegn_core::submodule::SubmoduleRowPolicy::pointer(
+        &submodule.diff,
+        submodule.state.as_ref(),
+        submodule.summary.as_ref(),
+    );
+    let label = if let Some(summary) = submodule.summary.as_ref()
+        && !summary.unavailable
+        && !summary.commits.is_empty()
+    {
+        format!(
+            "{} · {} commit{}{}",
+            policy.label,
+            summary.commits.len(),
+            if summary.commits.len() == 1 { "" } else { "s" },
+            if summary.truncated { "+" } else { "" }
+        )
+    } else {
+        policy.label
+    };
+    let right = vec![
+        seg(g2(), policy.old_sha),
+        sp(1),
+        seg(g2(), gl.arrow_right),
+        sp(1),
+        seg(g(), policy.new_sha),
+        sp(1),
+        seg(state_tok(c, submodule), format!("({label})")),
+    ];
+    let prefix_w = 4 + seg_width(&right) + 5;
+    let path_budget = cols.saturating_sub(prefix_w);
+    let dir_display = clip_dir_left(&c.dir, UnicodeWidthStr::width(c.name.as_str()), path_budget);
+    let name = if on {
+        seg(t(), c.name.clone()).bold()
+    } else {
+        seg(d(), c.name.clone())
+    };
+    let left = vec![
+        seg(hue(Hue::Purple), gl.submodule),
+        sp(1),
+        seg(state_tok(c, submodule), format!("{:<2}", c.status)).bold(),
+        seg(f(), dir_display),
+        name,
+    ];
+    let mut row =
+        PanelRow::plain(Line::split(left, right)).with_hit(PanelHit::Row(Section::Changes, i));
+    if on {
+        row = row.with_bg(crate::seg::Tok::SelAccent);
+    }
+    row
+}
+
+fn state_tok(c: &ChangeRow, submodule: &crate::panel::SubmoduleChange) -> crate::seg::Tok {
+    if c.stage == Stage::Conflict
+        || submodule.state.as_ref().is_some_and(|state| {
+            matches!(
+                state.pointer,
+                thegn_core::submodule::SubmodulePointer::Conflict
+                    | thegn_core::submodule::SubmodulePointer::Diverged
+            )
+        })
+    {
+        hue(Hue::Red)
+    } else if submodule
+        .state
+        .as_ref()
+        .is_some_and(|state| state.dirty || state.untracked || !state.initialized)
+    {
+        hue(Hue::Amber)
+    } else {
+        g()
+    }
 }
 
 /// The `◇ N incoming from <onto>` divider between the user's local edits and the
@@ -438,6 +525,17 @@ fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
 /// The inline hunk preview under a highlighted change row. The Half view
 /// shows more hunks and more lines per hunk.
 fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<PanelRow> {
+    if let Some(submodule) = &c.submodule {
+        let gl = crate::caps::active_glyphs();
+        let preview = thegn_core::submodule::SubmoduleRowPolicy::format_preview(
+            gl.submodule,
+            gl.arrow_right,
+            &submodule.diff,
+            submodule.state.as_ref(),
+            submodule.summary.as_ref(),
+        );
+        return vec![PanelRow::plain(Line::segs(vec![sp(1), seg(g(), preview)]))];
+    }
     let (hunk_cap, line_cap) = if deep { (3, 12) } else { (2, 6) };
     let mut rows = Vec::new();
     if c.stage == Stage::Untracked {
@@ -637,6 +735,7 @@ mod tests {
             path: "crates/thegn-host/src/changes.rs".into(),
             added: 3,
             deleted: 1,
+            submodule: None,
             incoming: false,
         };
         for on in [false, true] {
@@ -675,6 +774,7 @@ mod tests {
                 path: "src/a.rs".into(),
                 added: 30,
                 deleted: 10,
+                submodule: None,
                 incoming: false,
             }],
             entities: Some(EntitySummary::new(vec![(
@@ -757,6 +857,7 @@ mod tests {
             path: path.into(),
             added,
             deleted: 0,
+            submodule: None,
             incoming,
         }
     }
@@ -841,6 +942,88 @@ mod tests {
             !out.contains("e expand"),
             "no collapse hint when open: {out}"
         );
+    }
+
+    #[test]
+    fn submodule_row_and_preview_replace_zero_diffstat_with_pointer_summary() {
+        use thegn_core::submodule::{
+            SubmoduleDiff, SubmoduleDiffKind, SubmoduleDirection, SubmodulePointer, SubmoduleState,
+            SubmoduleSummary,
+        };
+        let mut row = chg("vendor/lib", false, 0);
+        row.submodule = Some(crate::panel::SubmoduleChange {
+            diff: SubmoduleDiff {
+                path: row.path.clone(),
+                old_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                new_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                kind: SubmoduleDiffKind::Changed,
+            },
+            state: Some(SubmoduleState {
+                path: row.path.clone(),
+                recorded_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                checked_out_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                initialized: true,
+                dirty: false,
+                untracked: false,
+                pointer: SubmodulePointer::Moved,
+            }),
+            summary: Some(SubmoduleSummary::bounded(
+                SubmoduleDirection::Forward,
+                vec!["one".into(), "two".into(), "three".into()],
+                8,
+                false,
+            )),
+        });
+        let data = crate::panel::PanelData {
+            changes: vec![row.clone()],
+            ..Default::default()
+        };
+        let model = crate::chrome::FrameModel {
+            panel: data,
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            open: Section::Changes,
+            chg_sel: Some(0),
+            ..Default::default()
+        };
+        let out = flat(&content(&SectionCtx {
+            model: &model,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        }));
+        assert!(out.contains("vendor/lib"), "{out}");
+        assert!(out.contains("aaaaaaa") && out.contains("bbbbbbb"), "{out}");
+        assert!(
+            out.contains("forward") && out.contains("3 commits"),
+            "{out}"
+        );
+        assert!(!out.contains("+0") && !out.contains("-0"), "{out}");
+
+        let submodule = row.submodule.as_mut().unwrap();
+        submodule.state.as_mut().unwrap().dirty = true;
+        submodule.summary = Some(SubmoduleSummary::bounded(
+            SubmoduleDirection::Unknown,
+            Vec::new(),
+            8,
+            true,
+        ));
+        let degraded = crate::chrome::FrameModel {
+            panel: crate::panel::PanelData {
+                changes: vec![row],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = flat(&content(&SectionCtx {
+            model: &degraded,
+            ui: &ui,
+            cols: 100,
+            rows: 30,
+        }));
+        assert!(out.contains("dirty"), "{out}");
+        assert!(out.contains("commit range unavailable locally"), "{out}");
     }
 
     #[test]

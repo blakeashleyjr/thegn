@@ -940,9 +940,11 @@ mod tests {
         // 97 → 98 (THE-60): `[toolchain.mise] inject` (MiseInject). Both
         // branches independently claimed the 96 → 97 slot; merged, each enum is
         // still present, so the ledger records them in turn.
+        // 98 → 99 (THE-32): `[git] submodules` (SubmoduleMode) — lifecycle
+        // initialization policy, trusted config only.
         assert_eq!(
             defs.len(),
-            98,
+            99,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

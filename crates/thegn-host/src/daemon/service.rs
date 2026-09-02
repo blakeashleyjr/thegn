@@ -1811,6 +1811,9 @@ impl ControlApi for DaemonService {
                         e.branch_created,
                     ))
                 })?;
+                if let Err(e) = crate::git_worktree::initialize(&cfg, &root, &path, None) {
+                    tracing::warn!(target: "thegn::worktree_create", error = %e, "submodule initialization failed");
+                }
 
                 let wt_str = path.to_string_lossy().into_owned();
                 let tab = repo::branch_tab(&slug, &branch);

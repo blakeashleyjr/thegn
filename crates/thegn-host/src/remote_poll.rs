@@ -707,7 +707,17 @@ mod tests {
         crate::hydrate::glyph_cache().lock().unwrap().insert(
             wt.clone(),
             (
-                (false, 0, 0, None, String::new(), 0, 0, None),
+                crate::glyph_types::GlyphRow {
+                    dirty: false,
+                    ahead: 0,
+                    behind: 0,
+                    branch: None,
+                    repo_root: String::new(),
+                    add: 0,
+                    del: 0,
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
                 std::time::Instant::now(),
             ),
         );

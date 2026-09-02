@@ -908,6 +908,7 @@ mod spec {
             path: "src/lib.rs".into(),
             added: 10,
             deleted: 2,
+            submodule: None,
             incoming: false,
         }];
         m.panel.ci_runs = vec![thegn_core::ci::CiRun {

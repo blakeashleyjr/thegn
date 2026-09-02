@@ -126,6 +126,20 @@ pub trait PlumbingOps: GitBackend {
         parse_merge_tree(code, &stdout, &stderr)
     }
 
+    /// Resolve the gitlink-specific metadata for paths returned by a
+    /// conflicted merge-tree result. Keeping this forwarding seam here lets
+    /// the fold host enrich a conflict without teaching core how to run git.
+    fn submodule_conflicts_for_paths(
+        &self,
+        loc: &GitLoc,
+        paths: &[String],
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<Vec<thegn_core::submodule::SubmoduleConflict>> {
+        GitBackend::submodule_conflicts(self, loc, paths, base, ours, theirs)
+    }
+
     /// Create a commit object from an existing tree (`git commit-tree`). The
     /// message rides stdin to dodge arg-length/quoting limits. Unsigned, ambient
     /// author — the historical default; `merge`/`squash`/`rebase` land through

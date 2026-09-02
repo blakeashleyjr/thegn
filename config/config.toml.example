@@ -150,6 +150,7 @@ sidebar_show_diff_stat = true
 sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
 sidebar_show_jj = true   # jujutsu-colocation marker (ĵ) when a repo has .jj/ beside .git/
+sidebar_show_submodules = true  # separate marker for dirty/moved submodule pointers
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
 # the highlighted row; "off" never shows it. "all" doubles the height of every
@@ -750,6 +751,8 @@ pr_interval_secs = 20  # PR refresh cadence (THEGN_WATCH_PR_INTERVAL)
 [git]
 backend = "auto"       # read engine: auto (gix-native, CLI fallback) | gix | cli
                        # (every read via the git binary). Writes are always CLI.
+submodules = "auto"    # initialize recursively only when .gitmodules exists;
+                       # off disables lifecycle work and recursive state reads
 override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
                        # -c tag.gpgSign=false, so a gpg passphrase prompt can
                        # never hang a background operation

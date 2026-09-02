@@ -77,6 +77,8 @@ pub(crate) struct ChangesActivateCtx<'a> {
     pub cfg: &'a thegn_core::config::Config,
     pub hunk_inflight: &'a mut std::collections::HashSet<String>,
     pub hunk_tx: &'a tokio::sync::mpsc::UnboundedSender<(u64, String, Vec<thegn_svc::git::Hunk>)>,
+    pub submodule_inflight: &'a mut std::collections::HashSet<String>,
+    pub submodule_tx: &'a tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
     pub waker: &'a termwiz::terminal::TerminalWaker,
     pub hydration_gen: u64,
 }
@@ -100,7 +102,7 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
             .panel
             .changes
             .get(cursor)
-            .is_some_and(|c| c.stage == crate::panel::Stage::Conflict);
+            .is_some_and(|c| c.stage == crate::panel::Stage::Conflict && c.submodule.is_none());
     if is_conflict {
         if let Some(path) = ctx.model.panel.changes.get(cursor).map(|c| c.path.clone()) {
             let cwd = crate::run::active_cwd(ctx.session);
@@ -149,6 +151,8 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
         ctx.session,
         ctx.hunk_inflight,
         ctx.hunk_tx,
+        ctx.submodule_inflight,
+        ctx.submodule_tx,
         ctx.waker,
         ctx.hydration_gen,
     );
@@ -180,6 +184,8 @@ pub(crate) fn toggle_change_selection(
     session: &crate::session::Session,
     hunk_inflight: &mut std::collections::HashSet<String>,
     hunk_tx: &tokio::sync::mpsc::UnboundedSender<(u64, String, Vec<thegn_svc::git::Hunk>)>,
+    submodule_inflight: &mut std::collections::HashSet<String>,
+    submodule_tx: &tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
     waker: &termwiz::terminal::TerminalWaker,
     generation: u64,
 ) {
@@ -197,6 +203,22 @@ pub(crate) fn toggle_change_selection(
         return;
     }
     panel_ui.chg_sel = Some(i);
+    if let Some(row) = model
+        .panel
+        .changes
+        .get(i)
+        .filter(|row| row.submodule.is_some())
+    {
+        spawn_submodule_preview(
+            row,
+            session,
+            submodule_inflight,
+            submodule_tx,
+            waker,
+            generation,
+        );
+        return;
+    }
     // Untracked rows have no diff: the preview renders a static note.
     if let Some(row) = model
         .panel
@@ -213,5 +235,78 @@ pub(crate) fn toggle_change_selection(
             waker,
             generation,
         );
+    }
+}
+
+pub(crate) type SubmodulePreviewMsg = (u64, String, thegn_core::submodule::SubmoduleSummary);
+
+/// Fetch a bounded, local-object-only gitlink summary off the event loop.
+/// Failures become an explicit unavailable summary so the preview keeps the
+/// two pointer IDs and never spins or fetches indefinitely.
+fn spawn_submodule_preview(
+    row: &crate::panel::ChangeRow,
+    session: &crate::session::Session,
+    inflight: &mut std::collections::HashSet<String>,
+    tx: &tokio::sync::mpsc::UnboundedSender<SubmodulePreviewMsg>,
+    waker: &termwiz::terminal::TerminalWaker,
+    generation: u64,
+) {
+    const LIMIT: usize = 8;
+    let Some(submodule) = row
+        .submodule
+        .as_ref()
+        .filter(|submodule| submodule.summary.is_none())
+    else {
+        return;
+    };
+    if !inflight.insert(row.path.clone()) {
+        return;
+    }
+    let wt = crate::hydrate::active_tab_path(session);
+    let path = row.path.clone();
+    let old = submodule.diff.old_sha.clone();
+    let new = submodule.diff.new_sha.clone();
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::GitBackend;
+        let loc = submodule_loc(thegn_core::remote::GitLoc::for_worktree(&wt), &path);
+        let summary = thegn_svc::git::CliGit
+            .submodule_summary(&loc, &path, &old, &new, LIMIT)
+            .unwrap_or_else(|_| {
+                thegn_core::submodule::SubmoduleSummary::bounded(
+                    thegn_core::submodule::SubmoduleDirection::Unknown,
+                    Vec::new(),
+                    LIMIT,
+                    true,
+                )
+            });
+        if tx.send((generation, path, summary)).is_ok() && waker.wake().is_err() {
+            tracing::debug!("submodule preview wake dropped during shutdown");
+        }
+    });
+}
+
+/// Point the summary read at the nested repository. The backend keeps the
+/// path parameter for implementations that can use it directly; the CLI
+/// backend runs its bounded log in the supplied location.
+fn submodule_loc(
+    loc: thegn_core::remote::GitLoc,
+    submodule_path: &str,
+) -> thegn_core::remote::GitLoc {
+    use thegn_core::remote::GitLoc;
+    match loc {
+        GitLoc::Local(root) => GitLoc::Local(root.join(submodule_path)),
+        GitLoc::Remote { ssh, path } => GitLoc::Remote {
+            ssh,
+            path: format!("{}/{}", path.trim_end_matches('/'), submodule_path),
+        },
+        GitLoc::Provider {
+            control_prefix,
+            path,
+        } => GitLoc::Provider {
+            control_prefix,
+            path: format!("{}/{}", path.trim_end_matches('/'), submodule_path),
+        },
     }
 }

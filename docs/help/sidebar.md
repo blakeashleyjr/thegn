@@ -192,6 +192,13 @@ does not clear it. It only goes back to white when work genuinely resumes.
 Thresholds are tunable — see [[config-reference]] `[activity]`, and
 `[theme.colors]` for the three dot colours.
 
+Git state on the right keeps submodules separate from ordinary file dirtiness.
+The submodule marker means a gitlink is moved, dirty, untracked, conflicted,
+uninitialized, or otherwise unavailable; it does not turn on the ordinary
+dirty dot. Set `[ui] sidebar_show_submodules = false` to hide only this marker.
+The setting is trusted user/workspace configuration and cannot be supplied by
+repo-local `.thegn.toml`.
+
 ## Act
 
 - `d` / `Del` — close or delete… (deleting files from disk is always the

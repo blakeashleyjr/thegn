@@ -12,23 +12,23 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
-use crate::hydrate::GlyphRow;
+use crate::glyph_types::GlyphRow;
 use crate::sidebar::GitGlyphs;
 
-/// Map a cached `GlyphRow` `(dirty, ahead, behind, branch, repo_root, add, del,
-/// branch_diff)` to the renderable `GitGlyphs`.
+/// Map a cached named glyph row to the renderable `GitGlyphs`.
 pub(crate) fn glyphs_from_row(row: &GlyphRow) -> GitGlyphs {
     GitGlyphs {
-        dirty: row.0,
-        ahead: row.1,
-        behind: row.2,
-        add: row.5,
-        del: row.6,
-        branch_diff: row.7,
-        // Recompute jj colocation from the cached repo_root (row.4) — a cheap
+        dirty: row.dirty,
+        ahead: row.ahead,
+        behind: row.behind,
+        add: row.add,
+        del: row.del,
+        branch_diff: row.branch_diff,
+        submodule_dirty: row.submodule_dirty,
+        // Recompute jj colocation from the cached repo_root — a cheap
         // stat — so a cache-restored row keeps its jj marker without widening the
-        // persisted GlyphRow tuple.
-        jj: thegn_core::jj::is_colocated(std::path::Path::new(&row.4)),
+        // persisted GlyphRow record.
+        jj: thegn_core::jj::is_colocated(std::path::Path::new(&row.repo_root)),
     }
 }
 
@@ -52,7 +52,7 @@ pub(crate) fn seed_glyphs_from_cache(
             // scanned — the right fallback for a row whose live scan is gated
             // (suspended sandbox, other workspace), and still fresher than the
             // creation-time tab name.
-            if let Some(branch) = &row.3 {
+            if let Some(branch) = &row.branch {
                 branches.entry(p.clone()).or_insert_with(|| branch.clone());
             }
             git.insert(p, glyphs_from_row(row));
@@ -78,7 +78,17 @@ mod tests {
 
     fn row(dirty: bool, ahead: usize, behind: usize) -> (GlyphRow, Instant) {
         (
-            (dirty, ahead, behind, None, String::new(), 0, 0, None),
+            GlyphRow {
+                dirty,
+                ahead,
+                behind,
+                branch: None,
+                repo_root: String::new(),
+                add: 0,
+                del: 0,
+                branch_diff: None,
+                submodule_dirty: false,
+            },
             Instant::now(),
         )
     }
@@ -99,7 +109,17 @@ mod tests {
 
     #[test]
     fn glyphs_from_row_maps_diff_stats() {
-        let r: GlyphRow = (true, 0, 0, None, String::new(), 42, 7, Some((310, 84)));
+        let r = GlyphRow {
+            dirty: true,
+            ahead: 0,
+            behind: 0,
+            branch: None,
+            repo_root: String::new(),
+            add: 42,
+            del: 7,
+            branch_diff: Some((310, 84)),
+            submodule_dirty: false,
+        };
         assert_eq!(
             glyphs_from_row(&r),
             GitGlyphs {
@@ -171,16 +191,17 @@ mod tests {
         cache.insert(
             "/a".to_string(),
             (
-                (
-                    false,
-                    0,
-                    0,
-                    Some("tg/live".to_string()),
-                    String::new(),
-                    0,
-                    0,
-                    None,
-                ),
+                GlyphRow {
+                    dirty: false,
+                    ahead: 0,
+                    behind: 0,
+                    branch: Some("tg/live".to_string()),
+                    repo_root: String::new(),
+                    add: 0,
+                    del: 0,
+                    branch_diff: None,
+                    submodule_dirty: false,
+                },
                 Instant::now(),
             ),
         );

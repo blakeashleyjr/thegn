@@ -296,6 +296,9 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 thegn_core::msg::warn(&message);
                 return;
             }
+            if let Err(e) = crate::git_worktree::initialize(&cfg2, &root, &path, None) {
+                thegn_core::msg::warn(&e);
+            }
 
             let wt_str = path.to_string_lossy().into_owned();
 

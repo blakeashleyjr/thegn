@@ -2555,6 +2555,36 @@ pub(crate) fn spawn_hunk_fetch(
     });
 }
 
+type SubmoduleScanMsg = (
+    u64,
+    Option<Vec<thegn_core::submodule::SubmoduleDiff>>,
+    Option<Vec<thegn_core::submodule::SubmoduleState>>,
+);
+
+/// Enrich hydrated change rows with gitlink data without putting git reads on
+/// either hydration's ordinary-file path or the event loop. Each read remains
+/// independently degradable (`None` retains the last-known field).
+fn spawn_submodule_scan(
+    generation: u64,
+    session: &crate::session::Session,
+    tx: &tokio_mpsc::UnboundedSender<SubmoduleScanMsg>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::GitBackend;
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let git = thegn_svc::git::CliGit;
+        let diffs = git.submodule_diffs(&loc, "HEAD").ok();
+        let states = git.submodule_states(&loc).ok();
+        if tx.send((generation, diffs, states)).is_ok() {
+            let _ = waker.wake(); // best-effort: a closed terminal is already exiting
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The git mutation pipeline: every lazygit-style write flows through ONE
 // runner — `enqueue_git_op` rejects while one is in flight, runs the op on
@@ -3360,6 +3390,10 @@ fn handle_git_msg(
         GitMsg::Drill => match panel_ui.git.focus {
             GitView::Files => {
                 if let Some(row) = sel_change(panel_ui, model) {
+                    if row.submodule.is_some() {
+                        model.status = "submodule pointers are atomic".into();
+                        return GitAfter::None;
+                    }
                     // Conflict files: open in the editor so the user can
                     // resolve the markers, then stage the file normally.
                     if row.stage == crate::panel::Stage::Conflict {
@@ -3580,6 +3614,11 @@ fn handle_git_msg(
                         if let Some(s) = panel_ui.git.staging.as_mut() {
                             s.anchor = None;
                         }
+                        if let Err(reason) = crate::gitmut::validate_line_selection(&diff, &indices)
+                        {
+                            model.status = reason;
+                            return GitAfter::None;
+                        }
                         let target = match pane {
                             StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
                             StagePane::Staged => crate::gitmut::StageTarget::Staged,
@@ -3601,6 +3640,16 @@ fn handle_git_msg(
             GitView::PatchBuilding => {
                 // Pure: toggle marks for the selected range.
                 let sel = panel_ui.git.staging.as_ref().map(|s| s.selection());
+                let pairs = sel
+                    .clone()
+                    .and_then(|sel| {
+                        panel_ui
+                            .git
+                            .patch_doc
+                            .as_ref()
+                            .map(|doc| gitui::sel_pairs(&doc.doc, sel))
+                    })
+                    .unwrap_or_default();
                 let toggles: Vec<usize> = sel
                     .and_then(|sel| {
                         panel_ui.git.patch_doc.as_ref().map(|d| {
@@ -3610,6 +3659,15 @@ fn handle_git_msg(
                     })
                     .unwrap_or_default();
                 let path = panel_ui.git.staging.as_ref().map(|s| s.path.clone());
+                if let Some(doc) = panel_ui.git.patch_doc.as_ref()
+                    && let Err(reason) = crate::gitmut::validate_line_selection(&doc.diff, &pairs)
+                {
+                    if let Some(s) = panel_ui.git.staging.as_mut() {
+                        s.anchor = None;
+                    }
+                    model.status = reason;
+                    return GitAfter::None;
+                }
                 if let (Some(path), GitFlow::Patch(p)) = (path, &mut panel_ui.git.flow) {
                     let marks = p.marks.entry(path).or_default();
                     for i in toggles {
@@ -5879,6 +5937,11 @@ async fn event_loop<T: Terminal>(
     // re-selects while a fetch is still out.
     let (hunk_tx, mut hunk_rx) =
         tokio_mpsc::unbounded_channel::<(u64, String, Vec<thegn_svc::git::Hunk>)>();
+    let (submodule_scan_tx, mut submodule_scan_rx) =
+        tokio_mpsc::unbounded_channel::<SubmoduleScanMsg>();
+    let (submodule_preview_tx, mut submodule_preview_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::panel_changes::SubmodulePreviewMsg>();
+    let mut submodule_preview_inflight = std::collections::HashSet::<String>::new();
     // Stale-while-revalidate switch cache: the last-known per-worktree slice
     // (panel + tab-bar chips + timeline — see `handlers::switch_cache`). On a
     // worktree switch we paint the cached slice instantly (no blank flash, no
@@ -8849,6 +8912,36 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Gitlink state/diffs and bounded drill summaries are separate reads:
+        // either can fail without erasing the other or fabricating a clean row.
+        while let Ok((generation, diffs, states)) = submodule_scan_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Hunk);
+            if generation == hydration_gen {
+                let before = model.panel.changes.clone();
+                crate::panel::merge_submodule_rows(
+                    &mut model.panel.changes,
+                    diffs.as_deref(),
+                    states.as_deref(),
+                );
+                dirty |= before != model.panel.changes;
+            }
+        }
+        while let Ok((generation, path, summary)) = submodule_preview_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Hunk);
+            submodule_preview_inflight.remove(&path);
+            if generation >= panel_ui.hunks_gen
+                && let Some(submodule) = model
+                    .panel
+                    .changes
+                    .iter_mut()
+                    .find(|row| row.path == path)
+                    .and_then(|row| row.submodule.as_mut())
+            {
+                submodule.summary = Some(summary);
+                dirty = true;
+            }
+        }
+
         // Rasterized preview images (document-viewer graphics path) land in the
         // graphics holder; the post-flush emitter draws them over the panel.
         while let Ok((path, raster)) = preview_img_rx.try_recv() {
@@ -9370,6 +9463,27 @@ async fn event_loop<T: Terminal>(
             // render at all. (`weather_cfg` is re-applied from the config after
             // the swap, below, so only the snapshot is carried here.)
             next_model.weather = model.weather.take();
+            // Typed gitlink reads arrive independently of hydration. Carry the
+            // last-known payload across an ordinary model refresh so a failed
+            // scan cannot make a submodule row appear clean or textual.
+            let active_repo_root = thegn_core::repo::main_worktree(&active_tab_path(&session));
+            let active_submodules_enabled = active_repo_root
+                .as_deref()
+                .map(|root| {
+                    current_config.repo_git(root).submodules
+                        != thegn_core::config::SubmoduleMode::Off
+                })
+                .unwrap_or(current_config.git.submodules != thegn_core::config::SubmoduleMode::Off);
+            if active_submodules_enabled {
+                for row in &mut next_model.panel.changes {
+                    row.submodule = model
+                        .panel
+                        .changes
+                        .iter()
+                        .find(|old| old.path == row.path)
+                        .and_then(|old| old.submodule.clone());
+                }
+            }
             // Idle guard: the 2s safety tick re-hydrates identical git/db data.
             // Compute up front (before `model` is mutated) whether this result
             // carries any render-affecting change; if not, we still apply it
@@ -9512,6 +9626,9 @@ async fn event_loop<T: Terminal>(
             model.ctrl_digits_reportable = ctrl_digits_reportable;
             model.notification_delivery = notification_delivery;
             model.notification_delivery_configured = notification_delivery_configured;
+            if active_submodules_enabled && !model.panel.changes.is_empty() {
+                spawn_submodule_scan(hydration_gen, &session, &submodule_scan_tx, &waker);
+            }
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
             // any tab added/closed while it ran (a second Alt-t during the
@@ -14081,6 +14198,8 @@ async fn event_loop<T: Terminal>(
                                             &session,
                                             &mut hunk_inflight,
                                             &hunk_tx,
+                                            &mut submodule_preview_inflight,
+                                            &submodule_preview_tx,
                                             &waker,
                                             hydration_gen,
                                         );
@@ -17662,6 +17781,9 @@ async fn event_loop<T: Terminal>(
                                                     cfg: keymap.config(),
                                                     hunk_inflight: &mut hunk_inflight,
                                                     hunk_tx: &hunk_tx,
+                                                    submodule_inflight:
+                                                        &mut submodule_preview_inflight,
+                                                    submodule_tx: &submodule_preview_tx,
                                                     waker: &waker,
                                                     hydration_gen,
                                                 },

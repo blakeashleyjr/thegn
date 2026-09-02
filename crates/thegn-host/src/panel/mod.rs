@@ -432,11 +432,24 @@ pub struct ChangeRow {
     pub path: String,
     pub added: u32,
     pub deleted: u32,
+    /// Typed gitlink data for an atomic submodule pointer. Its presence also
+    /// means the ordinary numeric diffstat is unavailable/not applicable.
+    pub submodule: Option<SubmoduleChange>,
     /// True when this file was brought in by an in-progress merge/rebase/etc.
     /// (it differs on the incoming side, not a local edit). Drives the
     /// `incoming from <onto>` grouping so the merge dump reads apart from the
     /// user's own changes. Always false outside a merge.
     pub incoming: bool,
+}
+
+/// The independently degradable submodule payload attached to a change row.
+/// The raw pointer diff identifies a gitlink even when checkout state or its
+/// local-object summary could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmoduleChange {
+    pub diff: thegn_core::submodule::SubmoduleDiff,
+    pub state: Option<thegn_core::submodule::SubmoduleState>,
+    pub summary: Option<thegn_core::submodule::SubmoduleSummary>,
 }
 
 /// A merge/rebase/cherry-pick in progress, for the header zone.
@@ -1306,6 +1319,7 @@ pub fn build_change_rows(
                 path: f.path.clone(),
                 added,
                 deleted,
+                submodule: None,
             }
         })
         .collect();
@@ -1324,6 +1338,82 @@ pub fn build_change_rows(
             .then(a.path.cmp(&b.path))
     });
     rows
+}
+
+/// Join independently-read gitlink diffs and checkout states onto hydrated
+/// change rows. A missing read (`None`) retains last-known data; a successful
+/// read (`Some`) is authoritative. Summary data survives only while the old
+/// and new pointer IDs are unchanged.
+pub fn merge_submodule_rows(
+    rows: &mut [ChangeRow],
+    diffs: Option<&[thegn_core::submodule::SubmoduleDiff]>,
+    states: Option<&[thegn_core::submodule::SubmoduleState]>,
+) {
+    let state_by_path: Option<
+        std::collections::HashMap<&str, &thegn_core::submodule::SubmoduleState>,
+    > = states.map(|states| states.iter().map(|s| (s.path.as_str(), s)).collect());
+    if let Some(diffs) = diffs {
+        let by_path: std::collections::HashMap<&str, &thegn_core::submodule::SubmoduleDiff> =
+            diffs.iter().map(|d| (d.path.as_str(), d)).collect();
+        for row in rows.iter_mut() {
+            let diff = by_path
+                .get(row.path.as_str())
+                .map(|diff| (*diff).clone())
+                .or_else(|| {
+                    state_by_path
+                        .as_ref()?
+                        .get(row.path.as_str())
+                        .map(|state| diff_from_state(state))
+                });
+            let Some(diff) = diff else {
+                row.submodule = None;
+                continue;
+            };
+            let old = row.submodule.take();
+            let same_pointer = old.as_ref().is_some_and(|s| s.diff == diff);
+            let summary = if same_pointer {
+                old.as_ref().and_then(|s| s.summary.clone())
+            } else {
+                None
+            };
+            row.submodule = Some(SubmoduleChange {
+                diff,
+                state: old.as_ref().and_then(|s| s.state.clone()),
+                summary,
+            });
+        }
+    }
+    if let Some(by_path) = state_by_path {
+        for row in rows.iter_mut() {
+            if row.submodule.is_none()
+                && let Some(state) = by_path.get(row.path.as_str())
+            {
+                row.submodule = Some(SubmoduleChange {
+                    diff: diff_from_state(state),
+                    state: None,
+                    summary: None,
+                });
+            }
+            if let Some(submodule) = row.submodule.as_mut() {
+                submodule.state = by_path.get(row.path.as_str()).map(|state| (*state).clone());
+            }
+        }
+    }
+}
+
+fn diff_from_state(
+    state: &thegn_core::submodule::SubmoduleState,
+) -> thegn_core::submodule::SubmoduleDiff {
+    thegn_core::submodule::SubmoduleDiff {
+        path: state.path.clone(),
+        old_sha: state.recorded_sha.clone(),
+        new_sha: if state.checked_out_sha.is_empty() {
+            state.recorded_sha.clone()
+        } else {
+            state.checked_out_sha.clone()
+        },
+        kind: thegn_core::submodule::SubmoduleDiffKind::Changed,
+    }
 }
 
 /// Trim a full test cache into the section snapshot: summary numbers, the
@@ -1670,6 +1760,88 @@ mod tests {
                 ("core/src/from_main.rs", true),
             ]
         );
+    }
+
+    #[test]
+    fn change_rows_join_atomic_submodule_add_move_delete_and_state() {
+        use thegn_core::submodule::{
+            SubmoduleDiff, SubmoduleDiffKind, SubmodulePointer, SubmoduleState,
+        };
+        let status = vec![
+            fstat('A', ' ', "vendor/added"),
+            fstat(' ', 'M', "vendor/moved"),
+            fstat('D', ' ', "vendor/deleted"),
+        ];
+        let sha = |ch: char| std::iter::repeat_n(ch, 40).collect::<String>();
+        let diffs = vec![
+            SubmoduleDiff {
+                path: "vendor/added".into(),
+                old_sha: sha('0'),
+                new_sha: sha('a'),
+                kind: SubmoduleDiffKind::Added,
+            },
+            SubmoduleDiff {
+                path: "vendor/moved".into(),
+                old_sha: sha('b'),
+                new_sha: sha('c'),
+                kind: SubmoduleDiffKind::Changed,
+            },
+            SubmoduleDiff {
+                path: "vendor/deleted".into(),
+                old_sha: sha('d'),
+                new_sha: sha('0'),
+                kind: SubmoduleDiffKind::Deleted,
+            },
+        ];
+        let states = vec![SubmoduleState {
+            path: "vendor/moved".into(),
+            recorded_sha: sha('b'),
+            checked_out_sha: sha('c'),
+            initialized: true,
+            dirty: true,
+            untracked: false,
+            pointer: SubmodulePointer::Moved,
+        }];
+        let mut rows = build_change_rows(&status, &[], &Default::default());
+        merge_submodule_rows(&mut rows, Some(&diffs), Some(&states));
+
+        for (path, kind) in [
+            ("vendor/added", SubmoduleDiffKind::Added),
+            ("vendor/moved", SubmoduleDiffKind::Changed),
+            ("vendor/deleted", SubmoduleDiffKind::Deleted),
+        ] {
+            let row = rows.iter().find(|row| row.path == path).unwrap();
+            assert_eq!(row.submodule.as_ref().unwrap().diff.kind, kind);
+            assert_eq!((row.added, row.deleted), (0, 0));
+        }
+        assert!(
+            rows.iter()
+                .find(|row| row.path == "vendor/moved")
+                .unwrap()
+                .submodule
+                .as_ref()
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .dirty
+        );
+
+        let state_only = SubmoduleState {
+            path: "vendor/dirty".into(),
+            recorded_sha: sha('e'),
+            checked_out_sha: sha('e'),
+            initialized: true,
+            dirty: true,
+            untracked: true,
+            pointer: SubmodulePointer::Clean,
+        };
+        let mut state_only_rows =
+            build_change_rows(&[fstat(' ', 'M', "vendor/dirty")], &[], &Default::default());
+        merge_submodule_rows(&mut state_only_rows, None, Some(&[state_only]));
+        let submodule = state_only_rows[0].submodule.as_ref().unwrap();
+        assert_eq!(submodule.diff.old_sha, submodule.diff.new_sha);
+        assert!(submodule.state.as_ref().unwrap().untracked);
     }
 
     #[test]

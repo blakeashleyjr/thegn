@@ -123,6 +123,9 @@ pub(crate) fn spawn_scan(
 
 /// Every cached total, as owned paths for [`thegn_core::disk::net_root_bytes`].
 fn cached_sizes(db: &Db) -> Vec<(std::path::PathBuf, u64)> {
+    // This table contains registered worktrees only. Submodule directories are
+    // deliberately never inserted as synthetic rows, so their physical bytes
+    // remain inside the owning worktree and are counted exactly once.
     db.all_worktree_disk()
         .unwrap_or_default()
         .into_iter()
