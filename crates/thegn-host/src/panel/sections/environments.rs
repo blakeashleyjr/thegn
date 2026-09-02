@@ -11,6 +11,23 @@ use crate::seg::{Line, Seg, seg};
 
 use super::{PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue};
 
+fn toolchain_label(toolchain: &crate::toolchain_ui::ToolchainStatus) -> String {
+    let mut label = format!(
+        "{} · {} · {}",
+        toolchain.provider, toolchain.tier, toolchain.state
+    );
+    if !toolchain.missing_tools.is_empty() {
+        label.push_str(&format!(
+            " · missing {}",
+            toolchain.missing_tools.join(", ")
+        ));
+    }
+    if let Some(reason) = &toolchain.reason {
+        label.push_str(&format!(" · {reason}"));
+    }
+    label
+}
+
 /// ● token present (green) · ✗ token missing (red) · ● no token needed (dim).
 fn glyph(e: &EnvSnapshot) -> Seg {
     match e.token {
@@ -46,6 +63,16 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             g(),
             "no environments — palette → ＋ New environment…",
         )])));
+        if let Some(toolchain) = &ctx.model.panel.toolchain {
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                d(),
+                "WORKTREE TOOLCHAIN",
+            )])));
+            rows.push(PanelRow::plain(Line::segs(vec![seg(
+                g(),
+                toolchain_label(toolchain),
+            )])));
+        }
         return rows;
     }
     // Each env row carries a `Row` hit so the enumerate index lines up with
@@ -78,5 +105,11 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("x", "remove"),
         ("n", "new…"),
     ]));
+    if let Some(toolchain) = &ctx.model.panel.toolchain {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            d(),
+            format!("WORKTREE TOOLCHAIN  {}", toolchain_label(toolchain)),
+        )])));
+    }
     rows
 }

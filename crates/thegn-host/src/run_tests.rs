@@ -25,9 +25,52 @@ impl Drop for XdgGuard {
     }
 }
 use crate::center::CenterTree;
+use crate::drawer_state::DrawerPool;
 use crate::hydrate::build_model;
 use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};
+
+#[test]
+fn claimed_intents_are_drained_before_a_stale_hydration_is_rejected() {
+    let row = |id, kind: &str| thegn_core::store::IntentRow {
+        id,
+        kind: kind.into(),
+        payload: format!(r#"{{"id":{id}}}"#),
+        created_at: 1,
+    };
+    let mut model = FrameModel {
+        intents: vec![row(1, "focus_workspace"), row(2, "focus_workspace")],
+        preset_intents: vec![row(3, "launch_preset")],
+        adopt_intents: vec![row(4, "adopt_session")],
+        open_editor_intents: vec![row(5, "open_editor"), row(6, "open_editor")],
+        ..Default::default()
+    };
+    let (mut focus, mut preset) = (None, None);
+    let (mut adopts, mut editor_opens) = (Vec::new(), Vec::new());
+
+    // The event loop calls this before comparing the snapshot generation.
+    // Therefore the subsequent stale-model `continue` cannot lose rows that
+    // hydration already deleted from SQLite.
+    drain_hydration_intents(
+        &mut model,
+        &mut focus,
+        &mut preset,
+        &mut adopts,
+        &mut editor_opens,
+    );
+
+    assert_eq!(focus.as_ref().map(|row| row.id), Some(2));
+    assert_eq!(preset.as_ref().map(|row| row.id), Some(3));
+    assert_eq!(adopts.iter().map(|row| row.id).collect::<Vec<_>>(), [4]);
+    assert_eq!(
+        editor_opens.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [5, 6]
+    );
+    assert!(model.intents.is_empty());
+    assert!(model.preset_intents.is_empty());
+    assert!(model.adopt_intents.is_empty());
+    assert!(model.open_editor_intents.is_empty());
+}
 
 #[test]
 fn issue_branch_tail_prefers_hint_then_slugifies() {
@@ -591,7 +634,7 @@ fn forgetting_closed_worktree_registry_prevents_restart_readoption() {
     assert_eq!(db.list_merge_queue().unwrap().len(), 1);
 
     let closing = session.worktrees[1].clone();
-    forget_worktree_group(&db, &session.id, &closing);
+    forget_worktree_group(&db, &session.id, &closing, true);
     assert!(
         db.list_merge_queue().unwrap().is_empty(),
         "closing a worktree should drop its merge-queue row"
@@ -738,22 +781,24 @@ fn drawer_pool_respects_zero_limit_and_evicts_oldest() {
     let mut pool = DrawerPool::default();
     let a = std::path::Path::new("/tmp/a");
     let b = std::path::Path::new("/tmp/b");
+    let a_key = crate::drawer_state::DrawerPoolKey::worktree(a, "files");
+    let b_key = crate::drawer_state::DrawerPoolKey::worktree(b, "files");
 
     // limit 0 = no pooling; the just-hidden pane is torn down immediately.
-    pool.stash(a, 1, 0, &mut panes);
-    assert!(!pool.contains(a));
+    pool.stash_key(a_key.clone(), 1, 0, &mut panes);
+    assert!(!pool.contains_key(&a_key));
 
     // limit 1 keeps only the most recent; stashing b evicts a.
-    pool.stash(a, 1, 1, &mut panes);
-    assert!(pool.contains(a));
-    pool.stash(b, 2, 1, &mut panes);
-    assert!(!pool.contains(a));
-    assert!(pool.contains(b));
-    assert_eq!(pool.take(b), Some(2));
-    assert!(!pool.contains(b));
+    pool.stash_key(a_key.clone(), 1, 1, &mut panes);
+    assert!(pool.contains_key(&a_key));
+    pool.stash_key(b_key.clone(), 2, 1, &mut panes);
+    assert!(!pool.contains_key(&a_key));
+    assert!(pool.contains_key(&b_key));
+    assert_eq!(pool.take_key(&b_key), Some(2));
+    assert!(!pool.contains_key(&b_key));
 
-    // remove_id forgets a pooled drawer whose yazi exited on its own.
-    pool.stash(a, 3, 2, &mut panes);
+    // remove_id forgets a pooled drawer whose process exited on its own.
+    pool.stash_key(a_key.clone(), 3, 2, &mut panes);
     assert!(pool.remove_id(3));
     assert!(!pool.remove_id(3));
 }
@@ -2723,6 +2768,47 @@ fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
             .map(|g| &g.name)
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
+    // The merge-queue sidebar outcome must not open a panel after this seam
+    // fails: the activation status is the only diagnostic the user gets for a
+    // deleted or unreadable dormant workspace.
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1);
+    let mut panes = Panes::new(tx);
+    let mut session = one_tab_session();
+    let mut model = FrameModel::default();
+    let mut sb = SidebarState::default();
+    let mut drawer_runtime = DrawerRuntime::default();
+    let mut workspace_pool = WorkspacePool::default();
+    let mut need_relayout = false;
+    let mut clear_on_next_frame = false;
+
+    let activated = activate_row_target(
+        crate::sidebar::RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: None,
+        },
+        &mut session,
+        &mut model,
+        &mut sb,
+        &mut panes,
+        &mut drawer_runtime,
+        &mut workspace_pool,
+        &thegn_core::config::Config::default(),
+        crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        },
+        &mut need_relayout,
+        &mut clear_on_next_frame,
+    );
+
+    assert!(!activated);
+    assert!(model.status.is_empty());
 }
 
 // `neutralize_paste_markers` and its tests moved to `crate::pane_writer`

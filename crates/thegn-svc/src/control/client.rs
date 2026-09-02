@@ -16,10 +16,13 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
+use thegn_core::control_wire::{EventDecoder, EventFrame, FeedFilter, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
-use super::{OpenSpec, RecordStatus, SessionInfo};
+use super::ControlErrorCode;
+use super::{
+    CiLogsReply, CiRunsReply, EditorOpenRequest, ForkSpec, OpenSpec, RecordStatus, SessionInfo,
+};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
@@ -59,6 +62,7 @@ pub struct ControlClient {
 pub struct ControlRequestError {
     status: u16,
     message: String,
+    code: Option<ControlErrorCode>,
 }
 
 impl ControlRequestError {
@@ -66,11 +70,27 @@ impl ControlRequestError {
         Self {
             status,
             message: message.into(),
+            code: None,
+        }
+    }
+
+    fn with_code(status: u16, message: impl Into<String>, code: Option<ControlErrorCode>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            code,
         }
     }
 
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// The server's stable error code, when supplied by a current server.
+    /// `None` means the response came from an older server (or used an
+    /// unrecognized future code) and remains readable via status/message.
+    pub fn code(&self) -> Option<ControlErrorCode> {
+        self.code
     }
 }
 
@@ -81,6 +101,17 @@ impl std::fmt::Display for ControlRequestError {
 }
 
 impl std::error::Error for ControlRequestError {}
+
+fn request_error(status: u16, value: &Value) -> ControlRequestError {
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("control request failed");
+    let code = value
+        .get("code")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    ControlRequestError::with_code(status, message, code)
+}
 
 /// Control messages for an attached session stream.
 pub enum AttachControl {
@@ -93,6 +124,64 @@ pub enum AttachControl {
 pub struct AttachStream {
     pub frames: tokio_mpsc::Receiver<EventFrame>,
     pub control: tokio_mpsc::Sender<AttachControl>,
+}
+
+/// The JSON envelope shared by SSE, plugin consumers, and CLI-facing client
+/// code. The frame kind comes from [`EventFrame::kind`], so formatters cannot
+/// drift from filter validation or SSE metadata.
+pub fn frame_json(frame: &EventFrame) -> Value {
+    let mut value = match frame {
+        EventFrame::Hello(h) => json!({
+            "proto": h.proto, "server": h.server, "scopes": h.scopes,
+        }),
+        EventFrame::PaneSnapshot {
+            session,
+            seq,
+            cols,
+            rows,
+            bytes,
+        } => json!({
+            "session": session, "seq": seq, "cols": cols, "rows": rows,
+            "ansi_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+        EventFrame::PaneDelta {
+            session,
+            seq,
+            bytes,
+        } => json!({
+            "session": session, "seq": seq,
+            "b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+        EventFrame::Activity { json: j } => json!({
+            "event": serde_json::from_str::<Value>(j)
+                .unwrap_or_else(|_| Value::String(j.clone())),
+        }),
+        EventFrame::Lease {
+            session,
+            kind,
+            expires_at,
+        } => json!({
+            "session": session, "event": kind, "expires_at": expires_at,
+        }),
+        EventFrame::Pairing {
+            pairing_id,
+            label,
+            scope,
+            state,
+        } => json!({
+            "pairing_id": pairing_id, "label": label,
+            "scopes": scope, "state": state,
+        }),
+        EventFrame::Sessions => json!({}),
+        EventFrame::SessionExit { session, code } => json!({
+            "session": session, "code": code,
+        }),
+        EventFrame::Lagged { missed } => json!({ "missed": missed }),
+    };
+    if let Value::Object(fields) = &mut value {
+        fields.insert("kind".into(), Value::String(frame.kind().into()));
+    }
+    value
 }
 
 impl ControlClient {
@@ -132,11 +221,7 @@ impl ControlClient {
         if (200..300).contains(&status) {
             Ok(value)
         } else {
-            let msg = value
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("control request failed");
-            Err(anyhow::Error::new(ControlRequestError::new(status, msg)))
+            Err(anyhow::Error::new(request_error(status, &value)))
         }
     }
 
@@ -173,6 +258,17 @@ impl ControlClient {
     pub async fn open(&self, spec: &OpenSpec) -> Result<SessionInfo> {
         let v = self
             .request("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    pub async fn fork(&self, spec: &ForkSpec) -> Result<SessionInfo> {
+        let v = self
+            .request(
+                "POST",
+                "/v1/sessions/fork",
+                Some(serde_json::to_value(spec)?),
+            )
             .await?;
         Ok(serde_json::from_value(v)?)
     }
@@ -300,6 +396,37 @@ impl ControlClient {
         )?)
     }
 
+    /// `GET /v1/ci/runs` — cache-first CI run history for a worktree.
+    pub async fn ci_runs(&self, worktree: &str, limit: Option<usize>) -> Result<CiRunsReply> {
+        let mut path = format!("/v1/ci/runs?worktree={}", query_escape(worktree));
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        let value = self.request("GET", &path, None).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `GET /v1/ci/logs` — one bounded, redacted job-log projection.
+    pub async fn ci_logs(
+        &self,
+        worktree: &str,
+        run_id: &str,
+        job_id: &str,
+        tail_lines: Option<usize>,
+    ) -> Result<CiLogsReply> {
+        let mut path = format!(
+            "/v1/ci/logs?worktree={}&run={}&job={}",
+            query_escape(worktree),
+            query_escape(run_id),
+            query_escape(job_id),
+        );
+        if let Some(tail_lines) = tail_lines {
+            path.push_str(&format!("&tail_lines={tail_lines}"));
+        }
+        let value = self.request("GET", &path, None).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     /// `POST /v1/notify` — push a notification into the tray. Returns the
     /// stored notification's row id.
     pub async fn notify_push(&self, note: &super::PushedNote) -> Result<i64> {
@@ -309,6 +436,41 @@ impl ControlClient {
         v.get("id")
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
+    }
+
+    pub async fn automations_list(&self) -> Result<Vec<super::AutomationRuleInfo>> {
+        let value = self.request("GET", "/v1/automations", None).await?;
+        Ok(serde_json::from_value(
+            value
+                .get("rules")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new())),
+        )?)
+    }
+
+    pub async fn automations_test(
+        &self,
+        request: &super::AutomationTestRequest,
+    ) -> Result<super::AutomationTestReply> {
+        let value = self
+            .request(
+                "POST",
+                "/v1/automations/test",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub async fn tools_run(&self, request: &super::ToolRunRequest) -> Result<SessionInfo> {
+        let value = self
+            .request(
+                "POST",
+                "/v1/tools/run",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
     }
 
     /// `GET /v1/mcp_proxy/status` — the mcp-proxy hub's per-upstream state.
@@ -331,6 +493,38 @@ impl ControlClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Queue a safe editor handoff through `POST /v1/editor/open`.
+    pub async fn open_editor(&self, request: &EditorOpenRequest) -> Result<()> {
+        request.target()?;
+        let value = self
+            .request(
+                "POST",
+                "/v1/editor/open",
+                Some(serde_json::to_value(request)?),
+            )
+            .await?;
+        if value.get("queued").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(anyhow!("malformed editor-open reply: {value}"))
+        }
+    }
+
+    /// `POST /v1/preview/fetch` — one bounded, credential-free preview GET.
+    pub async fn preview_fetch(
+        &self,
+        req: &super::PreviewFetchRequest,
+    ) -> Result<super::PreviewFetchReply> {
+        let v = self
+            .request(
+                "POST",
+                "/v1/preview/fetch",
+                Some(serde_json::to_value(req)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
     }
 
     // --- agent orchestration (THE-57) ---------------------------------------
@@ -475,13 +669,21 @@ impl ControlClient {
     /// keeping the [`AttachStream`] alive keeps the pump running. Dropping it
     /// ends the subscription.
     pub async fn subscribe_events(&self) -> Result<AttachStream> {
+        self.subscribe_events_opts(&FeedFilter::default()).await
+    }
+
+    /// Subscribe with per-connection narrowing and optional lag signaling.
+    /// The server-side filter is still constrained to the read-scoped feed;
+    /// this method only adds query parameters and keeps the 256-frame buffer.
+    pub async fn subscribe_events_opts(&self, filter: &FeedFilter) -> Result<AttachStream> {
         let (host, token) = match &self.addr {
             ControlAddr::Unix(_) => ("localhost".to_string(), None),
             ControlAddr::Tcp { addr, token } => (addr.clone(), Some(token.clone())),
         };
+        let path = events_path(filter);
         let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
             .method("GET")
-            .uri(format!("ws://{host}/v1/events"))
+            .uri(format!("ws://{host}{path}"))
             .header("Host", &host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -521,6 +723,12 @@ impl ControlClient {
             frames: frame_rx,
             control: ctrl_tx,
         })
+    }
+
+    /// Owned-options convenience form for callers that construct a filter at
+    /// the call site.
+    pub async fn subscribe_events_with(&self, filter: FeedFilter) -> Result<AttachStream> {
+        self.subscribe_events_opts(&filter).await
     }
 
     /// Warm-attach over WebSocket. The first frames on `frames` are `Hello`
@@ -604,6 +812,52 @@ impl ControlClient {
             control: ctrl_tx,
         })
     }
+}
+
+/// Encode a query component without pulling URL policy into the core crate.
+/// Paths and ids normally contain only safe ASCII, but worktree names can
+/// contain spaces and the control endpoint must remain unambiguous there.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn events_path(filter: &FeedFilter) -> String {
+    let mut params = Vec::new();
+    if let Some(kinds) = &filter.kinds {
+        params.push(format!("kinds={}", percent_encode(&kinds.join(","))));
+    }
+    if let Some(session) = &filter.session {
+        params.push(format!("session={}", percent_encode(session)));
+    }
+    if filter.signal_lag {
+        params.push("signal_lag=1".into());
+    }
+    if params.is_empty() {
+        "/v1/events".into()
+    } else {
+        format!("/v1/events?{}", params.join("&"))
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 type Ws<S> = tokio_tungstenite::WebSocketStream<S>;
@@ -795,6 +1049,24 @@ where
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    #[test]
+    fn control_error_request_code_is_optional_for_old_servers() {
+        let old = request_error(404, &serde_json::json!({ "error": "not found" }));
+        assert_eq!(old.code(), None);
+
+        let current = request_error(
+            404,
+            &serde_json::json!({ "error": "not found", "code": "not_found" }),
+        );
+        assert_eq!(current.code(), Some(ControlErrorCode::NotFound));
+
+        let future = request_error(
+            500,
+            &serde_json::json!({ "error": "failure", "code": "future_code" }),
+        );
+        assert_eq!(future.code(), None);
+    }
 
     fn daemon_row(id: &str, scope: &str, endpoint: &str, heartbeat_at: i64) -> DaemonRow {
         DaemonRow {

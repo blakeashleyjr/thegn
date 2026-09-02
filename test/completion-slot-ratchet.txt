@@ -17,8 +17,8 @@ agent sessions	harness
 api call	params
 bridge-revtunnel	port
 ci cancel	run_id
-ci log	job_id
-ci log	run_id
+ci logs	job_id
+ci logs	run_id
 ci rerun	run_id
 ci runs	limit
 ci trigger	input
@@ -123,11 +123,6 @@ pr comment	body
 pr create	body
 pr create	title
 pr review	body
-project assign	project
-project create	name
-project rename	name
-project rename	new_name
-project rm	name
 proxy stats	hours
 recent	count
 repo recent	count
@@ -163,7 +158,6 @@ vps-ssh	cmd
 vps-ssh	name
 wt diff	file
 wt new	name
-wt new	project
 wt new	repos
 zone assign	zone
 zone create	name

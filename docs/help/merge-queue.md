@@ -18,7 +18,14 @@ ever checking `main` out. Enable it with `[merge_queue] enabled = true`.
 Add the current worktree's branch from the [[panel]]'s _merge_ section,
 the sidebar row menu, or `thegn merge add` in the pane. The queue is
 persisted; entries survive restarts. The section shows the active
-workspace's queue by default; `g` widens it to every workspace.
+project's queue by default; `g` widens it to every project.
+
+The project header in the full sidebar also shows a compact queue token when
+that project has active entries. It summarizes the highest-priority tier —
+blocked, working, or populated — and is a shortcut to this existing Work ▸
+Merge queue section. The token is omitted for empty or landed-only queues and
+is not shown in rail mode. The bottom-bar summary is opt-in: set
+`[bars] bottom_right = ["mq"]` if you want it alongside the other widgets.
 
 ## Landing
 
@@ -174,7 +181,7 @@ Placeholders are checked against the kind (`conflict` gets `{branch}`,
 `{target}`, `{worktree}`, `{paths}`, and `{submodule_conflicts}`;
 `gate_failure` swaps the conflict fields for `{log}`) — a typo is a config
 error, never a blank sent to the agent.
-A repo can carry its own via `[workspace.<slug>.merge_queue.prompts]`,
+A repo can carry its own via `[project.<slug>.merge_queue.prompts]`,
 merged key by key with your global ones.
 
 If you replace a prompt, keep its rules: the agent must commit on the
@@ -232,5 +239,6 @@ changes elsewhere.
 
 ## Watching
 
-The status bar shows queue depth ([[bars]]); the _merge_ section lists
-entries with their gate state. Failures surface as notifications.
+The full sidebar token and optional `mq` widget show queue depth; the _merge_
+section lists entries with their gate state. Failures surface as
+notifications. E2E baselines are not re-recorded for this behavior change.

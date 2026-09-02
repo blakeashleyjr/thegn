@@ -491,6 +491,55 @@ pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<Strin
     )
 }
 
+/// Wrap a provider-backed pane argv with the same CPU/memory policy used by a
+/// local host-toolchain pane. Provider implementations must use this narrow
+/// pure adapter instead of inventing a second resource-limit path.
+pub fn wrap_provider_pane_argv(
+    argv: Vec<String>,
+    limits: &SandboxLimits,
+    mechanism: CpuCap,
+) -> Vec<String> {
+    cap_prefix(Backend::None, true, limits, argv, mechanism, CapRole::Pane)
+}
+
+/// Peel the [`CpuCap::ScopeHard`] prefix back off a capped argv, yielding the
+/// argv that actually enters the sandbox. Returns `argv` unchanged when there
+/// is no cap prefix.
+///
+/// A resource ceiling is not containment, and conflating the two broke both
+/// directions of the containment label. `wrap_pane_argv` prepends
+/// `systemd-run --scope …` to host-toolchain backends (bwrap has no cgroup
+/// mechanism of its own), so the composed argv reads
+/// `systemd-run … -- bwrap … -- <shell>`. `sandbox_truth::observed` returns on
+/// the FIRST runtime word it recognizes, so it saw `systemd-run` and never
+/// reached `bwrap`: every bwrap pane was reported as a degraded fallback to
+/// `systemd` (and on the terminal path, `panes.rs` acts on that verdict by
+/// discarding the sandbox wrap — a false report there costs real containment).
+/// The same prefix on an UNCAPPED host shell produced the opposite lie:
+/// `wrap_uncontained_pane_argv` caps a bare `bash -lc`, and that argv also read
+/// as `systemd`, claiming a boundary that was never there.
+///
+/// `--scope` is the discriminator, and it is exact: the cap runs the pane in a
+/// transient *scope*, while the Systemd *backend* runs it as a transient unit
+/// (`--pty`, no `--scope`) — and [`cap_prefix`] refuses to stack on an argv that
+/// already begins with `systemd-run`, so a `--scope` in this position can only
+/// be ours. Stripping therefore can never erase a real systemd sandbox.
+pub fn strip_pane_cap(argv: &[String]) -> &[String] {
+    if argv.first().map(String::as_str) != Some("systemd-run") {
+        return argv;
+    }
+    let Some(sep) = argv.iter().position(|w| w == "--") else {
+        return argv;
+    };
+    if !argv[..sep].iter().any(|w| w == "--scope") {
+        return argv;
+    }
+    let inner = &argv[sep + 1..];
+    // Defensive: a prefix with nothing after it is not something we produced,
+    // and returning an empty argv would read as "no containment".
+    if inner.is_empty() { argv } else { inner }
+}
+
 /// How many parallel build jobs a pane should ask for, from its own CPU ceiling.
 ///
 /// `CARGO_BUILD_JOBS` is per-INVOCATION, so N worktrees each claim the whole
@@ -1329,5 +1378,60 @@ mod tests {
         let argv: Vec<String> = vec!["claude".into(), "-p".into()];
         assert_eq!(wrap_control_argv(argv.clone(), false), argv);
         assert_eq!(wrap_background_argv(argv.clone()), argv);
+    }
+
+    fn sv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn strip_pane_cap_peels_exactly_what_the_cap_prepended() {
+        // Round-trip against the real wrapper rather than a hand-written prefix,
+        // so a change to the cap's argv shape cannot drift away from the strip.
+        let limits = SandboxLimits {
+            cpu: Some("8".into()),
+            memory: Some("24G".into()),
+            ..SandboxLimits::default()
+        };
+        let inner = sv(&["bwrap", "--bind", "/wt", "/wt", "--", "zsh"]);
+        let capped = wrap_provider_pane_argv(inner.clone(), &limits, CpuCap::ScopeHard);
+        assert_eq!(capped.first().map(String::as_str), Some("systemd-run"));
+        assert!(capped.len() > inner.len(), "the cap must actually wrap");
+        assert_eq!(strip_pane_cap(&capped), inner.as_slice());
+    }
+
+    #[test]
+    fn strip_pane_cap_leaves_a_real_systemd_sandbox_alone() {
+        // The Systemd BACKEND is a transient unit (`--pty`), not a scope. If the
+        // strip touched this, a genuinely sandboxed pane would read as
+        // uncontained — and `panes.rs` would then drop its sandbox.
+        let backend = sv(&[
+            "systemd-run",
+            "--user",
+            "--pty",
+            "--quiet",
+            "--collect",
+            "--working-directory=/wt",
+            "-p",
+            "PrivateTmp=yes",
+            "--",
+            "zsh",
+        ]);
+        assert_eq!(strip_pane_cap(&backend), backend.as_slice());
+    }
+
+    #[test]
+    fn strip_pane_cap_ignores_argv_it_did_not_produce() {
+        for argv in [
+            sv(&["bwrap", "--bind", "/wt", "/wt", "zsh"]),
+            sv(&["podman", "run", "--rm", "img", "zsh"]),
+            // `--scope` but no `--` separator, and a separator with nothing after
+            // it: neither is a shape the cap emits.
+            sv(&["systemd-run", "--user", "--scope", "zsh"]),
+            sv(&["systemd-run", "--user", "--scope", "--"]),
+            Vec::new(),
+        ] {
+            assert_eq!(strip_pane_cap(&argv), argv.as_slice(), "argv: {argv:?}");
+        }
     }
 }

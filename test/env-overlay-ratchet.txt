@@ -13,6 +13,20 @@
 accounts.dir
 accounts.name
 accounts.provider
+autopilot.agent
+autopilot.agent_command
+autopilot.agent_timeout_secs
+autopilot.assignee
+autopilot.done_on_merge
+autopilot.enabled
+autopilot.max_attempts
+autopilot.max_concurrent
+autopilot.open_as
+autopilot.pickup_status
+autopilot.trigger_label
+# autopilot.* — issue pickup is a trusted file/workspace policy, not a
+# launcher/environment switch; enabling it can run commands and make forge
+# writes, so every key stays file-only.
 actions.action
 actions.close_on_exit
 actions.floating
@@ -33,6 +47,10 @@ activity.unsolicited_gap_secs
 # agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
 # list item, like `provider`; an env knob cannot address one entry of a list.
 agents.command
+# agents.drawer_* — structured per-entry drawer metadata; list entries have no
+# stable index-addressable THEGN_* environment override.
+agents.drawer_cwd
+agents.drawer_scope
 agents.harness
 agents.model
 agents.name
@@ -40,6 +58,14 @@ agents.permissions
 agents.provider
 agents.resume
 agents.route_via_proxy
+# automations.* — trusted global/profile automation policy is intentionally
+# file-scoped; exposing it through process environment would make automation
+# behavior depend on unreviewed launcher state.
+automations.action_timeout_secs
+automations.audit_retention_per_rule
+automations.enabled
+automations.max_concurrent
+automations.queue_capacity
 bars.bottom_left
 bars.bottom_right
 bars.clock_format
@@ -63,6 +89,8 @@ calendar.time_format
 calendar.ttl_secs
 calendar.week_start
 ci.log_tail_lines
+ci.log_cache_runs
+ci.log_max_bytes
 ci.max_runs
 ci.poll_interval_secs
 ci.provider
@@ -117,6 +145,12 @@ git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+hooks.pre_create
+hooks.post_create
+hooks.pre_destroy
+hooks.post_destroy
+hooks.session_start
+hooks.session_end
 host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
@@ -335,6 +369,7 @@ sandbox.default_backend
 sandbox.default_env
 sandbox.devenv
 sandbox.devshell
+sandbox.devcontainer
 sandbox.env_passthrough
 sandbox.failover
 sandbox.file_access
@@ -413,10 +448,15 @@ toolchain.extra
 toolchain.go
 toolchain.jvm
 toolchain.mode
+toolchain.mise.inject
 toolchain.node
 toolchain.python
 toolchain.ruby
 tools.command
+# tools.drawer_* — structured per-entry drawer metadata; list entries have no
+# stable index-addressable THEGN_* environment override.
+tools.drawer_cwd
+tools.drawer_scope
 tools.harness
 tools.model
 tools.name
@@ -424,7 +464,7 @@ tools.permissions
 tools.provider
 tools.resume
 tools.route_via_proxy
-ui.confirm_delete_workspace
+ui.confirm_delete_project
 ui.dismiss_overlay_on_click_outside
 ui.full_mode_chip
 ui.fullscreen_keep_masthead
@@ -448,7 +488,7 @@ ui.sidebar_show_status_icon
 ui.sidebar_terminals_section
 ui.sidebar_wide_ratio
 ui.sidebar_width
-ui.sidebar_workspace_sort
+ui.sidebar_project_sort
 usage.allow_network
 usage.crit_percent
 usage.discover_profiles
@@ -471,6 +511,14 @@ weather.show_forecast
 weather.stale_after_secs
 weather.timeout_secs
 weather.units
+# Voice is an explicit, structured consent surface. In particular, argv
+# arrays are config-only so a launcher cannot silently redirect microphone
+# audio or transcription through an environment alias.
+voice.capture_command
+voice.command
+voice.enabled
+voice.kind
+voice.max_seconds
 window_margin
 worktree_templates.agent
 worktree_templates.base

@@ -16,7 +16,7 @@
 
 use std::sync::OnceLock;
 
-use schemars::schema::{RootSchema, Schema, SchemaObject, SingleOrVec};
+use schemars::schema::{InstanceType, RootSchema, Schema, SchemaObject, SingleOrVec};
 
 use crate::config::Config;
 
@@ -35,7 +35,17 @@ fn config_schema() -> &'static RootSchema {
 /// rather than warned-and-defaulted). Returns the list of problems (empty = ok).
 pub fn validate_str(body: &str) -> Vec<String> {
     let mut errs = Vec::new();
-    let val: toml::Value = match body.parse() {
+    let normalized = match crate::config_compat::normalize(body) {
+        Ok(v) => v,
+        Err(e) => return vec![format!("TOML syntax error: {e}")],
+    };
+    errs.extend(
+        normalized
+            .diagnostics
+            .iter()
+            .map(|d| format!("warning: {d}")),
+    );
+    let val: toml::Value = match normalized.body.parse() {
         Ok(v) => v,
         Err(e) => return vec![format!("TOML syntax error: {e}")],
     };
@@ -43,12 +53,19 @@ pub fn validate_str(body: &str) -> Vec<String> {
     // deserialize into `Config`, the entire file is discarded for defaults.
     // This catches shape/type errors; the schema walk below catches the
     // warn-and-default enum values `Deserialize` never rejects.
-    match toml::from_str::<Config>(body) {
-        Err(e) => errs.push(format!("config would be rejected on load: {e}")),
+    let load_error = match toml::from_str::<Config>(&normalized.body) {
+        Err(e) => Some(e),
         // Templates are strings as far as the schema is concerned, so their
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            errs.extend(cfg.autopilot.validate("autopilot"));
+            for (slug, ws) in &cfg.workspace {
+                errs.extend(
+                    ws.autopilot
+                        .validate(&format!("workspace.{slug}.autopilot")),
+                );
+            }
             // `[[presets]]` semantic checks (empty preset, template `preset`
             // exclusivity) — strings to the schema, so only checkable post-parse.
             errs.extend(crate::config_presets::validate_presets(&cfg));
@@ -56,10 +73,19 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // concurrency, `next` targets and cycles). Structure only — thegn
             // validates the org chart it will never execute.
             errs.extend(crate::config_pipeline::validate_pipeline(&cfg));
+            // The handoff contract: a stage prompt that never names `{row}` or
+            // never asks for `thegn dispatch report` produces rows the done-gate
+            // can never close, so the roster grows without bound. Checked here
+            // because it is a property of the prompt string, not the org chart.
+            errs.extend(crate::config_pipeline::validate_stage_contracts(&cfg));
             // `model` / `env` on [[agents]]/[[tools]] and stage overrides: a
             // model must land on a harness with a model flag, env keys must be
             // exportable names.
             errs.extend(crate::agent_task::validate_agent_models(&cfg));
+            // Skill names and directory-list syntax are a config-boundary
+            // concern. Directory existence/discovery stays at the host edge.
+            errs.extend(cfg.skills.validate());
+            errs.extend(crate::config_drawer::validate_drawer_config(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
@@ -86,13 +112,69 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[notifications]` live-agent signatures must be non-empty and
             // bounded; otherwise an empty substring would match every line.
             errs.extend(cfg.notifications.validate());
+            errs.extend(cfg.automations.validate());
+            for (name, profile) in &cfg.profiles {
+                if profile.automations.is_empty() {
+                    continue;
+                }
+                let mut effective = cfg.automations.clone();
+                profile.automations.clone().apply(&mut effective);
+                errs.extend(
+                    effective
+                        .validate()
+                        .into_iter()
+                        .map(|error| format!("profiles.{name}: {error}")),
+                );
+            }
+            // Sound references and kind selectors use a free-form map, so the
+            // schema walker cannot validate their keys or values.
+            errs.extend(cfg.notifications.validate_sound());
+            for (profile, profile_cfg) in &cfg.profiles {
+                errs.extend(
+                    profile_cfg
+                        .notifications
+                        .validate_sound(&format!("profiles.{profile}.notifications.sound")),
+                );
+            }
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());
+            errs.extend(cfg.ci.validate());
+            None
+        }
+    };
+    let val = serde_json::to_value(val).expect("TOML values are JSON-compatible");
+    let root = config_schema();
+    let before_schema = errs.len();
+    walk_object(&root.schema, root, &val, "", &mut errs, true);
+    if let Some(error) = load_error {
+        let type_errors: Vec<String> = errs[before_schema..]
+            .iter()
+            .filter(|message| message.contains(": expected "))
+            .cloned()
+            .collect();
+        errs.truncate(before_schema);
+        if type_errors.is_empty() {
+            errs.push(format!("config would be rejected on load: {error}"));
+        } else {
+            errs.push(format!(
+                "config would be rejected on load: {error}; {}",
+                type_errors.join("; ")
+            ));
         }
     }
-    let root = config_schema();
-    walk_object(&root.schema, root, &val, "", &mut errs);
+    errs
+}
+
+/// Validate a format-neutral document against a config schema.  Repo-local
+/// overlays use this same walker as the trusted `Config` document, but supply
+/// their narrower `RepoConfigFile` schema.
+pub(crate) fn validate_schema_value<T: schemars::JsonSchema>(
+    value: &serde_json::Value,
+) -> Vec<String> {
+    let root = schemars::schema_for!(T);
+    let mut errs = Vec::new();
+    walk_object(&root.schema, &root, value, "", &mut errs, true);
     errs
 }
 
@@ -166,6 +248,13 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         check(key, template, kind.prompt_vars(), false);
     }
 
+    check(
+        "autopilot.agent_command",
+        &cfg.autopilot.agent_command,
+        COMMAND_VARS,
+        true,
+    );
+
     // The per-repo layer carries the same keys, so it needs the same check —
     // otherwise a bad template hides in a `[workspace.<slug>]` block until that
     // repo happens to drain.
@@ -174,6 +263,14 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         if let Some(c) = p.agent_command.as_deref() {
             check(
                 &format!("workspace.{slug}.pr_queue.agent_command"),
+                c,
+                COMMAND_VARS,
+                true,
+            );
+        }
+        if let Some(c) = ws.autopilot.agent_command.as_deref() {
+            check(
+                &format!("workspace.{slug}.autopilot.agent_command"),
                 c,
                 COMMAND_VARS,
                 true,
@@ -267,15 +364,16 @@ fn ref_name(reference: &str) -> &str {
 fn walk_schema(
     schema: &Schema,
     root: &RootSchema,
-    value: &toml::Value,
+    value: &serde_json::Value,
     path: &str,
     errs: &mut Vec<String>,
+    check_types: bool,
 ) {
     // `Schema::Bool` (e.g. `additionalProperties: false`) constrains shape,
     // which the wholesale `Config` parse already enforces — nothing enum-shaped
     // to check.
     if let Schema::Object(obj) = schema {
-        walk_object(obj, root, value, path, errs);
+        walk_object(obj, root, value, path, errs, check_types);
     }
 }
 
@@ -283,52 +381,69 @@ fn walk_schema(
 fn walk_object(
     obj: &SchemaObject,
     root: &RootSchema,
-    value: &toml::Value,
+    value: &serde_json::Value,
     path: &str,
     errs: &mut Vec<String>,
+    check_types: bool,
 ) {
     // Resolve `$ref` through the root's definitions.
     if let Some(reference) = &obj.reference {
         if let Some(def) = root.definitions.get(ref_name(reference)) {
-            walk_schema(def, root, value, path, errs);
+            walk_schema(def, root, value, path, errs, check_types);
         }
         return;
     }
     // schemars 0.8 wraps a `$ref` field in `allOf` whenever the field carries
-    // ANY metadata (a `default`, a doc comment, …), and `Option<Enum>` becomes
-    // `anyOf [$ref, null]` — recurse all subschema lists unconditionally. Only
-    // the resolved enum definition carries [`ENUM_MARKER`], so a value reached
-    // through a wrapper is still checked exactly once (never double-reported).
+    // ANY metadata (a `default`, a doc comment, …), so every `allOf` constraint
+    // still applies. `anyOf` / `oneOf` are alternatives instead: validate each
+    // branch in isolation and accept the union as soon as one branch is clean.
     if let Some(sub) = &obj.subschemas {
-        for list in [&sub.all_of, &sub.any_of, &sub.one_of]
-            .into_iter()
-            .flatten()
-        {
-            for s in list {
-                walk_schema(s, root, value, path, errs);
-            }
+        for s in sub.all_of.iter().flatten() {
+            walk_schema(s, root, value, path, errs, check_types);
         }
+        if let Some(branches) = &sub.any_of {
+            walk_union(branches, root, value, path, errs, check_types);
+        }
+        if let Some(branches) = &sub.one_of {
+            walk_union(branches, root, value, path, errs, check_types);
+        }
+    }
+    // `sandbox.failover` and `env.<name>.failover` retain a legacy boolean
+    // spelling through their custom deserializers, although schemars exposes
+    // the enum's canonical string shape. Preserve that compatibility while
+    // still type-checking every other schema node.
+    let legacy_failover_bool = value.is_boolean() && path.rsplit('.').next() == Some("failover");
+    if check_types
+        && !legacy_failover_bool
+        && let Some(expected) = expected_type(obj, value)
+        && !value_matches_type(value, &expected)
+    {
+        errs.push(format!(
+            "{path}: expected {expected}, got {}",
+            value_type(value)
+        ));
+        return;
     }
     // The strict enum check: only nodes carrying the `config_enum!` marker,
     // and only string TOML values — `failover` keys legally accept a bool
     // (`de_failover`), and genuinely wrong types are already reported by the
     // wholesale `Config` parse above.
-    if let toml::Value::String(s) = value
+    if let serde_json::Value::String(s) = value
         && let Some(marker) = obj.extensions.get(ENUM_MARKER)
         && let Err(e) = check_enum(obj, marker, s)
     {
         errs.push(format!("{path}: {e}"));
     }
     match value {
-        toml::Value::Table(table) => {
+        serde_json::Value::Object(table) => {
             if let Some(ov) = &obj.object {
                 for (key, child) in table {
                     let child_path = join_key(path, key);
                     if let Some(prop) = ov.properties.get(key) {
-                        walk_schema(prop, root, child, &child_path, errs);
+                        walk_schema(prop, root, child, &child_path, errs, check_types);
                     } else if let Some(additional) = &ov.additional_properties {
                         // Map tables: `[env.<name>]`, `[host.<name>]`, …
-                        walk_schema(additional, root, child, &child_path, errs);
+                        walk_schema(additional, root, child, &child_path, errs, check_types);
                     } else if !LEGACY_KEYS.contains(&child_path.as_str()) {
                         // Not in the schema: the lenient loader drops it
                         // silently (a typo'd key is the classic "my config
@@ -343,17 +458,155 @@ fn walk_object(
                 }
             }
         }
-        toml::Value::Array(items) => {
+        serde_json::Value::Array(items) => {
             if let Some(av) = &obj.array
                 && let Some(SingleOrVec::Single(item)) = &av.items
             {
                 for (i, child) in items.iter().enumerate() {
-                    walk_schema(item, root, child, &format!("{path}[{i}]"), errs);
+                    walk_schema(
+                        item,
+                        root,
+                        child,
+                        &format!("{path}[{i}]"),
+                        errs,
+                        check_types,
+                    );
                 }
             }
         }
         _ => {}
     }
+}
+
+/// Validate a schema union without leaking errors from non-matching branches.
+/// JSON Schema's `oneOf` normally also requires exactly one match, but the
+/// config schemas use these lists only to describe serde alternatives; for
+/// validation, either union is satisfied by any clean branch.
+fn walk_union(
+    branches: &[Schema],
+    root: &RootSchema,
+    value: &serde_json::Value,
+    path: &str,
+    errs: &mut Vec<String>,
+    check_types: bool,
+) {
+    let matched = branches.iter().any(|branch| match branch {
+        Schema::Bool(allowed) => *allowed,
+        Schema::Object(_) => {
+            let mut branch_errs = Vec::new();
+            walk_schema(branch, root, value, path, &mut branch_errs, check_types);
+            branch_errs.is_empty()
+        }
+    });
+    if matched {
+        return;
+    }
+
+    let mut shapes = Vec::new();
+    for branch in branches {
+        collect_schema_shapes(branch, root, &mut shapes);
+    }
+    shapes.sort();
+    shapes.dedup();
+    let accepted = if shapes.is_empty() {
+        "a matching union branch".to_string()
+    } else {
+        shapes.join(" or ")
+    };
+    errs.push(format!(
+        "{path}: expected one of: {accepted}, got {}",
+        value_type(value)
+    ));
+}
+
+/// Collect concise, user-facing shape names for a union diagnostic.
+fn collect_schema_shapes(schema: &Schema, root: &RootSchema, out: &mut Vec<String>) {
+    let Schema::Object(obj) = schema else {
+        if matches!(schema, Schema::Bool(true)) {
+            out.push("any value".to_string());
+        }
+        return;
+    };
+    if let Some(reference) = &obj.reference {
+        if let Some(def) = root.definitions.get(ref_name(reference)) {
+            collect_schema_shapes(def, root, out);
+        }
+        return;
+    }
+    if let Some(types) = &obj.instance_type {
+        match types {
+            SingleOrVec::Single(instance) => out.push(instance_type_name(instance)),
+            SingleOrVec::Vec(instances) => {
+                out.extend(instances.iter().map(instance_type_name));
+            }
+        }
+        return;
+    }
+    if obj.object.is_some() {
+        out.push("table/object".to_string());
+        return;
+    }
+    if obj.array.is_some() {
+        out.push("array".to_string());
+        return;
+    }
+    if let Some(sub) = &obj.subschemas {
+        for branch in sub
+            .all_of
+            .iter()
+            .flatten()
+            .chain(sub.any_of.iter().flatten())
+            .chain(sub.one_of.iter().flatten())
+        {
+            collect_schema_shapes(branch, root, out);
+        }
+    }
+}
+
+fn expected_type(obj: &SchemaObject, value: &serde_json::Value) -> Option<String> {
+    let types = obj.instance_type.as_ref()?;
+    let mut names = match types {
+        SingleOrVec::Single(t) => vec![instance_type_name(t)],
+        SingleOrVec::Vec(ts) => ts.iter().map(instance_type_name).collect(),
+    };
+    if !value.is_null() && names.len() > 1 {
+        names.retain(|name| name != "null");
+    }
+    Some(names.join(" or "))
+}
+
+fn instance_type_name(instance: &InstanceType) -> String {
+    match instance {
+        InstanceType::Null => "null",
+        InstanceType::Boolean => "boolean",
+        InstanceType::Object => "table/object",
+        InstanceType::Array => "array",
+        InstanceType::Number => "number",
+        InstanceType::Integer => "integer",
+        InstanceType::String => "string",
+    }
+    .to_string()
+}
+
+fn value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "table/object",
+    }
+}
+
+fn value_matches_type(value: &serde_json::Value, expected: &str) -> bool {
+    expected.split(" or ").any(|kind| match kind {
+        "number" => matches!(value, serde_json::Value::Number(_)),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        other => value_type(value) == other,
+    })
 }
 
 /// Mirror of `from_str_validated`: trim + ASCII-lowercase, match canonical
@@ -456,6 +709,32 @@ fn join_key(path: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    struct UnionDocument {
+        value: StringOrObject,
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    #[serde(untagged)]
+    enum StringOrObject {
+        String(String),
+        Object(UnionObject),
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    struct UnionObject {
+        command: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    struct StrictStringDocument {
+        value: String,
+    }
 
     /// Structural walk of the schema (no TOML document): collect every
     /// `(path, enum name)` pair reachable from the root. Maps contribute a `*`
@@ -622,11 +901,29 @@ mod tests {
         // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
         // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
         // (WeatherUnits).
-        // 90 → 91 (THE-32): `[git] submodules` (SubmoduleMode) — lifecycle
+        // 90 → 91 (THE-56): `[autopilot] open_as` (AutopilotOpenAs).
+        // 90 → 91 (THE-11): `[[tools]] drawer_scope` (DrawerScope) — which
+        // eligible catalog entries can occupy the bottom drawer.
+        // 91 → 92 (THE-17): `[editor] provider` (EditorProvider) — the
+        // logical external-editor handoff implementation.
+        // 92 → 93: `[database] migration_authority` (MigrationAuthority) — which
+        // process kind may advance the shared state schema. Added after an
+        // unlanded branch's worker migrated the live database out from under
+        // main and locked the supervisor's own CLI out of the roster.
+        // 93 → 94 (THE-23): `[sandbox] devcontainer`
+        // (DevcontainerMode) — repo-authored devcontainer overlay mode.
+        // 94 → 95 (THE-59): `[voice] kind` (VoiceKind — generic command
+        // provider).
+        // 96 → 97 (THE-48): `[ci.autofix] mode` (CiAutofixMode). The provider
+        // enum was already present on main.
+        // 97 → 98 (THE-60): `[toolchain.mise] inject` (MiseInject). Both
+        // branches independently claimed the 96 → 97 slot; merged, each enum is
+        // still present, so the ledger records them in turn.
+        // 98 → 99 (THE-32): `[git] submodules` (SubmoduleMode) — lifecycle
         // initialization policy, trusted config only.
         assert_eq!(
             defs.len(),
-            91,
+            99,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -664,6 +961,7 @@ mod tests {
         has("lifecycle.eager", "EagerScope");
         has("sandbox.failover", "FailoverMode");
         has("toolchain.mode", "ToolchainMode");
+        has("toolchain.mise.inject", "MiseInject");
         has("issues.provider", "IssueProviderKind");
         has("ui.sidebar_focus_detail", "FocusDetail");
         // Maps via additionalProperties.
@@ -695,6 +993,88 @@ mod tests {
     }
 
     // ---- behavior ----------------------------------------------------------
+
+    #[test]
+    fn union_accepts_each_shape_and_reports_only_the_union_on_a_miss() {
+        assert!(
+            validate_schema_value::<UnionDocument>(&serde_json::json!({ "value": "echo ok" }))
+                .is_empty()
+        );
+        assert!(
+            validate_schema_value::<UnionDocument>(
+                &serde_json::json!({ "value": { "command": "echo ok" } })
+            )
+            .is_empty()
+        );
+
+        let errs = validate_schema_value::<UnionDocument>(
+            &serde_json::json!({ "value": ["neither shape"] }),
+        );
+        assert_eq!(
+            errs,
+            ["value: expected one of: string or table/object, got array"]
+        );
+
+        // Exercise the `oneOf` field directly as schemars uses `anyOf` for
+        // serde's untagged enums. Config validation intentionally gives both
+        // union spellings the same any-clean-branch semantics.
+        let string = SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            ..Default::default()
+        };
+        let object = SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            ..Default::default()
+        };
+        let one_of = SchemaObject {
+            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                one_of: Some(vec![Schema::Object(string), Schema::Object(object)]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let root = schemars::schema_for!(StrictStringDocument);
+        let mut errs = Vec::new();
+        walk_object(
+            &one_of,
+            &root,
+            &serde_json::json!(false),
+            "value",
+            &mut errs,
+            true,
+        );
+        assert_eq!(
+            errs,
+            ["value: expected one of: string or table/object, got boolean"]
+        );
+    }
+
+    #[test]
+    fn hooks_list_entries_accept_both_union_shapes() {
+        let body = r#"
+[hooks]
+pre_create = [
+  "echo shorthand",
+  { command = "echo object", timeout_secs = 30, on_failure = "block" },
+]
+"#;
+        assert!(validate_str(body).is_empty(), "{:#?}", validate_str(body));
+
+        let errs = validate_str("[hooks]\npre_create = [42]\n");
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(errs[0].contains("hooks.pre_create[0]"), "{errs:#?}");
+        assert!(
+            errs[0].contains("expected one of: string or table/object, got integer"),
+            "{errs:#?}"
+        );
+    }
+
+    #[test]
+    fn non_union_types_remain_strict() {
+        let errs =
+            validate_schema_value::<StrictStringDocument>(&serde_json::json!({ "value": false }));
+        assert_eq!(errs, ["value: expected string, got boolean"]);
+    }
 
     #[test]
     fn newly_covered_keys_error_with_dotted_path_and_valid_set() {
@@ -731,6 +1111,7 @@ mod tests {
             ("[[forges]]\nkind = \"forgejo\"\n", true),
             ("[[forges]]\nkind = \"gitea\"\n", true),
             ("[[forges]]\nkind = \"github\"\n", false),
+            ("[media]\nbackend = \"spotify\"\n", true),
             ("[media]\nbackend = \"jellyfin\"\n", true),
             ("[media]\nbackend = \"mpv\"\n", false),
             ("[sandbox]\nbackend = \"wsl\"\n", true),
@@ -827,6 +1208,27 @@ mod tests {
         assert!(errs[0].contains("rejected on load"), "{errs:?}");
     }
 
+    #[test]
+    fn legacy_project_config_keys_are_known_compatibility_diagnostics() {
+        let errs = validate_str(
+            r#"workspaces_dir = "/legacy"
+[ui]
+confirm_delete_workspace = false
+sidebar_workspace_sort = "attention"
+[workspace.repo]
+"#,
+        );
+        assert!(!errs.iter().any(|e| e.contains("unknown key")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("workspaces_dir") && e.contains("projects_dir"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("workspace.repo") && e.contains("project.repo"))
+        );
+    }
+
     /// Walker matching == `from_str_validated` matching by construction: both
     /// lowercase+trim the input, so every canonical value and alias must
     /// already be its own normalized form.
@@ -889,17 +1291,32 @@ command = "worker --run"
 [[pipeline.stages]]
 name = "architect"
 agent = "worker"
-prompt = "Chunk {issue_title} into {artifact}"
+prompt = "Row {row}: chunk {issue_title} into {artifact}, then `thegn dispatch report {row}`"
 next = "code"
 
 [[pipeline.stages]]
 name = "code"
 agent = "worker"
-prompt = "Implement {parent_artifact} for stage {stage}"
+prompt = "Row {row}: implement {parent_artifact} for {stage}, then `thegn dispatch report {row}`"
 concurrency = 3
 on_blocked = "escalate"
 "#;
         assert!(validate_str(body).is_empty(), "{:#?}", validate_str(body));
+
+        // The handoff-contract channel: drop the report instruction and the
+        // stage can no longer produce a closable row, so validation must say so
+        // even though the org chart is still perfectly well-formed.
+        let no_contract = body.replace(", then `thegn dispatch report {row}`", "");
+        let errs = validate_str(&no_contract);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("dispatch report") && e.contains("architect")),
+            "{errs:#?}"
+        );
+        // And dropping `{row}` is reported as its own, separate gap.
+        let no_row = body.replace("Row {row}: ", "").replace(" {row}", " <id>");
+        let errs = validate_str(&no_row);
+        assert!(errs.iter().any(|e| e.contains("{row}")), "{errs:#?}");
 
         // Schema walk: an unknown `on_blocked` spelling.
         let errs = validate_str(&body.replace("\"escalate\"", "\"retry\""));

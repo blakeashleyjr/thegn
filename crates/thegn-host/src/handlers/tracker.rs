@@ -270,8 +270,30 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let branch = wt::dedupe(&raw_branch, &taken);
             let path = wt::worktree_path(&root, &branch, &cfg2);
 
-            if let Err(e) = crate::git_worktree::add_checked(&root, &branch, &base, &path, &cfg2) {
-                thegn_core::msg::warn(&format!("agent dispatch: {e}"));
+            let pre = crate::worktree_lifecycle::run_event(
+                &cfg2,
+                &root,
+                &path,
+                &branch,
+                &repo::repo_slug(&root),
+                thegn_core::hooks::HookEvent::PreCreate,
+                thegn_core::hooks::HookExecutionMode::User,
+            );
+            if pre.blocked() {
+                thegn_core::msg::warn(&format!("agent dispatch: {}", pre.message()));
+                return;
+            }
+
+            if let Err(e) = wt::add_checked_with_state(&root, &branch, &base, &path, &cfg2) {
+                let message = crate::worktree_lifecycle::create_failure_with_add_state(
+                    format!("agent dispatch: {}", e.message),
+                    &cfg2,
+                    &root,
+                    &path,
+                    &branch,
+                    e.branch_created,
+                );
+                thegn_core::msg::warn(&message);
                 return;
             }
             if let Err(e) = crate::git_worktree::initialize(&cfg2, &root, &path, None) {
@@ -298,7 +320,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let rendered_prompt =
                 render_prompt(default_prompt(TaskKind::Issue), &vars).unwrap_or_default();
 
-            let Ok(mut spec) = crate::direnv_warm::launch_spec_synced_with(
+            let mut spec = match crate::direnv_warm::launch_spec_synced_with(
                 &cfg2,
                 &wt_str,
                 Some(&branch),
@@ -311,8 +333,19 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     suppress_agent_record: false,
                     stage: None,
                 },
-            ) else {
-                return;
+            ) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch launch spec failed: {error}"),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
             };
 
             // Inject issue context for the agent.
@@ -324,11 +357,37 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
 
             let slug = repo::repo_slug(&root);
             let tab = repo::branch_tab(&slug, &branch);
+            let root_s = root.to_string_lossy();
 
-            // Register the dispatch in the DB.
-            if let Ok(db) = thegn_core::db::Db::open() {
-                let root_s = root.to_string_lossy();
-                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            // Register the dispatch in the DB. A missing/failed primary row
+            // leaves no usable create result, so force-clean the speculative
+            // checkout while preserving the original error in the warning.
+            let db = match thegn_core::db::Db::open() {
+                Ok(db) => db,
+                Err(error) => {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch database open failed: {error}"),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
+            };
+            if let Err(error) = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None) {
+                let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                    format!("agent dispatch registration failed: {error}"),
+                    &cfg2,
+                    &root,
+                    &path,
+                    &branch,
+                );
+                thegn_core::msg::warn(&message);
+                return;
+            }
+            {
                 // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let _ = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
                     &issue_id,
@@ -336,6 +395,26 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     &agent_name,
                 ));
                 let _ = db.link_issue(&wt_str, &issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+                if let Err(report) = crate::worktree_lifecycle::schedule_post_create(
+                    &cfg2,
+                    &root,
+                    &path,
+                    &branch,
+                    &slug,
+                    Some(&db),
+                    None,
+                ) {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch post_create: {}", report.message()),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    let _ = db.del_worktree(&wt_str);
+                    thegn_core::msg::warn(&message);
+                    return;
+                }
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
             let env = crate::wizard::ambient_env_name_live(&cfg2, &root);

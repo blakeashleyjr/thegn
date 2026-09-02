@@ -61,6 +61,10 @@ pub struct DevContainer {
     /// [`detect_and_parse`]; `None` when parsed from bare text). Build
     /// `context`/`dockerfile` and compose-file paths resolve against it.
     pub config_dir: Option<PathBuf>,
+    /// Absolute path to the selected config file when loaded from a worktree.
+    pub(crate) config_path: Option<PathBuf>,
+    /// Top-level keys retained for the shared field-disposition inventory.
+    pub(crate) source_keys: std::collections::BTreeSet<String>,
 }
 
 /// Where a dev container's image is sourced from.
@@ -177,6 +181,8 @@ pub enum ParseError {
     Json(String),
     /// The top-level value was not a JSON object.
     NotAnObject,
+    /// The selected file could not be read.
+    Read { path: PathBuf, error: String },
 }
 
 impl std::fmt::Display for ParseError {
@@ -184,6 +190,9 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::Json(e) => write!(f, "invalid devcontainer.json: {e}"),
             ParseError::NotAnObject => write!(f, "devcontainer.json is not a JSON object"),
+            ParseError::Read { path, error } => {
+                write!(f, "{}: cannot read: {error}", path.display())
+            }
         }
     }
 }
@@ -195,39 +204,38 @@ impl std::error::Error for ParseError {}
 /// the first `.devcontainer/<name>/devcontainer.json` (sorted). Pure over the
 /// filesystem; returns the path without reading it.
 pub fn detect(worktree: &Path) -> Option<PathBuf> {
-    let primary = worktree.join(".devcontainer/devcontainer.json");
-    if primary.is_file() {
-        return Some(primary);
-    }
-    let dotfile = worktree.join(".devcontainer.json");
-    if dotfile.is_file() {
-        return Some(dotfile);
-    }
-    // `.devcontainer/<name>/devcontainer.json` — pick the lexicographically
-    // first sub-config so the choice is deterministic.
-    let dir = worktree.join(".devcontainer");
-    let mut subs: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path().join("devcontainer.json");
-            p.is_file().then_some(p)
-        })
-        .collect();
-    subs.sort();
-    subs.into_iter().next()
+    crate::devcontainer_select::select_and_parse(worktree, None).selected
 }
 
 /// Detect + read + parse in one step. Returns `None` when no devcontainer.json
 /// exists; propagates parse errors otherwise.
 pub fn detect_and_parse(worktree: &Path) -> Option<Result<DevContainer, ParseError>> {
-    let path = detect(worktree)?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    Some(parse(&text).map(|mut dc| {
-        dc.config_dir = path.parent().map(Path::to_path_buf);
-        dc
-    }))
+    let selected = crate::devcontainer_select::select_and_parse(worktree, None);
+    if selected.candidates.is_empty() {
+        return None;
+    }
+    Some(match selected.error {
+        Some(crate::devcontainer_select::SelectionError::Ambiguous(paths)) => {
+            Err(ParseError::Json(format!(
+                "ambiguous devcontainer configs: {}",
+                paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        }
+        Some(crate::devcontainer_select::SelectionError::Read { path, error }) => {
+            Err(ParseError::Read { path, error })
+        }
+        Some(crate::devcontainer_select::SelectionError::Parse { error, .. }) => Err(error),
+        Some(crate::devcontainer_select::SelectionError::SelectorNotFound { selector, .. }) => {
+            Err(ParseError::Json(format!(
+                "devcontainer selector {selector:?} matched no config"
+            )))
+        }
+        None => Ok(selected.config.expect("successful selection has a config")),
+    })
 }
 
 /// Parse devcontainer.json (JSONC) text into a normalized [`DevContainer`].
@@ -288,7 +296,26 @@ pub fn parse(text: &str) -> Result<DevContainer, ParseError> {
             .unwrap_or_default(),
         override_command: obj.get("overrideCommand").and_then(Value::as_bool),
         config_dir: None,
+        config_path: None,
+        source_keys: obj.keys().cloned().collect(),
     })
+}
+
+/// Stable identifier for a repo/config pair, suitable for `${devcontainerId}`
+/// and deterministic volume names. The separator prevents path concatenation
+/// collisions and no file contents are included, so edits keep the same id.
+pub fn devcontainer_id(repo_root: &Path, config_relative_path: &Path) -> String {
+    let key = format!(
+        "{}\0{}",
+        repo_root.to_string_lossy(),
+        config_relative_path.to_string_lossy()
+    );
+    crate::util::short_hash(&key, 12)
+}
+
+/// Classify every source key using the shared inventory table.
+pub fn recognized_unapplied(dc: &DevContainer) -> crate::devcontainer_inventory::FieldInventory {
+    crate::devcontainer_inventory::classify_keys(&dc.source_keys)
 }
 
 /// Substitute the devcontainer variable syntax (`${...}`) in a string against a
@@ -296,7 +323,52 @@ pub fn parse(text: &str) -> Result<DevContainer, ParseError> {
 /// Pure — the environment lookups are supplied by the caller so this stays
 /// testable.
 pub fn substitute(input: &str, ctx: &SubstCtx) -> String {
+    substitute_with_report(input, ctx, &|_| true).0
+}
+
+/// Names of local environment variables that were denied during expansion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubstitutionReport {
+    pub blocked_local_env: std::collections::BTreeSet<String>,
+}
+
+/// Expand variables while enforcing a caller-supplied local environment
+/// allowlist. Blocked values become empty and only their names are reported.
+pub fn substitute_with_report(
+    input: &str,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+) -> (String, SubstitutionReport) {
+    substitute_with_id_report(input, ctx, None, local_env_allowed)
+}
+
+/// Expand variables with `${devcontainerId}` supplied by the selected config.
+pub fn substitute_with_devcontainer_id(
+    input: &str,
+    ctx: &SubstCtx,
+    devcontainer_id: &str,
+) -> String {
+    substitute_with_devcontainer_id_report(input, ctx, devcontainer_id, &|_| true).0
+}
+
+/// Expand variables with both the selected config id and local-env policy.
+pub fn substitute_with_devcontainer_id_report(
+    input: &str,
+    ctx: &SubstCtx,
+    devcontainer_id: &str,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+) -> (String, SubstitutionReport) {
+    substitute_with_id_report(input, ctx, Some(devcontainer_id), local_env_allowed)
+}
+
+fn substitute_with_id_report(
+    input: &str,
+    ctx: &SubstCtx,
+    devcontainer_id: Option<&str>,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+) -> (String, SubstitutionReport) {
     let mut out = String::with_capacity(input.len());
+    let mut report = SubstitutionReport::default();
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -306,7 +378,7 @@ pub fn substitute(input: &str, ctx: &SubstCtx) -> String {
             && let Some(end) = input[i + 2..].find('}')
         {
             let name = &input[i + 2..i + 2 + end];
-            out.push_str(&ctx.resolve(name));
+            out.push_str(&ctx.resolve(name, devcontainer_id, local_env_allowed, &mut report));
             i = i + 2 + end + 1;
             continue;
         }
@@ -316,7 +388,7 @@ pub fn substitute(input: &str, ctx: &SubstCtx) -> String {
         out.push(ch);
         i += ch.len_utf8();
     }
-    out
+    (out, report)
 }
 
 /// Context for [`substitute`]: the values behind the devcontainer `${...}`
@@ -334,7 +406,13 @@ pub struct SubstCtx<'a> {
 }
 
 impl SubstCtx<'_> {
-    fn resolve(&self, name: &str) -> String {
+    fn resolve(
+        &self,
+        name: &str,
+        devcontainer_id: Option<&str>,
+        local_env_allowed: &dyn Fn(&str) -> bool,
+        report: &mut SubstitutionReport,
+    ) -> String {
         let basename = |p: &str| {
             p.trim_end_matches('/')
                 .rsplit('/')
@@ -347,9 +425,17 @@ impl SubstCtx<'_> {
             "containerWorkspaceFolder" => self.container_workspace_folder.clone(),
             "localWorkspaceFolderBasename" => basename(&self.local_workspace_folder),
             "containerWorkspaceFolderBasename" => basename(&self.container_workspace_folder),
+            "devcontainerId" => devcontainer_id
+                .map(str::to_string)
+                .unwrap_or_else(|| "${devcontainerId}".into()),
             _ => {
                 if let Some(var) = name.strip_prefix("localEnv:") {
-                    (self.local_env)(var).unwrap_or_default()
+                    if local_env_allowed(var) {
+                        (self.local_env)(var).unwrap_or_default()
+                    } else {
+                        report.blocked_local_env.insert(var.to_string());
+                        String::new()
+                    }
                 } else if let Some(var) = name.strip_prefix("containerEnv:") {
                     (self.container_env)(var).unwrap_or_default()
                 } else {
@@ -863,6 +949,19 @@ mod tests {
     }
 
     #[test]
+    fn selected_read_and_parse_failures_are_surfaced() {
+        let root = std::env::temp_dir().join(format!("tg-dc-errors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::write(root.join(".devcontainer/devcontainer.json"), "{ broken").unwrap();
+        assert!(matches!(
+            detect_and_parse(&root),
+            Some(Err(ParseError::Json(_)))
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn substitute_variables() {
         let ctx = SubstCtx {
             local_workspace_folder: "/home/u/proj".into(),
@@ -883,6 +982,47 @@ mod tests {
         assert_eq!(substitute("m=${localEnv:MISSING}", &ctx), "m=");
         // Unknown variables are preserved literally.
         assert_eq!(substitute("${weird}", &ctx), "${weird}");
+    }
+
+    #[test]
+    fn substitution_reports_blocked_local_env_and_supports_stable_id() {
+        let ctx = SubstCtx {
+            local_workspace_folder: "/work/repo".into(),
+            container_workspace_folder: "/workspaces/repo".into(),
+            local_env: &|name| (name == "SAFE").then(|| "ok".into()),
+            container_env: &|_| None,
+        };
+        let (value, report) = substitute_with_devcontainer_id_report(
+            "${localEnv:SAFE}/${localEnv:SECRET}/${devcontainerId}",
+            &ctx,
+            "abc123",
+            &|name| name == "SAFE",
+        );
+        assert_eq!(value, "ok//abc123");
+        assert_eq!(
+            report.blocked_local_env.iter().collect::<Vec<_>>(),
+            [&"SECRET".to_string()]
+        );
+        assert_eq!(
+            devcontainer_id(
+                Path::new("/repo"),
+                Path::new(".devcontainer/a/devcontainer.json")
+            ),
+            devcontainer_id(
+                Path::new("/repo"),
+                Path::new(".devcontainer/a/devcontainer.json")
+            )
+        );
+        assert_ne!(
+            devcontainer_id(
+                Path::new("/repo"),
+                Path::new(".devcontainer/a/devcontainer.json")
+            ),
+            devcontainer_id(
+                Path::new("/repo"),
+                Path::new(".devcontainer/b/devcontainer.json")
+            )
+        );
     }
 
     #[test]

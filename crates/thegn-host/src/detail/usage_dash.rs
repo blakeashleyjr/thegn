@@ -82,6 +82,7 @@ fn shell(content: DetailContent) -> DetailOverlay {
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
+        ci_autofix: None,
     };
     ov.rows = ov.content_rows().clamp(5, 30);
     ov

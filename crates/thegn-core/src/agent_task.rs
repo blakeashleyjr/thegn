@@ -964,6 +964,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         }
     }
 
@@ -1641,6 +1643,8 @@ mod tests {
                     model: None,
                     env: Default::default(),
                     permissions: Vec::new(),
+                    drawer_scope: None,
+                    drawer_cwd: None,
                 })
                 .collect(),
             // Explicitly empty: `post_process` seeds defaults into both lists, and
@@ -1701,6 +1705,8 @@ mod tests {
             model: None,
             env: Default::default(),
             permissions: Vec::new(),
+            drawer_scope: None,
+            drawer_cwd: None,
         }];
         assert_eq!(
             resolve_agent(&cfg, "codex", "").as_deref(),
@@ -1733,6 +1739,8 @@ mod tests {
                 model: None,
                 env: Default::default(),
                 permissions: Vec::new(),
+                drawer_scope: None,
+                drawer_cwd: None,
             }],
             tools: Vec::new(),
             ..Config::default()

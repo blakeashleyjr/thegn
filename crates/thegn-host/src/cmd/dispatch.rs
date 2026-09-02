@@ -27,6 +27,7 @@ use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_chunk;
+use thegn_core::pipeline_reap;
 use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
@@ -81,6 +82,77 @@ pub enum Action {
         #[arg(long)]
         force: bool,
         /// Emit the created row as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconcile active rows against reality: which ones still have a live
+    /// worker, which finished, and which died without handing anything off.
+    ///
+    /// This is the join a supervisor otherwise does by hand across three
+    /// places — the roster, the daemon's live sessions, and each row's
+    /// artifact in git. Dry-run by default; `--apply` performs only the
+    /// unambiguous transitions. A row whose artifact IS committed but which
+    /// filed no report is never closed automatically: that one needs a person.
+    Reap {
+        /// Perform the unambiguous transitions instead of only reporting them.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claim a slot and append the row in ONE atomic step — the safe
+    /// alternative to `list` + judgment + `put`, which races with another
+    /// monitor and with your own restart.
+    ///
+    /// Refuses when an equivalent row is already open (same issue/stage/
+    /// worktree/artifact) or when the stage's `concurrency` budget is full.
+    /// Rows whose worker has EXITED but which nobody closed still occupy their
+    /// slot — that is deliberate: they are unreconciled work, not free capacity.
+    Claim {
+        /// Tracker issue id (`"<provider>:<key>"`, e.g. `linear:THE-57`).
+        issue_id: String,
+        /// The worktree the agent works in (path).
+        worktree_path: String,
+        /// An `[[agents]]`/`[[tools]]` name (or a provider id).
+        agent_name: String,
+        /// The `[[pipeline.stages]]` step this row is (e.g. `architect`). Its
+        /// configured `concurrency` is the budget enforced here.
+        #[arg(long)]
+        stage: String,
+        /// Path to the handoff artifact this row will produce. This is what
+        /// distinguishes parallel chunks from a re-dispatch — give each
+        /// concurrent worker its own.
+        #[arg(long)]
+        artifact: Option<String>,
+        /// The roster row this one was chunked out of.
+        #[arg(long)]
+        parent: Option<i64>,
+        /// The chunk file this row dispatches under.
+        #[arg(long)]
+        chunk: Option<String>,
+        /// Create the row even though it duplicates an open one. Requires a
+        /// reason, which is recorded as an audit note on the new row.
+        #[arg(long, value_name = "REASON")]
+        allow_duplicate: Option<String>,
+        /// Emit the created row (or the refusal) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take, renew, release or inspect the pipeline monitor lease — the guard
+    /// that stops two Leads driving one pipeline and filling the same slots.
+    Lease {
+        /// What to do: `acquire` | `release` | `show`.
+        action: String,
+        /// Who is asking (a stable id for this monitor process).
+        #[arg(long)]
+        owner: Option<String>,
+        /// Seconds the lease stays valid; renew before it lapses. A crashed
+        /// holder's lease expires on its own.
+        #[arg(long, default_value_t = 300)]
+        ttl: i64,
+        /// The lease name — one pipeline per name.
+        #[arg(long, default_value = "lead")]
+        name: String,
         #[arg(long)]
         json: bool,
     },
@@ -185,6 +257,36 @@ pub enum Action {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { active, json } => list(active, json),
+        Action::Reap { apply, json } => reap(cfg, apply, json),
+        Action::Claim {
+            issue_id,
+            worktree_path,
+            agent_name,
+            stage,
+            artifact,
+            parent,
+            chunk,
+            allow_duplicate,
+            json,
+        } => claim(
+            cfg,
+            &issue_id,
+            &worktree_path,
+            &agent_name,
+            &stage,
+            artifact.as_deref(),
+            parent,
+            chunk.as_deref(),
+            allow_duplicate.as_deref(),
+            json,
+        ),
+        Action::Lease {
+            action,
+            owner,
+            ttl,
+            name,
+            json,
+        } => lease(&action, owner.as_deref(), ttl, &name, json),
         Action::Put {
             issue_id,
             worktree_path,
@@ -432,6 +534,148 @@ fn chunk_name(chunk_path: &str) -> &str {
         .unwrap_or("")
 }
 
+/// `dispatch claim` — the atomic slot check plus insert.
+///
+/// The stage's budget comes from `[[pipeline.stages]]`, so the number enforced
+/// is the one the operator configured; an unknown stage name has no budget and
+/// only the duplicate rule applies (naming a stage thegn does not know is a
+/// supervisor bug, but refusing every dispatch for it would be a worse one).
+#[allow(clippy::too_many_arguments)]
+fn claim(
+    cfg: &Config,
+    issue_id: &str,
+    worktree_path: &str,
+    agent_name: &str,
+    stage: &str,
+    artifact: Option<&str>,
+    parent: Option<i64>,
+    chunk: Option<&str>,
+    allow_duplicate: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let db = Db::open()?;
+    let limit = cfg
+        .pipeline
+        .stage(stage)
+        .map(|s| s.concurrency)
+        .unwrap_or(0);
+    let outcome = db.claim_dispatch(
+        NewDispatch {
+            issue_id,
+            worktree_path,
+            agent_name,
+            stage: Some(stage),
+            parent_id: parent,
+            session_id: None,
+            artifact_path: artifact,
+            chunk_path: chunk,
+        },
+        limit,
+        allow_duplicate,
+    )?;
+    match outcome {
+        Ok(id) => {
+            let row = db.get_dispatch(id)?;
+            if json {
+                let mut v = serde_json::json!({ "granted": true, "id": id });
+                if let Some(r) = &row {
+                    v["row"] = serde_json::to_value(r)?;
+                }
+                if let Some(why) = allow_duplicate {
+                    v["allowed_duplicate"] = serde_json::json!(why);
+                }
+                return super::emit_json(&v);
+            }
+            if allow_duplicate.is_some() {
+                outln!("dispatch {id} claimed (duplicate explicitly authorized)");
+            } else {
+                outln!("dispatch {id} claimed for stage {stage}");
+            }
+            Ok(())
+        }
+        Err(decision) => {
+            if json {
+                super::emit_json(&serde_json::json!({
+                    "granted": false,
+                    "reason": decision.reason(),
+                }))?;
+            }
+            // Exit 2 = retryable, matching `verify`/`wait`: the supervisor's
+            // correct response is to reconcile and try again, not to abort.
+            anyhow::bail!(
+                "dispatch refused: {}\n(exit 2 — reconcile and retry)",
+                decision.reason()
+            )
+        }
+    }
+}
+
+/// `dispatch lease` — monitor ownership.
+fn lease(action: &str, owner: Option<&str>, ttl: i64, name: &str, json: bool) -> Result<()> {
+    let db = Db::open()?;
+    match action {
+        "show" => {
+            let held = db.pipeline_lease_holder(name)?;
+            if json {
+                return super::emit_json(&serde_json::json!({
+                    "name": name,
+                    "owner": held.as_ref().map(|(o, _)| o.clone()),
+                    "expires_in_ms": held.as_ref().map(|(_, ms)| *ms),
+                }));
+            }
+            match held {
+                Some((o, ms)) => outln!("lease {name}: held by {o} ({}s left)", ms / 1000),
+                None => outln!("lease {name}: free"),
+            }
+            Ok(())
+        }
+        "acquire" | "release" => {
+            let owner = owner.ok_or_else(|| {
+                anyhow::anyhow!("--owner is required for `{action}` (a stable id for this monitor)")
+            })?;
+            if action == "release" {
+                let dropped = db.release_pipeline_lease(name, owner)?;
+                if json {
+                    return super::emit_json(&serde_json::json!({ "released": dropped }));
+                }
+                outln!(
+                    "lease {name}: {}",
+                    if dropped {
+                        "released"
+                    } else {
+                        "not held by this owner — nothing released"
+                    }
+                );
+                return Ok(());
+            }
+            match db.acquire_pipeline_lease(name, owner, ttl)? {
+                Ok(()) => {
+                    if json {
+                        return super::emit_json(
+                            &serde_json::json!({ "acquired": true, "owner": owner, "ttl": ttl }),
+                        );
+                    }
+                    outln!("lease {name}: held by {owner} for {ttl}s");
+                    Ok(())
+                }
+                Err(holder) => {
+                    if json {
+                        super::emit_json(
+                            &serde_json::json!({ "acquired": false, "holder": holder }),
+                        )?;
+                    }
+                    anyhow::bail!(
+                        "lease {name} is held by {holder} — another monitor is already driving \
+                         this pipeline. Stop it, or wait for its lease to lapse, before starting \
+                         a second one.\n(exit 2 — retryable)"
+                    )
+                }
+            }
+        }
+        other => anyhow::bail!("unknown lease action {other:?} (expected: acquire, release, show)"),
+    }
+}
+
 fn list(active: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
     let mut rows = db.list_dispatches()?;
@@ -445,8 +689,12 @@ fn list(active: bool, json: bool) -> Result<()> {
         // omitted rather than emitted empty (an empty list would read as "this
         // chunk touches nothing", the opt-out, which is a different claim).
         let mut vals: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        let now_ms = thegn_core::util::now_ms();
         for d in &rows {
             let mut v = serde_json::to_value(d)?;
+            // The derived liveness, so a supervisor need not re-implement the
+            // exited-vs-running distinction (and get it wrong, as one did).
+            v["liveness"] = serde_json::json!(pipeline_run::row_liveness(d, now_ms).token());
             if let Some(scope) = d
                 .chunk_path
                 .as_deref()
@@ -465,14 +713,28 @@ fn list(active: bool, json: bool) -> Result<()> {
         outln!("no dispatches");
         return Ok(());
     }
+    let now_ms = thegn_core::util::now_ms();
+    // How many active rows have an exited worker: the number that turns "121
+    // running" from a workload into a backlog. Printed once, after the table.
+    let mut stale = 0usize;
     for d in &rows {
+        // A row whose worker exited but which nobody closed prints its status
+        // with the exit made explicit — `running!exited` rather than a bare
+        // `running` that reads identically to a live worker.
+        let status_cell = match pipeline_run::row_liveness(d, now_ms) {
+            pipeline_run::RowLiveness::ExitedUnverified { .. } => {
+                stale += 1;
+                format!("{}!exited", d.status.as_str())
+            }
+            _ => d.status.as_str().to_string(),
+        };
         // The pipeline columns print as `-` when absent rather than collapsing
         // the row's shape, so the table stays column-aligned for a roster that
         // mixes pipeline and plain dispatches.
         outln!(
             "{}  {}  {}  {}  {}  {}  {}  {}  {}",
             d.id,
-            d.status.as_str(),
+            status_cell,
             d.stage.as_deref().unwrap_or("-"),
             d.parent_id
                 .map(|p| p.to_string())
@@ -482,6 +744,13 @@ fn list(active: bool, json: bool) -> Result<()> {
             d.worktree_path,
             note_cell(d.note.as_deref()),
             chunk_cell(d.chunk_path.as_deref()),
+        );
+    }
+    if stale > 0 {
+        outln!(
+            "\n{stale} row(s) marked `!exited`: the worker is gone but the row is still open. \
+             These occupy a slot and are NOT free capacity — run `thegn dispatch verify <id>` \
+             and close each with `set-status done|failed` before dispatching more."
         );
     }
     Ok(())
@@ -646,6 +915,139 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         tracked,
         dirty,
         report_present,
+    }
+}
+
+/// `dispatch reap` — reconcile active rows against the daemon and git.
+///
+/// The three-way join a supervisor otherwise performs by hand. Liveness comes
+/// from the daemon when it is reachable; when it is NOT, every session reads as
+/// absent, which is correct — a restarted daemon really has lost them — and is
+/// safe, because a row is only ever auto-closed on a committed artifact plus a
+/// filed report. The genuinely ambiguous case (artifact committed, no report)
+/// is reported and left alone.
+fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (live_ids, daemon_up) = rt.block_on(live_session_ids(cfg));
+    let db = Db::open()?;
+    let rows: Vec<_> = db
+        .list_dispatches()?
+        .into_iter()
+        .filter(|r| r.status.is_active())
+        .collect();
+
+    let plan = pipeline_reap::plan(&rows, |r| {
+        let f = verify_facts(r);
+        pipeline_reap::ReapFacts {
+            session_live: r
+                .session_id
+                .as_deref()
+                .is_some_and(|s| live_ids.iter().any(|l| l == s)),
+            artifact_exists: f.exists,
+            artifact_tracked: f.tracked,
+            report_present: f.report_present,
+        }
+    });
+    let summary = pipeline_reap::summarize(&plan);
+
+    if json {
+        let items: Vec<_> = plan
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "verdict": r.verdict.token(),
+                    "why": match &r.verdict {
+                        pipeline_reap::ReapVerdict::MarkFailed { why }
+                        | pipeline_reap::ReapVerdict::NeedsDecision { why } => Some(*why),
+                        _ => None,
+                    },
+                })
+            })
+            .collect();
+        super::emit_json(&serde_json::json!({
+            "daemon_reachable": daemon_up,
+            "applied": apply,
+            "rows": items,
+            "summary": {
+                "live": summary.live,
+                "close_done": summary.close_done,
+                "mark_failed": summary.mark_failed,
+                "needs_decision": summary.needs_decision,
+            },
+        }))?;
+    } else {
+        if !daemon_up {
+            outln!(
+                "note: no daemon reachable — every session reads as absent. That is correct \\
+                 after a restart, and safe: nothing closes without a committed artifact AND a \\
+                 report."
+            );
+        }
+        for r in &plan {
+            match &r.verdict {
+                pipeline_reap::ReapVerdict::Live => outln!("  {} live", r.id),
+                pipeline_reap::ReapVerdict::MarkFailed { why }
+                | pipeline_reap::ReapVerdict::NeedsDecision { why } => {
+                    outln!("  {} {}: {why}", r.id, r.verdict.token());
+                }
+                v => outln!("  {} {}", r.id, v.token()),
+            }
+        }
+        outln!(
+            "\\n{} live, {} to close done, {} to mark failed, {} need a decision",
+            summary.live,
+            summary.close_done,
+            summary.mark_failed,
+            summary.needs_decision
+        );
+        if !apply && summary.actionable() > 0 {
+            outln!(
+                "(dry run — pass --apply to perform the {} unambiguous transition(s))",
+                summary.actionable()
+            );
+        }
+    }
+
+    if !apply {
+        return Ok(());
+    }
+    for r in &plan {
+        match &r.verdict {
+            pipeline_reap::ReapVerdict::CloseDone => {
+                // Plain, gated `done`: it passes unforced precisely because the
+                // artifact is committed and a report exists.
+                db.update_dispatch_status(r.id, AgentDispatchStatus::Done)?;
+                outln!("dispatch {} → done", r.id);
+            }
+            pipeline_reap::ReapVerdict::MarkFailed { why } => {
+                // best-effort: the note is context; losing it must not block
+                // recording the outcome, which is the thing that matters.
+                let _ = db.append_dispatch_note(r.id, &format!("reaped: {why}"));
+                db.update_dispatch_status(r.id, AgentDispatchStatus::Failed)?;
+                outln!("dispatch {} → failed", r.id);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Live (non-tombstone) session ids, plus whether the daemon answered at all.
+async fn live_session_ids(cfg: &Config) -> (Vec<String>, bool) {
+    match crate::cmd::session::connect(cfg).await {
+        Ok(client) => match client.sessions().await {
+            Ok(sessions) => (
+                sessions
+                    .into_iter()
+                    .filter(|s| s.exited_at_ms.is_none())
+                    .map(|s| s.id)
+                    .collect(),
+                true,
+            ),
+            Err(_) => (Vec::new(), false),
+        },
+        Err(_) => (Vec::new(), false),
     }
 }
 
@@ -1347,6 +1749,8 @@ mod tests {
             note: None,
             chunk_path: None,
             report: None,
+            exit_code: None,
+            exited_at_ms: None,
         }
     }
 

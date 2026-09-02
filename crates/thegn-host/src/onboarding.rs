@@ -1070,7 +1070,7 @@ impl OnboardingWizard {
                     false,
                 ),
                 blank(),
-                note("repo roots power repo discovery in the workspace picker."),
+                note("repo roots power repo discovery in the project picker."),
             ],
             Step::Forge => {
                 let status = match &self.forge {

@@ -25,6 +25,7 @@ pub mod gitfull;
 pub mod gitui;
 pub mod graph;
 pub mod hints;
+pub(crate) mod media;
 pub mod rollback;
 pub mod scope;
 pub mod section_keys;
@@ -102,9 +103,30 @@ pub enum PanelHit {
     Expand,
     /// The i-th actionable row of a section's content.
     Row(Section, usize),
+    /// A painted media transport control. Unlike a row, this is a direct
+    /// operation target and is shared by keyboard and mouse dispatch.
+    MediaAction(MediaAction),
     /// A click on the tab bar: resolved by x-position via `panel_tab_hit`.
     #[allow(dead_code)]
     Tab(PanelTab),
+}
+
+/// Transport controls painted by the Media section. The panel owns only the
+/// intent; `media_ctl` owns the provider dispatch and keeps it off the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaAction {
+    PlayPause,
+    Next,
+    Previous,
+    Shuffle,
+    Loop,
+    VolumeUp,
+    VolumeDown,
+    SeekForward,
+    SeekBack,
+    ChapterNext,
+    ChapterPrev,
+    Fullscreen,
 }
 
 /// One of the accordion sections, in built-in display order.
@@ -570,6 +592,23 @@ pub struct StashRow {
 }
 
 /// The panel's data payload (git + GitHub), rebuilt on background refresh.
+/// TUI projection of one durable watched-review task. Provider identity and the
+/// exact anchor are recovered from the complete cached snapshot during
+/// hydration; lifecycle/prompt/head facts remain owned by the roster row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTaskRow {
+    pub id: i64,
+    pub pr_number: u64,
+    pub repository: String,
+    pub thread_id: String,
+    pub path: String,
+    pub line: Option<u64>,
+    pub role: String,
+    pub status: thegn_core::issue::AgentDispatchStatus,
+    pub source_revision: String,
+    pub worktree_path: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelData {
     pub branch: String,
@@ -599,6 +638,8 @@ pub struct PanelData {
     pub merge_queue: Vec<thegn_core::db::MergeQueueRow>,
     /// `PrQueue` section + statusbar badge. Empty when the queue is unused.
     pub pr_queue: Vec<thegn_core::db::PrQueueRow>,
+    /// Per-thread tasks derived only from the explicit rows above.
+    pub review_tasks: Vec<ReviewTaskRow>,
     /// Now-playing snapshot for the optional `[media]` feature (`Media` section +
     /// statusbar badge). `None` when media is disabled or no player is loaded.
     pub media: Option<thegn_core::media::MediaState>,
@@ -620,6 +661,11 @@ pub struct PanelData {
     /// ("CLEAN" | "BLOCKED" | …) for the PR view's Overview tab.
     pub pr_mergeable: String,
     pub pr_merge_state: String,
+    /// Complete PR review feedback snapshot, when the cache has a matching
+    /// branch/PR/head identity. The compact `threads` field remains the panel
+    /// summary projection.
+    pub review_snapshot: Option<thegn_core::review::PrReviewSnapshot>,
+    pub review_snapshot_status: Option<String>,
     /// Review threads (unresolved first) and open issues, from the PR cache.
     pub threads: Vec<thegn_core::forge::model::ReviewThreadRow>,
     pub issues: Vec<thegn_core::forge::model::IssueRow>,
@@ -713,6 +759,9 @@ pub struct PanelData {
     /// off-loop from the config by hydration (placement kind, region/size, token
     /// presence). Empty without any `[env.*]`.
     pub environments: Vec<crate::env_ui::EnvSnapshot>,
+    /// Presence-only toolchain state for the active worktree. Hydrated from
+    /// the provider cache; no process probe occurs during rendering.
+    pub toolchain: Option<crate::toolchain_ui::ToolchainStatus>,
 }
 
 impl PanelData {
@@ -973,6 +1022,9 @@ pub struct PanelUi {
     /// The Help section's state: which page is docked, and the registry it
     /// renders from (installed at startup, refreshed on config reload).
     pub help: HelpPanelState,
+    /// Interactive state for the docked Media section: source/queue cursors
+    /// and identity-checked asynchronous decoration.
+    pub(crate) media: media::MediaPanelState,
     /// The live accordion order (config-resolved, possibly trimmed) across ALL
     /// tabs. Sections are filtered to the active tab before display.
     /// The numbered jump keys index the ACTIVE TAB's slice. Never empty.
@@ -1064,6 +1116,7 @@ impl Default for PanelUi {
         PanelUi {
             tests: TestPanelState::default(),
             help: HelpPanelState::default(),
+            media: media::MediaPanelState::default(),
             order: SECTION_ORDER.to_vec(),
             tab: PanelTab::default(),
             open: Section::default(),

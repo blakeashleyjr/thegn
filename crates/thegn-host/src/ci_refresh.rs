@@ -11,6 +11,9 @@ use std::sync::Mutex;
 
 use termwiz::terminal::TerminalWaker;
 
+#[path = "ci_autofix.rs"]
+pub(crate) mod ci_autofix;
+
 /// The CI ticker cadence in 500ms slots, from `[ci] poll_interval_secs`.
 /// Clamped to ≥ 5s — every tick is a provider subprocess (`gh run list`), so a
 /// faster cadence would thrash. Pure, so it's unit-tested.
@@ -105,15 +108,15 @@ fn backoff_active(worktree: &str, now: i64) -> bool {
 /// re-poll an open live drill on a still-running run so it updates in place.
 pub(crate) fn on_ci_tick(
     session: &crate::session::Session,
-    cfg: &thegn_core::config::CiConfig,
+    full: &thegn_core::config::Config,
     refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
     waker: &TerminalWaker,
     force: bool,
     bar_detail: &mut Option<crate::detail::DetailOverlay>,
 ) {
-    spawn_ci_cache_refresh(session.clone(), cfg.clone(), Some(waker.clone()), force);
+    spawn_ci_cache_refresh(session.clone(), full.clone(), Some(waker.clone()), force);
     if let Some(run) = bar_detail.as_mut().and_then(|ov| ov.live_ci_repoll()) {
-        crate::actions::spawn_ci_detail(session, cfg, refresh_tx, waker, run);
+        crate::actions::spawn_ci_detail(session, &full.ci, refresh_tx, waker, run);
     }
 }
 
@@ -127,20 +130,21 @@ pub(crate) fn on_ci_tick(
 /// failure backoff; fetch errors surface via [`note_for`].
 pub(crate) fn spawn_ci_cache_refresh(
     session: crate::session::Session,
-    cfg: thegn_core::config::CiConfig,
+    full: thegn_core::config::Config,
     waker: Option<TerminalWaker>,
     force: bool,
 ) {
     crate::sched::spawn_bg(move || {
+        let cfg = full.ci.clone();
         let cwd = crate::hydrate::active_tab_path(&session);
         if cwd.is_dir() {
             let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-            refresh_ci_cache_for(&cwd, &loc, &cfg, waker.as_ref(), force);
+            refresh_ci_cache_for(&cwd, &loc, &cfg, &full, waker.as_ref(), force);
         }
         // The sweep rides the same bg task so provider subprocesses stay
         // serialized (kind to rate limits) and the loop-side call stays one
         // spawn. Sweeping is never forced — the ttl guard is its rate limiter.
-        sweep_one_background(&session, &cwd, &cfg, waker.as_ref());
+        sweep_one_background(&session, &cwd, &cfg, &full, waker.as_ref());
     });
 }
 
@@ -155,6 +159,7 @@ fn sweep_one_background(
     session: &crate::session::Session,
     active: &std::path::Path,
     cfg: &thegn_core::config::CiConfig,
+    full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
 ) {
     let others: Vec<&str> = session
@@ -175,7 +180,7 @@ fn sweep_one_background(
         let loc = thegn_core::remote::GitLoc::for_worktree(p);
         // First worktree that actually fetched (fresh ones are skipped by the
         // guard) ends the sweep — one provider subprocess per tick, max.
-        if refresh_ci_cache_for(p, &loc, cfg, waker, false) {
+        if refresh_ci_cache_for(p, &loc, cfg, full, waker, false) {
             return;
         }
     }
@@ -194,6 +199,7 @@ fn refresh_ci_cache_for(
     host_path: &std::path::Path,
     loc: &thegn_core::remote::GitLoc,
     cfg: &thegn_core::config::CiConfig,
+    full: &thegn_core::config::Config,
     waker: Option<&TerminalWaker>,
     force: bool,
 ) -> bool {
@@ -211,6 +217,12 @@ fn refresh_ci_cache_for(
             return false;
         }
     }
+    let old_runs = db
+        .get_ci_cache(&key)
+        .ok()
+        .flatten()
+        .and_then(|(json, _)| serde_json::from_str::<Vec<thegn_core::ci::CiRun>>(&json).ok())
+        .unwrap_or_default();
     let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
         return false;
     };
@@ -225,6 +237,7 @@ fn refresh_ci_cache_for(
             if let Ok(json) = serde_json::to_string(&runs) {
                 let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
+            ingest_failed_logs(host_path, loc, cfg, full, &db, &runs, &old_runs, waker);
         }
         Err(e) => {
             // The stale cache stays (better than blank), but the panel gets an
@@ -241,6 +254,96 @@ fn refresh_ci_cache_for(
         let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
     true
+}
+
+/// Populate the redacted per-job cache after a successful run-history fetch.
+/// Only terminal failed runs and only the configured number of recent terminal
+/// runs are expanded. Existing entries for the same run/head are reused, so a
+/// normal poll does not repeatedly download unchanged logs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the refresh worker passes its immutable policy and cache context explicitly"
+)]
+fn ingest_failed_logs(
+    host_path: &std::path::Path,
+    loc: &thegn_core::remote::GitLoc,
+    cfg: &thegn_core::config::CiConfig,
+    full: &thegn_core::config::Config,
+    db: &thegn_core::db::Db,
+    runs: &[thegn_core::ci::CiRun],
+    old_runs: &[thegn_core::ci::CiRun],
+    waker: Option<&TerminalWaker>,
+) {
+    use thegn_core::ci::CiState;
+    use thegn_core::store::CacheStore;
+    if cfg.log_cache_runs == 0 {
+        return;
+    }
+    let key = thegn_core::remote::GitLoc::worktree_cache_key(host_path);
+    let terminal_ids: Vec<String> = runs
+        .iter()
+        .filter(|r| r.state.is_terminal())
+        .map(|r| r.id.clone())
+        .collect();
+    let retained = thegn_core::ci_log::retained_run_ids(&terminal_ids, cfg.log_cache_runs);
+    let old_ids: std::collections::HashSet<&str> = old_runs.iter().map(|r| r.id.as_str()).collect();
+    for run in runs
+        .iter()
+        .filter(|r| retained.contains(&r.id) && r.state == CiState::Fail)
+    {
+        let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
+            break;
+        };
+        let detail = match client.run_detail(loc, &run.id) {
+            Ok(detail) => detail,
+            Err(_) => continue,
+        };
+        // A run first seen on this refresh gets priority, while a previously
+        // seen run is still expanded when its cache is cold or its head moved.
+        let _new_run = !old_ids.contains(run.id.as_str());
+        // A large matrix must not turn one refresh into an unbounded provider
+        // fan-out. Four-at-a-time was the old drill policy; the cache worker
+        // keeps the same finite work shape with a hard per-run ceiling.
+        for job in detail
+            .jobs
+            .iter()
+            .filter(|j| j.state == CiState::Fail)
+            .take(16)
+        {
+            let cached = db.get_ci_log(&key, &run.id, &job.id).ok().flatten();
+            if cached
+                .as_ref()
+                .is_some_and(|old| old.head_sha == run.sha && !old.text.is_empty())
+            {
+                continue;
+            }
+            let Ok(log) = client.logs(loc, &run.id, &job.id) else {
+                continue;
+            };
+            let mut entry = thegn_core::ci_log::CiLogEntry::new(
+                &key,
+                &run.id,
+                &job.id,
+                &job.name,
+                &log.text,
+                cfg.log_tail_lines
+                    .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                cfg.log_max_bytes
+                    .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                thegn_core::util::now(),
+            );
+            entry.truncated |= log.truncated;
+            entry.head_sha = run.sha.clone();
+            if db.put_ci_log(&entry).is_ok() {
+                ci_autofix::consider(full, db, &entry);
+            }
+        }
+    }
+    let keep: Vec<String> = retained.into_iter().collect();
+    let _ = db.retain_ci_logs(&key, &keep);
+    if let Some(w) = waker {
+        let _ = w.wake();
+    }
 }
 
 #[cfg(test)]

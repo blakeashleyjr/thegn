@@ -42,6 +42,8 @@ pub enum Action {
     CloneOpen,
     /// Open the "Add environment" wizard (`[env.<name>]`).
     NewEnvironment,
+    /// Install the active worktree's declared toolchain off the event loop.
+    InstallToolchain,
     /// Re-run the first-launch setup wizard.
     SetupWizard,
     NewTab,
@@ -68,6 +70,8 @@ pub enum Action {
     NewWorktreeFromTemplate,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
+    /// Open the boxed theme builder with live previews.
+    ThemeBuilderOpen,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
     SwitchFont,
     /// Close the active tab within the worktree. The final tab is kept; use
@@ -152,6 +156,8 @@ pub enum Action {
     PoolDecrement,
     TogglePanel,
     ToggleRecorder,
+    /// Fork the focused live daemon session into a fresh process.
+    ForkSession,
     /// Open time-travel replay for the focused pane — scrub its recorded byte
     /// stream (play/pause, seek, search across time). See `[replay]`.
     EnterReplay,
@@ -167,6 +173,10 @@ pub enum Action {
     /// only — the clipboard is never watched. See `[clipboard]`.
     PasteImage,
     ToggleDrawer,
+    /// Cycle the active drawer through files and eligible configured tools.
+    DrawerCycle,
+    /// Open the dedicated drawer occupant picker.
+    DrawerPick,
     /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
     /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
     ToggleCorner,
@@ -184,6 +194,7 @@ pub enum Action {
     OpenPrQueue,
     PrQueueAdd,
     PrQueueRefresh,
+    PrReviewTaskHandle,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
     /// Open the tabbed system monitor.
@@ -219,6 +230,9 @@ pub enum Action {
     Help,
     Lazygit,
     Yazi,
+    /// Hand the focused worktree to the configured external IDE/editor seam.
+    /// Distinct from [`Action::Editor`], which remains the terminal editor tool.
+    OpenInIde,
     Editor,
     Diff,
     /// Push the current branch to its upstream — fast-path, no branches-panel
@@ -284,6 +298,10 @@ pub enum Action {
     MediaSelectPlaylist,
     /// Open the picker to choose which player to control.
     MediaSelectPlayer,
+    /// Toggle command-backed voice capture for the focused pane.
+    VoiceToggle,
+    /// Cancel voice capture or an in-flight transcription.
+    VoiceCancel,
     /// Toggle do-not-disturb (quiet notifications) on/off (item 426).
     NotifyDndToggle,
     /// Cycle the active notification routing mode (item 427).
@@ -401,7 +419,31 @@ pub fn check_binding_conflicts(
 }
 
 pub fn action_spec(id: &str) -> Option<&'static ActionSpec> {
-    ACTION_SPECS.iter().find(|s| s.id == id)
+    ACTION_SPECS
+        .iter()
+        .find(|s| s.id == canonical_action_id(id))
+}
+
+fn canonical_action_id(id: &str) -> &str {
+    match id {
+        "new-workspace" => "new-project",
+        "delete-workspace" => "delete-project",
+        "switch-workspace" => "switch-project",
+        "next-workspace" => "next-project",
+        "prev-workspace" => "prev-project",
+        _ => id,
+    }
+}
+
+fn legacy_action_id(id: &str) -> Option<&'static str> {
+    match canonical_action_id(id) {
+        "new-project" => Some("new-workspace"),
+        "delete-project" => Some("delete-workspace"),
+        "switch-project" => Some("switch-workspace"),
+        "next-project" => Some("next-workspace"),
+        "prev-project" => Some("prev-workspace"),
+        _ => None,
+    }
 }
 
 /// Modifier prefixes for the three digit-slot ("summon") binding families.
@@ -412,7 +454,7 @@ pub(crate) const SUMMON_WORKTREE_MOD: &str = "Alt";
 pub(crate) const SUMMON_WORKSPACE_MOD: &str = "Ctrl";
 pub(crate) const SUMMON_PIN_MOD: &str = "Ctrl Alt";
 
-/// The default chord for a parametric `summon-{worktree,workspace,pin}-N` id.
+/// The default chord for a parametric `summon-{worktree,project,pin}-N` id.
 ///
 /// These families are bound in a loop by `default_keymap` rather than declared
 /// in `ACTION_SPECS`, so [`action_spec`] can't supply their default — without
@@ -426,7 +468,7 @@ fn summon_default_chord(id: &str) -> Option<String> {
     }
     let prefix = match family {
         "summon-worktree" | "worktree" => SUMMON_WORKTREE_MOD,
-        "summon-workspace" | "workspace" => SUMMON_WORKSPACE_MOD,
+        "summon-project" | "project" | "summon-workspace" | "workspace" => SUMMON_WORKSPACE_MOD,
         "summon-pin" | "pin" => SUMMON_PIN_MOD,
         _ => return None,
     };
@@ -452,12 +494,30 @@ pub fn chord_hint_for_mode(
     id: &str,
     mode: Mode,
 ) -> Option<String> {
-    let mut chord = action_spec(id)
+    let canonical_summon = id
+        .strip_prefix("summon-workspace-")
+        .map(|slot| format!("summon-project-{slot}"));
+    let canonical = canonical_summon
+        .as_deref()
+        .unwrap_or_else(|| canonical_action_id(id));
+    let legacy_summon = canonical
+        .strip_prefix("summon-project-")
+        .map(|slot| format!("summon-workspace-{slot}"));
+    let mut chord = action_spec(canonical)
         .and_then(|s| s.default_chords.first().copied())
         .map(str::to_string)
-        .or_else(|| summon_default_chord(id));
+        .or_else(|| summon_default_chord(canonical));
     for layer in cfg.effective_keybinds(None, None) {
-        if let Some(override_chord) = layer.normal.get(id) {
+        if let Some(override_chord) = layer
+            .normal
+            .get(canonical)
+            .or_else(|| legacy_action_id(canonical).and_then(|legacy| layer.normal.get(legacy)))
+            .or_else(|| {
+                legacy_summon
+                    .as_deref()
+                    .and_then(|legacy| layer.normal.get(legacy))
+            })
+        {
             chord = Some(override_chord.clone());
         }
         let mode_table = match mode {
@@ -466,7 +526,11 @@ pub fn chord_hint_for_mode(
             Mode::VimInsert => Some(&layer.vim_insert),
             Mode::Emacs => Some(&layer.emacs),
         };
-        if let Some(override_chord) = mode_table.and_then(|t| t.get(id)) {
+        if let Some(override_chord) = mode_table.and_then(|t| {
+            t.get(canonical)
+                .or_else(|| legacy_action_id(canonical).and_then(|legacy| t.get(legacy)))
+                .or_else(|| legacy_summon.as_deref().and_then(|legacy| t.get(legacy)))
+        }) {
             chord = Some(override_chord.clone());
         }
     }
@@ -481,12 +545,13 @@ impl Action {
     pub fn key(&self) -> &str {
         match self {
             Action::NewWorktree => "new-worktree",
-            Action::NewWorkspace => "new-workspace",
+            Action::NewWorkspace => "new-project",
             Action::ConnectRoot => "connect-root",
             Action::CloneOpen => "clone-open",
             Action::NewEnvironment => "new-environment",
+            Action::InstallToolchain => "toolchain-install",
             Action::SetupWizard => "setup-wizard",
-            Action::DeleteWorkspace => "delete-workspace",
+            Action::DeleteWorkspace => "delete-project",
             Action::NewTerminal => "new-terminal",
             Action::NewTab => "new-tab",
             Action::NewPane => "new-pane",
@@ -499,10 +564,11 @@ impl Action {
             Action::ImportLayout => "import-layout",
             Action::NewWorktreeFromTemplate => "new-worktree-from-template",
             Action::CycleTheme => "cycle-theme",
+            Action::ThemeBuilderOpen => "theme-builder-open",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
-            Action::SwitchWorkspace => "switch-workspace",
+            Action::SwitchWorkspace => "switch-project",
             Action::SwitchAccount => "switch-account",
             Action::SwitchBundle => "switch-bundle",
             Action::SwitchProfile => "switch-profile",
@@ -511,8 +577,8 @@ impl Action {
             Action::PrevTab => "prev-tab",
             Action::NextWorktree => "next-worktree",
             Action::PrevWorktree => "prev-worktree",
-            Action::NextWorkspace => "next-workspace",
-            Action::PrevWorkspace => "prev-workspace",
+            Action::NextWorkspace => "next-project",
+            Action::PrevWorkspace => "prev-project",
             Action::ToggleRegion => "toggle-region",
             Action::MoveItemUp => "move-item-up",
             Action::MoveItemDown => "move-item-down",
@@ -544,11 +610,14 @@ impl Action {
             Action::PoolDecrement => "warm-pool-decrement",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
+            Action::ForkSession => "fork-session",
             Action::EnterReplay => "enter-replay",
             Action::ExportCast => "export-cast",
             Action::PasteRegister => "paste-register",
             Action::PasteImage => "paste-image",
             Action::ToggleDrawer => "files-drawer",
+            Action::DrawerCycle => "drawer-cycle",
+            Action::DrawerPick => "drawer-pick",
             Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
@@ -557,6 +626,7 @@ impl Action {
             Action::OpenPrQueue => "open-pr-queue",
             Action::PrQueueAdd => "pr-queue-add",
             Action::PrQueueRefresh => "pr-queue-refresh",
+            Action::PrReviewTaskHandle => "pr-review-task-handle",
             Action::OpenUsage => "open-usage",
             Action::OpenMonitor => "open-monitor",
             Action::OpenPipelineBoard => "open-pipeline-board",
@@ -573,6 +643,7 @@ impl Action {
             Action::Help => "help",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
+            Action::OpenInIde => "open-in-ide",
             Action::Editor => "editor",
             Action::Diff => "show-diff",
             Action::Push => "git-push",
@@ -591,7 +662,7 @@ impl Action {
             Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
             Action::SwitchMode(Mode::Emacs) => "mode-emacs",
             Action::SummonPin(_) => "summon-pin",
-            Action::SummonWorkspace(_) => "summon-workspace",
+            Action::SummonWorkspace(_) => "summon-project",
             Action::SummonWorktree(_) => "summon-worktree",
             Action::ToggleStrip => "toggle-strip",
             Action::GrowStrip => "grow-strip",
@@ -613,6 +684,8 @@ impl Action {
             Action::MediaOpenPanel => "media-open-panel",
             Action::MediaSelectPlaylist => "media-select-playlist",
             Action::MediaSelectPlayer => "media-select-player",
+            Action::VoiceToggle => "voice-toggle",
+            Action::VoiceCancel => "voice-cancel",
             Action::NotifyDndToggle => "notify-dnd-toggle",
             Action::NotifyModeCycle => "notify-mode-cycle",
             Action::JumpAttention => "attention-next",
@@ -627,12 +700,13 @@ impl Action {
     pub fn from_key(key: &str) -> Option<Action> {
         Some(match key {
             "new-worktree" => Action::NewWorktree,
-            "new-workspace" => Action::NewWorkspace,
+            "new-project" | "new-workspace" => Action::NewWorkspace,
             "connect-root" => Action::ConnectRoot,
             "clone-open" => Action::CloneOpen,
             "new-environment" => Action::NewEnvironment,
+            "toolchain-install" => Action::InstallToolchain,
             "setup-wizard" => Action::SetupWizard,
-            "delete-workspace" => Action::DeleteWorkspace,
+            "delete-project" | "delete-workspace" => Action::DeleteWorkspace,
             "new-terminal" => Action::NewTerminal,
             "new-tab" => Action::NewTab,
             "new-pane" => Action::NewPane,
@@ -645,10 +719,11 @@ impl Action {
             "import-layout" => Action::ImportLayout,
             "new-worktree-from-template" | "worktree-template" => Action::NewWorktreeFromTemplate,
             "cycle-theme" | "theme" => Action::CycleTheme,
+            "theme-builder-open" | "theme-builder" => Action::ThemeBuilderOpen,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
-            "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
+            "switch-project" | "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
             "switch-account" => Action::SwitchAccount,
             "switch-bundle" => Action::SwitchBundle,
             "switch-profile" => Action::SwitchProfile,
@@ -657,8 +732,8 @@ impl Action {
             "prev-tab" => Action::PrevTab,
             "next-worktree" => Action::NextWorktree,
             "prev-worktree" => Action::PrevWorktree,
-            "next-workspace" => Action::NextWorkspace,
-            "prev-workspace" => Action::PrevWorkspace,
+            "next-project" | "next-workspace" => Action::NextWorkspace,
+            "prev-project" | "prev-workspace" => Action::PrevWorkspace,
             "toggle-region" | "terminals-toggle" => Action::ToggleRegion,
             "move-item-up" | "move-worktree-up" => Action::MoveItemUp,
             "move-item-down" | "move-worktree-down" => Action::MoveItemDown,
@@ -690,11 +765,14 @@ impl Action {
             "warm-pool-decrement" => Action::PoolDecrement,
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
+            "fork-session" => Action::ForkSession,
             "enter-replay" | "replay" => Action::EnterReplay,
             "export-cast" => Action::ExportCast,
             "paste-register" => Action::PasteRegister,
             "paste-image" => Action::PasteImage,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
+            "drawer-cycle" | "cycle-drawer" => Action::DrawerCycle,
+            "drawer-pick" | "pick-drawer" => Action::DrawerPick,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
@@ -703,6 +781,7 @@ impl Action {
             "open-pr-queue" => Action::OpenPrQueue,
             "pr-queue-add" => Action::PrQueueAdd,
             "pr-queue-refresh" => Action::PrQueueRefresh,
+            "pr-review-task-handle" | "review-task-handle" => Action::PrReviewTaskHandle,
             "open-usage" => Action::OpenUsage,
             "open-monitor" => Action::OpenMonitor,
             "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,
@@ -719,6 +798,7 @@ impl Action {
             "help" => Action::Help,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
+            "open-in-ide" | "ide" => Action::OpenInIde,
             "editor" | "tool-editor" => Action::Editor,
             "show-diff" | "diff" | "tool-diff" => Action::Diff,
             "git-push" | "push" => Action::Push,
@@ -759,15 +839,20 @@ impl Action {
             "media-open-panel" | "media-panel" | "media-now-playing" => Action::MediaOpenPanel,
             "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
             "media-select-player" | "media-player" => Action::MediaSelectPlayer,
+            "voice-toggle" | "voice" => Action::VoiceToggle,
+            "voice-cancel" | "voice-stop" => Action::VoiceCancel,
             "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
             "notify-mode-cycle" | "notify-mode" => Action::NotifyModeCycle,
             "attention-next" | "jump-attention" => Action::JumpAttention,
             "mark-all-read" | "notify-mark-all-read" => Action::MarkAllRead,
             // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9);
-            // `summon-workspace-N` / `workspace-N` → SummonWorkspace(N) (1..=9).
+            // `summon-project-N` / `project-N` → SummonWorkspace(N) (1..=9);
+            // the old workspace spellings remain accepted.
             other => {
                 if let Some(n) = other
-                    .strip_prefix("summon-workspace-")
+                    .strip_prefix("summon-project-")
+                    .or_else(|| other.strip_prefix("summon-workspace-"))
+                    .or_else(|| other.strip_prefix("project-"))
                     .or_else(|| other.strip_prefix("workspace-"))
                     .and_then(|s| s.parse::<u8>().ok())
                     .filter(|n| (1..=9).contains(n))
@@ -1306,6 +1391,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
         .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
+    map.insert_all("Ctrl Alt Shift t", Action::ThemeBuilderOpen)
+        .unwrap();
     // Bind every `ACTION_SPECS` default chord for real: these six were
     // DECLARED (so the palette + `thegn keys list` advertised them) but never
     // registered here — pressing the shown chord did nothing.
@@ -1460,6 +1547,10 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt m v", Action::MediaFullscreen).unwrap();
     map.insert_all("Alt m ]", Action::MediaChapterNext).unwrap();
     map.insert_all("Alt m [", Action::MediaChapterPrev).unwrap();
+    // Experimental voice mode: toggle-to-talk. Esc is handled specially only
+    // while recording, so ordinary overlay Escape behavior remains intact.
+    map.insert_all("Alt v", Action::VoiceToggle).unwrap();
+    map.insert_all("Alt V", Action::VoiceCancel).unwrap();
     map.insert_all("Ctrl Alt d", Action::NotifyDndToggle)
         .unwrap();
     map.insert_all("Ctrl Alt m", Action::NotifyModeCycle)
@@ -2081,6 +2172,10 @@ mod tests {
         assert_eq!(Action::NewWorktree.key(), "new-worktree");
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
+        assert_eq!(Action::DrawerCycle.key(), "drawer-cycle");
+        assert_eq!(Action::DrawerPick.key(), "drawer-pick");
+        assert_eq!(Action::from_key("cycle-drawer"), Some(Action::DrawerCycle));
+        assert_eq!(Action::from_key("pick-drawer"), Some(Action::DrawerPick));
         assert_eq!(Action::SwitchFont.key(), "switch-font");
     }
 
@@ -2154,7 +2249,7 @@ mod tests {
         assert!(ids.len() > 100, "key() arm scan broke: {}", ids.len());
         const SENTINELS: &[&str] = &[
             "summon-pin",
-            "summon-workspace",
+            "summon-project",
             "summon-worktree",
             "custom-action",
         ];
@@ -2365,10 +2460,10 @@ mod tests {
 
     #[test]
     fn summon_workspace_round_trips_through_keys() {
-        assert_eq!(Action::SummonWorkspace(4).key(), "summon-workspace");
-        // Parses both `summon-workspace-N` and `workspace-N`, 1..=9 only.
+        assert_eq!(Action::SummonWorkspace(4).key(), "summon-project");
+        // Parses canonical project ids and legacy workspace ids, 1..=9 only.
         assert_eq!(
-            Action::from_key("summon-workspace-3"),
+            Action::from_key("summon-project-3"),
             Some(Action::SummonWorkspace(3))
         );
         assert_eq!(
@@ -2381,6 +2476,41 @@ mod tests {
         );
         assert_eq!(Action::from_key("workspace-0"), None);
         assert_eq!(Action::from_key("workspace-10"), None);
+    }
+
+    #[test]
+    fn project_action_ids_keep_workspace_aliases() {
+        for (canonical, legacy, action) in [
+            ("new-project", "new-workspace", Action::NewWorkspace),
+            (
+                "delete-project",
+                "delete-workspace",
+                Action::DeleteWorkspace,
+            ),
+            (
+                "switch-project",
+                "switch-workspace",
+                Action::SwitchWorkspace,
+            ),
+            ("next-project", "next-workspace", Action::NextWorkspace),
+            ("prev-project", "prev-workspace", Action::PrevWorkspace),
+        ] {
+            assert_eq!(action.key(), canonical);
+            assert_eq!(Action::from_key(canonical), Some(action.clone()));
+            assert_eq!(Action::from_key(legacy), Some(action));
+            assert!(action_spec(canonical).is_some());
+        }
+        assert_eq!(
+            Action::from_key("project-2"),
+            Some(Action::SummonWorkspace(2))
+        );
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.keybinds
+            .insert("summon-workspace-1".into(), "Alt z".into());
+        assert_eq!(
+            chord_hint_for(&cfg, "summon-project-1").as_deref(),
+            Some("Alt-z")
+        );
     }
 
     #[test]
@@ -2523,6 +2653,7 @@ mod tests {
                 notifications: Default::default(),
                 identity: Default::default(),
                 mcp_serve: Default::default(),
+                automations: Default::default(),
             },
         );
         let cfg = thegn_core::config::Config {

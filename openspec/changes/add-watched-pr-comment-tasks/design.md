@@ -1,133 +1,146 @@
-# Design — comment tasks on watched PRs
+# Design — durable review tasks on watched PRs
 
-## Threads join the classify inputs
+## Dependencies and ownership
 
-`classify` today reads only `PrStatus` fields ("no extra fetching is needed to
-decide"). Unresolved threads are not on `PrStatus`, so the input grows
-honestly rather than by side channel: `classify(&PrStatus, unresolved:
-&ThreadsFingerprint, cfg)` (or an equivalent `PrQueueSignals` struct) where
-the driver supplies the thread summary it already fetches per poll for the
-blocker hint. The ordering slot is deliberate:
+THE-27 is a satisfied dependency. Its `PrReviewSnapshot`, provider
+`ReviewThread` identities, complete-cache write rule, anchor data, and bounded
+single-thread formatter are reused directly. THE-22 neither forks those types
+nor performs a second cache migration.
 
-```
-Closed > Draft > Ci > Conflict > ChangesRequested > UnresolvedComments
-      > ChecksPending > AwaitingReview > None
-```
+The PR queue remains the owner of which PRs are watched. Only a durable queue
+row in a repository whose resolved `[pr_queue].watch` contains `review` enters
+this path. `auto_enqueue = "off"` remains the default, and review work rides the
+existing `poll_interval_secs` worker/ticker slot. Disabled or unwatched queues
+perform no deep review fetch.
 
-`ChangesRequested` subsumes `UnresolvedComments` (a request-changes review
-almost always carries threads; the formal decision is the stronger, clearer
-signal). `UnresolvedComments` outranks `ChecksPending`/`AwaitingReview`
-because it is _actionable_ — the same reason a red check outranks a stale
-base today. `Blocker::UnresolvedComments(n)` carries the count for display;
-`watch_kind()` returns `PrWatchKind::Review`; `task_kind()` returns
-`TaskKind::PrReview`.
+## Snapshot-to-roster reconciliation
 
-**Actionability vs display:** classification always reports the blocker (the
-row must tell the truth), but `decide` treats `UnresolvedComments` as
-dispatchable only when `review_trigger = "any_unresolved"`. With the default
-`changes_requested`, the row shows "2 unresolved comments" and waits — no
-behavior change for existing configurations. All of this is pure and
-table-tested (95% core gate), like every other team-safety rule.
+For each successful complete snapshot, the host supplies stable PR context and
+the current queue role/review prompt to the substrate-free core reconciler:
 
-## Fingerprint + refill
+1. Each unresolved thread with a non-empty opaque provider id receives a
+   canonical source key over forge, repository, PR number, and thread id.
+2. Its source revision is a bounded deterministic digest of the current head,
+   anchor, resolved state, and bounded comment identities/content. New comments
+   therefore change the revision without changing task identity.
+3. An unseen source produces one queued roster upsert. A changed revision
+   updates that same row and requeues terminal/human-parked work; a running row
+   retains its running state so it cannot be launched twice.
+4. An unchanged revision produces no write or event. A thread observed resolved
+   transitions its existing row to done. A transient fetch failure never calls
+   the reconciler, so absence cannot fabricate resolution.
 
-The row stores `threads_fingerprint`: a stable hash over the sorted ids of
-unresolved threads (ids, not count — one thread resolved plus one opened must
-read as changed). Two consumers:
+When a provider supplies no thread objects, a non-empty latest
+changes-requested review may create one PR-level fallback task. Real threads
+supersede it. Because that fallback has no provider thread id, handling it ends
+in human re-review rather than automatic resolution.
 
-1. **Budget refill** — `attempts_reset` gains the fingerprint alongside the
-   head OID: budget refills when the fingerprint changes _and_ the change
-   introduces at least one thread id thegn has not seen for this row. The
-   agent's own replies never alter the unresolved id set (reply ≠ resolve),
-   so — like the head-OID rule recording the OID thegn produced — the agent
-   cannot refill its own budget.
-2. **Notification** — a fingerprint change with a new thread id raises
-   `NotificationKind::PrQueueNewComments` (exact name per the existing
-   pr-queue kinds' convention), for every watched row including foreign-author
-   rows the agent will never touch.
+The prompt uses `TaskKind::PrReview` validation and THE-27's formatter, with the
+current `[pr_queue].agent` role and resolved `[pr_queue.prompts].review` at
+derivation time. Prompt and event fields are sanitized and bounded. The event
+wire name is exactly `pr.thread_unresolved`; it is published only after the
+atomic roster upsert, with durable once-keyed notification audit sharing the
+same source identity and revision.
 
-Fetch cost: the driver already calls the forge's `review_threads` on the
-dispatch path; the poll path adds it only for rows whose blocker resolution
-could change (open, non-draft), under the existing per-row backoff. A thread
-fetch failure leaves the previous fingerprint intact — never fabricate
-"changed" from an error (mirrors the existing fetch-failure rule).
+## Persistence
 
-## Per-entry agent override
+Review tasks are a nullable projection of the existing shared
+`agent_dispatches` roster, not columns on `pr_queue`. Schema v64 (following
+THE-27's v63) adds `task_kind`, `source_key`, `source_revision`, `prompt`,
+`expected_head_oid`, `forge_action_attempts`, and
+`next_forge_action_at_ms`. A partial unique index on `(task_kind, source_key)`
+provides durable dedupe while ordinary pipeline dispatch rows keep NULL review
+metadata and their existing projection.
 
-Two nullable columns on `pr_queue`: `agent` (an `[[agents]]`/`[[tools]]` name)
-and `agent_command` (a full template). Dispatch resolution order becomes
-row-`agent_command` > row-`agent` > `[pr_queue] agent_command` >
-`[pr_queue] agent`, all through the existing `agent_task::resolve_agent` /
-template validation — an invalid row template fails dispatch with the same
-diagnostics as the config one, and the row goes `needs_human` with the reason
-rather than silently falling back. CLI: `pr queue add --agent/--agent-command`
-(also accepted by a new `pr queue set <number> --agent …` only if trivially
-cheap — otherwise the panel action suffices; decide at implementation).
-Panel: a row action prompting from the configured `[[agents]]` list, clear
-with an empty pick.
+The upsert is atomic and preserves one row/id across revisions. Forge action
+attempts and the next retry time survive restarts. Successful create/revision,
+successful thread resolution, and needs-human transitions use once-keyed inbox
+notifications so retries do not flood the audit.
 
-## Event loop, rendering, schema, help
+## Refresh and rendering
 
-- **Wake path:** unchanged — the existing `RefreshKind::PrQueue` ticker slot
-  and push kick; the thread fetch rides the same off-loop poll pass and
-  pulses the waker once. Disabled ⇒ no polling (unchanged).
-- **Damage:** panel-section row changes set the master `dirty` ⇒ `Full`
-  frame, exactly as today.
-- **SQLite:** three additive columns (`agent`, `agent_command`,
-  `threads_fingerprint`) on `pr_queue` ⇒ **`user_version` bump** with an
-  additive migration (NULL for existing rows).
-- **Help:** `panel:prq` → `docs/help/pr-queue.md` documents the override
-  action, `review_trigger`, and the new notification (prose ratchet). No new
-  action id is strictly required if the override rides the existing row-action
-  menu; if a new id is minted it must be claimed by the page (help ratchet).
+Conversation and diff I/O, cache writes, reconciliation persistence, and
+notification writes stay on the existing blocking PR-queue worker. The worker
+pulses the normal queue channel/waker once; there is no new wake source or idle
+poll. Panel hydration joins roster tasks with THE-27's cached snapshot to render
+thread id, anchor, role, status, and revision beneath the owning PR.
 
-## Security
+The aggregate `ChangesRequested -> PrReview` agent path is suppressed when
+per-thread reconciliation owns review work. Polling creates/revises rows and
+emits audit events, but never launches a per-thread agent. Empty provider
+feedback and stale snapshots remain visible/parked rather than producing an
+empty generic prompt.
 
-- **Blast radius of the broader trigger.** `any_unresolved` means a single
-  reviewer comment can start an agent that ends in a push. Bounds, all
-  pre-existing and unmodified: the feature is off by default
-  (`[pr_queue] enabled = false`), dispatch requires the `review` watch kind,
-  `own_prs_only` blocks writes to foreign PRs, `pause_on_foreign_push` stops
-  races, pushes are `--force-with-lease` only, the attempt budget caps
-  loops, and the agent never merges/approves/resolves. The new default
-  (`changes_requested`) adds zero new autonomous behavior until a user opts
-  up.
-- **Prompt injection.** Thread bodies are untrusted remote text that becomes
-  agent instructions — true of the existing `PrReview` path already; the
-  broader trigger widens _who_ can put text there (anyone who can comment on
-  the PR, which on public repos is everyone). Mitigations: the rules block in
-  every PR prompt, the agent's lack of forge credentials (writes go through
-  thegn's seam under thegn's policy — the agent can only edit and push the
-  branch), the sandbox the pane/job runs in, and `own_prs_only` +
-  `review_trigger` defaults. State plainly in docs: enabling
-  `any_unresolved` on a public repo lets any commenter feed the agent text.
-- **Credential handling:** none new — the forge seam and `gh` auth are
-  untouched; row `agent_command` is config-equivalent user input, validated
-  by the same template rules (no raw secrets; SecretRef conventions apply to
-  agent config as today).
-- **Notification text** renders comment excerpts through the existing
-  notification pipeline (chrome-composed, no PTY) — no sanitization concern
-  beyond the usual width caps.
+## Explicit handle lifecycle
 
-## Alternatives considered
+The TUI-only `pr-review-task-handle` action is available from the command
+palette and as `h` on a queued task row. The event loop selects an id and spawns
+the blocking worker; all DB, git, forge, sandbox, and agent work remains off the
+loop.
 
-- **A new `TaskKind::PrComments`** — rejected: the `PrReview` prompt already
-  says "unresolved review threads"; a second kind duplicates prompts, config,
-  validation, and the pinned-count tests for identical work.
-- **Count-based fingerprint** — rejected: resolve-one-open-one reads as
-  unchanged; id-set hashing is as cheap and correct.
-- **Auto-acting on PR-level comments via @mention detection** — deferred
-  (non-goal): no resolved bit means no termination condition; an agent that
-  replies to every comment forever is the failure mode.
-- **Per-blocker-kind agent override** (different agent for CI vs review on
-  one row) — rejected as config surface bloat; the issue asks per-PR, not
-  per-kind.
+The worker:
 
-## Open questions
+1. admits only a queued task, respects durable resolution cooldown, and changes
+   it to running;
+2. resolves exactly the task's configured role plus the current queue command,
+   with no default-role fallback, then applies the existing agent sandbox floor;
+3. verifies the provider head still equals the task's recorded baseline before
+   launching the saved bounded prompt;
+4. treats agent exit status as advisory, reloads the roster, and requeues rather
+   than resolving if a refresh revised the task while it ran;
+5. requires the provider head to have moved from the baseline and to exactly
+   equal the task worktree's local HEAD, rejecting no-op or foreign/concurrent
+   pushes;
+6. refetches the conversation and confirms the same provider thread remains
+   unresolved; and
+7. calls the optional forge `resolve_review_thread` operation with a bounded
+   audit reply, then marks the roster row done and records resolution.
 
-- Should `review_trigger = "any_unresolved"` also require the PR to be
-  otherwise green (no red CI) before dispatching a review task, to avoid the
-  agent juggling two blockers? (Ordering already prefers CI first; leaning
-  no extra rule.)
-- Whether `pr queue set` (post-hoc override without re-adding) earns its CLI
-  surface or the panel action suffices.
+If the thread was already resolved after the verified push, the roster can
+finish without another mutation. Unsupported/not-configured/not-authenticated
+providers, missing worktrees or roles, stale heads/revisions, and PR-level
+fallbacks park for a human. Offline, rate-limited, and other transient forge
+errors additionally persist bounded backoff; they never claim the provider
+thread was resolved.
+
+## Provider seam and external surfaces
+
+`ForgeCaps::resolve_review_thread` advertises the optional internal provider
+operation. The object-safe `Forge::resolve_review_thread` default returns
+unsupported; GitHub implements a bounded reply plus resolve mutation, and the
+service provider ladder forwards the capability and call. Capability discovery
+therefore stays honest without exposing a new product capability.
+
+The action is intentionally TUI-only. No CLI, completion, control schema,
+capability catalog, gRPC, MCP, or plugin surface is added, and no config or
+environment overlay key is introduced.
+
+## Security and failure posture
+
+Remote review text is untrusted input. It is formatted through THE-27's bounded
+sanitizer, stored as a bounded prompt, and never executed as a command template.
+The agent retains the queue's existing sandbox, timeout, own-PR, and
+force-with-lease posture; it cannot satisfy the lifecycle merely by exiting.
+Forge credentials remain in thegn's provider seam rather than the prompt.
+
+Automatic reply/resolve is deliberately behind an explicit human gesture plus
+verified local/remote head equality, unchanged source revision, a fresh
+unresolved-thread recheck, provider capability, and durable cooldown. Every
+ambiguous direction is fail-closed to `waiting_human` while leaving the remote
+thread unresolved.
+
+## Rejected alternatives
+
+- **PR-wide `UnresolvedComments` blocker, `review_trigger`, and fingerprint.**
+  These collapse independent threads, create a second attempt-budget mechanism,
+  and make display classification control task identity. Thread-keyed roster
+  reconciliation is the honest unit.
+- **Automatically dispatch during polling.** It can race refresh revisions and
+  a second aggregate review run. Polling only prepares durable work; `handle` is
+  the single admission gesture.
+- **Reply but never resolve.** That leaves completed durable tasks permanently
+  actionable. Verified-push provider resolution supplies a real terminal state,
+  with human fallback when it is unsafe or unsupported.
+- **Per-entry agent override.** It would require new PR-queue schema, CLI/config
+  semantics, and public projections. The final contract uses the queue's current
+  configured role/prompt.

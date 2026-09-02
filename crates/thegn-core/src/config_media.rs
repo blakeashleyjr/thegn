@@ -56,6 +56,7 @@ impl MediaConfig {
                 MediaBackendKind::Mpd => BackendKind::Mpd,
                 MediaBackendKind::Smtc => BackendKind::Smtc,
                 MediaBackendKind::AppleScript => BackendKind::AppleScript,
+                MediaBackendKind::Spotify => BackendKind::Spotify,
                 MediaBackendKind::Jellyfin => BackendKind::Jellyfin,
             }
         };

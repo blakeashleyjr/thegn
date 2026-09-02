@@ -771,9 +771,18 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Forward => {
-            let n = model.forwards.len();
-            if n > 0 {
-                vec![seg(hue(Hue::Teal), format!("\u{21c5} {n}"))]
+            if let Some(preview) = &model.preview {
+                let tone = match preview.status {
+                    thegn_core::preview::PreviewStatus::Up => hue(Hue::Green),
+                    thegn_core::preview::PreviewStatus::Down => hue(Hue::Red),
+                    thegn_core::preview::PreviewStatus::Unknown => hue(Hue::Amber),
+                };
+                vec![seg(tone, format!(":{} {}", preview.port, preview.status))]
+            } else if !model.forwards.is_empty() {
+                vec![seg(
+                    hue(Hue::Teal),
+                    format!("\u{21c5} {}", model.forwards.len()),
+                )]
             } else {
                 vec![seg(g2(), "—")]
             }
@@ -1138,6 +1147,13 @@ mod spec {
             url: "http://localhost:5174".into(),
             remapped: true,
         }];
+        m.preview = Some(crate::chrome::PreviewView {
+            worktree: "/repo/feat-views".into(),
+            port: 5173,
+            url: "http://localhost:5174".into(),
+            source: thegn_core::preview::PortHintSource::PaneOutput,
+            status: thegn_core::preview::PreviewStatus::Up,
+        });
         m.active_container_name = "tg-feat-views".into();
         m.timeline = vec![thegn_core::models::TimelineEvent {
             ts_ms: 1_700_000_000_000,
@@ -1278,6 +1294,38 @@ mod spec {
         // U+2B24 draws wider than its one-cell advance (and has no ASCII
         // fallback), so it bled into the count. The green hue is the signal.
         assert!(!s.contains('⬤'));
+    }
+
+    #[test]
+    fn forward_section_projects_target_status_source_and_url_hits() {
+        let rendered = render(Section::Forward, PanelWidth::Normal);
+        assert!(rendered.contains("5173 up"), "status/port: {rendered}");
+        assert!(rendered.contains("pane-output"), "source: {rendered}");
+        assert!(
+            rendered.contains("http://localhost:5174"),
+            "url: {rendered}"
+        );
+
+        let m = model();
+        let u = ui(PanelWidth::Normal, Section::Forward);
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let hits: Vec<PanelHit> = content(Section::Forward, &ctx)
+            .into_iter()
+            .filter_map(|row| row.hit)
+            .collect();
+        assert_eq!(
+            hits,
+            vec![
+                PanelHit::Row(Section::Forward, 0),
+                PanelHit::Row(Section::Forward, 1),
+            ],
+            "preview and existing forward share one cursor/URL ordering"
+        );
     }
 
     #[test]

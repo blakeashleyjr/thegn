@@ -119,6 +119,13 @@ fn command_words(argv: &[String]) -> Vec<String> {
 /// contains a runtime's name — a path, a git remote, a script's text — cannot
 /// promote a host shell into a claimed container.
 pub fn observed(argv: &[String]) -> Backend {
+    // A resource ceiling is not containment. `sandbox_cpucap` prepends
+    // `systemd-run --scope …` to host-toolchain backends, which sits in front of
+    // the real runtime word and, first-match-wins, made every bwrap pane read as
+    // `systemd` (and every merely-capped host shell claim `systemd` outright).
+    // See `strip_pane_cap` for why removing it can never erase a real systemd
+    // sandbox.
+    let argv = crate::sandbox_cpucap::strip_pane_cap(argv);
     let mut sudo = false;
     for w in command_words(argv) {
         match w.as_str() {

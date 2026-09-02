@@ -9,11 +9,11 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use thegn_svc::issue::IssueBackend;
+use thegn_svc::issue::{IssueBackend, IssueCaps};
 use thegn_svc::plugin::{PluginIssueBackend, ProviderBridge};
 
-/// One live plugin issue provider: `(plugin id, account label, bridge)`.
-type Row = (String, String, Arc<ProviderBridge>);
+/// One live plugin issue provider: `(plugin id, account label, bridge, caps)`.
+type Row = (String, String, Arc<ProviderBridge>, IssueCaps);
 
 fn registry() -> &'static Mutex<Vec<Row>> {
     static REG: OnceLock<Mutex<Vec<Row>>> = OnceLock::new();
@@ -32,10 +32,11 @@ pub(crate) fn set_issue_providers(rows: Vec<Row>) {
 pub(crate) fn issue_backends() -> Vec<(String, Box<dyn IssueBackend>)> {
     let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     reg.iter()
-        .map(|(plugin, account, bridge)| {
+        .map(|(plugin, account, bridge, caps)| {
             (
                 account.clone(),
-                Box::new(PluginIssueBackend::new(bridge.clone(), plugin)) as Box<dyn IssueBackend>,
+                Box::new(PluginIssueBackend::new(bridge.clone(), plugin, *caps))
+                    as Box<dyn IssueBackend>,
             )
         })
         .collect()
@@ -61,11 +62,16 @@ mod tests {
         // A bridge over a closed writer still registers; calls just error.
         let (session, _rx) = fake_session();
         let bridge = ProviderBridge::new(session, std::time::Duration::from_millis(50));
-        set_issue_providers(vec![("demo".into(), "Demo".into(), bridge)]);
+        let caps = IssueCaps {
+            comments: true,
+            labels: false,
+        };
+        set_issue_providers(vec![("demo".into(), "Demo".into(), bridge, caps)]);
         let backends = issue_backends();
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].0, "Demo");
         assert_eq!(backends[0].1.provider_id(), "plugin:demo");
+        assert_eq!(backends[0].1.caps(), caps);
         set_issue_providers(Vec::new());
         assert!(issue_backends().is_empty());
     }

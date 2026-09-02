@@ -66,7 +66,7 @@ pub fn run(
     db.set_active_workspace(&target)?;
     enqueue_preset(&db, preset)?;
     if no_launch {
-        outln!("active workspace set to {target}");
+        outln!("active project set to {target}");
         return Ok(OpenOutcome::Delivered);
     }
     Ok(OpenOutcome::LaunchTui)

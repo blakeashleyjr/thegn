@@ -35,27 +35,27 @@ const ALLOWLIST: &[&str] = &[
     // `[profiles.<name>.notifications]` is likewise an all-Option overlay
     // mirror of `[notifications]`; the example points at the canonical table.
     "profiles.*.notifications",
-    // `[workspace.<slug>.merge_queue]` is the same shape again: an all-Option
+    // `[project.<slug>.merge_queue]` is the same shape again: an all-Option
     // overlay mirror of `[merge_queue]`, letting one repo refine its gate,
     // target branch and lockfile set. Every key is documented once at its
     // canonical `[merge_queue]` location, and the example shows the overlay
     // pattern there with a representative subset.
-    "workspace.*.merge_queue",
-    // `[workspace.<slug>.pr_queue]` is the same overlay-mirror shape as the
+    "project.*.merge_queue",
+    // `[project.<slug>.pr_queue]` is the same overlay-mirror shape as the
     // merge-queue one above: every key documented once at `[pr_queue]`, with the
     // overlay pattern shown there.
-    "workspace.*.pr_queue",
-    // `[workspace.<slug>.git]` is likewise an all-Option overlay mirror of the
+    "project.*.pr_queue",
+    // `[project.<slug>.git]` is likewise an all-Option overlay mirror of the
     // base `[git]` table (signing/fetch/diff-view policy per repo). Every key is
     // documented once at its canonical `[git]` location, and the example shows
-    // the overlay pattern (`[workspace.acme.git]`) with a representative subset.
-    "workspace.*.git",
-    // `[profiles.<name>.mcp_serve]` / `[workspace.<slug>.mcp_serve]` are
+    // the overlay pattern (`[project.acme.git]`) with a representative subset.
+    "project.*.git",
+    // `[profiles.<name>.mcp_serve]` / `[project.<slug>.mcp_serve]` are
     // all-Option overlay mirrors of `[mcp.serve]` (the clamp-only MCP-serve
     // scope ceiling); every key (`scopes`) is documented once at its canonical
     // `[mcp.serve]` location, which also explains the overlay clamping pattern.
     "profiles.*.mcp_serve",
-    "workspace.*.mcp_serve",
+    "project.*.mcp_serve",
     // `[[plugins]]` manifests are developer-facing (see `plugin_api.rs`); the
     // schema (id/name/version/api/capabilities/contributions) is an internal
     // contract for bundled plugins, not an end-user configuration surface.
@@ -257,4 +257,33 @@ fn example_config_parses_as_config() {
     if let Err(e) = cfg {
         panic!("config.toml.example does not parse as Config: {e}");
     }
+}
+
+#[test]
+fn generated_config_reference_keeps_example_schema_keys() {
+    let path = example_path();
+    let example = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let generated = thegn_core::help::config_ref::page(&example);
+    let doc = scan_example(&generated);
+    let required = common::required();
+    let mut missing = Vec::new();
+    let mut expected = BTreeSet::new();
+    for (pattern, key) in &required.keys {
+        if allowlisted(pattern, Some(key)) {
+            continue;
+        }
+        expected.insert(key);
+    }
+    let generated_keys: BTreeSet<&String> = doc.keys.iter().map(|(_, key)| key).collect();
+    for key in expected {
+        if !generated_keys.contains(key) {
+            missing.push(key.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "generated config reference dropped schema/example keys:\n  {}",
+        missing.join("\n  ")
+    );
 }
