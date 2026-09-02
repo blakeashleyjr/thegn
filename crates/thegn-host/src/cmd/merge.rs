@@ -132,7 +132,12 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 /// its 34 hunks and wrong for 25. Classification is computable; the decisions
 /// are not, so this prints the split and leaves the decisions blank.
 fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
-    let root = repo_root().context("`merge conflicts` must run inside a git worktree")?;
+    // The CURRENT worktree, not `repo_root()`: that resolves the main checkout,
+    // and a reconcile is always in flight in the lane's own linked worktree.
+    let cwd = std::env::current_dir().context("`merge conflicts` needs a working directory")?;
+    let root = thegn_core::util::git_out(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(|s| PathBuf::from(s.trim()))
+        .context("`merge conflicts` must run inside a git worktree")?;
     let out = thegn_core::util::git_out(&root, &["diff", "--name-only", "--diff-filter=U"])
         .unwrap_or_default();
     let paths: Vec<String> = out
