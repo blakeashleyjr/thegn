@@ -6,7 +6,7 @@ implements its reserved `webhook` kind and adds siblings).
 ## 1. Routing (thegn-core, pure)
 
 - [ ] 1.1 Named sinks in the route model: `RouteDecision` carries a resolved
-      sink set; rules' `channels` accept `push` and `push:<name>`; per-sink
+      sink set; rules' `route` accepts `push` and `push:<name>`; per-sink
       `min_priority` — **unit tests**: targeting tables, DND/priority
       interaction per sink, unknown sink name is a config error (95% gate).
 - [ ] 1.2 Sink config parsing/validation: array-of-tables superset of the
@@ -26,17 +26,15 @@ implements its reserved `webhook` kind and adds siblings).
       inside the push worker's bounded-retry budget; over-limit drops
       counted — limiter logic **unit-tested** as pure state transitions;
       HTTP by smoke.
-- [ ] 2.3 Doctor probes per sink: config + secret resolution + drop
-      counters, never a network post; secrets never in probe output.
+- [ ] 2.3 Doctor probes per sink: config + secret resolution + offline request
+      shape, never a network post; runtime delivery counters belong to Monitor
+      and secrets never appear in probe output.
 
 ## 3. Wiring and docs (thegn-host)
 
 - [ ] 3.1 Route decisions fan out to the named-sink worker; existing ntfy
       behavior byte-identical when it is the only sink.
-- [ ] 3.2 `thegn notify … --send-test <sink>` (or equivalent flag on the
-      existing notify verb — no new catalog row) for deliberate delivery
-      verification.
-- [ ] 3.3 Help/notification page prose: sink setup, the exfiltration
+- [ ] 3.2 Help/notification page prose: sink setup, the exfiltration
       caution, rate-limit behavior; `[[tools]]` config example for chat TUI
       tiles (AM 470/471) in the example config comments (prose ratchet
       green).

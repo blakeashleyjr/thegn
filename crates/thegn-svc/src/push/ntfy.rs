@@ -78,10 +78,7 @@ impl NtfyPublisher {
                     Err(PushError::Other(format!("{status}")))
                 }
             }
-            Err(e) if e.is_timeout() || e.is_connect() || e.is_request() => {
-                Err(PushError::Transient(e.to_string()))
-            }
-            Err(e) => Err(PushError::Other(e.to_string())),
+            Err(e) => Err(super::transport_error(&e)),
         }
     }
 }

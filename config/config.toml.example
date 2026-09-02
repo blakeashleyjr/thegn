@@ -2141,7 +2141,8 @@ active_mode = ""
 # "push" to a rule's `route` to include/exclude it. Notifications below
 # `min_priority` never push (they still record in the inbox). A push is
 # best-effort (bounded retry, dropped on overflow); the inbox row is durable.
-#   kind         — ntfy (implemented) | telegram | gotify | pushover | webhook (reserved)
+#   kind         — ntfy, webhook, discord, slack (implemented) |
+#                  telegram, gotify, pushover (reserved)
 #   min_priority — "info" | "notice" (default) | "alert"
 # The server sees message plaintext: self-host and reach it over your tailnet.
 # [notifications.push]
@@ -2150,6 +2151,24 @@ active_mode = ""
 # topic = "thegn-yourname-9f3a2"     # required; treat as a capability URL (keep it unguessable)
 # token = "env:NTFY_TOKEN"           # SecretRef / env: / file: — never a raw token
 # min_priority = "notice"
+#
+# Multiple named sinks live inside the same push table. Webhook URLs are
+# bearer credentials and therefore accept only env:VAR or file:PATH refs:
+#[[notifications.push.sinks]]
+# name = "oncall"
+# kind = "slack"
+# url = "env:THEGN_SLACK_ONCALL_URL"
+# min_priority = "alert"
+#[[notifications.push.sinks]]
+# name = "automation"
+# kind = "webhook"
+# url = "file:~/.config/thegn/webhook-url"
+# min_priority = "notice"
+# Ntfy sinks use these provider-specific fields instead of `url`:
+# server = "https://ntfy.sh"
+# topic = "thegn-yourname-9f3a2"
+# token = "env:NTFY_TOKEN"
+# A rule route of ["push"] fans out to every sink; ["push:oncall"] targets one.
 #
 # INBOUND — the command inbox (HARD-OFF by default; an inbound command surface).
 # Enabling it requires ALL of: a SecretRef `inbox_secret` (a raw token in config

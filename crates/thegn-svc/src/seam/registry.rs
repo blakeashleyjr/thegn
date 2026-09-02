@@ -67,19 +67,26 @@ fn voice_probes(cfg: &Config) -> Vec<ProbeReport> {
 fn push_probes(cfg: &Config) -> Vec<ProbeReport> {
     let p = &cfg.notifications.push;
     let mut out = Vec::new();
-    // Outbound delivery channel.
-    if p.kind.is_reserved() {
-        out.push(ProbeReport::reserved("push", p.kind.as_str()));
-    } else if let Some(provider) = crate::push::provider_for(p) {
-        out.push(provider.probe());
+    // Outbound delivery channel. Keep the legacy scalar report's id and ntfy
+    // notes stable, while named sinks use the sink name as their doctor id.
+    if p.sinks.is_empty() {
+        if p.kind.is_reserved() {
+            out.push(ProbeReport::reserved("push", p.kind.as_str()));
+        } else if let Some(provider) = crate::push::provider_for(p) {
+            out.push(provider.probe().with_caps(&provider.caps()));
+        } else {
+            out.push(ProbeReport::new(
+                "push",
+                p.kind.as_str(),
+                Availability::Unavailable(
+                    "no [notifications.push] topic configured — outbound push off".into(),
+                ),
+            ));
+        }
     } else {
-        out.push(ProbeReport::new(
-            "push",
-            p.kind.as_str(),
-            Availability::Unavailable(
-                "no [notifications.push] topic configured — outbound push off".into(),
-            ),
-        ));
+        for sink in p.effective_sinks() {
+            out.push(crate::push::probe_sink(&sink));
+        }
     }
     // Inbound command inbox (a daemon feature).
     let inbox = &p.inbox;

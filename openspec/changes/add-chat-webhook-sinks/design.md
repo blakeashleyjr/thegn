@@ -5,9 +5,9 @@
 `add-ntfy-push-bridge` defines the push-provider seam: a `push` delivery
 channel in `RouteDecision`, an object-safe provider trait in `thegn-svc`, a
 bounded best-effort worker, `kind` implemented-or-`reserved` (`ntfy`
-implemented; `telegram`, `gotify`, `pushover`, `webhook` reserved), doctor
-probes. This change implements the reserved `webhook` kind and adds `discord`
-and `slack` as siblings — formatters over the same worker, not a new
+implemented; `telegram`, `gotify`, and `pushover` reserved), doctor probes.
+This change implements `webhook` and adds `discord` and `slack` as siblings —
+formatters over the same worker, not a new
 mechanism. Everything below is delta on that seam.
 
 ## Named sinks and routing
@@ -17,35 +17,33 @@ to #ship"). The router therefore addresses **named sinks**:
 
 - Each configured sink has a unique `name` (defaulting to its kind when only
   one of that kind exists) and a `kind`.
-- Rules' `channels` selectors accept `push` (all sinks) and `push:<name>`
+- Rules' `route` selectors accept `push` (all sinks) and `push:<name>`
   (one sink). `RouteDecision` carries the resolved sink set instead of a
   boolean — a pure-core change under the 95% gate.
 - Per-sink `min_priority` gives the common "chat only gets alerts" shape
   without a rule.
 
-**Config shape (reconciled at land time).** `add-ntfy-push-bridge` specs a
-single `[notifications.push]` table. The compatible superset is an array
-form — e.g.
+**Config shape.** `add-ntfy-push-bridge` specifies a single
+`[notifications.push]` table. The compatible superset keeps that table and
+places an array of named sinks below it — e.g.
 
 ```toml
-[[notifications.push]]
+[[notifications.push.sinks]]
 name = "phone"
 kind = "ntfy"
 server = "https://ntfy.example"
 topic = "thegn"
 token = "env:THEGN_NTFY_TOKEN"
 
-[[notifications.push]]
+[[notifications.push.sinks]]
 name = "oncall"
 kind = "slack"
 url = "env:THEGN_SLACK_ONCALL_URL"
 min_priority = "alert"
 ```
 
-— where a lone single-table `[notifications.push]` keeps parsing as one sink
-named by its kind. Whichever change lands second owns making both forms
-parse; the behavior requirement (one or more named sinks) is what this spec
-pins, not the TOML spelling.
+— where a lone scalar `[notifications.push]` keeps parsing as one sink named
+by its kind. The nested array leaves `[notifications.push.inbox]` unchanged.
 
 ## Payload shapes (pure, unit-tested)
 
@@ -114,9 +112,9 @@ admission policy, and still preferably out-of-process.
   containment knobs; the help page says plainly that chat sinks exfiltrate
   whatever the routed notification says, so route deliberately. No secrets
   are ever interpolated into payloads by thegn itself.
-- **Probe never posts.** Doctor validates config + secret resolution only;
-  a visible test message is an explicit user action (`--send-test`), not a
-  side effect of diagnostics.
+- **Probe never posts.** Doctor validates config + secret resolution only; a
+  visible test delivery is outside this change and not a side effect of
+  diagnostics.
 - **Blast radius**: worst case on a leaked config is nil (URL is a
   SecretRef); worst case on a leaked env/file secret is spam into one chat
   channel — revoke the webhook at the platform.

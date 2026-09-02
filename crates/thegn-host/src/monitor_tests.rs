@@ -195,7 +195,11 @@ fn switching_tabs_records_where_to_reopen() {
 fn tab_cycles_the_visible_list_and_wraps() {
     let (mut ov, _m, _h) = open();
     let tabs = ov.tabs.clone();
-    assert_eq!(tabs.len(), MonitorTab::ALL.len(), "full snapshot: all tabs");
+    assert_eq!(
+        tabs.len(),
+        MonitorTab::ALL.len() - 1,
+        "full snapshot: all metric tabs"
+    );
     for expect in tabs.iter().skip(1).chain(tabs.first()) {
         key(&mut ov, KeyCode::Tab);
         assert_eq!(ov.tab, *expect);
@@ -1167,7 +1171,7 @@ fn the_last_tab_is_reachable_by_its_digit() {
     // case where the old `1`-`9` arm ran out: with nine tabs the bar's digits
     // cover it, and each digit really lands on the tab whose label it prints.
     let (mut ov, _m, _h) = open();
-    assert_eq!(ov.tabs.len(), MonitorTab::ALL.len());
+    assert_eq!(ov.tabs.len(), MonitorTab::ALL.len() - 1);
     let last = *ov.tabs.last().expect("at least one tab");
     let d = char::from_digit(ov.tabs.len() as u32, 10).expect("a digit");
     assert_eq!(ch(&mut ov, d), MonitorOutcome::PrefsChanged);
@@ -1199,7 +1203,7 @@ fn the_active_tab_is_never_clipped_out_of_the_bar() {
     // silently ate the tab the user was standing on. Walk the tabs the way a
     // user does — the digit keys — and stand on every one of them.
     let (mut ov, _m, _h) = open_on(Rect::full(80, 24), full_snap());
-    assert_eq!(ov.tabs.len(), MonitorTab::ALL.len());
+    assert_eq!(ov.tabs.len(), MonitorTab::ALL.len() - 1);
     let tabs = ov.tabs.clone();
     for (i, want) in tabs.iter().enumerate() {
         assert_eq!(
@@ -1427,6 +1431,7 @@ fn has_graphs_matches_what_the_builders_emit() {
         containment: String::new(),
         mounts: String::new(),
     });
+    model.notification_delivery_configured = true;
     let hist = history(120, NOW_MS);
     for tab in MonitorTab::ALL {
         let ov = open_tab(tab, &model, &hist, Rect::full(120, 40));

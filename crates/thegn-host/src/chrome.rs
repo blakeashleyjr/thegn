@@ -518,6 +518,11 @@ pub struct FrameModel {
     /// Active notification routing mode (item 427; `""` = default). Shown as a
     /// statusbar chip when non-empty.
     pub notify_mode: String,
+    /// Loop-readable, in-memory delivery counters for the Monitor view.
+    pub notification_delivery: crate::notification_delivery::DeliverySnapshot,
+    /// Whether at least one effective named push sink is configured. Kept
+    /// separate from the snapshot because an idle sink has all-zero counters.
+    pub notification_delivery_configured: bool,
     /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.

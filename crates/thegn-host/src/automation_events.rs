@@ -265,7 +265,7 @@ fn fallback_decision(kind: &str, source_ref: &str, message: &str, worktree: &str
         effective_priority,
         desktop: false,
         toast: false,
-        push: false,
+        push_sinks: Vec::new(),
         sound: None,
     }
 }
