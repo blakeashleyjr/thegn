@@ -1200,18 +1200,33 @@ fn report(id: i64, text: &str, json: bool) -> Result<()> {
 pub(crate) fn write_report(db: &Db, id: i64, text: &str, json: bool) -> Result<()> {
     let validated = pipeline_report::report_text(text).map_err(|e| anyhow::anyhow!("{e}"))?;
     db.set_dispatch_report(id, &validated)?;
+    // A PASS is a claim that the queue-boundary suite is green. Surfaced, never
+    // refused: a report that cannot be filed is a silent death, which is the
+    // worse failure — see the handoff contract in `[[pipeline.stages]]`.
+    let ungated = pipeline_report::pass_without_gate_evidence(&validated);
     if json {
-        let v = serde_json::json!({
+        let mut v = serde_json::json!({
             "id": id,
             "report": validated,
             "bytes": validated.len(),
         });
+        if ungated {
+            v["pass_without_gate_evidence"] = serde_json::json!(true);
+        }
         super::emit_json(&v)?;
-    } else {
+        return Ok(());
+    }
+    outln!(
+        "report recorded on dispatch {} ({} chars)",
+        id,
+        validated.chars().count()
+    );
+    if ungated {
         outln!(
-            "report recorded on dispatch {} ({} chars)",
-            id,
-            validated.chars().count()
+            "note: this report reads as PASS but cites no gate result. A PASS means the \
+             queue-boundary suite is green — add a line like\n  gate: cargo nextest run \
+             --workspace -- <N> passed, <M> skipped\nScoped suites do not run the \
+             workspace-level coverage tests the fold gate rejects branches on."
         );
     }
     Ok(())
@@ -1454,6 +1469,21 @@ fn is_reaped_wait_error(error: &anyhow::Error) -> bool {
         .is_some_and(|e| e.status() == 404)
 }
 
+/// Does a wake carry a handoff, whatever happened to the session?
+///
+/// A `gone` wake reads as loss — the tombstone expired, the daemon restarted,
+/// the worker vanished — and a supervisor's reflex is to re-dispatch. Very
+/// often the stage had in fact finished: it committed its artifact and filed
+/// its report, then died in the gap before anyone looked. Across the 469-row
+/// run the exit was unobserved for 424 rows, and 99 of those had filed a report
+/// regardless, so "the session is gone" says nothing about whether the work is.
+///
+/// Pure: the two row facts the wake already fetches, and nothing else.
+fn wake_has_handoff(report: Option<&str>, artifact: Option<&str>) -> bool {
+    let present = |s: Option<&str>| s.map(str::trim).is_some_and(|s| !s.is_empty());
+    present(report) || present(artifact)
+}
+
 async fn wait_wake(
     cfg: &Config,
     targets: Vec<WaitTarget>,
@@ -1532,11 +1562,23 @@ async fn wait_wake(
             });
             if gone {
                 v["gone"] = serde_json::json!(true);
+                // A gone session says nothing about whether the stage handed
+                // off; this is the fact that decides re-dispatch.
+                v["handoff_present"] =
+                    serde_json::json!(wake_has_handoff(report.as_deref(), artifact.as_deref()));
             }
             return super::emit_json(&v);
         }
         let stage = t.stage.as_deref().unwrap_or("-");
         match (gone, exit_code) {
+            (true, _) if wake_has_handoff(report.as_deref(), artifact.as_deref()) => outln!(
+                "dispatch {} ({}) session is gone — but the row carries a handoff. \
+                 Run `thegn dispatch verify {}` before re-dispatching: the stage most \
+                 likely finished and died in the gap.",
+                t.id,
+                stage,
+                t.id
+            ),
             (true, _) => outln!("dispatch {} ({}) session is gone", t.id, stage),
             (false, Some(code)) => outln!("dispatch {} ({}) exited {code}", t.id, stage),
             // Matched but unreapable — the same `?` `session list` prints.
@@ -1569,6 +1611,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join(format!("{name}.db"))).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn a_gone_wake_still_reports_a_handoff_when_the_row_has_one() {
+        // The re-dispatch trap: 424 of 469 rows had an unobserved exit, and 99
+        // of those had filed a report anyway. "Session gone" is not "work lost".
+        assert!(wake_has_handoff(Some("PASS; ready for the queue"), None));
+        assert!(wake_has_handoff(
+            None,
+            Some(".thegn/pipeline/THE-60/review/464.md")
+        ));
+        assert!(wake_has_handoff(Some("done"), Some("a.md")));
+        // Genuinely nothing to show for it.
+        assert!(!wake_has_handoff(None, None));
+        assert!(!wake_has_handoff(Some("  "), Some("")));
     }
 
     #[test]
