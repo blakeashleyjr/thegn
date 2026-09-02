@@ -15,16 +15,37 @@ use crate::panes::Panes;
 use crate::session::{GroupKind, Session};
 use crate::terminal_wizard::{TerminalChoice, TerminalWizard};
 
+/// Every terminal name already spoken for: the live session's terminal groups
+/// UNIONED with the global `terminals` registry (`model.sidebar_db_terminals`,
+/// already resident — no DB read on the loop).
+///
+/// The registry half is not optional. `db.put_terminal` upserts on a globally
+/// unique name while a session only ever holds the terminals it happens to have
+/// opened, so deduping against the session alone let a "local" created in one
+/// project overwrite another project's row — leaving two live groups sharing one
+/// name, which makes the by-name lookups that reunite a terminal with its shell
+/// (`workspace_pool::take_terminal_group`, `db.terminal_group_tabs`) ambiguous.
+pub(crate) fn taken_names(
+    session: &Session,
+    db_terminals: &[thegn_core::models::TerminalRow],
+) -> Vec<String> {
+    let mut taken: Vec<String> = db_terminals.iter().map(|t| t.name.clone()).collect();
+    for g in &session.worktrees {
+        if g.kind == GroupKind::Terminal && !taken.contains(&g.name) {
+            taken.push(g.name.clone());
+        }
+    }
+    taken
+}
+
 /// Open the new-terminal wizard, seeding it with existing terminal names so its
 /// random default slug is deduped (back-to-back creates would otherwise collide).
-pub(crate) fn open_wizard(cfg: &Config, session: &Session) -> TerminalWizard {
-    let taken: Vec<String> = session
-        .worktrees
-        .iter()
-        .filter(|g| g.kind == GroupKind::Terminal)
-        .map(|g| g.name.clone())
-        .collect();
-    TerminalWizard::new(cfg, &taken)
+pub(crate) fn open_wizard(
+    cfg: &Config,
+    session: &Session,
+    db_terminals: &[thegn_core::models::TerminalRow],
+) -> TerminalWizard {
+    TerminalWizard::new(cfg, &taken_names(session, db_terminals))
 }
 
 /// Persist a terminal from the wizard: upsert the row (keyed by unique name) and
@@ -106,14 +127,80 @@ pub(crate) fn push_terminal_group(
     choice: &TerminalChoice,
 ) -> u32 {
     remember_choice(&choice.name, &choice.connection, &choice.sandbox);
-    let placeholder = panes.reserve_ids(1);
-    let mut group = crate::session::WorktreeGroup::terminal(&choice.name);
-    let tab = &mut group.tabs[0];
-    tab.center = crate::center::CenterTree::Leaf(placeholder);
-    tab.focused_pane = placeholder;
+    let group = fresh_group(&choice.name, panes);
+    let placeholder = group.tabs[0].focused_pane;
     session.worktrees.push(group);
     session.active = session.worktrees.len() - 1;
     placeholder
+}
+
+/// A never-opened terminal's group: one `main` tab holding a freshly reserved
+/// placeholder leaf for the materialize path to spawn over. See
+/// [`push_terminal_group`] for why the placeholder is reserved rather than left
+/// at `Tab::new`'s default `Leaf(0)`.
+pub(crate) fn fresh_group(name: &str, panes: &mut Panes) -> crate::session::WorktreeGroup {
+    let placeholder = panes.reserve_ids(1);
+    let mut group = crate::session::WorktreeGroup::terminal(name);
+    let tab = &mut group.tabs[0];
+    tab.center = crate::center::CenterTree::Leaf(placeholder);
+    tab.focused_pane = placeholder;
+    group
+}
+
+/// Rebuild terminal `name`'s group from the layout it was last persisted under,
+/// wherever that was, returning it beside the donor session key.
+///
+/// This is the COLD half of keeping one terminal to one shell: with no live
+/// group anywhere (a fresh launch, or a workspace evicted past
+/// `[session] resident_pool_limit`), the persisted tab is the only thing that
+/// still knows the terminal's daemon session id. Restoring it means
+/// `materialize_with_specs` takes its warm-reattach branch and reconnects the
+/// running shell; if that session is gone the relay's `SessionFallback` at least
+/// repaints the persisted scrollback tail. Building an empty group instead —
+/// what every re-open used to do — throws both away.
+///
+/// Ids are remapped onto a fresh disjoint range (with all four id-keyed side
+/// maps, via [`crate::workspace_pool::remap_group_ids`]) so a persisted id can't
+/// alias a live pane of some other resident workspace.
+///
+/// One indexed SELECT on the loop, on a user-initiated activation only — the
+/// same trade `switch_workspace`'s registry re-read already makes.
+pub(crate) fn restore_group(
+    name: &str,
+    panes: &mut Panes,
+) -> Option<(String, crate::session::WorktreeGroup)> {
+    let db = thegn_core::db::Db::open().ok()?;
+    let (donor, grow, rows) = db.terminal_group_tabs(name).ok().flatten()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let tabs: Vec<crate::session::Tab> = rows.iter().map(crate::session::Tab::from_row).collect();
+    let active_tab = (grow.active_tab.max(0) as usize).min(tabs.len() - 1);
+    let mut group = crate::session::WorktreeGroup {
+        name: name.to_string(),
+        kind: GroupKind::Terminal,
+        path: String::new(),
+        tabs,
+        active_tab,
+    };
+    crate::workspace_pool::remap_group_ids(&mut group, panes);
+    Some((donor, group))
+}
+
+/// Drop terminal `name`'s layout rows from the session that used to hold it,
+/// after its group has moved into the active one.
+///
+/// Two sessions both claiming one terminal is how a cold resurrect of the donor
+/// would fork a phantom duplicate — a second group with the same name and a
+/// stale pane tree, racing the real one for the sidebar row. `write_layout` only
+/// clears the session it is writing, so the donor's rows have to be deleted
+/// explicitly. Best-effort and off-loop: the DB is a cache, and the worst a lost
+/// delete costs is that phantom, which the next persist of the donor clears
+/// anyway.
+pub(crate) fn forget_layout(donor: String, name: String) {
+    crate::db_task::persist(move |db| {
+        let _ = db.delete_tab_group(&donor, &name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    });
 }
 
 #[cfg(test)]
@@ -189,6 +276,53 @@ mod tests {
             Some(("ssh user@host".to_string(), String::new()))
         );
         assert_eq!(live_choice("live-choice-never-created"), None);
+    }
+
+    fn db_terminal(name: &str) -> thegn_core::models::TerminalRow {
+        thegn_core::models::TerminalRow {
+            id: 0,
+            name: name.to_string(),
+            kind: "local".into(),
+            connection_string: String::new(),
+            folder_id: None,
+            created_at: 0,
+            last_active: 0,
+            position: 0,
+            sandbox_backend: String::new(),
+            env_name: String::new(),
+            observed_backend: String::new(),
+        }
+    }
+
+    /// The wizard must dedupe against the GLOBAL registry, not just this
+    /// session: `put_terminal` upserts on a unique name, so a name only free in
+    /// the current project would overwrite another project's row and leave two
+    /// live groups sharing it — which the by-name reunion can't disambiguate.
+    #[test]
+    fn taken_names_unions_the_global_registry_with_the_live_session() {
+        let mut session = test_session();
+        session
+            .worktrees
+            .push(crate::session::WorktreeGroup::terminal("live-only"));
+        let taken = taken_names(&session, &[db_terminal("db-only"), db_terminal("both")]);
+
+        assert!(
+            taken.contains(&"db-only".to_string()),
+            "registry name taken"
+        );
+        assert!(
+            taken.contains(&"live-only".to_string()),
+            "session name taken"
+        );
+        assert_eq!(
+            taken.iter().filter(|n| *n == "db-only").count(),
+            1,
+            "no duplicates for `dedupe` to trip over"
+        );
+        assert!(
+            !taken.contains(&"home".to_string()),
+            "a worktree group is not a terminal name"
+        );
     }
 
     #[test]

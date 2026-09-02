@@ -21,6 +21,31 @@ thegn SHALL manage terminal environments (local, ssh, mosh, container) persisted
 - **WHEN** a git-dependent query runs against a terminal group
 - **THEN** it returns empty/None without raising an error
 
+### Requirement: A terminal is one shell, reachable from any workspace
+
+A terminal SHALL have at most one live session at a time regardless of which
+workspace it is opened from. Because the `terminals` registry is global and its
+sidebar row renders in every workspace, activating a terminal MUST reunite it
+with its existing session before spawning: reusing the group when resident,
+migrating the live group when it is parked with another workspace, and restoring
+its persisted layout (so the daemon session reattaches) when neither. Only a
+terminal with no live and no persisted session spawns a new one.
+
+#### Scenario: Re-open a terminal from another workspace
+
+- **WHEN** the user opens a terminal in one workspace, switches to another
+  workspace, and activates that same terminal row there
+- **THEN** the original session is re-shown — same running process, same
+  scrollback — rather than a second group with a new shell
+
+#### Scenario: Re-open a terminal with no resident group
+
+- **WHEN** a terminal's group is resident in no workspace (a fresh launch, or a
+  workspace evicted from the resident pool) but its layout was persisted
+- **THEN** the terminal is restored from that layout so its session reattaches,
+  falling back to repainting the persisted scrollback tail when the session is
+  gone
+
 ### Requirement: Connection kind drives the spawned process
 
 A terminal's `kind` SHALL determine the spawned process: `local` drops into `$HOME`, while `ssh`/`mosh` exec the connection binary instead of `$SHELL`, degrading gracefully when the binary is unavailable.

@@ -273,6 +273,28 @@ pub trait WorkspaceStore {
     /// All persisted tabs for every group in a session, ordered (group, tab).
     fn group_tabs_for_session(&self, session: &str) -> Result<Vec<crate::models::GroupTabRow>>;
 
+    /// The persisted group row and tabs of the TERMINAL group `name`, plus the
+    /// session that last held them — `None` when no session ever persisted it.
+    ///
+    /// Terminals are workspace-independent (the `terminals` registry is global
+    /// and its sidebar row renders in every workspace) but their layout rows are
+    /// keyed by whichever session was active when they were last persisted, so
+    /// re-opening one from a different workspace has to find that row wherever
+    /// it landed — otherwise the restore has no `pane_sessions` to warm-reattach
+    /// with and silently forks a fresh shell. The session name comes back so the
+    /// caller can delete the donor rows once the group has moved.
+    #[allow(clippy::type_complexity)]
+    fn terminal_group_tabs(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<(
+            String,
+            crate::models::TabGroupRow,
+            Vec<crate::models::GroupTabRow>,
+        )>,
+    >;
+
     /// Forget one worktree group and its tabs (on worktree close).
     fn delete_tab_group(&self, session: &str, name: &str) -> Result<()>;
 

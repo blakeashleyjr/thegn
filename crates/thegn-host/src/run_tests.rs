@@ -2149,6 +2149,154 @@ fn workspace_pool_evicts_lru_and_reaps_its_panes_past_the_limit() {
     assert!(panes.table.contains_key(&3));
 }
 
+/// A parked workspace holding `groups`, focused on index `active`.
+#[cfg(test)]
+fn resident_of(groups: Vec<WorktreeGroup>, active: usize) -> ResidentWorkspace {
+    ResidentWorkspace {
+        worktrees: groups,
+        active,
+    }
+}
+
+/// A terminal group whose single leaf is `pane_id`, live in `panes`.
+#[cfg(test)]
+fn live_terminal(panes: &mut Panes, name: &str, pane_id: u32) -> WorktreeGroup {
+    let mut g = WorktreeGroup::terminal(name);
+    g.tabs[0].center = CenterTree::Leaf(pane_id);
+    g.tabs[0].focused_pane = pane_id;
+    panes.insert_test_pane(pane_id);
+    g
+}
+
+/// The core of the cross-project terminal fix: a terminal parked with another
+/// project is MIGRATED out of the pool, keeping its live pane ids — so the
+/// activating session sees no missing leaf and nothing respawns.
+#[test]
+fn take_terminal_group_migrates_the_live_group_out_of_its_parked_workspace() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+
+    let term = live_terminal(&mut panes, "prod", 7);
+    pool.stash(
+        "/r/a".into(),
+        resident_of(
+            vec![
+                WorktreeGroup::new("a/home", GroupKind::Home, "/r/a"),
+                term,
+                WorktreeGroup::new("a/feat", GroupKind::Branch, "/r/a-feat"),
+            ],
+            2,
+        ),
+        &mut panes,
+    );
+
+    let (donor, g) = pool.take_terminal_group("prod").expect("parked terminal");
+    assert_eq!(donor, "/r/a", "the donor session is named for the delete");
+    assert_eq!(g.kind, GroupKind::Terminal);
+    assert_eq!(
+        g.tabs[0].center,
+        CenterTree::Leaf(7),
+        "the live pane id travels with the group — no respawn"
+    );
+    assert!(panes.table.contains_key(&7), "the pane is never detached");
+
+    // The donor keeps its worktrees, and its `active` index follows the group
+    // it was pointing at ("a/feat", which shifted from 2 to 1).
+    let rw = pool.take("/r/a").expect("donor still parked");
+    assert_eq!(
+        rw.worktrees
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a/home", "a/feat"]
+    );
+    assert_eq!(rw.active, 1, "active follows the group it pointed at");
+}
+
+/// A workspace whose only group was the migrated terminal is dropped outright:
+/// leaving an empty shell behind would make `contains` claim it is resident and
+/// a warm switch restore a session with no groups at all.
+#[test]
+fn take_terminal_group_drops_an_emptied_workspace() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    let term = live_terminal(&mut panes, "solo", 4);
+    pool.stash("/r/a".into(), resident_of(vec![term], 0), &mut panes);
+
+    assert!(pool.take_terminal_group("solo").is_some());
+    assert!(!pool.contains("/r/a"), "emptied workspace left the pool");
+}
+
+/// Only terminals migrate. A worktree belongs to its repo — the sidebar's
+/// `Workspace` target switches to that project instead — so a same-named
+/// worktree group must never be pulled out from under a parked workspace.
+#[test]
+fn take_terminal_group_refuses_a_worktree_group() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    pool.stash(
+        "/r/a".into(),
+        resident_of(
+            vec![WorktreeGroup::new("prod", GroupKind::Branch, "/r/a-prod")],
+            0,
+        ),
+        &mut panes,
+    );
+
+    assert!(pool.take_terminal_group("prod").is_none());
+    assert!(pool.contains("/r/a"), "the workspace is untouched");
+}
+
+/// `remap_group_ids` must carry `pane_sessions` and `pane_scrollback` onto the
+/// new ids: those two ARE the restore (daemon reattach + repainted tail), so
+/// leaving either under the old key downgrades a restore to a blank shell.
+#[test]
+fn remap_group_ids_carries_the_reattach_state_onto_the_new_ids() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    // Occupy ids so the remap demonstrably lands past every live pane.
+    let live = panes.reserve_ids(5);
+    panes.insert_test_pane(live);
+
+    let mut g = WorktreeGroup::terminal("prod");
+    g.tabs[0].center = CenterTree::Leaf(2);
+    g.tabs[0].focused_pane = 2;
+    g.tabs[0].pane_sessions.insert(
+        2,
+        crate::session::ProviderSession {
+            provider: "daemon".into(),
+            id: "local".into(),
+            session: "sess-42".into(),
+        },
+    );
+    g.tabs[0]
+        .pane_scrollback
+        .insert(2, "the tail I was reading\n".into());
+
+    crate::workspace_pool::remap_group_ids(&mut g, &mut panes);
+
+    let CenterTree::Leaf(new) = g.tabs[0].center else {
+        panic!("still a single leaf");
+    };
+    assert!(new > live, "remapped past every live pane id");
+    assert_eq!(g.tabs[0].focused_pane, new);
+    assert_eq!(
+        g.tabs[0]
+            .pane_sessions
+            .get(&new)
+            .map(|s| s.session.as_str()),
+        Some("sess-42"),
+        "the daemon session follows the leaf, so materialize reattaches"
+    );
+    assert_eq!(
+        g.tabs[0].pane_scrollback.get(&new).map(String::as_str),
+        Some("the tail I was reading\n")
+    );
+}
+
 /// A one-tab workspace group whose single leaf pane (`pane_id`) is live in
 /// `panes` and has emitted the OSC-2 window title `title`. `focused_pane` is
 /// wired to `pane_id` so [`collect_window_titles`] finds it.
@@ -2809,6 +2957,84 @@ fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
 
     assert!(!activated);
     assert!(model.status.is_empty());
+}
+
+/// The regression this whole change exists for: a terminal created in one
+/// project, then activated from ANOTHER, must be REUNITED with its running
+/// shell — not forked into a second group with a fresh one.
+///
+/// The tell is the pane id. A migrated group carries the live leaf ids it was
+/// parked with, so `missing_leaves` is empty and the materialize path never
+/// runs; the old behaviour pushed a group holding a freshly reserved
+/// placeholder, which materialized as a brand-new shell while the original kept
+/// running, invisible, in the pane daemon.
+#[test]
+fn activating_a_terminal_parked_with_another_project_migrates_its_live_shell() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1);
+    let mut panes = Panes::new(tx);
+    let mut session = one_tab_session();
+    let mut model = FrameModel::default();
+    let mut sb = SidebarState::default();
+    let mut drawer_runtime = DrawerRuntime::default();
+    let mut workspace_pool = WorkspacePool::default();
+    let mut need_relayout = false;
+    let mut clear_on_next_frame = false;
+
+    // A terminal live in the project the user just left.
+    let term = live_terminal(&mut panes, "prod", 11);
+    workspace_pool.stash(
+        "/r/other".into(),
+        resident_of(
+            vec![
+                WorktreeGroup::new("o/home", GroupKind::Home, "/r/other"),
+                term,
+            ],
+            0,
+        ),
+        &mut panes,
+    );
+    let groups_before = session.worktrees.len();
+
+    activate_row_target(
+        crate::sidebar::RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: Some("prod".into()),
+        },
+        &mut session,
+        &mut model,
+        &mut sb,
+        &mut panes,
+        &mut drawer_runtime,
+        &mut workspace_pool,
+        &thegn_core::config::Config::default(),
+        crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        },
+        &mut need_relayout,
+        &mut clear_on_next_frame,
+    );
+
+    assert_eq!(session.worktrees.len(), groups_before + 1);
+    let g = session.active_group().expect("landed on the terminal");
+    assert_eq!(g.name, "prod");
+    assert_eq!(g.kind, GroupKind::Terminal);
+    assert_eq!(
+        g.tabs[0].center,
+        CenterTree::Leaf(11),
+        "the live pane id came across — not a fresh placeholder"
+    );
+    assert!(
+        panes.missing_leaves(&g.tabs[0]).is_empty(),
+        "nothing is missing, so nothing materializes and no shell respawns"
+    );
+    assert!(panes.table.contains_key(&11), "the running shell is intact");
+    assert!(
+        workspace_pool.take_terminal_group("prod").is_none(),
+        "the pool no longer holds a second copy to fork from"
+    );
 }
 
 // `neutralize_paste_markers` and its tests moved to `crate::pane_writer`

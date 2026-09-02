@@ -543,6 +543,10 @@ impl Panes {
         let source = std::sync::Arc::new(crate::daemon::client::LazyDaemonSource {
             cfg: dcfg,
             worktree: cwd_s.clone(),
+            // Fresh cell per pane: this pane's emulator is empty, so its first
+            // attach takes the scrollback tail even if another pane in this
+            // process already attached the same session.
+            attached_once: Default::default(),
         });
         let id = self.next_id;
         self.next_id += 1;
