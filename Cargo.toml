@@ -108,7 +108,7 @@ ignore = "0.4.26"
 # including in core (C-dep-free, cross-compilable). Pinned to the exact nightly:
 # fff publishes only prereleases (no stable line yet).
 fff-search = "=0.10.6-nightly.611dd87"
-neo_frizbee = "0.10"
+neo_frizbee = "0.11"
 futures = "0.3"
 # --- native host substrate (Phase 1+) ---
 # NOTE: wezterm-term (the plan's first choice for its built-in sixel/kitty image
