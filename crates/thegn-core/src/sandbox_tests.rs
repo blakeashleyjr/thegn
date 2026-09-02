@@ -1341,8 +1341,6 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
     // must NOT ride the world-readable `-e K=V` argv; it goes to a 0600
     // `--env-file`. A synthetic pair (value absent from the host env) stays
     // inline as `-e`.
-    let state = tempfile::tempdir().unwrap();
-    let state_home = state.path().to_string_lossy().into_owned();
     // Also clear ambient THEGN_SANDBOX (a live thegn shell sets it) — these
     // tests use it as a SYNTHETIC inline pair, so its ambient presence would
     // divert it to the env-file and break the assertion. Hermetic under nextest

@@ -773,6 +773,7 @@ impl NewWorktreeWizard {
 pub enum CreateStep {
     ResolveBase,
     CreateWorktree,
+    InitSubmodules,
     FinalizeName,
     SandboxPrep,
     Register,
@@ -780,9 +781,10 @@ pub enum CreateStep {
 }
 
 impl CreateStep {
-    const ALL: [CreateStep; 6] = [
+    const ALL: [CreateStep; 7] = [
         CreateStep::ResolveBase,
         CreateStep::CreateWorktree,
+        CreateStep::InitSubmodules,
         CreateStep::FinalizeName,
         CreateStep::SandboxPrep,
         CreateStep::Register,
@@ -793,6 +795,7 @@ impl CreateStep {
         match self {
             CreateStep::ResolveBase => "resolve base",
             CreateStep::CreateWorktree => "create worktree",
+            CreateStep::InitSubmodules => "initialize submodules",
             CreateStep::FinalizeName => "finalize name",
             CreateStep::SandboxPrep => "sandbox",
             CreateStep::Register => "register",
@@ -1088,6 +1091,12 @@ pub fn run_worker(
         );
         fail(CreateStep::CreateWorktree, error);
         return;
+    }
+    step(CreateStep::InitSubmodules, StepState::Running, None);
+    match crate::git_worktree::initialize(cfg, root, &path, None) {
+        Ok(true) => step(CreateStep::InitSubmodules, StepState::Done, None),
+        Ok(false) => step(CreateStep::InitSubmodules, StepState::Skipped, None),
+        Err(e) => step(CreateStep::InitSubmodules, StepState::Done, Some(e)),
     }
     // Seed configured skills while still on the wizard's blocking worker.
     // Conflicts and discovery failures stay best-effort diagnostics.

@@ -683,6 +683,18 @@ impl GitLoc {
 /// a `.git`, so the guard skips). When `branch` is set, check it out (creating it
 /// if it doesn't exist on the remote). `origin` is the upstream URL.
 pub fn provision_repo_script(origin: &str, branch: Option<&str>) -> String {
+    provision_repo_script_with_submodules(origin, branch, false)
+}
+
+/// As provision_repo_script, optionally initialize the repo's declared
+/// submodules after the clone/branch checkout. The command is only emitted
+/// when the host has already applied the effective policy and trust decision;
+/// this function remains pure and only produces shell-quoted text.
+pub fn provision_repo_script_with_submodules(
+    origin: &str,
+    branch: Option<&str>,
+    recursive_submodules: bool,
+) -> String {
     let oq = util::sh_quote(origin);
     // Already a repo → done. Else clone into the cwd, then settle the branch.
     let mut s =
@@ -694,6 +706,9 @@ pub fn provision_repo_script(origin: &str, branch: Option<&str>) -> String {
         s.push_str(&format!(
             " && (git checkout {bq} 2>/dev/null || git checkout -b {bq})"
         ));
+    }
+    if recursive_submodules {
+        s.push_str(" && git submodule update --init --recursive");
     }
     s
 }
@@ -791,6 +806,14 @@ mod tests {
         assert!(!s2.contains("checkout"), "no branch ⇒ no checkout: {s2}");
         // Blank branch is treated as no branch.
         assert!(!provision_repo_script("x", Some("  ")).contains("checkout"));
+    }
+
+    #[test]
+    fn provision_script_can_initialize_recursive_submodules() {
+        let s = provision_repo_script_with_submodules("https://x/r.git", Some("main"), true);
+        assert!(s.ends_with("git submodule update --init --recursive"));
+        let off = provision_repo_script_with_submodules("https://x/r.git", Some("main"), false);
+        assert!(!off.contains("submodule update"));
     }
 
     #[test]

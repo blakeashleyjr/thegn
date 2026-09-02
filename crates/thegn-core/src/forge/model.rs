@@ -531,6 +531,10 @@ pub struct DiffFile {
     /// Old-side path (`a/…`); `None` for added files.
     #[serde(default)]
     pub old_path: Option<String>,
+    /// True for a mode-160000 gitlink; its body is metadata, not selectable
+    /// source text.
+    #[serde(default)]
+    pub is_submodule: bool,
     pub hunks: Vec<DiffHunk>,
 }
 
@@ -573,6 +577,7 @@ pub fn parse_unified_diff(raw: &str) -> PrDiff {
             files.push(DiffFile {
                 path: git_header_path(rest),
                 old_path: None,
+                is_submodule: false,
                 hunks: Vec::new(),
             });
             continue;
@@ -580,6 +585,24 @@ pub fn parse_unified_diff(raw: &str) -> PrDiff {
         let Some(file) = files.last_mut() else {
             continue; // preamble before any `diff --git`
         };
+        if line.starts_with("index ")
+            && line
+                .split_whitespace()
+                .any(|part| part.eq_ignore_ascii_case("160000"))
+        {
+            file.is_submodule = true;
+        }
+        if line.starts_with("new file mode 160000")
+            || line.starts_with("deleted file mode 160000")
+            || line.starts_with("old mode 160000")
+            || line.starts_with("new mode 160000")
+            || line
+                .strip_prefix('+')
+                .or_else(|| line.strip_prefix('-'))
+                .is_some_and(|body| body.starts_with("Subproject commit "))
+        {
+            file.is_submodule = true;
+        }
         if let Some(p) = line.strip_prefix("--- ") {
             file.old_path = strip_ab(p);
             continue;
@@ -1129,6 +1152,15 @@ mod tests {
         );
         // Odd input with no ` b/` falls back to the leading-token behavior.
         assert_eq!(git_header_path("a/only.txt"), "only.txt");
+    }
+
+    #[test]
+    fn unified_diff_marks_gitlinks_as_non_text_submodules() {
+        let diff = parse_unified_diff(
+            "diff --git a/vendor/lib b/vendor/lib\nindex aaaaaaa..bbbbbbb 160000\n--- a/vendor/lib\n+++ b/vendor/lib\n@@ -1 +1 @@\n-Subproject commit aaaaaaa\n+Subproject commit bbbbbbb\n",
+        );
+        assert_eq!(diff.files.len(), 1);
+        assert!(diff.files[0].is_submodule);
     }
 
     #[test]

@@ -126,6 +126,9 @@ pub struct GitGlyphs {
     pub add: u32,
     pub del: u32,
     pub branch_diff: Option<(u32, u32)>,
+    /// A submodule gitlink is moved, dirty, untracked, conflicted, unavailable,
+    /// or uninitialized. Kept separate from ordinary-file dirtiness.
+    pub submodule_dirty: bool,
     /// The worktree's repo is colocated with jujutsu (a `.jj/` beside `.git/`).
     /// Drives the sidebar jj marker; a directory check, never a `jj` subprocess.
     pub jj: bool,

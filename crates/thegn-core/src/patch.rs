@@ -62,6 +62,8 @@ pub enum FileKind {
     Deleted,
     Binary,
     ModeOnly,
+    /// A mode-160000 gitlink. Gitlinks are atomic and never line-stageable.
+    Submodule,
 }
 
 /// One file section of a (possibly multi-file) diff.
@@ -171,6 +173,7 @@ struct FileBuilder {
     added: bool,
     deleted: bool,
     binary: bool,
+    submodule: bool,
     hunks: Vec<PatchHunk>,
 }
 
@@ -193,6 +196,8 @@ impl FileBuilder {
             self.added = true;
         } else if line.starts_with("deleted file mode") {
             self.deleted = true;
+        } else if is_submodule_header(line) {
+            self.submodule = true;
         } else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
             self.binary = true;
         }
@@ -213,7 +218,15 @@ impl FileBuilder {
             .flatten()
             .or_else(|| guess.map(|g| g.1))
             .unwrap_or_default();
-        let kind = if self.binary {
+        let submodule = self.submodule
+            || self
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .any(|line| line.text.starts_with("Subproject commit "));
+        let kind = if submodule {
+            FileKind::Submodule
+        } else if self.binary {
             FileKind::Binary
         } else if self.added || minus_devnull {
             FileKind::Added
@@ -237,6 +250,18 @@ impl FileBuilder {
             hunks: self.hunks,
         }
     }
+}
+
+fn is_submodule_header(line: &str) -> bool {
+    let mode_160000 = line
+        .split_whitespace()
+        .any(|part| part.eq_ignore_ascii_case("160000"));
+    mode_160000
+        && (line.starts_with("index ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode "))
 }
 
 /// Parse a (possibly multi-file) unified diff as produced by
@@ -445,6 +470,35 @@ impl Selection {
     pub fn len(&self) -> usize {
         self.set.len()
     }
+
+    /// Validate that this selection can be sent through the line-stage patch
+    /// engine. Gitlink pointers are whole entries, not text, so any selected
+    /// line on a submodule is rejected before `git apply` can be attempted.
+    pub fn validate(&self, file: &PatchFile) -> Result<(), SelectionError> {
+        if file.kind == FileKind::Submodule && !self.is_empty() {
+            return Err(SelectionError::SubmoduleAtomic);
+        }
+        Ok(())
+    }
+
+    /// Alias used by staging callers that make the line-level boundary
+    /// explicit.
+    pub fn validate_for_file(&self, file: &PatchFile) -> Result<(), SelectionError> {
+        self.validate(file)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionError {
+    SubmoduleAtomic,
+}
+
+impl std::fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelectionError::SubmoduleAtomic => f.write_str("submodule pointers are atomic"),
+        }
+    }
 }
 
 impl FromIterator<(usize, usize)> for Selection {
@@ -539,7 +593,7 @@ fn count_kinds(lines: &[PatchLine], a: LineKind, b: LineKind) -> i64 {
 /// (`@@ -1,2 +0,0 @@`, `@@ -3,0 +4,2 @@` — verified against `git diff`),
 /// hence the ±1 adjustment when a recounted side hits or leaves zero.
 pub fn transform(file: &PatchFile, sel: &Selection, reverse: bool) -> Option<String> {
-    if file.kind == FileKind::Binary {
+    if file.kind == FileKind::Binary || file.kind == FileKind::Submodule {
         return None;
     }
     let mut body = String::new();
@@ -983,9 +1037,16 @@ mod tests {
             "diff --git a/run.sh b/run.sh",
             "old mode 100644",
             "new mode 100755",
+            "diff --git a/vendor/lib b/vendor/lib",
+            "index 1111111..2222222 160000",
+            "--- a/vendor/lib",
+            "+++ b/vendor/lib",
+            "@@ -1 +1 @@",
+            "-Subproject commit 1111111",
+            "+Subproject commit 2222222",
         ]);
         let files = parse_patch(&diff);
-        assert_eq!(files.len(), 5);
+        assert_eq!(files.len(), 6);
         assert_eq!(files[0].kind, FileKind::Modified);
         assert_eq!(
             (files[0].old_path.as_str(), files[0].new_path.as_str()),
@@ -1001,6 +1062,31 @@ mod tests {
         assert_eq!(files[3].new_path, "img.png");
         assert_eq!(files[4].kind, FileKind::ModeOnly);
         assert_eq!(files[4].new_path, "run.sh");
+        assert_eq!(files[5].kind, FileKind::Submodule);
+        assert_eq!(files[5].new_path, "vendor/lib");
+        assert_eq!(
+            render_patch(&files[5..]),
+            diff.split("diff --git a/vendor/lib")
+                .nth(1)
+                .map_or_else(String::new, |tail| format!("diff --git a/vendor/lib{tail}"))
+        );
+    }
+
+    #[test]
+    fn submodule_selection_is_atomic() {
+        let file = &parse_patch(&d(&[
+            "diff --git a/lib b/lib",
+            "index aaaaaaa..bbbbbbb 160000",
+            "@@ -1 +1 @@",
+            "-Subproject commit aaaaaaa",
+            "+Subproject commit bbbbbbb",
+        ]))[0];
+        let selection = Selection::whole_file(file);
+        assert_eq!(
+            selection.validate(file),
+            Err(SelectionError::SubmoduleAtomic)
+        );
+        assert_eq!(transform(file, &selection, false), None);
     }
 
     #[test]

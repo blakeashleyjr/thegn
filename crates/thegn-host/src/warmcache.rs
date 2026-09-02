@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::hydrate::GlyphRow;
+use crate::glyph_types::GlyphRow;
 
 /// Load every persisted glyph row into a fresh cache map. Best-effort: a DB miss
 /// or an unparseable row is skipped. Rows are stamped `now`, so they serve

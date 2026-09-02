@@ -301,6 +301,7 @@ mod tests {
             files: vec![DiffFile {
                 path: path.into(),
                 old_path: None,
+                is_submodule: false,
                 hunks: vec![DiffHunk {
                     header: "@@".into(),
                     lines: lines

@@ -11,7 +11,7 @@ use anyhow::Result;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::store::WorkspaceStore;
-use thegn_core::{outln, util, worktree};
+use thegn_core::{msg, outln, util, worktree};
 
 /// Args shared by `diff` and `wt diff`.
 #[derive(clap::Args, Clone)]
@@ -284,6 +284,9 @@ fn create_and_register(
         );
         anyhow::anyhow!(message)
     })?;
+    if let Err(e) = crate::git_worktree::initialize(cfg, root, &path, None) {
+        msg::warn(&e);
+    }
     // Seed the configured skill registry in each harness-native layout. This
     // non-interactive CLI path may do the bounded work synchronously.
     crate::skill_seed::seed_if_enabled(cfg, &path, thegn_core::skills::SeedPhase::Create);

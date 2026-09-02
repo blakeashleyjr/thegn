@@ -37,6 +37,26 @@ flows follow lazygit conventions. An action key that needs a wider view
 crumb says so); drill detail views at the half width carry a breadcrumb
 (`changes › staging · esc back`) so the way back is always visible.
 
+## Submodule pointers
+
+A submodule is shown as the superproject's atomic gitlink, not as a text
+directory. Its change row uses the terminal-safe submodule marker, path, and
+abbreviated old and new object IDs, followed by a state such as `forward`,
+`rewind`, `diverged`, `dirty`, `uninitialized`, or `unavailable`. It never
+shows a made-up `+0/-0` diffstat.
+
+Opening the row asks a background worker for a bounded commit summary using
+objects already present locally. This view never fetches; when either object is
+missing it keeps the two IDs visible and says that the range is unavailable.
+`space` still stages or unstages the whole gitlink. Enter does not open line
+staging, because submodule pointers are atomic.
+
+Configure lifecycle reads with `[git] submodules = "auto"` (the default) or
+`"off"`. `auto` acts only when a root-level `.gitmodules` exists; `off` skips
+initialization and deeper state queries. `THEGN_GIT_SUBMODULES` is the matching
+environment override. This is trusted user/workspace configuration, not a key
+a repository may set through `.thegn.toml`.
+
 `Alt-/` opens a plain `git diff` in a pane; `thegn wt diff` prints one
 from any shell.
 

@@ -23,7 +23,7 @@ use crate::review_rows::{
     render_review_row, review_state_marker, row_thread, sel_marker, trunc,
 };
 use crate::seg::{Line, Seg, Tok, seg, sp};
-use thegn_core::forge::model::{PrConversation, PrDiff, ReviewState};
+use thegn_core::forge::model::{DiffFile, DiffLineKind, PrConversation, PrDiff, ReviewState};
 
 /// The four workflow tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +344,11 @@ impl PrView {
         let Some(file) = diff.files.get(i) else {
             return Vec::new();
         };
+        if file.is_submodule {
+            // A gitlink is one atomic pointer row. The Files renderer replaces
+            // this non-commentable sentinel with the pointer presentation.
+            return vec![ReviewRow::Hunk(String::new())];
+        }
         expanded_file_rows(file, self.anchored_review().as_ref(), self.include_resolved)
     }
 
@@ -748,6 +753,15 @@ impl PrView {
                     // 'c' is claimed globally as PR-comment above; only reached
                     // for line comments when a file is open. Anchor to the
                     // selected new-side line.
+                    if self
+                        .diff
+                        .as_ref()
+                        .and_then(|d| d.files.get(fi))
+                        .is_some_and(|f| f.is_submodule)
+                    {
+                        self.status = Some("submodule pointers are atomic".into());
+                        return PrViewOutcome::Pending;
+                    }
                     let rows = self.open_file_rows(fi);
                     let path = self
                         .diff
@@ -1281,43 +1295,43 @@ impl PrView {
                     let review = self.anchored_review();
                     for (i, f) in diff.files.iter().enumerate() {
                         let selected = i == self.sel;
-                        let (adds, dels) = file_stat(f);
+                        let stats = if f.is_submodule {
+                            vec![seg(
+                                Tok::Slot(S::Dim),
+                                format!("{} pointer", crate::caps::active_glyphs().submodule),
+                            )]
+                        } else {
+                            let (adds, dels) = file_stat(f);
+                            let unresolved = review
+                                .as_ref()
+                                .and_then(|r| r.files.get(i))
+                                .map(|r| {
+                                    r.threads.iter().filter(|t| !t.thread.resolved).count()
+                                        + r.outdated.iter().filter(|t| !t.resolved).count()
+                                })
+                                .unwrap_or(0);
+                            let mut stats = vec![
+                                seg(Tok::Hue(thegn_core::theme::Hue::Green), format!("+{adds} ")),
+                                seg(Tok::Hue(thegn_core::theme::Hue::Red), format!("-{dels}")),
+                            ];
+                            if unresolved > 0 {
+                                stats.push(seg(
+                                    Tok::Slot(S::Accent),
+                                    format!(
+                                        " {} {unresolved} unresolved",
+                                        crate::caps::active_glyphs().middot
+                                    ),
+                                ));
+                            }
+                            stats
+                        };
                         out.push((
                             Line::split(
                                 vec![
                                     seg(Tok::Slot(S::Faint), sel_marker(selected)),
                                     seg(Tok::Slot(S::Text), f.path.clone()),
                                 ],
-                                {
-                                    let unresolved = review
-                                        .as_ref()
-                                        .and_then(|r| r.files.get(i))
-                                        .map(|r| {
-                                            r.threads.iter().filter(|t| !t.thread.resolved).count()
-                                                + r.outdated.iter().filter(|t| !t.resolved).count()
-                                        })
-                                        .unwrap_or(0);
-                                    let mut stats = vec![
-                                        seg(
-                                            Tok::Hue(thegn_core::theme::Hue::Green),
-                                            format!("+{adds} "),
-                                        ),
-                                        seg(
-                                            Tok::Hue(thegn_core::theme::Hue::Red),
-                                            format!("-{dels}"),
-                                        ),
-                                    ];
-                                    if unresolved > 0 {
-                                        stats.push(seg(
-                                            Tok::Slot(S::Accent),
-                                            format!(
-                                                " {} {unresolved} unresolved",
-                                                crate::caps::active_glyphs().middot
-                                            ),
-                                        ));
-                                    }
-                                    stats
-                                },
+                                stats,
                             ),
                             selected,
                         ));
@@ -1329,9 +1343,14 @@ impl PrView {
                             Line::segs(vec![seg(Tok::Slot(S::Text), f.path.clone()).bold()]),
                             false,
                         ));
-                        for (ri, row) in self.open_file_rows(fi).into_iter().enumerate() {
-                            let selected = ri == self.sel;
-                            out.extend(render_review_row(&row, selected, cols));
+                        if f.is_submodule {
+                            let selected = self.sel == 0;
+                            out.push((submodule_line(f, selected, cols), selected));
+                        } else {
+                            for (ri, row) in self.open_file_rows(fi).into_iter().enumerate() {
+                                let selected = ri == self.sel;
+                                out.extend(render_review_row(&row, selected, cols));
+                            }
                         }
                     }
                 }
@@ -1391,6 +1410,49 @@ impl PrView {
 }
 
 // --- free helpers ----------------------------------------------------------
+
+fn submodule_diff(f: &DiffFile) -> thegn_core::submodule::SubmoduleDiff {
+    let mut old_sha = String::new();
+    let mut new_sha = String::new();
+    for line in f.hunks.iter().flat_map(|h| &h.lines) {
+        let Some(sha) = line.text.strip_prefix("Subproject commit ") else {
+            continue;
+        };
+        match line.kind {
+            DiffLineKind::Del => old_sha = sha.trim().to_string(),
+            DiffLineKind::Add => new_sha = sha.trim().to_string(),
+            DiffLineKind::Context => {}
+        }
+    }
+    let kind = if old_sha.is_empty() {
+        thegn_core::submodule::SubmoduleDiffKind::Added
+    } else if new_sha.is_empty() {
+        thegn_core::submodule::SubmoduleDiffKind::Deleted
+    } else {
+        thegn_core::submodule::SubmoduleDiffKind::Changed
+    };
+    thegn_core::submodule::SubmoduleDiff {
+        path: f.path.clone(),
+        old_sha,
+        new_sha,
+        kind,
+    }
+}
+
+pub(crate) fn submodule_line(f: &DiffFile, selected: bool, cols: usize) -> Line {
+    let diff = submodule_diff(f);
+    let text = thegn_core::submodule::SubmoduleRowPolicy::format_pointer(
+        crate::caps::active_glyphs().submodule,
+        crate::caps::active_glyphs().arrow_right,
+        &diff,
+        None,
+        None,
+    );
+    Line::segs(vec![
+        seg(Tok::Slot(S::Faint), sel_marker(selected)),
+        seg(Tok::Slot(S::Text), trunc(&text, cols)),
+    ])
+}
 
 fn pr_ide_outcome_for_row(row: &ReviewRow, file_path: Option<&str>) -> PrViewOutcome {
     match row {
@@ -1514,6 +1576,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/lib.rs".into(),
                 old_path: None,
+                is_submodule: false,
                 hunks: vec![thegn_core::forge::model::DiffHunk {
                     header: "@@ -1 +12 @@".into(),
                     lines: vec![DiffLine {
@@ -1623,6 +1686,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/x.rs".into(),
                 old_path: Some("src/x.rs".into()),
+                is_submodule: false,
                 hunks: vec![thegn_core::forge::model::DiffHunk {
                     header: "@@ -1,2 +1,3 @@".into(),
                     lines: vec![
@@ -1702,6 +1766,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/current.rs".into(),
                 old_path: None,
+                is_submodule: false,
                 hunks: vec![],
             }],
         };
@@ -1754,6 +1819,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/current.rs".into(),
                 old_path: None,
+                is_submodule: false,
                 hunks: vec![],
             }],
         };
@@ -1815,11 +1881,13 @@ mod tests {
                 DiffFile {
                     path: "src/current.rs".into(),
                     old_path: None,
+                    is_submodule: false,
                     hunks: vec![],
                 },
                 DiffFile {
                     path: "src/other.rs".into(),
                     old_path: None,
+                    is_submodule: false,
                     hunks: vec![],
                 },
             ],
@@ -1919,6 +1987,7 @@ mod tests {
                     files: vec![DiffFile {
                         path: "src/lib.rs".into(),
                         old_path: None,
+                        is_submodule: false,
                         hunks: vec![thegn_core::forge::model::DiffHunk {
                             header: "@@ -1,2 +1,2 @@".into(),
                             lines: vec![
@@ -2000,6 +2069,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/lib.rs".into(),
                 old_path: None,
+                is_submodule: false,
                 hunks: vec![thegn_core::forge::model::DiffHunk {
                     header: "@@ -1 +1 @@".into(),
                     lines: vec![DiffLine {
@@ -2056,6 +2126,55 @@ mod tests {
     }
 
     #[test]
+    fn submodule_file_is_one_atomic_non_commentable_row() {
+        let mut v = sample();
+        v.diff = Some(PrDiff {
+            files: vec![DiffFile {
+                path: "vendor/lib".into(),
+                old_path: Some("vendor/lib".into()),
+                is_submodule: true,
+                hunks: vec![thegn_core::forge::model::DiffHunk {
+                    header: "@@ -1 +1 @@".into(),
+                    lines: vec![
+                        DiffLine {
+                            kind: DiffLineKind::Del,
+                            text: "Subproject commit aaaaaaa".into(),
+                            old_lineno: None,
+                            new_lineno: None,
+                        },
+                        DiffLine {
+                            kind: DiffLineKind::Add,
+                            text: "Subproject commit bbbbbbb".into(),
+                            old_lineno: None,
+                            new_lineno: None,
+                        },
+                    ],
+                }],
+            }],
+        });
+        v.switch_tab(PrTab::Files);
+        assert_eq!(v.row_count(), 1);
+        v.handle_key(&KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(v.row_count(), 1);
+        let rendered = v
+            .files_body(80)
+            .iter()
+            .map(|(line, _)| format!("{line:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("vendor/lib"));
+        assert!(rendered.contains("aaaaaaa"));
+        assert!(rendered.contains("bbbbbbb"));
+        assert!(!rendered.contains("Subproject commit"));
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('c'), Modifiers::NONE),
+            PrViewOutcome::Pending
+        );
+        assert_eq!(v.status.as_deref(), Some("submodule pointers are atomic"));
+        assert!(v.composer.is_none());
+    }
+
+    #[test]
     fn hiding_resolved_threads_clamps_an_expanded_file_cursor() {
         let threads = vec![
             ReviewThread {
@@ -2076,6 +2195,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/lib.rs".into(),
                 old_path: None,
+                is_submodule: false,
                 hunks: vec![thegn_core::forge::model::DiffHunk {
                     header: "@@ -1 +1 @@".into(),
                     lines: vec![DiffLine {

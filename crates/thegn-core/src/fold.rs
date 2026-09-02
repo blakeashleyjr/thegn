@@ -28,8 +28,18 @@ use anyhow::Result;
 /// `thegn-svc`; the host adapter converts between the two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
-    Clean { tree: String },
-    Conflict { paths: Vec<String> },
+    Clean {
+        tree: String,
+    },
+    Conflict {
+        paths: Vec<String>,
+    },
+    /// A gitlink conflict carries raw paths for git operations and typed
+    /// pointer details for reporting/prompt rendering.
+    SubmoduleConflict {
+        paths: Vec<String>,
+        conflicts: Vec<crate::submodule::SubmoduleConflict>,
+    },
 }
 
 /// The author of a commit, preserved when a `rebase` land replays it. The
@@ -112,6 +122,7 @@ pub struct Deferred {
     pub branch: Branch,
     pub paths: Vec<String>,
     pub kind: ConflictKind,
+    pub submodule_conflicts: Vec<crate::submodule::SubmoduleConflict>,
 }
 
 /// A branch that landed, with the resulting tip oid (a merge/squash commit, or
@@ -192,8 +203,13 @@ fn is_regenerable(path: &str, regenerate_paths: &[String]) -> bool {
 
 /// Outcome of folding one branch under a strategy.
 enum One {
-    Landed { commit: String },
-    Deferred { paths: Vec<String> },
+    Landed {
+        commit: String,
+    },
+    Deferred {
+        paths: Vec<String>,
+        submodule_conflicts: Vec<crate::submodule::SubmoduleConflict>,
+    },
 }
 
 /// Fold `branches` onto `start_tip` in order under `opts.strategy`. Each clean
@@ -217,12 +233,20 @@ pub fn fold(
                 tip = commit.clone();
                 landed.push(Landed { branch: b, commit });
             }
-            One::Deferred { paths } => {
-                let kind = classify(&paths, regenerate_paths);
+            One::Deferred {
+                paths,
+                submodule_conflicts,
+            } => {
+                let kind = if submodule_conflicts.is_empty() {
+                    classify(&paths, regenerate_paths)
+                } else {
+                    ConflictKind::Textual
+                };
                 deferred.push(Deferred {
                     branch: b,
                     paths,
                     kind,
+                    submodule_conflicts,
                 });
             }
         }
@@ -245,7 +269,14 @@ fn fold_one(git: &impl FoldGit, tip: &str, b: &Branch, opts: &LandOpts) -> Resul
                     commit: git.commit_tree(&tree, &[tip, &b.tip], &msg)?,
                 })
             }
-            MergeOutcome::Conflict { paths } => Ok(One::Deferred { paths }),
+            MergeOutcome::Conflict { paths } => Ok(One::Deferred {
+                paths,
+                submodule_conflicts: Vec::new(),
+            }),
+            MergeOutcome::SubmoduleConflict { paths, conflicts } => Ok(One::Deferred {
+                paths,
+                submodule_conflicts: conflicts,
+            }),
         },
         LandStrategy::Squash => match git.merge_tree(tip, &b.tip)? {
             MergeOutcome::Clean { tree } => {
@@ -255,7 +286,14 @@ fn fold_one(git: &impl FoldGit, tip: &str, b: &Branch, opts: &LandOpts) -> Resul
                     commit: git.commit_tree(&tree, &[tip], &msg)?,
                 })
             }
-            MergeOutcome::Conflict { paths } => Ok(One::Deferred { paths }),
+            MergeOutcome::Conflict { paths } => Ok(One::Deferred {
+                paths,
+                submodule_conflicts: Vec::new(),
+            }),
+            MergeOutcome::SubmoduleConflict { paths, conflicts } => Ok(One::Deferred {
+                paths,
+                submodule_conflicts: conflicts,
+            }),
         },
         LandStrategy::Rebase => rebase_replay(git, tip, b),
     }
@@ -277,7 +315,18 @@ fn rebase_replay(git: &impl FoldGit, tip: &str, b: &Branch) -> Result<One> {
             }
             // Stop at the first conflicting commit; nothing this branch would
             // have replayed lands (the caller keeps the running tip pre-branch).
-            MergeOutcome::Conflict { paths } => return Ok(One::Deferred { paths }),
+            MergeOutcome::Conflict { paths } => {
+                return Ok(One::Deferred {
+                    paths,
+                    submodule_conflicts: Vec::new(),
+                });
+            }
+            MergeOutcome::SubmoduleConflict { paths, conflicts } => {
+                return Ok(One::Deferred {
+                    paths,
+                    submodule_conflicts: conflicts,
+                });
+            }
         }
     }
     Ok(One::Landed { commit: running })
@@ -357,6 +406,7 @@ mod tests {
     /// How a given branch tip behaves when folded.
     enum Rule {
         Conflict(Vec<String>),
+        SubmoduleConflict(Vec<String>, Vec<crate::submodule::SubmoduleConflict>),
         /// Conflicts only once the named branch has already landed (models a
         /// branch that's clean against base but collides with an earlier fold).
         ConflictIfLanded(&'static str, Vec<String>),
@@ -444,8 +494,15 @@ mod tests {
                 Some(Rule::ConflictIfLanded(name, p)) => {
                     self.landed.borrow().contains(*name).then(|| p.clone())
                 }
+                Some(Rule::SubmoduleConflict(_, _)) => None,
                 None => None,
             };
+            if let Some(Rule::SubmoduleConflict(paths, conflicts)) = self.rules.get(theirs) {
+                return Ok(MergeOutcome::SubmoduleConflict {
+                    paths: paths.clone(),
+                    conflicts: conflicts.clone(),
+                });
+            }
             Ok(match conflict {
                 Some(paths) => MergeOutcome::Conflict { paths },
                 None => MergeOutcome::Clean {
@@ -577,6 +634,35 @@ mod tests {
         assert_eq!(plan.deferred[0].paths, ["src/x.rs"]);
         assert_eq!(plan.deferred[0].kind, ConflictKind::Textual);
         assert!(plan.advanced());
+    }
+
+    #[test]
+    fn typed_submodule_conflicts_are_preserved_and_textual() {
+        let conflicts = vec![crate::submodule::SubmoduleConflict {
+            path: "vendor/lib".into(),
+            ours_sha: "1111111".into(),
+            theirs_sha: "2222222".into(),
+        }];
+        let git = Fake::new().branch(
+            "submodule",
+            Some(Rule::SubmoduleConflict(
+                vec!["vendor/lib".into()],
+                conflicts.clone(),
+            )),
+        );
+
+        let plan = fold(
+            &git,
+            "base",
+            vec![br("submodule")],
+            &["vendor/lib".into()],
+            &merge_opts(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.deferred[0].paths, ["vendor/lib"]);
+        assert_eq!(plan.deferred[0].kind, ConflictKind::Textual);
+        assert_eq!(plan.deferred[0].submodule_conflicts, conflicts);
     }
 
     #[test]

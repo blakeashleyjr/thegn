@@ -13,6 +13,7 @@ use tokio::task;
 use termwiz::terminal::TerminalWaker;
 
 use crate::chrome::{FrameModel, LoadStep};
+use crate::glyph_types::GlyphRow;
 use crate::hydrate_tuning::{bg_glyph_ttl, model_refresh_interval};
 use crate::run::now_secs;
 use thegn_core::store::{
@@ -30,17 +31,6 @@ const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// the repo's LOCAL default branch (`thegn_svc::git::glyph_base` — not
 /// `origin/HEAD`, so an unpushed trunk doesn't leak its backlog into every row),
 /// `None` when no base is resolvable.
-pub(crate) type GlyphRow = (
-    bool,
-    usize,
-    usize,
-    Option<String>,
-    String,
-    u32,
-    u32,
-    Option<(u32, u32)>,
-);
-
 /// Process-global staleness cache for background-worktree git glyphs. Mirrors
 /// the global-state pattern of the sibling `activity` subsystem, so it needs no
 /// threading through `spawn_model_hydration`'s ~dozen call sites. The `Mutex`
@@ -132,6 +122,7 @@ pub(crate) fn should_rescan_glyphs(
 /// background reuse for up to the TTL). `Err` is modelled as `()` so the helper
 /// stays free of the git backend's error type.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_glyph_scan(
     prior: Option<&GlyphRow>,
     dirty: std::result::Result<bool, ()>,
@@ -140,13 +131,14 @@ pub(crate) fn merge_glyph_scan(
     repo_root: String,
     uncommitted: std::result::Result<(u32, u32), ()>,
     branch_diff: std::result::Result<Option<(u32, u32)>, ()>,
+    submodule_dirty: std::result::Result<bool, ()>,
 ) -> (GlyphRow, bool) {
     let mut clean = true;
     let dirty = match dirty {
         Ok(d) => d,
         Err(()) => {
             clean = false;
-            prior.map(|p| p.0).unwrap_or(false)
+            prior.map(|p| p.dirty).unwrap_or(false)
         }
     };
     let (ahead, behind) = match ahead_behind {
@@ -154,32 +146,39 @@ pub(crate) fn merge_glyph_scan(
         Ok(None) => (0, 0),
         Err(()) => {
             clean = false;
-            prior.map(|p| (p.1, p.2)).unwrap_or((0, 0))
+            prior.map(|p| (p.ahead, p.behind)).unwrap_or((0, 0))
         }
     };
     let branch = match branch {
         Ok(b) => b,
         Err(()) => {
             clean = false;
-            prior.and_then(|p| p.3.clone())
+            prior.and_then(|p| p.branch.clone())
         }
     };
     let (add, del) = match uncommitted {
         Ok(ad) => ad,
         Err(()) => {
             clean = false;
-            prior.map(|p| (p.5, p.6)).unwrap_or((0, 0))
+            prior.map(|p| (p.add, p.del)).unwrap_or((0, 0))
         }
     };
     let branch_diff = match branch_diff {
         Ok(bd) => bd,
         Err(()) => {
             clean = false;
-            prior.and_then(|p| p.7)
+            prior.and_then(|p| p.branch_diff)
+        }
+    };
+    let submodule_dirty = match submodule_dirty {
+        Ok(dirty) => dirty,
+        Err(()) => {
+            clean = false;
+            prior.map(|p| p.submodule_dirty).unwrap_or(false)
         }
     };
     (
-        (
+        GlyphRow {
             dirty,
             ahead,
             behind,
@@ -188,7 +187,8 @@ pub(crate) fn merge_glyph_scan(
             add,
             del,
             branch_diff,
-        ),
+            submodule_dirty,
+        },
         clean,
     )
 }
@@ -1945,25 +1945,29 @@ fn collect_sidebar_status(
                 s.spawn(move || {
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
+                    let repo_root =
+                        thegn_core::repo::main_worktree(wt).unwrap_or_else(|| wt.to_path_buf());
+                    let include_submodules = app_cfg.repo_git(&repo_root).submodules
+                        != thegn_core::config::SubmoduleMode::Off;
                     // One batched round-trip for a bridged loc (status + ahead/
                     // behind + branch), gix/CLI reads for a local one.
-                    let reads = crate::git_handle::get().glyph_reads(&loc);
+                    let reads = crate::git_handle::get()
+                        .glyph_reads_with_submodules(&loc, include_submodules);
                     let dirty = reads.dirty.map_err(|_| ());
                     let ahead_behind = reads.ahead_behind.map_err(|_| ());
                     let branch = reads.branch.map(Some).map_err(|_| ());
                     let uncommitted = reads.uncommitted.map_err(|_| ());
                     let branch_diff = reads.branch_diff.map_err(|_| ());
-                    let repo_root = thegn_core::repo::main_worktree(wt)
-                        .map(|r| r.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.clone());
+                    let submodule_dirty = reads.submodule_dirty.map_err(|_| ());
                     let (row, clean) = merge_glyph_scan(
                         prior_for_scan.get(p),
                         dirty,
                         ahead_behind,
                         branch,
-                        repo_root,
+                        repo_root.to_string_lossy().into_owned(),
                         uncommitted,
                         branch_diff,
+                        submodule_dirty,
                     );
                     (p.clone(), row, clean)
                 })
@@ -2022,23 +2026,19 @@ fn collect_sidebar_status(
         // rescan (prior existed) keeps its merged last-known row as before.
         .filter(|(p, _, clean)| *clean || prior_for_scan.contains_key(p))
         .map(|(p, row, _clean)| (p, row))
-        .chain(reused)
-        .map(
-            |(p, (dirty, ahead, behind, branch, repo_root, add, del, branch_diff))| {
-                (
-                    p,
-                    dirty,
-                    ahead,
-                    behind,
-                    branch,
-                    repo_root,
-                    add,
-                    del,
-                    branch_diff,
-                )
-            },
-        );
-    for (path, dirty, ahead, behind, branch, repo_root, add, del, branch_diff) in git_rows {
+        .chain(reused);
+    for (path, row) in git_rows {
+        let GlyphRow {
+            dirty,
+            ahead,
+            behind,
+            branch,
+            repo_root,
+            add,
+            del,
+            branch_diff,
+            submodule_dirty,
+        } = row;
         // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
         // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
         let jj = thegn_core::jj::is_colocated(std::path::Path::new(&repo_root));
@@ -2051,6 +2051,7 @@ fn collect_sidebar_status(
                 add,
                 del,
                 branch_diff,
+                submodule_dirty,
                 jj,
             },
         );

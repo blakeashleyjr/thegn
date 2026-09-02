@@ -1222,6 +1222,7 @@ mod tests {
             path: name.into(),
             added: 1,
             deleted: 0,
+            submodule: None,
             incoming: false,
         };
         // Footer/entity rows exist only when the semantic summary is

@@ -371,6 +371,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn nested_submodule_bytes_stay_in_the_owning_physical_total() {
+        let dir = temp_dir("submodule-physical");
+        std::fs::write(
+            dir.join(".gitmodules"),
+            b"[submodule \"lib\"]\npath = lib\nurl = x\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("lib/src")).unwrap();
+        std::fs::write(dir.join("lib/src/lib.rs"), vec![0u8; 7000]).unwrap();
+
+        let usage = measure_worktree(&dir);
+        assert_eq!(
+            usage.total_bytes,
+            walk_size(&dir),
+            "a checked-out submodule is physical content of its owner"
+        );
+        assert!(usage.total_bytes >= 7000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn p(s: &str) -> &Path {
         Path::new(s)
     }

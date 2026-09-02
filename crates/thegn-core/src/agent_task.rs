@@ -61,7 +61,13 @@ impl TaskKind {
     /// else is a configuration error rather than a silent empty expansion.
     pub fn prompt_vars(self) -> &'static [&'static str] {
         match self {
-            TaskKind::MergeConflict => &["branch", "target", "worktree", "paths"],
+            TaskKind::MergeConflict => &[
+                "branch",
+                "target",
+                "worktree",
+                "paths",
+                "submodule_conflicts",
+            ],
             TaskKind::GateFailure => &["branch", "target", "worktree", "log"],
             TaskKind::PrCiFailure => &[
                 "branch",
@@ -538,6 +544,12 @@ const DEFAULT_ISSUE: &str = concat!(
 /// `  - path` line each, including a trailing newline.
 pub fn format_paths(paths: &[String]) -> String {
     paths.iter().map(|p| format!("  - {p}\n")).collect()
+}
+
+/// Format typed gitlink conflicts for a merge prompt. Raw paths remain
+/// available through [`format_paths`] for git commands and ordinary conflicts.
+pub fn format_submodule_conflicts(conflicts: &[crate::submodule::SubmoduleConflict]) -> String {
+    crate::submodule::format_submodule_conflicts(conflicts)
 }
 
 /// Every task kind, for exhaustive iteration in tests and config validation.
