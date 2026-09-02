@@ -27,14 +27,21 @@ Three render-only tiers, all through the existing chokepoints (theme slots +
 - **Folder headers drop a tier.** Folder labels lose bold and render in the
   secondary text slot with their filed-count; the caret and glyph stay. A
   folder now reads as a grouping _inside_ a project, not a peer of one.
-- **Adjacent workspaces separate.** A one-row gap is laid out between the end
-  of one workspace's subtree and the next workspace header (and before the
-  TERMINALS section), gated by a new `[ui] sidebar_dividers` key (default
-  on). The gap is produced by the same `build_sidebar` layout pass the
-  renderer and hit-testing share: it is not a click target (a click resolves
-  as empty space, like the truncation affordances), it counts toward scroll
-  geometry (`max_scroll`, hidden-above/below counts), and it is skipped in
-  rail mode and under the `/` filter (matches stay dense).
+- **Adjacent projects separate, in colour.** Each project block — its header
+  and every row beneath it — shares one background tint, and consecutive
+  blocks alternate between `panel` and a derived `panel_alt` slot, gated by a
+  new `[ui] sidebar_dividers` key (default on). Headers keep their `bg0` band
+  on both parities, and `panel_alt` is derived to sit between `bg0` and
+  `panel` and never past their midpoint, so the header stays the block start
+  either way. Because the separation costs no layout rows it applies in rail
+  mode and under the `/` filter too, and geometry is identical with the key on
+  and off.
+
+  **This replaces a one-row separator gap** (the original form of this
+  requirement, as shipped): the gap worked, but it spent a screen row per
+  project, and on a real tree of a dozen-plus repos that consumed a large
+  fraction of the very column it was meant to make legible. A tint says the
+  same thing for nothing.
 
 Out of scope, noted as related: per-workspace icon/color labels (roadmap C 39) would further strengthen identity but need per-workspace config and is
 its own change; the merge-queue project token is
@@ -52,17 +59,15 @@ its own change; the merge-queue project token is
   its glyph-table routing and `sidebar_view.rs` extraction; its rail-identity
   and glyph requirements are untouched). Coordinates with
   `add-sidebar-actions-and-mouse` + `fix-sidebar-drop-position-semantics`
-  (gap rows must be invisible to the drag/drop spot rules: a drop over a gap
-  resolves to the adjacent run boundary exactly as if the gap were not
-  painted — same clause family as their "affordances are not click targets")
+  (unaffected now that the boundary adds no rows: with no gap to hit-test or
+  drop onto, every row is a plain 1-row placement again)
   and `add-sidebar-folder-ordering` (runs and membership unaffected — this
   change never reorders anything). `move-merge-queue-ambient-surface` and
   `rename-workspaces-to-projects` touch the same header row/labels; batch the
   e2e re-record when landing together.
-- **Code:** `sidebar_view.rs` (compose + `row_bg` + layout gap), `sidebar.rs`
-  (row build emits the spacer), `handlers/sidebar_mouse.rs` (hit/drag
-  transparency), `theme` slot consumption only (no new slot needed — reuse
-  `S::Accent`/`S::Dim`), `config` `[ui] sidebar_dividers`,
-  `docs/help/sidebar.md`.
+- **Code:** `sidebar_view.rs` (compose + `row_bg` + `block_parity`),
+  `theme.rs`/`theme_contrast.rs`/`config_theme.rs`/`chrome.rs` (the derived
+  `panel_alt` slot, registered as a gated surface), `config` `[ui]
+sidebar_dividers`, `docs/help/sidebar.md`.
 - **e2e:** baseline-affecting for nearly every case that shows the sidebar —
   full re-record with `just e2e-update`, diff reviewed.

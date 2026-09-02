@@ -6,18 +6,21 @@
       `thegn-core/src/config.rs`, documented in
       `config/config.toml.example`; config round-trip test updated.
 
-## 2. Row build + layout (thegn-host)
+## 2. Project-block tint (thegn-core + thegn-host)
 
-- [ ] 2.1 Emit separator entries between workspace subtrees (and before the
-      TERMINALS section) in the row-build pass, suppressed in rail mode,
-      under the `/` filter, and when `sidebar_dividers = false`.
-- [ ] 2.2 Scroll geometry: separators count in `max_scroll` and the
-      hidden-above/below tallies; cursor movement (`j/k`, quick-jump,
-      re-anchor) skips them.
-- [ ] 2.3 Hit-testing/drag: a click over a gap resolves to no row; the drag
-      spot layer maps a gap to the adjacent run boundary (unit tests beside
-      the `sidebar_order`/spot tests; coordinate with
-      `fix-sidebar-drop-position-semantics` if it lands first).
+- [x] 2.1 Derive a `panel_alt` palette slot in `theme::extend_palette`
+      (`blend_over(bg0, panel, 0.5)`), declare it through the slot chain
+      (`Palette`, `ThemeColors`, `theme_resolve`, `config::get_dotted`,
+      `chrome::S`/`S::ALL`/`slot_rgb`, `config.toml.example`), and register it
+      as a gated surface in `theme_contrast::audit`.
+- [x] 2.2 `block_parity` in `sidebar_view.rs`: one forward pass over the
+      visible slice, advancing on a block head and resetting at a
+      `SectionHeading`; threaded into `row_bg` as its lowest-precedence arm,
+      gated by `[ui] sidebar_dividers`.
+- [x] 2.3 Remove the workspace arm from `lead_gap_rows` so a project header is
+      a plain 1-row placement again; the `SectionHeading` breathing gap and
+      the clipped-gap trim stay. Update the hit-test/mouse tests that asserted
+      a header owned a gap line.
 
 ## 3. Tier styling (thegn-host)
 
@@ -31,7 +34,7 @@
 
 ## 4. Docs + help
 
-- [ ] 4.1 `docs/help/sidebar.md`: describe the tiers and the dividers key (no
+- [x] 4.1 `docs/help/sidebar.md`: describe the tiers and the block tint (no
       new action ids — help ratchets unaffected; prose ratchet satisfied by
       the mention).
 - [ ] 4.2 CHANGELOG entry (visual change + the opt-out key).

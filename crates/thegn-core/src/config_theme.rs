@@ -86,6 +86,10 @@ pub struct ThemeColors {
     pub bg1: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel: Option<String>,
+    /// The alternate list tint sidebar project blocks alternate onto. Unset
+    /// derives a shade of `panel` toward `bg0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel_alt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel2: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

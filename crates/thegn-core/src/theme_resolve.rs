@@ -54,6 +54,7 @@ pub fn apply_config_overrides(
     set(&mut palette.bg0, &colors.bg0);
     set(&mut palette.bg1, &colors.bg1);
     set(&mut palette.panel, &colors.panel);
+    set(&mut palette.panel_alt, &colors.panel_alt);
     set(&mut palette.panel2, &colors.panel2);
     set(&mut palette.raise, &colors.raise);
     set(&mut palette.border, &colors.border);
@@ -103,6 +104,7 @@ pub fn palette_from_user_theme(
         bg0: required_rgb(&c.bg0),
         bg1: required_rgb(&c.bg1),
         panel: required_rgb(&c.panel),
+        panel_alt: String::new(),
         panel2: required_rgb(&c.panel2),
         raise: required_rgb(&c.raise),
         border: required_rgb(&c.border),
