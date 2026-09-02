@@ -205,6 +205,16 @@ fn readable_regular_file(worktree: &Path, relative: &str) -> Option<Vec<u8>> {
     if !safe_relative(relative) {
         return None;
     }
+    let mut component = worktree.to_path_buf();
+    for part in Path::new(relative).components() {
+        let Component::Normal(part) = part else {
+            return None;
+        };
+        component.push(part);
+        if is_symlink(&component) {
+            return None;
+        }
+    }
     let path = worktree.join(relative);
     let meta = std::fs::symlink_metadata(&path).ok()?;
     if !meta.file_type().is_file() || meta.file_type().is_symlink() {
@@ -647,6 +657,11 @@ mod tests {
         )
         .unwrap();
         assert!(DetectedToolchainFiles::detect(dir.path(), None).is_empty());
+
+        let nested = temp("nested-links");
+        write(outside.path(), "mise.toml", "outside-nested");
+        symlink(outside.path(), nested.path().join(".config")).unwrap();
+        assert!(DetectedToolchainFiles::detect(nested.path(), None).is_empty());
     }
 
     #[test]

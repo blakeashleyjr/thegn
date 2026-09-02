@@ -16,3 +16,6 @@ startup.rs
 util.rs
 # config_repo.rs: two symlink-only tests (#[cfg(unix)] on std::os::unix::fs::symlink); no runtime cfg.
 config_repo.rs
+# toolchain_activation.rs: one symlink-only test (#[cfg(unix)]); detection is
+# runtime-platform-neutral and rejects symlinks through file metadata.
+toolchain_activation.rs
