@@ -29,6 +29,53 @@ config_enum! {
     } default = Auto;
 }
 
+config_enum! {
+    /// Policy for handing a failed CI job to the existing PR-queue agent.
+    /// `auto` is guarded by trusted PR context and the effective PR queue.
+    pub enum CiAutofixMode: "CI autofix mode" {
+        Off = "off",
+        Suggest = "suggest",
+        Auto = "auto",
+    } default = Off;
+}
+
+/// Trusted per-workspace refinement of `[ci.autofix]`. Repo-authored
+/// `.thegn.*` files intentionally have no corresponding field and cannot
+/// enable an agent handoff.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CiAutofixOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CiAutofixMode>,
+}
+
+impl CiAutofixOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+    }
+
+    pub(crate) fn apply(&self, base: &mut CiAutofixConfig) {
+        if let Some(mode) = self.mode {
+            base.mode = mode;
+        }
+    }
+}
+
+/// `[ci.autofix]` — opt-in policy for the existing PR queue agent handoff.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CiAutofixConfig {
+    pub mode: CiAutofixMode,
+}
+
+impl Default for CiAutofixConfig {
+    fn default() -> Self {
+        Self {
+            mode: CiAutofixMode::Off,
+        }
+    }
+}
+
 /// `[ci]` — cross-provider CI/CD inspection (AV group). Provider-agnostic knobs
 /// here; per-provider endpoints/tokens in the sub-tables. Tokens accept the
 /// `"env:VAR"` form resolved by `expand_env_ref`, so secrets stay out of the
@@ -47,6 +94,13 @@ pub struct CiConfig {
     pub max_runs: usize,
     /// Cap on fetched log lines (the tail is kept) — bounds memory on huge jobs.
     pub log_tail_lines: usize,
+    /// Number of recent terminal runs whose failed-job logs are persisted.
+    /// `0` disables log persistence and background log fetching.
+    pub log_cache_runs: usize,
+    /// Hard per-entry byte cap for cached log tails.
+    pub log_max_bytes: usize,
+    /// Global default for the guarded CI-failure handoff.
+    pub autofix: CiAutofixConfig,
     pub gitlab: GitLabCiConfig,
 }
 
@@ -58,8 +112,34 @@ impl Default for CiConfig {
             poll_interval_secs: 30,
             max_runs: 50,
             log_tail_lines: 2000,
+            log_cache_runs: 10,
+            log_max_bytes: 1024 * 1024,
+            autofix: CiAutofixConfig::default(),
             gitlab: GitLabCiConfig::default(),
         }
+    }
+}
+
+impl CiConfig {
+    /// Validate bounds that cannot be expressed by the generated schema.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.poll_interval_secs < 5 {
+            errors.push("ci.poll_interval_secs: must be at least 5 seconds".into());
+        }
+        if self.log_tail_lines == 0 {
+            errors.push("ci.log_tail_lines: must be greater than zero".into());
+        }
+        if self.log_max_bytes == 0 {
+            errors.push("ci.log_max_bytes: must be greater than zero".into());
+        }
+        if self.log_max_bytes > crate::ci_log::HARD_MAX_LOG_BYTES {
+            errors.push(format!(
+                "ci.log_max_bytes: must not exceed {} bytes",
+                crate::ci_log::HARD_MAX_LOG_BYTES
+            ));
+        }
+        errors
     }
 }
 

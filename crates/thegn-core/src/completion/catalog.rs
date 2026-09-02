@@ -256,7 +256,7 @@ pub const CATALOG: &[Slot] = &[
     slot("agent sessions", "worktree", SourceKind::Worktree),
     slot("ci cancel", "worktree", SourceKind::Worktree),
     slot("ci detect", "worktree", SourceKind::Worktree),
-    slot("ci log", "worktree", SourceKind::Worktree),
+    slot("ci logs", "worktree", SourceKind::Worktree),
     slot("ci rerun", "worktree", SourceKind::Worktree),
     slot("ci runs", "worktree", SourceKind::Worktree),
     slot("ci trigger", "worktree", SourceKind::Worktree),

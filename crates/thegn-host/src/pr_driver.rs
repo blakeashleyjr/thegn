@@ -817,6 +817,22 @@ fn compose(
     fetched: &FetchedPr,
     blocker: &Blocker,
 ) -> Option<(TaskVars, String)> {
+    compose_with_log(cfg, kind, worktree, item, fetched, blocker, None)
+}
+
+/// Build the task variables and render a PR prompt, optionally replacing the
+/// usual check-URL evidence with a bounded CI-log excerpt.  The CI refresh
+/// owns log redaction; this function still accepts only cache-shaped text so
+/// the existing prompt renderer remains the one prompt seam.
+pub(crate) fn compose_with_log(
+    cfg: &PrQueueConfig,
+    kind: TaskKind,
+    worktree: &str,
+    item: &PrItem,
+    fetched: &FetchedPr,
+    blocker: &Blocker,
+    log: Option<&str>,
+) -> Option<(TaskVars, String)> {
     let pr = &fetched.pr;
     let mut vars = TaskVars::new()
         .set("branch", &item.branch)
@@ -832,11 +848,15 @@ fn compose(
                 Blocker::Ci(n) => n.join(", "),
                 _ => String::new(),
             };
+            let evidence = log
+                .map(str::to_owned)
+                .unwrap_or_else(|| check_urls(fetched));
             vars = vars
                 .set("checks", names)
-                // The forge's rollup carries no log text; point the agent at the
-                // run instead of inventing output it can't see.
-                .set("log", check_urls(fetched));
+                // The forge's rollup carries no log text.  When the CI cache has
+                // evidence use it; otherwise retain the established URL
+                // fallback instead of inventing output it can't see.
+                .set("log", evidence);
         }
         TaskKind::PrReview => {
             vars = vars.set("threads", format_threads(&fetched.threads));
@@ -995,6 +1015,23 @@ mod tests {
         assert!(p.contains("clippy, test"));
         // With no rollup details, the prompt says so instead of implying output.
         assert!(p.contains("no failing check details"));
+    }
+
+    #[test]
+    fn the_ci_prompt_accepts_bounded_log_evidence() {
+        let f = fetched(vec![]);
+        let (_, p) = compose_with_log(
+            &cfg(),
+            TaskKind::PrCiFailure,
+            "/w/feat",
+            &item(),
+            &f,
+            &Blocker::Ci(vec!["test".into()]),
+            Some("error: boom\ntoken=***redacted***\n"),
+        )
+        .unwrap();
+        assert!(p.contains("error: boom"));
+        assert!(p.contains("***redacted***"));
     }
 
     #[test]

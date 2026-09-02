@@ -140,6 +140,12 @@ pub enum DetailAction {
     CiRerun { run_id: String, failed: bool },
     /// Cancel an in-flight CI run, off the loop.
     CiCancel { run_id: String },
+    /// Authorize a guarded CI-failure handoff from cached, redacted evidence.
+    /// The action carries the complete candidate identity so the blocking
+    /// worker can re-read and revalidate exactly the entry the user saw.
+    CiAutofix {
+        candidate: thegn_core::ci_log::CiLogCandidate,
+    },
     /// Force a CI run-history refetch (bypasses the `[ci] ttl_secs` guard).
     CiRefresh,
     /// Fetch one month's calendar events off-loop, delivered back into the live
@@ -222,6 +228,7 @@ impl DetailAction {
 /// `DetailOverlay`'s private fields); re-exported so callers keep using
 /// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
 mod ci_drill;
+pub(crate) use ci_drill::overlay_for_run;
 pub use ci_drill::{CiDetailPayload, apply_ci_detail};
 /// The date/clock widgets' month-calendar + world-clock popup. Same
 /// child-module arrangement as `ci_drill` — it reaches `DetailOverlay`'s
@@ -438,6 +445,9 @@ pub struct DetailOverlay {
     /// re-polls it on the CI tick ([`DetailOverlay::live_ci_repoll`]) so the
     /// drill updates in place. `None` outside a CI drill / once terminal.
     live_ci: Option<thegn_core::ci::CiRun>,
+    /// A human-authorized CI autofix action, populated only after a bounded
+    /// redacted log entry has landed in the in-place CI drill.
+    ci_autofix: Option<DetailAction>,
 }
 
 /// What a key delivered to the detail overlay meant.
@@ -574,6 +584,12 @@ impl DetailOverlay {
         // otherwise read them as scroll or close.
         if let DetailContent::Calendar(c) = &mut self.content {
             return calendar::keys::handle_calendar_key(&mut c.st, key, mods);
+        }
+        if key == &KeyCode::Char('f')
+            && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+            && let Some(action) = self.ci_autofix.clone()
+        {
+            return DetailOutcome::Act(action);
         }
         if mods.contains(Modifiers::CTRL) {
             return match key {
@@ -1409,6 +1425,7 @@ fn graph(
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
+        ci_autofix: None,
     }
 }
 
@@ -1431,6 +1448,7 @@ fn keyval(
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
+        ci_autofix: None,
     }
 }
 
@@ -1447,6 +1465,7 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
+        ci_autofix: None,
     }
 }
 
@@ -1478,6 +1497,7 @@ fn sections(
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
+        ci_autofix: None,
     };
     fit_to_screen(&mut ov, screen);
     ov
@@ -1508,6 +1528,7 @@ fn list(
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
+        ci_autofix: None,
     }
 }
 
@@ -2531,6 +2552,15 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
     }
     if n.id != 0 {
         row = row.action('x', DetailAction::DismissNotification { id: n.id });
+    }
+    // Suggest-mode CI notifications carry the complete candidate identity in
+    // their opaque source reference.  Evidence-ready rows expose the same
+    // human-authorized action as the CI drill; all other notifications remain
+    // generic and cannot accidentally dispatch a handoff.
+    if n.message.contains("CI log evidence is ready")
+        && let Some(candidate) = crate::ci_refresh::ci_autofix::candidate_from_notification(n)
+    {
+        row = row.action('f', DetailAction::CiAutofix { candidate });
     }
     // One clear/dismiss convention across every surface: `x` dismisses this row,
     // `a` clears all — and "all" is the same total clear (notifications read

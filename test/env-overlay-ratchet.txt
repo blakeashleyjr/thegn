@@ -89,6 +89,8 @@ calendar.time_format
 calendar.ttl_secs
 calendar.week_start
 ci.log_tail_lines
+ci.log_cache_runs
+ci.log_max_bytes
 ci.max_runs
 ci.poll_interval_secs
 ci.provider

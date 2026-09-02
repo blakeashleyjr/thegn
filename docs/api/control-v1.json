@@ -219,6 +219,71 @@
       ],
       "type": "object"
     },
+    "CiLogsReply": {
+      "description": "One cache-first CI log projection. Entries contain only the bounded, redacted cache shape; the response metadata makes a provider fill explicit.",
+      "properties": {
+        "fetched_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "logs": {
+          "items": true,
+          "type": "array"
+        },
+        "redacted": {
+          "type": "boolean"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fetched_at",
+        "job_id",
+        "logs",
+        "redacted",
+        "run_id",
+        "source",
+        "truncated",
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "CiRunsReply": {
+      "description": "Cached CI run history projected through the control plane. `runs` is kept as JSON because the provider-neutral CI model intentionally belongs to `thegn-core` without a control-wire schema dependency; the response still carries the cache source and timestamp explicitly.",
+      "properties": {
+        "fetched_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "runs": true,
+        "source": {
+          "type": "string"
+        },
+        "worktree": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fetched_at",
+        "runs",
+        "source",
+        "worktree"
+      ],
+      "type": "object"
+    },
     "ControlErrorCode": {
       "description": "The closed set of machine-readable control-plane error identifiers.",
       "enum": [
@@ -1443,6 +1508,16 @@
       "path": "/v1/pr/status"
     },
     {
+      "cap": "ci.runs",
+      "method": "GET",
+      "path": "/v1/ci/runs"
+    },
+    {
+      "cap": "ci.logs",
+      "method": "GET",
+      "path": "/v1/ci/logs"
+    },
+    {
       "cap": "agent.sessions",
       "method": "GET",
       "path": "/v1/agent/sessions"
@@ -1539,6 +1614,12 @@
     },
     "BrowserCommand": {
       "$ref": "#/definitions/BrowserCommand"
+    },
+    "CiLogsReply": {
+      "$ref": "#/definitions/CiLogsReply"
+    },
+    "CiRunsReply": {
+      "$ref": "#/definitions/CiRunsReply"
     },
     "DispatchPutReq": {
       "$ref": "#/definitions/DispatchPutReq"

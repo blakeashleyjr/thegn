@@ -241,19 +241,6 @@ pub(crate) fn open_url_detached(url: &str) {
     spawn_detached_reaped(cmd);
 }
 
-/// Build a `thegn <args>` command line rooted at this process's own binary
-/// (falling back to the `thegn` name on PATH), for spawning a subcommand pane.
-pub(crate) fn thegn_cmd(args: &[&str]) -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "thegn".to_string());
-    std::iter::once(exe.as_str())
-        .chain(args.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
 /// the badge + panel repaint. The provider is resolved inside the blocking task;
 /// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
@@ -339,48 +326,92 @@ pub(crate) fn spawn_ci_detail(
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let Some(client) = thegn_svc::ci::provider_for(&loc, &cfg) else {
-            return;
-        };
+        let key = thegn_core::remote::GitLoc::worktree_cache_key(&wt);
+        let db = thegn_core::db::Db::open().ok();
+        let client = thegn_svc::ci::provider_for(&loc, &cfg);
         // Full run (jobs/steps); on error keep the cached run so the header stays.
-        let detail = client.run_detail(&loc, &run.id).unwrap_or(run);
-        // Failing-job log tails (the "why did it fail"), each tail-capped by
-        // `log_tail_lines` and prefixed with the job name. Fetched in small
-        // concurrent batches — the provider "async" methods block on a
-        // subprocess, so a run with many failed jobs was N serial calls —
-        // scoped threads (each with a tiny current-thread runtime) buy real
-        // parallelism while chunking keeps display order + bounds the fan-out.
-        let cap = cfg.log_tail_lines;
+        let detail = client
+            .as_ref()
+            .and_then(|c| c.run_detail(&loc, &run.id).ok())
+            .unwrap_or(run);
+        // `log_cache_runs = 0` is the explicit privacy/IO opt-out: refresh
+        // ingestion, CLI, and control already honor it, so the interactive
+        // drill must not bypass it by fetching provider logs on a cache miss.
+        if cfg.log_cache_runs == 0 {
+            let payload = crate::detail::CiDetailPayload {
+                run: detail,
+                log_tail: Vec::new(),
+                log_entries: Vec::new(),
+            };
+            if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
+                let _ = waker.wake();
+            }
+            return;
+        }
+        // Read the cache before asking the provider.  A cache miss is fetched
+        // in this blocking lane and written back through CiLogEntry, which
+        // applies the same byte/line bounds and redaction as refresh ingestion.
         let failing: Vec<&thegn_core::ci::CiJob> = detail
             .jobs
             .iter()
             .filter(|j| j.state == CiState::Fail)
             .collect();
         let mut log_tail: Vec<String> = Vec::new();
-        for chunk in failing.chunks(4) {
-            let logs: Vec<Option<thegn_core::ci::CiLog>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|job| scope.spawn(|| client.logs(&loc, &detail.id, &job.id).ok()))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().ok().flatten())
-                    .collect()
-            });
-            for (job, log) in chunk.iter().zip(logs) {
-                let Some(log) = log else { continue };
-                let lines: Vec<&str> = log.text.lines().collect();
-                let start = lines
-                    .len()
-                    .saturating_sub(if cap > 0 { cap } else { lines.len() });
-                log_tail.push(format!("\u{2500}\u{2500} {} \u{2500}\u{2500}", job.name));
-                log_tail.extend(lines[start..].iter().map(|s| (*s).to_string()));
+        let mut log_entries = Vec::new();
+        // A provider can report a very large matrix. Keep detail responsive and
+        // predictable by inspecting only a bounded failed-job batch.
+        for job in failing.into_iter().take(16) {
+            let cached = (cfg.log_cache_runs > 0)
+                .then(|| {
+                    db.as_ref().and_then(|db| {
+                        use thegn_core::store::CacheStore;
+                        db.get_ci_log(&key, &detail.id, &job.id).ok().flatten()
+                    })
+                })
+                .flatten();
+            let entry = if cached.as_ref().is_some_and(|e| {
+                e.head_sha.is_empty() || detail.sha.is_empty() || e.head_sha == detail.sha
+            }) {
+                cached
+            } else {
+                client.as_ref().and_then(|c| {
+                    let log = c.logs(&loc, &detail.id, &job.id).ok()?;
+                    let mut entry = thegn_core::ci_log::CiLogEntry::new(
+                        &key,
+                        &detail.id,
+                        &job.id,
+                        &job.name,
+                        &log.text,
+                        cfg.log_tail_lines
+                            .min(thegn_core::ci_log::HARD_MAX_LOG_LINES),
+                        cfg.log_max_bytes
+                            .min(thegn_core::ci_log::HARD_MAX_LOG_BYTES),
+                        thegn_core::util::now(),
+                    );
+                    entry.truncated |= log.truncated;
+                    entry.head_sha = detail.sha.clone();
+                    if cfg.log_cache_runs > 0
+                        && let Some(db) = db.as_ref()
+                    {
+                        use thegn_core::store::CacheStore;
+                        let _ = db.put_ci_log(&entry);
+                    }
+                    Some(entry)
+                })
+            };
+            if let Some(entry) = entry {
+                log_tail.push(format!(
+                    "\u{2500}\u{2500} {} \u{2500}\u{2500}",
+                    entry.job_name
+                ));
+                log_tail.extend(entry.text.lines().map(str::to_string));
+                log_entries.push(entry);
             }
         }
         let payload = crate::detail::CiDetailPayload {
             run: detail,
             log_tail,
+            log_entries,
         };
         if tx.send(RefreshKind::CiDetail(Box::new(payload))).is_ok() {
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
@@ -1263,28 +1294,6 @@ impl CiActionCtx<'_> {
             .map(|r| r.id.clone())
     }
 
-    /// Spawn `thegn <args>` in a split beside the focused pane, then focus it.
-    fn open_thegn_pane(&mut self, args: &[&str]) {
-        let cmd = thegn_cmd(args);
-        let focused = self
-            .session
-            .active_tab()
-            .map(|t| t.focused_pane)
-            .unwrap_or(0);
-        let cwd = crate::run::active_cwd(self.session);
-        open_command_pane(
-            self.session,
-            self.panes,
-            focused,
-            &cmd,
-            cwd.as_deref(),
-            self.center,
-        );
-        self.focus.zone = Zone::Center;
-        crate::run::refresh_tab_model(self.model, self.session, self.sb);
-        *self.need_relayout = true;
-    }
-
     /// Kick the off-loop fetch that fills a CI-run drill (the overlay already
     /// swapped to the run's header in place). The result lands back in the modal
     /// via `RefreshKind::CiDetail` — no pane is spawned (that one-shot pane was
@@ -1343,6 +1352,24 @@ impl CiActionCtx<'_> {
         );
     }
 
+    /// Re-read and authorize a cached CI-failure candidate off the compositor
+    /// thread.  The coordinator performs the provider/head/queue checks and
+    /// claims the candidate immediately before the existing agent spawn.
+    fn spawn_autofix(&mut self, candidate: thegn_core::ci_log::CiLogCandidate) {
+        self.model.status = "Authorizing CI autofix…".into();
+        let full = self.cfg.clone();
+        let tx = self.refresh_tx.clone();
+        let waker = self.waker.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = thegn_core::db::Db::open() {
+                crate::ci_refresh::ci_autofix::authorize(&full, &db, &candidate);
+            }
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+            }
+        });
+    }
+
     /// Execute a detail-overlay row action, returning the overlay to *retain*
     /// (the CI drill keeps it open to fill in place) or `None` to close it — the
     /// loop assigns the result back to its `bar_detail` slot. Covers the CI badge
@@ -1366,6 +1393,7 @@ impl CiActionCtx<'_> {
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)
             }
+            DetailAction::CiAutofix { candidate } => self.spawn_autofix(candidate),
             DetailAction::CiRefresh => self.refresh_ci(),
             DetailAction::FetchCalendar {
                 year,
@@ -1524,20 +1552,34 @@ impl CiActionCtx<'_> {
         *self.need_relayout = true;
     }
 
-    /// Enter on a panel `Section::Ci` row: drill into the selected run.
-    pub(crate) fn open_view_at(&mut self, cursor: usize) {
-        if let Some(id) = self.run_id_at(cursor) {
-            self.open_thegn_pane(&["ci", "view", &id]);
+    /// Enter on a panel `Section::Ci` row: open the in-place run drill and
+    /// start its off-loop cache-first detail fetch.
+    pub(crate) fn open_view_at(
+        &mut self,
+        cursor: usize,
+        overlay: &mut Option<crate::detail::DetailOverlay>,
+    ) {
+        if let Some(run) = crate::panel::sections::ci::display_runs(&self.model.panel)
+            .get(cursor)
+            .map(|run| (*run).clone())
+        {
+            *overlay = Some(crate::detail::overlay_for_run(&run));
+            self.drill_ci_detail(run.clone());
         }
     }
 
     /// A `Section::Ci` action key; returns whether it was claimed. `v` drills in,
     /// `o` opens the run page, `r`/`R` re-run (all/failed), `c` cancels,
     /// `g` force-refreshes the run history.
-    pub(crate) fn panel_key(&mut self, key: KeyCode, cursor: usize) -> bool {
+    pub(crate) fn panel_key(
+        &mut self,
+        key: KeyCode,
+        cursor: usize,
+        overlay: &mut Option<crate::detail::DetailOverlay>,
+    ) -> bool {
         match key {
             KeyCode::Char('v') => {
-                self.open_view_at(cursor);
+                self.open_view_at(cursor, overlay);
                 true
             }
             KeyCode::Char('g') => {
@@ -1604,18 +1646,6 @@ mod tests {
             };
             assert_eq!(url_opener(), expect);
         }
-    }
-
-    #[test]
-    fn thegn_cmd_joins_args_after_the_exe() {
-        let cmd = thegn_cmd(&["pr", "list", "--json"]);
-        // The exe path varies per environment, but the argv tail is fixed and
-        // space-joined with no trailing/leading padding.
-        assert!(cmd.ends_with(" pr list --json"), "cmd: {cmd}");
-        assert!(!cmd.starts_with(' '));
-        // No args ⇒ just the exe, no trailing space.
-        let bare = thegn_cmd(&[]);
-        assert!(!bare.ends_with(' '), "bare: {bare}");
     }
 
     #[test]
