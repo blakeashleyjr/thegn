@@ -35,7 +35,17 @@ fn config_schema() -> &'static RootSchema {
 /// rather than warned-and-defaulted). Returns the list of problems (empty = ok).
 pub fn validate_str(body: &str) -> Vec<String> {
     let mut errs = Vec::new();
-    let val: toml::Value = match body.parse() {
+    let normalized = match crate::config_compat::normalize(body) {
+        Ok(v) => v,
+        Err(e) => return vec![format!("TOML syntax error: {e}")],
+    };
+    errs.extend(
+        normalized
+            .diagnostics
+            .iter()
+            .map(|d| format!("warning: {d}")),
+    );
+    let val: toml::Value = match normalized.body.parse() {
         Ok(v) => v,
         Err(e) => return vec![format!("TOML syntax error: {e}")],
     };
@@ -43,7 +53,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
     // deserialize into `Config`, the entire file is discarded for defaults.
     // This catches shape/type errors; the schema walk below catches the
     // warn-and-default enum values `Deserialize` never rejects.
-    let load_error = match toml::from_str::<Config>(body) {
+    let load_error = match toml::from_str::<Config>(&normalized.body) {
         Err(e) => Some(e),
         // Templates are strings as far as the schema is concerned, so their
         // placeholders can only be checked once the file has deserialized.
@@ -1190,6 +1200,27 @@ pre_create = [
         let errs = validate_str("picker = 3\n");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("rejected on load"), "{errs:?}");
+    }
+
+    #[test]
+    fn legacy_project_config_keys_are_known_compatibility_diagnostics() {
+        let errs = validate_str(
+            r#"workspaces_dir = "/legacy"
+[ui]
+confirm_delete_workspace = false
+sidebar_workspace_sort = "attention"
+[workspace.repo]
+"#,
+        );
+        assert!(!errs.iter().any(|e| e.contains("unknown key")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("workspaces_dir") && e.contains("projects_dir"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("workspace.repo") && e.contains("project.repo"))
+        );
     }
 
     /// Walker matching == `from_str_validated` matching by construction: both

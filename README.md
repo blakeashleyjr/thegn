@@ -10,7 +10,7 @@
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
-One session: each git repo is a **workspace**, each git **worktree** is a
+One session: each git repo is a **project**, each git **worktree** is a
 **tab**, and the chrome — a left sidebar tree, a right diff/PR panel, masthead,
 statusbar, and a pinned-program strip — is rendered in-process by a native
 compositor. No plugins, no external multiplexer. (thegn was originally built
@@ -33,7 +33,7 @@ never a session change.
 
 | Concept       | Maps to                       | Created / toggled by                                                    |
 | ------------- | ----------------------------- | ----------------------------------------------------------------------- |
-| **Workspace** | a repo                        | `Alt-W` — pick/clone a repo                                             |
+| **Project**   | a repo                        | `Alt-W` — pick/clone a repo                                             |
 | **Worktree**  | a git worktree = a tab        | `Alt-w` — new worktree off the base branch, then a "what to run" picker |
 | **Pane**      | a terminal split within a tab | `Alt-p` smart split (`Alt-n` down, `Alt-N` right)                       |
 | **Sidebar**   | native left tree              | repo → worktree → tabs; `Alt-s` focus, `Ctrl-Alt-s` hide                |
@@ -52,7 +52,7 @@ never a session change.
   `Alt-g` lazygit · `Alt-e` `$EDITOR` · `Alt-/` git diff ·
   `Ctrl-Alt-f` / `Alt-y` bottom files drawer.
 - **Quick-jump digits:** `Alt-1..9` jump to a worktree, `Ctrl-1..9` to a
-  workspace, by their slot in sidebar order. `Ctrl-Alt-1..9` launch or focus
+  project, by their slot in sidebar order. `Ctrl-Alt-1..9` launch or focus
   pinned programs.
 - **Cleanup.** `Alt-x` is one smart **close** — the focused pane if the tab is
   split, otherwise the tab. `Alt-X` (Shift) escalates to removing the whole
@@ -64,11 +64,11 @@ never a session change.
 Context-relevant keys are shown in the bottom **status bar**, and
 **Ctrl-Space** opens a fuzzy **command palette** of every action — the palette
 is the complete, always-current reference. A leading `~` switches it to the
-**frecency opener**: workspaces + worktrees ranked by how often _and_ how
+**frecency opener**: projects + worktrees ranked by how often _and_ how
 recently you use them — type a fragment, Enter lands in that worktree's tab.
 The palette also carries **Connect to root** (jump from a shell nested deep in
 a subdir straight to the owning worktree's tab) and **Clone and open** (paste
-a git URL; it clones off-loop and opens as a workspace). Existing
+a git URL; it clones off-loop and opens as a project). Existing
 tmuxinator/sesh project files show up automatically as new-worktree templates.
 Defaults (override via `[keybinds]`):
 
@@ -76,21 +76,21 @@ Defaults (override via `[keybinds]`):
 | ----------------------- | -------------------------------------------------------- |
 | Ctrl-Space              | command palette (fuzzy menu of all actions)              |
 | Alt-←/→                 | previous / next tab (within the worktree)                |
-| Alt-↑/↓                 | previous / next worktree (within the workspace)          |
-| Shift-Alt-↑/↓           | previous / next workspace                                |
+| Alt-↑/↓                 | previous / next worktree (within the project)            |
+| Shift-Alt-↑/↓           | previous / next project                                  |
 | Ctrl-←/↓/↑/→ (h/j/k/l)  | move focus: sidebar ↔ panes ↔ panel (↑/↓ reach the bars) |
-| Alt-\`                  | bounce between workspaces region and terminals region    |
-| Alt-w / Alt-W           | new worktree ("what to run" picker) / new workspace      |
+| Alt-\`                  | bounce between projects region and terminals region      |
+| Alt-w / Alt-W           | new worktree ("what to run" picker) / new project        |
 | Alt-t / Alt-T           | new tab on the _same_ worktree / new terminal tab        |
 | Alt-p / Alt-n / Alt-N   | new pane: smart split / split down / split right         |
-| Alt-o                   | switch workspace                                         |
+| Alt-o                   | switch project                                           |
 | Alt-s / Alt-.           | focus sidebar / focus panel                              |
 | Ctrl-Alt-s / Ctrl-Alt-p | hide/show sidebar / diff-PR panel                        |
 | Ctrl-Alt-f · Alt-y      | toggle files drawer (bundled yazi, bottom)               |
 | Alt-g · Alt-e · Alt-/   | lazygit · `$EDITOR` · git diff                           |
-| Alt-1..9 / Ctrl-1..9    | jump to worktree N / workspace N (sidebar order)         |
+| Alt-1..9 / Ctrl-1..9    | jump to worktree N / project N (sidebar order)           |
 | Ctrl-Alt-1..9           | launch / focus pinned programs (`[[pins]]`)              |
-| Ctrl-Alt-↑/↓            | reorder the selected workspace / worktree                |
+| Ctrl-Alt-↑/↓            | reorder the selected project / worktree                  |
 | Ctrl-Alt-/ · Ctrl-/     | search pane history · search across panes                |
 | Ctrl-Alt-z              | zoom the focused pane / zone                             |
 | Alt-r                   | time-travel replay of the focused pane (`[replay]`)      |
@@ -102,7 +102,7 @@ The defaults follow one modifier grammar, so a chord is predictable from its
 modifiers: **Ctrl** moves focus only (and never creates/destroys, so `Ctrl-w`
 stays free for the shell's delete-word); **Alt** is object lifecycle + tools
 (create is `Alt-<letter>`); **Alt-Shift** is one level up (`Alt-w` worktree →
-`Alt-W` workspace; `Alt-x` close → `Alt-X` remove worktree); **Ctrl-Alt** is
+`Alt-W` project; `Alt-x` close → `Alt-X` remove worktree); **Ctrl-Alt** is
 chrome toggles.
 
 _The above is the `Normal` mode. Native `VimNormal` (with a `Space` leader
@@ -299,7 +299,7 @@ Reports (and fixes) from either platform are welcome — that is how they gradua
 ### CLI
 
 Bare `thegn` launches the compositor; subcommands run non-interactively:
-`pr`, `issue`, `ci`, `diff`, `list`, `integrate` (drain the local merge
+`pr`, `issue`, `ci`, `diff`, `list`, `program`, `integrate` (drain the local merge
 queue), `disk` / `clean` (per-worktree disk usage / reclaim `target/`),
 `repos`, `recent`, `config`, `env` (named execution environments), `theme`,
 `share`, `forward`, `notify`, `logs`, `doctor`. `--profile <name>`
@@ -317,6 +317,15 @@ Behavior is configured in `~/.config/thegn/config.toml` — see
 documented. Home-manager users configure via `programs.thegn.*`. A
 repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
 (sandbox, keybinds, env selection). Highlights:
+
+- `projects_dir` is the canonical repository root. The legacy
+  `workspaces_dir` key and `THEGN_WORKSPACES_DIR` environment variable remain
+  accepted, with warnings, for three stable releases; canonical values win on
+  duplicates. Home-manager uses `projectsDir` (and accepts deprecated
+  `workspacesDir`).
+- `thegn program` manages multi-repo groups, and `wt new --program` creates a
+  linked branch across a group. The old `thegn project` and `wt new --project`
+  spellings remain behavior-identical deprecated aliases for three releases.
 
 - `[theme]` — `accent` recolors every surface; named theme presets cycle with
   `Ctrl-Alt-t`.

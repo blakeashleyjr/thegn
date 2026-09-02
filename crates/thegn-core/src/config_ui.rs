@@ -52,14 +52,16 @@ config_enum! {
 pub struct UiConfig {
     /// Language code (e.g. "en-US", "ja-JP"). "auto" to detect from system.
     pub language: String,
-    /// Ask before destructive worktree actions (deleting a worktree from disk via the sidebar).
+    /// Ask before destructive project worktree actions (deleting a worktree from disk via the sidebar).
+    #[serde(rename = "confirm_delete_project", alias = "confirm_delete_workspace")]
     pub confirm_delete_workspace: bool,
     /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
     pub full_mode_chip: bool,
     /// Dismiss a detail popup when the user left-clicks outside it, like Escape.
     pub dismiss_overlay_on_click_outside: bool,
-    /// Sidebar workspace ordering: keep the manual order, or bubble the
-    /// most-urgent workspace to the top (see [`WorkspaceSort`]).
+    /// Sidebar project ordering: keep the manual order, or bubble the
+    /// most-urgent project to the top (see [`WorkspaceSort`]).
+    #[serde(rename = "sidebar_project_sort", alias = "sidebar_workspace_sort")]
     pub sidebar_workspace_sort: WorkspaceSort,
     /// Sidebar TERMINALS section visibility (see [`TerminalsSection`]).
     pub sidebar_terminals_section: TerminalsSection,

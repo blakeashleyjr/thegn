@@ -179,7 +179,7 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
             "key": origin.key,
             "value": ws.as_ref().map_or(origin.value.clone(), |(_, v)| v.clone()),
             "origin": ws.as_ref().map_or(origin.origin.as_str().to_string(), |(s, _)| {
-                format!("workspace [workspace.{s}]")
+                format!("project [project.{s}]")
             }),
             "cascade_value": origin.value,
         });
@@ -194,7 +194,7 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
     match &ws {
         Some((slug, v)) => {
             outln!("{} = {v}", origin.key);
-            outln!("  set by: workspace `[workspace.{slug}]`");
+            outln!("  set by: project `[project.{slug}]`");
         }
         None => {
             outln!("{} = {}", origin.key, origin.value);
@@ -206,7 +206,7 @@ fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: Path
     }
     if let (Some((slug, v)), Some(root)) = (&ws, &repo_root) {
         outln!(
-            "    workspace `[workspace.{slug}]`: {v}   (for {})",
+            "    project `[project.{slug}]`: {v}   (for {})",
             root.display()
         );
     }

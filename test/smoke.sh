@@ -486,20 +486,22 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM tab_groups WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
 fi
 
-# Projects (THE-33): group two repos, batch-create a feature across both, and
+# Programs (THE-33): group two repos, batch-create a feature across both, and
 # verify the retry/attach path. `alpha` + `beta` under $TMP/code are the members.
-"$SZ" project create smoke-proj >/dev/null
-"$SZ" project assign smoke-proj "$TMP/code/alpha" >/dev/null
-"$SZ" project assign smoke-proj "$TMP/code/beta" >/dev/null
-check "project list --json reports the two members" \
-  "[[ \$('$SZ' project list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
-check "project rm refuses a non-empty project without --force" \
-  "! '$SZ' project rm smoke-proj >/dev/null 2>&1"
+"$SZ" program create smoke-proj >/dev/null
+"$SZ" program assign smoke-proj "$TMP/code/alpha" >/dev/null
+"$SZ" program assign smoke-proj "$TMP/code/beta" >/dev/null
+check "program list --json reports the two members" \
+  "[[ \$('$SZ' program list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
+check "legacy project alias warns" \
+  "'$SZ' project list --json 2>&1 >/dev/null | grep -q 'use.*thegn program'"
+check "program rm refuses a non-empty program without --force" \
+  "! '$SZ' program rm smoke-proj >/dev/null 2>&1"
 
 # Batched create: one linked branch name, a worktree in each member repo.
 # shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
-PJ="$("$SZ" wt new cross-feat --project smoke-proj --json)"
-check "wt new --project emits a per-member report" \
+PJ="$("$SZ" wt new cross-feat --program smoke-proj --json)"
+check "wt new --program emits a per-member report" \
   "printf '%s' \"\$PJ\" | grep -q '\"branch\"' && printf '%s' \"\$PJ\" | grep -q '\"status\":\"created\"'"
 check "batched create made the branch in alpha" \
   "[[ -n \$(git -C '$TMP/code/alpha' branch --list '*cross-feat*') ]]"
@@ -508,22 +510,24 @@ check "batched create made the branch in beta" \
 
 # Re-run attaches: both members already have the branch → reported exists,
 # exit 0 (idempotent retry-after-partial-failure recovery path).
-check "re-running --project attaches existing members and exits 0" \
-  "'$SZ' wt new cross-feat --project smoke-proj --json | grep -q '\"status\":\"exists\"'"
+check "re-running --project alias warns and attaches existing members" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 | grep -q '\"status\":\"exists\"'"
+check "re-running --project alias emits deprecation warning" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json 2>&1 >/dev/null | grep -q 'use.*wt new --program'"
 
 # Subset: --repos restricts creation to the named member(s) only.
 # shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
-PJ2="$("$SZ" wt new subset-feat --project smoke-proj --repos beta --json)"
-check "wt new --project --repos restricts to the named subset" \
+PJ2="$("$SZ" wt new subset-feat --program smoke-proj --repos beta --json)"
+check "wt new --program --repos restricts to the named subset" \
   "printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"beta\"' && ! printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"alpha\"'"
 check "batched create did not touch the excluded member" \
   "[[ -z \$(git -C '$TMP/code/alpha' branch --list '*subset-feat*') ]]"
 
 # Assign none unprojects; the project can then be deleted.
-"$SZ" project assign none "$TMP/code/alpha" >/dev/null
-"$SZ" project assign none "$TMP/code/beta" >/dev/null
-check "project rm removes an emptied project" \
-  "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
+"$SZ" program assign none "$TMP/code/alpha" >/dev/null
+"$SZ" program assign none "$TMP/code/beta" >/dev/null
+check "program rm removes an emptied program" \
+  "'$SZ' program rm smoke-proj >/dev/null && ! '$SZ' program list | grep -q smoke-proj"
 
 # Repo map: `thegn map` builds a capped tree-sitter entity index from the git
 # listing and renders a ranked, budgeted outline (no language server needed).
@@ -569,7 +573,7 @@ check "ci runs --json degrades gracefully" \
   "'$SZ' ci runs --worktree '$WT' --json >/dev/null 2>&1"
 
 # Grouped help + shell completions.
-check "--help shows the Workspace group" "'$SZ' --help | grep -q 'Workspace:'"
+check "--help shows the Projects & worktrees group" "'$SZ' --help | grep -q 'Projects & worktrees:'"
 check "--help shows the Forge group" "'$SZ' --help | grep -q 'Forge:'"
 check "setup appears in --help (onboarding wizard)" \
   "'$SZ' --help | grep -q '^  setup '"

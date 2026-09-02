@@ -463,7 +463,7 @@ tools.permissions
 tools.provider
 tools.resume
 tools.route_via_proxy
-ui.confirm_delete_workspace
+ui.confirm_delete_project
 ui.dismiss_overlay_on_click_outside
 ui.full_mode_chip
 ui.fullscreen_keep_masthead
@@ -486,7 +486,7 @@ ui.sidebar_show_status_icon
 ui.sidebar_terminals_section
 ui.sidebar_wide_ratio
 ui.sidebar_width
-ui.sidebar_workspace_sort
+ui.sidebar_project_sort
 usage.allow_network
 usage.crit_percent
 usage.discover_profiles

@@ -160,7 +160,7 @@ pub(crate) fn plan_new_workspace_input(
 ) -> SubmitPlan {
     let input = input.trim();
     if input.is_empty() {
-        return SubmitPlan::Invalid("no workspace path or URL given".into());
+        return SubmitPlan::Invalid("no project path or URL given".into());
     }
     if let Some(dest) = workspace_clone_dest(input, cfg) {
         // An already-materialized clone dest is just a local open.
@@ -253,7 +253,7 @@ pub(crate) fn create_workspace_from_input_with_config(
     cfg: &thegn_core::config::Config,
 ) -> Result<WorkspaceResolution> {
     let input = input.trim();
-    anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
+    anyhow::ensure!(!input.is_empty(), "no project path or URL given");
 
     let root = if let Some(dest) = workspace_clone_dest(input, cfg) {
         // URL inputs are cloned OFF the loop before this runs (NewWorkspace
@@ -328,10 +328,10 @@ pub(crate) fn complete_workspace_create(
             remap_cold_workspace_ids(session, panes);
             focus.zone = crate::focus::Zone::Center;
             refresh_tab_model(model, session, sb);
+            model.status = format!("project created: {}", path.display());
             if let Some(dir) = crate::run::active_cwd(session) {
                 drawer_runtime.reconcile(cfg, &dir, panes, center);
             }
-            model.status = format!("workspace created: {}", path.display());
             true
         }
         Ok(WorkspaceResolution::NotARepo(path)) => {
@@ -339,7 +339,7 @@ pub(crate) fn complete_workspace_create(
             false
         }
         Err(e) => {
-            model.status = format!("workspace create failed: {e}");
+            model.status = format!("project create failed: {e}");
             false
         }
     }
@@ -466,7 +466,7 @@ pub(crate) fn handle_picker_outcome(
         PickerOutcome::Pending => false,
         PickerOutcome::Cancel => {
             *picker = None;
-            model.status = "workspace creation cancelled".into();
+            model.status = "project creation cancelled".into();
             false
         }
         PickerOutcome::OpenRepo(path) => create(

@@ -83,7 +83,7 @@ you want a direct key.
   the row of panes and keeps going into tabs. Unlike `Ctrl-←/→` it never steps
   into the [[sidebar]] / [[panel]].
 - `Alt-↑/↓` — move to the pane above / below; at the top / bottom pane it
-  switches to the previous / next worktree within the current workspace. This
+  switches to the previous / next worktree within the current project. This
   never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab

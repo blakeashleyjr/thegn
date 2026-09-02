@@ -65,8 +65,8 @@ fn keyboard_remedy(in_tmux: bool) -> Vec<&'static str> {
         out.push("  (tmux 3.4+ also: set -as terminal-features '*:extkeys')");
     } else {
         out.push("use a terminal supporting xterm modifyOtherKeys level 2,");
-        out.push("  or rebind in [keybinds]: summon-workspace-1 … -9 and");
-        out.push("  summon-pin-1 … -9, e.g. summon-workspace-1 = \"Ctrl Alt q\"");
+        out.push("  or rebind in [keybinds]: summon-project-1 … -9 and");
+        out.push("  summon-pin-1 … -9, e.g. summon-project-1 = \"Ctrl Alt q\"");
     }
     out
 }
@@ -3472,7 +3472,7 @@ mod tests {
         assert!(plain.contains("modifyOtherKeys level 2"));
         // The rebind escape hatch (design D1: the family stays on Ctrl+<digit>
         // BECAUSE it is rebindable) must name ids `Action::from_key` parses.
-        assert!(plain.contains("summon-workspace-1"));
+        assert!(plain.contains("summon-project-1"));
         assert!(plain.contains("summon-pin-1"));
         assert_eq!(
             crate::keymap::Action::from_key("summon-workspace-1"),

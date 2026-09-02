@@ -7,7 +7,7 @@ actions: [search-replace-open]
 
 # Search & Replace
 
-Workspace-wide find **and change**. `Ctrl-Shift-H` opens the Search & Replace
+Project-wide find **and change**. `Ctrl-Shift-H` opens the Search & Replace
 surface — a focusable overlay, not a panel — for the active worktree. It streams
 matches as you type and applies replacements through one guarded, atomic write
 path with a per-match preview.
