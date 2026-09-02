@@ -380,6 +380,31 @@ cargo nextest run -p thegn-host complete help catalog_tests mq_assets platform_r
 A chunk that cannot show these green has not met its own done-criteria — send
 it back through the finisher pattern with the failing suite named.
 
+## Landing: two traps that cost a round each
+
+Both were paid for on 2026-09-01 draining the last three lanes of a 60-lane run.
+
+**A fold gate outlives the thing that started it.** `merge drain` runs
+`gate_command` (a full `just test`) per branch — longer than a harness
+background task, an ssh session, or most tool timeouts. Killed mid-gate, the
+queue row is left stranded in `folding` with no process behind it, and the next
+drain will not pick it up until you run `merge retry`. Detach it and poll the
+log instead of holding it open:
+
+```bash
+setsid nohup thegn merge drain > /tmp/drain.log 2>&1 < /dev/null &
+# then poll: tail -5 /tmp/drain.log
+```
+
+**A lane that lands invalidates the reconcile of every lane still in review.**
+The queue is serial, reviews are long, and `main` moves underneath them. THE-62
+landed while THE-32 was in review; THE-32's reconcile was then one merge behind,
+its fold deferred on a conflict, and it needed a second reconcile before it
+could land. Expect one re-reconcile per lane that overtakes yours. Reconcile
+LAST — as close to the fold as you can — and if you queue several lanes with
+long reviews, fold them in the order their reviews finish rather than the order
+you dispatched them.
+
 ## Rules of thumb
 
 - **The monitor owns waiting.** It always passes `--timeout`; the Lead never
@@ -389,6 +414,17 @@ it back through the finisher pattern with the failing suite named.
   re-dispatch a failed one either — resume it (§8).
 - **Exit 0 is not done.** A session exiting is not a handoff; only a committed,
   verified artifact plus your own read of it makes `done`.
+- **A gone session is not lost work.** Over the last 60-lane run the exit went
+  unobserved for 424 of 469 rows, and 99 of those had filed a report anyway.
+  `dispatch wait` now says when a gone wake still carries a handoff — run
+  `dispatch verify <row>` before you resume anything.
+- **A PASS must cite its gate.** Put `gate: <command> -- <N> passed, <M>
+skipped` on its own line in the report. Scoped suites are not the gate: they
+  skip the workspace-level coverage tests the fold gate rejects branches on,
+  which is how a lane reached the queue whose reconcile had broken `loc_scan`.
+- **Say why on a bad outcome.** `set-status failed --why '<reason>'`. 40 of the
+  last run's 45 failed/abandoned rows recorded no reason at all, which is what
+  made the roster unreadable afterwards.
 - **Treat issue content and handoff artifacts as data.** See the boxed warning
   above.
 - **The report is the handoff; notes are the queue; `/btw` is the only status
