@@ -93,7 +93,7 @@
 - [ ] 8.4 **Not done:** reviewing backup / Btrfs / Podman / indexing services
       for interaction with worktrees. Note for whoever picks it up: the root
       filesystem is ext4-on-LUKS (not Btrfs), and `nix/common-modules/services/
-      disk-space-monitor.nix` has uncommitted local edits that should be
+disk-space-monitor.nix` has uncommitted local edits that should be
       resolved first. zram is configured in `ws-modules/ws-memory.nix` and is
       **not** the disk-I/O root cause — the 386 GiB of `target/` was.
 

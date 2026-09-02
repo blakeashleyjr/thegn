@@ -199,7 +199,11 @@ error: test run failed
         }
         let d = gate_failure_digest(&log);
         assert_eq!(d.lines().count(), 12, "digest must stay bounded: {d}");
-        assert_eq!(d.matches("same::test").count(), 1, "duplicates collapse: {d}");
+        assert_eq!(
+            d.matches("same::test").count(),
+            1,
+            "duplicates collapse: {d}"
+        );
     }
 
     #[test]
