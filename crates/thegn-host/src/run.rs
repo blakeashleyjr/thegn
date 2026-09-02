@@ -166,6 +166,25 @@ fn keybind_conflict_summary(cfg: &thegn_core::config::Config) -> Option<String> 
     ))
 }
 
+/// Rebuild the bounded push worker set from the effective notification config.
+/// Provider construction happens before the route sender is swapped, so a
+/// reload never leaves a half-built map visible to an emitting producer.
+fn install_push_workers(
+    notify_state: &crate::notify::NotifyState,
+    notifications: thegn_core::config::NotificationsConfig,
+) {
+    let snapshot = notify_state.delivery_snapshot();
+    let (providers, rows) = crate::push_notify::providers_for(&notifications.push);
+    snapshot.configure(rows);
+    if providers.is_empty() {
+        notify_state.replace_cfg_and_push(notifications, None);
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(crate::push_notify::QUEUE_DEPTH);
+    notify_state.replace_cfg_and_push(notifications, Some(tx));
+    crate::push_notify::spawn(rx, providers, snapshot);
+}
+
 /// Resolve `[theme] undercurl` to a capability: "on"/"off" are explicit, and
 /// "auto" sniffs $TERM/$TERM_PROGRAM/$VTE_VERSION.
 fn resolve_undercurl(cfg: &thegn_core::config::Config) -> bool {
@@ -6829,20 +6848,10 @@ async fn event_loop<T: Terminal>(
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
-    // Push-to-phone publisher: a bounded, off-loop worker (QoS Background) that
-    // drives the ntfy seam. Wired only when `[notifications.push]` is configured
-    // — `emit_push` is a silent no-op otherwise. Best-effort: the bounded queue
-    // drops on overflow, the provider retries then drops; the inbox row is the
-    // durable record.
-    {
-        let push_cfg = current_config.effective_notifications(None).push;
-        if let Some(provider) = thegn_svc::push::provider_for(&push_cfg) {
-            let (push_tx, push_rx) = std::sync::mpsc::sync_channel(crate::push_notify::QUEUE_DEPTH);
-            notify_state.set_push_tx(push_tx);
-            crate::push_notify::spawn(push_rx, provider);
-            tracing::info!(target: "thegn::push", "push-to-phone channel enabled");
-        }
-    }
+    // Push delivery is one bounded worker per effective named sink. The
+    // snapshot is shared with Monitor but carries counters only — never URLs,
+    // tokens, or message payloads.
+    install_push_workers(&notify_state, current_config.effective_notifications(None));
     // Surface any unacknowledged crash report from a previous run (this process
     // OR the daemon — the crash dir is shared) as a notification naming the
     // report path, then acknowledge it so it never re-surfaces. Entirely
@@ -9609,8 +9618,14 @@ async fn event_loop<T: Terminal>(
             // without carrying it across the swap the sidebar would re-advertise
             // Ctrl+<digit> hints on the first hydration tick.
             let ctrl_digits_reportable = model.ctrl_digits_reportable;
+            // Delivery accounting is loop-owned and shared with the worker;
+            // hydration must not replace it with its empty default.
+            let notification_delivery = model.notification_delivery.clone();
+            let notification_delivery_configured = model.notification_delivery_configured;
             model = next_model;
             model.ctrl_digits_reportable = ctrl_digits_reportable;
+            model.notification_delivery = notification_delivery;
+            model.notification_delivery_configured = notification_delivery_configured;
             if active_submodules_enabled && !model.panel.changes.is_empty() {
                 spawn_submodule_scan(hydration_gen, &session, &submodule_scan_tx, &waker);
             }
@@ -10939,9 +10954,12 @@ async fn event_loop<T: Terminal>(
                         .set_art_enabled(current_config.media.show_art);
                     // Live resident-pool cap reload: applies on the next park.
                     workspace_pool.set_limit(current_config.session.resident_pool_limit);
-                    // Live notification-routing reload: swap in the reloaded
-                    // rules/DND/sound/modes (preserving the runtime mode/toggle).
-                    notify_state.update_cfg(current_config.effective_notifications(None));
+                    // Live notification-routing and push-worker reload: publish
+                    // the matching config/sender pair under one lock boundary.
+                    install_push_workers(
+                        &notify_state,
+                        current_config.effective_notifications(None),
+                    );
                     // Live replay/daemon toggle: newly spawned panes pick up the
                     // reloaded configs (existing panes keep their transport/ring).
                     crate::handlers::startup::install_pane_services(&mut panes, &current_config);
@@ -12152,6 +12170,13 @@ async fn event_loop<T: Terminal>(
             // render time — no timer).
             model.notify_dnd = notify_state.dnd_active();
             model.notify_mode = notify_state.active_mode();
+            model.notification_delivery = notify_state.delivery_snapshot();
+            model.notification_delivery_configured = current_config
+                .effective_notifications(None)
+                .push
+                .effective_sinks()
+                .iter()
+                .any(thegn_core::config_push::PushSinkConfig::is_configured);
             // Persistent chip: the focused pane is daemon-backed (survives quit).
             model.persistent_pane = panes
                 .table
