@@ -302,6 +302,14 @@ pub const CATALOG: &[Slot] = &[
     slot("merge land", "worktree_pos", SourceKind::Worktree),
     slot("merge retry", "worktree", SourceKind::Worktree),
     slot("merge retry", "worktree_pos", SourceKind::Worktree),
+    // `merge conflicts --issue` labels the generated reconcile chunk with the
+    // lane's tracker id (`THE-32`), so the issue source is the right one even
+    // though nothing serves it yet.
+    slot(
+        "merge conflicts",
+        "issue",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
     slot("merge rm", "worktree", SourceKind::Worktree),
     slot("merge rm", "worktree_pos", SourceKind::Worktree),
     slot("notify push", "worktree", SourceKind::Worktree),
@@ -498,6 +506,15 @@ pub const CATALOG: &[Slot] = &[
     slot(
         "dispatch wait",
         "timeout",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // `dispatch set-status --why` is the reason recorded on a bad outcome. Free
+    // prose with nothing to enumerate — `Freeform` rather than `Structural`,
+    // because clap cannot complete it from the tree and saying otherwise would
+    // record the wrong reason for leaving it unsourced.
+    slot(
+        "dispatch set-status",
+        "why",
         SourceKind::Reserved(Reserved::Freeform),
     ),
     // --- pipeline report/note/status (THE-88) -----------------------------
