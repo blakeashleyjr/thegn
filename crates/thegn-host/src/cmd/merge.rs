@@ -72,6 +72,24 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
+    /// Classify the conflicts of an in-progress merge, and print the reconcile
+    /// chunk skeleton a Lead annotates before dispatching a reconcile.
+    ///
+    /// Splits hunks into the two kinds that need different advice: `additive`
+    /// (the base had nothing — keep both sides) and `restructure` (both sides
+    /// changed code that existed — someone must decide). Run it in the worktree
+    /// with the conflicted merge already in progress.
+    Conflicts {
+        /// Issue label for the skeleton heading, e.g. `THE-32`.
+        #[arg(long, default_value = "LANE")]
+        issue: String,
+        /// Print the counts only, not the skeleton.
+        #[arg(long)]
+        summary: bool,
+        /// Emit JSON instead of the human output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
@@ -99,7 +117,88 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Drain { all, json } => drain(cfg, all, json),
         Action::Land { target } => land(cfg, target.get()),
         Action::Retry { target } => retry(target.get()),
+        Action::Conflicts {
+            issue,
+            summary,
+            json,
+        } => conflicts(&issue, summary, json),
     }
+}
+
+/// `merge conflicts` — the mechanical half of writing a reconcile chunk.
+///
+/// A reconcile chunk written as generic prose is worse than none: the one used
+/// for THE-32 advised "default to keeping both sides", which was right for 9 of
+/// its 34 hunks and wrong for 25. Classification is computable; the decisions
+/// are not, so this prints the split and leaves the decisions blank.
+fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
+    let root = repo_root().context("`merge conflicts` must run inside a git worktree")?;
+    let out = thegn_core::util::git_out(&root, &["diff", "--name-only", "--diff-filter=U"])
+        .unwrap_or_default();
+    let paths: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() {
+        outln!("no conflicted files — is a merge actually in progress here?");
+        return Ok(());
+    }
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let body = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        let hunks = thegn_core::merge_classify::classify_file(&body);
+        files.push(thegn_core::merge_classify::FileConflicts { path, hunks });
+    }
+    let additive: usize = files
+        .iter()
+        .map(thegn_core::merge_classify::FileConflicts::additive)
+        .sum();
+    let restructure: usize = files
+        .iter()
+        .map(thegn_core::merge_classify::FileConflicts::restructure)
+        .sum();
+    if json {
+        let rows: Vec<_> = files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "path": f.path,
+                    "additive": f.additive(),
+                    "restructure": f.restructure(),
+                    "hunks": f.hunks.iter().map(|h| serde_json::json!({
+                        "line": h.line,
+                        "class": h.class.as_str(),
+                        "ours": h.ours_hint,
+                        "theirs": h.theirs_hint,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return super::emit_json(&serde_json::json!({
+            "files": rows,
+            "additive": additive,
+            "restructure": restructure,
+        }));
+    }
+    if summary {
+        for f in &files {
+            outln!(
+                "  {:>3} additive  {:>3} decide   {}",
+                f.additive(),
+                f.restructure(),
+                f.path
+            );
+        }
+        outln!("\n{additive} additive, {restructure} needing a decision");
+        return Ok(());
+    }
+    outln!(
+        "{}",
+        thegn_core::merge_classify::render_chunk_skeleton(issue, &files)
+    );
+    Ok(())
 }
 
 /// `merge retry [worktree]` — re-arm a blocked row.

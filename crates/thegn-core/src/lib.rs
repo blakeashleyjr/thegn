@@ -182,6 +182,7 @@ pub mod lsp_registry;
 pub mod managed_tool;
 pub mod mcp;
 pub mod media;
+pub mod merge_classify;
 pub mod merge_guard;
 pub mod merge_lifecycle;
 pub mod merge_queue_view;
