@@ -68,7 +68,7 @@ once_cell = "1.21.4"
 # the canonical envelope. Pure-Rust, no C deps, cross-compilable — keeps core's
 # substrate-free status (a hasher is not a runtime).
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 # Display-cell widths for the usage view's padded name column (`usage_view.rs`):
 # chars ≠ cells on wide glyphs, and `format!("{:<n$}")` drifts. Same crate the
 # host sizes text with; was already here as a dev-dep for the glyph tables.

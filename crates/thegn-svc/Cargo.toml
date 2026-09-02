@@ -68,7 +68,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = "0.1"
 http-body-util = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = "0.4"
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
