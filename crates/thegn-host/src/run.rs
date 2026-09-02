@@ -13569,8 +13569,11 @@ async fn event_loop<T: Terminal>(
                             dispatch_sidebar_outcome!(out, &mut synth);
                             match synth {
                                 Some(crate::keymap::Action::NewTerminal) => {
-                                    terminal_wizard_ui =
-                                        Some(open_terminal_wizard(keymap.config(), &session));
+                                    terminal_wizard_ui = Some(open_terminal_wizard(
+                                        keymap.config(),
+                                        &session,
+                                        &model.sidebar_db_terminals,
+                                    ));
                                 }
                                 Some(crate::keymap::Action::OpenPipelineBoard) => {
                                     open_pipeline_board!();
@@ -14026,8 +14029,11 @@ async fn event_loop<T: Terminal>(
                                 dispatch_sidebar_outcome!(out, &mut synth);
                                 match synth {
                                     Some(crate::keymap::Action::NewTerminal) => {
-                                        terminal_wizard_ui =
-                                            Some(open_terminal_wizard(keymap.config(), &session));
+                                        terminal_wizard_ui = Some(open_terminal_wizard(
+                                            keymap.config(),
+                                            &session,
+                                            &model.sidebar_db_terminals,
+                                        ));
                                     }
                                     Some(crate::keymap::Action::OpenPipelineBoard) => {
                                         open_pipeline_board!();
@@ -15074,10 +15080,27 @@ async fn event_loop<T: Terminal>(
                             // it and the new terminal never materializes. The
                             // wizard already dedupes its random slug; a typed
                             // name reaches here verbatim, so dedupe it here too.
+                            //
+                            // Dedupe against the global `terminals` registry as
+                            // well as this session's groups: `put_terminal`
+                            // upserts on a unique name, so a name only free in
+                            // THIS project would overwrite another project's row
+                            // and leave two live groups sharing it — which is
+                            // exactly what the by-name reunion in
+                            // `handlers::sidebar_activate` must never face.
                             {
-                                let taken = thegn_core::worktree::BranchSet::from_names(
-                                    session.worktrees.iter().map(|g| g.name.clone()),
+                                let mut names: Vec<String> = crate::handlers::terminal::taken_names(
+                                    &session,
+                                    &model.sidebar_db_terminals,
                                 );
+                                names.extend(
+                                    session
+                                        .worktrees
+                                        .iter()
+                                        .filter(|g| g.kind != crate::session::GroupKind::Terminal)
+                                        .map(|g| g.name.clone()),
+                                );
+                                let taken = thegn_core::worktree::BranchSet::from_names(names);
                                 choice.name = thegn_core::worktree::dedupe(&choice.name, &taken);
                             }
                             // The tiny upsert stays synchronous (sanctioned
@@ -21556,8 +21579,11 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewTerminal => {
-                                terminal_wizard_ui =
-                                    Some(open_terminal_wizard(keymap.config(), &session));
+                                terminal_wizard_ui = Some(open_terminal_wizard(
+                                    keymap.config(),
+                                    &session,
+                                    &model.sidebar_db_terminals,
+                                ));
                             }
                             Action::ConnectRoot => {
                                 // Connect-to-root (the sesh `root` jump):
@@ -21835,8 +21861,11 @@ async fn event_loop<T: Terminal>(
                                 // means "new terminal", not "new worktree" —
                                 // true when the sidebar cursor is on a terminal
                                 // row, or the active tab is a terminal group.
-                                terminal_wizard_ui =
-                                    Some(open_terminal_wizard(keymap.config(), &session));
+                                terminal_wizard_ui = Some(open_terminal_wizard(
+                                    keymap.config(),
+                                    &session,
+                                    &model.sidebar_db_terminals,
+                                ));
                             }
                             Action::NewWorktree => {
                                 // Create a real git worktree. From the sidebar,

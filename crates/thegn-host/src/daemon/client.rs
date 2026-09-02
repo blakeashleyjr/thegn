@@ -192,34 +192,32 @@ pub(crate) struct DaemonSource {
     pub client: ControlClient,
     /// Worktree hint recorded on opened sessions (listing/grouping).
     pub worktree: Option<String>,
+    /// Shared with the [`LazyDaemonSource`] that built this (see [`HistoryOnce`]).
+    pub attached_once: HistoryOnce,
 }
 
-/// Sessions this process has already warm-attached once. The FIRST attach
-/// feeds a fresh client emulator, so its snapshot should carry the scrollback
-/// history tail; every later attach to the same session is `relay_exec`'s
-/// reconnect ladder re-feeding an emulator that already holds that history —
-/// replaying the tail would append up to 2000 duplicate lines to scrollback
-/// on every transient drop. Session ids are short and few; entries live for
-/// the process.
-fn history_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    SEEN.get_or_init(Default::default)
-}
+/// Whether THIS PANE has already been fed a session's screen.
+///
+/// The first attach feeds a fresh client emulator, so its snapshot should carry
+/// the scrollback history tail; every later attach on the same pane is
+/// `relay_exec`'s reconnect ladder re-feeding an emulator that already holds
+/// that history — replaying the tail would append up to 2000 duplicate lines to
+/// scrollback on every transient drop.
+///
+/// The distinguishing thing is therefore the **pane**, not the session: this
+/// used to be a process-global set keyed by session id, which meant the SECOND
+/// pane in a process to attach a given session got no history — and that pane is
+/// precisely the one that needs it, being a brand-new `PtyPane` with an empty
+/// emulator (a re-materialize after a workspace eviction, or a terminal restored
+/// from its persisted layout). Its screen came up blank, which reads exactly
+/// like the shell having restarted. One cell per pane: [`LazyDaemonSource`] is
+/// built per pane in `Panes::spawn_daemon_backed` and hands a clone to each
+/// short-lived [`DaemonSource`] it makes.
+pub(crate) type HistoryOnce = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
-/// Should an attach to `session` request the history tail? True until
-/// [`mark_attached`] records a successful attach from this process.
-fn wants_history(session: &str) -> bool {
-    history_registry()
-        .lock()
-        .map(|s| !s.contains(session))
-        .unwrap_or(true)
-}
-
-fn mark_attached(session: &str) {
-    if let Ok(mut s) = history_registry().lock() {
-        s.insert(session.to_string());
-    }
+/// Claim the history tail for this pane: true exactly once per cell.
+fn claim_history(once: &HistoryOnce) -> bool {
+    !once.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl DaemonSource {
@@ -240,9 +238,9 @@ impl DaemonSource {
                 ..Default::default()
             })
             .await?;
-        // A just-opened session has no history yet; record it so a later
-        // reconnect counts as a re-attach.
-        mark_attached(&info.id);
+        // A just-opened session has no history yet; claim the cell so a later
+        // reconnect on this pane counts as a re-attach.
+        claim_history(&self.attached_once);
         self.attach_session(&info.id, spec.cols, spec.rows, true)
             .await
     }
@@ -285,12 +283,10 @@ impl ExecSource for DaemonSource {
         rows: u16,
     ) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(async move {
-            // First attach in this process (resurrect warm attach) restores
-            // the scrollback context; reconnects repaint without it.
-            let history = wants_history(session);
-            let s = self.attach_session(session, cols, rows, history).await?;
-            mark_attached(session);
-            Ok(s)
+            // First attach on this pane (resurrect warm attach) restores the
+            // scrollback context; its reconnects repaint without it.
+            let history = claim_history(&self.attached_once);
+            self.attach_session(session, cols, rows, history).await
         })
     }
 
@@ -382,6 +378,9 @@ pub(crate) struct LazyDaemonSource {
     pub cfg: DaemonConfig,
     /// Worktree hint recorded on opened sessions (listing/grouping).
     pub worktree: Option<String>,
+    /// This pane's history-tail cell — see [`HistoryOnce`]. One source is built
+    /// per pane, so `Default` (unclaimed) is right for every new pane.
+    pub attached_once: HistoryOnce,
 }
 
 impl LazyDaemonSource {
@@ -390,6 +389,10 @@ impl LazyDaemonSource {
         Ok(DaemonSource {
             client,
             worktree: self.worktree.clone(),
+            // Cloned, not fresh: `source()` runs per open/attach, so a
+            // per-`DaemonSource` cell would read as "first attach" every time
+            // and replay the tail on every reconnect.
+            attached_once: std::sync::Arc::clone(&self.attached_once),
         })
     }
 }
@@ -407,11 +410,10 @@ impl ExecSource for LazyDaemonSource {
     ) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(async move {
             let source = self.source().await?;
-            // Same first-attach/reconnect split as `DaemonSource::attach`.
-            let history = wants_history(session);
-            let s = source.attach_session(session, cols, rows, history).await?;
-            mark_attached(session);
-            Ok(s)
+            // Same first-attach/reconnect split as `DaemonSource::attach`, on
+            // the cell `source()` just cloned from this (per-pane) source.
+            let history = claim_history(&source.attached_once);
+            source.attach_session(session, cols, rows, history).await
         })
     }
 
@@ -444,17 +446,42 @@ mod tests {
         );
     }
 
-    /// Only the first attach of a session in this process requests the
-    /// history tail; reconnects (and anything after `mark_attached`) do not.
+    /// Only a pane's FIRST attach requests the history tail; its reconnects do
+    /// not, or every transient drop would append the tail again.
     #[test]
-    fn only_the_first_attach_requests_history() {
-        let sid = format!("history-test-{}", std::process::id());
-        assert!(wants_history(&sid), "fresh session: history wanted");
-        assert!(wants_history(&sid), "peeking must not consume the slot");
-        mark_attached(&sid);
+    fn only_the_first_attach_on_a_pane_requests_history() {
+        let pane: HistoryOnce = Default::default();
+        assert!(claim_history(&pane), "fresh pane: history wanted");
         assert!(
-            !wants_history(&sid),
-            "reconnects must skip the history tail"
+            !claim_history(&pane),
+            "this pane's reconnects must skip the history tail"
         );
+    }
+
+    /// The cell is per PANE, not per session. A second pane attaching a session
+    /// this process already showed is a brand-new `PtyPane` with an empty
+    /// emulator (a re-materialize after an eviction, or a terminal restored from
+    /// its persisted layout) — it must get the tail, or it comes up blank and
+    /// reads exactly like the shell having restarted.
+    #[test]
+    fn a_second_pane_on_the_same_session_still_gets_the_history() {
+        let first: HistoryOnce = Default::default();
+        let second: HistoryOnce = Default::default();
+        assert!(claim_history(&first));
+        assert!(
+            claim_history(&second),
+            "a fresh pane's empty emulator needs the tail"
+        );
+    }
+
+    /// Every short-lived `DaemonSource` a pane's `LazyDaemonSource` builds
+    /// shares the one cell — a per-`DaemonSource` cell would read as "first
+    /// attach" on every reconnect.
+    #[test]
+    fn cloned_cells_share_the_claim() {
+        let pane: HistoryOnce = Default::default();
+        let per_call = std::sync::Arc::clone(&pane);
+        assert!(claim_history(&per_call));
+        assert!(!claim_history(&pane), "the clone consumed the claim");
     }
 }
