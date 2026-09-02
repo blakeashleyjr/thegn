@@ -85,7 +85,11 @@ pub(crate) async fn run(
         }
     };
     if json {
-        outln!("{}", serde_json::to_string_pretty(&info)?);
+        // Through the chokepoint, which also makes this COMPACT like every
+        // other `--json` in the CLI. It was the lone `to_string_pretty`, so a
+        // consumer parsing the fleet of verbs got one differently-shaped
+        // document from this one.
+        super::emit_json(&info)?;
     } else {
         let lineage = info
             .forked_from
