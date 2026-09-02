@@ -8337,7 +8337,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "chrono-tz",
  "clap 4.6.6",
@@ -8431,7 +8431,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "criterion",
  "futures-util",

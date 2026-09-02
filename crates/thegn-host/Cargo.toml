@@ -126,7 +126,7 @@ toml_edit = "0.25.12"
 unicode-width = "0.2"
 sha2 = "0.10"
 tempfile.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 # Serve mode mounts the control-plane gRPC service into the TCP axum router.
 tonic.workspace = true
 
