@@ -108,8 +108,19 @@ pub const DETECT_PROBE_SCRIPT: &str = r#"
 [ -f .envrc ] && grep -Eq 'use[ _]flake' .envrc && echo DIRENV_FLAKE=1
 emit_toolchain_file() {
   kind="$1"; file="$2"
+  no_symlink_components "$file" || return 0
   [ -f "$file" ] && [ -r "$file" ] && [ ! -L "$file" ] || return 0
   printf 'TOOLCHAIN_%s=%s\n' "$kind" "$file"
+}
+no_symlink_components() {
+  path="$1"
+  while [ "$path" != "." ] && [ "$path" != "/" ] && [ -n "$path" ]; do
+    [ ! -L "$path" ] || return 1
+    case "$path" in
+      */*) path="${path%/*}"; [ -n "$path" ] || path="." ;;
+      *) path="." ;;
+    esac
+  done
 }
 for file in mise.toml .mise.toml mise.local.toml mise/config.toml .mise/config.toml .config/mise.toml .config/mise/config.toml; do
   emit_toolchain_file CONFIG "$file"

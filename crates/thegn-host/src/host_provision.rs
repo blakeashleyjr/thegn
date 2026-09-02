@@ -26,6 +26,7 @@ use crate::agent::{ProvisionState, ProvisionStepView};
 /// Marker inside the container `$HOME`: the per-container pipeline ran.
 /// (Volumes/images dedup the heavy parts; this only skips the cheap replay.)
 const MARKER: &str = ".thegn-host-provisioned";
+const MARKER_VERSION: &str = "2";
 const TOOLCHAIN_PROVIDER_STEP: &str = "toolchain_provider";
 
 /// Run the host-backed per-worktree pipeline. Returns the pane-entry init
@@ -94,7 +95,11 @@ pub(crate) fn provision_worktree_on_host(
         Ok((true, out, _)) if !out.trim().is_empty() => out.trim().to_string(),
         _ => "/home/thegn".to_string(),
     };
-    let marker_probe = format!("test -f {home}/{MARKER} && echo HAVE || echo NEED");
+    let marker_path = thegn_core::util::sh_quote(&format!("{home}/{MARKER}"));
+    let marker_version = thegn_core::util::sh_quote(MARKER_VERSION);
+    let marker_probe = format!(
+        "test -f {marker_path} && grep -Fxq {marker_version} {marker_path} && echo HAVE || echo NEED"
+    );
     let already = matches!(
         runner.exec_in_container(&container, &marker_probe, secs(30)),
         Ok((true, ref out, _)) if out.contains("HAVE")
@@ -285,7 +290,8 @@ pub(crate) fn provision_worktree_on_host(
         }
         progress(&views);
     }
-    let _ = runner.exec_in_container(&container, &format!("touch {home}/{MARKER}"), secs(30)); // best-effort: marker touch: a failed touch just re-runs init on the next claim
+    let marker_write = format!("printf '%s\\n' {marker_version} > {marker_path}");
+    let _ = runner.exec_in_container(&container, &marker_write, secs(30)); // best-effort: marker write: a failed write just re-runs init on the next claim
     init
 }
 

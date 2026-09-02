@@ -406,8 +406,9 @@ fn remote_requirements(loc: &GitLoc) -> Result<EnvRequirements, String> {
 
 fn remote_file(loc: &GitLoc, relative: &str) -> Option<Vec<u8>> {
     let quoted = thegn_core::util::sh_quote(relative);
-    let script =
-        format!("if [ -f {quoted} ] && [ ! -L {quoted} ]; then cat {quoted}; else exit 42; fi");
+    let script = format!(
+        "no_symlink_components() {{ path=\"$1\"; while [ \"$path\" != . ] && [ \"$path\" != / ] && [ -n \"$path\" ]; do [ ! -L \"$path\" ] || return 1; case \"$path\" in */*) path=\"${{path%/*}}\"; [ -n \"$path\" ] || path=.;; *) path=.;; esac; done; }}; if no_symlink_components {quoted} && [ -f {quoted} ] && [ ! -L {quoted} ]; then cat {quoted}; else exit 42; fi"
+    );
     let (ok, output) = target_script(loc, &script, TARGET_DETECT_TIMEOUT, MAX_OUTPUT).ok()?;
     ok.then(|| output.into_bytes())
 }
@@ -579,7 +580,7 @@ fn target_file(
 ) -> Option<Vec<u8>> {
     let quoted = thegn_core::util::sh_quote(relative);
     let script = format!(
-        "cd {} 2>/dev/null && if [ -f {quoted} ] && [ ! -L {quoted} ]; then cat {quoted}; else exit 42; fi",
+        "cd {} 2>/dev/null && no_symlink_components() {{ path=\"$1\"; while [ \"$path\" != . ] && [ \"$path\" != / ] && [ -n \"$path\" ]; do [ ! -L \"$path\" ] || return 1; case \"$path\" in */*) path=\"${{path%/*}}\"; [ -n \"$path\" ] || path=.;; *) path=.;; esac; done; }}; if no_symlink_components {quoted} && [ -f {quoted} ] && [ ! -L {quoted} ]; then cat {quoted}; else exit 42; fi",
         thegn_core::util::sh_quote(target_worktree),
     );
     let (ok, output, _) = runner
@@ -1002,13 +1003,22 @@ fn prewarm(worktree: &Path, identity: &ConfigSetIdentity) {
     }
     let worktree = worktree.to_path_buf();
     let identity = identity.clone();
-    std::thread::Builder::new()
+    let key = identity.hash.clone();
+    if std::thread::Builder::new()
         .name("thegn-toolchain".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             resolve_cached(&worktree, &identity);
         })
-        .ok();
+        .is_err()
+    {
+        // A failed worker spawn must not permanently suppress retries for this
+        // identity. Resource exhaustion is transient and the next launch can
+        // succeed once another worker exits.
+        if let Ok(mut keys) = in_flight().lock() {
+            keys.remove(&key);
+        }
+    }
 }
 
 fn resolve_remote_cache(cfg: &Config, worktree: &str, loc: &GitLoc, approved: Vec<String>) {
@@ -1109,13 +1119,19 @@ fn prewarm_remote(
     let approved = db
         .map(|db| approvals_for(Some(db), repo_root.as_path()))
         .unwrap_or_default();
-    std::thread::Builder::new()
+    if std::thread::Builder::new()
         .name("thegn-toolchain-remote".into())
         .spawn(move || {
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             resolve_remote_cache(&cfg, &worktree, &loc, approved);
         })
-        .ok();
+        .is_err()
+    {
+        // Keep the remote resolver retryable when the OS refuses a new worker.
+        if let Ok(mut keys) = in_flight().lock() {
+            keys.remove(&key);
+        }
+    }
 }
 
 struct MiseProvider {
