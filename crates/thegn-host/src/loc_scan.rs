@@ -40,7 +40,7 @@ pub fn scan_excluding(path: &Path, submodule_paths: &[String]) -> Option<LocRepo
     let excludes: Vec<String> = submodule_paths
         .iter()
         .filter(|candidate| thegn_core::submodule::validate_submodule_path(candidate).is_ok())
-        .cloned()
+        .map(|candidate| format!("**/{candidate}"))
         .collect();
     let exclude_refs: Vec<&str> = excludes.iter().map(String::as_str).collect();
     let mut languages = tokei::Languages::new();
