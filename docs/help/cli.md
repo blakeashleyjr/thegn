@@ -178,6 +178,12 @@ secrets, or CI logs. With autopilot disabled it reports the disabled state and
 an empty/bounded journal view. (`notify list --json`
 is NDJSON and `doctor --json` is a single object — both historical.)
 
+`thegn ci logs <run-id> <job-id> --worktree <path>` prints the bounded,
+redacted cached job-log tail. It reads the cache first and uses the daemon's
+blocking provider lane for a miss; `ci log` remains a compatibility alias.
+With `--json`, stdout is one valid JSON value with explicit `fetched_at`,
+`truncated`, and `redacted` metadata.
+
 `thegn host discover` is the inbound tailnet path: it lists the machines
 your tailscale client already knows (from `tailscale status --json`) as
 remote-host candidates, credential-free. `--promote <name|fqdn>` saves one

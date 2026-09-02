@@ -18,6 +18,10 @@ path but not its parser. A repo-root `.thegn.toml`, `.thegn.yaml`,
 and JSON; if multiple readable candidates exist, thegn warns which path won
 and which paths were ignored.
 
+CI autofix is only permitted in trusted user configuration:
+`[project.<slug>.ci] mode = "suggest"` or `"auto"`; a repo-authored file
+cannot enable it.
+
 `[project.<slug>]` in your own config refines settings for one repo —
 including `[project.<slug>.merge_queue]` and
 `[project.<slug>.pr_queue]`, which is where a repo whose gate,
@@ -80,6 +84,9 @@ The file is watched: edits apply live, no restart.
   language; `thegn doctor` lists every server and whether its command
   resolves. Servers named in a repo-local `.thegn.*` are ignored (a
   language-server command is untrusted) — declare them in your user config.
+- `[ci]` — cached, bounded CI run/log reads. `log_cache_runs = 0` disables
+  persistence; `[ci.autofix] mode = "off"|"suggest"|"auto"` defaults to off
+  and reuses the existing trusted PR-queue agent policy.
 - `[merge_queue]`, `[pr_queue]`, `[autopilot]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 

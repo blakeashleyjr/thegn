@@ -180,6 +180,56 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "ci.runs",
+        description: "List cached CI runs and their bounded job metadata for a worktree. \
+                      Read-only; provider refreshes happen in the daemon's blocking lane.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree path (default: the server's working directory)",
+            },
+            ArgSpec {
+                name: "limit",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Maximum number of cached runs to return",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "ci.logs",
+        description: "Read a bounded, redacted cached CI job-log tail. Read-only; a cache \
+                      miss may be filled by the daemon's blocking provider lane.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree path (default: the server's working directory)",
+            },
+            ArgSpec {
+                name: "run",
+                kind: ArgKind::String,
+                required: true,
+                description: "CI run id",
+            },
+            ArgSpec {
+                name: "job",
+                kind: ArgKind::String,
+                required: true,
+                description: "CI job id",
+            },
+            ArgSpec {
+                name: "tail_lines",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Optional smaller tail selection",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "agent.sessions",
         description: "List discovered coding-agent sessions from each harness's local \
                       transcript store: harness, session id, worktree/project, last-modified \
@@ -521,6 +571,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "preview.fetch",
     "leases.list",
     "me",
+    "ci.runs",
+    "ci.logs",
     "agent.sessions",
     "sessions.wait",
     "sessions.open",
@@ -928,6 +980,8 @@ mod tests {
             "preview.fetch",
             "leases.list",
             "me",
+            "ci.runs",
+            "ci.logs",
             "agent.sessions",
             "sessions.wait",
             "semantic.map",
