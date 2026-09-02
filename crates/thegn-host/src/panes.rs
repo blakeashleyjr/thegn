@@ -827,10 +827,7 @@ impl Panes {
             if !worktree.is_empty()
                 && let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, worktree)
             {
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.to_str().map(str::to_string))
-                    .unwrap_or_else(|| "thegn".to_string());
+                let exe = thegn_core::util::self_exe_str();
                 let argv = crate::agent::sprite_ssh_argv(&exe, worktree, &key, &user, &workdir);
                 match self.spawn_argv_env(&argv, cwd.as_deref(), &[], center) {
                     Ok(fresh) => {

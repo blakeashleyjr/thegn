@@ -139,6 +139,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[model_proxy]` — SecretRef-only keys, routes referencing declared
             // providers, aliases naming real routes. Only when enabled.
             errs.extend(cfg.model_proxy.validate());
+            errs.extend(cfg.ci.validate());
             None
         }
     };
@@ -913,10 +914,14 @@ mod tests {
         // (DevcontainerMode) — repo-authored devcontainer overlay mode.
         // 94 → 95 (THE-59): `[voice] kind` (VoiceKind — generic command
         // provider).
-        // 96 → 97 (THE-60): `[toolchain.mise] inject` (MiseInject).
+        // 96 → 97 (THE-48): `[ci.autofix] mode` (CiAutofixMode). The provider
+        // enum was already present on main.
+        // 97 → 98 (THE-60): `[toolchain.mise] inject` (MiseInject). Both
+        // branches independently claimed the 96 → 97 slot; merged, each enum is
+        // still present, so the ledger records them in turn.
         assert_eq!(
             defs.len(),
-            97,
+            98,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

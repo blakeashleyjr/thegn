@@ -355,6 +355,20 @@
           treefmt = {
             enable = true;
             settings.formatters = fmtPackages;
+            # ALSO on pre-push, unlike the other cheap staged-file hooks. Until
+            # this was added, `pre-commit` was the ONLY point that checked
+            # formatting anywhere, and it is the most bypassable one: inside a
+            # sandbox with a read-only $HOME, prek cannot create its cache, the
+            # hook dies with "Permission denied" (a message about caches, not
+            # about code), and the documented fallback is `--no-verify` — see
+            # build_cache.rs's `inject_cache_mounts`. One such bypass used to be
+            # permanent: pre-push runs clippy/test/smoke and none of them look at
+            # formatting, the fold path runs no git hooks at all, and remote CI
+            # is dispatch-only. Thirteen files had drifted that way. treefmt is
+            # the cheap hook (no compile), so re-running it on the tier that
+            # already spends minutes on clippy + test costs effectively nothing
+            # and turns a silent bypass into a caught one.
+            stages = ["pre-commit" "pre-merge-commit" "pre-push"];
           };
 
           # linters — these are checks, not formatters, so they stay separate

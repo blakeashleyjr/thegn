@@ -318,6 +318,104 @@ pub fn host_base_env() -> Vec<(String, String)> {
     filter_host_env(std::env::vars(), host_env_allow_extra())
 }
 
+/// The marker Linux appends to `/proc/self/exe` once the running binary's inode
+/// is unlinked — i.e. after a rebuild-in-place under a live process, which is
+/// this repo's normal worktree-per-agent workflow.
+const DELETED_EXE_MARKER: &str = " (deleted)";
+
+/// Strip [`DELETED_EXE_MARKER`] from a raw `current_exe()` result, yielding the
+/// path the binary occupied before it was replaced. `None` when unmarked.
+///
+/// `std::env::current_exe()` on Linux is a verbatim `readlink("/proc/self/exe")`
+/// and keeps the marker, so the value is a path that does not exist: passing it
+/// to `Command::new` fails with `ENOENT`, and `canonicalize` fails too. Pure —
+/// the unit-test seam for [`self_exe_path`] / [`self_exe`].
+pub fn strip_deleted_exe_marker(exe: &Path) -> Option<PathBuf> {
+    exe.to_str()
+        .and_then(|s| s.strip_suffix(DELETED_EXE_MARKER))
+        .map(PathBuf::from)
+}
+
+/// Resolve a raw `current_exe()` result to an on-disk path, deciding existence
+/// through `exists` so the branch table is testable without touching `/proc`.
+fn resolve_exe_path(raw: Option<PathBuf>, exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let raw = raw?;
+    if exists(&raw) {
+        return Some(raw);
+    }
+    // Only trust the stripped path when something is actually there: a binary
+    // genuinely named `foo (deleted)` would otherwise be rewritten out from
+    // under the caller.
+    strip_deleted_exe_marker(&raw).filter(|p| exists(p))
+}
+
+/// The filesystem path of the running binary, with Linux's `" (deleted)"`
+/// marker resolved away. Use this for path *reasoning* — sibling lookup
+/// (`.parent()`), `canonicalize`, comparison, display. `None` when the path
+/// cannot be determined or no longer exists.
+///
+/// Not for spawning this build: after a rebuild-in-place the returned path is
+/// the *replacement* binary, a different build. Use [`self_exe`] for that.
+pub fn self_exe_path() -> Option<PathBuf> {
+    resolve_exe_path(std::env::current_exe().ok(), |p| p.exists())
+}
+
+/// The path to pass to `Command::new` **in this process** to re-run this build.
+///
+/// After a rebuild-in-place `current_exe()` names a deleted file and every
+/// self-spawn dies with `ENOENT` — how a live host stopped being able to start
+/// its pane daemon at all (`[native exec failed: spawn pane daemon]`), which is
+/// latent until something actually needs a respawn. On Linux the unlinked inode
+/// is still reachable through `/proc/self/exe`, and exec'ing that keeps the
+/// child on the *same build* as its parent. That matters more than merely
+/// working: the on-disk replacement can carry a newer `db::SCHEMA_VERSION` or
+/// control-wire shape, so respawning into it would pair an old host with a new
+/// daemon over a shared database — the skew the schema lease then refuses.
+///
+/// **Only for a spawn this process performs.** `/proc/self/exe` is resolved by
+/// whoever opens it, so the returned path is meaningless once it leaves here:
+/// handed to another process — an env var like `THEGN_BIN`, an ssh
+/// `ProxyCommand`, a persisted command template — it would name *that*
+/// process's binary, and inside a PID-namespaced sandbox nothing at all. Use
+/// [`self_exe_path`] / [`self_exe_str`] for anything another process resolves.
+///
+/// Off Linux (and if `/proc` is unavailable) this falls back to the replacement
+/// binary, which is better than not spawning at all.
+pub fn self_exe() -> Option<PathBuf> {
+    let raw = std::env::current_exe().ok();
+    #[cfg(target_os = "linux")]
+    if raw
+        .as_deref()
+        .is_some_and(|p| !p.exists() && strip_deleted_exe_marker(p).is_some())
+    {
+        let proc_self_exe = PathBuf::from("/proc/self/exe");
+        // The magic symlink resolves through to the open inode even when the
+        // name is gone; `exists()` follows it and so still answers true.
+        if proc_self_exe.exists() {
+            return Some(proc_self_exe);
+        }
+    }
+    resolve_exe_path(raw, |p| p.exists())
+}
+
+/// [`self_exe_path`] as a string, falling back to a bare `thegn` for `PATH`
+/// lookup. The shape every site wants that hands thegn's own path to *another*
+/// process to execute — so it is deliberately built on [`self_exe_path`] (a
+/// real, externally-resolvable path) and never on [`self_exe`].
+pub fn self_exe_str() -> String {
+    self_exe_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "thegn".to_string())
+}
+
+/// Whether the running binary was replaced or deleted since launch — the
+/// rebuild-in-place condition. Reported by `thegn doctor`, because every
+/// downstream symptom (failed self-spawn, schema-lease refusal, a `THEGN_BIN`
+/// no worker can execute) is otherwise attributed to the wrong subsystem.
+pub fn self_exe_is_stale() -> bool {
+    std::env::current_exe().is_ok_and(|p| !p.exists())
+}
+
 /// A `Command` for `program` detached from the compositor's controlling
 /// terminal: null stdin/stdout/stderr + its own process group. An off-loop
 /// helper that inherited the real tty (fd 0/1/2) and touched job control
@@ -984,6 +1082,79 @@ fn platform_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_the_linux_deleted_marker() {
+        assert_eq!(
+            strip_deleted_exe_marker(Path::new("/opt/thegn/bin/thegn (deleted)")),
+            Some(PathBuf::from("/opt/thegn/bin/thegn"))
+        );
+        // Unmarked paths are left alone — the caller keeps its own value.
+        assert_eq!(
+            strip_deleted_exe_marker(Path::new("/opt/thegn/bin/thegn")),
+            None
+        );
+        // The marker only counts as a suffix, never mid-path.
+        assert_eq!(
+            strip_deleted_exe_marker(Path::new("/opt/x (deleted)/thegn")),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_exe_path_prefers_the_live_path() {
+        let live = PathBuf::from("/opt/thegn/bin/thegn");
+        assert_eq!(
+            resolve_exe_path(Some(live.clone()), |_| true),
+            Some(live),
+            "an existing path must be returned untouched"
+        );
+    }
+
+    #[test]
+    fn resolve_exe_path_recovers_a_rebuilt_binary() {
+        // The bug: a live host whose binary was rebuilt in place reads back
+        // `<path> (deleted)`, which no longer exists, so every self-spawn
+        // ENOENTs. The replacement at the stripped path is the recovery.
+        let raw = PathBuf::from("/opt/thegn/bin/thegn (deleted)");
+        let real = PathBuf::from("/opt/thegn/bin/thegn");
+        let resolved = resolve_exe_path(Some(raw), |p| p == real);
+        assert_eq!(resolved, Some(real));
+    }
+
+    #[test]
+    fn resolve_exe_path_keeps_a_genuine_deleted_suffix() {
+        // A binary really named `... (deleted)` and present on disk must win
+        // over the strip, or we would rewrite a valid path out from under the
+        // caller.
+        let odd = PathBuf::from("/opt/thegn/bin/thegn (deleted)");
+        assert_eq!(resolve_exe_path(Some(odd.clone()), |p| p == odd), Some(odd));
+    }
+
+    #[test]
+    fn resolve_exe_path_gives_up_when_nothing_exists() {
+        // Binary deleted outright with no replacement: no path to offer, so
+        // callers fall back to a bare `thegn` on PATH rather than spawn a
+        // path that cannot work.
+        assert_eq!(
+            resolve_exe_path(Some(PathBuf::from("/gone/thegn (deleted)")), |_| false),
+            None
+        );
+        assert_eq!(resolve_exe_path(None, |_| true), None);
+    }
+
+    #[test]
+    fn self_exe_str_is_a_usable_program_name() {
+        // In-process the test binary exists, so this is the live path; the
+        // contract that matters is that it is never empty and never carries
+        // the marker into a `Command`.
+        let exe = self_exe_str();
+        assert!(!exe.is_empty(), "self_exe_str must never be empty");
+        assert!(
+            !exe.ends_with(DELETED_EXE_MARKER),
+            "the deleted marker must never reach Command::new: {exe:?}"
+        );
+    }
 
     #[test]
     fn hostname_is_non_empty_and_trimmed() {

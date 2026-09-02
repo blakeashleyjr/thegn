@@ -8,7 +8,7 @@ thegn SHALL record a dispatch row's worker exit — the exit code when it was
 reaped, and when the exit was observed — and SHALL derive from it a liveness
 that separates a row whose worker is still running from a row whose worker has
 finished but which no supervisor has closed. Absence of an exit stamp MUST mean
-*unknown*, never *exited*: a row from before the column existed, or one whose
+_unknown_, never _exited_: a row from before the column existed, or one whose
 daemon died before it could stamp, MUST NOT be reported as finished. A row
 whose worker has exited MUST still count as occupying its stage slot until a
 supervisor closes it — exiting is not the same as being reconciled.

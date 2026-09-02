@@ -478,6 +478,53 @@ fn notifications_are_actionable_with_dismiss_clear_keys() {
     );
 }
 
+#[test]
+fn suggest_ci_notification_exposes_the_same_candidate_action() {
+    let model = notif_model(
+        vec![Notification {
+            id: 9,
+            kind: NotificationKind::PrQueueNeedsHuman,
+            source_ref: "ci-autofix:/wt/repo:run-7:job-3:abc123".into(),
+            message:
+                "CI job build failed for PR #4; CI log evidence is ready for a PR-agent handoff"
+                    .into(),
+            created_at_ms: thegn_core::util::now() - 5,
+            read: false,
+            worktree_path: "/wt/repo".into(),
+        }],
+        vec![],
+    );
+    let mut ov = open_notifications(&model);
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    assert!(l.rows.iter().any(|row| {
+        row.actions.iter().any(|(key, action)| {
+            *key == 'f'
+                && *action
+                    == DetailAction::CiAutofix {
+                        candidate: thegn_core::ci_log::CiLogCandidate {
+                            worktree: "/wt/repo".into(),
+                            run_id: "run-7".into(),
+                            job_id: "job-3".into(),
+                            head_sha: "abc123".into(),
+                        },
+                    }
+        })
+    }));
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('f'), Modifiers::NONE),
+        DetailOutcome::Act(DetailAction::CiAutofix {
+            candidate: thegn_core::ci_log::CiLogCandidate {
+                worktree: "/wt/repo".into(),
+                run_id: "run-7".into(),
+                job_id: "job-3".into(),
+                head_sha: "abc123".into(),
+            },
+        })
+    );
+}
+
 /// Read rows are history, not "needs you": they belong to the panel's inbox
 /// section (show-read toggle), never this surface. Listing them dimmed was
 /// what made `x`/`a` look inert — nothing ever left the list.

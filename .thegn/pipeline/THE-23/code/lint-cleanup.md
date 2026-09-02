@@ -1,7 +1,8 @@
 # THE-23 — lint cleanup (Lead work order)
 
 files:
-  - crates/thegn-host/src/handlers/repo_trust.rs
+
+- crates/thegn-host/src/handlers/repo_trust.rs
 
 ## Why this exists
 
@@ -31,7 +32,7 @@ Reproduced with `cargo clippy -p thegn-host --bins -- -D warnings`:
     then wire it, or
   - they are vestigial — then delete them and any code that only exists to
     populate them.
-  Prefer deleting over `#[allow]`. If you believe an `#[allow]` is genuinely
-  correct, it needs a written justification naming the future consumer.
+    Prefer deleting over `#[allow]`. If you believe an `#[allow]` is genuinely
+    correct, it needs a written justification naming the future consumer.
 - Do not change behaviour beyond what the above requires; no refactors.
 - Keep every ratchet green (`test/ignored-result-ratchet.txt` especially).

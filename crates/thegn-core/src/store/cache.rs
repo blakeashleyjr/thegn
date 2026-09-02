@@ -28,6 +28,22 @@ pub trait CacheStore {
     /// Replace the CI run-history cache for a worktree.
     fn put_ci_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()>;
 
+    /// One bounded, redacted cached CI job log.
+    fn get_ci_log(
+        &self,
+        worktree: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<crate::ci_log::CiLogEntry>>;
+    /// All cached CI logs for a worktree, newest fetched entries first.
+    fn list_ci_logs(&self, worktree: &str) -> Result<Vec<crate::ci_log::CiLogEntry>>;
+    /// Upsert one bounded, redacted CI log entry.
+    fn put_ci_log(&self, entry: &crate::ci_log::CiLogEntry) -> Result<()>;
+    /// Retain only logs belonging to the supplied newest terminal run ids.
+    fn retain_ci_logs(&self, worktree: &str, run_ids: &[String]) -> Result<usize>;
+    /// Atomically claim an autofix candidate; false means another refresh won.
+    fn claim_ci_autofix(&self, candidate: &crate::ci_log::CiLogCandidate) -> Result<bool>;
+
     /// Per-repo open-PRs-by-branch cache: `(json, fetched_at)`.
     fn get_pr_branch_cache(&self, repo_root: &str) -> Result<Option<(String, i64)>>;
     /// Replace the per-repo open-PRs-by-branch cache.

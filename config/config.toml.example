@@ -705,6 +705,11 @@ ttl_secs = 30              # skip non-forced refreshes while cache is younger (0
 poll_interval_secs = 30    # background refresh cadence for run history (min 5)
 max_runs = 50              # how many recent runs to fetch/display
 log_tail_lines = 2000      # cap on fetched log lines (the tail is kept)
+log_cache_runs = 10        # terminal runs retained in the redacted log cache (0 = off)
+log_max_bytes = 1048576    # hard byte cap per cached log tail
+
+[ci.autofix]
+mode = "off"               # off | suggest | auto (uses the existing PR-queue agent)
 
 # Per-provider endpoints + tokens. Tokens accept "env:VAR" so secrets stay out
 # of this file. Only the provider you use needs configuring.
@@ -1106,6 +1111,8 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # which may also carry its own [keybinds] table — the most specific layer wins.
 # [project.my-repo.keybinds]
 # new-worktree = "Alt w"
+# [project.my-repo.ci]
+# mode = "off"                         # trusted override for [ci.autofix].mode
 
 # Per-worktree lifecycle commands for this project. These lists accumulate
 # after the global [hooks] table and before a repo-root .thegn.* [hooks] table.
