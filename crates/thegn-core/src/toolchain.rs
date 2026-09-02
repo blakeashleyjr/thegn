@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{config_enum, config_warn};
 use crate::envplan::Language;
+use crate::toolchain_activation::ActivationPolicy;
 
 config_enum! {
     /// `[toolchain] mode` — how a languages-only repo gets its toolchain:
@@ -26,6 +27,36 @@ config_enum! {
     } default = Auto;
 }
 
+config_enum! {
+    /// `[toolchain.mise] inject` — how a detected mise/asdf declaration is
+    /// folded into worktree launches. Environment resolution remains
+    /// trust-gated; both `auto` and `env` fall back to shims while pending.
+    pub enum MiseInject: "mise injection mode" {
+        Auto = "auto", Shims = "shims", Env = "env", Off = "off",
+    } default = Auto;
+}
+
+/// Mise activation policy nested beneath `[toolchain]`. This is separate from
+/// [`ToolchainMode`]: mode owns languages-only provisioning, while injection
+/// layers detected declarations into every normal worktree launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MiseConfig {
+    pub inject: MiseInject,
+}
+
+impl MiseConfig {
+    /// Resolve config + trust into provider-independent activation intent.
+    pub fn activation_policy(&self, config_approved: bool) -> ActivationPolicy {
+        match self.inject {
+            MiseInject::Off => ActivationPolicy::Off,
+            MiseInject::Shims => ActivationPolicy::Shims,
+            MiseInject::Auto | MiseInject::Env if config_approved => ActivationPolicy::Environment,
+            MiseInject::Auto | MiseInject::Env => ActivationPolicy::Shims,
+        }
+    }
+}
+
 /// `[toolchain]` — the batteries-included toolchain for languages-only repos.
 /// Per-language lists override the built-in nixpkgs package defaults (empty ⇒
 /// defaults); `extra` is always appended.
@@ -33,6 +64,8 @@ config_enum! {
 #[serde(default)]
 pub struct ToolchainConfig {
     pub mode: ToolchainMode,
+    /// Activation of detected mise/asdf declarations in worktree launches.
+    pub mise: MiseConfig,
     /// nixpkgs packages for Python repos (empty ⇒ `["python3", "uv"]`).
     pub python: Vec<String>,
     /// nixpkgs packages for Node repos (empty ⇒ `["nodejs_22"]`).
@@ -177,6 +210,7 @@ mod tests {
     fn config_default_is_all_empty_auto() {
         let tc = ToolchainConfig::default();
         assert_eq!(tc.mode, ToolchainMode::Auto);
+        assert_eq!(tc.mise.inject, MiseInject::Auto);
         assert!(tc.python.is_empty() && tc.node.is_empty() && tc.deno.is_empty());
         assert!(tc.jvm.is_empty() && tc.go.is_empty() && tc.ruby.is_empty());
         assert!(tc.extra.is_empty());
@@ -189,13 +223,32 @@ mod tests {
             mode = "mise"
             python = ["python312"]
             extra = ["just"]
+            [mise]
+            inject = "env"
             "#,
         )
         .unwrap();
         assert_eq!(tc.mode, ToolchainMode::Mise);
         assert_eq!(tc.python, v(&["python312"]));
         assert_eq!(tc.extra, v(&["just"]));
+        assert_eq!(tc.mise.inject, MiseInject::Env);
         assert!(tc.node.is_empty());
+    }
+
+    #[test]
+    fn mise_inject_modes_resolve_trust_without_an_ambient_override() {
+        let policy = |inject, approved| MiseConfig { inject }.activation_policy(approved);
+        assert_eq!(policy(MiseInject::Auto, false), ActivationPolicy::Shims);
+        assert_eq!(
+            policy(MiseInject::Auto, true),
+            ActivationPolicy::Environment
+        );
+        assert_eq!(policy(MiseInject::Shims, true), ActivationPolicy::Shims);
+        assert_eq!(policy(MiseInject::Env, false), ActivationPolicy::Shims);
+        assert_eq!(policy(MiseInject::Env, true), ActivationPolicy::Environment);
+        assert_eq!(policy(MiseInject::Off, true), ActivationPolicy::Off);
+        assert_eq!(MiseInject::default(), MiseInject::Auto);
+        assert!(MiseInject::from_str_validated("bogus").is_err());
     }
 
     #[test]

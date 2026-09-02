@@ -36,6 +36,17 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
     if let Some(kind) = &model.active_placement_kind {
         chips.push(format!("[{kind}]"));
     }
+    if let Some(toolchain) = &model.panel.toolchain {
+        let token = match toolchain.state.as_str() {
+            "ready" | "shims" => "(mise)",
+            "pending-trust" => "(mise ~)",
+            "missing-binary" | "missing-shims" | "missing-tools" | "degraded" => "(mise !)",
+            _ => "",
+        };
+        if !token.is_empty() {
+            chips.push(token.to_string());
+        }
+    }
     chips
 }
 

@@ -42,6 +42,8 @@ pub enum Action {
     CloneOpen,
     /// Open the "Add environment" wizard (`[env.<name>]`).
     NewEnvironment,
+    /// Install the active worktree's declared toolchain off the event loop.
+    InstallToolchain,
     /// Re-run the first-launch setup wizard.
     SetupWizard,
     NewTab,
@@ -547,6 +549,7 @@ impl Action {
             Action::ConnectRoot => "connect-root",
             Action::CloneOpen => "clone-open",
             Action::NewEnvironment => "new-environment",
+            Action::InstallToolchain => "toolchain-install",
             Action::SetupWizard => "setup-wizard",
             Action::DeleteWorkspace => "delete-project",
             Action::NewTerminal => "new-terminal",
@@ -701,6 +704,7 @@ impl Action {
             "connect-root" => Action::ConnectRoot,
             "clone-open" => Action::CloneOpen,
             "new-environment" => Action::NewEnvironment,
+            "toolchain-install" => Action::InstallToolchain,
             "setup-wizard" => Action::SetupWizard,
             "delete-project" | "delete-workspace" => Action::DeleteWorkspace,
             "new-terminal" => Action::NewTerminal,

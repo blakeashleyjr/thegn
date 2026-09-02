@@ -3349,13 +3349,27 @@ pub fn launch_spec_full(
         .then(|| devenv::cached(&repo_root))
         .flatten();
     match (&devshell, outcome.spec.as_mut()) {
-        (Some(dev), Some(spec)) => inject_devshell_sandbox(spec, dev),
+        (Some(_), _) => {}
         // No cache yet — warm it in the background for the next launch.
         (None, _) if cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote => {
             devenv::prewarm(&repo_root);
         }
         _ => {}
     }
+
+    // Toolchain activation is one shared, cache-first composition for host,
+    // sandbox, provider, and daemon launches. The provider call performs no
+    // child-process work here: a cold approved environment schedules a bounded
+    // background refresh and this launch safely receives shims/base instead.
+    let activation = crate::mise_provider::activation_for_launch(
+        cfg,
+        worktree,
+        &repo_root,
+        &loc,
+        &resolved,
+        devshell.as_ref(),
+        db.as_ref(),
+    );
 
     // Pre-warm this worktree's `direnv` cache on the host so the in-sandbox
     // direnv hook replays it read-only instead of failing on the read-only
@@ -3378,6 +3392,9 @@ pub fn launch_spec_full(
     // sessions, so the guard would only reap a shell that is meant to persist.
     if let Some(spec) = outcome.spec.as_mut() {
         spec.daemon_persistent = daemon_persistent;
+        // `compose_spec` snapshots init_script/env_overrides into argv, so the
+        // activation layer must be applied before it builds the wrapper.
+        apply_activation_sandbox(spec, &activation);
     }
 
     // `[[agents]].env` (+ the stage overlay) is applied LAST inside
@@ -3435,12 +3452,11 @@ pub fn launch_spec_full(
         extend_reserving(&mut spec.env, resolved.env_pairs(), agent_env_keys);
         extend_reserving(&mut spec.env, build_env, agent_env_keys);
     }
-    // Host (no-sandbox) devShell injection rides the pane env directly.
-    if outcome.spec.is_none()
-        && !provider_active
-        && let Some(dev) = &devshell
-    {
-        inject_devshell_host(&mut spec, dev);
+    // Apply the same composed activation plan to both launch forms. Sandbox
+    // paths become an init export against the target's own base PATH; host
+    // paths are materialized as one ordinary PATH value.
+    if outcome.spec.is_none() && !provider_active {
+        apply_activation_host(&mut spec, &activation);
     }
     // Record what this launch ACTUALLY enters, for every surface that displays
     // containment. `spec.backend` is argv-derived (see `compose_spec`), so this
@@ -3452,6 +3468,22 @@ pub fn launch_spec_full(
         let _ = db.set_worktree_observed(worktree, &spec.backend); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     Ok(spec)
+}
+
+fn apply_activation_sandbox(
+    spec: &mut sandbox::SandboxSpec,
+    plan: &thegn_core::toolchain_activation::ActivationPlan,
+) {
+    if let Some(path) = plan.path() {
+        let line = format!("export PATH={}:$PATH\n", thegn_core::util::sh_quote(&path));
+        spec.init_script = Some(match spec.init_script.take() {
+            Some(existing) => format!("{line}{existing}"),
+            None => line,
+        });
+    }
+    for (key, value) in plan.env_pairs() {
+        spec.env_overrides.entry(key).or_insert(value);
+    }
 }
 
 /// Append `extra` to a pane env, skipping every key the agent entry declares in
@@ -3512,29 +3544,31 @@ fn reserve_sandbox_overrides(
     overrides.retain(|k, _| !reserved.contains_key(k));
 }
 
-/// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw
-/// `init_script` line — `$PATH` expands to the sandbox's *own* base PATH, so it
-/// works for OCI and bwrap alike without the host knowing the in-sandbox PATH —
-/// and set other safe exported vars as overrides (never clobbering one the user
-/// already pinned).
-fn inject_devshell_sandbox(spec: &mut sandbox::SandboxSpec, dev: &devenv::Devshell) {
-    if let Some(path) = &dev.path {
-        let line = format!("export PATH=\"{path}:$PATH\"\n");
-        spec.init_script = Some(match spec.init_script.take() {
-            Some(existing) => format!("{line}{existing}"),
-            None => line,
-        });
+fn apply_activation_host(
+    spec: &mut LaunchSpec,
+    plan: &thegn_core::toolchain_activation::ActivationPlan,
+) {
+    if let Some(path) = plan.path() {
+        let base = std::env::var("PATH").unwrap_or_default();
+        spec.env.retain(|(key, _)| key != "PATH");
+        let path = if base.is_empty() {
+            path
+        } else {
+            format!("{path}:{base}")
+        };
+        spec.env.push(("PATH".into(), path));
     }
-    for (k, v) in &dev.vars {
-        spec.env_overrides
-            .entry(k.clone())
-            .or_insert_with(|| v.clone());
+    for (key, value) in plan.env_pairs() {
+        if !spec.env.iter().any(|(existing, _)| existing == &key) {
+            spec.env.push((key, value));
+        }
     }
 }
 
-/// Tier A inject for the host (no-sandbox) path: prepend the devShell `PATH` to
-/// the pane env (base = the host's current `PATH`) and add other safe vars that
-/// aren't already set on the spec.
+// Compatibility helper for the focused legacy unit test. Production launches
+// use `apply_activation_host` above so bundle, devshell, and provider values
+// share one composition path.
+#[cfg(test)]
 fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
     if let Some(path) = &dev.path {
         let base = std::env::var("PATH").unwrap_or_default();
@@ -3543,12 +3577,12 @@ fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
         } else {
             format!("{path}:{base}")
         };
-        spec.env.retain(|(k, _)| k != "PATH");
-        spec.env.push(("PATH".to_string(), merged));
+        spec.env.retain(|(key, _)| key != "PATH");
+        spec.env.push(("PATH".into(), merged));
     }
-    for (k, v) in &dev.vars {
-        if !spec.env.iter().any(|(ek, _)| ek == k) {
-            spec.env.push((k.clone(), v.clone()));
+    for (key, value) in &dev.vars {
+        if !spec.env.iter().any(|(existing, _)| existing == key) {
+            spec.env.push((key.clone(), value.clone()));
         }
     }
 }

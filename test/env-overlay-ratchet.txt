@@ -448,6 +448,7 @@ toolchain.extra
 toolchain.go
 toolchain.jvm
 toolchain.mode
+toolchain.mise.inject
 toolchain.node
 toolchain.python
 toolchain.ruby
