@@ -14,11 +14,11 @@
 /// drift test accounts for it.
 pub const GROUPS: &[(&str, &[&str])] = &[
     (
-        "Workspace",
+        "Projects & worktrees",
         &[
             "wt",
             "repo",
-            "project",
+            "program",
             "open",
             "map",
             "land",

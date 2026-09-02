@@ -19,14 +19,26 @@ and JSON; if multiple readable candidates exist, thegn warns which path won
 and which paths were ignored.
 
 CI autofix is only permitted in trusted user configuration:
-`[workspace.<slug>.ci] mode = "suggest"` or `"auto"`; a repo-authored file
+`[project.<slug>.ci] mode = "suggest"` or `"auto"`; a repo-authored file
 cannot enable it.
 
-`[workspace.<slug>]` in your own config refines settings for one repo —
-including `[workspace.<slug>.merge_queue]` and
-`[workspace.<slug>.pr_queue]`, which is where a repo whose gate,
+`[project.<slug>]` in your own config refines settings for one repo —
+including `[project.<slug>.merge_queue]` and
+`[project.<slug>.pr_queue]`, which is where a repo whose gate,
 integration branch, or review rules differ from your defaults belongs. `thegn
 config explain <key>`, run inside the repo, names the layer that won.
+
+The canonical root for repositories is `projects_dir`; the former
+`workspaces_dir` spelling remains accepted for three stable releases. The
+same compatibility window applies to `[workspace.<slug>]`,
+`confirm_delete_workspace`, `sidebar_workspace_sort`, and
+`THEGN_WORKSPACES_DIR`; their replacements are `[project.<slug>]`,
+`confirm_delete_project`, `sidebar_project_sort`, and
+`THEGN_PROJECTS_DIR`. When both spellings are present, the canonical value
+wins and validation reports both exact keys. Legacy values are accepted and
+warned about, but canonical writes and generated references emit only the
+project spellings. Tracker-owned `workspace_id`, `workspace_slug`, and
+`project_id` keys are unrelated and remain unchanged.
 
 The file is watched: edits apply live, no restart.
 

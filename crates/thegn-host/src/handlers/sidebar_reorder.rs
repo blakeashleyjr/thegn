@@ -571,7 +571,7 @@ impl SidebarState {
         // would be silently reverted on the next config reload.
         if self.view.workspace_sort == thegn_core::config::WorkspaceSort::Attention {
             model.status =
-                "Workspace order is by attention — set [ui] sidebar_workspace_sort = \"manual\" to reorder"
+                "Project order is by attention — set [ui] sidebar_project_sort = \"manual\" to reorder"
                     .into();
             return false;
         }
@@ -584,7 +584,7 @@ impl SidebarState {
             .zip(&target)
             .any(|(a, b)| a != b && (pinned(a) || pinned(b)))
         {
-            model.status = "Pinned workspaces stay on top — unpin to reorder".into();
+            model.status = "Pinned projects stay on top — unpin to reorder".into();
             return false;
         }
 
@@ -699,7 +699,7 @@ impl SidebarState {
                     .map(|r| r.workspace_slug.clone())
                     .collect();
                 if slugs.len() > 1 {
-                    model.status = "Can't move a selection across workspaces".into();
+                    model.status = "Can't move a selection across projects".into();
                     return false;
                 }
                 let Some(slug) = slugs.into_iter().next() else {
@@ -1140,7 +1140,7 @@ mod tests {
         sb.sync(&mut model);
 
         assert!(!sb.reorder_selection(&mut model, &mut session, true));
-        assert!(model.status.contains("across workspaces"));
+        assert!(model.status.contains("across projects"));
         assert_eq!(
             names(&session),
             vec!["app/home", "app/a", "lib/home", "lib/x"],

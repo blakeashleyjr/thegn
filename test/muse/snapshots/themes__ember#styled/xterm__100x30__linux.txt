@@ -20,7 +20,7 @@ R0 94 5 fg=#b5a697 bg=#261f1b attrs=
 R0 99 1 fg=#f0e6dc bg=#261f1b attrs=
 L1|────────────────────────────────────────────────────────────────────────────────────────────────────
 R1 0 100 fg=#6a584b bg=#261f1b attrs=
-L2| WORKSPACES                       REPO ▸ home   1        git  work  system
+L2| PROJECTS                       REPO ▸ home   1        git  work  system
 R2 0 11 fg=#f0e6dc bg=#261f1b attrs=BOLD
 R2 11 21 fg=default bg=#261f1b attrs=
 R2 32 2 fg=default bg=#181412 attrs=

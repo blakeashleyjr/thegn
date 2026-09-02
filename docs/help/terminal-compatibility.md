@@ -129,7 +129,7 @@ correctly, so it is the one thegn relies on.
 
 Two chord families depend on it:
 
-- `Ctrl-1..9` — jump to a workspace ([[workspaces-and-worktrees]]).
+- `Ctrl-1..9` — jump to a project ([[workspaces-and-worktrees]]).
 - `Ctrl-Alt-1..9` — launch or focus a pinned program ([[drawer-and-corner]]).
 
 `Alt-1..9` (jump to a worktree) does **not** — `Alt` has a legacy encoding
@@ -169,7 +169,7 @@ The broken state prints the remedy next to it. **Unknown always means
 said no, so nothing is taken away.
 
 When the answer is a definite no, the [[sidebar]] stops painting the
-`Ctrl-<digit>` workspace hints. The digits do not renumber and the layout
+`Ctrl-<digit>` project hints. The digits do not renumber and the layout
 does not shift; thegn just stops advertising a chord your terminal cannot
 send. Everything else is unaffected — `Alt-<digit>`, the arrows, `Alt-o`,
 and the [[command-palette]] all reach the same actions.
@@ -186,16 +186,16 @@ set -as terminal-features '*:extkeys'
 ```
 
 **Otherwise**, use a terminal that supports `modifyOtherKeys` level 2, or
-rebind the family to chords your terminal can send. The workspace and pin
+rebind the family to chords your terminal can send. The project and pin
 actions are ordinary bindable ids:
 
 ```toml
 [keybinds]
-summon-workspace-1 = "Ctrl Alt q"
+summon-project-1 = "Ctrl Alt q"
 summon-pin-1 = "Alt Shift p"
 ```
 
-`summon-workspace-1` … `-9` and `summon-pin-1` … `-9` are all bindable; see
+`summon-project-1` … `-9` and `summon-pin-1` … `-9` are all bindable; see
 [[keybindings]] for the full list and [[config-reference]] for the
 `[keybinds]` section.
 

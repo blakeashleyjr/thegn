@@ -296,7 +296,7 @@ pub const SIDEBAR_KEYS: &[SidebarKey] = &[
         SidebarKeyId::NewWorkspace,
         &[KeyCode::Char('N')],
         "N",
-        "new workspace",
+        "new project",
         HintTier::Full,
     ),
     k(
@@ -424,7 +424,7 @@ pub fn footer_hints(
     let mut out = Vec::new();
     for (id, label) in [
         ("summon-worktree-1", "jump worktree"),
-        ("summon-workspace-1", "jump workspace"),
+        ("summon-project-1", "jump project"),
     ] {
         if let Some(chord) = crate::keymap::chord_hint_for(cfg, id) {
             if ctrl_digits_reportable == Some(false) && needs_modified_key_reporting(&chord) {
@@ -646,12 +646,12 @@ mod tests {
         };
         for keep in [None, Some(true)] {
             let l = labels(keep);
-            assert!(l.iter().any(|l| l == "jump workspace"), "{keep:?}: {l:?}");
+            assert!(l.iter().any(|l| l == "jump project"), "{keep:?}: {l:?}");
             assert!(l.iter().any(|l| l == "jump worktree"), "{keep:?}: {l:?}");
         }
         let dead = labels(Some(false));
         assert!(
-            !dead.iter().any(|l| l == "jump workspace"),
+            !dead.iter().any(|l| l == "jump project"),
             "Ctrl-1-9 must not be advertised: {dead:?}"
         );
         // Alt has a legacy encoding — the worktree row is never affected.
@@ -665,10 +665,10 @@ mod tests {
     fn a_rebound_workspace_family_is_never_suppressed() {
         let mut cfg = thegn_core::config::Config::default();
         cfg.keybinds
-            .insert("summon-workspace-1".to_string(), "Ctrl Alt q".to_string());
+            .insert("summon-project-1".to_string(), "Ctrl Alt q".to_string());
         let rows = footer_hints(&cfg, Some(false));
         assert!(
-            rows.iter().any(|(_, l)| l == "jump workspace"),
+            rows.iter().any(|(_, l)| l == "jump project"),
             "a rebound family still works: {rows:?}"
         );
     }

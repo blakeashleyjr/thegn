@@ -339,11 +339,45 @@ pub const CATALOG: &[Slot] = &[
     slot("autopilot status", "repo", SourceKind::Repo),
     slot("config explain", "repo", SourceKind::Repo),
     slot("open", "repo", SourceKind::Repo),
-    slot("project assign", "repo", SourceKind::Repo),
+    // `program` is the canonical spelling; clap's visible `project` alias
+    // resolves to the same command tree, so one canonical path covers both.
+    slot("program assign", "repo", SourceKind::Repo),
     slot("repo trust", "path", SourceKind::Repo),
     // The hidden legacy top-level alias of `repo trust`.
     slot("repo-trust", "path", SourceKind::Repo),
     slot("wt new", "repo", SourceKind::Repo),
+    // Program names are existing DB-backed groups, while `wt new --program`
+    // selects one for the cross-repo operation.
+    slot(
+        "program assign",
+        "project",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "program create",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "program rename",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "program rename",
+        "new_name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "program rm",
+        "name",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    slot(
+        "wt new",
+        "program",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
     slot("zone assign", "repo", SourceKind::Repo),
     // --- session ----------------------------------------------------------
     slot("attach", "session", SourceKind::Session),

@@ -232,7 +232,7 @@ mod tests {
         let b = collect(&Config::default());
         let row = b
             .iter()
-            .find(|x| x.id == "delete-workspace")
+            .find(|x| x.id == "delete-project")
             .expect("chordless host spec listed");
         assert!(row.palette_only(), "no default chord: {row:?}");
     }

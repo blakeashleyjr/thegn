@@ -15103,7 +15103,7 @@ async fn event_loop<T: Terminal>(
                             let kind = host_input.take().map(|(_, k)| k);
                             model.status = match kind {
                                 Some(HostInputKind::AddHost) => "add host cancelled".into(),
-                                _ => "workspace creation cancelled".into(),
+                                _ => "project creation cancelled".into(),
                             };
                         }
                         menu::InputOutcome::Submit(text) => {
@@ -21515,7 +21515,7 @@ async fn event_loop<T: Terminal>(
                                         p.start_manual(path.clone());
                                         workspace_picker = Some(p);
                                         model.status = format!(
-                                            "{path} is not a registered workspace — Enter adds it"
+                                            "{path} is not a registered project — Enter adds it"
                                         );
                                     }
                                     None => {
@@ -21563,13 +21563,14 @@ async fn event_loop<T: Terminal>(
                                 workspace_picker = Some(p);
                                 model.status = crate::i18n_surface::status(
                                     crate::i18n_surface::StatusText::NewWorkspacePrompt,
-                                );
+                                )
+                                .replace("workspace", "project");
                             }
                             Action::DeleteWorkspace => {
                                 // Remove the *active* workspace. Same modal + path
                                 // as the sidebar "Remove workspace" action.
                                 if session.id.is_empty() {
-                                    model.status = "No workspace to delete".into();
+                                    model.status = "No project to delete".into();
                                     dirty = true;
                                     continue;
                                 }
