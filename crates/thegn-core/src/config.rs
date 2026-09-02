@@ -2340,6 +2340,10 @@ pub struct WorkspaceConfig {
     /// conventions are repository facts, exactly like the merge queue's gate.
     #[serde(skip_serializing_if = "PrQueueOverlay::is_empty")]
     pub pr_queue: PrQueueOverlay,
+    /// Trusted per-repo CI autofix policy (`[workspace.<slug>.ci]`).
+    /// Repo-authored `.thegn.*` files cannot set this field.
+    #[serde(skip_serializing_if = "CiAutofixOverlay::is_empty")]
+    pub ci: CiAutofixOverlay,
     /// Trusted per-repo issue autopilot policy (`[workspace.<slug>.autopilot]`).
     /// This is the only repo-scoped layer allowed to enable the supervisor.
     #[serde(skip_serializing_if = "AutopilotOverlay::is_empty")]
@@ -3265,7 +3269,9 @@ impl Default for PrConfig {
 
 // The `[ci]` provider config family lives in the `config_ci` sibling module
 // (kept flat); re-exported so `crate::config::*` paths are unchanged.
-pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
+pub use crate::config_ci::{
+    CiAutofixConfig, CiAutofixMode, CiAutofixOverlay, CiConfig, CiProviderKind, GitLabCiConfig,
+};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
 // The `[[presets]]` launch-configuration family lives in `config_presets` to
@@ -6455,6 +6461,19 @@ impl Config {
             ws.pr_queue.clone().apply(&mut pq);
         }
         pq
+    }
+
+    /// The effective CI config for a repo: global `[ci]`, with only the
+    /// trusted workspace autofix mode overlaid. Untrusted repo files cannot
+    /// enable or widen this policy.
+    pub fn repo_ci(&self, repo_root: &Path) -> CiConfig {
+        let mut ci = self.ci.clone();
+        if !self.workspace.is_empty()
+            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+        {
+            ws.ci.apply(&mut ci.autofix);
+        }
+        ci
     }
 
     /// Effective issue-autopilot policy for a repo.  A repo-root overlay is

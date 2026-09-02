@@ -5131,10 +5131,7 @@ pub(crate) fn spawn_worktree_shell_pane(
             // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
             // relay). A normal local PTY pane.
             if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.to_str().map(str::to_string))
-                    .unwrap_or_else(|| "thegn".to_string());
+                let exe = thegn_core::util::self_exe_str();
                 let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
                 return panes.spawn_argv_env(&argv, Some(dir), &[], center);
             }
@@ -8021,7 +8018,7 @@ async fn event_loop<T: Terminal>(
             // coalesced by the [ci] ttl guard, not a per-keystroke cost.
             crate::ci_refresh::spawn_ci_cache_refresh(
                 session.clone_for_hydrate(),
-                current_config.ci.clone(),
+                current_config.clone(),
                 Some(waker.clone()),
                 false, // on-switch backstop: respect the ttl guard
             );
@@ -11394,7 +11391,7 @@ async fn event_loop<T: Terminal>(
         if want_ci_refresh {
             crate::ci_refresh::on_ci_tick(
                 &session,
-                &current_config.ci,
+                &current_config,
                 &refresh_tx,
                 &waker,
                 ci_refresh_force,
@@ -16624,10 +16621,7 @@ async fn event_loop<T: Terminal>(
                                     if name == thegn_core::profile::name() {
                                         model.status = format!("Already on profile {name}");
                                     } else {
-                                        let exe = std::env::current_exe()
-                                            .ok()
-                                            .and_then(|p| p.to_str().map(str::to_string))
-                                            .unwrap_or_else(|| "thegn".to_string());
+                                        let exe = thegn_core::util::self_exe_str();
                                         match thegn_core::profile::launch_window_argv(
                                             None, &exe, name,
                                         ) {
@@ -17906,7 +17900,8 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Ci => {
-                                            // Enter drills into the selected run (`ci view`).
+                                            // Enter drills into the selected run in-place;
+                                            // detail/log work stays off the compositor.
                                             CiActionCtx {
                                                 session: &mut session,
                                                 panes: &mut panes,
@@ -17919,7 +17914,7 @@ async fn event_loop<T: Terminal>(
                                                 refresh_tx: &refresh_tx,
                                                 waker: &waker,
                                             }
-                                            .open_view_at(panel_ui.cursor);
+                                            .open_view_at(panel_ui.cursor, &mut bar_detail);
                                         }
                                         Section::Media => {
                                             // Enter selects a source or queue row;
@@ -19180,7 +19175,11 @@ async fn event_loop<T: Terminal>(
                                 refresh_tx: &refresh_tx,
                                 waker: &waker,
                             }
-                            .panel_key(key, panel_ui.cursor)
+                            .panel_key(
+                                key,
+                                panel_ui.cursor,
+                                &mut bar_detail,
+                            )
                         }
                         // -- merge queue: add (a/A), remove (x), land (l),
                         // retry (r), clear landed (c), drain (D). Mutations run

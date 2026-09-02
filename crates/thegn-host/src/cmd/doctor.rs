@@ -1280,12 +1280,21 @@ fn build_parity_lines() {
         }
         None => outln!("  schema        (no database yet) build v{build}"),
     }
-    let cli = std::env::current_exe().ok();
+    let cli = thegn_core::util::self_exe_path();
     outln!(
-        "  cli binary    {}",
+        "  cli binary    {}{}",
         cli.as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(unknown)".into())
+            .unwrap_or_else(|| "(unknown)".into()),
+        // A binary rebuilt out from under a live process is the root cause of
+        // several unrelated-looking failures at once — self-spawn ENOENT, a
+        // refused schema migration, a THEGN_BIN no worker can run — so name the
+        // condition here rather than leave each symptom to be diagnosed alone.
+        if thegn_core::util::self_exe_is_stale() {
+            "  (stale: rebuilt or removed since launch — restart thegn)"
+        } else {
+            ""
+        }
     );
     // Every registered daemon's actual executable — a daemon still running an
     // older build is invisible in its reported version but obvious here.

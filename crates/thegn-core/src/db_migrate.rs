@@ -837,6 +837,36 @@ pub(crate) fn migrate_v66(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v67: bounded CI log tails plus an intent marker for deduplicated autofix
+/// handoffs. Both are cache-side and additive.
+pub(crate) fn migrate_v67(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ci_log_cache (
+           worktree   TEXT NOT NULL,
+           run_id     TEXT NOT NULL,
+           job_id     TEXT NOT NULL,
+           job_name   TEXT NOT NULL,
+           head_sha   TEXT NOT NULL DEFAULT '',
+           text       TEXT NOT NULL,
+           truncated  INTEGER NOT NULL DEFAULT 0,
+           redacted   INTEGER NOT NULL DEFAULT 1,
+           fetched_at INTEGER NOT NULL,
+           PRIMARY KEY (worktree, run_id, job_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_ci_log_cache_worktree
+           ON ci_log_cache(worktree, fetched_at);
+         CREATE TABLE IF NOT EXISTS ci_autofix_dedupe (
+           worktree   TEXT NOT NULL,
+           run_id     TEXT NOT NULL,
+           job_id     TEXT NOT NULL,
+           head_sha   TEXT NOT NULL,
+           claimed_at INTEGER NOT NULL,
+           PRIMARY KEY (worktree, run_id, job_id, head_sha)
+         );",
+    )?;
+    Ok(())
+}
+
 /// Does `table` have a column named `col`? The probe for migrations that can't
 /// be expressed as an idempotent `ALTER` (a primary-key change forces a
 /// rebuild-and-copy, which must run exactly once). Returns false when the table
@@ -881,6 +911,39 @@ pub(crate) fn verify_v61_schema(conn: &Connection) -> Result<()> {
         .optional()?;
     if notes_index.is_none() {
         anyhow::bail!("schema v61 migration did not create the dispatch notes index");
+    }
+    Ok(())
+}
+
+/// Verify the v62 cache tables before `user_version` is stamped. This keeps a
+/// swallowed best-effort DDL failure from making a partial upgrade look done.
+pub(crate) fn verify_v67_schema(conn: &Connection) -> Result<()> {
+    verify_v61_schema(conn)?;
+    for table in ["ci_log_cache", "ci_autofix_dedupe"] {
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if kind.as_deref() != Some("table") {
+            anyhow::bail!("schema v67 migration did not create {table}");
+        }
+    }
+    conn.prepare("SELECT worktree, run_id, job_id, job_name, head_sha, text, truncated, redacted, fetched_at FROM ci_log_cache LIMIT 0")?;
+    conn.prepare(
+        "SELECT worktree, run_id, job_id, head_sha, claimed_at FROM ci_autofix_dedupe LIMIT 0",
+    )?;
+    let index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ci_log_cache_worktree'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if index.is_none() {
+        anyhow::bail!("schema v67 migration did not create the CI log index");
     }
     Ok(())
 }
@@ -1668,6 +1731,39 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_v67_db_gains_ci_log_tables_without_resetting_run_cache() {
+        use crate::store::CacheStore;
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v67-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ci_runs_cache (
+                   worktree TEXT PRIMARY KEY, branch TEXT, json TEXT, fetched_at INTEGER
+                 );
+                 INSERT INTO ci_runs_cache VALUES ('/wt/old','main','[]',42);
+                 PRAGMA user_version = 66;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let old = db.get_ci_cache("/wt/old").unwrap().unwrap();
+        assert_eq!(old, ("[]".into(), 42));
+        let entry =
+            crate::ci_log::CiLogEntry::new("/wt/old", "run", "job", "tests", "ok\n", 10, 1024, 7);
+        db.put_ci_log(&entry).unwrap();
+        assert!(db.get_ci_log("/wt/old", "run", "job").unwrap().is_some());
+        let version: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

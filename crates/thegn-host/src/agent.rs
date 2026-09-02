@@ -1997,9 +1997,7 @@ pub fn provision_provider_env_named(
                 // it must not abort provisioning, so warn + continue.
                 match sprite_ssh_connect(cfg, worktree) {
                     Some((key, user, _workdir)) => {
-                        let exe = std::env::current_exe()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| "thegn".into());
+                        let exe = thegn_core::util::self_exe_str();
                         if let Err(e) = push_home_closure_p2p(&exe, worktree, &key, &user, roots) {
                             thegn_core::msg::warn(&format!(
                                 "host-parity p2p: pushing the home closure to the sandbox \
@@ -2911,7 +2909,13 @@ pub fn compose_spec(
     // every pipeline worker's `thegn dispatch report <row>` — the one call that
     // closes its row — failed with `unrecognized subcommand`. That is
     // indistinguishable from a crashed worker and is how rows pile up unclosable.
-    if let Ok(exe) = std::env::current_exe() {
+    // `self_exe_path`, not `current_exe`: after a rebuild-in-place the latter
+    // reads back `<path> (deleted)`, and a worker inheriting THAT gets a
+    // THEGN_BIN whose every call fails with "No such file or directory" — the
+    // same unclosable-row signature as the stale-copy case above. It must stay
+    // an on-disk path the worker can resolve itself (never `/proc/self/exe`,
+    // which would name the worker's own binary).
+    if let Some(exe) = thegn_core::util::self_exe_path() {
         env.push(("THEGN_BIN".to_string(), exe.to_string_lossy().into_owned()));
     }
     // Match the build's parallelism to the pane's OWN ceiling. `CARGO_BUILD_JOBS`

@@ -361,6 +361,18 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Cached PR status for a worktree",
     ),
+    cap(
+        "ci.runs",
+        Verb::CiRuns,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Cached CI run and job metadata for a worktree",
+    ),
+    cap(
+        "ci.logs",
+        Verb::CiLogs,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli, Surface::Mcp]),
+        "Bounded, redacted cached CI job logs",
+    ),
     // --- calendar / notifications -------------------------------------------
     cap(
         "calendar.events",
