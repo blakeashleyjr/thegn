@@ -108,6 +108,53 @@ impl WorkspacePool {
         self.parked.remove(idx).map(|(_, rw)| rw)
     }
 
+    /// Remove and return the parked **terminal** group named `name`, with the
+    /// key of the workspace that was holding it.
+    ///
+    /// A terminal's identity is global — the `terminals` table is not scoped to
+    /// a repo, so its sidebar row renders in every workspace — but until now its
+    /// *residency* was per-workspace: the group lived in whichever session
+    /// created it and parked with that session on a switch. Activating the row
+    /// from another workspace therefore missed
+    /// (`sidebar::build_rows`' `position(|w| w.name == t.name)` only sees the
+    /// ACTIVE session) and forked a second group with an empty `pane_sessions`,
+    /// which materialized as a brand-new shell while the original stayed alive
+    /// and unreachable in the parked trees. Migrating the group instead keeps
+    /// one terminal = one shell: its `PtyPane`s are already live in the global
+    /// table under these same ids, so the move alone restores it — no
+    /// materialize, no respawn, scrollback intact.
+    ///
+    /// Worktree groups are never migrated: they belong to their repo, and the
+    /// `Workspace` row target switches to that workspace instead.
+    pub(crate) fn take_terminal_group(
+        &mut self,
+        name: &str,
+    ) -> Option<(String, crate::session::WorktreeGroup)> {
+        let (pi, gi) = self.parked.iter().enumerate().find_map(|(pi, (_, rw))| {
+            rw.worktrees
+                .iter()
+                .position(|g| g.name == name && g.kind == crate::session::GroupKind::Terminal)
+                .map(|gi| (pi, gi))
+        })?;
+        let (key, rw) = self.parked.get_mut(pi)?;
+        let key = key.clone();
+        let group = rw.worktrees.remove(gi);
+        // `active` is an INDEX into the vec we just shortened: a group removed
+        // at or before it shifts every later group down one, so replaying the
+        // old index would land the user on their neighbour on the next visit.
+        if gi < rw.active {
+            rw.active -= 1;
+        }
+        rw.active = rw.active.min(rw.worktrees.len().saturating_sub(1));
+        // A workspace whose only group was this terminal has nothing left to
+        // park; leaving the empty shell behind would make `contains` claim it is
+        // resident and a warm switch restore a session with no groups.
+        if rw.worktrees.is_empty() {
+            self.parked.remove(pi);
+        }
+        Some((key, group))
+    }
+
     /// Park `rw` under `repo`, enforcing the configured limit. A limit of 0
     /// detaches the workspace's panes immediately (no pooling); an unset limit
     /// (`None`) keeps every entry (unbounded); otherwise the least-recently
@@ -146,46 +193,59 @@ impl WorkspacePool {
 /// `materialize_with_specs` then spawns real panes over these placeholders.
 pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
     for g in &mut session.worktrees {
-        for tab in &mut g.tabs {
-            let mut uniq = tab.center.pane_ids();
-            uniq.sort_unstable();
-            uniq.dedup();
-            if uniq.is_empty() {
-                continue;
-            }
-            let base = panes.reserve_ids(uniq.len() as u32);
-            let map: std::collections::HashMap<u32, u32> = uniq
-                .iter()
-                .enumerate()
-                .map(|(i, &old)| (old, base + i as u32))
-                .collect();
+        remap_group_ids(g, panes);
+    }
+}
 
-            tab.center
-                .remap(&mut |id| map.get(&id).copied().unwrap_or(id));
-            tab.focused_pane = map
-                .get(&tab.focused_pane)
-                .copied()
-                .unwrap_or(tab.focused_pane);
-            tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
-                .into_iter()
-                .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))
-                .collect();
-            tab.pane_cmds = std::mem::take(&mut tab.pane_cmds)
-                .into_iter()
-                .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
-                .collect();
-            tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
-                .into_iter()
-                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
-                .collect();
-            // Scrollback is keyed by pane id too; without this remap the
-            // persisted scrollback stays under the OLD id and is lost when the
-            // resurrected pane reads it under its new id (data loss on the
-            // cold-workspace id-collision-avoidance path).
-            tab.pane_scrollback = std::mem::take(&mut tab.pane_scrollback)
-                .into_iter()
-                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
-                .collect();
+/// Move ONE group's persisted pane ids onto a fresh disjoint range (the
+/// per-group body of [`remap_cold_workspace_ids`], shared with the cold
+/// terminal restore in `handlers::sidebar_activate`).
+///
+/// All four id-keyed side maps travel with the tree. That is the whole point:
+/// `pane_sessions` is what `materialize_with_specs` reads to warm-reattach a
+/// live daemon session instead of forking a fresh shell, and `pane_scrollback`
+/// is what repaints the tail when the reattach can't be had — leaving either
+/// under the OLD key silently downgrades a restore into a blank new terminal.
+pub(crate) fn remap_group_ids(g: &mut crate::session::WorktreeGroup, panes: &mut Panes) {
+    for tab in &mut g.tabs {
+        let mut uniq = tab.center.pane_ids();
+        uniq.sort_unstable();
+        uniq.dedup();
+        if uniq.is_empty() {
+            continue;
         }
+        let base = panes.reserve_ids(uniq.len() as u32);
+        let map: std::collections::HashMap<u32, u32> = uniq
+            .iter()
+            .enumerate()
+            .map(|(i, &old)| (old, base + i as u32))
+            .collect();
+
+        tab.center
+            .remap(&mut |id| map.get(&id).copied().unwrap_or(id));
+        tab.focused_pane = map
+            .get(&tab.focused_pane)
+            .copied()
+            .unwrap_or(tab.focused_pane);
+        tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
+            .into_iter()
+            .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))
+            .collect();
+        tab.pane_cmds = std::mem::take(&mut tab.pane_cmds)
+            .into_iter()
+            .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
+            .collect();
+        tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
+            .into_iter()
+            .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
+            .collect();
+        // Scrollback is keyed by pane id too; without this remap the
+        // persisted scrollback stays under the OLD id and is lost when the
+        // resurrected pane reads it under its new id (data loss on the
+        // cold-workspace id-collision-avoidance path).
+        tab.pane_scrollback = std::mem::take(&mut tab.pane_scrollback)
+            .into_iter()
+            .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
+            .collect();
     }
 }

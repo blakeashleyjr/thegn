@@ -919,6 +919,89 @@ impl WorkspaceStore for Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// The persisted group row and tabs of the TERMINAL group `name`, plus the
+    /// session that last held them — `None` when no session ever persisted it.
+    ///
+    /// Terminals are workspace-independent (the `terminals` registry is global
+    /// and its sidebar row renders in every workspace), but their layout rows
+    /// are keyed by whichever session was active when they were last persisted.
+    /// Re-opening a terminal from a different workspace has to find that row
+    /// wherever it landed, or the restore has no `pane_sessions` to warm-reattach
+    /// with and silently forks a fresh shell. Terminal names are unique in the
+    /// `terminals` table, so the lookup is unambiguous; the `kind` filter keeps a
+    /// same-named worktree group from ever answering.
+    ///
+    /// The session name comes back so the caller can delete the donor rows once
+    /// the group has moved — two sessions both claiming one terminal is how a
+    /// cold resurrect would resurrect a phantom duplicate.
+    #[allow(clippy::type_complexity)]
+    fn terminal_group_tabs(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<(
+            String,
+            crate::models::TabGroupRow,
+            Vec<crate::models::GroupTabRow>,
+        )>,
+    > {
+        let mut stmt = self.conn().prepare(
+            "SELECT t.session_name, g.ordinal, g.active_tab,
+                    t.group_name, t.ordinal, t.title, t.pane_tree,
+                    t.focused_pane, t.pane_cwds, t.pane_cmds, t.pane_sessions,
+                    t.scrollback_snapshot
+               FROM group_tabs t
+               JOIN tab_groups g
+                 ON g.session_name = t.session_name AND g.name = t.group_name
+              WHERE g.kind = 'terminal' AND g.name = ?1
+              ORDER BY t.session_name, t.ordinal",
+        )?;
+        let rows = stmt.query_map(params![name], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                crate::models::GroupTabRow {
+                    group_name: r.get(3)?,
+                    ordinal: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    title: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    pane_tree: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    focused_pane: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    pane_cwds: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                    pane_cmds: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    pane_sessions: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    scrollback_snapshot: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                },
+            ))
+        })?;
+        // A terminal belongs to exactly one session, but a crash between the
+        // migration's write and its donor delete could leave two. Keep the first
+        // session's tabs whole rather than interleaving two layouts into one
+        // group — the ORDER BY makes that choice deterministic.
+        let mut owner: Option<(String, crate::models::TabGroupRow)> = None;
+        let mut tabs = Vec::new();
+        for (session, ordinal, active_tab, row) in rows.filter_map(|r| r.ok()) {
+            match &owner {
+                Some((s, _)) if *s != session => break,
+                Some(_) => tabs.push(row),
+                None => {
+                    owner = Some((
+                        session,
+                        crate::models::TabGroupRow {
+                            name: name.to_string(),
+                            kind: "terminal".to_string(),
+                            worktree: String::new(),
+                            ordinal,
+                            active_tab,
+                        },
+                    ));
+                    tabs.push(row);
+                }
+            }
+        }
+        Ok(owner.map(|(s, g)| (s, g, tabs)))
+    }
+
     /// Forget one worktree group and its tabs (on worktree close).
     fn delete_tab_group(&self, session: &str, name: &str) -> Result<()> {
         self.conn().execute(
@@ -1536,6 +1619,99 @@ mod tests {
         let stamps = db.all_worktree_disk_stamps().unwrap();
         let (_, _, at) = db.get_worktree_disk("/wt/a").unwrap().unwrap();
         assert_eq!(stamps.get("/wt/a"), Some(&at));
+    }
+
+    /// A terminal's layout row is keyed by whatever session was active when it
+    /// was persisted, so re-opening it from ANOTHER project has to find that row
+    /// wherever it landed — that lookup is what carries `pane_sessions` into the
+    /// restore and turns a fresh shell back into a reattach.
+    #[test]
+    fn terminal_group_tabs_finds_the_row_from_another_session() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        db.put_tab_group(
+            "/repo/a",
+            &TabGroupRow {
+                name: "prod".into(),
+                kind: "terminal".into(),
+                worktree: String::new(),
+                ordinal: 3,
+                active_tab: 1,
+            },
+        )
+        .unwrap();
+        for (ordinal, sessions) in [
+            (
+                0i64,
+                r#"{"1":{"provider":"daemon","id":"local","session":"s-a"}}"#,
+            ),
+            (1, ""),
+        ] {
+            db.put_group_tab(
+                "/repo/a",
+                &GroupTabRow {
+                    group_name: "prod".into(),
+                    ordinal,
+                    title: "main".into(),
+                    pane_tree: "1".into(),
+                    focused_pane: 1,
+                    pane_cwds: String::new(),
+                    pane_cmds: String::new(),
+                    pane_sessions: sessions.into(),
+                    scrollback_snapshot: String::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let (session, group, tabs) = db
+            .terminal_group_tabs("prod")
+            .unwrap()
+            .expect("the row is found from any session");
+        assert_eq!(session, "/repo/a", "the donor is named for the delete");
+        assert_eq!(group.active_tab, 1, "the remembered tab comes back too");
+        assert_eq!(tabs.len(), 2, "every tab, in order");
+        assert!(
+            tabs[0].pane_sessions.contains("s-a"),
+            "the daemon session survives the lookup"
+        );
+    }
+
+    /// A same-named WORKTREE group must never answer a terminal lookup: it would
+    /// hand a terminal another group's pane tree.
+    #[test]
+    fn terminal_group_tabs_ignores_a_same_named_worktree_group() {
+        use crate::models::{GroupTabRow, TabGroupRow};
+        let db = Db::open_memory().unwrap();
+        db.put_tab_group(
+            "/repo/a",
+            &TabGroupRow {
+                name: "prod".into(),
+                kind: "branch".into(),
+                worktree: "/wt/prod".into(),
+                ordinal: 0,
+                active_tab: 0,
+            },
+        )
+        .unwrap();
+        db.put_group_tab(
+            "/repo/a",
+            &GroupTabRow {
+                group_name: "prod".into(),
+                ordinal: 0,
+                title: "1".into(),
+                pane_tree: "1".into(),
+                focused_pane: 1,
+                pane_cwds: String::new(),
+                pane_cmds: String::new(),
+                pane_sessions: String::new(),
+                scrollback_snapshot: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(db.terminal_group_tabs("prod").unwrap().is_none());
+        assert!(db.terminal_group_tabs("never-persisted").unwrap().is_none());
     }
 
     #[test]

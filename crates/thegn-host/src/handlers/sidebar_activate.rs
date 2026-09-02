@@ -50,11 +50,33 @@ pub(crate) fn activate_row_target(
             pure_focus = true;
         }
         // A terminal row uses the sentinel repo_path "terminal" when its group
-        // isn't resident in the session yet (a terminal declared in the global
-        // `terminals` table — e.g. the auto-provisioned default — that this
-        // session has never opened). Switch to the existing group if present,
-        // else materialize a fresh Terminal group; its pane spawns lazily via
-        // the materialize path, which resolves the connection by name.
+        // isn't resident in the ACTIVE session (a terminal declared in the
+        // global `terminals` table that this session has never opened — or, far
+        // more often, one this session parked when the user switched projects).
+        //
+        // Terminals are workspace-independent: the registry is global, so the
+        // row renders in every project. Residency has to follow, or the same
+        // terminal ends up with one group per project. This arm therefore
+        // REUNITES the row with its shell before it will ever fork a new one:
+        //
+        //   1. resident here          → focus it (its remembered tab, not 0);
+        //   2. parked in another      → migrate the live group across; its
+        //      project's pool           `PtyPane`s are already in the global
+        //                               table under these very ids, so the move
+        //                               alone restores the running shell — no
+        //                               missing leaf, no materialize, no respawn;
+        //   3. persisted somewhere    → rebuild from that layout so the
+        //                               materialize path warm-reattaches its
+        //                               daemon session (or at least repaints the
+        //                               scrollback tail) instead of forking;
+        //   4. never opened           → a fresh placeholder leaf, spawned lazily
+        //                               by the materialize path, which resolves
+        //                               the connection by name.
+        //
+        // Only (4) is a new shell. Before this ladder existed, (2) and (3) both
+        // fell through to it — which is why working in a terminal, switching
+        // project and coming back handed you a brand-new shell while the
+        // original kept running, invisible, in the pane daemon.
         crate::sidebar::RowTarget::Workspace { repo_path, group } if repo_path == "terminal" => {
             let Some(name) = group else {
                 return false;
@@ -64,24 +86,24 @@ pub(crate) fn activate_row_target(
             // patch — which only retargets `RowTarget::Tab` rows — couldn't
             // move the active highlight onto it. Rebuild.
             if let Some(gi) = session.worktrees.iter().position(|w| w.name == name) {
-                session.switch_to_tab(gi, 0);
+                let ti = session.worktrees[gi].active_tab;
+                session.switch_to_tab(gi, ti);
             } else {
-                let placeholder = panes.reserve_ids(1);
-                session.worktrees.push(crate::session::WorktreeGroup {
-                    name,
-                    kind: crate::session::GroupKind::Terminal,
-                    path: String::new(),
-                    tabs: vec![crate::session::Tab {
-                        title: "main".to_string(),
-                        center: crate::center::CenterTree::Leaf(placeholder),
-                        focused_pane: placeholder,
-                        pane_cwds: Default::default(),
-                        pane_cmds: Default::default(),
-                        pane_sessions: Default::default(),
-                        pane_scrollback: Default::default(),
-                    }],
-                    active_tab: 0,
-                });
+                let migrated = workspace_pool.take_terminal_group(&name);
+                let restored =
+                    migrated.or_else(|| crate::handlers::terminal::restore_group(&name, panes));
+                let group = match restored {
+                    Some((donor, group)) => {
+                        // The donor session's rows still name this terminal;
+                        // leave them and a cold resurrect of that project forks
+                        // a phantom copy. The structural persist below rewrites
+                        // them under the session it just moved to.
+                        crate::handlers::terminal::forget_layout(donor, name.clone());
+                        group
+                    }
+                    None => crate::handlers::terminal::fresh_group(&name, panes),
+                };
+                session.worktrees.push(group);
                 session.active = session.worktrees.len() - 1;
                 *need_relayout = true;
                 structural = true;
