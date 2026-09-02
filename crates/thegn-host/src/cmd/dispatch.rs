@@ -26,8 +26,8 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, DispatchNote, NewDispatch};
 use thegn_core::outln;
-use thegn_core::pipeline_reap;
 use thegn_core::pipeline_chunk;
+use thegn_core::pipeline_reap;
 use thegn_core::pipeline_report;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
@@ -1002,7 +1002,10 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
             summary.needs_decision
         );
         if !apply && summary.actionable() > 0 {
-            outln!("(dry run — pass --apply to perform the {} unambiguous transition(s))", summary.actionable());
+            outln!(
+                "(dry run — pass --apply to perform the {} unambiguous transition(s))",
+                summary.actionable()
+            );
         }
     }
 

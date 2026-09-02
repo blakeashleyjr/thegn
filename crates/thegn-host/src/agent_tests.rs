@@ -1091,11 +1091,8 @@ fn inject_devshell_host_prepends_path_and_merges_vars() {
 /// never load and the worker dies unable to write.
 #[test]
 fn agent_entry_env_is_not_clobbered_by_the_host_env_fold() {
-    let reserved: std::collections::BTreeMap<String, String> = [(
-        "CODEX_HOME".to_string(),
-        "/pipeline/codex-home".to_string(),
-    )]
-    .into();
+    let reserved: std::collections::BTreeMap<String, String> =
+        [("CODEX_HOME".to_string(), "/pipeline/codex-home".to_string())].into();
     let mut env = vec![
         ("THEGN_WORKTREE".to_string(), "/wt".to_string()),
         // What `compose_spec` applied last from the entry.
@@ -1106,7 +1103,10 @@ fn agent_entry_env_is_not_clobbered_by_the_host_env_fold() {
         &mut env,
         vec![
             ("CODEX_HOME".to_string(), "/home/u/.codex".to_string()),
-            ("CLAUDE_CONFIG_DIR".to_string(), "/home/u/.claude".to_string()),
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/u/.claude".to_string(),
+            ),
         ],
         Some(&reserved),
     );
@@ -1154,11 +1154,8 @@ fn extend_reserving_without_an_agent_entry_folds_everything() {
 /// they clobber `[[agents]].env` just as the host fold did.
 #[test]
 fn agent_entry_env_is_not_clobbered_by_sandbox_overrides() {
-    let reserved: std::collections::BTreeMap<String, String> = [(
-        "CODEX_HOME".to_string(),
-        "/pipeline/codex-home".to_string(),
-    )]
-    .into();
+    let reserved: std::collections::BTreeMap<String, String> =
+        [("CODEX_HOME".to_string(), "/pipeline/codex-home".to_string())].into();
     let mut overrides: std::collections::HashMap<String, String> = [
         ("CODEX_HOME".to_string(), "/home/u/.codex".to_string()),
         ("SCCACHE_DIR".to_string(), "/cache/sccache".to_string()),
