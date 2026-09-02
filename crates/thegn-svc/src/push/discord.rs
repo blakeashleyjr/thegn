@@ -23,6 +23,10 @@ pub const DISCORD_MESSAGE_LIMIT: usize = 2_000;
 pub fn payload(notification: &RenderedNotification) -> serde_json::Value {
     serde_json::json!({
         "content": truncate_chars(&notification.message, DISCORD_MESSAGE_LIMIT, "…"),
+        // Notification text can originate from issue/forge content. Incoming
+        // webhooks parse @everyone/@here and user/role mentions by default;
+        // outbound alerts must never turn untrusted text into a broadcast.
+        "allowed_mentions": { "parse": [] },
         "embeds": [{
             "title": notification.title,
             "color": priority_color(notification.priority),
@@ -163,6 +167,7 @@ mod tests {
         let content = value["content"].as_str().unwrap();
         assert_eq!(content.chars().count(), DISCORD_MESSAGE_LIMIT);
         assert!(content.ends_with('…'));
+        assert_eq!(value["allowed_mentions"]["parse"], serde_json::json!([]));
         assert_eq!(priority_color(Priority::Alert), 0xED4245);
     }
 

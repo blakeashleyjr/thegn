@@ -203,15 +203,22 @@ fn push_targets(chans: &[String], sinks: &[crate::config_push::PushSinkConfig]) 
     if chans.iter().any(|c| c.trim().eq_ignore_ascii_case("push")) {
         return sinks.iter().map(|sink| sink.name.clone()).collect();
     }
-    let wanted: std::collections::HashSet<&str> = chans
+    let wanted: std::collections::HashSet<String> = chans
         .iter()
-        .filter_map(|channel| channel.trim().strip_prefix("push:"))
+        .filter_map(|channel| {
+            channel
+                .trim()
+                .get(..5)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("push:"))
+                .and_then(|_| channel.trim().get(5..))
+        })
         .map(str::trim)
         .filter(|name| !name.is_empty())
+        .map(str::to_string)
         .collect();
     sinks
         .iter()
-        .filter(|sink| wanted.contains(sink.name.as_str()))
+        .filter(|sink| wanted.iter().any(|name| name == sink.name.as_str()))
         .map(|sink| sink.name.clone())
         .collect()
 }
