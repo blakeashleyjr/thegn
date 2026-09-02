@@ -201,6 +201,55 @@ pub fn verdict_disagrees_with_status(
     )
 }
 
+/// The `gate:` line a stage worker is asked to include when it reports PASS —
+/// the queue-boundary suite it ran, and what came back.
+///
+/// Shape (anywhere in the report, its own line):
+///
+/// ```text
+/// gate: cargo nextest run --workspace -- 7676 passed, 24 skipped
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GateEvidence {
+    /// Everything after `gate:` — the command and its result, verbatim.
+    pub cited: String,
+}
+
+/// Read the `gate:` line out of a report, if it has one.
+///
+/// Deliberately a STRUCTURED line rather than prose sniffing. The obvious
+/// heuristic — look for "N passed" — is wrong on the exact report that motivated
+/// this: row 468 stated "Not verified: the full workspace test suite" and, in
+/// the same breath, listed scoped runs reading "(2 passed)" and "(22 passed)".
+/// A prose match would have read that as gate evidence and blessed the very
+/// report that admits it has none. So the worker states it explicitly or it
+/// does not count.
+pub fn gate_evidence(report: &str) -> Option<GateEvidence> {
+    report.lines().find_map(|l| {
+        let t = l.trim();
+        let rest = t
+            .strip_prefix("gate:")
+            .or_else(|| t.strip_prefix("Gate:"))
+            .or_else(|| t.strip_prefix("GATE:"))?;
+        let cited = rest.trim();
+        (!cited.is_empty()).then(|| GateEvidence {
+            cited: cited.to_string(),
+        })
+    })
+}
+
+/// A report claiming PASS while citing no gate result.
+///
+/// The review stage's contract already says a PASS requires a green full gate,
+/// but that lived only in prompt prose and nothing checked it. Row 468 reported
+/// its stage complete with "Not verified: the full workspace test suite", and
+/// the review that followed caught a real bug the scoped suites had missed
+/// (`loc_scan` exclusion patterns broken on absolute worktree paths). Prose is
+/// not a precondition; this is the check.
+pub fn pass_without_gate_evidence(report: &str) -> bool {
+    verdict_of(Some(report)) == Verdict::Pass && gate_evidence(report).is_none()
+}
+
 // --- status digest ----------------------------------------------------------
 
 /// One row's status snapshot — report, note count, and the most recent note
@@ -501,5 +550,40 @@ mod tests {
         assert!(!verdict_disagrees_with_status(S::Done, Verdict::Revise));
         assert!(!verdict_disagrees_with_status(S::Done, Verdict::Pass));
         assert!(!verdict_disagrees_with_status(S::Running, Verdict::None));
+    }
+
+    #[test]
+    fn gate_evidence_needs_a_structured_line_not_prose() {
+        let good = "PASS\n\ngate: cargo nextest run --workspace -- 7676 passed, 24 skipped\n";
+        assert_eq!(
+            gate_evidence(good).map(|g| g.cited),
+            Some("cargo nextest run --workspace -- 7676 passed, 24 skipped".to_string())
+        );
+        assert!(!pass_without_gate_evidence(good));
+
+        // The report that motivated this, near-verbatim: it ADMITS the full
+        // suite was not run, while listing scoped runs whose "(N passed)" a
+        // prose heuristic would have accepted as proof.
+        let row_468 = "Verdict: complete.\n\nVerification completed:\n                       - `just quick thegn-core`\n                       - `cargo nextest run -p thegn-host submodule_file` (2 passed)\n                       - `cargo nextest run -p thegn-host integrate` (22 passed)\n\n                       Not verified: the full workspace test suite.";
+        assert_eq!(gate_evidence(row_468), None, "scoped runs are not the gate");
+        assert!(
+            pass_without_gate_evidence(row_468),
+            "a completion claim with no cited gate must be flagged"
+        );
+    }
+
+    #[test]
+    fn only_a_pass_is_asked_for_gate_evidence() {
+        // A REVISE or FAIL is a verdict about the code, not a claim that the
+        // suite is green — demanding a gate there would be noise.
+        assert!(!pass_without_gate_evidence(
+            "REVISE; two ratchet violations"
+        ));
+        assert!(!pass_without_gate_evidence("FAIL: the queue gate is red"));
+        assert!(!pass_without_gate_evidence(
+            "BLOCKED — sandbox denied the socket"
+        ));
+        // An empty `gate:` is not evidence.
+        assert!(pass_without_gate_evidence("PASS\ngate:   \n"));
     }
 }
