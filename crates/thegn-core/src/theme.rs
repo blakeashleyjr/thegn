@@ -46,6 +46,11 @@ pub const FOCUS: &str = "155;209;255"; // focused frame + highlights (#9bd1ff)
 pub const P_BG0: &str = "11;14;22"; // #0b0e16
 pub const P_BG1: &str = "16;20;31"; // #10141f
 pub const P_PANEL: &str = "21;26;40"; // #151a28
+// The alternate list tint: `panel` half-way to `bg0`. Sidebar project blocks
+// alternate panel/panel_alt so two abutting repos never read as one (the
+// boundary used to be a blank row). Half and no further, so the `bg0` header
+// band keeps a full surface step against BOTH parities — see `extend_palette`.
+pub const P_PANEL_ALT: &str = "16;20;31"; // #10141f
 pub const P_PANEL2: &str = "26;32;49"; // #1a2031
 pub const P_RAISE: &str = "34;41;66"; // #222942
 // fg ramp t d f g g2 g3
@@ -156,6 +161,13 @@ pub struct Palette {
     pub bg0: String,
     pub bg1: String,
     pub panel: String,
+    /// The alternate list tint, a shade of `panel` toward `bg0`. Sidebar
+    /// project blocks alternate between `panel` and this so two abutting
+    /// projects read as two blocks without spending a blank row on the
+    /// boundary. Derived (see [`extend_palette`]) — it must stay between `bg0`
+    /// and `panel`, and never past the midpoint, so the `bg0` header band still
+    /// reads as the block start whichever tint its block took.
+    pub panel_alt: String,
     pub panel2: String,
     pub raise: String,
     /// Frame lines around panes and chrome edges.
@@ -198,6 +210,7 @@ impl Default for Palette {
             bg0: P_BG0.into(),
             bg1: P_BG1.into(),
             panel: P_PANEL.into(),
+            panel_alt: P_PANEL_ALT.into(),
             panel2: P_PANEL2.into(),
             raise: P_RAISE.into(),
             border: P_GHOST.into(),
@@ -287,6 +300,17 @@ pub fn extend_palette(p: &mut Palette) {
     } else if p.ghost2.is_empty() {
         p.ghost2 = blend_over(&p.ghost, &p.bg0, 0.62);
     }
+    // The sidebar's alternate block tint. A fraction, never an absolute shade,
+    // so light presets stay light (it is a step TOWARD bg0, which on paper
+    // themes is the lighter direction). Half-way splits the bg0→panel gap
+    // evenly, so the project boundary reads as strongly as the header band
+    // above it and neither signal swallows the other; going further would put
+    // `panel_alt` past the midpoint and start eroding the header. A preset
+    // whose `panel` IS its `bg0` (some flat themes) derives a no-op tint —
+    // correct, since there is no room for a shade there.
+    if p.panel_alt.is_empty() {
+        p.panel_alt = blend_over(&p.bg0, &p.panel, 0.5);
+    }
     if p.shadow_bg.is_empty() {
         // 45% of bg0 — darker than every surface but never pure black.
         p.shadow_bg = blend_over("0;0;0", &p.bg0, 0.55);
@@ -362,6 +386,7 @@ fn pal(c: [&str; 12]) -> Palette {
         bg0: c[0].into(),
         bg1: c[1].into(),
         panel: c[2].into(),
+        panel_alt: String::new(),
         panel2: c[3].into(),
         raise: c[4].into(),
         border: c[5].into(),
@@ -998,6 +1023,50 @@ mod tests {
         // Light mode really is light (bg brighter than text).
         let l = preset("light").unwrap();
         assert!(lum(&l.bg0) > lum(&l.text));
+    }
+
+    /// The sidebar alternates project blocks between `panel` and `panel_alt`
+    /// while workspace headers keep the `bg0` band, so the two signals only
+    /// compose if `panel_alt` lands BETWEEN the two and stays nearer `panel`.
+    /// If it ever drifted past the midpoint the header would stop being the
+    /// darkest row on alt-tinted blocks and the boundary would read backwards.
+    #[test]
+    fn panel_alt_sits_between_bg0_and_panel_on_every_preset() {
+        let chans =
+            |s: &str| -> Vec<i32> { s.split(';').map(|n| n.parse::<i32>().unwrap()).collect() };
+        for name in PRESETS {
+            let mut p = preset(name).expect(name);
+            extend_palette(&mut p);
+            assert_eq!(
+                p.panel_alt.split(';').count(),
+                3,
+                "{name}: panel_alt must be derived, got {:?}",
+                p.panel_alt
+            );
+            let (bg0, panel, alt) = (chans(&p.bg0), chans(&p.panel), chans(&p.panel_alt));
+            for c in 0..3 {
+                let (lo, hi) = (bg0[c].min(panel[c]), bg0[c].max(panel[c]));
+                assert!(
+                    (lo..=hi).contains(&alt[c]),
+                    "{name}: panel_alt channel {c} ({}) escaped [{lo}, {hi}]",
+                    alt[c]
+                );
+            }
+            // Never meaningfully past the midpoint: the header band keeps at
+            // least as much of the bg0→panel gap as the block boundary takes,
+            // so a header still reads as the block start on an alt-tinted
+            // block. Summed over the channels with a 3-unit tolerance — a
+            // midpoint blend rounds each of the three channels by up to half a
+            // unit, which is drift in the arithmetic, not in the design.
+            let dist = |a: &[i32], b: &[i32]| -> i32 { (0..3).map(|c| (a[c] - b[c]).abs()).sum() };
+            assert!(
+                dist(&alt, &panel) <= dist(&alt, &bg0) + 3,
+                "{name}: panel_alt drifted past the midpoint (bg0 {:?}, panel {:?}, alt {:?})",
+                bg0,
+                panel,
+                alt
+            );
+        }
     }
 
     #[test]

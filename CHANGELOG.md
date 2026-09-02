@@ -7,6 +7,26 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — the sidebar tree reads tighter
+
+- Adjacent projects are now separated by an **alternating background tint**
+  rather than a blank separator row. Each project block — its header, its
+  worktrees, its folders — shares one tint, and the next project takes the
+  other; project headers keep their recessed band on both. `[ui]
+sidebar_dividers` still gates the separation (off = one uniform tint), but it
+  no longer costs a screen row per project, and it now applies in the rail and
+  under a `/` filter too. The new `[theme.colors] panel_alt` slot is derived
+  from each theme's own `bg0`/`panel` and can be overridden.
+- **Pipelines only ever nest under a project.** The top-level `Pipelines`
+  group that collected unattributable lanes is gone; a lane whose worktree is
+  not registered anywhere is now filed by the directory its siblings live in,
+  and one that still matches no project is left out of the tree rather than
+  opening a second, root-level pipeline section. The flat layout, which has no
+  project rows to nest under, grows no pipeline rows.
+- The compact `Pipeline ▸ N running` roster row at the bottom of the tree has
+  been removed. `Alt b` opens the pipeline board from anywhere, as before, and
+  the board carries the counts.
+
 ### Changed — projects are the one-repo product concept
 
 - One-repo sidebar, picker, navigation, and help surfaces now say

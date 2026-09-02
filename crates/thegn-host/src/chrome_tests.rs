@@ -1039,25 +1039,27 @@ fn build_sidebar_and_click_hit_test_round_trip() {
         }
     }
 
-    // THE-64: with dividers on, the second workspace's hit box includes the
-    // separator gap line — every screen line of the placement (gap included)
-    // still resolves to that placement's own visible_index.
-    let gapped = FrameModel {
+    // A project boundary is a tint now, not a gap: consecutive workspace
+    // headers are plain 1-row placements, and every screen line still resolves
+    // to its own placement.
+    let blocks = FrameModel {
         sidebar_rows: two_workspaces(),
         sidebar_focused: false,
         ..Default::default()
     };
-    let frame = build_sidebar(&gapped, rect, gapped.sidebar_scroll);
-    let beta = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
-    assert_eq!(beta.lead_gap, 1, "the second header owns the gap line");
-    let hits = hit_rows(&gapped, rect);
+    let frame = build_sidebar(&blocks, rect, blocks.sidebar_scroll);
+    assert!(
+        frame.rows.iter().all(|p| p.lead_gap == 0),
+        "a workspace header no longer owns a separator line"
+    );
+    let hits = hit_rows(&blocks, rect);
     for p in &frame.rows {
         for dy in 0..p.height {
             let found = row_at(&hits, p.y + dy).map(|h| h.visible_index);
             assert_eq!(
                 found,
                 Some(p.visible_index),
-                "click on row {} line {dy} resolves to itself (gapped)",
+                "click on row {} line {dy} resolves to itself (blocks)",
                 p.visible_index
             );
         }
