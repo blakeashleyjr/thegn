@@ -29,3 +29,11 @@ crates/thegn-host/src/cmd/pair.rs
 crates/thegn-host/src/cmd/placement.rs
 crates/thegn-host/src/cmd/pr.rs
 crates/thegn-host/src/cmd/session.rs
+# 2026-09-02 audit: neither of these PRINTS json — the ratchet's regex cannot
+# tell "builds a string" from "writes to stdout".
+# events.rs formats a feed frame and RETURNS it for the caller to print; it is
+# the streaming feed's projection, and `emit_json` prints rather than returns,
+# so the chokepoint does not fit. session_move.rs's hit is inside a test that
+# encodes a migration audit to assert no secret leaks into it.
+crates/thegn-host/src/cmd/events.rs
+crates/thegn-host/src/cmd/session_move.rs

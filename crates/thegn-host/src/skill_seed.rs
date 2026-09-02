@@ -1017,9 +1017,15 @@ mod tests {
 
     fn worktree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
+        // `util::git_cmd`, not a raw `Command::new("git")`: it scrubs
+        // GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE, which git exports as paths
+        // RELATIVE to the outer repo when the suite runs under a git hook. An
+        // unscrubbed init here targets the wrong tree entirely.
+        // A test never runs on the compositor loop, which is what the
+        // blocking-wait ban protects.
+        #[expect(clippy::disallowed_methods, reason = "test fixture, never on the loop")]
+        let status = thegn_core::util::git_cmd(dir.path())
             .args(["init", "-q"])
-            .arg(dir.path())
             .status()
             .unwrap();
         assert!(status.success());
