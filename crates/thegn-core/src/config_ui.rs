@@ -71,11 +71,16 @@ pub struct UiConfig {
     /// group, folded or not. If every other stop is collapsed the step still
     /// lands on the immediate neighbour, so the keybind never goes dead.
     pub sidebar_nav_skips_collapsed: bool,
-    /// Lay out a one-row separator gap above each workspace header in the full
-    /// sidebar, so adjacent repos read as separate groups instead of one stack
-    /// of bands. Off ⇒ the tree lays out exactly as it did before the key
-    /// existed (for vertically-tight setups: many repos, a short terminal).
-    /// Never applies in the rail or while the `/` filter is active.
+    /// Separate one workspace's block from the next in the sidebar, so adjacent
+    /// repos read as separate groups instead of one stack of bands. The
+    /// separation is an alternating background tint (`panel` / `panel_alt`)
+    /// covering each workspace and everything under it; off ⇒ one uniform tint.
+    ///
+    /// This used to lay out a blank separator ROW above each workspace header,
+    /// which cost a screen row per repo — on a tree of a dozen-plus repos, a
+    /// sixth of the column. The tint says the same thing in colour and costs
+    /// nothing, so unlike the gap it also applies in the rail and while the `/`
+    /// filter is active.
     pub sidebar_dividers: bool,
     /// In full-window pane fullscreen (the third stop of Ctrl+Alt+z, which
     /// hides the sidebar/panel/strip), keep the top masthead bar visible.

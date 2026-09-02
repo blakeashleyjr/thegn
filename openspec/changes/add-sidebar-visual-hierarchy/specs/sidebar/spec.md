@@ -26,44 +26,60 @@ chokepoints; no color or glyph literal at a draw site.
 - **THEN** workspace headers, folder headers and worktree rows remain
   distinguishable by weight and layout
 
-### Requirement: Adjacent workspaces are visibly separated
+### Requirement: Adjacent projects are visibly separated
 
-The full sidebar SHALL lay out a separator gap between one workspace's
-subtree and the next workspace header (and before the terminals region),
-gated by `[ui] sidebar_dividers` (default on). The gap MUST be produced by
-the same layout pass the renderer, hit-testing and scrolling share: it
-belongs to the workspace header's hit box (a click over it resolves to the
-header it precedes — selecting, never toggling collapse; the header's caret
-cell is inert on the gap line), the cursor never rests on it as its own row,
-a drag-drop over it resolves to the same destination as the run boundary it
-separates, and it counts toward scroll geometry so the truncation
-indications stay truthful. Gaps MUST be suppressed in rail mode and while
-the `/` filter is active. With `sidebar_dividers = false` the layout MUST be
-identical to the ungapped form.
+The sidebar SHALL separate one project's subtree from the next by an
+alternating background tint, gated by `[ui] sidebar_dividers` (default on).
+Each project block — its header row and every row beneath it up to the next
+block head — SHALL share one tint, and consecutive blocks SHALL alternate
+between the `panel` and `panel_alt` palette slots; a section banner SHALL
+reset the alternation so a following region always opens on the base tint.
+Project and terminal-host headers SHALL keep their recessed `bg0` band on
+both parities, and `panel_alt` SHALL be derived to sit between `bg0` and
+`panel` and never past their midpoint, so a header still reads as the start
+of its block whichever tint the block took.
 
-#### Scenario: Two repos no longer abut
+Because the separation costs no layout rows, it SHALL apply in rail mode and
+while the `/` filter is active, and row geometry SHALL be identical with
+`sidebar_dividers` on and off. With `sidebar_dividers = false` every block
+SHALL render on the base tint.
 
-- **WHEN** two workspaces render consecutively with `sidebar_dividers = true`
-- **THEN** a blank separator row lies between the first workspace's last row
-  and the second workspace's header
+The separation MUST NOT be a blank separator row: an earlier form of this
+requirement spent one screen row per project, which on a tree of a dozen or
+more repos consumed a large fraction of the column it was meant to make
+legible.
 
-#### Scenario: The gap is interaction-transparent
+#### Scenario: Two repos no longer read as one
 
-- **WHEN** the user clicks on a separator gap, or releases a dragged worktree
-  over it
-- **THEN** the click resolves to the workspace header that owns the gap
-  (selecting it; the caret cell never toggles from the gap line), and the
-  drop lands exactly where a drop on the adjacent run boundary would land
-  with dividers off
+- **WHEN** two projects render consecutively with `sidebar_dividers = true`
+- **THEN** the second project's rows carry a different background tint from
+  the first's, and no blank row lies between them
 
-#### Scenario: Filtering stays dense
+#### Scenario: A project block is tinted as a unit
 
-- **WHEN** the user types a `/` filter that matches rows in several
-  workspaces
-- **THEN** the filtered list renders without separator gaps
+- **WHEN** a project block contains worktree rows, folder headers and a
+  derived `Pipelines` folder
+- **THEN** every one of those rows carries the same tint as its project
+  header's block, so the block reads as one thing
 
-#### Scenario: Dividers can be turned off
+#### Scenario: The header band survives both parities
+
+- **WHEN** a project header renders on an alternate-tinted block
+- **THEN** it keeps the `bg0` band, which stays at least as distinct from the
+  block tint as the two block tints are from each other
+
+#### Scenario: Separation costs no rows
+
+- **WHEN** the same tree is laid out with `sidebar_dividers` on and off
+- **THEN** the two layouts have identical row heights and scroll geometry,
+  differing only in the background tint of alternate blocks
+
+#### Scenario: The tint survives the rail and a filter
+
+- **WHEN** the sidebar is in rail mode, or a `/` filter is active
+- **THEN** consecutive project blocks still alternate tint
+
+#### Scenario: Alternation can be turned off
 
 - **WHEN** `[ui] sidebar_dividers = false`
-- **THEN** no gaps are laid out and row geometry matches the pre-change
-  layout exactly
+- **THEN** every project block renders on the base `panel` tint

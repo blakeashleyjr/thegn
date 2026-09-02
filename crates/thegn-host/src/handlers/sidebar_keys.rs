@@ -524,7 +524,7 @@ impl SidebarState {
                     entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
                 }
             }
-            RowKind::SectionHeading | RowKind::EmptyHint | RowKind::PipelineSummary => {
+            RowKind::SectionHeading | RowKind::EmptyHint => {
                 return None;
             }
         }
@@ -716,9 +716,6 @@ impl SidebarState {
                     }
                     if row.kind == crate::sidebar::RowKind::EmptyHint {
                         return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
-                    }
-                    if row.kind == crate::sidebar::RowKind::PipelineSummary {
-                        return SidebarOutcome::Synthetic(crate::keymap::Action::OpenPipelineBoard);
                     }
                     if let Some(t) = row.tab_target.clone() {
                         return SidebarOutcome::Activate(t);

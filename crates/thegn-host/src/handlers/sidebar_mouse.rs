@@ -298,15 +298,6 @@ pub(crate) fn on_left_press(
             crate::keymap::Action::NewTerminal,
         ));
     }
-    // The roster rollup is a door, not a destination: one click opens the board,
-    // exactly as `↵` does — the same `Synthetic` seam the hint rows use, so the
-    // two input paths cannot diverge.
-    if hit.kind == RowKind::PipelineSummary {
-        return PressOut::Outcome(SidebarOutcome::Synthetic(
-            crate::keymap::Action::OpenPipelineBoard,
-        ));
-    }
-
     sb.sync(model);
     match sb.cursor_target(model) {
         Some(target) => PressOut::Activate {
@@ -2030,7 +2021,10 @@ mod tests {
             .into_iter()
             .find(|hit| hit.pin_key == "lib")
             .expect("workspace token row");
-        assert_eq!(hit.lead_gap, 1, "the test must cover a painted divider gap");
+        assert_eq!(
+            hit.lead_gap, 0,
+            "a workspace header is a plain 1-row hit box"
+        );
         let (start, end) = hit.mq_span.expect("workspace token span");
         let mut sb = SidebarState::default();
         let mut ui = MouseUi::default();
@@ -2052,34 +2046,35 @@ mod tests {
         ));
         assert!(end > start);
 
-        // The token is not painted on a workspace's leading divider gap, even
-        // though that gap belongs to the same row hit box.
-        let mut gap_ui = MouseUi::default();
-        let mut gap_sb = SidebarState::default();
-        let gap = on_left_press(
-            &mut gap_ui,
-            &mut gap_sb,
+        // A column outside the token span on the same row is a plain header
+        // click, not a merge-queue one.
+        let mut off_ui = MouseUi::default();
+        let mut off_sb = SidebarState::default();
+        let off = on_left_press(
+            &mut off_ui,
+            &mut off_sb,
             &mut model,
             &crate::session::Session::default(),
             rect,
-            start,
+            start.saturating_sub(1),
             hit.y,
             false,
             Instant::now(),
         );
         assert!(!matches!(
-            gap,
+            off,
             PressOut::Outcome(SidebarOutcome::OpenMergeQueue { .. })
         ));
     }
 
     #[test]
-    fn a_click_on_the_gap_line_does_not_toggle_collapse() {
-        // THE-64: `lib`'s hit box opens with the workspace separator gap (the
-        // default display has dividers on and the fixture has two workspaces).
-        // The caret cell on the GAP line must be inert — nothing is under a
-        // blank line — while the same column on the LABEL line toggles. The
-        // toggle path persists to the DB, so isolate `XDG_STATE_HOME`.
+    fn a_workspace_header_has_no_gap_line_and_its_caret_toggles() {
+        // THE-64 gave each workspace header a leading separator row, and the
+        // caret cell had to be inert on it (nothing is under a blank line). The
+        // boundary is a block tint now, so the header is a plain 1-row
+        // placement: no gap to be inert on, and the caret cell sits on the row
+        // itself. The toggle path persists to the DB, so isolate
+        // `XDG_STATE_HOME`.
         let (model, rect) = fixture();
         let dir = std::env::temp_dir().join(format!("thegn-the64-caret-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
@@ -2092,7 +2087,7 @@ mod tests {
             .iter()
             .find(|h| visible[h.visible_index].pin_key == "lib")
             .expect("the second workspace header is hit");
-        assert_eq!(lib.lead_gap, 1, "dividers on: the header owns a gap line");
+        assert_eq!(lib.lead_gap, 0, "the separator row is gone");
         let caret_x = lib
             .caret_x
             .expect("a workspace header advertises a caret cell");
@@ -2100,14 +2095,12 @@ mod tests {
         let session = crate::session::Session::default();
         let mut ui = MouseUi::default();
 
-        // Click the caret column ON the gap line: selects the header, never
-        // toggles.
-        let mut model_gap = model.clone();
-        let mut sb_gap = SidebarState::default();
+        let mut model_click = model.clone();
+        let mut sb = SidebarState::default();
         on_left_press(
             &mut ui,
-            &mut sb_gap,
-            &mut model_gap,
+            &mut sb,
+            &mut model_click,
             &session,
             rect,
             caret_x,
@@ -2116,26 +2109,8 @@ mod tests {
             now,
         );
         assert!(
-            !sb_gap.view.collapsed.contains("lib"),
-            "a gap click must not toggle collapse"
-        );
-
-        // The same column on the label line below the gap: toggles.
-        let mut sb_label = SidebarState::default();
-        on_left_press(
-            &mut ui,
-            &mut sb_label,
-            &mut model_gap,
-            &session,
-            rect,
-            caret_x,
-            lib.y + lib.lead_gap,
-            false,
-            now,
-        );
-        assert!(
-            sb_label.view.collapsed.contains("lib"),
-            "the caret cell on the label line toggles collapse"
+            sb.view.collapsed.contains("lib"),
+            "the caret cell on the header line toggles collapse"
         );
     }
 }

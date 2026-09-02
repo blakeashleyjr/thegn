@@ -54,6 +54,9 @@ pub enum S {
     Bg0,
     Bg1,
     Panel,
+    /// The alternate list tint. Sidebar project blocks alternate between this
+    /// and [`S::Panel`] so two abutting projects read as two blocks.
+    PanelAlt,
     Panel2,
     Raise,
     Border,
@@ -75,10 +78,11 @@ pub enum S {
 
 impl S {
     /// Every slot, in discriminant order — indexes [`RESOLVED`].
-    pub const ALL: [S; 20] = [
+    pub const ALL: [S; 21] = [
         S::Bg0,
         S::Bg1,
         S::Panel,
+        S::PanelAlt,
         S::Panel2,
         S::Raise,
         S::Border,
@@ -107,6 +111,7 @@ pub fn slot_rgb(p: &theme::Palette, s: S) -> &str {
         S::Bg0 => &p.bg0,
         S::Bg1 => &p.bg1,
         S::Panel => &p.panel,
+        S::PanelAlt => &p.panel_alt,
         S::Panel2 => &p.panel2,
         S::Raise => &p.raise,
         S::Border => &p.border,
