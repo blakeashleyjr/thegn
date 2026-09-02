@@ -626,16 +626,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
-    // Regression: when the worktree can't be removed (read-only sandbox mount,
-    // uncommitted changes) the cache row must be KEPT so the sidebar keeps it
-    // filed, instead of dropping the row and orphaning it under "home".
+    // Regression: a directory that is no longer registered with Git cannot be
+    // removed by `git worktree remove`, but it is still a stale checkout
+    // directory that the lifecycle must reclaim safely.
     #[test]
-    fn landed_remove_keeps_row_when_removal_fails() {
+    fn landed_remove_reclaims_git_unregistered_orphan() {
         let db = Db::open_memory().unwrap();
         let (root, _feat) = repo_with_feat(&db, "rmfail");
         let root_s = root.to_string_lossy().to_string();
-        // A path that is NOT a registered git worktree ⇒ `git worktree remove`
-        // fails (stands in for the read-only-mount removal failure).
+        // A path that is NOT a registered git worktree makes
+        // `git worktree remove` fail. It has no `.git` marker, so it is safe to
+        // reclaim as an orphan after the registry check.
         let bogus = root.with_extension("bogus");
         std::fs::create_dir_all(&bogus).unwrap();
         let bogus_s = bogus.to_string_lossy().to_string();
@@ -651,12 +652,13 @@ mod tests {
             "bogus",
             LifecycleEvent::Landed,
         );
+        assert!(!bogus.exists(), "the orphan directory was reclaimed");
         assert!(
             db.worktrees()
                 .unwrap()
                 .iter()
-                .any(|w| w.worktree == bogus_s),
-            "worktree row kept when removal failed (not orphaned)"
+                .all(|w| w.worktree != bogus_s),
+            "reclaimed orphan is removed from the cache"
         );
         assert!(
             db.list_merge_queue()

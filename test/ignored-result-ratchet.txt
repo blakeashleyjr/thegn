@@ -146,6 +146,12 @@ crates/thegn-host/src/daemon/inbox.rs
 # failure cannot invalidate a successfully spawned child, and cleanup retries
 # are not allowed to turn child teardown into a failure.
 crates/thegn-host/src/daemon/fork.rs
+# 2026-09-02 audit: BOTH ignores here are reviewed, not wholesale-pinned.
+# The `spawn_blocking` join is dropped because a reap pass that cannot read
+# git must never take the daemon down — the next tick retries. The note
+# append is dropped because losing the context must not stop the status
+# moving off `running`, which is the whole point of the pass.
+crates/thegn-host/src/daemon/pipeline_reaper.rs
 crates/thegn-host/src/daemon/mod.rs
 crates/thegn-host/src/daemon/record.rs
 crates/thegn-host/src/daemon/service.rs

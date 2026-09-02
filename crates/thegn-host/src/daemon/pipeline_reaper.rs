@@ -128,6 +128,25 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
     }
 }
 
+// Cadence invariants, pinned at COMPILE time rather than in a `#[test]`: both
+// operands are constants, so a runtime `assert!` on them is tautological — it
+// can never observe a violation a compile could not (clippy's
+// `assertions_on_constants` says exactly this). As `const` assertions they
+// genuinely cannot be violated: lowering either value stops the build.
+//
+// A restart re-adopts its sessions asynchronously, so an immediate first pass
+// would read live workers as absent and park rows that are seconds from
+// checking back in. And each pass walks every active row's worktree and shells
+// out to `git`, which is not something to do on a short timer.
+const _: () = assert!(
+    REAP_FIRST_DELAY_SECS >= 30,
+    "first pass must not race a restart's session re-adoption"
+);
+const _: () = assert!(
+    REAP_INTERVAL_SECS >= 60,
+    "this pass does per-row git I/O; it must stay a slow timer"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,19 +180,5 @@ mod tests {
             "an ambiguous row is explicitly a human's call"
         );
         assert_eq!(daemon_writes(&ReapVerdict::Live), None);
-    }
-
-    #[test]
-    fn the_first_pass_is_delayed_past_a_restarts_re_adoption() {
-        // A restart re-adopts sessions asynchronously; reaping immediately would
-        // read them as absent and park rows that are about to check back in.
-        assert!(
-            REAP_FIRST_DELAY_SECS >= 30,
-            "first pass must not race a restart's session re-adoption"
-        );
-        assert!(
-            REAP_INTERVAL_SECS >= 60,
-            "this pass does per-row git I/O; it must stay a slow timer"
-        );
     }
 }
