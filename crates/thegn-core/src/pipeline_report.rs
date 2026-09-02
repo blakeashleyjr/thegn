@@ -91,6 +91,116 @@ pub fn note_text(text: &str) -> Result<String, NoteError> {
     Ok(t.to_string())
 }
 
+// --- verdict ----------------------------------------------------------------
+
+/// What a stage worker's report *concluded*, as distinct from what happened to
+/// its row.
+///
+/// `status` and verdict are independent axes that the roster collapsed into
+/// one field, and both became unreadable as a result. Measured over a 469-row
+/// run: three rows sat at `failed` whose reports read "PASS; ready for the
+/// merge queue", and sixteen sat at `done` carrying a REVISE. So "the worker
+/// broke", "the reviewer asked for changes" and "the bookkeeping lost the row"
+/// were indistinguishable without opening the artifact — which is the read the
+/// report exists to save.
+///
+/// Deliberately **derived, never stored.** A column would need a schema bump,
+/// and the enum-ladder collision that costs is the single most repeated merge
+/// conflict in this repo's queue; worse, a stored copy can disagree with the
+/// report it came from. The report is the source of truth and this is a pure
+/// read of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Ready to advance — the stage says its work stands.
+    Pass,
+    /// The stage worked and is asking for changes. NOT a failure: a REVISE is
+    /// a review doing its job.
+    Revise,
+    /// The stage ran and concluded the work is not sound.
+    Fail,
+    /// The stage could not run at all (environment, not code).
+    Blocked,
+    /// No report, or a report that states no verdict.
+    None,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Revise => "revise",
+            Verdict::Fail => "fail",
+            Verdict::Blocked => "blocked",
+            Verdict::None => "none",
+        }
+    }
+}
+
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Read the verdict out of a report's opening words.
+///
+/// Workers are told to lead with the verdict and overwhelmingly do, but the
+/// shapes vary in practice — `PASS`, `PASS (ready for the merge queue)`,
+/// `verdict: done`, `done; commits: …`, `REVISE; …`. Only the FIRST line is
+/// considered, and only its leading token: a report body that merely discusses
+/// a failure ("no remaining blocking defect was found") must never read as one.
+pub fn verdict_of(report: Option<&str>) -> Verdict {
+    let Some(line) = report
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(|r| r.lines().find(|l| !l.trim().is_empty()))
+    else {
+        return Verdict::None;
+    };
+    // Strip a `verdict:` lead-in, then take the first word, unpunctuated.
+    let line = line.trim();
+    let rest = line
+        .strip_prefix("verdict:")
+        .or_else(|| line.strip_prefix("Verdict:"))
+        .or_else(|| line.strip_prefix("VERDICT:"))
+        .unwrap_or(line)
+        .trim_start();
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match token.as_str() {
+        "pass" | "approved" | "done" | "complete" => Verdict::Pass,
+        "revise" => Verdict::Revise,
+        "fail" | "failed" => Verdict::Fail,
+        "blocked" => Verdict::Blocked,
+        _ => Verdict::None,
+    }
+}
+
+/// Does this row's recorded outcome contradict what its own report says?
+///
+/// The reconciliation a supervisor otherwise performs by eye. `true` means the
+/// pair is worth a human's attention: a row parked at `failed` whose report
+/// says PASS is either a bookkeeping loss (the work is fine and the row lies)
+/// or a worker overclaiming — both matter, and neither is visible from `status`
+/// alone.
+pub fn verdict_disagrees_with_status(
+    status: crate::issue::AgentDispatchStatus,
+    v: Verdict,
+) -> bool {
+    use crate::issue::AgentDispatchStatus as S;
+    matches!(
+        (status, v),
+        // A closed-as-broken row whose worker said the work stands.
+        (S::Failed | S::Abandoned, Verdict::Pass)
+            // ...and the inverse: a row closed as good over its own objection.
+            | (S::Done, Verdict::Fail | Verdict::Blocked)
+    )
+}
+
 // --- status digest ----------------------------------------------------------
 
 /// One row's status snapshot — report, note count, and the most recent note
@@ -315,5 +425,81 @@ mod tests {
             Some("verdict: done\nnext: review")
         );
         assert_eq!(got[1].report, None);
+    }
+
+    // --- verdict ------------------------------------------------------------
+
+    #[test]
+    fn verdict_reads_the_shapes_workers_actually_wrote() {
+        // Every string here is a real report opening from the 469-row roster.
+        for (report, want) in [
+            ("PASS", Verdict::Pass),
+            ("PASS (ready for the merge queue)", Verdict::Pass),
+            (
+                "PASS; ready for the merge queue. Corrected observer authority",
+                Verdict::Pass,
+            ),
+            (
+                "verdict: done; commits: 57bd6e34 feat(the-32)",
+                Verdict::Pass,
+            ),
+            (
+                "done; commits: b8f133b0 (merge main into THE-59 lane)",
+                Verdict::Pass,
+            ),
+            (
+                "REVISE; reviewed THE-48 from base caef2f0e",
+                Verdict::Revise,
+            ),
+            ("APPROVED with notes", Verdict::Pass),
+            ("BLOCKED — the gate could not run", Verdict::Blocked),
+            ("FAIL: two ratchet violations", Verdict::Fail),
+        ] {
+            assert_eq!(verdict_of(Some(report)), want, "report: {report:?}");
+        }
+    }
+
+    #[test]
+    fn verdict_only_reads_the_opening_token() {
+        // The dangerous direction: prose that MENTIONS a failure must not be
+        // read as one. This body is from a real PASS verdict.
+        assert_eq!(
+            verdict_of(Some(
+                "PASS\n\nNo remaining blocking injection, path, permission, swallowed-error \
+                 or concurrency defect was found. Earlier rounds did FAIL."
+            )),
+            Verdict::Pass
+        );
+        // ... and a verdict is never inferred from a later line.
+        assert_eq!(
+            verdict_of(Some("Reviewed the diff.\nPASS")),
+            Verdict::None,
+            "only the first non-empty line carries the verdict"
+        );
+    }
+
+    #[test]
+    fn verdict_is_none_without_a_report() {
+        assert_eq!(verdict_of(None), Verdict::None);
+        assert_eq!(verdict_of(Some("")), Verdict::None);
+        assert_eq!(verdict_of(Some("   \n  ")), Verdict::None);
+        assert_eq!(verdict_of(Some("looked at it, seems fine")), Verdict::None);
+    }
+
+    #[test]
+    fn disagreement_flags_the_pairs_that_actually_occurred() {
+        use crate::issue::AgentDispatchStatus as S;
+        // Roster rows 324/443/298: `failed` carrying a PASS/done report.
+        assert!(verdict_disagrees_with_status(S::Failed, Verdict::Pass));
+        assert!(verdict_disagrees_with_status(S::Abandoned, Verdict::Pass));
+        // A `done` row carrying FAIL/BLOCKED is the inverse overclaim.
+        assert!(verdict_disagrees_with_status(S::Done, Verdict::Fail));
+        assert!(verdict_disagrees_with_status(S::Done, Verdict::Blocked));
+        // A REVISE on a done row is NOT a disagreement: the stage worked and
+        // asked for changes, which is a review doing its job. Sixteen rows in
+        // the corpus are exactly this and none of them are defects.
+        assert!(!verdict_disagrees_with_status(S::Done, Verdict::Revise));
+        assert!(!verdict_disagrees_with_status(S::Done, Verdict::Pass));
+        assert!(!verdict_disagrees_with_status(S::Running, Verdict::None));
     }
 }

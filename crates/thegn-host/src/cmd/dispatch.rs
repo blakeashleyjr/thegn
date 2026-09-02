@@ -171,6 +171,13 @@ pub enum Action {
         /// completion is printed as such, in both output modes.
         #[arg(long)]
         force: bool,
+        /// Why — recorded as a note on the row. Strongly wanted for a bad
+        /// outcome: 40 of the last run's 45 failed/abandoned rows recorded no
+        /// reason at all, which is what made the roster unreadable after the
+        /// fact. Never required: recording a bad outcome must always be
+        /// possible (see `set_status`).
+        #[arg(long)]
+        why: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -339,8 +346,9 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             id,
             status,
             force,
+            why,
             json,
-        } => set_status(id, &status, force, json),
+        } => set_status(id, &status, force, why.as_deref(), json),
         Action::Verify { id, json } => verify(id, json),
         Action::Wait {
             row,
@@ -695,6 +703,14 @@ fn list(active: bool, json: bool) -> Result<()> {
             // The derived liveness, so a supervisor need not re-implement the
             // exited-vs-running distinction (and get it wrong, as one did).
             v["liveness"] = serde_json::json!(pipeline_run::row_liveness(d, now_ms).token());
+            // The derived verdict, and whether it contradicts the row's status.
+            // Derived rather than stored so it can never drift from the report
+            // it came from (see `pipeline_report::Verdict`).
+            let verdict = pipeline_report::verdict_of(d.report.as_deref());
+            v["verdict"] = serde_json::json!(verdict.as_str());
+            v["verdict_disagrees"] = serde_json::json!(
+                pipeline_report::verdict_disagrees_with_status(d.status, verdict)
+            );
             if let Some(scope) = d
                 .chunk_path
                 .as_deref()
@@ -717,6 +733,10 @@ fn list(active: bool, json: bool) -> Result<()> {
     // How many active rows have an exited worker: the number that turns "121
     // running" from a workload into a backlog. Printed once, after the table.
     let mut stale = 0usize;
+    // Rows whose recorded outcome contradicts their own report. Counted for the
+    // same reason as `stale`: it is invisible from `status`, and it was three
+    // rows in the last run — each one a PASS sitting at `failed`.
+    let mut disagree = 0usize;
     for d in &rows {
         // A row whose worker exited but which nobody closed prints its status
         // with the exit made explicit — `running!exited` rather than a bare
@@ -728,13 +748,25 @@ fn list(active: bool, json: bool) -> Result<()> {
             }
             _ => d.status.as_str().to_string(),
         };
+        // What the worker CONCLUDED, which is a different axis from what
+        // happened to its row. `!` marks the pair that contradict each other.
+        let verdict = pipeline_report::verdict_of(d.report.as_deref());
+        let verdict_cell = if pipeline_report::verdict_disagrees_with_status(d.status, verdict) {
+            disagree += 1;
+            format!("{verdict}!")
+        } else if verdict == pipeline_report::Verdict::None {
+            "-".to_string()
+        } else {
+            verdict.to_string()
+        };
         // The pipeline columns print as `-` when absent rather than collapsing
         // the row's shape, so the table stays column-aligned for a roster that
         // mixes pipeline and plain dispatches.
         outln!(
-            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}  {}",
             d.id,
             status_cell,
+            verdict_cell,
             d.stage.as_deref().unwrap_or("-"),
             d.parent_id
                 .map(|p| p.to_string())
@@ -751,6 +783,14 @@ fn list(active: bool, json: bool) -> Result<()> {
             "\n{stale} row(s) marked `!exited`: the worker is gone but the row is still open. \
              These occupy a slot and are NOT free capacity — run `thegn dispatch verify <id>` \
              and close each with `set-status done|failed` before dispatching more."
+        );
+    }
+    if disagree > 0 {
+        outln!(
+            "\n{disagree} row(s) whose verdict is marked `!`: the row's status contradicts its \
+             own report — a PASS parked at `failed`, or a `done` carrying a FAIL. Usually \
+             bookkeeping lost the row rather than the work being bad; read the report with \
+             `thegn dispatch status <id>` before re-running anything."
         );
     }
     Ok(())
@@ -790,7 +830,31 @@ fn note_cell(note: Option<&str>) -> String {
     }
 }
 
-fn set_status(id: i64, status: &str, force: bool, json: bool) -> Result<()> {
+/// Should recording `status` prompt for a reason that was not given?
+///
+/// Pure so the policy is testable without a DB. True only for an outcome that
+/// closes a row as *bad* while the row carries nothing explaining why — no
+/// `--why`, no report, no prior note. That combination is the one that made 40
+/// of the last run's 45 failed/abandoned rows unreadable after the fact.
+///
+/// This drives a WARNING, never a refusal: a supervisor must always be able to
+/// record a bad outcome, and a gate here would mean the worst outcomes are the
+/// hardest to write down.
+fn wants_a_reason(
+    status: AgentDispatchStatus,
+    why_given: bool,
+    has_report: bool,
+    has_note: bool,
+) -> bool {
+    matches!(
+        status,
+        AgentDispatchStatus::Failed | AgentDispatchStatus::Abandoned
+    ) && !why_given
+        && !has_report
+        && !has_note
+}
+
+fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool) -> Result<()> {
     // Reject an unparseable status up front — writing `Unknown` back would
     // corrupt the roster the fix exists to protect. `Unknown` is a read-only
     // coercion, never a target a caller may set.
@@ -813,11 +877,27 @@ fn set_status(id: i64, status: &str, force: bool, json: bool) -> Result<()> {
         done_gate(&row)?;
     }
     db.update_dispatch_status(id, parsed)?;
+    // The reason rides as a note on the same row, so it reads back through
+    // `dispatch status` beside whatever the worker itself said.
+    // best-effort: the note is context; losing it must never make the outcome
+    // itself unrecordable.
+    if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
+        let _ = db.append_dispatch_note(id, &format!("set-status {}: {w}", parsed.as_str()));
+    }
+    let unexplained = wants_a_reason(
+        parsed,
+        why.is_some_and(|w| !w.trim().is_empty()),
+        row.report.as_deref().is_some_and(|r| !r.trim().is_empty()),
+        row.note.as_deref().is_some_and(|n| !n.trim().is_empty()),
+    );
     if json {
         let mut v = serde_json::json!({ "id": id, "status": parsed.as_str() });
         if force {
             // A forced completion is never invisible.
             v["forced"] = serde_json::json!(true);
+        }
+        if unexplained {
+            v["unexplained"] = serde_json::json!(true);
         }
         return super::emit_json(&v);
     }
@@ -825,6 +905,15 @@ fn set_status(id: i64, status: &str, force: bool, json: bool) -> Result<()> {
         outln!("dispatch {id} → {} (forced)", parsed.as_str());
     } else {
         outln!("dispatch {id} → {}", parsed.as_str());
+    }
+    if unexplained {
+        outln!(
+            "note: row {id} is now {} with nothing recording why — no --why, no report, no \
+             note. That is how 40 of the last run's 45 bad rows became unreadable. Pass \
+             `--why '<reason>'` next time, or add one now with `thegn dispatch note {id} \
+             --text '<reason>'`.",
+            parsed.as_str()
+        );
     }
     Ok(())
 }
@@ -1480,6 +1569,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join(format!("{name}.db"))).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn a_bad_outcome_prompts_for_a_reason_but_is_never_blocked() {
+        use thegn_core::issue::AgentDispatchStatus as S;
+        // The case that made 40 of 45 bad rows unreadable: closed as failed
+        // with nothing at all recording why.
+        assert!(wants_a_reason(S::Failed, false, false, false));
+        assert!(wants_a_reason(S::Abandoned, false, false, false));
+        // Any one source of explanation is enough — the point is that SOMETHING
+        // says why, not that it came from this flag.
+        assert!(
+            !wants_a_reason(S::Failed, true, false, false),
+            "--why given"
+        );
+        assert!(
+            !wants_a_reason(S::Failed, false, true, false),
+            "the worker's own report explains it"
+        );
+        assert!(
+            !wants_a_reason(S::Failed, false, false, true),
+            "a prior note (e.g. the reaper's) explains it"
+        );
+        // A good outcome is not interrogated, and `done` has its own gate.
+        assert!(!wants_a_reason(S::Done, false, false, false));
+        assert!(!wants_a_reason(S::Merged, false, false, false));
+        assert!(!wants_a_reason(S::WaitingHuman, false, false, false));
     }
 
     #[test]
