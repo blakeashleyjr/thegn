@@ -1111,7 +1111,7 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # which may also carry its own [keybinds] table — the most specific layer wins.
 # [project.my-repo.keybinds]
 # new-worktree = "Alt w"
-# [workspace.my-repo.ci]
+# [project.my-repo.ci]
 # mode = "off"                         # trusted override for [ci.autofix].mode
 
 # Per-worktree lifecycle commands for this project. These lists accumulate
