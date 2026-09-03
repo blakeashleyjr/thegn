@@ -106,17 +106,23 @@ cycle planning, and generated-Dockerfile feature layers are reserved.
 ## Visibility without live builds
 
 `thegn doctor` reads the current repo context, selection result, persisted
-approvals, parser inventory, and resolved backend honorability. Its only
+approvals, fully resolved worktree environment, and backend honorability. For an
+explicitly uncontained local environment it reports devcontainer execution as
+off without parsing the repo file. Its only
 process probe is bounded `devcontainer --version`; it does not pull an image,
 build, start a container, execute lifecycle code, or make a network probe. Text
 output is headed `Devcontainer support` and reports `mode`, `repo`,
 `candidates`, `selected`, optional `selection`, `provider`, `status`, `trust`,
 and `backend`. JSON exposes the corresponding detailed lists.
 
-Off-loop hydration computes the same transient status for each worktree. The
-sidebar and active tab-bar environment cluster show
+Off-loop hydration computes the same transient status for each worktree from
+the worktree's fully resolved environment (including workspace/worktree env
+selection and its sandbox overlay). An explicitly uncontained local environment
+does not read or apply repo devcontainer configuration. The sidebar shows
 `dc:<selected-path> [<state>]`, or `dc:[<state>]` when no path is selected. The
-states are:
+active tab-bar environment cluster shows that token only when the observed
+runtime backend is the devcontainer provider; repository/config status must not
+masquerade as active containment. The states are:
 
 - `off`: effective mode disabled;
 - `ambiguous`: multiple variants need a selector;

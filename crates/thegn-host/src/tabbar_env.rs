@@ -16,21 +16,13 @@ use termwiz::surface::Surface;
 /// `(backend)` first (when sandboxed), then the terse placement `[kind]` (when
 /// remote). Empty when the worktree runs locally with no sandbox.
 pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
-    let mut chips = Vec::new();
-    // Sandbox backend — same filter as the sidebar detail line: skip the
-    // no-op backends so a plain local worktree shows nothing.
     let backend = model.active_sandbox_backend.as_str();
-    if !backend.is_empty() && backend != "none" && backend != "host" {
-        chips.push(format!("({backend})"));
-    }
-    if let Some(status) = model
+    let devcontainer_status = model
         .sidebar_rows
         .iter()
         .find(|row| row.active && matches!(row.kind, crate::sidebar::RowKind::Worktree))
-        .and_then(|row| row.devcontainer_status.as_deref())
-    {
-        chips.push(status.to_string());
-    }
+        .and_then(|row| row.devcontainer_status.as_deref());
+    let mut chips = runtime_sandbox_chips(backend, devcontainer_status);
     // Remote placement kind (ssh/mosh/k8s/<provider>); `None` when local. The
     // full detail (ssh:host, sprite:<id>, …) lives in the System → Sandbox panel.
     if let Some(kind) = &model.active_placement_kind {
@@ -48,6 +40,20 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
         }
     }
     chips
+}
+
+/// Runtime-truthful sandbox chips. A devcontainer status is repository/config
+/// metadata until the observed backend confirms this pane actually entered the
+/// devcontainer provider. Pending/degraded metadata remains available in the
+/// sidebar, but never masquerades as active containment in the tab bar.
+fn runtime_sandbox_chips(backend: &str, devcontainer_status: Option<&str>) -> Vec<String> {
+    if backend == "devcontainer" {
+        return vec![devcontainer_status.unwrap_or("(devcontainer)").to_string()];
+    }
+    if !backend.is_empty() && backend != "none" && backend != "host" {
+        return vec![format!("({backend})")];
+    }
+    Vec::new()
 }
 
 /// Total columns the env cluster occupies, including the one-column leading gap
@@ -93,4 +99,24 @@ pub(crate) fn draw_env_chips(
         x += chip.chars().count();
     }
     start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_sandbox_chips;
+
+    #[test]
+    fn repo_devcontainer_status_never_labels_a_host_pane_as_contained() {
+        let pending = "dc:.devcontainer.json [pending]";
+        assert!(runtime_sandbox_chips("host", Some(pending)).is_empty());
+        assert!(runtime_sandbox_chips("none", Some(pending)).is_empty());
+        assert_eq!(
+            runtime_sandbox_chips("docker", Some(pending)),
+            vec!["(docker)"]
+        );
+        assert_eq!(
+            runtime_sandbox_chips("devcontainer", Some(pending)),
+            vec![pending]
+        );
+    }
 }

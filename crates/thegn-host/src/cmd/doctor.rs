@@ -198,7 +198,15 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
         .as_ref()
         .map(|db| crate::handlers::repo_trust::approvals_for(db, &root.to_string_lossy()))
         .unwrap_or_else(thegn_core::config_resolve::Approvals::deny_all);
-    let sandbox = cfg.repo_sandbox_resolved(&root, &approvals).sandbox;
+    let environment = crate::handlers::repo_trust::effective_environment_for_worktree(
+        cfg,
+        db.as_ref(),
+        &root,
+        &worktree,
+        None,
+        &approvals,
+    );
+    let sandbox = environment.sandbox.clone();
     if sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
         return serde_json::json!({
             "mode": "off",
@@ -206,6 +214,20 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
             "candidates": [],
             "selected": null,
             "status": { "variant": "", "state": "off", "reason": "disabled by repo sandbox policy" },
+        });
+    }
+    if !environment.allows_devcontainer() {
+        let reason = if sandbox.enabled {
+            "effective local environment is explicitly uncontained"
+        } else {
+            "sandboxing is disabled in the effective environment"
+        };
+        return serde_json::json!({
+            "mode": sandbox.devcontainer.as_str(),
+            "repo": root.display().to_string(),
+            "candidates": [],
+            "selected": null,
+            "status": { "variant": "", "state": "off", "reason": reason },
         });
     }
     let selection = thegn_core::devcontainer_select::select_and_parse(
@@ -236,7 +258,7 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
     });
     let Some(config) = selection.config.as_ref() else {
         return serde_json::json!({
-            "mode": cfg.sandbox.devcontainer.as_str(),
+            "mode": sandbox.devcontainer.as_str(),
             "repo": root.display().to_string(),
             "candidates": candidates,
             "selected": selected,
@@ -279,7 +301,7 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
         config, &selection, &worktree, &sandbox, &approvals, &probe,
     );
     serde_json::json!({
-        "mode": cfg.sandbox.devcontainer.as_str(),
+        "mode": sandbox.devcontainer.as_str(),
         "repo": root.display().to_string(),
         "candidates": candidates,
         "selected": selected,

@@ -363,10 +363,21 @@ pub(crate) fn status_for_worktree(
     cfg: &thegn_core::config::Config,
     repo_root: &Path,
     worktree: &Path,
-    sandbox: &thegn_core::config::SandboxConfig,
+    environment: &thegn_core::env::Environment,
     approvals: &thegn_core::config_resolve::Approvals,
     probe: &ProbeReport,
 ) -> Option<DevcontainerStatus> {
+    // An explicitly uncontained local environment is a deliberate execution
+    // choice, not a failed devcontainer launch. Hide repo devcontainer status
+    // there and, consistently with launch/provisioning, do not solicit approvals
+    // for config that cannot affect the pane.
+    if !environment.sandbox.enabled
+        || (environment.placement.is_local()
+            && environment.sandbox.backend == thegn_core::config::SandboxBackend::None)
+    {
+        return None;
+    }
+    let sandbox = &environment.sandbox;
     if sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
         return Some(DevcontainerStatus {
             variant: String::new(),
@@ -902,5 +913,31 @@ mod tests {
             },
         );
         assert_eq!(status.state, DevcontainerState::Degraded);
+    }
+
+    #[test]
+    fn status_is_hidden_for_an_explicitly_uncontained_local_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".devcontainer.json"), r#"{"image":"repo"}"#).unwrap();
+        let sandbox = thegn_core::config::SandboxConfig {
+            backend: thegn_core::config::SandboxBackend::None,
+            ..Default::default()
+        };
+        let environment = thegn_core::env::Environment {
+            name: "host".into(),
+            placement: thegn_core::placement::Placement::Local,
+            sandbox,
+            data: thegn_core::config::DataMode::InEnv,
+            unresolved_selection: false,
+        };
+        let status = status_for_worktree(
+            &thegn_core::config::Config::default(),
+            dir.path(),
+            dir.path(),
+            &environment,
+            &thegn_core::config_resolve::Approvals::deny_all(),
+            &ProbeReport::unavailable("not installed"),
+        );
+        assert_eq!(status, None);
     }
 }

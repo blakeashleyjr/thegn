@@ -19,7 +19,7 @@ use thegn_core::devcontainer_overlay;
 use thegn_core::devcontainer_select;
 use thegn_core::env::Environment;
 use thegn_core::remote::GitLoc;
-use thegn_core::store::{NotificationStore, RepoTrustStore, ZoneStore};
+use thegn_core::store::{NotificationStore, RepoTrustStore, WorkspaceStore, ZoneStore};
 
 /// Notification kind for a clamped/pending repo overlay request.
 pub(crate) const CLAMP_KIND: &str = "repo_config_trust";
@@ -53,6 +53,29 @@ pub(crate) fn approvals_for(db: &Db, repo_root: &str) -> Approvals {
             Approvals::deny_all()
         }
     }
+}
+
+/// Resolve the same effective environment used by pane launch for a registered
+/// worktree. Read-only status/provisioning callers must not stop at the base
+/// repo sandbox: doing so drops the workspace/worktree env selection and its
+/// `[env.<name>.sandbox]` overlay.
+pub(crate) fn effective_environment_for_worktree(
+    cfg: &Config,
+    db: Option<&Db>,
+    repo_root: &Path,
+    worktree: &Path,
+    location: Option<&str>,
+    approvals: &Approvals,
+) -> Environment {
+    let worktree_s = worktree.to_string_lossy();
+    let repo_s = repo_root.to_string_lossy();
+    let persisted_location = location
+        .map(str::to_string)
+        .or_else(|| db.and_then(|db| db.location_for(&worktree_s).ok().flatten()));
+    let loc = GitLoc::from_db(&worktree_s, persisted_location.as_deref());
+    let selected = db.and_then(|db| db.effective_env(&worktree_s, &repo_s));
+    cfg.resolve_env_with(repo_root, &loc, worktree, selected.as_deref(), approvals)
+        .0
 }
 
 /// Resolve the effective [`Environment`] for a worktree honouring persisted
@@ -98,7 +121,11 @@ pub(crate) fn resolve_env_trusted(
     // exactly like the `.thegn.toml` overlay above. The worktree is bind-
     // mounted at its real path, so the devcontainer's workspace folder is that
     // same path. No-op without a devcontainer.json.
-    let devcontainer = overlay_devcontainer(cfg, repo_root, worktree, &mut env.sandbox);
+    let devcontainer = if env.allows_devcontainer() {
+        overlay_devcontainer(cfg, repo_root, worktree, &mut env.sandbox)
+    } else {
+        None
+    };
     apply_zone(&db, cfg, worktree, &mut env);
     TrustedEnvironment {
         environment: env,
@@ -238,19 +265,27 @@ pub(crate) fn devcontainer_lifecycle_steps(
     workdir: &str,
 ) -> Vec<thegn_core::envplan::ProvisionStep> {
     let cfg = crate::hydrate::load_hydration_config();
-    let sb = cfg.repo_sandbox(repo_root);
-    if sb.devcontainer == thegn_core::config::DevcontainerMode::Off {
+    let Ok(db) = Db::open() else {
+        return Vec::new();
+    };
+    let approvals = approvals_for(&db, &repo_root.to_string_lossy());
+    let env = effective_environment_for_worktree(
+        &cfg,
+        Some(&db),
+        repo_root,
+        Path::new(worktree),
+        None,
+        &approvals,
+    );
+    if !env.allows_devcontainer() {
         return Vec::new();
     }
+    let sb = env.sandbox;
     let selector = cfg.repo_devcontainer_selector(repo_root);
     let selected = devcontainer_select::select_and_parse(Path::new(worktree), Some(&selector));
     let Some(dc) = selected.config else {
         return Vec::new();
     };
-    let Ok(db) = Db::open() else {
-        return Vec::new();
-    };
-    let approvals = approvals_for(&db, &repo_root.to_string_lossy());
     let allowed = sb.env_passthrough.clone();
     let local_env = |key: &str| {
         allowed
@@ -271,8 +306,19 @@ pub(crate) fn devcontainer_feature_steps(
     worktree: &str,
 ) -> Vec<thegn_core::envplan::ProvisionStep> {
     let cfg = crate::hydrate::load_hydration_config();
-    let sb = cfg.repo_sandbox(repo_root);
-    if sb.devcontainer == thegn_core::config::DevcontainerMode::Off {
+    let Ok(db) = Db::open() else {
+        return Vec::new();
+    };
+    let approvals = approvals_for(&db, &repo_root.to_string_lossy());
+    let env = effective_environment_for_worktree(
+        &cfg,
+        Some(&db),
+        repo_root,
+        Path::new(worktree),
+        None,
+        &approvals,
+    );
+    if !env.allows_devcontainer() {
         return Vec::new();
     }
     let selector = cfg.repo_devcontainer_selector(repo_root);
@@ -280,10 +326,6 @@ pub(crate) fn devcontainer_feature_steps(
     let Some(dc) = selected.config else {
         return Vec::new();
     };
-    let Ok(db) = Db::open() else {
-        return Vec::new();
-    };
-    let approvals = approvals_for(&db, &repo_root.to_string_lossy());
     let remote_user = dc.remote_user.as_deref().unwrap_or("root");
     devcontainer_overlay::gated_feature_steps(&dc, remote_user, &approvals)
 }
