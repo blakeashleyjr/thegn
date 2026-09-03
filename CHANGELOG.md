@@ -7,6 +7,68 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — the sidebar names its sort, and holds it while you navigate
+
+- **The active sort mode is now on screen.** It is the quiet word at the right
+  of the `WORKSPACES` header, and clicking it opens the sort menu. Previously
+  the mode lived only inside the `s` menu, so a `live` sort quietly reordering
+  rows read as the sidebar misbehaving rather than as a mode doing its job.
+  The chip degrades by dropping rather than clipping — a narrow column loses
+  the qualifier, then the whole chip — and yields the header row to the `/`
+  filter. The NAVIGATE footer's `s` row now reads `sort: <mode>` too. (The
+  one-line statusbar strip is deliberately unchanged; it elides under width
+  pressure, and a 15-cell hint there would evict an essential one.)
+- **The `attention` and `live` sorts no longer re-rank under the cursor.**
+  Both order by a signal that changes on its own — tier ranks and last-active
+  time, recomputed off-loop every few seconds — so a row you were walking
+  towards could move as you reached it. The ordering keys are now held for as
+  long as the sidebar has focus (the chip appends `hold`), and for ~2s after an
+  `Alt-↑↓` / `Alt-1-9` jump made from a pane, where the sidebar never takes
+  focus. The order re-settles the moment focus moves into a pane. A worktree
+  created while the order is held still sorts to its real position rather than
+  being exiled to the bottom, and project blocks are held too under `[ui]
+sidebar_project_sort = "attention"`. Expiry is evaluated lazily on a frame
+  that was happening anyway — no timer, no wake source, nothing at idle. New
+  `[ui] sidebar_freeze_sort` (default `true`); a no-op under manual/name/recent,
+  which never move on their own.
+
+### Fixed — `just smoke` is green again (and actually hermetic)
+
+- `test/smoke.sh` now clears `THEGN_DATABASE_MIGRATION_EXECUTABLE` and
+  `THEGN_DATABASE_MIGRATION_AUTHORITY`. Both are ambient in any shell started
+  from inside a live thegn, and inheriting them pinned migration authority to a
+  _different_ binary than the one under test — every schema advance in a
+  database the script owns outright was refused. The v5→v6 layout check now
+  also opts into `migration_authority = any` for its one `thegn list` call,
+  since `controller` (the default) forbids ordinary CLIs from advancing a
+  schema at all.
+- Two lifecycle-hook checks had been failing since branch prefixes existed:
+  both compared `$THEGN_BRANCH` against a bare worktree name, but hooks
+  correctly receive the real branch (`tg/smoke-cli`). The pre-create check now
+  pins the hook's value to what git reports rather than hardcoding a prefix,
+  and the pre-destroy veto matches on suffix — so the refusal that check exists
+  to prove is actually exercised now.
+- `config explain` has named the layer `project` since the workspace→project
+  rename; the assertion still grepped for `workspace`.
+- A failed `session move` left no target database, and the unguarded `sqlite3`
+  read of it aborted the whole suite under `set -e` — reporting a bare "unable
+  to open database file" and skipping every remaining check. Those reads now
+  fall back to a sentinel so the failure surfaces in its own check.
+
+### Fixed — `manual` sidebar order is actually stable
+
+- A worktree no longer changes place under `manual` sort when it is loaded or
+  unloaded. Manual order keyed on a tie-break that conflated two independent
+  sequences — live groups numbered by their session slot, registry-reconstructed
+  rows numbered _after_ all of them — so a worktree crossing between the two
+  re-sorted against its siblings even though its persisted position never moved.
+  Activating a dormant row appends it to the session and would bump it up the
+  list permanently; a failed create demoted one to the tail; and the same repo
+  could read in a different order depending on whether you reached it by a warm
+  switch or a cold restore. Manual now ranks on the registry itself, so the tree
+  reads the same live, dormant, warm and cold. Worktrees with no registry row
+  keep their session slot and sort first, matching how a session resurrects.
+
 ### Changed — the sidebar tree reads tighter
 
 - Adjacent projects are now separated by an **alternating background tint**

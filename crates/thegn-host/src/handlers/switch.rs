@@ -268,6 +268,15 @@ mod tests {
         sort: crate::sidebar::SortMode,
         ranks: &[(&str, u32)],
     ) -> (FrameModel, SidebarState) {
+        built_maybe_frozen(session, sort, ranks, false)
+    }
+
+    fn built_maybe_frozen(
+        session: &Session,
+        sort: crate::sidebar::SortMode,
+        ranks: &[(&str, u32)],
+        frozen: bool,
+    ) -> (FrameModel, SidebarState) {
         let mut model = crate::hydrate::build_initial_model(session, None);
         let mut sb = SidebarState::default();
         sb.view.sort = sort;
@@ -276,6 +285,11 @@ mod tests {
                 .sidebar_status
                 .attention_ranks
                 .insert((*p).to_string(), *r);
+        }
+        if frozen {
+            sb.freeze_sort = true;
+            sb.focused = true;
+            crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
         }
         crate::run::refresh_tab_model(&mut model, session, &mut sb);
         (model, sb)
@@ -325,6 +339,47 @@ mod tests {
             assert_eq!(light_model.worktree, full_model.worktree);
             assert_eq!(light_model.tabs, full_model.tabs);
             assert_eq!(light_model.active_tab, full_model.active_tab);
+        }
+    }
+
+    /// The same invariant with the sort freeze armed. The fast path never calls
+    /// `build_rows`, so it cannot consult the freeze at all — which is only safe
+    /// because a frozen rebuild produces the same rows. If the freeze ever
+    /// started depending on the active pointer, this is what would catch it.
+    #[test]
+    fn retarget_matches_full_rebuild_with_the_sort_freeze_armed() {
+        for sort in [
+            crate::sidebar::SortMode::Manual,
+            crate::sidebar::SortMode::Attention,
+            crate::sidebar::SortMode::Live,
+        ] {
+            let ranks = [
+                ("/tmp/app-fix", 0u32),
+                ("/tmp/app", 1),
+                ("/tmp/app-feat", 2),
+            ];
+            let mut session = session_two_workspaces();
+            let (mut light_model, mut light_sb) = built_maybe_frozen(&session, sort, &ranks, true);
+            let (mut full_model, mut full_sb) = built_maybe_frozen(&session, sort, &ranks, true);
+
+            // The world re-ranks underneath, as a hydration pass would. The
+            // freeze must absorb it identically on both paths.
+            for m in [&mut light_model, &mut full_model] {
+                m.sidebar_status
+                    .attention_ranks
+                    .insert("/tmp/app-feat".into(), 0);
+            }
+
+            session.switch_to(2);
+            refresh_tab_model_switch(&mut light_model, &session, &mut light_sb);
+            crate::run::refresh_tab_model(&mut full_model, &session, &mut full_sb);
+
+            assert_eq!(
+                rows_debug(&light_model),
+                rows_debug(&full_model),
+                "frozen patch ≡ rebuild violated under {sort:?}"
+            );
+            assert_eq!(light_sb.cursor, full_sb.cursor, "cursor under {sort:?}");
         }
     }
 

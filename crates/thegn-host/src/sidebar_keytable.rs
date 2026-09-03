@@ -420,6 +420,7 @@ pub fn hints(tier: HintTier) -> Vec<(String, String)> {
 pub fn footer_hints(
     cfg: &thegn_core::config::Config,
     ctrl_digits_reportable: Option<bool>,
+    sort: crate::sidebar::SortMode,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (id, label) in [
@@ -435,6 +436,14 @@ pub fn footer_hints(
         }
     }
     out.extend(hints(HintTier::Common));
+    // Name the active mode on the `s` row, so the footer answers "which sort am
+    // I in?" as well as "how do I change it". The footer has the width for it;
+    // the Essential statusbar strip deliberately does not (see `sidebar_help`).
+    for (_, label) in out.iter_mut() {
+        if label == "sort" {
+            *label = format!("sort: {}", sort.as_str());
+        }
+    }
     out
 }
 
@@ -613,7 +622,7 @@ mod tests {
     #[test]
     fn footer_jump_hints_follow_rebinds() {
         let mut cfg = thegn_core::config::Config::default();
-        let default = footer_hints(&cfg, None);
+        let default = footer_hints(&cfg, None, crate::sidebar::SortMode::default());
         assert!(
             default.iter().any(|(_, l)| l == "jump worktree"),
             "{default:?}"
@@ -621,7 +630,7 @@ mod tests {
 
         cfg.keybinds
             .insert("summon-worktree-1".to_string(), "Super 1".to_string());
-        let rebound = footer_hints(&cfg, None);
+        let rebound = footer_hints(&cfg, None, crate::sidebar::SortMode::default());
         let chord = rebound
             .iter()
             .find(|(_, l)| l == "jump worktree")
@@ -639,7 +648,7 @@ mod tests {
     fn footer_drops_the_workspace_row_only_when_ctrl_digits_are_proved_dead() {
         let cfg = thegn_core::config::Config::default();
         let labels = |ctrl: Option<bool>| -> Vec<String> {
-            footer_hints(&cfg, ctrl)
+            footer_hints(&cfg, ctrl, crate::sidebar::SortMode::default())
                 .into_iter()
                 .map(|(_, l)| l)
                 .collect()
@@ -666,7 +675,7 @@ mod tests {
         let mut cfg = thegn_core::config::Config::default();
         cfg.keybinds
             .insert("summon-project-1".to_string(), "Ctrl Alt q".to_string());
-        let rows = footer_hints(&cfg, Some(false));
+        let rows = footer_hints(&cfg, Some(false), crate::sidebar::SortMode::default());
         assert!(
             rows.iter().any(|(_, l)| l == "jump project"),
             "a rebound family still works: {rows:?}"

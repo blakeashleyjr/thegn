@@ -287,6 +287,10 @@ impl SidebarState {
             self.view.sort = crate::sidebar::SortMode::Manual;
             self.persist("sort_mode", self.view.sort.as_str());
         }
+        // Manual never freezes (it has no computed key to hold), and the whole
+        // point of the move is that the order changed — drop any snapshot the
+        // previous mode left armed or the move would be invisible.
+        crate::sidebar_freeze::thaw(self);
         // Stamp the optimistic edit so the model swap keeps these lists while
         // the deferred write is in flight (see `optimistic_db_edit_at`).
         self.optimistic_db_edit_at = Some(std::time::Instant::now());

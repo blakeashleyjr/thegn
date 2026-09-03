@@ -406,6 +406,11 @@ pub struct FrameModel {
     pub sidebar_filtering: bool,
     /// The current sort mode, shown in the header.
     pub sidebar_sort: crate::sidebar::SortMode,
+    /// True while the sort keys are held — the order will not move under the
+    /// cursor (see `crate::sidebar_freeze`). Renders as the header chip's
+    /// `hold` mark. Mirrored from `SidebarState`, so it is loop-owned like
+    /// `sidebar_focused` and deliberately outside hydration equality.
+    pub sidebar_sort_frozen: bool,
     /// Row indices (into the visible list) that are multi-selected.
     pub sidebar_marked: std::collections::HashSet<usize>,
     /// When `Some`, an open row context menu: (anchor visible-row index,

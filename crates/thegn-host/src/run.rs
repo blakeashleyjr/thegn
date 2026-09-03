@@ -1361,6 +1361,19 @@ impl SidebarState {
     /// Rederive `model.sidebar_rows` from its data carriers + this view state,
     /// then mirror interaction fields into the model for the renderer.
     pub(crate) fn rebuild(&mut self, model: &mut FrameModel, session: &crate::session::Session) {
+        // Lazy freeze expiry: no timer, no wake source. A freeze held by focus
+        // lives as long as the focus does; a grace freeze (the post-jump window)
+        // simply stops applying the next time something ELSE already caused a
+        // rebuild — which the 500ms hydration ticker guarantees within a tick of
+        // the deadline. `rebuild` is never called on a `Skip`/`Panes` frame, so
+        // this costs nothing at idle.
+        if !self.focused
+            && self
+                .freeze_until
+                .is_none_or(|t| std::time::Instant::now() >= t)
+        {
+            crate::sidebar_freeze::thaw(self);
+        }
         // Overlay a loading dot on worktrees mid-creation, re-applied every
         // rebuild so a hydration pass can't drop the marker.
         for name in &self.creating {
@@ -1457,6 +1470,10 @@ impl SidebarState {
         model.sidebar_filter = self.view.filter.clone();
         model.sidebar_filtering = self.filtering;
         model.sidebar_sort = self.view.sort;
+        // `is_computed` guards the mark as well as the arming: a `hold` under
+        // manual/name/recent would advertise a hold the user cannot observe,
+        // since those orders never move on their own in the first place.
+        model.sidebar_sort_frozen = self.view.freeze.is_some() && self.view.sort.is_computed();
         // Project the stable mark identities onto the current visible-row
         // indices the renderer paints (`chrome::row_bg`). Re-derived every frame
         // so marks always land on the right rows after any rebuild.
@@ -6215,6 +6232,7 @@ async fn event_loop<T: Terminal>(
     let mut sb = SidebarState::default();
     sb.view.workspace_sort = keymap.config().ui.sidebar_workspace_sort;
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
+    sb.freeze_sort = keymap.config().ui.sidebar_freeze_sort;
     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
     // The drag-set Normal width, restored below; takes precedence over the
@@ -7867,6 +7885,22 @@ async fn event_loop<T: Terminal>(
         let sidebar_focus_gained = focus.sidebar() && prev_zone != crate::focus::Zone::Sidebar;
         prev_zone = focus.zone;
         sb.focused = focus.sidebar();
+        // Freeze the worktree order for as long as the user is on the bar, so a
+        // computed sort (attention/live) can't re-rank a row out from under the
+        // cursor mid-navigation. Captured HERE, on the focus edge, rather than
+        // inside `rebuild`: `model.sidebar_status` at this point is what the
+        // last `build_rows` consumed — i.e. the order actually on screen. A
+        // hydration landing later in the same iteration has already swapped the
+        // status, and capturing from that would pin the order one hop AFTER the
+        // user watched it move.
+        //
+        // Nothing thaws here: `rebuild`'s lazy expiry already drops the freeze
+        // once focus has left AND any post-jump grace has run out, which is the
+        // same condition and — unlike a bare `else` on this edge — doesn't
+        // cancel the grace freeze a pane-driven Alt+↑/↓ just armed.
+        if sidebar_focus_gained {
+            crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+        }
 
         // Detect an active-worktree change centrally so every switch path is
         // covered without per-call-site wiring.
@@ -10858,6 +10892,14 @@ async fn event_loop<T: Terminal>(
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
+                    sb.freeze_sort = new_cfg.ui.sidebar_freeze_sort;
+                    // Turning the key off must take effect NOW. `arm` already
+                    // refuses to re-arm, but a freeze taken before the edit
+                    // would otherwise hold until focus next left the sidebar,
+                    // so the user would see the setting do nothing.
+                    if !sb.freeze_sort {
+                        crate::sidebar_freeze::thaw(&mut sb);
+                    }
                     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&new_cfg.ui);
                     // `workspace_sort`/`terminals_section` are only read inside
                     // `build_rows`, and nothing else on the reload path
@@ -11717,8 +11759,11 @@ async fn event_loop<T: Terminal>(
         model.mode_chip =
             crate::voice::mode_chip(mode, current_config.ui.full_mode_chip, voice.is_recording());
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
-        model.sidebar_hints =
-            crate::sidebar_keytable::footer_hints(keymap.config(), model.ctrl_digits_reportable);
+        model.sidebar_hints = crate::sidebar_keytable::footer_hints(
+            keymap.config(),
+            model.ctrl_digits_reportable,
+            sb.view.sort,
+        );
         model.splash_hints = crate::logotype::splash_hints(keymap.config());
         // Chords the chrome names inline (see `FrameModel::chord`). Kept to the
         // handful of ids actually mentioned in draw code, not the whole registry.
@@ -15758,6 +15803,10 @@ async fn event_loop<T: Terminal>(
                             {
                                 sb.view.sort = crate::sidebar::SortMode::from_str(arg);
                                 sb.persist("sort_mode", sb.view.sort.as_str());
+                                // The user just asked for a different order;
+                                // showing them the frozen one would be a bug.
+                                // Re-arm so the NEW order is what gets held.
+                                crate::sidebar_freeze::rearm(&mut sb, &model.sidebar_status);
                                 sb.rebuild(&mut model, &session);
                                 model.status = format!("Sort: {}", sb.view.sort.as_str());
                                 dirty = true;
@@ -20701,6 +20750,15 @@ async fn event_loop<T: Terminal>(
                                     std::time::Instant::now(),
                                     crate::perf::SwitchKind::Worktree,
                                 ));
+                                // Hold the order across the jump. This path runs
+                                // with a PANE focused, so the focus-edge freeze
+                                // never armed — without the grace, the hydration
+                                // tick landing 0-500ms later would re-rank the
+                                // list the user is stepping through.
+                                crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+                                sb.freeze_until = Some(
+                                    std::time::Instant::now() + crate::sidebar_freeze::FREEZE_GRACE,
+                                );
                                 // Reveal first: if the active workspace/folder is
                                 // collapsed its worktrees are invisible to
                                 // `sidebar_worktree_order` (which `cycle_worktree`
@@ -21011,6 +21069,16 @@ async fn event_loop<T: Terminal>(
                                 // N in the *visible* sidebar order — the same
                                 // order Alt+↑/↓ walks and the digit hints reveal.
                                 // Out-of-range N or already-active is a no-op.
+                                //
+                                // Hold the order across the jump, for the same
+                                // reason Next/PrevWorktree does: the digit maps
+                                // to a *visible slot*, so a re-rank between this
+                                // jump and the next would renumber the slots the
+                                // user just read off the hints.
+                                crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+                                sb.freeze_until = Some(
+                                    std::time::Instant::now() + crate::sidebar_freeze::FREEZE_GRACE,
+                                );
                                 let order = sidebar_worktree_order(&model);
                                 if let Some(&g) = order.get((n as usize).saturating_sub(1))
                                     && g != session.active
