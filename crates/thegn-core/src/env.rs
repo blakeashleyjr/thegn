@@ -15,7 +15,7 @@
 //! env onto the base `[sandbox]` and returns one of these. The default env (no
 //! `[env.*]` selected) reproduces today's behavior exactly.
 
-use crate::config::{DataMode, SandboxConfig};
+use crate::config::{DataMode, DevcontainerMode, SandboxBackend, SandboxConfig};
 use crate::placement::Placement;
 
 /// A fully-resolved execution environment for a worktree.
@@ -48,6 +48,21 @@ impl Environment {
     /// A short status label, e.g. `default · local`, `company-k8s · k8s:ns/pod`.
     pub fn label(&self) -> String {
         format!("{} · {}", self.name, self.placement.label())
+    }
+
+    /// Whether repo-authored devcontainer configuration can affect this
+    /// environment. An explicitly uncontained local env (`backend = none`) is a
+    /// deliberate request to run on the host, so discovering a repo
+    /// `devcontainer.json` must not silently turn that choice back into a
+    /// container or surface execution approvals that can never be applied.
+    ///
+    /// A non-local env may legitimately use `backend = none`: its placement
+    /// (provider VM, pod, or SSH host) is already the execution boundary, and
+    /// the native feature/lifecycle plan can still run there.
+    pub fn allows_devcontainer(&self) -> bool {
+        self.sandbox.enabled
+            && self.sandbox.devcontainer != DevcontainerMode::Off
+            && !(self.placement.is_local() && self.sandbox.backend == SandboxBackend::None)
     }
 }
 
@@ -85,5 +100,37 @@ mod tests {
         };
         assert_eq!(k8s.label(), "company-k8s · k8s:ns/p");
         assert!(k8s.is_remote());
+    }
+
+    #[test]
+    fn explicitly_uncontained_local_env_disables_devcontainer_execution() {
+        let sandbox = SandboxConfig {
+            backend: SandboxBackend::None,
+            ..Default::default()
+        };
+        let mut env = Environment {
+            name: "host".into(),
+            placement: Placement::Local,
+            sandbox,
+            data: DataMode::InEnv,
+            unresolved_selection: false,
+        };
+        assert!(!env.allows_devcontainer());
+
+        // `none` on a remote/provider placement means the placement itself is
+        // the boundary; devcontainer feature/lifecycle planning remains valid.
+        env.placement = Placement::K8s(crate::placement::K8sPlacement {
+            kubectl: "kubectl".into(),
+            context: None,
+            namespace: None,
+            pod: "p".into(),
+            container: None,
+            pod_template: None,
+            image: None,
+        });
+        assert!(env.allows_devcontainer());
+
+        env.sandbox.devcontainer = DevcontainerMode::Off;
+        assert!(!env.allows_devcontainer());
     }
 }

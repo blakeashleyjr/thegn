@@ -1696,14 +1696,19 @@ fn collect_sidebar_status(
             continue;
         }
         let approvals = crate::handlers::repo_trust::approvals_for(db, &wt.repo_root);
-        let sandbox = app_cfg
-            .repo_sandbox_resolved(std::path::Path::new(&wt.repo_root), &approvals)
-            .sandbox;
+        let environment = crate::handlers::repo_trust::effective_environment_for_worktree(
+            app_cfg,
+            Some(db),
+            std::path::Path::new(&wt.repo_root),
+            std::path::Path::new(&wt.worktree),
+            Some(&wt.location),
+            &approvals,
+        );
         if let Some(devcontainer) = crate::devcontainer_provider::status_for_worktree(
             app_cfg,
             std::path::Path::new(&wt.repo_root),
             std::path::Path::new(&wt.worktree),
-            &sandbox,
+            &environment,
             &approvals,
             &devcontainer_probe,
         ) {

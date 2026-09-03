@@ -883,6 +883,43 @@ fn inherited_remote_ambient_env_survives_missing_local_dir() {
     let _ = std::fs::remove_dir_all(p.parent().unwrap()); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
+#[test]
+fn devcontainer_status_resolves_the_repo_selected_host_environment() {
+    use thegn_core::config::{Config, EnvConfig, PlacementMode, SandboxBackend, SandboxOverlay};
+
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join(".thegn.toml"), "env = \"host\"\n").unwrap();
+    let mut cfg = Config {
+        sandbox: thegn_core::config::SandboxConfig {
+            backend: SandboxBackend::Bwrap,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.env.insert(
+        "host".into(),
+        EnvConfig {
+            placement: PlacementMode::Local,
+            sandbox: SandboxOverlay {
+                backend: Some(SandboxBackend::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let environment = crate::handlers::repo_trust::effective_environment_for_worktree(
+        &cfg,
+        None,
+        repo.path(),
+        repo.path(),
+        None,
+        &thegn_core::config_resolve::Approvals::deny_all(),
+    );
+    assert_eq!(environment.name, "host");
+    assert_eq!(environment.sandbox.backend, SandboxBackend::None);
+    assert!(!environment.allows_devcontainer());
+}
+
 // --- THE-73: only git may condemn a worktree row -----------------------
 
 /// A real git repo at `root` with one linked worktree at `linked` (whose parent
