@@ -65,6 +65,17 @@ pub struct UiConfig {
     pub sidebar_workspace_sort: WorkspaceSort,
     /// Sidebar TERMINALS section visibility (see [`TerminalsSection`]).
     pub sidebar_terminals_section: TerminalsSection,
+    /// Hold the sidebar's worktree order steady while you are navigating it —
+    /// for as long as the sidebar has focus, and for ~2s after an `Alt+↑/↓` /
+    /// `Alt+<digit>` jump made from a pane.
+    ///
+    /// Only the *computed* worktree sorts can move a row on their own
+    /// (`attention`, from the hydration thread's tier ranks; `live`, from the
+    /// activity FSM's last-active timestamp), so this is a no-op under
+    /// manual/name/recent. Off ⇒ rows re-rank the instant the underlying signal
+    /// changes, including mid-keystroke — which is what made a row you were
+    /// walking towards move out from under the cursor.
+    pub sidebar_freeze_sort: bool,
     /// Shift+Alt+↑/↓ steps *past* workspaces and terminal hosts you have
     /// collapsed instead of stopping on them (and expanding them on arrival) —
     /// a folded group is one you are not working in. Set false to visit every
@@ -137,6 +148,7 @@ impl Default for UiConfig {
             dismiss_overlay_on_click_outside: true,
             sidebar_workspace_sort: WorkspaceSort::default(),
             sidebar_terminals_section: TerminalsSection::default(),
+            sidebar_freeze_sort: true,
             sidebar_nav_skips_collapsed: true,
             sidebar_dividers: true,
             fullscreen_keep_masthead: true,
@@ -207,6 +219,18 @@ mod tests {
         // Opt back into the old stop-on-every-group behaviour.
         let cfg: UiConfig = toml::from_str("sidebar_nav_skips_collapsed = false").unwrap();
         assert!(!cfg.sidebar_nav_skips_collapsed);
+    }
+
+    /// Defaults ON: a row moving out from under the cursor mid-navigation is a
+    /// bug in every mode, so the freeze is the behaviour and the key is the
+    /// escape hatch.
+    #[test]
+    fn sidebar_freeze_sort_defaults_on_and_toggles() {
+        assert!(UiConfig::default().sidebar_freeze_sort);
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert!(cfg.sidebar_freeze_sort);
+        let cfg: UiConfig = toml::from_str("sidebar_freeze_sort = false").unwrap();
+        assert!(!cfg.sidebar_freeze_sort);
     }
 
     #[test]

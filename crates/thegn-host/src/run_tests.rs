@@ -958,6 +958,134 @@ fn rebuild_reanchors_focused_cursor_by_identity_across_a_resort() {
     assert_eq!(sb.cursor, visible_index_of_active(&model));
 }
 
+/// The freeze arms on the focus edge and is held by focus, and `rebuild`'s lazy
+/// expiry drops it once focus is gone — the no-timer contract. This is the
+/// mechanism the loop wires at the `sidebar_focus_gained` edge; the loop body
+/// itself isn't callable from a test, so the helpers are driven directly.
+#[test]
+fn the_sort_freeze_arms_on_focus_and_expires_lazily_once_focus_is_gone() {
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![
+            WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+            WorktreeGroup::new("app/zeta", GroupKind::Branch, "/tmp/app-zeta"),
+        ],
+        active: 0,
+    };
+    let mut model = build_initial_model(&session, None);
+    model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+    model
+        .sidebar_status
+        .activity_recency
+        .insert("/tmp/app-zeta".into(), 500.0);
+    let mut sb = focused_state(&mut model, &session);
+    sb.freeze_sort = true;
+    sb.view.sort = crate::sidebar::SortMode::Live;
+
+    // Focus gain arms it, and the mirrored flag reaches the renderer.
+    crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+    assert!(sb.view.freeze.is_some());
+    sb.sync(&mut model);
+    assert!(model.sidebar_sort_frozen);
+
+    // Re-arming while held is a no-op: tracking the live keys on every
+    // keystroke would freeze nothing at all.
+    let held = sb.view.freeze.clone();
+    model
+        .sidebar_status
+        .activity_recency
+        .insert("/tmp/app".into(), 900.0);
+    crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+    assert_eq!(sb.view.freeze, held, "the original snapshot must be kept");
+
+    // Still focused ⇒ a rebuild does NOT expire it, however long it has been.
+    sb.freeze_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sb.rebuild(&mut model, &session);
+    assert!(
+        sb.view.freeze.is_some(),
+        "focus outranks the grace deadline"
+    );
+
+    // Focus gone and the grace expired ⇒ the NEXT rebuild drops it. No timer
+    // fired; the rebuild was going to happen anyway.
+    sb.focused = false;
+    sb.rebuild(&mut model, &session);
+    assert!(sb.view.freeze.is_none());
+    assert!(sb.freeze_until.is_none());
+    sb.sync(&mut model);
+    assert!(!model.sidebar_sort_frozen);
+}
+
+/// A pane-driven `Alt+↑/↓` arms a grace freeze with the sidebar unfocused; it
+/// must survive rebuilds until the deadline, or the hydration tick landing
+/// 0-500ms later re-ranks the list the user is stepping through.
+#[test]
+fn a_grace_freeze_outlives_rebuilds_while_the_sidebar_is_unfocused() {
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
+        active: 0,
+    };
+    let mut model = build_initial_model(&session, None);
+    model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+    let mut sb = focused_state(&mut model, &session);
+    sb.freeze_sort = true;
+    sb.view.sort = crate::sidebar::SortMode::Live;
+    sb.focused = false;
+
+    crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+    sb.freeze_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    sb.rebuild(&mut model, &session);
+    assert!(sb.view.freeze.is_some(), "the grace holds without focus");
+
+    sb.freeze_until = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    sb.rebuild(&mut model, &session);
+    assert!(sb.view.freeze.is_none(), "and lapses once it runs out");
+}
+
+/// The freeze is off for the sorts that cannot move a row on their own, and off
+/// entirely when the config key is.
+#[test]
+fn the_sort_freeze_never_arms_for_static_sorts_or_when_disabled() {
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
+        active: 0,
+    };
+    let mut model = build_initial_model(&session, None);
+    let mut sb = focused_state(&mut model, &session);
+    sb.freeze_sort = true;
+
+    for mode in [
+        crate::sidebar::SortMode::Manual,
+        crate::sidebar::SortMode::Name,
+        crate::sidebar::SortMode::Recent,
+    ] {
+        sb.view.sort = mode;
+        crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+        assert!(sb.view.freeze.is_none(), "{mode:?} has nothing to hold");
+    }
+
+    sb.view.sort = crate::sidebar::SortMode::Live;
+    sb.freeze_sort = false;
+    crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+    assert!(sb.view.freeze.is_none(), "[ui] sidebar_freeze_sort = false");
+
+    // `rearm` re-snapshots while focused (a sort/filter change), and is a plain
+    // thaw once focus is elsewhere.
+    sb.freeze_sort = true;
+    crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
+    assert!(sb.view.freeze.is_some());
+    crate::sidebar_freeze::rearm(&mut sb, &model.sidebar_status);
+    assert!(
+        sb.view.freeze.is_some(),
+        "still on the bar: hold the new order"
+    );
+    sb.focused = false;
+    crate::sidebar_freeze::rearm(&mut sb, &model.sidebar_status);
+    assert!(sb.view.freeze.is_none());
+}
+
 #[test]
 fn move_active_worktree_reorders_within_workspace_and_anchors_home() {
     // Holds the env lock: move_active_worktree opens the user DB to persist

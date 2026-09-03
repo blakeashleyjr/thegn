@@ -38,6 +38,15 @@ export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/st
 # let the socket probe cross-connect these checks to a live daemon.
 export XDG_RUNTIME_DIR="$TMP/run"
 mkdir -p "$XDG_RUNTIME_DIR"
+# Isolate the `[database]` migration policy. These are ambient in any shell
+# started from inside a live thegn (it exports the pin so a stale binary can
+# never migrate the user's real state DB), and inheriting them here pinned
+# migration authority to a *different* executable than the one under test —
+# every schema advance was then refused with "this executable is not the
+# configured migration executable", against a database this script owns
+# outright. Hermetic means hermetic: the checks below opt into whatever
+# authority they need, per check.
+unset THEGN_DATABASE_MIGRATION_EXECUTABLE THEGN_DATABASE_MIGRATION_AUTHORITY
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Exercise the full product surface: the experimental verbs (host/placement/
 # kaneo) are dev-channel-only, so run smoke in the dev channel. A dedicated
@@ -70,7 +79,10 @@ override_gpg = true
 [hooks]
 pre_create = ["printf '%s\\n' \"\$THEGN_BRANCH\" > \"\$THEGN_REPO_ROOT/.thegn-smoke-pre-create\""]
 post_create = ["printf '%s\\n' \"\$THEGN_EVENT\" > \"\$THEGN_WORKTREE/.thegn-smoke-post-create\""]
-pre_destroy = ["test \"\$THEGN_BRANCH\" = smoke-fail-hook && exit 23 || true"]
+# Suffix match, not equality: THEGN_BRANCH is the real branch, which carries
+# the configured branch_prefix (tg/smoke-fail-hook), so the old equality test
+# never fired and the veto this check exists to prove was never exercised.
+pre_destroy = ["case \"\$THEGN_BRANCH\" in *smoke-fail-hook) exit 23 ;; esac; true"]
 post_destroy = ["printf '%s\\n' \"\$THEGN_EVENT\" >> \"\$THEGN_REPO_ROOT/.thegn-smoke-post-destroy\""]
 session_start = []
 session_end = []
@@ -446,7 +458,14 @@ check "repo recent matches legacy recent" \
 # git + DB; removal cleans the checkout + DB rows and honors --delete-branch.
 NP="$("$SZ" wt new smoke-cli --repo "$R")"
 check "wt new prints an existing worktree path" "[[ -d '$NP' ]]"
-check "wt new runs the pre-create hook" "grep -qx 'smoke-cli' '$R/.thegn-smoke-pre-create'"
+# The hook records `$THEGN_BRANCH`, which is the REAL branch and so carries the
+# configured `branch_prefix`. This asserted `grep -qx 'smoke-cli'` — a
+# whole-line match against the bare name — so it had been failing since the
+# prefix existed. Pin it to what git actually reports instead of hardcoding the
+# prefix: that is the contract worth holding (hooks see the real branch), and it
+# cannot rot the same way again.
+check "wt new runs the pre-create hook" \
+  "[[ \$(cat '$R/.thegn-smoke-pre-create') == \$(git -C '$NP' symbolic-ref --short HEAD) ]]"
 check "wt new runs the post-create hook" "grep -qx 'post_create' '$NP/.thegn-smoke-post-create'"
 check "wt new registered the branch in git" \
   "git -C '$R' worktree list --porcelain | grep -q 'smoke-cli'"
@@ -859,8 +878,14 @@ target_branch = "smoke-target"
 EOF
 check "a [workspace.<slug>] block refines merge_queue for that repo" \
   "[[ \$('$SZ' config explain merge_queue.target_branch --repo '$R' --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"value\"])') == 'smoke-target' ]]"
-check "config explain names the workspace layer as the origin" \
-  "'$SZ' config explain merge_queue.target_branch --repo '$R' | grep -q 'workspace'"
+# The seeded table above is the DEPRECATED `[workspace.<slug>]` spelling, which
+# is exactly what makes this worth asserting: the alias must resolve *and* be
+# reported under the canonical layer name. `config explain` says `project` since
+# the workspace→project rename; this line still grepped for "workspace" and had
+# been failing ever since. (The deprecation notice does say "workspace", but it
+# goes to stderr, so it never satisfied a stdout-only grep either.)
+check "config explain names the project layer as the origin" \
+  "'$SZ' config explain merge_queue.target_branch --repo '$R' | grep -q 'project .\\[project\\.$WSLUG\\]'"
 # Trim it again so the rest of the merge checks see the plain global config.
 python3 - "$XDG_CONFIG_HOME/thegn/config.toml" <<'PYEOF'
 import sys
@@ -1064,7 +1089,13 @@ INSERT INTO tab_layout VALUES
   ('/r', 'app/feat',    'worktree', '/wt/feat', '{"leaf":1}', 1, 0),
   ('/r', 'app/feat ·2', 'worktree', '/wt/feat', '{"leaf":2}', 2, 0);
 SQL
-  "$SZ" list >/dev/null 2>&1 || true
+  # `migration_authority` defaults to `controller`, and `thegn list` is an
+  # ordinary CLI — it may USE a matching schema but never advance one. The
+  # subject here is the v5→v6 data transform, not who is allowed to run it, so
+  # opt this one call into the legacy "first opener migrates" rule. (The seeded
+  # `user_version = 5` is what makes this an upgrade rather than a bootstrap;
+  # `observed == 0` would have been exempt.)
+  THEGN_DATABASE_MIGRATION_AUTHORITY=any "$SZ" list >/dev/null 2>&1 || true
   groups="$(sqlite3 "$DB" "SELECT count(*) FROM tab_groups WHERE session_name='/r'")"
   feat_tabs="$(sqlite3 "$DB" "SELECT count(*) FROM group_tabs WHERE session_name='/r' AND group_name='app/feat'")"
   legacy="$(sqlite3 "$DB" "SELECT count(*) FROM sqlite_master WHERE name='tab_layout'")"
@@ -1152,7 +1183,10 @@ SQL
   cold_rc=$?
   set -e
   cold_source_rows="$(sqlite3 "$COLD_DB" "SELECT (SELECT count(*) FROM worktrees WHERE worktree='$COLD_WT'),(SELECT count(*) FROM tab_groups WHERE worktree='$COLD_WT'),(SELECT count(*) FROM group_tabs WHERE group_name='move-cold'),(SELECT count(*) FROM ui_state WHERE key IN ('collapse:move-cold','pin:move-cold','pin_ordinal:move-cold')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT'),(SELECT count(*) FROM agent_dispatch_notes),(SELECT count(*) FROM session_state WHERE session_name='default' AND pin_state IS NOT NULL);")"
-  cold_target_rows="$(sqlite3 "$COLD_TARGET_DB" "SELECT (SELECT count(*) FROM worktrees WHERE worktree='$COLD_WT'),(SELECT count(*) FROM tab_groups WHERE worktree='$COLD_WT'),(SELECT count(*) FROM group_tabs WHERE group_name='move-cold' AND pane_sessions IS NULL),(SELECT count(*) FROM ui_state WHERE key IN ('collapse:move-cold','pin:move-cold','pin_ordinal:move-cold')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT' AND session_id IS NULL),(SELECT count(*) FROM agent_dispatch_notes),(SELECT count(*) FROM session_state WHERE session_name='default' AND pin_state='SMOKE_OPAQUE_PIN');")"
+  # Same guard as the --kill case below: a failed cold move leaves no target
+  # database, and an unguarded read would abort the suite instead of failing
+  # this check.
+  cold_target_rows="$(sqlite3 "$COLD_TARGET_DB" "SELECT (SELECT count(*) FROM worktrees WHERE worktree='$COLD_WT'),(SELECT count(*) FROM tab_groups WHERE worktree='$COLD_WT'),(SELECT count(*) FROM group_tabs WHERE group_name='move-cold' AND pane_sessions IS NULL),(SELECT count(*) FROM ui_state WHERE key IN ('collapse:move-cold','pin:move-cold','pin_ordinal:move-cold')),(SELECT count(*) FROM agent_dispatches WHERE worktree_path='$COLD_WT' AND session_id IS NULL),(SELECT count(*) FROM agent_dispatch_notes),(SELECT count(*) FROM session_state WHERE session_name='default' AND pin_state='SMOKE_OPAQUE_PIN');" 2>/dev/null || echo no-target-db)"
   cold_head_after="$(git -C "$COLD_WT" rev-parse HEAD)"
   cold_git_after="$(git -C "$COLD_WT" worktree list --porcelain)"
   cold_git_status_after="$(git -C "$COLD_WT" status --porcelain)"
@@ -1213,8 +1247,13 @@ SQL
       kill_out="$(move_cli "$KILL" session move "$KILL_WT" --to-profile target --kill --json 2>&1)"
       kill_rc=$?
       set -e
-      kill_source_rows="$(sqlite3 "$KILL_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$KILL_WT';")"
-      kill_target_panes="$(sqlite3 "$KILL_TARGET_DB" "SELECT count(*) FROM group_tabs WHERE group_name='move-kill' AND pane_sessions IS NULL;")"
+      # The TARGET database exists only if the move committed. Reading it
+      # unguarded made a failed move abort the whole script under `set -e` —
+      # the suite died with a bare sqlite3 "unable to open database file" and
+      # skipped every remaining check, hiding which move broke and why. A
+      # sentinel keeps the failure where it belongs: in the `check` below.
+      kill_source_rows="$(sqlite3 "$KILL_DB" "SELECT count(*) FROM tab_groups WHERE worktree='$KILL_WT';" 2>/dev/null || echo unreadable)"
+      kill_target_panes="$(sqlite3 "$KILL_TARGET_DB" "SELECT count(*) FROM group_tabs WHERE group_name='move-kill' AND pane_sessions IS NULL;" 2>/dev/null || echo no-target-db)"
       check "session move --kill kills before importing the live session" \
         "[[ $kill_rc -eq 0 ]] && grep -q '\"killed_ids\":\[\"$KILL_ID\"\]' <<<\"\$kill_out\" && grep -q '\"target_committed\":true' <<<\"\$kill_out\""
       check "session move --kill clears source rows and target daemon ids" \

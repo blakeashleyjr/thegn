@@ -176,6 +176,15 @@ impl SortMode {
             SortMode::Live => "live",
         }
     }
+    /// True for the sorts whose keys are **computed off-loop** and can therefore
+    /// re-rank on their own between keystrokes (`Attention` from the hydration
+    /// thread's tier ranks, `Live` from the activity FSM's `last_active_at`).
+    /// The other three key on data that only changes when the user changes it,
+    /// so they need no freeze — and must not advertise one (see
+    /// `crate::sidebar_freeze`).
+    pub fn is_computed(self) -> bool {
+        matches!(self, SortMode::Attention | SortMode::Live)
+    }
     pub fn from_str(s: &str) -> Self {
         match s {
             "manual" => SortMode::Manual,
@@ -490,6 +499,14 @@ pub struct ViewState {
     /// startup/reload like `workspace_sort`). Which right-cluster fields show,
     /// the focused-detail policy, and glyph overrides.
     pub display: crate::sidebar_view::SidebarDisplay,
+    /// Frozen sort keys, armed while the user is navigating the bar (see
+    /// [`crate::sidebar_freeze`]). While `Some`, the computed sorts read this
+    /// snapshot instead of the live [`SidebarStatus`] maps, so rows cannot move
+    /// under the cursor. `Arc` so a rebuild clones a pointer, not three maps.
+    ///
+    /// Loop-owned and transient: never persisted to `ui_state`, and never part
+    /// of hydration equality.
+    pub freeze: Option<std::sync::Arc<crate::sidebar_freeze::SortFreeze>>,
 }
 
 /// What activating a sidebar row does.
@@ -623,7 +640,26 @@ struct Group {
     /// Sort tie-break within a tier: the live session slot for a loaded
     /// workspace, or the DB position (per-slug enumeration index) for a
     /// dormant one.
+    ///
+    /// **Not the manual-order key** — see [`Group::manual_rank`]. `gi` is also
+    /// the group index [`RowTarget::Tab`] activates, so it must stay the
+    /// session slot.
     gi: usize,
+    /// The worktree's rank in the persistent registry (`db.worktrees()` order,
+    /// i.e. its `position`), when it has a registry row. `None` = never
+    /// registered — a legacy or purely in-session group — which sorts *before*
+    /// registered rows, the same tier order `Session::resurrect` uses.
+    ///
+    /// This, not `gi`, is what [`SortMode::Manual`] keys on. `gi` conflates two
+    /// independent sequences: live groups are numbered by their slot in
+    /// `session.worktrees`, while rows reconstructed from the registry are
+    /// numbered *after* all the live ones. A worktree that migrates between
+    /// those two blocks — `Session::adopt_missing_registered` appends when you
+    /// activate a dormant row, a failed create removes one — therefore
+    /// re-sorted against its siblings even though its persisted `position`
+    /// never changed. Ranking on the registry makes the manual order the same
+    /// whether a worktree is live, dormant, warm-restored or cold-resurrected.
+    manual_rank: Option<u32>,
     /// Worktree path — the key into the attention-rank map for the
     /// [`SortMode::Attention`] ordering (and into the per-worktree status maps).
     path: String,
@@ -846,19 +882,20 @@ pub fn build_rows(
     let activity = &status.activity;
     let mut rows = Vec::new();
 
+    // Every ordering key the computed sorts read, in one place: the live status
+    // maps, or the frozen snapshot while the user is navigating the bar (see
+    // `crate::sidebar_freeze`). Unarmed, this is exactly the live maps.
+    let keys = crate::sidebar_freeze::SortKeys::new(view.freeze.as_deref(), status);
+
     // Workspace bubbling (`[ui] sidebar_workspace_sort = "attention"`): order
     // workspaces by their most-urgent worktree's tier. The sort is stable and
     // tier-granular, so equal-urgency workspaces keep their manual order and a
     // workspace only moves on a real tier change — hysteresis for free.
+    // Routed through `keys` like the worktree sorts, or whole project blocks
+    // would still slide under the cursor while their worktrees were held.
     let mut workspaces: Vec<&(String, String, String, String)> = workspaces.iter().collect();
     if view.workspace_sort == thegn_core::config::WorkspaceSort::Attention {
-        workspaces.sort_by_key(|(slug, ..)| {
-            status
-                .workspace_attention
-                .get(slug)
-                .map(|s| s.tier as u8)
-                .unwrap_or(u8::MAX)
-        });
+        workspaces.sort_by_key(|(slug, ..)| keys.workspace_tier(slug));
     }
 
     // Index the DB rows once. `build_rows` runs on every tab/worktree switch
@@ -891,6 +928,7 @@ pub fn build_rows(
             &workspaces,
             view,
             status,
+            &keys,
             &db_by_tab,
             &db_by_slug,
         );
@@ -1004,12 +1042,7 @@ pub fn build_rows(
             &db_by_slug,
         );
 
-        sort_groups(
-            &mut groups,
-            view.sort,
-            &status.attention_ranks,
-            &status.activity_recency,
-        );
+        sort_groups(&mut groups, view.sort, &keys);
 
         // One shared worktree-row builder for both the loose (depth 1) and
         // filed (depth 2) placements, and for both live and dormant sources —
@@ -1426,6 +1459,21 @@ fn gather_groups(
     // never key anything (they'd collide with every other pathless row).
     let mut live_tabs: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut live_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // The registry's own order for this repo, keyed by tab name — the stable
+    // manual-order rank (see `Group::manual_rank`). Keyed on the tab name and
+    // not the path because that is the identity BOTH sources carry here, and it
+    // survives a checkout being moved on disk. Built once; the live loop and the
+    // registry fill below both stamp from it, which is the whole point: the two
+    // blocks end up on ONE axis.
+    let slug_rows_for_rank = db_by_slug
+        .get(repo_slug)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let rank_by_tab: std::collections::HashMap<&str, u32> = slug_rows_for_rank
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.tab_name.as_str(), i as u32))
+        .collect();
     for (gi, g) in session.worktrees.iter().enumerate() {
         let Some((repo, branch)) = split_tab(&g.name) else {
             continue;
@@ -1441,6 +1489,7 @@ fn gather_groups(
         groups.push(Group {
             label: branch,
             gi,
+            manual_rank: rank_by_tab.get(g.name.as_str()).copied(),
             path: g.path.clone(),
             sandbox_backend: dbw.and_then(|w| w.sandbox_backend.clone()),
             env_name: dbw.and_then(|w| w.env_name.clone()),
@@ -1477,6 +1526,7 @@ fn gather_groups(
             groups.push(Group {
                 label: "home".into(),
                 gi: next_gi,
+                manual_rank: rank_by_tab.get(home_tab.as_str()).copied(),
                 path: repo_path.to_string(),
                 sandbox_backend: db_home.and_then(|w| w.sandbox_backend.clone()),
                 env_name: db_home.and_then(|w| w.env_name.clone()),
@@ -1502,6 +1552,7 @@ fn gather_groups(
             groups.push(Group {
                 label: w.branch.clone(),
                 gi: next_gi,
+                manual_rank: rank_by_tab.get(w.tab_name.as_str()).copied(),
                 path: w.path.clone(),
                 sandbox_backend: w.sandbox_backend.clone(),
                 env_name: w.env_name.clone(),
@@ -1604,12 +1655,14 @@ fn worktree_row(
 /// its repo. Folders and per-workspace collapse are intentionally ignored —
 /// flat mode is a single recency-ordered list, so every worktree is visible at
 /// depth 1 (its collapse keys stay persisted for the return to grouped view).
+#[allow(clippy::too_many_arguments)]
 fn build_rows_flat(
     rows: &mut Vec<SidebarRow>,
     session: &Session,
     workspaces: &[&(String, String, String, String)],
     view: &ViewState,
     status: &SidebarStatus,
+    keys: &crate::sidebar_freeze::SortKeys<'_>,
     db_by_tab: &std::collections::HashMap<&str, &DbWorktree>,
     db_by_slug: &std::collections::HashMap<&str, Vec<&DbWorktree>>,
 ) {
@@ -1623,24 +1676,30 @@ fn build_rows_flat(
 
     let mut pool: Vec<(String, String, Group)> = Vec::new();
     for (slug, display, _kind, repo_path) in workspaces {
-        for g in gather_groups(
+        let mut gs = gather_groups(
             session,
             slug,
             repo_path,
             &status.activity,
             db_by_tab,
             db_by_slug,
-        ) {
+        );
+        // Order each repo's groups BEFORE pooling. `gather_groups` emits live
+        // groups first and registry-only ones after, which is not an order the
+        // user chose — and `sort_groups_flat`'s Manual arm is a deliberate
+        // no-op ("keep the gathered interleave"), so without this the flat view
+        // kept the very live-vs-dormant instability the grouped view just lost.
+        // For the other modes the global pass below is a stable sort that
+        // simply overrides this, so the result is unchanged.
+        if view.sort == SortMode::Manual {
+            sort_groups(&mut gs, view.sort, keys);
+        }
+        for g in gs {
             pool.push((slug.clone(), display.clone(), g));
         }
     }
 
-    sort_groups_flat(
-        &mut pool,
-        view.sort,
-        &status.attention_ranks,
-        &status.activity_recency,
-    );
+    sort_groups_flat(&mut pool, view.sort, keys);
 
     for (slug, display, gr) in &pool {
         // Same loose-worktree pin key as the grouped path, so pins persist
@@ -1665,8 +1724,7 @@ fn build_rows_flat(
 fn sort_groups_flat(
     pool: &mut [(String, String, Group)],
     sort: SortMode,
-    ranks: &std::collections::BTreeMap<String, u32>,
-    recency: &std::collections::BTreeMap<String, f64>,
+    keys: &crate::sidebar_freeze::SortKeys<'_>,
 ) {
     match sort {
         // Manual: keep the gathered interleave (workspace order, home-first).
@@ -1679,13 +1737,13 @@ fn sort_groups_flat(
         }
         SortMode::Attention => {
             pool.sort_by(|a, b| {
-                let r = |g: &Group| ranks.get(&g.path).copied().unwrap_or(u32::MAX);
+                let r = |g: &Group| keys.rank(&g.path);
                 r(&a.2).cmp(&r(&b.2))
             });
         }
         SortMode::Live => {
             pool.sort_by(|a, b| {
-                let t = |g: &Group| recency.get(&g.path).copied().unwrap_or(f64::MIN);
+                let t = |g: &Group| keys.recency(&g.path);
                 t(&b.2)
                     .partial_cmp(&t(&a.2))
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -1694,19 +1752,29 @@ fn sort_groups_flat(
     }
 }
 
-fn sort_groups(
-    groups: &mut [Group],
-    sort: SortMode,
-    ranks: &std::collections::BTreeMap<String, u32>,
-    recency: &std::collections::BTreeMap<String, f64>,
-) {
+fn sort_groups(groups: &mut [Group], sort: SortMode, keys: &crate::sidebar_freeze::SortKeys<'_>) {
     match sort {
         SortMode::Manual => {
-            // Trust the session order (gi); just float "home" to the top.
-            // `gi` is the worktree's slot in `session.worktrees`, which the
-            // host keeps in persisted `position` order — so this is the
-            // creation-order-by-default, manually-reorderable sequence.
-            groups.sort_by_key(|a| (a.label != "home", a.gi));
+            // "home" first, then the REGISTRY order (`manual_rank`) — the
+            // persisted `position` sequence that Shift+↑/↓ rearranges. `gi` is
+            // only the last tie-break, because it is not one axis: a live group
+            // is numbered by its session slot while a registry-reconstructed row
+            // is numbered after every live one, so keying on it re-sorted a
+            // worktree whenever it crossed between the two (activating a dormant
+            // row appends it to the session; a failed create removes it) even
+            // though its position never moved.
+            //
+            // Unregistered groups (`None`) sort ahead of registered ones,
+            // matching the tier order `Session::resurrect` uses, so the tree
+            // reads the same warm, cold, live and dormant.
+            groups.sort_by_key(|a| {
+                (
+                    a.label != "home",
+                    a.manual_rank.is_some(),
+                    a.manual_rank.unwrap_or(0),
+                    a.gi,
+                )
+            });
         }
         SortMode::Name => {
             // "home" first, then case-insensitive label, ties by position.
@@ -1731,7 +1799,7 @@ fn sort_groups(
             // hydration thread (see `attention_status`). A path with no rank yet
             // (brand-new worktree, first pass) keeps its manual slot at the end.
             groups.sort_by(|a, b| {
-                let r = |g: &Group| ranks.get(&g.path).copied().unwrap_or(u32::MAX);
+                let r = |g: &Group| keys.rank(&g.path);
                 r(a).cmp(&r(b))
                     .then((a.label != "home").cmp(&(b.label != "home")))
                     .then(a.gi.cmp(&b.gi))
@@ -1746,7 +1814,7 @@ fn sort_groups(
             // co-active worktrees never churn frame-to-frame. A worktree the
             // FSM never saw active sorts to the end (recency floor).
             groups.sort_by(|a, b| {
-                let t = |g: &Group| recency.get(&g.path).copied().unwrap_or(f64::MIN);
+                let t = |g: &Group| keys.recency(&g.path);
                 t(b).partial_cmp(&t(a))
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then((a.label != "home").cmp(&(b.label != "home")))
@@ -2694,6 +2762,326 @@ mod tests {
             .map(|r| r.label.as_str())
             .collect();
         assert_eq!(labels, vec!["urgent", "home", "calm"]);
+    }
+
+    fn db_row(slug: &str, branch: &str) -> DbWorktree {
+        DbWorktree {
+            slug: slug.into(),
+            branch: branch.into(),
+            repo_path: format!("/repos/{slug}"),
+            tab_name: format!("{slug}/{branch}"),
+            path: format!("/wt/{branch}"),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+            env_degraded: false,
+        }
+    }
+
+    /// The registry order `a, b, c`, and a workspace that owns it.
+    fn manual_fixture() -> (
+        Vec<(String, String, String, String)>,
+        Vec<DbWorktree>,
+        SidebarStatus,
+    ) {
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw = vec![
+            db_row("app", "home"),
+            db_row("app", "a"),
+            db_row("app", "b"),
+            db_row("app", "c"),
+        ];
+        (ws, dbw, no_activity())
+    }
+
+    /// Manual order must be a property of the REGISTRY, not of which worktrees
+    /// happen to be loaded. Activating a dormant row makes
+    /// `Session::adopt_missing_registered` append it to `session.worktrees`;
+    /// keyed on `gi` that append jumped the row up the list permanently, because
+    /// live groups are numbered ahead of every registry-reconstructed one.
+    #[test]
+    fn manual_order_survives_a_dormant_row_being_adopted() {
+        let (ws, dbw, status) = manual_fixture();
+        let view = ViewState::default();
+
+        // Two live, two still dormant.
+        let before = session(vec![tab("app/home", "/wt/home"), tab("app/a", "/wt/a")], 0);
+        assert_eq!(
+            labels_of(&build_rows(&before, &ws, &view, &status, &dbw, &[], &[])),
+            vec!["home", "a", "b", "c"],
+        );
+
+        // The user activates `c`; the session APPENDS it (session.rs asserts
+        // that append is deliberate). Its registry position did not move, so
+        // neither may its row.
+        let after = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/a", "/wt/a"),
+                tab("app/c", "/wt/c"),
+            ],
+            2,
+        );
+        assert_eq!(
+            labels_of(&build_rows(&after, &ws, &view, &status, &dbw, &[], &[])),
+            vec!["home", "a", "b", "c"],
+            "adopting `c` must not move it ahead of `b`"
+        );
+    }
+
+    /// The same registry must render the same order whether the workspace is
+    /// fully loaded or fully dormant — otherwise the manual order silently
+    /// depends on how you arrived at the repo (warm switch vs cold resurrect).
+    #[test]
+    fn manual_order_is_identical_live_and_dormant() {
+        let (ws, dbw, status) = manual_fixture();
+        let view = ViewState::default();
+
+        let live = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/a", "/wt/a"),
+                tab("app/b", "/wt/b"),
+                tab("app/c", "/wt/c"),
+            ],
+            0,
+        );
+        let dormant = session(vec![], 0);
+        assert_eq!(
+            labels_of(&build_rows(&live, &ws, &view, &status, &dbw, &[], &[])),
+            labels_of(&build_rows(&dormant, &ws, &view, &status, &dbw, &[], &[])),
+        );
+        // And it is the registry's own order, not the session's.
+        assert_eq!(
+            labels_of(&build_rows(&live, &ws, &view, &status, &dbw, &[], &[])),
+            vec!["home", "a", "b", "c"],
+        );
+    }
+
+    /// A live group with no registry row keeps its session slot and sorts ahead
+    /// of the registered ones — the tier order `Session::resurrect` uses, so an
+    /// unregistered worktree never vanishes into the tail.
+    #[test]
+    fn manual_order_keeps_unregistered_groups_ahead_of_registered_ones() {
+        let (ws, dbw, status) = manual_fixture();
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/scratch", "/wt/scratch"), // no DB row
+                tab("app/c", "/wt/c"),
+            ],
+            0,
+        );
+        assert_eq!(
+            labels_of(&build_rows(
+                &s,
+                &ws,
+                &ViewState::default(),
+                &status,
+                &dbw,
+                &[],
+                &[]
+            )),
+            vec!["home", "scratch", "a", "b", "c"],
+        );
+    }
+
+    /// The flat view gathers the same live-then-dormant sequence, and its own
+    /// Manual arm is a no-op, so it needs the per-repo pass to be stable too.
+    #[test]
+    fn flat_manual_order_survives_a_dormant_row_being_adopted() {
+        let (ws, dbw, status) = manual_fixture();
+        let view = ViewState {
+            flat: true,
+            ..Default::default()
+        };
+        let before = session(vec![tab("app/home", "/wt/home"), tab("app/a", "/wt/a")], 0);
+        assert_eq!(
+            labels_of(&build_rows(&before, &ws, &view, &status, &dbw, &[], &[])),
+            vec!["home", "a", "b", "c"],
+        );
+        let after = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/a", "/wt/a"),
+                tab("app/c", "/wt/c"),
+            ],
+            2,
+        );
+        assert_eq!(
+            labels_of(&build_rows(&after, &ws, &view, &status, &dbw, &[], &[])),
+            vec!["home", "a", "b", "c"],
+        );
+    }
+
+    /// Fixture for the freeze tests: three worktrees, `urgent` most recent.
+    fn freeze_fixture() -> (
+        crate::session::Session,
+        Vec<(String, String, String, String)>,
+        SidebarStatus,
+    ) {
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/calm", "/wt/calm"),
+                tab("app/urgent", "/wt/urgent"),
+            ],
+            0,
+        );
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            String::new(),
+        )];
+        let mut status = no_activity();
+        for (p, t) in [
+            ("/wt/home", 100.0),
+            ("/wt/calm", 50.0),
+            ("/wt/urgent", 300.0),
+        ] {
+            status.activity_recency.insert(p.into(), t);
+        }
+        (s, ws, status)
+    }
+
+    fn labels_of(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    /// The whole point: while the freeze is armed, a re-rank on the hydration
+    /// thread cannot move a row out from under the user's cursor.
+    #[test]
+    fn frozen_live_recency_keeps_the_order_across_a_rerank() {
+        let (s, ws, status) = freeze_fixture();
+        let freeze = std::sync::Arc::new(crate::sidebar_freeze::SortFreeze::capture(&status));
+
+        // The world moves on: `calm` becomes the most recently active.
+        let mut fresh = status.clone();
+        fresh.activity_recency.insert("/wt/calm".into(), 900.0);
+
+        let frozen_view = ViewState {
+            sort: SortMode::Live,
+            freeze: Some(freeze),
+            ..Default::default()
+        };
+        assert_eq!(
+            labels_of(&build_rows(&s, &ws, &frozen_view, &fresh, &[], &[], &[])),
+            vec!["urgent", "home", "calm"],
+            "a frozen order must survive a re-rank"
+        );
+
+        // Thawed, the same status produces the new order — the freeze suppresses
+        // the move, it does not discard the signal.
+        let thawed_view = ViewState {
+            sort: SortMode::Live,
+            ..Default::default()
+        };
+        assert_eq!(
+            labels_of(&build_rows(&s, &ws, &thawed_view, &fresh, &[], &[], &[])),
+            vec!["calm", "urgent", "home"],
+        );
+    }
+
+    /// Same contract on the Attention axis, whose key is the tier rank.
+    #[test]
+    fn frozen_attention_ranks_keep_the_order_across_a_rerank() {
+        let (s, ws, mut status) = freeze_fixture();
+        for (p, r) in [("/wt/home", 0u32), ("/wt/calm", 1), ("/wt/urgent", 2)] {
+            status.attention_ranks.insert(p.into(), r);
+        }
+        let freeze = std::sync::Arc::new(crate::sidebar_freeze::SortFreeze::capture(&status));
+
+        let mut fresh = status.clone();
+        fresh.attention_ranks.insert("/wt/urgent".into(), 0);
+        fresh.attention_ranks.insert("/wt/home".into(), 2);
+
+        let frozen_view = ViewState {
+            sort: SortMode::Attention,
+            freeze: Some(freeze),
+            ..Default::default()
+        };
+        assert_eq!(
+            labels_of(&build_rows(&s, &ws, &frozen_view, &fresh, &[], &[], &[])),
+            vec!["home", "calm", "urgent"],
+        );
+
+        let thawed_view = ViewState {
+            sort: SortMode::Attention,
+            ..Default::default()
+        };
+        assert_eq!(
+            labels_of(&build_rows(&s, &ws, &thawed_view, &fresh, &[], &[], &[])),
+            vec!["urgent", "calm", "home"],
+        );
+    }
+
+    /// Manual/Name/Recent key on data that only the user changes, so a freeze
+    /// must be a pure no-op there — never a silently different order.
+    #[test]
+    fn a_freeze_is_inert_under_the_static_sorts() {
+        let (s, ws, status) = freeze_fixture();
+        let freeze = std::sync::Arc::new(crate::sidebar_freeze::SortFreeze::capture(&status));
+        let mut fresh = status.clone();
+        fresh.activity_recency.insert("/wt/calm".into(), 900.0);
+
+        for mode in [SortMode::Manual, SortMode::Name, SortMode::Recent] {
+            let frozen = ViewState {
+                sort: mode,
+                freeze: Some(freeze.clone()),
+                ..Default::default()
+            };
+            let thawed = ViewState {
+                sort: mode,
+                ..Default::default()
+            };
+            assert_eq!(
+                labels_of(&build_rows(&s, &ws, &frozen, &fresh, &[], &[], &[])),
+                labels_of(&build_rows(&s, &ws, &thawed, &fresh, &[], &[], &[])),
+                "{mode:?} must not care about the freeze"
+            );
+        }
+    }
+
+    /// A worktree created during the freeze was never on screen, so it has no
+    /// order to protect — it must use its real key and land where it belongs,
+    /// not be exiled to the bottom for the whole freeze window.
+    #[test]
+    fn a_new_worktree_uses_live_keys_during_a_freeze() {
+        let (_, ws, status) = freeze_fixture();
+        let freeze = std::sync::Arc::new(crate::sidebar_freeze::SortFreeze::capture(&status));
+
+        // A fourth worktree appears mid-freeze, more recently active than any.
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/calm", "/wt/calm"),
+                tab("app/urgent", "/wt/urgent"),
+                tab("app/fresh", "/wt/fresh"),
+            ],
+            0,
+        );
+        let mut fresh = status.clone();
+        fresh.activity_recency.insert("/wt/fresh".into(), 900.0);
+
+        let view = ViewState {
+            sort: SortMode::Live,
+            freeze: Some(freeze),
+            ..Default::default()
+        };
+        assert_eq!(
+            labels_of(&build_rows(&s, &ws, &view, &fresh, &[], &[], &[])),
+            vec!["fresh", "urgent", "home", "calm"],
+            "the new row sorts by its real recency; the held rows stay put"
+        );
     }
 
     #[test]
