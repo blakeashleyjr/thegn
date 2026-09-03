@@ -658,7 +658,16 @@ pub(crate) fn build_palette(
 pub(crate) fn build_sandbox_palette(
     cfg: &thegn_core::config::Config,
 ) -> Vec<crate::palette::PaletteItem> {
-    let def = cfg.sandbox.default_backend.as_str();
+    use thegn_core::config::SandboxBackend;
+
+    // Palette keys intentionally use friendly aliases (`host`,
+    // `podman-rootless`) while the enum's canonical strings are `none` and
+    // `podman`. Compare parsed values so those defaults still sort and label
+    // correctly.
+    let is_default = |key: &str| {
+        SandboxBackend::from_str_validated(key)
+            .is_ok_and(|backend| backend == cfg.sandbox.default_backend)
+    };
     let mut rows = vec![
         ("auto", "Auto (configured chain)"),
         ("podman-rootless", "Rootless Podman"),
@@ -667,10 +676,10 @@ pub(crate) fn build_sandbox_palette(
         ("bwrap", "Bubblewrap"),
         ("host", "Host / uncontained"),
     ];
-    rows.sort_by_key(|(k, _)| if *k == def { 0 } else { 1 });
+    rows.sort_by_key(|(key, _)| if is_default(key) { 0 } else { 1 });
     rows.into_iter()
         .map(|(key, label)| {
-            let suffix = if key == def { "  default" } else { "" };
+            let suffix = if is_default(key) { "  default" } else { "" };
             crate::palette::PaletteItem::new(format!("sandbox:{key}"), format!("▣ {label}{suffix}"))
         })
         .collect()
@@ -1018,6 +1027,27 @@ mod tests {
             PaletteItem::new("switch", "Switch project"),
             PaletteItem::new("diff", "Show diff"),
         ]
+    }
+
+    #[test]
+    fn sandbox_palette_matches_friendly_aliases_to_enum_defaults() {
+        use thegn_core::config::{Config, SandboxBackend};
+
+        for (backend, key) in [
+            (SandboxBackend::None, "sandbox:host"),
+            (SandboxBackend::Podman, "sandbox:podman-rootless"),
+        ] {
+            let cfg = Config {
+                sandbox: thegn_core::config::SandboxConfig {
+                    default_backend: backend,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let rows = build_sandbox_palette(&cfg);
+            assert_eq!(rows[0].key, key);
+            assert!(rows[0].label.ends_with("default"));
+        }
     }
 
     #[test]
