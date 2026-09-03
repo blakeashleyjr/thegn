@@ -104,6 +104,25 @@ pub(crate) struct SidebarState {
     /// `materialize_failed`/`prewarm_failed`); `rebuild` overlays a red error
     /// dot so the failure stays visible after the halt modal is dismissed.
     pub(crate) env_failed: std::collections::HashSet<String>,
+    /// Deadline for the post-navigation grace freeze — the window after an
+    /// `Alt+↑/↓` / `Alt+<digit>` jump made from a **pane**, where the sidebar
+    /// never takes focus so the focus-edge freeze can't cover it. `None` = no
+    /// grace pending (the freeze, if any, is held by focus instead).
+    ///
+    /// LOOP-SIDE ONLY, and evaluated LAZILY at the top of `rebuild` — never
+    /// armed as a timer and never a wake source, so the loop still blocks on
+    /// `poll_input(None)` and idles at 0%. The 500ms hydration ticker
+    /// guarantees the expiry is noticed within a tick of the deadline.
+    pub(crate) freeze_until: Option<std::time::Instant>,
+    /// Mirror of `[ui] sidebar_freeze_sort`, seeded at startup and on config
+    /// reload beside `view.workspace_sort`. Held here rather than read from the
+    /// config at each call site because the arm/thaw points are spread across
+    /// the key handlers, which have no config in scope.
+    ///
+    /// `Default` is `false` (the derive), i.e. a `SidebarState` that never saw
+    /// a config simply doesn't freeze — the conservative direction: a test
+    /// fixture gets today's unheld behaviour rather than a silent hold.
+    pub(crate) freeze_sort: bool,
 }
 
 impl SidebarState {

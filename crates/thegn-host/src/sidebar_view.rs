@@ -193,6 +193,59 @@ pub fn menu_step(entries: &[RowMenuEntry], from: usize, dir: i32) -> usize {
     }
 }
 
+/// The `WORKSPACES` header row's title, and the width it occupies.
+const HEADER_TITLE: &str = " WORKSPACES";
+
+/// The header-row sort chip: its label and painted half-open x-range, or `None`
+/// when there is nowhere to put it.
+///
+/// **The only source of this geometry.** `draw_sidebar` paints from it and
+/// `handlers::sidebar_mouse::on_left_press` hit-tests from it, so a click can
+/// never land off the chip the user can see — the same one-layout-pass contract
+/// `build_sidebar` holds for the rows below.
+///
+/// The chip exists because nothing else on screen names the active sort: the
+/// mode lived only in the `s` menu, so a `live` sort silently reordering rows
+/// read as the sidebar misbehaving rather than as a mode doing its job.
+pub(crate) fn sort_chip(model: &FrameModel, rect: Rect) -> Option<(String, usize, usize)> {
+    // The slim rail paints no header at all and is a handful of columns wide;
+    // a mode word is illegible there, and a rail user has opted out of labels.
+    if model.sidebar_rail {
+        return None;
+    }
+    // The filter input owns the header row while filtering. It is a live text
+    // field that grows to the right, so a right-aligned chip beside it is a
+    // collision waiting to happen — and while filtering, the order question is
+    // moot anyway. Returns the instant the filter clears.
+    if model.sidebar_filtering || !model.sidebar_filter.is_empty() {
+        return None;
+    }
+
+    // Degrade by budget, never by truncation: a half-word mode name reads as a
+    // rendering bug, so the chip drops its `hold` qualifier first and then
+    // disappears entirely rather than being clipped.
+    let mode = model.sidebar_sort.as_str();
+    let candidates: [String; 2] = [
+        if model.sidebar_sort_frozen {
+            format!("{mode} hold ")
+        } else {
+            format!("{mode} ")
+        },
+        format!("{mode} "),
+    ];
+    for label in candidates {
+        let w = unicode_width::UnicodeWidthStr::width(label.as_str());
+        // One column of breathing room between the title and the chip.
+        if rect.cols >= unicode_width::UnicodeWidthStr::width(HEADER_TITLE) + 1 + w {
+            // Right-aligned against the FULL width: the header sits above
+            // `list_y`, so the scrollbar gutter `build_sidebar` reserves for the
+            // rows does not narrow this row.
+            return Some((label, rect.x + rect.cols - w, w));
+        }
+    }
+    None
+}
+
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     fill(surface, rect, col(S::Panel));
     if rect.cols == 0 || rect.rows == 0 {
@@ -224,11 +277,22 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             surface,
             rect.x,
             rect.y,
-            " WORKSPACES",
+            HEADER_TITLE,
             col(S::Text),
             col(S::Panel),
             rect.cols,
         );
+        // The active sort, right-aligned and quiet — the answer to "why did
+        // that row move?" without opening the `s` menu. Brighter while held so
+        // the two states are distinguishable at a glance.
+        if let Some((label, x, cols)) = sort_chip(model, rect) {
+            let fg = if model.sidebar_sort_frozen {
+                col(S::Dim)
+            } else {
+                col(S::Faint)
+            };
+            draw_text(surface, x, rect.y, &label, fg, col(S::Panel), cols);
+        }
     }
 
     // One layout pass: the renderer and the click hit-test (`sidebar_hits`)
@@ -2799,6 +2863,111 @@ mod tests {
                 m.sidebar_filter
             );
         }
+    }
+
+    /// A wide-enough column with room for the mode word and its `hold`.
+    fn chip_rect(cols: usize) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows: 40,
+        }
+    }
+
+    #[test]
+    fn sort_chip_names_the_active_mode() {
+        for mode in [
+            crate::sidebar::SortMode::Manual,
+            crate::sidebar::SortMode::Name,
+            crate::sidebar::SortMode::Recent,
+            crate::sidebar::SortMode::Attention,
+            crate::sidebar::SortMode::Live,
+        ] {
+            let m = FrameModel {
+                sidebar_sort: mode,
+                ..Default::default()
+            };
+            let (label, _, _) = sort_chip(&m, chip_rect(40)).expect("chip fits at 40 cols");
+            assert!(
+                label.contains(mode.as_str()),
+                "{mode:?} chip must name its mode, got {label:?}"
+            );
+        }
+    }
+
+    /// `hold` is the freeze's only user-visible signal, and it must not appear
+    /// under a sort that never moves rows on its own — that would advertise a
+    /// hold the user has no way to observe.
+    #[test]
+    fn sort_chip_shows_hold_only_when_the_order_is_actually_held() {
+        let held = FrameModel {
+            sidebar_sort: crate::sidebar::SortMode::Live,
+            sidebar_sort_frozen: true,
+            ..Default::default()
+        };
+        let (label, _, _) = sort_chip(&held, chip_rect(40)).unwrap();
+        assert!(label.contains("hold"), "got {label:?}");
+
+        let loose = FrameModel {
+            sidebar_sort: crate::sidebar::SortMode::Live,
+            ..Default::default()
+        };
+        let (label, _, _) = sort_chip(&loose, chip_rect(40)).unwrap();
+        assert!(!label.contains("hold"), "got {label:?}");
+    }
+
+    /// Degrade by budget, never by truncation: the `hold` qualifier goes first,
+    /// then the whole chip. A clipped mode word reads as a rendering bug.
+    #[test]
+    fn sort_chip_drops_hold_then_itself_as_the_column_narrows() {
+        let m = FrameModel {
+            sidebar_sort: crate::sidebar::SortMode::Attention,
+            sidebar_sort_frozen: true,
+            ..Default::default()
+        };
+        // " WORKSPACES" (11) + 1 + "attention hold " (15) = 27
+        assert!(sort_chip(&m, chip_rect(27)).unwrap().0.contains("hold"));
+        // One column short of the held form: keep the mode, drop the qualifier.
+        let (label, _, _) = sort_chip(&m, chip_rect(26)).unwrap();
+        assert_eq!(label, "attention ");
+        // " WORKSPACES" (11) + 1 + "attention " (10) = 22; below that, nothing.
+        assert!(sort_chip(&m, chip_rect(22)).is_some());
+        assert!(sort_chip(&m, chip_rect(21)).is_none());
+        assert!(sort_chip(&m, chip_rect(4)).is_none());
+    }
+
+    #[test]
+    fn sort_chip_yields_the_header_row_to_the_rail_and_the_filter() {
+        let rail = FrameModel {
+            sidebar_rail: true,
+            ..Default::default()
+        };
+        let filtering = FrameModel {
+            sidebar_filtering: true,
+            ..Default::default()
+        };
+        // A COMMITTED filter still owns the header row, even unfocused.
+        let filtered = FrameModel {
+            sidebar_filter: "wt".into(),
+            ..Default::default()
+        };
+        for m in [&rail, &filtering, &filtered] {
+            assert!(sort_chip(m, chip_rect(40)).is_none());
+        }
+        // ...and it comes straight back when the filter clears.
+        assert!(sort_chip(&FrameModel::default(), chip_rect(40)).is_some());
+    }
+
+    /// Paint and hit-test share this span, so it must land inside the column.
+    #[test]
+    fn sort_chip_is_right_aligned_within_the_column() {
+        let m = FrameModel::default();
+        let rect = chip_rect(40);
+        let (label, x, cols) = sort_chip(&m, rect).unwrap();
+        assert_eq!(cols, label.chars().count());
+        assert_eq!(x + cols, rect.x + rect.cols, "flush with the right edge");
+        assert!(x > rect.x + " WORKSPACES".chars().count());
     }
 
     #[test]

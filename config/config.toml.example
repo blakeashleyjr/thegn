@@ -120,6 +120,14 @@ dismiss_overlay_on_click_outside = true
 # menu: manual/name/recent/attention; manual — rows stay where you put them —
 # is the default).
 sidebar_project_sort = "manual"
+# Hold the sidebar's worktree order steady while you navigate it: for as long as
+# the sidebar has focus, and for ~2s after an Alt+↑/↓ (or Alt+<digit>) jump made
+# from a pane. Only the *computed* sorts can move a row on their own — attention
+# (tier ranks) and live (last-active time) — so this is a no-op under
+# manual/name/recent. The header chip appends "hold" while the order is frozen,
+# and it thaws the moment focus leaves the sidebar. Off = rows re-rank the
+# instant the underlying signal changes, including mid-keystroke.
+sidebar_freeze_sort = true
 # Sidebar TERMINALS section: "always" keeps the banner visible (with a
 # "no terminals" hint when empty) so the entry point never vanishes;
 # "nonempty" hides the whole section until a terminal exists.

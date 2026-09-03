@@ -201,6 +201,17 @@ pub(crate) fn on_left_press(
     ctrl: bool,
     now: Instant,
 ) -> PressOut {
+    // The header row sits above the list, so `row_at` resolves it to nothing and
+    // the click would be swallowed. Give the sort chip its branch first: an
+    // indicator you can click to change what it indicates. Geometry comes from
+    // the same `sort_chip` the painter uses, so the target is exactly the text.
+    if my == rect.y
+        && let Some((_, cx, ccols)) = crate::sidebar_view::sort_chip(model, rect)
+        && mx >= cx
+        && mx < cx + ccols
+    {
+        return PressOut::Outcome(SidebarOutcome::SortMenu);
+    }
     let hits = hit_rows(model, rect);
     let Some(hit) = row_at(&hits, my).cloned() else {
         return PressOut::Consumed;
@@ -2064,6 +2075,59 @@ mod tests {
         assert!(!matches!(
             off,
             PressOut::Outcome(SidebarOutcome::OpenMergeQueue { .. })
+        ));
+    }
+
+    /// The header sort chip is clickable, and its target is exactly the span
+    /// `sort_chip` paints — paint and hit-test share the one function, so a
+    /// click can never land off the chip the user can see.
+    #[test]
+    fn clicking_the_header_sort_chip_opens_the_sort_menu() {
+        let (mut model, rect) = fixture();
+        let (_, cx, ccols) =
+            crate::sidebar_view::sort_chip(&model, rect).expect("chip fits the fixture width");
+
+        let press = |model: &mut crate::chrome::FrameModel, mx: usize, my: usize| {
+            on_left_press(
+                &mut MouseUi::default(),
+                &mut SidebarState::default(),
+                model,
+                &crate::session::Session::default(),
+                rect,
+                mx,
+                my,
+                false,
+                Instant::now(),
+            )
+        };
+
+        for mx in [cx, cx + ccols - 1] {
+            assert!(
+                matches!(
+                    press(&mut model, mx, rect.y),
+                    PressOut::Outcome(SidebarOutcome::SortMenu)
+                ),
+                "column {mx} is on the chip"
+            );
+        }
+
+        // One column left of the chip is bare header: it must stay inert, not
+        // open a menu the user didn't aim at.
+        assert!(!matches!(
+            press(&mut model, cx - 1, rect.y),
+            PressOut::Outcome(SidebarOutcome::SortMenu)
+        ));
+        // The same columns one row down belong to the list, not the header.
+        assert!(!matches!(
+            press(&mut model, cx, rect.y + 1),
+            PressOut::Outcome(SidebarOutcome::SortMenu)
+        ));
+
+        // No chip painted (filtering) ⇒ no hidden hit target on the header row.
+        model.sidebar_filtering = true;
+        assert!(!matches!(
+            press(&mut model, cx, rect.y),
+            PressOut::Outcome(SidebarOutcome::SortMenu)
         ));
     }
 

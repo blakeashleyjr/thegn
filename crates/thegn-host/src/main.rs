@@ -217,6 +217,7 @@ mod session;
 mod share;
 mod shell_snippet;
 mod sidebar;
+mod sidebar_freeze;
 mod sidebar_help;
 mod sidebar_keytable;
 mod sidebar_legend;
