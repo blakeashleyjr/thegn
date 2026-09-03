@@ -203,6 +203,10 @@ pub struct NewWorktreeWizard {
     /// "○ new") for envs bound to a `[host.*]` entry; rendered dim after the
     /// host label. Empty unless the launcher provided one (hosts-as-resources).
     host_badges: std::collections::HashMap<String, String>,
+    /// Host env key → sandbox row key selected when that host becomes active.
+    /// A named local env's explicit `[env.<name>.sandbox] backend` wins; envs
+    /// without one use the global new-worktree `default_backend`.
+    host_sandbox_defaults: std::collections::HashMap<String, String>,
     sandbox_rows: Vec<(String, String)>,
     sandbox_sel: usize,
     agent_rows: Vec<(String, String)>,
@@ -242,13 +246,38 @@ impl NewWorktreeWizard {
             .iter()
             .position(|(k, _, _)| *k == default_env)
             .unwrap_or(0);
-        let sandbox_rows = crate::palette::build_sandbox_palette(cfg)
+        let sandbox_rows: Vec<(String, String)> = crate::palette::build_sandbox_palette(cfg)
             .into_iter()
             .map(|i| {
                 let key = i.key.strip_prefix("sandbox:").unwrap_or(&i.key).to_string();
                 (key, i.label)
             })
             .collect();
+        let host_sandbox_defaults = host_rows
+            .iter()
+            .filter_map(|(key, _, local)| {
+                let backend = if *local {
+                    cfg.env
+                        .get(key)
+                        .and_then(|env| env.sandbox.backend)
+                        .unwrap_or(cfg.sandbox.default_backend)
+                } else {
+                    thegn_core::config::SandboxBackend::Auto
+                };
+                sandbox_rows
+                    .iter()
+                    .find(|(row_key, _)| {
+                        thegn_core::config::SandboxBackend::from_str_validated(row_key)
+                            .is_ok_and(|parsed| parsed == backend)
+                    })
+                    .map(|(row_key, _)| (key.clone(), row_key.clone()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let sandbox_sel = host_rows
+            .get(host_sel)
+            .and_then(|(key, _, _)| host_sandbox_defaults.get(key))
+            .and_then(|want| sandbox_rows.iter().position(|(key, _)| key == want))
+            .unwrap_or(0);
         let agent_rows = crate::palette::build_agent_palette(cfg)
             .into_iter()
             .map(|i| (i.key, i.label))
@@ -264,8 +293,9 @@ impl NewWorktreeWizard {
             host_rows,
             host_sel,
             host_badges: std::collections::HashMap::new(),
+            host_sandbox_defaults,
             sandbox_rows,
-            sandbox_sel: 0,
+            sandbox_sel,
             agent_rows,
             agent_sel: 0,
         }
@@ -289,6 +319,21 @@ impl NewWorktreeWizard {
     pub fn preselect_host(&mut self, key: &str) {
         if let Some(i) = self.host_rows.iter().position(|(k, _, _)| k == key) {
             self.host_sel = i;
+            self.select_host_sandbox_default();
+        }
+    }
+
+    /// Keep the default sandbox choice coupled to the selected environment.
+    /// Without this, selecting an explicit uncontained `host` env still left the
+    /// independent sandbox row on global `auto`, so creation probed Podman/Docker
+    /// before later launches reverted to the env's `none` backend.
+    fn select_host_sandbox_default(&mut self) {
+        let host = self.host_key();
+        let Some(want) = self.host_sandbox_defaults.get(&host) else {
+            return;
+        };
+        if let Some(i) = self.sandbox_rows.iter().position(|(key, _)| key == want) {
+            self.sandbox_sel = i;
         }
     }
 
@@ -488,6 +533,7 @@ impl NewWorktreeWizard {
                 KeyCode::LeftArrow | KeyCode::Char('h') => {
                     if self.host_sel > 0 {
                         self.host_sel -= 1;
+                        self.select_host_sandbox_default();
                         return self.prep_outcome();
                     }
                     WizardOutcome::Pending
@@ -495,6 +541,7 @@ impl NewWorktreeWizard {
                 KeyCode::RightArrow | KeyCode::Char('l') => {
                     if self.host_sel + 1 < self.host_rows.len() {
                         self.host_sel += 1;
+                        self.select_host_sandbox_default();
                         return self.prep_outcome();
                     }
                     WizardOutcome::Pending
@@ -1697,6 +1744,41 @@ mod tests {
         key(&mut w, KeyCode::UpArrow); // Program -> Sandbox
         key(&mut w, KeyCode::UpArrow); // Sandbox -> Host
         assert_eq!(key(&mut w, KeyCode::RightArrow), WizardOutcome::Pending);
+    }
+
+    #[test]
+    fn local_host_env_defaults_to_its_explicit_uncontained_backend() {
+        use thegn_core::config::{EnvConfig, PlacementMode, SandboxBackend, SandboxOverlay};
+
+        let mut cfg = test_cfg();
+        cfg.sandbox.default_backend = SandboxBackend::Auto;
+        cfg.sandbox.default_env = "host".into();
+        cfg.env.insert(
+            "host".into(),
+            EnvConfig {
+                placement: PlacementMode::Local,
+                sandbox: SandboxOverlay {
+                    backend: Some(SandboxBackend::None),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        assert_eq!(w.host_key(), "host");
+        assert_eq!(w.sandbox_key(), "host");
+
+        // Changing hosts reselects that host's own default instead of carrying
+        // the previous host's isolation choice across environments.
+        w.preselect_host("default");
+        assert_eq!(w.sandbox_key(), "auto");
+        w.preselect_host("host");
+        let WizardOutcome::Submit(choices) = w.submit() else {
+            panic!("expected submit");
+        };
+        assert_eq!(choices.env, "host");
+        assert_eq!(choices.sandbox, "host");
     }
 
     #[test]
