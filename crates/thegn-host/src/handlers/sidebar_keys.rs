@@ -577,6 +577,9 @@ impl SidebarState {
                 _ => return SidebarOutcome::Redraw,
             }
             self.cursor = 0;
+            // The visible set just changed shape, so a snapshot of the old
+            // order means nothing — re-snapshot the filtered one.
+            crate::sidebar_freeze::rearm(self, &model.sidebar_status);
             self.rebuild(model, session);
             // Committing lands the cursor on the first actionable MATCH (a
             // worktree/terminal row), not on row 0 — which is the first
@@ -666,6 +669,8 @@ impl SidebarState {
                 if !self.view.filter.is_empty() {
                     self.view.filter.clear();
                     self.cursor = 0;
+                    // Same as the filter sub-mode: the visible set changed.
+                    crate::sidebar_freeze::rearm(self, &model.sidebar_status);
                     self.rebuild(model, session);
                     model.status = "Sidebar filter cleared".into();
                     return SidebarOutcome::Redraw;
@@ -1102,6 +1107,9 @@ impl SidebarState {
         // top so the cursor and scroll window don't dangle past the new list.
         self.cursor = 0;
         self.scroll = 0;
+        // Grouped and flat are different sort domains (`sort_groups` vs
+        // `sort_groups_flat`), so re-snapshot rather than hold the old one.
+        crate::sidebar_freeze::rearm(self, &model.sidebar_status);
         self.rebuild(model, session);
         model.status = if self.view.flat {
             // Honest about the order: flat obeys the active `s` sort (Manual —

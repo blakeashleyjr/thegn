@@ -198,7 +198,10 @@ fn hints(cfg: &Config, zone: &str) -> Result<()> {
         // `None` = unknown: this subcommand lists what is bound, it does not
         // own a raw tty to probe the terminal with, and unknown never hides a
         // row (THE-70).
-        "sidebar" => crate::sidebar_keytable::footer_hints(cfg, None),
+        // A static listing, with no live sidebar to read a mode from.
+        "sidebar" => {
+            crate::sidebar_keytable::footer_hints(cfg, None, crate::sidebar::SortMode::default())
+        }
         "splash" => crate::logotype::splash_hints(cfg)
             .into_iter()
             .map(|h| (h.chord, h.label.to_string()))

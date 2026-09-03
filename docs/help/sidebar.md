@@ -79,7 +79,10 @@ mode.
 - `r` / `F2` — rename
 - `p` — pin to top
 - `s` — sort menu: manual / name / recent / attention / live (live orders
-  worktrees by most-recent process/agent activity, newest first)
+  worktrees by most-recent process/agent activity, newest first). The
+  active mode is always on screen: it is the quiet word at the right of
+  the `WORKSPACES` header, which you can also **click** to open this menu.
+  The header drops the word rather than clipping it in a narrow column.
 - `Space` — mark rows for bulk actions (marks clear when you click or type
   into a pane); `Shift-↑↓` — reorder manually
 
@@ -233,6 +236,17 @@ repo-local `.thegn.toml`.
 Project ordering is configurable: `sidebar_project_sort = "attention"`
 bubbles the project that most needs you to the top. See
 [[config-reference]] `[ui]`.
+
+**Attention and live sorts hold still while you navigate.** Both re-rank
+off a signal that changes on its own (tier ranks, last-active time), so
+without this a row could move out from under the cursor mid-keystroke.
+The order is held for as long as the sidebar has focus — the header chip
+appends `hold` while it is — and for a couple of seconds after an
+`Alt-↑↓` / `Alt-1-9` jump made from a pane. It re-settles the moment
+focus moves into a pane, and a worktree created while held still sorts to
+its real position rather than the bottom. Turn it off with
+`sidebar_freeze_sort = false` in [[config-reference]] `[ui]`; the other
+three sorts never move on their own, so it does nothing there.
 
 ## Width
 

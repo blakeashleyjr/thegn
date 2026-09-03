@@ -58,6 +58,12 @@ mod tests {
             glyph: '●',
         });
         other.stats.cpu_pct = Some(99);
+        // Loop-owned like `sidebar_focused`: re-derived by `SidebarState::sync`
+        // after every model swap, so hydration equality must not read it.
+        // Pinned here deliberately — if it ever joined `hydration_eq`, arming
+        // the freeze would itself count as "hydration changed" and force the
+        // repaint the idle guard exists to avoid.
+        other.sidebar_sort_frozen = true;
         // Loop-owned, like `stats`: pushed by the weather task, never by
         // hydration — which is exactly why the swap in `run.rs` has to CARRY it
         // (a dropped snapshot is not visible here, it just blanks the widget
