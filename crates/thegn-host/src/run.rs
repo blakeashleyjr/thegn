@@ -1692,6 +1692,39 @@ pub(crate) fn active_cwd(session: &crate::session::Session) -> Option<std::path:
     session.active_group().and_then(group_cwd)
 }
 
+/// Open the bottom-bar worktree-size action in an interactive `gdu` pane.
+///
+/// The top-bar `disk` widget is the machine-wide filesystem statistic; the
+/// bottom-bar one is the active worktree's cached checkout size. Keep their
+/// actions separate so the latter answers the useful follow-up question:
+/// which directories inside this worktree are consuming that space?
+fn open_worktree_disk(
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    focus: &mut crate::focus::FocusState,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+    center: Rect,
+    need_relayout: &mut bool,
+) {
+    let cwd = active_cwd(session);
+    let focused = focused_pane_id(session);
+    // Keep the inspector read-only: gdu's navigation remains interactive, but
+    // the statusbar should never make deleting a worktree file one keystroke
+    // away.
+    open_command_pane(
+        session,
+        panes,
+        focused,
+        "gdu --no-delete --no-spawn-shell .",
+        cwd.as_deref(),
+        center,
+    );
+    focus.zone = crate::focus::Zone::Center;
+    refresh_tab_model(model, session, sb);
+    *need_relayout = true;
+}
+
 /// Render-facing share snapshot for the active worktree (badge + Share panel).
 pub(crate) fn current_share_views(
     sup: &crate::share::ShareSupervisor,
@@ -13945,7 +13978,18 @@ async fn event_loop<T: Terminal>(
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Statusbar;
                             model.statusbar_sel = idx;
-                            if id == BarItemId::Badge(BarBadge::Media)
+                            if matches!(&id, BarItemId::Widget(w) if w == "disk") {
+                                bar_detail = None;
+                                open_worktree_disk(
+                                    &mut session,
+                                    &mut panes,
+                                    &mut focus,
+                                    &mut model,
+                                    &mut sb,
+                                    chrome.center,
+                                    &mut need_relayout,
+                                );
+                            } else if id == BarItemId::Badge(BarBadge::Media)
                                 && current_config.media.enabled
                                 && current_config.media.overlay_on_badge_click
                             {
@@ -17381,7 +17425,19 @@ async fn event_loop<T: Terminal>(
                                 .nth(model.statusbar_sel)
                         };
                         if let Some((id, rect)) = hit {
-                            if id == BarItemId::Badge(BarBadge::Media)
+                            if !focus.masthead()
+                                && matches!(&id, BarItemId::Widget(w) if w == "disk")
+                            {
+                                open_worktree_disk(
+                                    &mut session,
+                                    &mut panes,
+                                    &mut focus,
+                                    &mut model,
+                                    &mut sb,
+                                    chrome.center,
+                                    &mut need_relayout,
+                                );
+                            } else if id == BarItemId::Badge(BarBadge::Media)
                                 && current_config.media.enabled
                                 && current_config.media.overlay_on_badge_click
                             {

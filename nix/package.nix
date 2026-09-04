@@ -29,6 +29,7 @@
   yazi,
   delta,
   gh,
+  gdu,
   coreutils,
   # yazi's preview/runtime tools (passed pinned from the flake); injected onto
   # PATH so previews work inside the file-manager drawer.
@@ -44,7 +45,7 @@
   # `callPackage ./nix/package.nix {}` cannot drift from `nix build`.
   src ? import ./source.nix {inherit lib;} ../.,
 }: let
-  runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
+  runtimeDeps = [git fzf gum lazygit yazi delta gh gdu coreutils] ++ yaziDeps;
   isDev = channel == "dev";
   # The dev build coexists with a stable install under distinct names.
   binName =
@@ -143,7 +144,7 @@ in
       ''}
 
       # Wrap the binary so it finds the pinned yazi + the tools it shells out to
-      # (git/lazygit/delta/gh) regardless of the user's PATH.
+      # (git/lazygit/delta/gh/gdu) regardless of the user's PATH.
       wrapProgram $out/bin/${binName} \
         --set THEGN_YAZI_BIN ${yazi}/bin/yazi \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}
