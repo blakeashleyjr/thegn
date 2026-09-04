@@ -678,7 +678,7 @@
         # zsh so a sandbox/sprite pane (which enters THIS devShell via
         # THEGN_DEVSHELL=sandbox) has a real login shell — the pane's shell probe
         # finds it instead of dropping to a bare `/bin/sh`.
-        packages = [rustToolchain pkgs.just pkgs.zsh];
+        packages = [rustToolchain pkgs.just pkgs.zsh pkgs.gdu];
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
           echo "thegn sandbox shell (lean: rust + just). Need a tool? Ephemeral:"
@@ -749,6 +749,7 @@
             lazygit
             delta
             gh
+            gdu
             # the e2e harness (`just e2e`) and the interactive TUI driver (`muse session`)
             musePkg
             # spec-driven development CLI (`openspec`, `just openspec*`)
@@ -805,6 +806,7 @@
             lazygit
             delta
             gh
+            gdu
             openspec
           ]
           ++ [yaziPinned]
