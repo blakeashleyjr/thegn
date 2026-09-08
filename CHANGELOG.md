@@ -7,6 +7,34 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — a project no longer resumes in a terminal
+
+- **Switching back to a project landed you in a terminal instead of your work.**
+  A terminal group shares `session.worktrees` with the worktrees, so whichever
+  one you were standing in when you left a project became that project's
+  remembered focus — and every later visit "magically jumped to the terminals".
+  But a terminal belongs to a global region: the `terminals` registry is not
+  scoped to a repo, and the group migrates between sessions when you open it
+  from another project. A workspace now parks and resumes on one of its
+  **worktrees**, whichever door the switch came through (`Shift-Alt-↑↓`,
+  `Ctrl-1-9`, a sidebar row, the palette, `thegn open`). Leaving a project from
+  the terminals region steps back onto the worktree you were last in first, so
+  the return trip lands exactly where you were. The cold path is covered too: a
+  workspace whose persisted layout named a terminal as active resurrects on a
+  worktree.
+- **Every way into the terminals region now bookmarks the worktree you left.**
+  The bookmark was written only by the `toggle-region` chord, so entering the
+  terminals any other way — the sidebar row's `↵`/click, the ring's terminal
+  stop, and above all the new-terminal wizard — left it unset, and toggling back
+  out dropped you on the home worktree rather than the one you had come from.
+  It is now written at the region crossing, by the one door every activation
+  gesture already goes through.
+- **The bookmark is a group name, not an index.** Two things re-index a
+  session's groups underneath it — a workspace switch, and a terminal migrating
+  out to another project — after which the old index silently named a
+  _different_ worktree. A name either resolves or falls back to the home
+  worktree, so a stale bookmark degrades instead of lying.
+
 ### Changed — the sidebar names its sort, and holds it while you navigate
 
 - **The active sort mode is now on screen.** It is the quiet word at the right

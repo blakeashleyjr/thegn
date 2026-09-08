@@ -2232,6 +2232,133 @@ fn workspace_pool_stash_take_roundtrips_trees() {
     assert!(pool.take("/r/a").is_none());
 }
 
+/// The reported bug: create a terminal in a project, work in it, switch away —
+/// and every later visit to that project lands in the terminal instead of the
+/// work ("going between workspaces magically jumps to the terminals").
+///
+/// A terminal shares `session.worktrees` but belongs to a global region: the
+/// registry is not scoped to a repo and the group migrates between sessions
+/// (`take_terminal_group`). So a workspace's parked landing group must be one of
+/// its WORKTREES, whatever the active pointer happened to be at park time.
+#[test]
+fn parking_a_workspace_from_the_terminals_region_lands_back_on_a_worktree() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+
+    let term = live_terminal(&mut panes, "music", 5);
+    pool.stash(
+        "/r/a".into(),
+        resident_of(
+            vec![
+                WorktreeGroup::new("a/home", GroupKind::Home, "/r/a"),
+                WorktreeGroup::new("a/feat", GroupKind::Branch, "/r/a-feat"),
+                term,
+            ],
+            2, // the user was standing in the terminal
+        ),
+        &mut panes,
+    );
+
+    let rw = pool.take("/r/a").expect("parked");
+    assert_eq!(
+        rw.worktrees[rw.active].kind,
+        GroupKind::Home,
+        "resumes on a worktree, never on the terminal that merely resided here"
+    );
+    assert_eq!(
+        rw.worktrees.len(),
+        3,
+        "the terminal group itself is still parked — only the pointer moved"
+    );
+}
+
+/// The pointer is only rewritten when it actually names a terminal: a workspace
+/// parked while the user was on a worktree resumes on exactly that worktree.
+#[test]
+fn parking_from_a_worktree_keeps_the_exact_landing_group() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    pool.stash(
+        "/r/a".into(),
+        resident_of(
+            vec![
+                WorktreeGroup::new("a/home", GroupKind::Home, "/r/a"),
+                WorktreeGroup::new("a/feat", GroupKind::Branch, "/r/a-feat"),
+            ],
+            1,
+        ),
+        &mut panes,
+    );
+    let rw = pool.take("/r/a").expect("parked");
+    assert_eq!(rw.active, 1);
+    assert_eq!(rw.worktrees[rw.active].name, "a/feat");
+}
+
+/// A workspace with nothing BUT a terminal has no worktree to fall back to; the
+/// pointer is left alone rather than clamped to something that doesn't exist.
+#[test]
+fn parking_a_terminal_only_workspace_leaves_the_pointer_alone() {
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    let term = live_terminal(&mut panes, "solo", 6);
+    pool.stash("/r/a".into(), resident_of(vec![term], 0), &mut panes);
+    let rw = pool.take("/r/a").expect("parked");
+    assert_eq!(rw.active, 0);
+}
+
+/// `region_last_w` is a group NAME, not an index. Two things re-index
+/// `session.worktrees` underneath the bookmark — a workspace switch, and a
+/// terminal migrating out via `take_terminal_group` — and an index bookmark
+/// silently landed on whichever worktree had shifted into that slot.
+#[test]
+fn worktree_landing_resolves_the_bookmark_by_name_across_a_reindex() {
+    let mut session = Session {
+        id: "/r/a".into(),
+        worktrees: vec![
+            WorktreeGroup::new("a/home", GroupKind::Home, "/r/a"),
+            WorktreeGroup::terminal("music"),
+            WorktreeGroup::new("a/feat", GroupKind::Branch, "/r/a-feat"),
+        ],
+        active: 1,
+    };
+    // "a/feat" is at index 2 here…
+    assert_eq!(worktree_landing(&session, Some("a/feat")), Some(2));
+    // …and at index 1 once the terminal migrates to another project. The name
+    // still finds it; the old index would now have named "a/feat" -> the wrong
+    // group had the order differed.
+    session.worktrees.remove(1);
+    assert_eq!(worktree_landing(&session, Some("a/feat")), Some(1));
+
+    // An unresolvable bookmark degrades to the home worktree, never to a
+    // terminal and never to nothing.
+    assert_eq!(worktree_landing(&session, Some("b/gone")), Some(0));
+    assert_eq!(worktree_landing(&session, None), Some(0));
+}
+
+/// The bookmark must never resolve to a terminal even when one carries the
+/// name — leaving the terminals region has to land in the worktree region.
+#[test]
+fn worktree_landing_never_lands_on_a_terminal() {
+    let session = Session {
+        id: "/r/a".into(),
+        worktrees: vec![
+            WorktreeGroup::terminal("music"),
+            WorktreeGroup::new("a/home", GroupKind::Home, "/r/a"),
+        ],
+        active: 0,
+    };
+    assert_eq!(worktree_landing(&session, Some("music")), Some(1));
+    let only_terminals = Session {
+        id: "/r/a".into(),
+        worktrees: vec![WorktreeGroup::terminal("music")],
+        active: 0,
+    };
+    assert_eq!(worktree_landing(&only_terminals, None), None);
+}
+
 /// Build a one-tab workspace whose single leaf pane has id `pane_id`, and
 /// register a live `PtyPane` for it in `panes` so eviction has something to reap.
 #[cfg(test)]
