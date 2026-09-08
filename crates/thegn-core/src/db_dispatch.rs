@@ -3,12 +3,72 @@
 //! cache; git / the live source is truth.
 
 use crate::db::Db;
-use crate::issue::DispatchNote;
+use crate::issue::{AgentDispatchStatus, DispatchNote};
 use crate::store::NotificationStore;
 use crate::util;
 use anyhow::Result;
 
 impl Db {
+    /// Atomically update a row's status and append its human-readable reason.
+    /// Neither write is allowed to survive without the other.
+    pub fn update_dispatch_status_with_note(
+        &self,
+        id: i64,
+        status: AgentDispatchStatus,
+        note: &str,
+    ) -> Result<()> {
+        let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE agent_dispatches SET status=?1 WHERE id=?2",
+            rusqlite::params![status.as_str(), id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("roster row {id} does not exist");
+        }
+        tx.execute(
+            "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, util::now_ms(), note],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply a planned status transition only if the row still has the status
+    /// observed by the planner. An optional note commits in the same
+    /// transaction. `false` means a concurrent writer won and is preserved.
+    pub fn compare_and_set_dispatch_status(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        status: AgentDispatchStatus,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let note = note
+            .map(crate::pipeline_report::note_text)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE agent_dispatches SET status=?1 WHERE id=?2 AND status=?3",
+            rusqlite::params![status.as_str(), id, expected.as_str()],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        if let Some(note) = note {
+            tx.execute(
+                "INSERT INTO agent_dispatch_notes (dispatch_id, created_at_ms, text) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, util::now_ms(), note],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Store the worker's structured handoff report on a roster row — UPDATE the
     /// nullable `report` column. Errors when the row does not exist (checks
     /// `get_dispatch` first, naming the id).
@@ -323,6 +383,47 @@ mod tests {
         let (db, _dir) = temp_db();
         let err = db.append_dispatch_note(99, "x").unwrap_err();
         assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    #[test]
+    fn status_and_reason_commit_together() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-6", "/wt/x");
+        db.update_dispatch_status_with_note(id, AgentDispatchStatus::Failed, "why it failed")
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Failed
+        );
+        assert_eq!(
+            db.dispatch_notes(id, None, 0).unwrap()[0].text,
+            "why it failed"
+        );
+    }
+
+    #[test]
+    fn stale_status_compare_and_set_preserves_the_newer_decision() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-7", "/wt/x");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Abandoned)
+            .unwrap();
+
+        assert!(
+            !db.compare_and_set_dispatch_status(
+                id,
+                AgentDispatchStatus::Running,
+                AgentDispatchStatus::Done,
+                Some("stale reap"),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().status,
+            AgentDispatchStatus::Abandoned
+        );
+        assert!(db.dispatch_notes(id, None, 0).unwrap().is_empty());
     }
 
     #[test]

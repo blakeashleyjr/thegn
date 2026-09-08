@@ -45,10 +45,12 @@ pub struct ReapFacts {
     pub session_live: bool,
     /// The row's artifact exists under its worktree.
     pub artifact_exists: bool,
-    /// git tracks that artifact — an uncommitted file is not a handoff.
+    /// The artifact is committed in `HEAD` and unchanged at that path.
     pub artifact_tracked: bool,
     /// The row carries a worker report.
     pub report_present: bool,
+    /// PASS reports carry a meaningful successful gate citation.
+    pub report_gate_valid: bool,
 }
 
 /// What the row should become.
@@ -102,6 +104,9 @@ impl ReapVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reap {
     pub id: i64,
+    /// Status observed while planning. Writers use this as a compare-and-set
+    /// guard so a later human decision is never overwritten by a stale plan.
+    pub observed_status: crate::issue::AgentDispatchStatus,
     pub verdict: ReapVerdict,
 }
 
@@ -114,23 +119,29 @@ pub struct Reap {
 /// also what a worker leaves when its sandbox forbade the commit (THE-91), so
 /// it must never read as success.
 pub fn classify(row: &AgentDispatch, facts: &ReapFacts) -> ReapVerdict {
-    if !row.status.is_active() {
+    if !matches!(
+        row.status,
+        crate::issue::AgentDispatchStatus::Spawning | crate::issue::AgentDispatchStatus::Running
+    ) {
         return ReapVerdict::Closed;
     }
     if facts.session_live {
         return ReapVerdict::Live;
     }
-    match (facts.artifact_tracked, facts.report_present) {
+    match (
+        facts.artifact_tracked,
+        facts.report_present && facts.report_gate_valid,
+    ) {
         (true, true) => ReapVerdict::CloseDone,
         (true, false) => ReapVerdict::NeedsDecision {
-            why: "worker is gone and its artifact IS committed, but no report was filed — \
-                  read the artifact and close it yourself; auto-closing would mean forcing \
-                  the gate or inventing a report",
+            why: "worker is gone and its artifact IS committed, but its report is missing or \
+                  claims PASS without a successful gate citation — read the artifact and close \
+                  it yourself; auto-closing would mean forcing the gate or inventing evidence",
         },
         (false, _) if facts.artifact_exists => ReapVerdict::MarkFailed {
-            why: "worker is gone and its artifact exists but is NOT tracked by git — an \
-                  uncommitted artifact is not a handoff (a worker whose sandbox forbade the \
-                  commit leaves exactly this state; see THE-91)",
+            why: "worker is gone and its artifact exists but is NOT committed and clean in \
+                  HEAD — an uncommitted or subsequently edited artifact is not a handoff (a \
+                  worker whose sandbox forbade the commit leaves exactly this state; see THE-91)",
         },
         (false, _) => ReapVerdict::MarkFailed {
             why: "worker is gone and its artifact was never written — the stage produced \
@@ -151,6 +162,7 @@ where
     rows.iter()
         .map(|r| Reap {
             id: r.id,
+            observed_status: r.status,
             verdict: classify(r, &facts_for(r)),
         })
         .collect()
@@ -218,6 +230,7 @@ mod tests {
         artifact_exists: true,
         artifact_tracked: true,
         report_present: true,
+        report_gate_valid: true,
     };
 
     #[test]
@@ -242,6 +255,17 @@ mod tests {
     }
 
     #[test]
+    fn queued_and_parked_rows_do_not_require_a_live_worker() {
+        for st in [S::Queued, S::WaitingHuman, S::PrOpen] {
+            assert_eq!(
+                classify(&row(1, st), &GONE_COMMITTED_REPORTED),
+                ReapVerdict::Closed,
+                "{st:?}"
+            );
+        }
+    }
+
+    #[test]
     fn gone_with_a_committed_artifact_and_a_report_closes_clean() {
         // The only case that may auto-close: the gate would pass unforced.
         assert_eq!(
@@ -257,6 +281,7 @@ mod tests {
         // forcing the gate or inventing a report — neither is the tool's call.
         let f = ReapFacts {
             report_present: false,
+            report_gate_valid: true,
             ..GONE_COMMITTED_REPORTED
         };
         let v = classify(&row(1, S::Running), &f);
@@ -274,11 +299,12 @@ mod tests {
             artifact_exists: true,
             artifact_tracked: false,
             report_present: false,
+            report_gate_valid: true,
         };
         match classify(&row(1, S::Running), &f) {
             ReapVerdict::MarkFailed { why } => {
                 assert!(
-                    why.contains("not tracked") || why.contains("NOT tracked"),
+                    why.contains("not committed") || why.contains("NOT committed"),
                     "{why}"
                 );
                 assert!(why.contains("THE-91"), "{why}");
@@ -294,6 +320,7 @@ mod tests {
             artifact_exists: false,
             artifact_tracked: false,
             report_present: false,
+            report_gate_valid: true,
         };
         match classify(&row(1, S::Running), &f) {
             ReapVerdict::MarkFailed { why } => assert!(why.contains("never written"), "{why}"),
@@ -310,6 +337,7 @@ mod tests {
             artifact_exists: true,
             artifact_tracked: false,
             report_present: true,
+            report_gate_valid: true,
         };
         assert!(matches!(
             classify(&row(1, S::Running), &f),
@@ -334,6 +362,7 @@ mod tests {
             2 => GONE_COMMITTED_REPORTED,
             3 => ReapFacts {
                 report_present: false,
+                report_gate_valid: true,
                 ..GONE_COMMITTED_REPORTED
             },
             _ => ReapFacts {
@@ -341,6 +370,7 @@ mod tests {
                 artifact_exists: false,
                 artifact_tracked: false,
                 report_present: false,
+                report_gate_valid: true,
             },
         });
         assert_eq!(out.len(), 5);

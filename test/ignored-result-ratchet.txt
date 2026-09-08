@@ -378,7 +378,6 @@ crates/thegn-svc/src/voice.rs
 # DB cache writes (`Db::open().ok()`, put/prune/del of cached rows). The DB is
 # a cache and git/the forge is the source of truth, so a failed write costs a
 # re-read, never correctness.
-crates/thegn-host/src/cmd/dispatch.rs
 crates/thegn-host/src/cmd/session_move.rs
 crates/thegn-host/src/theme_store.rs
 #

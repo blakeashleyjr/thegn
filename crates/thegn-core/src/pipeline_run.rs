@@ -85,7 +85,7 @@ pub struct VerifyFacts {
     pub artifact: Option<String>,
     /// The file exists under the worktree.
     pub exists: bool,
-    /// git tracks the file (`git ls-files` names it).
+    /// The file is committed in `HEAD` and unchanged at this path.
     pub tracked: bool,
     /// The worktree has uncommitted changes.
     pub dirty: bool,
@@ -94,6 +94,9 @@ pub struct VerifyFacts {
     /// the gated rule in [`verify_report`] names `dispatch report` as the
     /// fix.
     pub report_present: bool,
+    /// The report does not make an unsupported PASS claim. Non-PASS reports
+    /// satisfy this automatically; PASS requires meaningful gate evidence.
+    pub report_gate_valid: bool,
 }
 
 /// The verdict for one run-completion claim, plus the reasons a caller can
@@ -107,6 +110,7 @@ pub struct VerifyReport {
     pub tracked: bool,
     pub dirty: bool,
     pub report_present: bool,
+    pub report_gate_valid: bool,
     /// Only the things that make `ok` false — a caller prints this verbatim
     /// on refusal. `dirty` is deliberately *not* here: it never blocks.
     pub reasons: Vec<String>,
@@ -137,6 +141,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
             tracked: f.tracked,
             dirty: f.dirty,
             report_present: f.report_present,
+            report_gate_valid: f.report_gate_valid,
             reasons: Vec::new(),
         };
     };
@@ -145,12 +150,17 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         reasons.push(format!("artifact {a:?} does not exist under the worktree"));
     } else if !f.tracked {
         reasons.push(format!(
-            "artifact {a:?} exists but git does not track it — commit it"
+            "artifact {a:?} exists but is not committed and clean in HEAD — commit it"
         ));
     }
     if !f.report_present {
         reasons.push(format!(
             "row has artifact {a:?} but no report — file one with `thegn dispatch report <id>`"
+        ));
+    }
+    if f.report_present && !f.report_gate_valid {
+        reasons.push(format!(
+            "row claims PASS but cites no successful gate result — update it with `thegn dispatch report <id>`"
         ));
     }
     VerifyReport {
@@ -160,6 +170,7 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         tracked: f.tracked,
         dirty: f.dirty,
         report_present: f.report_present,
+        report_gate_valid: f.report_gate_valid,
         reasons,
     }
 }
@@ -454,6 +465,7 @@ mod tests {
             tracked,
             dirty,
             report_present,
+            report_gate_valid: true,
         }
     }
 
@@ -487,7 +499,7 @@ mod tests {
         let r = verify_report(&facts(Some("a.md"), true, false, false));
         assert!(!r.ok);
         assert!(
-            r.reasons[0].contains("does not track it — commit it"),
+            r.reasons[0].contains("not committed and clean in HEAD — commit it"),
             "{r:?}"
         );
     }
@@ -551,6 +563,19 @@ mod tests {
         assert!(r.ok);
         assert!(r.reasons.is_empty());
         assert!(r.report_present);
+    }
+
+    #[test]
+    fn pass_without_successful_gate_evidence_is_refused() {
+        let mut f = facts_report(Some("a.md"), true, true, false, true);
+        f.report_gate_valid = false;
+        let r = verify_report(&f);
+        assert!(!r.ok);
+        assert!(
+            r.reasons
+                .iter()
+                .any(|reason| reason.contains("successful gate"))
+        );
     }
 
     #[test]

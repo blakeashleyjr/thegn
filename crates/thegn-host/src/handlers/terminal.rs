@@ -163,17 +163,55 @@ pub(crate) fn fresh_group(name: &str, panes: &mut Panes) -> crate::session::Work
 /// maps, via [`crate::workspace_pool::remap_group_ids`]) so a persisted id can't
 /// alias a live pane of some other resident workspace.
 ///
-/// One indexed SELECT on the loop, on a user-initiated activation only — the
-/// same trade `switch_workspace`'s registry re-read already makes.
-pub(crate) fn restore_group(
+/// The indexed SELECT runs on `spawn_blocking`; only the owned rows cross back
+/// to the loop, where pane ids are allocated and remapped.
+pub(crate) struct RestoreDone {
+    pub workspace: String,
+    pub name: String,
+    pub restored: Result<
+        Option<(
+            String,
+            thegn_core::models::TabGroupRow,
+            Vec<thegn_core::models::GroupTabRow>,
+        )>,
+        String,
+    >,
+}
+
+/// Read a terminal's resurrection rows off the compositor loop. The completion
+/// is tagged with the workspace that requested it so a late result can never
+/// inject the terminal into a project the user switched to meanwhile.
+pub(crate) fn request_restore(
+    workspace: String,
+    name: String,
+    tx: tokio::sync::mpsc::UnboundedSender<RestoreDone>,
+    waker: termwiz::terminal::TerminalWaker,
+) {
+    tokio::task::spawn_blocking(move || {
+        let restored = thegn_core::db::Db::open()
+            .and_then(|db| db.terminal_group_tabs(&name))
+            .map_err(|e| e.to_string());
+        let _ = tx.send(RestoreDone {
+            workspace,
+            name,
+            restored,
+        }); // best-effort: send: the UI may have exited
+        let _ = waker.wake(); // best-effort: waker pulse: completion must wake the blocked loop
+    });
+}
+
+pub(crate) fn finish_restore(
     name: &str,
+    restored: Option<(
+        String,
+        thegn_core::models::TabGroupRow,
+        Vec<thegn_core::models::GroupTabRow>,
+    )>,
     panes: &mut Panes,
-) -> Option<(String, crate::session::WorktreeGroup)> {
-    let db = thegn_core::db::Db::open().ok()?;
-    let (donor, grow, rows) = db.terminal_group_tabs(name).ok().flatten()?;
-    if rows.is_empty() {
-        return None;
-    }
+) -> (Option<String>, crate::session::WorktreeGroup) {
+    let Some((donor, grow, rows)) = restored.filter(|(_, _, rows)| !rows.is_empty()) else {
+        return (None, fresh_group(name, panes));
+    };
     let tabs: Vec<crate::session::Tab> = rows.iter().map(crate::session::Tab::from_row).collect();
     let active_tab = (grow.active_tab.max(0) as usize).min(tabs.len() - 1);
     let mut group = crate::session::WorktreeGroup {
@@ -184,7 +222,7 @@ pub(crate) fn restore_group(
         active_tab,
     };
     crate::workspace_pool::remap_group_ids(&mut group, panes);
-    Some((donor, group))
+    (Some(donor), group)
 }
 
 /// Drop terminal `name`'s layout rows from the session that used to hold it,

@@ -28,6 +28,15 @@ pub(crate) trait ExecSource: Send + Sync {
         cols: u16,
         rows: u16,
     ) -> BoxFuture<'a, Result<ExecSession>>;
+    /// Whether a failed attach names a session that is authoritatively absent.
+    ///
+    /// A transport error is not evidence that the shell died: opening a fresh
+    /// exec in that case would fork a second live shell. Sources that can query
+    /// an authoritative roster override this; the conservative default keeps
+    /// the attach error visible and never duplicates work.
+    fn session_absent<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
     /// Health feedback after an open/attach outcome (e.g. flips `exec=auto`
     /// panes to the CLI fallback during a cooldown). Default: no-op.
     fn report_health(&self, _ok: bool) {}

@@ -68,7 +68,11 @@ pub(crate) fn request(
 /// `old_path` (identity, not index) and persists the rename to the DB cache.
 /// Returns the status line to show. Pure of I/O except the DB cache write
 /// (best-effort; git is the source of truth).
-pub(crate) fn apply(session: &mut Session, done: RenameDone) -> String {
+pub(crate) fn apply(
+    session: &mut Session,
+    region_last_w: &mut Option<String>,
+    done: RenameDone,
+) -> String {
     let RenameDone {
         old_path,
         want,
@@ -87,9 +91,13 @@ pub(crate) fn apply(session: &mut Session, done: RenameDone) -> String {
     let slug = crate::sidebar::split_tab(&g.name)
         .map(|(s, _)| s)
         .unwrap_or_default();
+    let old_name = g.name.clone();
     g.name = format!("{slug}/{want}");
     g.path = new_path_s.clone();
     let tab = g.name.clone();
+    if region_last_w.as_deref() == Some(old_name.as_str()) {
+        *region_last_w = Some(tab.clone());
+    }
     use thegn_core::store::WorkspaceStore;
     if let Ok(db) = thegn_core::db::Db::open() {
         // best-effort: the DB is a cache; git already moved the worktree.
@@ -125,7 +133,8 @@ mod tests {
             want: "renamed".into(),
             result: Ok(std::path::PathBuf::from("/wt/renamed")),
         };
-        let status = apply(&mut session, done);
+        let mut bookmark = None;
+        let status = apply(&mut session, &mut bookmark, done);
         assert_eq!(status, "Renamed to renamed");
         // The correct group (found by old_path) was re-keyed, not whatever now
         // sits at the stale index.
@@ -155,7 +164,8 @@ mod tests {
             want: "x".into(),
             result: Ok(std::path::PathBuf::from("/wt/x")),
         };
-        let status = apply(&mut session, done);
+        let mut bookmark = None;
+        let status = apply(&mut session, &mut bookmark, done);
         assert!(status.contains("no longer in session"), "got: {status}");
         assert_eq!(session.worktrees.len(), 1);
     }
@@ -168,7 +178,27 @@ mod tests {
             want: "x".into(),
             result: Err("boom".into()),
         };
-        let status = apply(&mut session, done);
+        let mut bookmark = None;
+        let status = apply(&mut session, &mut bookmark, done);
         assert_eq!(status, "rename failed: boom");
+    }
+
+    #[test]
+    fn apply_rekeys_terminal_region_worktree_bookmark() {
+        let mut session = Session {
+            worktrees: vec![group("repo/feature", "/wt/feature")],
+            ..Default::default()
+        };
+        let mut bookmark = Some("repo/feature".into());
+        let done = RenameDone {
+            old_path: "/wt/feature".into(),
+            want: "renamed".into(),
+            result: Ok(std::path::PathBuf::from("/wt/renamed")),
+        };
+        assert_eq!(
+            apply(&mut session, &mut bookmark, done),
+            "Renamed to renamed"
+        );
+        assert_eq!(bookmark.as_deref(), Some("repo/renamed"));
     }
 }

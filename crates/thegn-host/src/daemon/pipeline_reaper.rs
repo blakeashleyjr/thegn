@@ -15,7 +15,8 @@
 //! rule in exactly one direction**, and it is worth being precise about why.
 //!
 //! - **`CloseDone` → `done`.** Allowed. This verdict fires only when the
-//!   artifact exists, is *tracked by git*, and a report is filed — bit for bit
+//!   artifact exists, is committed and unchanged in `HEAD`, and a report with
+//!   valid PASS gate evidence is filed — bit for bit
 //!   the gate `dispatch set-status done` already enforces on the supervisor's
 //!   behalf. Applying it is arithmetic on recorded facts, not a judgement about
 //!   whether the work was any good, so there is nothing here for a human to
@@ -42,7 +43,6 @@ use std::time::Duration;
 
 use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::pipeline_reap::ReapVerdict;
-use thegn_core::store::NotificationStore;
 
 use super::service::DaemonService;
 
@@ -94,10 +94,15 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
     for r in &plan {
         match &r.verdict {
             ReapVerdict::CloseDone => {
-                if db
-                    .update_dispatch_status(r.id, AgentDispatchStatus::Done)
-                    .is_ok()
-                {
+                if matches!(
+                    db.compare_and_set_dispatch_status(
+                        r.id,
+                        r.observed_status,
+                        AgentDispatchStatus::Done,
+                        None,
+                    ),
+                    Ok(true)
+                ) {
                     tracing::info!(
                         target: "thegn::pipeline",
                         row = r.id,
@@ -106,15 +111,17 @@ fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
                 }
             }
             ReapVerdict::MarkFailed { why } => {
-                // Park, do not fail: the daemon records what it saw and leaves
-                // the verdict to a supervisor.
-                // best-effort: the note is context; losing it must not stop the
-                // status from moving off `running`, which is the point.
-                let _ = db.append_dispatch_note(r.id, &format!("reaped (daemon): {why}"));
-                if db
-                    .update_dispatch_status(r.id, AgentDispatchStatus::WaitingHuman)
-                    .is_ok()
-                {
+                // Park, do not fail. Status and reason are one atomic,
+                // compare-and-set transition: a concurrent human decision wins.
+                if matches!(
+                    db.compare_and_set_dispatch_status(
+                        r.id,
+                        r.observed_status,
+                        AgentDispatchStatus::WaitingHuman,
+                        Some(&format!("reaped (daemon): {why}")),
+                    ),
+                    Ok(true)
+                ) {
                     tracing::info!(
                         target: "thegn::pipeline",
                         row = r.id, why = %why,
@@ -150,35 +157,94 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use thegn_core::db::Db;
+    use thegn_core::issue::NewDispatch;
+    use thegn_core::store::NotificationStore;
 
-    /// The boundary this module is allowed to cross, pinned so a later edit
-    /// cannot quietly widen it. `CloseDone` is arithmetic on a committed,
-    /// tracked artifact plus a filed report; everything else the daemon either
-    /// parks or leaves alone.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = thegn_core::util::git_cmd(dir).args(args).status().unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn row(db: &Db, wt: &std::path::Path, artifact: &str) -> i64 {
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                issue_id: "linear:THE-1",
+                worktree_path: wt.to_str().unwrap(),
+                agent_name: "worker",
+                stage: Some("code"),
+                parent_id: None,
+                session_id: Some("dead-session"),
+                artifact_path: Some(artifact),
+                chunk_path: None,
+            })
+            .unwrap();
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+        id
+    }
+
     #[test]
-    fn the_daemon_finishes_only_the_mechanically_gated_verdict() {
-        let daemon_writes = |v: &ReapVerdict| -> Option<AgentDispatchStatus> {
-            match v {
-                ReapVerdict::CloseDone => Some(AgentDispatchStatus::Done),
-                ReapVerdict::MarkFailed { .. } => Some(AgentDispatchStatus::WaitingHuman),
-                ReapVerdict::NeedsDecision { .. } | ReapVerdict::Live | ReapVerdict::Closed => None,
-            }
-        };
+    fn production_pass_parks_once_and_does_not_grow_notes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let id = row(&db, &wt, ".thegn/pipeline/THE-1/code/1.md");
+        let shared = Arc::new(Mutex::new(db));
 
+        reap_pass(&shared, &[]);
+        {
+            let db = shared.lock().unwrap();
+            assert_eq!(
+                db.get_dispatch(id).unwrap().unwrap().status,
+                AgentDispatchStatus::WaitingHuman
+            );
+            assert_eq!(db.dispatch_notes(id, None, 0).unwrap().len(), 1);
+        }
+        reap_pass(&shared, &[]);
         assert_eq!(
-            daemon_writes(&ReapVerdict::CloseDone),
-            Some(AgentDispatchStatus::Done)
+            shared
+                .lock()
+                .unwrap()
+                .dispatch_notes(id, None, 0)
+                .unwrap()
+                .len(),
+            1,
+            "a parked row is not reaped again"
         );
+    }
+
+    #[test]
+    fn production_pass_closes_only_a_clean_head_artifact_with_gated_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_at(&dir.path().join("thegn.db")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        git(&wt, &["init", "-q"]);
+        git(&wt, &["config", "user.email", "test@example.com"]);
+        git(&wt, &["config", "user.name", "Test"]);
+        let artifact = ".thegn/pipeline/THE-1/code/1.md";
+        std::fs::create_dir_all(wt.join(".thegn/pipeline/THE-1/code")).unwrap();
+        std::fs::write(wt.join(artifact), "handoff").unwrap();
+        git(&wt, &["add", artifact]);
+        git(&wt, &["commit", "-qm", "handoff"]);
+        let id = row(&db, &wt, artifact);
+        db.set_dispatch_report(id, "PASS\ngate: just test — passed")
+            .unwrap();
+        let shared = Arc::new(Mutex::new(db));
+
+        reap_pass(&shared, &[]);
         assert_eq!(
-            daemon_writes(&ReapVerdict::MarkFailed { why: "gone" }),
-            Some(AgentDispatchStatus::WaitingHuman),
-            "the daemon parks rather than failing — a verdict belongs to a supervisor"
+            shared
+                .lock()
+                .unwrap()
+                .get_dispatch(id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentDispatchStatus::Done
         );
-        assert_eq!(
-            daemon_writes(&ReapVerdict::NeedsDecision { why: "ambiguous" }),
-            None,
-            "an ambiguous row is explicitly a human's call"
-        );
-        assert_eq!(daemon_writes(&ReapVerdict::Live), None);
     }
 }

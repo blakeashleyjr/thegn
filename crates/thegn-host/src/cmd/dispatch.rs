@@ -157,8 +157,8 @@ pub enum Action {
         json: bool,
     },
     /// Advance one dispatch's status. Marking a row `done` is gated: when the
-    /// row carries an artifact, it must exist in the worktree and be tracked by
-    /// git (a session exiting is not a handoff — see `dispatch verify`).
+    /// row carries an artifact, it must exist and be committed and unchanged
+    /// in `HEAD` (a session exiting is not a handoff — see `dispatch verify`).
     /// `failed`/`abandoned`/`merged` are never gated: recording a bad outcome
     /// must always be possible.
     SetStatus {
@@ -182,7 +182,7 @@ pub enum Action {
         json: bool,
     },
     /// Report whether a row's handoff artifact is real — present in the row's
-    /// worktree AND tracked by git (an uncommitted artifact is not a handoff).
+    /// worktree, committed in `HEAD`, and unchanged at that path.
     /// Exit 0 when it is; exit 2 (retryable) with the reasons when not. Reads
     /// only — the verdict is the supervisor's judgment.
     Verify {
@@ -876,13 +876,17 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
     if parsed == AgentDispatchStatus::Done && !force {
         done_gate(&row)?;
     }
-    db.update_dispatch_status(id, parsed)?;
-    // The reason rides as a note on the same row, so it reads back through
-    // `dispatch status` beside whatever the worker itself said.
-    // best-effort: the note is context; losing it must never make the outcome
-    // itself unrecordable.
+    // A supplied reason is primary audit data, not cache context: commit it
+    // atomically with the status so the command cannot claim success after
+    // silently losing the explanation.
     if let Some(w) = why.map(str::trim).filter(|w| !w.is_empty()) {
-        let _ = db.append_dispatch_note(id, &format!("set-status {}: {w}", parsed.as_str()));
+        db.update_dispatch_status_with_note(
+            id,
+            parsed,
+            &format!("set-status {}: {w}", parsed.as_str()),
+        )?;
+    } else {
+        db.update_dispatch_status(id, parsed)?;
     }
     let unexplained = wants_a_reason(
         parsed,
@@ -922,7 +926,8 @@ fn set_status(id: i64, status: &str, force: bool, why: Option<&str>, json: bool)
 /// artifact may only be recorded done when its handoff is real. Two
 /// gates, both in [`pipeline_run::verify_report`]:
 ///
-/// 1. The artifact is present in the row's worktree **and** tracked by git
+/// 1. The artifact is present in the row's worktree, committed in `HEAD`, and
+///    unchanged at that path
 ///    (THE-76's original rule — a session exiting is not a handoff).
 /// 2. The row carries a non-empty `report` (THE-88 — the worker must file
 ///    `thegn dispatch report <id>`; the report is what the Lead reads, the
@@ -972,6 +977,7 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
             // A plain (non-pipeline) row is never gated; the report fact is
             // still returned so verify reflects the row faithfully.
             report_present,
+            report_gate_valid: true,
         };
     };
     let wt = std::path::Path::new(&row.worktree_path);
@@ -988,10 +994,15 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         .join(&artifact)
         .symlink_metadata()
         .is_ok_and(|m| m.is_file());
-    let tracked = git_ok(
+    let tracked_in_index = git_ok(
         wt,
         &["ls-files", "--error-unmatch", "--", artifact.as_str()],
     );
+    // The artifact must be present in HEAD and byte-for-byte clean relative to
+    // it. `ls-files` alone blesses a newly staged file, which is not a durable
+    // handoff and disappears if the worktree is cleaned.
+    let tracked =
+        tracked_in_index && git_ok(wt, &["diff", "--quiet", "HEAD", "--", artifact.as_str()]);
     // `git_out` returns `None` for empty output, so `Some` ⇔ the worktree
     // has uncommitted changes.
     let dirty = git_out(wt, &["status", "--porcelain"]).is_some();
@@ -1004,6 +1015,10 @@ pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         tracked,
         dirty,
         report_present,
+        report_gate_valid: row
+            .report
+            .as_deref()
+            .is_none_or(|report| !pipeline_report::pass_without_gate_evidence(report)),
     }
 }
 
@@ -1029,7 +1044,12 @@ pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_rea
     let rows: Vec<_> = db
         .list_dispatches()?
         .into_iter()
-        .filter(|r| r.status.is_active())
+        .filter(|r| {
+            matches!(
+                r.status,
+                AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+            )
+        })
         .collect();
     Ok(pipeline_reap::plan(&rows, |r| {
         let f = verify_facts(r);
@@ -1041,6 +1061,7 @@ pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_rea
             artifact_exists: f.exists,
             artifact_tracked: f.tracked,
             report_present: f.report_present,
+            report_gate_valid: f.report_gate_valid,
         }
     }))
 }
@@ -1119,15 +1140,24 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
             pipeline_reap::ReapVerdict::CloseDone => {
                 // Plain, gated `done`: it passes unforced precisely because the
                 // artifact is committed and a report exists.
-                db.update_dispatch_status(r.id, AgentDispatchStatus::Done)?;
-                outln!("dispatch {} → done", r.id);
+                if db.compare_and_set_dispatch_status(
+                    r.id,
+                    r.observed_status,
+                    AgentDispatchStatus::Done,
+                    None,
+                )? {
+                    outln!("dispatch {} → done", r.id);
+                }
             }
             pipeline_reap::ReapVerdict::MarkFailed { why } => {
-                // best-effort: the note is context; losing it must not block
-                // recording the outcome, which is the thing that matters.
-                let _ = db.append_dispatch_note(r.id, &format!("reaped: {why}"));
-                db.update_dispatch_status(r.id, AgentDispatchStatus::Failed)?;
-                outln!("dispatch {} → failed", r.id);
+                if db.compare_and_set_dispatch_status(
+                    r.id,
+                    r.observed_status,
+                    AgentDispatchStatus::Failed,
+                    Some(&format!("reaped: {why}")),
+                )? {
+                    outln!("dispatch {} → failed", r.id);
+                }
             }
             _ => {}
         }
@@ -1970,7 +2000,7 @@ mod tests {
         assert!(!f.exists && !f.tracked);
         assert!(!f.dirty, "a fresh repo with one commit is clean");
 
-        // Written but never committed: exists, git does not track it — the
+        // Written but never committed: exists, but is not a handoff — the
         // exact pilot failure the gate exists to catch.
         let path = root.join(ARTIFACT);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1979,6 +2009,12 @@ mod tests {
         assert!(f.exists && !f.tracked);
         // …and writing it left the worktree dirty (whole-tree read).
         assert!(f.dirty);
+
+        // Staging is still not committing. The old `ls-files` check blessed
+        // this exact state and allowed cleanup to erase the only copy.
+        assert!(git_ok(&root, &["add", "--", ARTIFACT]));
+        let f = verify_facts(&row_in(&root, Some(ARTIFACT)));
+        assert!(f.exists && !f.tracked && f.dirty);
 
         // Committed: tracked, and the tree is clean again.
         commit_artifact(&root);
@@ -2035,7 +2071,7 @@ mod tests {
         let err = done_gate(&row_in(&root, Some(ARTIFACT)))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("does not track"), "{err}");
+        assert!(err.contains("not committed and clean in HEAD"), "{err}");
 
         // Committed artifact AND a report: the gate passes. (THE-88: the
         // report is the second of the two gates; a row with an artifact
@@ -2047,9 +2083,15 @@ mod tests {
         row.report = Some("verdict: done".into());
         done_gate(&row).unwrap();
 
-        // A dirty tree never blocks: reported, never gating (the tracked check
-        // already holds the line).
+        // Editing the artifact after its commit blocks: HEAD no longer holds
+        // the handoff being presented to the reviewer.
         std::fs::write(root.join(ARTIFACT), "post-commit edit").unwrap();
+        done_gate(&row).unwrap_err();
+
+        // Unrelated worktree dirt remains informational and never blocks the
+        // committed artifact.
+        std::fs::write(root.join(ARTIFACT), "# handoff").unwrap();
+        std::fs::write(root.join("unrelated.txt"), "wip").unwrap();
         done_gate(&row).unwrap();
     }
 

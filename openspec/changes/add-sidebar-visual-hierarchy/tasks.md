@@ -2,7 +2,7 @@
 
 ## 1. Config
 
-- [ ] 1.1 `[ui] sidebar_dividers: bool` (default `true`) in
+- [x] 1.1 `[ui] sidebar_dividers: bool` (default `true`) in
       `thegn-core/src/config.rs`, documented in
       `config/config.toml.example`; config round-trip test updated.
 
@@ -24,7 +24,7 @@
 
 ## 3. Tier styling (thegn-host)
 
-- [ ] 3.1 `compose_row_lines`: workspace/host header label takes the accent
+- [x] 3.1 `compose_row_lines`: workspace/host header label takes the accent
       tier treatment; folder header label drops bold to the secondary
       treatment (existing `S::` slots only — no new slot, no draw-site
       literal; ratchet files unchanged or shrunk).
@@ -37,7 +37,7 @@
 - [x] 4.1 `docs/help/sidebar.md`: describe the tiers and the block tint (no
       new action ids — help ratchets unaffected; prose ratchet satisfied by
       the mention).
-- [ ] 4.2 CHANGELOG entry (visual change + the opt-out key).
+- [x] 4.2 CHANGELOG entry (visual change + the opt-out key).
 
 ## 5. Validation
 

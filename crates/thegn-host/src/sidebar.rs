@@ -1255,7 +1255,7 @@ pub fn build_rows(
                     .worktrees
                     .iter()
                     .position(|w| w.name == t.name)
-                    .map(|i| RowTarget::Tab(i, 0));
+                    .map(|i| RowTarget::Tab(i, session.worktrees[i].active_tab));
 
                 rows.push(SidebarRow {
                     tab_target: target.or_else(|| {
@@ -3453,6 +3453,28 @@ mod tests {
             term_labels,
             vec!["local", "term-ssh-dave-prod", "term-ssh-root-prod"]
         );
+    }
+
+    #[test]
+    fn resident_terminal_row_targets_its_remembered_tab() {
+        let mut terminal = WorktreeGroup::terminal("local");
+        terminal.tabs.push(crate::session::Tab::new("logs"));
+        terminal.active_tab = 1;
+        let s = session(vec![terminal], 0);
+        let rows = build_rows(
+            &s,
+            &[],
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[term("local", "local", "")],
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Terminal)
+            .expect("terminal row");
+        assert_eq!(row.tab_target, Some(RowTarget::Tab(0, 1)));
     }
 
     #[test]

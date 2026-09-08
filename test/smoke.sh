@@ -46,7 +46,12 @@ mkdir -p "$XDG_RUNTIME_DIR"
 # configured migration executable", against a database this script owns
 # outright. Hermetic means hermetic: the checks below opt into whatever
 # authority they need, per check.
-unset THEGN_DATABASE_MIGRATION_EXECUTABLE THEGN_DATABASE_MIGRATION_AUTHORITY
+# A smoke run must not inherit config overlays from the live thegn that
+# launched it.  Clear the whole namespace, then opt into the deliberate values
+# below; enumerating two known variables let every newly added overlay leak.
+for var in "${!THEGN_@}"; do
+  unset "$var"
+done
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Exercise the full product surface: the experimental verbs (host/placement/
 # kaneo) are dev-channel-only, so run smoke in the dev channel. A dedicated

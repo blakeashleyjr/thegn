@@ -285,16 +285,14 @@ pub fn add_checked_with_state(
     }
 }
 
-/// Delete a removed worktree's files from wherever they actually live: the
-/// local dir AND — for a remote/provider worktree — the checkout on the box
-/// over ssh (the local remove never reaches it, so the remote dir would
-/// otherwise leak under the host's `remote_dir`). ONLY the worktree dir is
-/// removed; the shared base image + warm volumes stay. Best-effort: git is the
-/// source of truth. Call BEFORE the DB's `worktrees.location` row is forgotten
-/// (else the remote target can't be resolved and only the local dir is purged).
+/// Delete a removed remote/provider worktree's checkout on the box over ssh.
+/// The local directory has already been removed by Git before this is called;
+/// deleting it again would introduce a pathname-reuse race in which unrelated
+/// replacement data could be recursively removed. The shared base image and
+/// warm volumes stay. Call before the DB's `worktrees.location` row is
+/// forgotten, otherwise the remote target cannot be resolved.
 pub fn purge_worktree_files(path: &Path) {
     crate::remote::GitLoc::for_worktree(path).remove_remote_dir();
-    let _ = std::fs::remove_dir_all(path); // best-effort: purge: git is the source of truth (see doc); a failed remove leaves the dir
 }
 
 /// Remove a worktree and optionally delete its branch. Returns whether the
@@ -305,11 +303,11 @@ pub fn purge_worktree_files(path: &Path) {
 ///
 /// A directory can survive after an older cleanup removed its Git worktree
 /// registration (or after that registration was lost during a partial
-/// operation). In that case Git cannot remove it because it is no longer a
-/// worktree. We only fall back to deleting such a directory when Git has
-/// successfully confirmed that it is *not* registered, it has no `.git`
-/// marker, and it is not the repository root. A real checkout, an unreadable
-/// repository, and the main checkout all fail closed.
+/// operation). Git can no longer authenticate such a directory as ours, so an
+/// existing unregistered path is retained for manual inspection. Its pathname
+/// may have been reused for unrelated user data since the registration was
+/// lost; absence of a `.git` marker is not proof of ownership. An already
+/// absent path still counts as removed.
 pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bool {
     let _lock = util::lock_git_mutations(root);
     let path_s = path.to_string_lossy();
@@ -317,35 +315,15 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) -> bo
         || util::git_ok(root, &["worktree", "remove", "--force", &path_s]);
     if !removed {
         match git_worktree_registration(root, path) {
-            Some(false) if is_safe_unregistered_orphan(root, path) => {
-                if !path.exists() {
-                    removed = true;
-                    msg::info(&format!(
-                        "Git-unregistered worktree directory at {} was already absent",
-                        path.display()
-                    ));
-                } else {
-                    match std::fs::remove_dir_all(path) {
-                        Ok(()) if !path.exists() => {
-                            removed = true;
-                            msg::info(&format!(
-                                "removed Git-unregistered worktree directory at {}",
-                                path.display()
-                            ));
-                        }
-                        Ok(()) => msg::warn(&format!(
-                            "could not remove Git-unregistered worktree directory at {}",
-                            path.display()
-                        )),
-                        Err(error) => msg::warn(&format!(
-                            "could not remove Git-unregistered worktree directory at {}: {error}",
-                            path.display()
-                        )),
-                    }
-                }
+            Some(false) if !path.exists() && !worktree_paths_equal(root, path) => {
+                removed = true;
+                msg::info(&format!(
+                    "Git-unregistered worktree directory at {} was already absent",
+                    path.display()
+                ));
             }
             Some(false) => msg::warn(&format!(
-                "could not remove Git-unregistered path at {} safely (repository marker or main root present)",
+                "kept Git-unregistered path at {}: Git can no longer prove that this directory belongs to the worktree",
                 path.display()
             )),
             Some(true) => msg::warn(&format!(
@@ -400,20 +378,6 @@ fn worktree_paths_equal(left: &Path, right: &Path) -> bool {
         || (left.exists()
             && right.exists()
             && std::fs::canonicalize(left).ok() == std::fs::canonicalize(right).ok())
-}
-
-/// A path Git no longer knows about is only safe to remove as an orphan when
-/// it is no longer a Git checkout. A `.git` file/directory (including a broken
-/// symlink, detected through `symlink_metadata`) means there may still be a
-/// recoverable checkout with user work in it, so retain it for manual repair.
-fn is_safe_unregistered_orphan(root: &Path, path: &Path) -> bool {
-    let is_directory_or_absent = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.file_type().is_dir(),
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-    };
-    !worktree_paths_equal(root, path)
-        && is_directory_or_absent
-        && std::fs::symlink_metadata(path.join(".git")).is_err()
 }
 
 /// Reclaim a worktree's build artifacts (`target/`) while keeping the checkout
@@ -609,18 +573,21 @@ mod tests {
     }
 
     #[test]
-    fn remove_reclaims_a_git_unregistered_directory_without_a_git_marker() {
+    fn remove_keeps_a_git_unregistered_directory_without_proof_of_ownership() {
         let repo = temp_repo("remove-orphan");
         let path = repo.join(".wt-orphan");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("leftover.txt"), "stale").unwrap();
         assert!(util::git_ok(&repo, &["branch", "orphan"]));
 
-        assert!(remove(&repo, &path, "orphan", true));
-        assert!(!path.exists(), "the orphan directory was reclaimed");
+        assert!(!remove(&repo, &path, "orphan", true));
         assert!(
-            !branch_exists(&repo, "orphan"),
-            "branch deletion follows successful orphan cleanup"
+            path.exists(),
+            "an unregistered path may contain replacement data"
+        );
+        assert!(
+            branch_exists(&repo, "orphan"),
+            "branch deletion is refused while the path remains"
         );
         assert!(repo.exists(), "the repository root is preserved");
 
@@ -628,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_reclaims_an_orphan_when_a_bare_repo_has_no_registered_worktrees() {
+    fn remove_keeps_an_unregistered_directory_for_a_bare_repo() {
         let repo = std::env::temp_dir().join(format!("tg-wt-bare-remove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
@@ -642,9 +609,21 @@ mod tests {
         let path = repo.join(".wt-orphan");
         std::fs::create_dir_all(&path).unwrap();
 
-        assert!(remove(&repo, &path, "", false));
-        assert!(!path.exists(), "the bare-repo orphan was reclaimed");
+        assert!(!remove(&repo, &path, "", false));
+        assert!(path.exists(), "the unauthenticated directory is retained");
         assert!(repo.exists(), "the bare repository root is preserved");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn remove_accepts_an_already_absent_unregistered_path() {
+        let repo = temp_repo("remove-absent");
+        let path = repo.join(".wt-gone");
+        assert!(util::git_ok(&repo, &["branch", "gone"]));
+
+        assert!(remove(&repo, &path, "gone", true));
+        assert!(!branch_exists(&repo, "gone"));
 
         let _ = std::fs::remove_dir_all(&repo);
     }

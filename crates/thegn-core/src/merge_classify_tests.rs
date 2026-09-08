@@ -76,6 +76,7 @@ fn the_the_32_split_matches_what_was_written_by_hand() {
     let f = FileConflicts {
         path: "crates/thegn-core/src/mixed.rs".into(),
         hunks,
+        inspection_error: None,
     };
     assert_eq!(f.additive(), 1);
     assert_eq!(f.restructure(), 1);
@@ -155,10 +156,12 @@ fn the_skeleton_names_both_groups_and_refuses_to_decide() {
         FileConflicts {
             path: "crates/thegn-core/src/config.rs".into(),
             hunks: classify_file(ADDITIVE_CONFIG),
+            inspection_error: None,
         },
         FileConflicts {
             path: "crates/thegn-host/src/pr_view.rs".into(),
             hunks: classify_file(RESTRUCTURE_PR_VIEW),
+            inspection_error: None,
         },
     ];
     let out = render_chunk_skeleton("THE-32", &files);
@@ -176,5 +179,20 @@ fn the_skeleton_names_both_groups_and_refuses_to_decide() {
     );
     // The counts a Lead reads first.
     assert!(out.contains("2 hunk(s) total"));
-    assert!(out.contains("1 hunk(s) are additive and 1 need a decision"));
+    assert!(out.contains("1 hunk(s) are additive, 1 textual hunk(s) need a decision"));
+    assert!(out.contains("DRAFT ONLY — do not dispatch"));
+}
+
+#[test]
+fn an_unclassified_conflict_is_prominent_and_blocks_dispatch() {
+    let files = vec![FileConflicts {
+        path: "asset.bin".into(),
+        hunks: vec![],
+        inspection_error: Some("not UTF-8; likely binary".into()),
+    }];
+    let out = render_chunk_skeleton("THE-99", &files);
+    assert!(out.contains("Unclassified conflicts — INSPECT BEFORE DISPATCHING"));
+    assert!(out.contains("`asset.bin` — not UTF-8; likely binary"));
+    assert!(out.contains("zero parsed hunks means the file is resolved"));
+    assert!(out.contains("DRAFT ONLY"));
 }

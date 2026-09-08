@@ -232,10 +232,40 @@ pub fn gate_evidence(report: &str) -> Option<GateEvidence> {
             .or_else(|| t.strip_prefix("Gate:"))
             .or_else(|| t.strip_prefix("GATE:"))?;
         let cited = rest.trim();
-        (!cited.is_empty()).then(|| GateEvidence {
+        meaningful_gate_citation(cited).then(|| GateEvidence {
             cited: cited.to_string(),
         })
     })
+}
+
+/// A gate citation must record a successful result, not merely occupy the
+/// structured slot. This remains deliberately format-light because different
+/// repositories use different runners, but rejects the dangerous vacuous
+/// forms (`gate: not run`, a command with no result, or an explicit failure).
+fn meaningful_gate_citation(cited: &str) -> bool {
+    let lower = cited.to_ascii_lowercase();
+    if cited.is_empty()
+        || ["not run", "did not run", "failed", "failure", " red"]
+            .iter()
+            .any(|bad| lower.contains(bad))
+    {
+        return false;
+    }
+    let words: Vec<_> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.len() < 2 || words.iter().any(|word| matches!(*word, "not" | "never")) {
+        return false;
+    }
+    words.iter().enumerate().any(|(i, word)| match *word {
+        "pass" | "success" | "succeeded" | "green" | "ok" => true,
+        "passed" => i
+            .checked_sub(1)
+            .and_then(|j| words[j].parse::<u64>().ok())
+            .is_none_or(|count| count > 0),
+        _ => false,
+    }) || lower.contains("exit 0")
 }
 
 /// A report claiming PASS while citing no gate result.
@@ -585,5 +615,20 @@ mod tests {
         ));
         // An empty `gate:` is not evidence.
         assert!(pass_without_gate_evidence("PASS\ngate:   \n"));
+        assert!(pass_without_gate_evidence("PASS\ngate: not run\n"));
+        assert!(pass_without_gate_evidence("PASS\ngate: not ok\n"));
+        assert!(pass_without_gate_evidence("PASS\ngate: pass\n"));
+        assert!(pass_without_gate_evidence(
+            "PASS\ngate: cargo test — 0 passed\n"
+        ));
+        assert!(pass_without_gate_evidence(
+            "PASS\ngate: cargo nextest run --workspace\n"
+        ));
+        assert!(pass_without_gate_evidence(
+            "PASS\ngate: cargo nextest run --workspace — failed\n"
+        ));
+        assert!(!pass_without_gate_evidence(
+            "PASS\ngate: just ci — exit 0\n"
+        ));
     }
 }
