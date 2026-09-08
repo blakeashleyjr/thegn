@@ -758,6 +758,14 @@ fn compose_spec_host_fallback_is_login_shell() {
     );
 }
 
+#[test]
+fn invalidated_devcontainer_exec_fails_closed() {
+    let argv = blocked_devcontainer_argv();
+    assert!(argv[2].contains("launch blocked"));
+    assert!(argv[2].ends_with("exit 126"));
+    assert!(!argv[2].contains("THEGN_WORKTREE"));
+}
+
 /// OCI shell panes emit a runtime probe chain so containers that don't have
 /// the host shell (e.g. a bare Debian image has bash but not zsh) still get
 /// a working login shell instead of "exec: zsh: not found".

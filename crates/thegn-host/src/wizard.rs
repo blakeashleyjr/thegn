@@ -138,9 +138,9 @@ pub(crate) fn ambient_env_name_live(cfg: &Config, repo_root: &Path) -> String {
 /// None`) so a recoverable bring-up failure leaves the worktree persisted, and
 /// again on SUCCESS carrying the provider `location` blob. `put_worktree` upserts
 /// `location` via `COALESCE`, so the early `None` never clobbers the blob written
-/// on success. Only the primary row insert + the env pin are fatal (a lost pin
-/// silently downgrades the env, e.g. machine0 → local — the exact fallback this
-/// flow must never produce); sandbox/agent are best-effort UPDATEs.
+/// on success. The row and every explicit execution-intent pin are one atomic
+/// write: losing a sandbox pin can weaken a later launch after restart just as
+/// surely as losing an environment pin can move it to the wrong machine.
 #[allow(clippy::too_many_arguments)]
 fn register_worktree_row(
     db: &Db,
@@ -152,27 +152,23 @@ fn register_worktree_row(
     choices: &WizardChoices,
     location: Option<&str>,
 ) -> anyhow::Result<()> {
-    let root_s = repo_root.to_string_lossy();
-    db.put_worktree(tab, &root_s, path_s, branch, location, None)
-        .map_err(|e| anyhow::anyhow!("db: {e}"))?;
-    // A *concrete* backend pick is a deliberate per-worktree override, pinned so
-    // it sticks across restarts even against a non-"auto" `[sandbox] backend`. An
-    // "auto" pick stays NULL so the worktree re-resolves against config each open.
-    if choices.sandbox != "auto" && !choices.sandbox.is_empty() {
-        let _ = db.set_worktree_sandbox(path_s, &choices.sandbox); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    }
-    let _ = db.set_worktree_agent(path_s, &choices.agent); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-    // Pin the chosen host only when it DIFFERS from the ambient default this
-    // worktree would otherwise inherit; a choice equal to the ambient stays NULL
-    // (clean inherit). A divergent choice — including an explicit "default"
-    // against a provider ambient — is pinned so every later re-resolution
-    // reproduces the wizard's placement instead of falling through to the ambient.
-    let ambient = ambient_env_name(Some(db), cfg, repo_root);
-    if choices.env != ambient {
-        db.set_worktree_env(path_s, &choices.env)
-            .map_err(|e| anyhow::anyhow!("pin env {}: {e}", choices.env))?;
-    }
-    Ok(())
+    db.transaction(|db| {
+        let root_s = repo_root.to_string_lossy();
+        db.put_worktree(tab, &root_s, path_s, branch, location, None)?;
+        // A *concrete* backend pick is a deliberate per-worktree override, pinned
+        // so it sticks across restarts. "auto" stays NULL and re-resolves.
+        if choices.sandbox != "auto" && !choices.sandbox.is_empty() {
+            db.set_worktree_sandbox(path_s, &choices.sandbox)?;
+        }
+        db.set_worktree_agent(path_s, &choices.agent)?;
+        // Pin the chosen host only when it differs from the ambient default.
+        let ambient = ambient_env_name(Some(db), cfg, repo_root);
+        if choices.env != ambient {
+            db.set_worktree_env(path_s, &choices.env)?;
+        }
+        Ok(())
+    })
+    .map_err(|e| anyhow::anyhow!("persist worktree launch intent: {e}"))
 }
 
 /// The Alt+w modal, a single-plane form: branch name (the configured prefix is

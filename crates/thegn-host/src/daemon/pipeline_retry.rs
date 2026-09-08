@@ -26,8 +26,8 @@
 //!
 //! Every outcome stamps `waiting_human` + a `note` on the SAME roster row —
 //! never `done`, never `failed`. A retry re-stamps the row's session and
-//! artifact (`stamp_dispatch_run`) and moves it back to `running`: one row
-//! cycling through attempts, not a chain of rows. The rule holds absolutely
+//! artifact and moves it back to `running` in one expected-state update: one
+//! row cycling through attempts, not a chain of rows. The rule holds absolutely
 //! here, because classifying a *final screen* is inference: this task is
 //! guessing why a worker died and must never turn a guess into a verdict.
 //!
@@ -172,15 +172,18 @@ pub(crate) async fn handle_exit(
     match decision {
         pipeline_exit::RetryDecision::Park { note } => {
             attempts.remove(&row.id);
-            park(svc, row.id, &note).await?;
+            park(svc, row.id, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Exhausted { note } => {
             attempts.remove(&row.id);
-            park(svc, row.id, &note).await?;
+            park(svc, row.id, row.status, &note).await?;
         }
         pipeline_exit::RetryDecision::Retry { attempt, delay_ms } => {
             let note = pipeline_exit::retry_note(signature_of(&class), attempt, tr.max_attempts);
-            park(svc, row.id, &note).await?;
+            if !park(svc, row.id, row.status, &note).await? {
+                attempts.remove(&row.id);
+                return Ok(());
+            }
             tracing::info!(
                 target: "thegn::daemon",
                 row = row.id,
@@ -189,20 +192,21 @@ pub(crate) async fn handle_exit(
                 "transport failure on a headless dispatch; relaunching"
             );
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            // The backoff slept past the park: a verdict the Lead wrote on the
-            // row meanwhile is NEWER than this retry plan and must win —
-            // relaunching would clobber it and spawn a second worker over a
-            // closed stage. Re-read and relaunch only a row still parked where
-            // this task left it.
+            // Reserve the row before opening the replacement. The old
+            // read-then-open sequence still let a supervisor close the row
+            // after the read and before `open` returned.
             let id_for_check = row.id;
-            let still_parked = svc
+            let reserved = svc
                 .with_db(move |db| {
-                    Ok(db
-                        .get_dispatch(id_for_check)?
-                        .is_some_and(|r| r.status == AgentDispatchStatus::WaitingHuman))
+                    db.compare_and_set_dispatch_status(
+                        id_for_check,
+                        AgentDispatchStatus::WaitingHuman,
+                        AgentDispatchStatus::Spawning,
+                        None,
+                    )
                 })
                 .await?;
-            if !still_parked {
+            if !reserved {
                 attempts.remove(&row.id);
                 tracing::info!(
                     target: "thegn::daemon",
@@ -216,17 +220,42 @@ pub(crate) async fn handle_exit(
                     let artifact = row.artifact_path.clone().unwrap_or_default();
                     let id = row.id;
                     let session_id = info.id.clone();
-                    svc.with_db(move |db| {
-                        db.stamp_dispatch_run(id, &session_id, &artifact)?;
-                        db.update_dispatch_status(id, AgentDispatchStatus::Running)
-                    })
-                    .await?;
+                    let published = svc
+                        .with_db(move |db| {
+                            db.compare_and_set_dispatch_retry_run(
+                                id,
+                                AgentDispatchStatus::Spawning,
+                                &session_id,
+                                &artifact,
+                            )
+                        })
+                        .await;
+                    if !matches!(published, Ok(true)) {
+                        attempts.remove(&row.id);
+                        let publish_error = published.err();
+                        // best-effort: either the supervisor won after `open`
+                        // or the publish itself failed. In both cases this
+                        // session has no roster ownership and must be killed.
+                        if let Err(error) = svc.kill(&info.id).await {
+                            tracing::warn!(target: "thegn::daemon", session = %info.id, %error, "could not kill stale retry launch");
+                        }
+                        if let Some(error) = publish_error {
+                            return Err(error.into());
+                        }
+                        return Ok(());
+                    }
                     tracing::info!(target: "thegn::daemon", row = row.id, session = %info.id, "relaunched");
                 }
                 Err(e) => {
-                    // The row stays waiting_human with the attempt note; the
-                    // failure is appended underneath it.
-                    append_note(svc, row.id, &format!("relaunch failed: {e:#}")).await?;
+                    attempts.remove(&row.id);
+                    // Provider errors may include arbitrarily long stderr.
+                    // The roster ledger is bounded; the artifact/log is where
+                    // full diagnostics belong.
+                    let failed_note: String = format!("{note}; relaunch failed: {e:#}")
+                        .chars()
+                        .take(thegn_core::pipeline_report::NOTE_MAX_CHARS)
+                        .collect();
+                    park(svc, row.id, AgentDispatchStatus::Spawning, &failed_note).await?;
                 }
             }
         }
@@ -236,32 +265,16 @@ pub(crate) async fn handle_exit(
 
 /// Stamp a row `waiting_human` with the given note — the observer's ONLY
 /// status write. The daemon can park a row but never finish one.
-async fn park(svc: &DaemonService, id: i64, note: &str) -> anyhow::Result<()> {
+async fn park(
+    svc: &DaemonService,
+    id: i64,
+    expected: AgentDispatchStatus,
+    note: &str,
+) -> anyhow::Result<bool> {
     let note = note.to_string();
-    svc.with_db(move |db| {
-        db.stamp_dispatch_note(id, &note)?;
-        db.update_dispatch_status(id, AgentDispatchStatus::WaitingHuman)
-    })
-    .await?;
-    Ok(())
-}
-
-/// Append a line under a row's existing note (read-modify-write), used for a
-/// failed relaunch attempt.
-async fn append_note(svc: &DaemonService, id: i64, line: &str) -> anyhow::Result<()> {
-    let existing = svc
-        .with_db(move |db| Ok(db.get_dispatch(id)?.and_then(|r| r.note)))
-        .await?
-        .unwrap_or_default();
-    let mut note = existing;
-    if !note.is_empty() {
-        note.push('\n');
-    }
-    note.push_str(line);
-    let note2 = note;
-    svc.with_db(move |db| db.stamp_dispatch_note(id, &note2))
-        .await?;
-    Ok(())
+    svc.with_db(move |db| db.compare_and_set_dispatch_retry_park(id, expected, &note))
+        .await
+        .map_err(Into::into)
 }
 
 /// Flatten the tombstone's final screen to the plain text the classifier

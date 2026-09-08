@@ -219,6 +219,13 @@ the supported approved subset.
 - **THEN** thegn surfaces the failure and continues through the existing OCI
   fallback instead of executing on the host without isolation
 
+#### Scenario: An established CLI session rejects changed configuration
+
+- **WHEN** provider startup succeeded but the approved devcontainer file changes
+  before a later pane enters that session
+- **THEN** thegn blocks that pane command and requires preparation to run again;
+  it MUST NOT execute the requested command directly on the host
+
 ### Requirement: Doctor and chrome expose the same transient state without a live build
 
 For a repo context, `thegn doctor` SHALL report the `Devcontainer support`

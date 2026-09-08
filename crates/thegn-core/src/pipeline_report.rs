@@ -244,28 +244,72 @@ pub fn gate_evidence(report: &str) -> Option<GateEvidence> {
 /// forms (`gate: not run`, a command with no result, or an explicit failure).
 fn meaningful_gate_citation(cited: &str) -> bool {
     let lower = cited.to_ascii_lowercase();
-    if cited.is_empty()
-        || ["not run", "did not run", "failed", "failure", " red"]
-            .iter()
-            .any(|bad| lower.contains(bad))
+    // The documented wire shape separates the command from a machine-shaped
+    // result. Free prose containing a positive word ("trust me, passed") is
+    // not evidence: there is no command/result boundary to audit.
+    let Some((command, result)) = lower
+        .rsplit_once(" -- ")
+        .or_else(|| lower.rsplit_once(" — "))
+    else {
+        return false;
+    };
+    if command.trim().is_empty() {
+        return false;
+    }
+    let result = result.trim();
+    if ["not run", "did not run", "failed", "failure", " red"]
+        .iter()
+        .any(|bad| result.contains(bad))
     {
         return false;
     }
-    let words: Vec<_> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
+    let command_words: Vec<_> = command
+        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '/' | '.' | '-'))
         .filter(|word| !word.is_empty())
         .collect();
-    if words.len() < 2 || words.iter().any(|word| matches!(*word, "not" | "never")) {
+    let command_like = command_words.iter().any(|word| {
+        matches!(
+            *word,
+            "cargo"
+                | "nextest"
+                | "just"
+                | "make"
+                | "nix"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "pytest"
+                | "test"
+                | "tests"
+                | "check"
+                | "lint"
+                | "ci"
+                | "gate"
+                | "verify"
+                | "validate"
+                | "build"
+        ) || word.contains('/')
+            || word.ends_with(".sh")
+    });
+    if !command_like {
         return false;
     }
-    words.iter().enumerate().any(|(i, word)| match *word {
-        "pass" | "success" | "succeeded" | "green" | "ok" => true,
-        "passed" => i
-            .checked_sub(1)
-            .and_then(|j| words[j].parse::<u64>().ok())
-            .is_none_or(|count| count > 0),
-        _ => false,
-    }) || lower.contains("exit 0")
+    if result == "exit 0" {
+        return true;
+    }
+    let mut parts = result.split(',').map(str::trim);
+    let passed = parts.next().and_then(|part| part.strip_suffix(" passed"));
+    let Some(passed) = passed.and_then(|n| n.trim().parse::<u64>().ok()) else {
+        return false;
+    };
+    if passed == 0 {
+        return false;
+    }
+    parts.all(|part| {
+        part.strip_suffix(" skipped")
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .is_some()
+    })
 }
 
 /// A report claiming PASS while citing no gate result.
@@ -618,6 +662,16 @@ mod tests {
         assert!(pass_without_gate_evidence("PASS\ngate: not run\n"));
         assert!(pass_without_gate_evidence("PASS\ngate: not ok\n"));
         assert!(pass_without_gate_evidence("PASS\ngate: pass\n"));
+        assert!(pass_without_gate_evidence("PASS\ngate: trust me, passed\n"));
+        assert!(pass_without_gate_evidence(
+            "PASS\ngate: trust me -- passed\n"
+        ));
+        assert!(pass_without_gate_evidence(
+            "PASS\ngate: trust me — exit 0\n"
+        ));
+        assert!(!pass_without_gate_evidence(
+            "PASS\ngate: cargo test failure_modes — 12 passed, 0 skipped\n"
+        ));
         assert!(pass_without_gate_evidence(
             "PASS\ngate: cargo test — 0 passed\n"
         ));

@@ -69,6 +69,50 @@ impl Db {
         Ok(true)
     }
 
+    /// Park a transport retry only if the row is still in the state observed
+    /// by the exit handler. Status and the retry ledger move together: a
+    /// supervisor verdict that wins the race is never overwritten.
+    pub fn compare_and_set_dispatch_retry_park(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        note: &str,
+    ) -> Result<bool> {
+        let note = crate::pipeline_report::note_text(note).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1, note=?2 WHERE id=?3 AND status=?4",
+            rusqlite::params![
+                AgentDispatchStatus::WaitingHuman.as_str(),
+                note,
+                id,
+                expected.as_str()
+            ],
+        )? != 0)
+    }
+
+    /// Publish a relaunched worker only while the retry reservation is still
+    /// ours. A supervisor may close the `spawning` row while `open` awaits;
+    /// in that case this returns false and the caller kills the orphan launch.
+    pub fn compare_and_set_dispatch_retry_run(
+        &self,
+        id: i64,
+        expected: AgentDispatchStatus,
+        session_id: &str,
+        artifact_path: &str,
+    ) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE agent_dispatches SET status=?1, session_id=?2, artifact_path=?3 \
+             WHERE id=?4 AND status=?5",
+            rusqlite::params![
+                AgentDispatchStatus::Running.as_str(),
+                session_id,
+                artifact_path,
+                id,
+                expected.as_str()
+            ],
+        )? != 0)
+    }
+
     /// Store the worker's structured handoff report on a roster row — UPDATE the
     /// nullable `report` column. Errors when the row does not exist (checks
     /// `get_dispatch` first, naming the id).
@@ -424,6 +468,61 @@ mod tests {
             AgentDispatchStatus::Abandoned
         );
         assert!(db.dispatch_notes(id, None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transport_retry_updates_are_expected_state_transitions() {
+        let (db, _dir) = temp_db();
+        let id = put_row(&db, "linear:X-8", "/wt/x");
+        db.update_dispatch_status(id, AgentDispatchStatus::Running)
+            .unwrap();
+
+        assert!(
+            db.compare_and_set_dispatch_retry_park(
+                id,
+                AgentDispatchStatus::Running,
+                "transport: retry 1",
+            )
+            .unwrap()
+        );
+        let parked = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(parked.status, AgentDispatchStatus::WaitingHuman);
+        assert_eq!(parked.note.as_deref(), Some("transport: retry 1"));
+
+        assert!(
+            db.compare_and_set_dispatch_status(
+                id,
+                AgentDispatchStatus::WaitingHuman,
+                AgentDispatchStatus::Spawning,
+                None,
+            )
+            .unwrap()
+        );
+        db.update_dispatch_status(id, AgentDispatchStatus::Done)
+            .unwrap();
+        assert!(
+            !db.compare_and_set_dispatch_retry_run(
+                id,
+                AgentDispatchStatus::Spawning,
+                "replacement",
+                "artifact.md",
+            )
+            .unwrap()
+        );
+        let closed = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(closed.status, AgentDispatchStatus::Done);
+        assert_ne!(closed.session_id.as_deref(), Some("replacement"));
+        assert!(
+            !db.compare_and_set_dispatch_retry_park(
+                id,
+                AgentDispatchStatus::Running,
+                "stale transport observer",
+            )
+            .unwrap()
+        );
+        let still_closed = db.get_dispatch(id).unwrap().unwrap();
+        assert_eq!(still_closed.status, AgentDispatchStatus::Done);
+        assert_eq!(still_closed.note.as_deref(), Some("transport: retry 1"));
     }
 
     #[test]

@@ -10,6 +10,13 @@ use crate::run::{
     refresh_tab_model, switch_workspace,
 };
 
+fn resident_terminal_index(session: &crate::session::Session, name: &str) -> Option<usize> {
+    session
+        .worktrees
+        .iter()
+        .position(|w| w.name == name && w.kind == crate::session::GroupKind::Terminal)
+}
+
 /// Activate a sidebar row target: focus a live `(group, tab)` in the session,
 /// or switch to another workspace (landing on its named worktree group when
 /// that group exists in the target's persisted layout).
@@ -89,7 +96,7 @@ pub(crate) fn activate_row_target(
             // (the group wasn't resident at the last rebuild), so the light
             // patch — which only retargets `RowTarget::Tab` rows — couldn't
             // move the active highlight onto it. Rebuild.
-            if let Some(gi) = session.worktrees.iter().position(|w| w.name == name) {
+            if let Some(gi) = resident_terminal_index(session, &name) {
                 let ti = session.worktrees[gi].active_tab;
                 session.switch_to_tab(gi, ti);
             } else {
@@ -195,4 +202,23 @@ pub(crate) fn activate_row_target(
         persist_active_focus(session);
     }
     workspace_switched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn resident_terminal_lookup_does_not_match_same_named_worktree() {
+        let session = Session {
+            id: "repo".into(),
+            worktrees: vec![
+                WorktreeGroup::new("prod", GroupKind::Branch, "/repo/prod"),
+                WorktreeGroup::terminal("prod"),
+            ],
+            active: 0,
+        };
+        assert_eq!(resident_terminal_index(&session, "prod"), Some(1));
+    }
 }

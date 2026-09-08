@@ -1051,7 +1051,17 @@ pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_rea
             )
         })
         .collect();
-    Ok(pipeline_reap::plan(&rows, |r| {
+    Ok(reap_plan_rows(&rows, live_ids))
+}
+
+/// Plan from a caller-owned row snapshot. The periodic daemon uses this form
+/// so no database mutex is held while `verify_facts` performs filesystem and
+/// git reads for each row.
+pub(crate) fn reap_plan_rows(
+    rows: &[AgentDispatch],
+    live_ids: &[String],
+) -> Vec<pipeline_reap::Reap> {
+    pipeline_reap::plan(rows, |r| {
         let f = verify_facts(r);
         pipeline_reap::ReapFacts {
             session_live: r
@@ -1063,7 +1073,7 @@ pub(crate) fn reap_plan(db: &Db, live_ids: &[String]) -> Result<Vec<pipeline_rea
             report_present: f.report_present,
             report_gate_valid: f.report_gate_valid,
         }
-    }))
+    })
 }
 
 fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
@@ -2080,7 +2090,7 @@ mod tests {
         // `facts_record_report_present_and_done_gate_names_the_report_command`.)
         commit_artifact(&root);
         let mut row = row_in(&root, Some(ARTIFACT));
-        row.report = Some("verdict: done".into());
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
         done_gate(&row).unwrap();
 
         // Editing the artifact after its commit blocks: HEAD no longer holds
@@ -2205,8 +2215,9 @@ mod tests {
         let err = done_gate(&row).unwrap_err().to_string();
         assert!(err.contains("dispatch report"), "{err}");
 
-        // Filing a report flips `report_present` on and the gate passes.
-        row.report = Some("verdict: done".into());
+        // Filing a report with structured gate evidence flips
+        // `report_present` on and the gate passes.
+        row.report = Some("PASS\ngate: just test -- exit 0".into());
         let f = verify_facts(&row);
         assert!(f.report_present);
         done_gate(&row).unwrap();

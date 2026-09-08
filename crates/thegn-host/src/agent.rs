@@ -2998,13 +2998,14 @@ pub fn compose_spec(
                 provider_session = None;
                 degraded = true;
                 warnings.push(format!(
-                    "devcontainer config changed; using host fallback ({error})"
+                    "devcontainer config changed; launch blocked until the environment is prepared again ({error})"
                 ));
-                thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(vec![
-                    thegn_core::util::shell(),
-                    "-lc".to_string(),
-                    cmd,
-                ])
+                // The provider was selected before the native OCI candidate was
+                // resolved, so there is no equivalent containment spec to enter
+                // here. Never turn config invalidation into execution of the
+                // requested repo command on the host. The pane exits visibly and
+                // the next launch re-runs preparation against the new config.
+                blocked_devcontainer_argv()
             }
         },
         (Some(spec), _) => sandbox::enter_argv(spec, &cmd),
@@ -3049,6 +3050,14 @@ pub fn compose_spec(
         warnings,
         degraded,
     }
+}
+
+fn blocked_devcontainer_argv() -> Vec<String> {
+    vec![
+        thegn_core::util::shell(),
+        "-lc".to_string(),
+        "printf '%s\\n' 'thegn: devcontainer configuration changed; launch blocked; retry to prepare it' >&2; exit 126".to_string(),
+    ]
 }
 
 /// Compose the [`LaunchSpec`] for running `choice` in `worktree`. Records the

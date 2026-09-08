@@ -626,17 +626,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
-    // Regression: a directory that is no longer registered with Git cannot be
-    // removed by `git worktree remove`, but it is still a stale checkout
-    // directory that the lifecycle must reclaim safely.
+    // Regression: unattended cleanup must not recursively delete a directory
+    // once Git can no longer prove that it is the registered worktree.
     #[test]
-    fn landed_remove_reclaims_git_unregistered_orphan() {
+    fn landed_remove_keeps_git_unregistered_directory() {
         let db = Db::open_memory().unwrap();
         let (root, _feat) = repo_with_feat(&db, "rmfail");
         let root_s = root.to_string_lossy().to_string();
         // A path that is NOT a registered git worktree makes
-        // `git worktree remove` fail. It has no `.git` marker, so it is safe to
-        // reclaim as an orphan after the registry check.
+        // `git worktree remove` fail. Absence of a `.git` marker is not proof
+        // that an unattended recursive delete is safe.
         let bogus = root.with_extension("bogus");
         std::fs::create_dir_all(&bogus).unwrap();
         let bogus_s = bogus.to_string_lossy().to_string();
@@ -652,13 +651,13 @@ mod tests {
             "bogus",
             LifecycleEvent::Landed,
         );
-        assert!(!bogus.exists(), "the orphan directory was reclaimed");
+        assert!(bogus.exists(), "the unverified directory is retained");
         assert!(
             db.worktrees()
                 .unwrap()
                 .iter()
-                .all(|w| w.worktree != bogus_s),
-            "reclaimed orphan is removed from the cache"
+                .any(|w| w.worktree == bogus_s),
+            "retained directory stays visible in the cache"
         );
         assert!(
             db.list_merge_queue()

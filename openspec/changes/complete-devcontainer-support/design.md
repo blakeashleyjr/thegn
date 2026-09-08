@@ -83,6 +83,11 @@ After selection and trust evaluation, host launch has two paths:
   existing OCI sandbox/build/compose seams. Raw repo JSON is not handed to the
   CLI when an unsafe or unapplied field is present.
 
+The native fallback is available during preparation, before a provider session
+is selected. If a later exec rejects that session because its approved config
+changed, the pane fails closed and asks the user to retry preparation; it never
+runs the requested command as a bare host fallback.
+
 The provider is not a new sandbox backend enum and does not bypass pane CPU
 caps. Non-OCI resolution cannot honor an image/build/compose source; doctor
 reports the backend honorability instead of implying that the container shape

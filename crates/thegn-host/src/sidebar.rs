@@ -3051,11 +3051,10 @@ mod tests {
         }
     }
 
-    /// A worktree created during the freeze was never on screen, so it has no
-    /// order to protect — it must use its real key and land where it belongs,
-    /// not be exiled to the bottom for the whole freeze window.
+    /// A worktree created during the freeze receives a stable unknown key. Its
+    /// changing live activity must not renumber the rows the user is navigating.
     #[test]
-    fn a_new_worktree_uses_live_keys_during_a_freeze() {
+    fn a_new_worktree_stays_in_a_stable_tier_during_a_freeze() {
         let (_, ws, status) = freeze_fixture();
         let freeze = std::sync::Arc::new(crate::sidebar_freeze::SortFreeze::capture(&status));
 
@@ -3079,8 +3078,8 @@ mod tests {
         };
         assert_eq!(
             labels_of(&build_rows(&s, &ws, &view, &fresh, &[], &[], &[])),
-            vec!["fresh", "urgent", "home", "calm"],
-            "the new row sorts by its real recency; the held rows stay put"
+            vec!["urgent", "home", "calm", "fresh"],
+            "the new row cannot renumber the held rows before thaw"
         );
     }
 
