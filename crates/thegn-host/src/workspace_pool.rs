@@ -36,6 +36,25 @@ pub(crate) struct ResidentWorkspace {
 }
 
 impl ResidentWorkspace {
+    /// The group index this workspace should resume on: `active` when it is a
+    /// worktree, else the first worktree (the home group), else `active`
+    /// unchanged — a workspace whose only group is a terminal has nothing better
+    /// to offer, and clamping it to 0 would be the same index anyway.
+    ///
+    /// See [`WorkspacePool::stash`] for why a terminal is never a valid landing.
+    fn landing_index(&self) -> usize {
+        let is_worktree =
+            |g: &crate::session::WorktreeGroup| g.kind != crate::session::GroupKind::Terminal;
+        match self.worktrees.get(self.active) {
+            Some(g) if is_worktree(g) => self.active,
+            _ => self
+                .worktrees
+                .iter()
+                .position(is_worktree)
+                .unwrap_or(self.active),
+        }
+    }
+
     /// Every live pane id this workspace owns, across all its groups' tabs — the
     /// panes to detach from the global table when this workspace is evicted.
     fn pane_ids(&self) -> Vec<u32> {
@@ -162,7 +181,16 @@ impl WorkspacePool {
     /// the table via [`Panes::detach_pane`] (daemon sessions survive; in-process
     /// PTYs die). Re-parking an already-present key replaces it in place (its
     /// live panes are the same ids, so they are not dropped).
-    pub(crate) fn stash(&mut self, repo: String, rw: ResidentWorkspace, panes: &mut Panes) {
+    pub(crate) fn stash(&mut self, repo: String, mut rw: ResidentWorkspace, panes: &mut Panes) {
+        // A workspace's remembered focus must be one of its WORKTREES. Terminals
+        // share `session.worktrees` but are a global region of their own — the
+        // registry isn't scoped to a repo and the group migrates between sessions
+        // (`take_terminal_group`) — so a workspace parked while the user stood in
+        // a terminal would replay that terminal on the way back in, which reads
+        // as the switch "jumping to the terminals" instead of returning to the
+        // project. Callers that know which worktree the user left step back onto
+        // it first; this is the floor for the ones that don't.
+        rw.active = rw.landing_index();
         if self.limit == Some(0) {
             for id in rw.pane_ids() {
                 panes.detach_pane(id);
