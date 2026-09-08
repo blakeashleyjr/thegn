@@ -1559,6 +1559,19 @@ fn worktree_landing(session: &crate::session::Session, last_w: Option<&str>) -> 
         .or_else(|| session.worktrees.iter().position(is_worktree))
 }
 
+fn restore_failed_region_switch(
+    session: &mut crate::session::Session,
+    prior_active: usize,
+    region_last_w: &mut Option<String>,
+    prior_last_w: Option<String>,
+    region_last_t: &mut Option<String>,
+    prior_last_t: Option<String>,
+) {
+    session.switch_to(prior_active);
+    *region_last_w = prior_last_w;
+    *region_last_t = prior_last_t;
+}
+
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
 /// name sort, pins, filter). Alt+↑/↓ steps through this, not the session's
 /// internal order — otherwise switching "skips around" relative to the tree.
@@ -6252,6 +6265,8 @@ async fn event_loop<T: Terminal>(
     // session group by identity.
     let (rename_tx, mut rename_rx) =
         tokio_mpsc::unbounded_channel::<crate::handlers::worktree_rename::RenameDone>();
+    let (terminal_restore_tx, mut terminal_restore_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::terminal::RestoreDone>();
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -7115,9 +7130,44 @@ async fn event_loop<T: Terminal>(
         };
     }
 
+    /// Sanitize terminal focus for a project switch, but commit that mutation
+    /// only when the switch succeeds. Several non-sidebar doors switch projects
+    /// directly (focus intents, picker, connect); they need the same rollback
+    /// guarantee as `activate_row!`.
+    macro_rules! switch_workspace_from_region {
+        ($target:expr, $group:expr, $db:expr) => {{
+            let prior_active = session.active;
+            let prior_last_w = region_last_w.clone();
+            let prior_last_t = region_last_t.clone();
+            leave_terminal_region!();
+            let switched = switch_workspace(
+                $target,
+                $group,
+                &mut session,
+                &mut panes,
+                &mut workspace_pool,
+                $db,
+                keymap.config(),
+                &mut need_relayout,
+                &mut clear_on_next_frame,
+            );
+            if !switched {
+                restore_failed_region_switch(
+                    &mut session,
+                    prior_active,
+                    &mut region_last_w,
+                    prior_last_w,
+                    &mut region_last_t,
+                    prior_last_t,
+                );
+            }
+            switched
+        }};
+    }
+
     // Activate a resolved sidebar row target (live tab or dormant-workspace
     // switch) using the loop's activation locals; returns whether the caller
-    // should kick a hydration (a workspace switch). The 13-arg call was copied
+    // should kick a hydration (a workspace switch). The activation call was copied
     // verbatim across every activation site (sidebar Enter, the Alt+↑/↓ ring,
     // terminal cycling, jump-to-attention, and the "Needs you" Enter) — this
     // collapses them to `activate_row!(target)`.
@@ -7133,6 +7183,10 @@ async fn event_loop<T: Terminal>(
         ($target:expr) => {{
             let target = $target;
             let was_terminal = active_is_terminal(&session);
+            let prior_session = session.id.clone();
+            let prior_active = session.active;
+            let prior_last_w = region_last_w.clone();
+            let prior_last_t = region_last_t.clone();
             let here = session
                 .worktrees
                 .get(session.active)
@@ -7158,7 +7212,24 @@ async fn event_loop<T: Terminal>(
                 chrome.center,
                 &mut need_relayout,
                 &mut clear_on_next_frame,
+                Some((&terminal_restore_tx, &waker)),
             );
+            if !landed && session.id == prior_session {
+                // Project activation sanitizes a terminal focus before the
+                // cold switch so a successfully parked workspace resumes on a
+                // worktree. That mutation is provisional: if DB open/resurrect
+                // fails, the user never left this workspace and must remain in
+                // the terminal they were using, with both region bookmarks
+                // unchanged.
+                restore_failed_region_switch(
+                    &mut session,
+                    prior_active,
+                    &mut region_last_w,
+                    prior_last_w,
+                    &mut region_last_t,
+                    prior_last_t,
+                );
+            }
             // Refresh both bookmarks: the region we ended in records its new
             // place, and the region we left (only when we actually crossed)
             // records the place we left it at.
@@ -7166,12 +7237,12 @@ async fn event_loop<T: Terminal>(
                 .worktrees
                 .get(session.active)
                 .map(|g| g.name.clone());
-            if active_is_terminal(&session) {
+            if landed && active_is_terminal(&session) {
                 if !was_terminal {
                     region_last_w = here;
                 }
                 region_last_t = now;
-            } else {
+            } else if landed {
                 if was_terminal {
                     region_last_t = here;
                 }
@@ -8976,10 +9047,55 @@ async fn event_loop<T: Terminal>(
         // Off-loop worktree-rename completions (audit run.rs:12131/12147).
         while let Ok(done) = rename_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
-            model.status = crate::handlers::worktree_rename::apply(&mut session, done);
+            model.status =
+                crate::handlers::worktree_rename::apply(&mut session, &mut region_last_w, done);
             persist_session_layout(&mut session, &panes);
             refresh_tab_model(&mut model, &session, &mut sb);
             sb.focus_active_row(&mut model);
+            dirty = true;
+        }
+        while let Ok(done) = terminal_restore_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            // A late completion belongs only to the workspace that requested
+            // it. If the user navigated away, dropping it is safer than moving
+            // a global terminal behind their back; activating the row again
+            // issues a fresh bounded request.
+            if done.workspace != session.id || session.worktrees.iter().any(|g| g.name == done.name)
+            {
+                continue;
+            }
+            let restored = match done.restored {
+                Ok(restored) => restored,
+                Err(why) => {
+                    model.status = format!("Can't restore terminal '{}': {why}", done.name);
+                    dirty = true;
+                    continue;
+                }
+            };
+            // A live group may have become resident while the SELECT was in
+            // flight. Prefer it over persisted rows so one terminal remains one
+            // shell even across overlapping activations.
+            let (donor, group) = match workspace_pool.take_terminal_group(&done.name) {
+                Some((donor, group)) => (Some(donor), group),
+                None => crate::handlers::terminal::finish_restore(&done.name, restored, &mut panes),
+            };
+            if let Some(donor) = donor {
+                crate::handlers::terminal::forget_layout(donor, done.name.clone());
+            }
+            let was_terminal = active_is_terminal(&session);
+            let here = session
+                .worktrees
+                .get(session.active)
+                .map(|g| g.name.clone());
+            session.worktrees.push(group);
+            session.active = session.worktrees.len() - 1;
+            if !was_terminal {
+                region_last_w = here;
+            }
+            region_last_t = Some(done.name);
+            persist_session_layout(&mut session, &panes);
+            refresh_tab_model(&mut model, &session, &mut sb);
+            need_relayout = true;
             dirty = true;
         }
         // Run results: the latest run upserts each reported test's status while
@@ -9969,20 +10085,7 @@ async fn event_loop<T: Terminal>(
             }
             if fi.repo != session.id
                 && let Ok(db) = thegn_core::db::Db::open()
-                && {
-                    leave_terminal_region!();
-                    switch_workspace(
-                        &fi.repo,
-                        None,
-                        &mut session,
-                        &mut panes,
-                        &mut workspace_pool,
-                        &db,
-                        keymap.config(),
-                        &mut need_relayout,
-                        &mut clear_on_next_frame,
-                    )
-                }
+                && switch_workspace_from_region!(&fi.repo, None, &db)
             {
                 refresh_tab_model(&mut model, &session, &mut sb);
                 kick_model_hydration!();
@@ -17144,20 +17247,11 @@ async fn event_loop<T: Terminal>(
                                     ));
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
                                         && let Ok(db) = thegn_core::db::Db::open()
-                                        && {
-                                            leave_terminal_region!();
-                                            switch_workspace(
-                                                repo_path,
-                                                Some(tab_name),
-                                                &mut session,
-                                                &mut panes,
-                                                &mut workspace_pool,
-                                                &db,
-                                                keymap.config(),
-                                                &mut need_relayout,
-                                                &mut clear_on_next_frame,
-                                            )
-                                        }
+                                        && switch_workspace_from_region!(
+                                            repo_path,
+                                            Some(tab_name),
+                                            &db
+                                        )
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
@@ -17178,20 +17272,7 @@ async fn event_loop<T: Terminal>(
                                         crate::perf::SwitchKind::Workspace,
                                     ));
                                     if let Ok(db) = thegn_core::db::Db::open()
-                                        && {
-                                            leave_terminal_region!();
-                                            switch_workspace(
-                                                repo_path,
-                                                None,
-                                                &mut session,
-                                                &mut panes,
-                                                &mut workspace_pool,
-                                                &db,
-                                                keymap.config(),
-                                                &mut need_relayout,
-                                                &mut clear_on_next_frame,
-                                            )
-                                        }
+                                        && switch_workspace_from_region!(repo_path, None, &db)
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         kick_model_hydration!();
@@ -20469,6 +20550,13 @@ async fn event_loop<T: Terminal>(
                                             .into();
                                 } else {
                                     // Take keyboard focus, land on the active worktree.
+                                    // Arm from the keys that painted the current
+                                    // frame BEFORE rebuilding. The centralized
+                                    // focus-edge detector runs at the top of the
+                                    // next loop pass; rebuilding here first would
+                                    // allow one live/attention re-rank exactly on
+                                    // the focus boundary.
+                                    crate::sidebar_freeze::arm(&mut sb, &model.sidebar_status);
                                     focus.zone = crate::focus::Zone::Sidebar;
                                     sb.focused = true;
                                     sb.rebuild(&mut model, &session);
@@ -21057,20 +21145,7 @@ async fn event_loop<T: Terminal>(
                                                 persist_active_focus(&session);
                                             } else if let (Some(target), Ok(db)) =
                                                 (repo_path, thegn_core::db::Db::open())
-                                                && {
-                                                    leave_terminal_region!();
-                                                    switch_workspace(
-                                                        &target,
-                                                        None,
-                                                        &mut session,
-                                                        &mut panes,
-                                                        &mut workspace_pool,
-                                                        &db,
-                                                        keymap.config(),
-                                                        &mut need_relayout,
-                                                        &mut clear_on_next_frame,
-                                                    )
-                                                }
+                                                && switch_workspace_from_region!(&target, None, &db)
                                             {
                                                 focus.zone = crate::focus::Zone::Center;
                                                 // The new session re-indexes groups;
@@ -21222,20 +21297,7 @@ async fn event_loop<T: Terminal>(
                                 }
                                 if let Some(target) = summoned
                                     && let Ok(db) = thegn_core::db::Db::open()
-                                    && {
-                                        leave_terminal_region!();
-                                        switch_workspace(
-                                            &target,
-                                            None,
-                                            &mut session,
-                                            &mut panes,
-                                            &mut workspace_pool,
-                                            &db,
-                                            keymap.config(),
-                                            &mut need_relayout,
-                                            &mut clear_on_next_frame,
-                                        )
-                                    }
+                                    && switch_workspace_from_region!(&target, None, &db)
                                 {
                                     focus.zone = crate::focus::Zone::Center;
                                     region_last_w = session
@@ -21906,20 +21968,11 @@ async fn event_loop<T: Terminal>(
                                             crate::perf::SwitchKind::Workspace,
                                         ));
                                         if let Ok(db) = thegn_core::db::Db::open()
-                                            && {
-                                                leave_terminal_region!();
-                                                switch_workspace(
-                                                    &repo_path,
-                                                    tab.as_deref(),
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &mut workspace_pool,
-                                                    &db,
-                                                    keymap.config(),
-                                                    &mut need_relayout,
-                                                    &mut clear_on_next_frame,
-                                                )
-                                            }
+                                            && switch_workspace_from_region!(
+                                                &repo_path,
+                                                tab.as_deref(),
+                                                &db
+                                            )
                                         {
                                             refresh_tab_model(&mut model, &session, &mut sb);
                                             kick_model_hydration!();

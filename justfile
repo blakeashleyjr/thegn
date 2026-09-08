@@ -540,7 +540,7 @@ coverage-html:
 # --- quality --------------------------------------------------------------
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
-# Architecture ratchets + grep guardrails. NO COMPILE — `git grep` over the
+# Source ratchets + grep guardrails. NO COMPILE — `git grep` over the
 # source and the checked-in allowlists, so this runs in seconds and its verdict
 # depends on the code alone.
 #
@@ -603,6 +603,18 @@ ratchets:
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
     ! grep -rIn 'poll_input(' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -vE 'poll_input\(None\)|Duration::ZERO\)|poll_input\(timeout\)' || (echo 'ERROR: a timed poll_input outside idle_poll::poll_timeout — the idle loop must never poll (CLAUDE.md)' && exit 1)
     test "$(grep -rIn 'poll_input(timeout)' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l)" = 1 || (echo 'ERROR: expected exactly one poll_input(timeout) site (run.rs)' && exit 1)
+
+# The complete ratchet contract. Unlike `ratchets`, this also executes the
+# Rust-side platform/host-key/surface/completion/help checks and therefore
+# compiles their test targets. Keep the cheap source-only target suitable for
+# merge-fold inner loops; use this target when claiming all architecture
+# ratchets have passed.
+ratchets-all: ratchets
+    cargo nextest run -p thegn-core -E 'test(/ratchet/)'
+    cargo nextest run -p thegn-svc -E 'test(/ratchet/)'
+    cargo nextest run -p thegn-host -E 'test(/ratchet/)'
+    cargo nextest run -p thegn-media -E 'test(/ratchet/)'
+    cargo nextest run -p thegn-metrics -E 'test(/ratchet/)'
 
 lint: ratchets
     @for t in treefmt shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done

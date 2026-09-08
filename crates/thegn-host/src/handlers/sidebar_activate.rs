@@ -26,6 +26,10 @@ pub(crate) fn activate_row_target(
     center: Rect,
     need_relayout: &mut bool,
     clear_on_next_frame: &mut bool,
+    terminal_restore: Option<(
+        &tokio::sync::mpsc::UnboundedSender<crate::handlers::terminal::RestoreDone>,
+        &termwiz::terminal::TerminalWaker,
+    )>,
 ) -> bool {
     // Set when this activation switched to a different workspace, so the caller
     // can kick an immediate model hydration (the new workspace's worktree paths
@@ -90,9 +94,7 @@ pub(crate) fn activate_row_target(
                 session.switch_to_tab(gi, ti);
             } else {
                 let migrated = workspace_pool.take_terminal_group(&name);
-                let restored =
-                    migrated.or_else(|| crate::handlers::terminal::restore_group(&name, panes));
-                let group = match restored {
+                let group = match migrated {
                     Some((donor, group)) => {
                         // The donor session's rows still name this terminal;
                         // leave them and a cold resurrect of that project forks
@@ -101,7 +103,19 @@ pub(crate) fn activate_row_target(
                         crate::handlers::terminal::forget_layout(donor, name.clone());
                         group
                     }
-                    None => crate::handlers::terminal::fresh_group(&name, panes),
+                    None => {
+                        let Some((tx, waker)) = terminal_restore else {
+                            return false;
+                        };
+                        crate::handlers::terminal::request_restore(
+                            session.id.clone(),
+                            name.clone(),
+                            tx.clone(),
+                            waker.clone(),
+                        );
+                        model.status = format!("Restoring terminal '{name}'…");
+                        return false;
+                    }
                 };
                 session.worktrees.push(group);
                 session.active = session.worktrees.len() - 1;

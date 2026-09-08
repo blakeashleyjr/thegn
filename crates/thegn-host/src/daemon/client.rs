@@ -290,6 +290,17 @@ impl ExecSource for DaemonSource {
         })
     }
 
+    fn session_absent<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Ok(!self
+                .client
+                .sessions()
+                .await?
+                .iter()
+                .any(|s| s.id == session))
+        })
+    }
+
     fn kill_session<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.client.kill(session))
     }

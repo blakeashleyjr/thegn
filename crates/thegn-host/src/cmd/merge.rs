@@ -72,8 +72,7 @@ pub enum Action {
         #[command(flatten)]
         target: super::target::WorktreeTarget,
     },
-    /// Classify the conflicts of an in-progress merge, and print the reconcile
-    /// chunk skeleton a Lead annotates before dispatching a reconcile.
+    /// Classify conflicts and print a reconcile draft that must be completed.
     ///
     /// Splits hunks into the two kinds that need different advice: `additive`
     /// (the base had nothing — keep both sides) and `restructure` (both sides
@@ -130,7 +129,8 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 /// A reconcile chunk written as generic prose is worse than none: the one used
 /// for THE-32 advised "default to keeping both sides", which was right for 9 of
 /// its 34 hunks and wrong for 25. Classification is computable; the decisions
-/// are not, so this prints the split and leaves the decisions blank.
+/// are not, so this prints a draft, labels unsupported conflict shapes, and
+/// makes its non-dispatchable state explicit.
 fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
     // The CURRENT worktree, not `repo_root()`: that resolves the main checkout,
     // and a reconcile is always in flight in the lane's own linked worktree.
@@ -138,23 +138,57 @@ fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
     let root = thegn_core::util::git_out(&cwd, &["rev-parse", "--show-toplevel"])
         .map(|s| PathBuf::from(s.trim()))
         .context("`merge conflicts` must run inside a git worktree")?;
-    let out = thegn_core::util::git_out(&root, &["diff", "--name-only", "--diff-filter=U"])
-        .unwrap_or_default();
-    let paths: Vec<String> = out
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+    let paths = conflicted_paths(&root)?;
     if paths.is_empty() {
         outln!("no conflicted files — is a merge actually in progress here?");
         return Ok(());
     }
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
-        let body = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
-        let hunks = thegn_core::merge_classify::classify_file(&body);
-        files.push(thegn_core::merge_classify::FileConflicts { path, hunks });
+        let display = display_git_path(&path);
+        let (hunks, inspection_error) = match std::fs::read(root.join(&path)) {
+            Err(error) => (
+                vec![],
+                Some(format!("could not read working-tree file: {error}")),
+            ),
+            Ok(bytes) => match std::str::from_utf8(&bytes) {
+                Err(_) => (
+                    vec![],
+                    Some("file is not UTF-8 (binary or encoded conflict)".into()),
+                ),
+                Ok(body) => {
+                    let hunks = thegn_core::merge_classify::classify_file(body);
+                    let marker_count = body
+                        .lines()
+                        .filter(|line| line.starts_with("<<<<<<<"))
+                        .count();
+                    if marker_count != hunks.len() {
+                        (
+                            hunks,
+                            Some(
+                                "one or more textual conflict markers are malformed or incomplete"
+                                    .into(),
+                            ),
+                        )
+                    } else if hunks.is_empty() {
+                        (
+                            hunks,
+                            Some(
+                                "no textual conflict markers (binary, rename, delete/modify, or submodule conflict)"
+                                    .into(),
+                            ),
+                        )
+                    } else {
+                        (hunks, None)
+                    }
+                }
+            },
+        };
+        files.push(thegn_core::merge_classify::FileConflicts {
+            path: display,
+            hunks,
+            inspection_error,
+        });
     }
     let additive: usize = files
         .iter()
@@ -164,6 +198,10 @@ fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
         .iter()
         .map(thegn_core::merge_classify::FileConflicts::restructure)
         .sum();
+    let unclassified = files
+        .iter()
+        .filter(|file| file.inspection_error.is_some())
+        .count();
     if json {
         let rows: Vec<_> = files
             .iter()
@@ -172,6 +210,7 @@ fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
                     "path": f.path,
                     "additive": f.additive(),
                     "restructure": f.restructure(),
+                    "inspection_error": f.inspection_error,
                     "hunks": f.hunks.iter().map(|h| serde_json::json!({
                         "line": h.line,
                         "class": h.class.as_str(),
@@ -185,18 +224,22 @@ fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
             "files": rows,
             "additive": additive,
             "restructure": restructure,
+            "unclassified": unclassified,
         }));
     }
     if summary {
         for f in &files {
             outln!(
-                "  {:>3} additive  {:>3} decide   {}",
+                "  {:>3} additive  {:>3} decide  {:>3} unclassified   {}",
                 f.additive(),
                 f.restructure(),
+                usize::from(f.inspection_error.is_some()),
                 f.path
             );
         }
-        outln!("\n{additive} additive, {restructure} needing a decision");
+        outln!(
+            "\n{additive} additive, {restructure} needing a decision, {unclassified} unclassified"
+        );
         return Ok(());
     }
     outln!(
@@ -204,6 +247,63 @@ fn conflicts(issue: &str, summary: bool, json: bool) -> Result<()> {
         thegn_core::merge_classify::render_chunk_skeleton(issue, &files)
     );
     Ok(())
+}
+
+/// Ask Git for raw, NUL-delimited paths. Newline parsing and Git's display
+/// quoting both corrupt valid filenames, particularly on Unix where paths are
+/// arbitrary byte strings.
+fn conflicted_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let output = thegn_core::util::git_cmd(root)
+        .args(["diff", "--name-only", "--diff-filter=U", "-z"])
+        .output()
+        .context("could not ask Git for conflicted files")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("could not list conflicted files: {}", stderr.trim());
+    }
+    parse_conflicted_paths(&output.stdout)
+}
+
+fn parse_conflicted_paths(stdout: &[u8]) -> Result<Vec<PathBuf>> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|bytes| !bytes.is_empty())
+        .map(os_path_from_git_bytes)
+        .collect()
+}
+
+#[cfg(unix)]
+fn os_path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(unix)]
+fn display_git_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    match path.to_str() {
+        Some(text) => text.to_owned(),
+        None => path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| std::ascii::escape_default(*byte))
+            .map(char::from)
+            .collect(),
+    }
+}
+
+#[cfg(not(unix))]
+fn display_git_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(not(unix))]
+fn os_path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    let path = String::from_utf8(bytes.to_vec())
+        .context("Git returned a conflicted path that is not valid UTF-8")?;
+    Ok(PathBuf::from(path))
 }
 
 /// `merge retry [worktree]` — re-arm a blocked row.
@@ -719,4 +819,34 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
         anyhow::bail!("{msg}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::{display_git_path, parse_conflicted_paths};
+    use std::path::PathBuf;
+
+    #[test]
+    fn nul_paths_preserve_whitespace_quotes_and_newlines() {
+        let paths = parse_conflicted_paths(b"space name.rs\0quote\"name.rs\0line\nbreak.rs\0")
+            .expect("valid raw paths");
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("space name.rs"),
+                PathBuf::from("quote\"name.rs"),
+                PathBuf::from("line\nbreak.rs"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nul_paths_preserve_non_utf8_bytes_on_unix() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let paths = parse_conflicted_paths(b"bad-\xff-name\0").expect("Unix paths are bytes");
+        assert_eq!(paths[0].as_os_str().as_bytes(), b"bad-\xff-name");
+        assert_eq!(display_git_path(&paths[0]), "bad-\\xff-name");
+    }
 }

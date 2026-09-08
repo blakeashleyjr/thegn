@@ -88,6 +88,9 @@ pub struct Hunk {
 pub struct FileConflicts {
     pub path: String,
     pub hunks: Vec<Hunk>,
+    /// Why this conflict could not be classified from textual markers. Such a
+    /// file still needs an explicit human decision; it must never look clean.
+    pub inspection_error: Option<String>,
 }
 
 impl FileConflicts {
@@ -204,6 +207,10 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
     let total: usize = files.iter().map(|f| f.hunks.len()).sum();
     let additive: usize = files.iter().map(FileConflicts::additive).sum();
     let restructure: usize = files.iter().map(FileConflicts::restructure).sum();
+    let unclassified = files
+        .iter()
+        .filter(|f| f.inspection_error.is_some())
+        .count();
     let mut s = String::new();
     s.push_str(&format!(
         "# {issue} reconcile — merge current main into the lane\n\n"
@@ -217,7 +224,8 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
          `git merge main` is ALREADY IN PROGRESS and left {} file(s) conflicted — \
          {total} hunk(s) total. Do not abort or restart it. Resolve, then `git commit` \
          the merge.\n\n\
-         {additive} hunk(s) are additive and {restructure} need a decision. \
+         {additive} hunk(s) are additive, {restructure} textual hunk(s) need a decision, \
+         and {unclassified} file(s) could not be classified automatically. \
          **Do not apply a blanket \"keep both sides\" rule** — see below.\n",
         files.len()
     ));
@@ -240,6 +248,22 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
         }
     }
 
+    if unclassified > 0 {
+        s.push_str(
+            "\n## Unclassified conflicts — INSPECT BEFORE DISPATCHING\n\n\
+             These Git conflicts could not be represented as textual marker hunks. \
+             Decide them with `git status` and `git ls-files -u`; do not infer that \
+             zero parsed hunks means the file is resolved.\n\n",
+        );
+        for f in files.iter().filter(|f| f.inspection_error.is_some()) {
+            s.push_str(&format!(
+                "- `{}` — {}\n",
+                f.path,
+                f.inspection_error.as_deref().unwrap_or("inspection failed")
+            ));
+        }
+    }
+
     if restructure > 0 {
         s.push_str(
             "\n## Restructure — NEEDS A DECISION (fill these in before dispatching)\n\n\
@@ -259,6 +283,11 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
             s.push('\n');
         }
     }
+    s.push_str(
+        "\n## Dispatch readiness\n\n\
+         **DRAFT ONLY — do not dispatch this chunk yet.** Replace every `DECISION` \
+         placeholder and resolve every unclassified conflict above first.\n",
+    );
     s
 }
 

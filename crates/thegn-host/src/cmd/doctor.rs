@@ -183,16 +183,10 @@ fn devcontainer_json(cfg: &Config) -> serde_json::Value {
             "selected": null,
         });
     };
-    let worktree = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    if cfg.sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
-        return serde_json::json!({
-            "mode": "off",
-            "repo": root.display().to_string(),
-            "candidates": [],
-            "selected": null,
-            "status": { "variant": "", "state": "off", "reason": "disabled by [sandbox] devcontainer = off" },
-        });
-    }
+    // Environment selection and devcontainer discovery are worktree-scoped,
+    // not cwd-scoped.  In a linked worktree `root` is the common checkout's
+    // root, while `--show-toplevel` is the worktree the user is diagnosing.
+    let worktree = current_worktree_root().unwrap_or_else(|| root.clone());
     let db = thegn_core::db::Db::open().ok();
     let approvals = db
         .as_ref()
@@ -2759,6 +2753,15 @@ fn current_repo_root() -> Option<std::path::PathBuf> {
     thegn_core::util::git_common_dir(&cwd)
         .parent()
         .map(|p| p.to_path_buf())
+}
+
+/// The top level of the linked worktree containing the current directory.
+/// Distinct from [`current_repo_root`], which deliberately follows the common
+/// git directory back to the main checkout.
+fn current_worktree_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    thegn_core::util::git_out(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(|path| std::path::PathBuf::from(path.trim()))
 }
 
 /// Names of custom `merge.<name>.driver` definitions in the repo's git config

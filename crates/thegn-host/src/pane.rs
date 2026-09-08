@@ -1054,21 +1054,31 @@ async fn relay_exec(
             // repaint the persisted scrollback tail + arm the relaunch
             // overlay. Only both failing surfaces the husk below.
             Err(attach_err) => {
-                // WARN, not debug: this is the moment a user's persisted shell
-                // is replaced by an empty one ("my terminal started over"). It
-                // must be visible in a default `THEGN_LOG=info` capture.
-                tracing::warn!(
-                    target: "thegn::sandbox",
-                    pane = id, sandbox = %sandbox_id, session = %session, %attach_err,
-                    "reattach to the persisted session failed; opening a FRESH session \
-                     (the previous shell's state is gone)"
-                );
-                match source.open(&fallback).await {
-                    Ok(s) => {
-                        fell_back = true;
-                        Ok(s)
+                let absent = source.session_absent(&session).await.unwrap_or(false);
+                if !absent {
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        pane = id, sandbox = %sandbox_id, session = %session, %attach_err,
+                        "reattach failed without authoritative session absence; refusing to open a duplicate shell"
+                    );
+                    Err(attach_err)
+                } else {
+                    // WARN, not debug: this is the moment a user's persisted shell
+                    // is replaced by an empty one ("my terminal started over"). It
+                    // must be visible in a default `THEGN_LOG=info` capture.
+                    tracing::warn!(
+                        target: "thegn::sandbox",
+                        pane = id, sandbox = %sandbox_id, session = %session, %attach_err,
+                        "reattach to the persisted session failed; opening a FRESH session \
+                         (the previous shell's state is gone)"
+                    );
+                    match source.open(&fallback).await {
+                        Ok(s) => {
+                            fell_back = true;
+                            Ok(s)
+                        }
+                        Err(open_err) => Err(open_err),
                     }
-                    Err(open_err) => Err(open_err),
                 }
             }
         },
@@ -1178,23 +1188,28 @@ async fn relay_exec(
                     let sid = session_cell.lock().ok().and_then(|c| c.clone());
                     // 1. Prefer reattaching the SAME session: a transient socket
                     //    drop replays scrollback with the shell state preserved.
-                    if let Some(sid) = &sid
-                        && let Ok(s) = source.attach(sid, cols, rows).await
-                    {
-                        tracing::debug!(target: "thegn::sandbox", pane = id, "reattached exec session");
-                        // Tell the loop the replay burst that follows is not
-                        // agent work (see `PaneEvent::Reattached`).
-                        let _ = tx.send(PaneEvent::Reattached(id)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
-                        session = s;
-                        continue;
-                    }
+                    let may_reopen = if let Some(sid) = &sid {
+                        match source.attach(sid, cols, rows).await {
+                            Ok(s) => {
+                                tracing::debug!(target: "thegn::sandbox", pane = id, "reattached exec session");
+                                // Tell the loop the replay burst that follows is not
+                                // agent work (see `PaneEvent::Reattached`).
+                                let _ = tx.send(PaneEvent::Reattached(id)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                session = s;
+                                continue;
+                            }
+                            Err(_) => source.session_absent(sid).await.unwrap_or(false),
+                        }
+                    } else {
+                        false
+                    };
                     // 2. Reattach failed — the session is genuinely gone (the
                     //    sandbox was suspended/restarted). Open a FRESH exec: this
                     //    resumes the sandbox and restores a working shell (a new
                     //    shell process; fs/cwd preserved). This is the
                     //    "suspend-idle, recover-on-return" path so a backgrounded
                     //    remote pane never becomes a permanently dead shell.
-                    if let Some(spec) = &reopen_spec {
+                    if may_reopen && let Some(spec) = &reopen_spec {
                         if let Ok(mut c) = session_cell.lock() {
                             *c = None; // drop the stale id; the fresh session announces a new one
                         }
@@ -1794,6 +1809,12 @@ mod tests {
         ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
             Box::pin(async move { Err(anyhow::anyhow!("session gone (reaped)")) })
         }
+        fn session_absent<'a>(
+            &'a self,
+            _session: &'a str,
+        ) -> futures::future::BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(true) })
+        }
         fn kill_session<'a>(
             &'a self,
             session: &'a str,
@@ -1895,6 +1916,76 @@ mod tests {
             ["fresh-sid".to_string()],
             "close must kill the session, not leak a lease"
         );
+    }
+
+    struct TransientAttachSource {
+        opens: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl crate::pane_source::ExecSource for TransientAttachSource {
+        fn open<'a>(
+            &'a self,
+            _spec: &'a thegn_svc::provider::ExecSpec,
+        ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+            self.opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Err(anyhow::anyhow!("must not open")) })
+        }
+
+        fn attach<'a>(
+            &'a self,
+            _session: &'a str,
+            _cols: u16,
+            _rows: u16,
+        ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+            Box::pin(async { Err(anyhow::anyhow!("transport unavailable")) })
+        }
+    }
+
+    #[test]
+    fn transient_reattach_failure_does_not_open_a_duplicate_shell() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let opens = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let source = Arc::new(TransientAttachSource {
+            opens: opens.clone(),
+        });
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(8);
+        let (_ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(1);
+        rt.block_on(relay_exec(
+            9,
+            source,
+            "daemon".into(),
+            "local".into(),
+            ExecOpen::Attach {
+                session: "still-live".into(),
+                cols: 80,
+                rows: 24,
+                fallback: thegn_svc::provider::ExecSpec {
+                    argv: vec!["/bin/sh".into()],
+                    tty: true,
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                    cwd: None,
+                },
+            },
+            tx,
+            None,
+            ctrl_rx,
+            Arc::new(Mutex::new(None)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(matches!(rx.blocking_recv(), Some(PaneEvent::Output(9, _))));
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(PaneEvent::Exit(9, Some(1)))
+        ));
     }
 
     /// The reconnect ladder's silent reopen is a DEGRADE, not a resume: the

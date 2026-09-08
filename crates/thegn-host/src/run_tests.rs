@@ -2359,6 +2359,40 @@ fn worktree_landing_never_lands_on_a_terminal() {
     assert_eq!(worktree_landing(&only_terminals, None), None);
 }
 
+#[test]
+fn failed_project_switch_restores_terminal_focus_and_region_bookmarks() {
+    let mut session = Session {
+        id: "repo".into(),
+        worktrees: vec![
+            WorktreeGroup::new("repo/home", GroupKind::Home, "/wt/home"),
+            WorktreeGroup::terminal("prod"),
+        ],
+        active: 0,
+    };
+    session.switch_to(1);
+    let mut last_w = Some("repo/home".into());
+    let mut last_t = Some("prod".into());
+    let prior_last_w = last_w.clone();
+    let prior_last_t = last_t.clone();
+
+    // This is the provisional park-time sanitisation performed immediately
+    // before the cold switch discovers that its target is unavailable.
+    session.switch_to(0);
+    last_t = Some("other".into());
+    restore_failed_region_switch(
+        &mut session,
+        1,
+        &mut last_w,
+        prior_last_w,
+        &mut last_t,
+        prior_last_t,
+    );
+
+    assert_eq!(session.active, 1);
+    assert_eq!(last_w.as_deref(), Some("repo/home"));
+    assert_eq!(last_t.as_deref(), Some("prod"));
+}
+
 /// Build a one-tab workspace whose single leaf pane has id `pane_id`, and
 /// register a live `PtyPane` for it in `panes` so eviction has something to reap.
 #[cfg(test)]
@@ -3208,6 +3242,7 @@ fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
         },
         &mut need_relayout,
         &mut clear_on_next_frame,
+        None,
     );
 
     assert!(!activated);
@@ -3270,6 +3305,7 @@ fn activating_a_terminal_parked_with_another_project_migrates_its_live_shell() {
         },
         &mut need_relayout,
         &mut clear_on_next_frame,
+        None,
     );
 
     assert_eq!(session.worktrees.len(), groups_before + 1);
