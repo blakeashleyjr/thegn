@@ -21,6 +21,17 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
+
+pub(crate) fn os_path_from_git_bytes(bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {
+    let path = String::from_utf8(bytes.to_vec()).map_err(|error| {
+        anyhow::anyhow!("Git returned a conflicted path that is not valid UTF-8: {error}")
+    })?;
+    Ok(std::path::PathBuf::from(path))
+}
+
+pub(crate) fn display_git_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     TerminateProcess,

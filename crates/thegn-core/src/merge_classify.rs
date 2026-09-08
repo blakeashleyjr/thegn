@@ -31,26 +31,25 @@
 //! >>>>>>> main
 //! ```
 //!
-//! - **Base empty** ⇒ [`HunkClass::Additive`]. Neither side edited anything;
-//!   both *added* different things at the same point. Keeping both is right,
-//!   and is what the enum ladder, the config override struct, and the env
-//!   parser collisions all are.
+//! - **Base empty** ⇒ [`HunkClass::ConcurrentAdd`]. Both sides inserted at
+//!   the same point. That does not prove they compose: duplicate declarations
+//!   and duplicate configuration keys are common counterexamples.
 //! - **Base non-empty** ⇒ [`HunkClass::Restructure`]. There was code here and
 //!   both sides changed it, so one of them rewrote what the other also touched.
 //!   "Keep both" is meaningless; somebody must decide what the merged behaviour
 //!   is.
 //!
-//! Checked against the real THE-32 merge: all 9 `config*.rs` hunks classify
-//! additive, and the `pr_view.rs` / `diff_view.rs` / lifecycle-hook hunks
-//! classify restructure — exactly the split the hand-written chunk drew.
+//! Checked against the real THE-32 merge: the 9 `config*.rs` hunks classify as
+//! concurrent additions, and the `pr_view.rs` / `diff_view.rs` /
+//! lifecycle-hook hunks classify as restructures. Both remain review items.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 /// What kind of decision a conflict hunk needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HunkClass {
-    /// Both sides added distinct content where the base had none. Keep both.
-    Additive,
+    /// Both sides inserted content where the base had none. Needs review.
+    ConcurrentAdd,
     /// Both sides changed content that existed. Needs a named decision.
     Restructure,
 }
@@ -58,7 +57,7 @@ pub enum HunkClass {
 impl HunkClass {
     pub fn as_str(self) -> &'static str {
         match self {
-            HunkClass::Additive => "additive",
+            HunkClass::ConcurrentAdd => "concurrent-add",
             HunkClass::Restructure => "restructure",
         }
     }
@@ -94,10 +93,10 @@ pub struct FileConflicts {
 }
 
 impl FileConflicts {
-    pub fn additive(&self) -> usize {
+    pub fn concurrent_add(&self) -> usize {
         self.hunks
             .iter()
-            .filter(|h| h.class == HunkClass::Additive)
+            .filter(|h| h.class == HunkClass::ConcurrentAdd)
             .count()
     }
     pub fn restructure(&self) -> usize {
@@ -134,7 +133,7 @@ fn hint(section: &[&str]) -> String {
 /// Without a base section — i.e. `merge.conflictStyle` left at the default
 /// `merge` — every hunk reads as [`HunkClass::Restructure`], the conservative
 /// answer: "someone has to look at this" is never actively wrong, whereas a
-/// false `Additive` tells a worker to keep both sides of a rewrite.
+/// false safe classification tells a worker to keep both sides of a rewrite.
 pub fn classify_file(contents: &str) -> Vec<Hunk> {
     let lines: Vec<&str> = contents.lines().collect();
     let mut out = Vec::new();
@@ -178,7 +177,7 @@ pub fn classify_file(contents: &str) -> Vec<Hunk> {
             Some(b) => {
                 let base = &lines[b + 1..sep_i];
                 if base.iter().all(|l| l.trim().is_empty()) {
-                    HunkClass::Additive
+                    HunkClass::ConcurrentAdd
                 } else {
                     HunkClass::Restructure
                 }
@@ -204,8 +203,20 @@ pub fn classify_file(contents: &str) -> Vec<Hunk> {
 /// generated file that pretended otherwise would reproduce exactly the generic
 /// advice this exists to replace.
 pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
+    render_chunk(issue, files, &BTreeMap::new())
+}
+
+/// Render a reconciliation chunk, filling review decisions supplied as
+/// `path:line=decision` for textual hunks and `path=decision` for unclassified
+/// files. The readiness footer becomes dispatchable only when every item has a
+/// non-empty decision.
+pub fn render_chunk(
+    issue: &str,
+    files: &[FileConflicts],
+    decisions: &BTreeMap<String, String>,
+) -> String {
     let total: usize = files.iter().map(|f| f.hunks.len()).sum();
-    let additive: usize = files.iter().map(FileConflicts::additive).sum();
+    let concurrent_add: usize = files.iter().map(FileConflicts::concurrent_add).sum();
     let restructure: usize = files.iter().map(FileConflicts::restructure).sum();
     let unclassified = files
         .iter()
@@ -213,38 +224,49 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
         .count();
     let mut s = String::new();
     s.push_str(&format!(
-        "# {issue} reconcile — merge current main into the lane\n\n"
+        "# {:?} reconcile — merge current main into the lane\n\n",
+        issue
     ));
     s.push_str("## Files to touch (exact paths)\n\n");
     for f in files {
-        s.push_str(&format!("- `{}`\n", f.path));
+        s.push_str(&format!("- {:?}\n", f.path));
     }
     s.push_str(&format!(
         "\n## State you are landing in\n\n\
          `git merge main` is ALREADY IN PROGRESS and left {} file(s) conflicted — \
          {total} hunk(s) total. Do not abort or restart it. Resolve, then `git commit` \
          the merge.\n\n\
-         {additive} hunk(s) are additive, {restructure} textual hunk(s) need a decision, \
+         {concurrent_add} concurrent insertion(s) and {restructure} rewrite(s) need a decision, \
          and {unclassified} file(s) could not be classified automatically. \
          **Do not apply a blanket \"keep both sides\" rule** — see below.\n",
         files.len()
     ));
 
-    if additive > 0 {
+    if concurrent_add > 0 {
         s.push_str(
-            "\n## Additive — keep both sides\n\n\
-             The base had nothing here; each side ADDED something different at the same \
-             point. Keeping both entries is right.\n\n",
+            "\n## Concurrent additions — NEEDS A DECISION\n\n\
+             The base had nothing here, but that proves only that both sides inserted. \
+             Keeping both may duplicate a declaration or configuration key. Decide each \
+             hunk explicitly.\n\n",
         );
-        for f in files.iter().filter(|f| f.additive() > 0) {
-            s.push_str(&format!("- `{}`", f.path));
-            let lines: Vec<String> = f
+        for f in files.iter().filter(|f| f.concurrent_add() > 0) {
+            s.push_str(&format!("### {:?}\n\n", f.path));
+            for h in f
                 .hunks
                 .iter()
-                .filter(|h| h.class == HunkClass::Additive)
-                .map(|h| h.line.to_string())
-                .collect();
-            s.push_str(&format!(" — line(s) {}\n", lines.join(", ")));
+                .filter(|h| h.class == HunkClass::ConcurrentAdd)
+            {
+                let key = format!("{}:{}", f.path, h.line);
+                let decision = decisions.get(&key).filter(|text| !text.trim().is_empty());
+                s.push_str(&format!(
+                    "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}\n",
+                    h.line,
+                    h.ours_hint,
+                    h.theirs_hint,
+                    decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
+                ));
+            }
+            s.push('\n');
         }
     }
 
@@ -256,10 +278,14 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
              zero parsed hunks means the file is resolved.\n\n",
         );
         for f in files.iter().filter(|f| f.inspection_error.is_some()) {
+            let decision = decisions
+                .get(&f.path)
+                .filter(|text| !text.trim().is_empty());
             s.push_str(&format!(
-                "- `{}` — {}\n",
+                "- {:?} — {:?}\n  - DECISION: {}\n",
                 f.path,
-                f.inspection_error.as_deref().unwrap_or("inspection failed")
+                f.inspection_error.as_deref().unwrap_or("inspection failed"),
+                decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
             ));
         }
     }
@@ -273,21 +299,44 @@ pub fn render_chunk_skeleton(issue: &str, files: &[FileConflicts]) -> String {
              structure wins and which behaviour is ported onto it.\n\n",
         );
         for f in files.iter().filter(|f| f.restructure() > 0) {
-            s.push_str(&format!("### `{}`\n\n", f.path));
+            s.push_str(&format!("### {:?}\n\n", f.path));
             for h in f.hunks.iter().filter(|h| h.class == HunkClass::Restructure) {
+                let key = format!("{}:{}", f.path, h.line);
+                let decision = decisions.get(&key).filter(|text| !text.trim().is_empty());
                 s.push_str(&format!(
-                    "- **line {}** — ours: `{}` / theirs: `{}`\n  - DECISION: _(state it)_\n",
-                    h.line, h.ours_hint, h.theirs_hint
+                    "- **line {}** — ours: {:?} / theirs: {:?}\n  - DECISION: {}\n",
+                    h.line,
+                    h.ours_hint,
+                    h.theirs_hint,
+                    decision.map_or_else(|| "_(state it)_".to_string(), |text| format!("{text:?}"))
                 ));
             }
             s.push('\n');
         }
     }
-    s.push_str(
-        "\n## Dispatch readiness\n\n\
-         **DRAFT ONLY — do not dispatch this chunk yet.** Replace every `DECISION` \
-         placeholder and resolve every unclassified conflict above first.\n",
-    );
+    let complete = files.iter().all(|file| {
+        let unclassified_done = file.inspection_error.is_none()
+            || decisions
+                .get(&file.path)
+                .is_some_and(|d| !d.trim().is_empty());
+        unclassified_done
+            && file.hunks.iter().all(|hunk| {
+                decisions
+                    .get(&format!("{}:{}", file.path, hunk.line))
+                    .is_some_and(|d| !d.trim().is_empty())
+            })
+    });
+    if complete {
+        s.push_str(
+            "\n## Dispatch readiness\n\n**READY — every conflict has an explicit decision.**\n",
+        );
+    } else {
+        s.push_str(
+            "\n## Dispatch readiness\n\n\
+             **DRAFT ONLY — do not dispatch this chunk yet.** Supply every `DECISION` \
+             with `--decision 'path:line=text'` (or `path=text` for an unclassified file).\n",
+        );
+    }
     s
 }
 

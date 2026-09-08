@@ -213,6 +213,7 @@ pub(crate) struct DrainSummary {
 /// Everything the moved Output/Exit handlers touch, borrowed from the loop.
 pub(crate) struct DrainCtx<'a> {
     pub session: &'a mut crate::session::Session,
+    pub workspace_pool: &'a mut crate::workspace_pool::WorkspacePool,
     pub panes: &'a mut Panes,
     pub model: &'a mut FrameModel,
     pub sb: &'a mut SidebarState,
@@ -836,6 +837,58 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .iter_tabs()
         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
         .map(|(gi, ti, t)| (gi, ti, t.center.pane_ids().len() == 1));
+    if owner.is_none()
+        && let Some(exit) = ctx.workspace_pool.detach_exited_terminal_pane(id)
+    {
+        let age = ctx.panes.pane_age(id).unwrap_or_default();
+        ctx.panes.forget_spawn_time(id);
+        let shutting_down = ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed);
+        let interactive_close = !shutting_down && age >= CRASH_THRESHOLD;
+        if exit.group_closed {
+            ctx.loading_state
+                .remove(&(exit.name.clone(), exit.tab_index));
+            ctx.loading_remote
+                .retain(|(group, _), _| group != &exit.name);
+            ctx.loading_retired.retain(|(group, _)| group != &exit.name);
+            if interactive_close
+                && let Some(pos) = ctx
+                    .model
+                    .sidebar_db_terminals
+                    .iter()
+                    .position(|t| t.name == exit.name)
+            {
+                let id = ctx.model.sidebar_db_terminals.remove(pos).id;
+                tokio::task::spawn_blocking(move || {
+                    use thegn_core::store::WorkspaceStore;
+                    if let Ok(db) = thegn_core::db::Db::open() {
+                        let _ = db.del_terminal(id); // best-effort: cache write after live ownership was removed
+                    }
+                });
+            }
+            ctx.model.status = if interactive_close {
+                format!("Closed terminal \"{}\"", exit.name)
+            } else {
+                format!("Terminal \"{}\" exited", exit.name)
+            };
+        } else if exit.tab_closed {
+            ctx.loading_state.on_tab_closed(&exit.name, exit.tab_index);
+            crate::handlers::tab_keys::shift_named_map(
+                ctx.loading_remote,
+                &exit.name,
+                exit.tab_index,
+            );
+            crate::handlers::tab_keys::shift_named_set(
+                ctx.loading_retired,
+                &exit.name,
+                exit.tab_index,
+            );
+        }
+        crate::run::persist_session_layout_cached(&exit.snapshot);
+        crate::run::refresh_tab_model(ctx.model, ctx.session, ctx.sb);
+        *ctx.need_relayout = true;
+        *ctx.dirty = true;
+        return false;
+    }
     if let Some((gi, ti, sole)) = owner {
         crate::worktree_lifecycle::session_end_after_pane_exit(
             ctx.current_config,

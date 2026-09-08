@@ -351,3 +351,38 @@ pub fn open_read_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::Fi
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }
+
+pub(crate) fn os_path_from_git_bytes(bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        bytes.to_vec(),
+    )))
+}
+
+pub(crate) fn display_git_path(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    match path.to_str() {
+        Some(text) => text.to_owned(),
+        None => path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| std::ascii::escape_default(*byte))
+            .map(char::from)
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod git_path_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[test]
+    fn non_utf8_git_paths_preserve_bytes_and_escape_for_display() {
+        let path = os_path_from_git_bytes(b"bad-\xff-name").expect("Unix paths are bytes");
+        assert_eq!(path.as_os_str().as_bytes(), b"bad-\xff-name");
+        assert_eq!(display_git_path(&path), "bad-\\xff-name");
+    }
+}

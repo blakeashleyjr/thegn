@@ -3330,3 +3330,20 @@ fn activating_a_terminal_parked_with_another_project_migrates_its_live_shell() {
 
 // `neutralize_paste_markers` and its tests moved to `crate::pane_writer`
 // alongside `build_paste_bytes` (the bracketed-paste chunk builder).
+
+#[test]
+fn worktree_disk_inspection_never_falls_back_to_process_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = WorktreeGroup::new("app/home", GroupKind::Home, temp.path().to_string_lossy());
+    assert_eq!(worktree_disk_cwd(&real).as_deref(), Some(temp.path()));
+
+    let terminal = WorktreeGroup::terminal("prod");
+    assert_eq!(worktree_disk_cwd(&terminal), None);
+
+    let missing = WorktreeGroup::new(
+        "app/gone",
+        GroupKind::Branch,
+        temp.path().join("gone").to_string_lossy(),
+    );
+    assert_eq!(worktree_disk_cwd(&missing), None);
+}

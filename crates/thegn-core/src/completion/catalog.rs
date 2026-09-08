@@ -302,13 +302,19 @@ pub const CATALOG: &[Slot] = &[
     slot("merge land", "worktree_pos", SourceKind::Worktree),
     slot("merge retry", "worktree", SourceKind::Worktree),
     slot("merge retry", "worktree_pos", SourceKind::Worktree),
-    // `merge conflicts --issue` labels the generated reconcile chunk with the
-    // lane's tracker id (`THE-32`), so the issue source is the right one even
-    // though nothing serves it yet.
+    // `merge conflicts --issue` is a free-form heading label. There is no issue
+    // provider behind this slot, so do not imply that Tab can discover ids.
     slot(
         "merge conflicts",
         "issue",
-        SourceKind::Reserved(Reserved::Issue),
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // Reconciliation decisions are deliberately free-form `KEY=TEXT` pairs;
+    // filenames are not a safe enumerable source and the prose is user-authored.
+    slot(
+        "merge conflicts",
+        "decision",
+        SourceKind::Reserved(Reserved::Freeform),
     ),
     slot("merge rm", "worktree", SourceKind::Worktree),
     slot("merge rm", "worktree_pos", SourceKind::Worktree),

@@ -1723,7 +1723,13 @@ fn open_worktree_disk(
     center: Rect,
     need_relayout: &mut bool,
 ) {
-    let cwd = active_cwd(session);
+    // This action describes and inspects the selected worktree. A terminal has
+    // no checkout, and a deleted/unmounted checkout must not silently redirect
+    // the recursive scan to thegn's unrelated process cwd.
+    let Some(cwd) = session.active_group().and_then(worktree_disk_cwd) else {
+        model.status = "Worktree is unavailable; disk inspection was not started".into();
+        return;
+    };
     let focused = focused_pane_id(session);
     // Keep the inspector read-only: gdu's navigation remains interactive, but
     // the statusbar should never make deleting a worktree file one keystroke
@@ -1733,12 +1739,19 @@ fn open_worktree_disk(
         panes,
         focused,
         "gdu --no-delete --no-spawn-shell .",
-        cwd.as_deref(),
+        Some(&cwd),
         center,
     );
     focus.zone = crate::focus::Zone::Center;
     refresh_tab_model(model, session, sb);
     *need_relayout = true;
+}
+
+fn worktree_disk_cwd(group: &crate::session::WorktreeGroup) -> Option<std::path::PathBuf> {
+    (group.kind != crate::session::GroupKind::Terminal
+        && !group.path.is_empty()
+        && std::path::Path::new(&group.path).is_dir())
+    .then(|| std::path::PathBuf::from(&group.path))
 }
 
 /// Render-facing share snapshot for the active worktree (badge + Share panel).
@@ -8763,6 +8776,7 @@ async fn event_loop<T: Terminal>(
         let drain_summary = {
             let mut dctx = crate::pty_drain::DrainCtx {
                 session: &mut session,
+                workspace_pool: &mut workspace_pool,
                 panes: &mut panes,
                 model: &mut model,
                 sb: &mut sb,
@@ -11123,14 +11137,11 @@ async fn event_loop<T: Terminal>(
                     keymap = rebuild_keymap(&new_cfg, &session);
                     sb.view.workspace_sort = new_cfg.ui.sidebar_workspace_sort;
                     sb.view.terminals_section = new_cfg.ui.sidebar_terminals_section;
-                    sb.freeze_sort = new_cfg.ui.sidebar_freeze_sort;
-                    // Turning the key off must take effect NOW. `arm` already
-                    // refuses to re-arm, but a freeze taken before the edit
-                    // would otherwise hold until focus next left the sidebar,
-                    // so the user would see the setting do nothing.
-                    if !sb.freeze_sort {
-                        crate::sidebar_freeze::thaw(&mut sb);
-                    }
+                    crate::sidebar_freeze::set_enabled(
+                        &mut sb,
+                        new_cfg.ui.sidebar_freeze_sort,
+                        &model.sidebar_status,
+                    );
                     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&new_cfg.ui);
                     // `workspace_sort`/`terminals_section` are only read inside
                     // `build_rows`, and nothing else on the reload path
@@ -15387,6 +15398,7 @@ async fn event_loop<T: Terminal>(
                                         .filter(|g| g.kind != crate::session::GroupKind::Terminal)
                                         .map(|g| g.name.clone()),
                                 );
+                                names.extend(workspace_pool.resident_terminal_names());
                                 let taken = thegn_core::worktree::BranchSet::from_names(names);
                                 choice.name = thegn_core::worktree::dedupe(&choice.name, &taken);
                             }

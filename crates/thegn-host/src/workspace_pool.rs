@@ -35,6 +35,15 @@ pub(crate) struct ResidentWorkspace {
     pub(crate) active: usize,
 }
 
+/// Bookkeeping produced when a dead pane belonged to a parked terminal.
+pub(crate) struct ParkedTerminalExit {
+    pub(crate) name: String,
+    pub(crate) tab_index: usize,
+    pub(crate) tab_closed: bool,
+    pub(crate) group_closed: bool,
+    pub(crate) snapshot: crate::session::Session,
+}
+
 impl ResidentWorkspace {
     /// The group index this workspace should resume on: `active` when it is a
     /// worktree, else the first worktree (the home group), else `active`
@@ -120,6 +129,15 @@ impl WorkspacePool {
         self.parked.iter().flat_map(|(_, rw)| rw.worktrees.iter())
     }
 
+    /// Names owned by live terminal groups in parked workspaces. Creation must
+    /// include these in its uniqueness set even when the registry write that
+    /// normally advertises the terminal failed.
+    pub(crate) fn resident_terminal_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.resident_groups()
+            .filter(|g| g.kind == crate::session::GroupKind::Terminal)
+            .map(|g| g.name.clone())
+    }
+
     /// Restore a parked workspace, removing it from the pool (it becomes the
     /// active workspace, which is never held here).
     pub(crate) fn take(&mut self, repo: &str) -> Option<ResidentWorkspace> {
@@ -174,6 +192,66 @@ impl WorkspacePool {
         Some((key, group))
     }
 
+    /// Remove a dead pane from the parked terminal group that owns it. Active
+    /// session lookup cannot see these groups, but their PTYs remain in the
+    /// global pane table and may exit while their workspace is parked.
+    pub(crate) fn detach_exited_terminal_pane(
+        &mut self,
+        pane_id: u32,
+    ) -> Option<ParkedTerminalExit> {
+        let (pi, gi, ti) = self.parked.iter().enumerate().find_map(|(pi, (_, rw))| {
+            rw.worktrees.iter().enumerate().find_map(|(gi, group)| {
+                (group.kind == crate::session::GroupKind::Terminal).then_some(())?;
+                group.tabs.iter().enumerate().find_map(|(ti, tab)| {
+                    tab.center
+                        .pane_ids()
+                        .contains(&pane_id)
+                        .then_some((pi, gi, ti))
+                })
+            })
+        })?;
+        let (donor, rw) = self.parked.get_mut(pi)?;
+        let donor = donor.clone();
+        let name = rw.worktrees[gi].name.clone();
+        let sole_pane = rw.worktrees[gi].tabs[ti].center.pane_ids().len() == 1;
+        let tab_closed = sole_pane;
+        let group_closed = sole_pane && rw.worktrees[gi].tabs.len() == 1;
+        if group_closed {
+            rw.worktrees.remove(gi);
+            if gi < rw.active {
+                rw.active -= 1;
+            }
+            rw.active = rw.active.min(rw.worktrees.len().saturating_sub(1));
+        } else if tab_closed {
+            let group = &mut rw.worktrees[gi];
+            group.tabs.remove(ti);
+            group.active_tab = group.active_tab.min(group.tabs.len().saturating_sub(1));
+        } else {
+            let tab = &mut rw.worktrees[gi].tabs[ti];
+            tab.center.remove(pane_id);
+            if tab.focused_pane == pane_id
+                && let Some(first) = tab.center.pane_ids().first()
+            {
+                tab.focused_pane = *first;
+            }
+        }
+        let snapshot = crate::session::Session {
+            id: donor.clone(),
+            worktrees: rw.worktrees.clone(),
+            active: rw.active,
+        };
+        if rw.worktrees.is_empty() {
+            self.parked.remove(pi);
+        }
+        Some(ParkedTerminalExit {
+            name,
+            tab_index: ti,
+            tab_closed,
+            group_closed,
+            snapshot,
+        })
+    }
+
     /// Park `rw` under `repo`, enforcing the configured limit. A limit of 0
     /// detaches the workspace's panes immediately (no pooling); an unset limit
     /// (`None`) keeps every entry (unbounded); otherwise the least-recently
@@ -212,6 +290,79 @@ impl WorkspacePool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::center::CenterTree;
+    use crate::session::{GroupKind, WorktreeGroup};
+
+    fn panes() -> Panes {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        Panes::new(tx)
+    }
+
+    fn group(name: &str, kind: GroupKind, id: u32) -> WorktreeGroup {
+        let mut group = WorktreeGroup::new(name, kind, "/repo");
+        group.tabs[0].center = CenterTree::Leaf(id);
+        group.tabs[0].focused_pane = id;
+        group
+    }
+
+    #[test]
+    fn parked_terminal_names_include_registry_write_failures() {
+        let mut pool = WorkspacePool::default();
+        let mut p = panes();
+        pool.stash(
+            "repo".into(),
+            ResidentWorkspace {
+                worktrees: vec![group("prod", GroupKind::Terminal, 41)],
+                active: 0,
+            },
+            &mut p,
+        );
+        assert_eq!(pool.resident_terminal_names().collect::<Vec<_>>(), ["prod"]);
+    }
+
+    #[test]
+    fn exited_parked_terminal_is_removed_from_its_owner() {
+        let mut pool = WorkspacePool::default();
+        let mut p = panes();
+        pool.stash(
+            "repo".into(),
+            ResidentWorkspace {
+                worktrees: vec![
+                    group("home", GroupKind::Home, 40),
+                    group("prod", GroupKind::Terminal, 41),
+                ],
+                active: 0,
+            },
+            &mut p,
+        );
+        let exit = pool.detach_exited_terminal_pane(41).expect("parked owner");
+        assert_eq!(exit.name, "prod");
+        assert!(exit.group_closed);
+        assert_eq!(exit.snapshot.id, "repo");
+        assert_eq!(exit.snapshot.worktrees.len(), 1);
+        assert_eq!(exit.snapshot.worktrees[0].name, "home");
+        assert!(pool.resident_terminal_names().next().is_none());
+    }
+
+    #[test]
+    fn parked_worktree_pane_is_not_claimed_as_a_terminal() {
+        let mut pool = WorkspacePool::default();
+        let mut p = panes();
+        pool.stash(
+            "repo".into(),
+            ResidentWorkspace {
+                worktrees: vec![group("home", GroupKind::Home, 40)],
+                active: 0,
+            },
+            &mut p,
+        );
+        assert!(pool.detach_exited_terminal_pane(40).is_none());
     }
 }
 

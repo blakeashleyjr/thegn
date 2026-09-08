@@ -69,10 +69,11 @@ impl SortFreeze {
 }
 
 /// The key source [`crate::sidebar::sort_groups`] and its flat counterpart read:
-/// the freeze when one is armed, falling back **per key** to the live map on a
-/// miss.
+/// the freeze when one is armed. A key absent from an armed snapshot receives
+/// the stable unknown value; consulting its changing live value would let a row
+/// created during the freeze reshuffle the numeric navigation slots.
 ///
-/// A struct with methods rather than a pair of `&BTreeMap`s so the miss-fallback
+/// A struct with methods rather than a pair of `&BTreeMap`s so the stable-miss
 /// rule (see [`SortKeys::recency`]) lives in exactly one place and can be tested
 /// on its own.
 pub(crate) struct SortKeys<'a> {
@@ -97,8 +98,8 @@ impl<'a> SortKeys<'a> {
     /// Attention rank for a worktree path; `u32::MAX` (last) when nothing knows it.
     pub(crate) fn rank(&self, path: &str) -> u32 {
         self.frozen
-            .and_then(|f| f.ranks.get(path))
-            .or_else(|| self.live_ranks.get(path))
+            .map(|f| f.ranks.get(path))
+            .unwrap_or_else(|| self.live_ranks.get(path))
             .copied()
             .unwrap_or(u32::MAX)
     }
@@ -106,40 +107,37 @@ impl<'a> SortKeys<'a> {
     /// Last-active time for a worktree path; `f64::MIN` (last) when nothing
     /// knows it.
     ///
-    /// **A path missing from the freeze falls through to the live map**, and
-    /// that is deliberate. The freeze's contract is "a row that is on screen
-    /// does not move", not "the list cannot grow": a worktree created during the
-    /// freeze was by definition not on screen, so there is no order to protect.
-    /// Treating a miss as "never active" would exile a just-created worktree to
-    /// the bottom for the whole freeze window — the exact opposite of what
-    /// `Live` promises. The freeze itself is never mutated to absorb newly-seen
-    /// paths; a time-varying snapshot would defeat the point.
+    /// A path missing from an armed freeze receives the stable unknown value.
+    /// It may appear, but cannot move existing rows or itself move as live
+    /// hydration changes during the short focus/grace window.
     pub(crate) fn recency(&self, path: &str) -> f64 {
         self.frozen
-            .and_then(|f| f.recency.get(path))
-            .or_else(|| self.live_recency.get(path))
+            .map(|f| f.recency.get(path))
+            .unwrap_or_else(|| self.live_recency.get(path))
             .copied()
             .unwrap_or(f64::MIN)
     }
 
     /// Workspace attention tier for a slug; `u8::MAX` (last) when unknown.
-    /// Same fallback rule as [`Self::recency`].
+    /// Same stable-miss rule as [`Self::recency`].
     pub(crate) fn workspace_tier(&self, slug: &str) -> u8 {
         self.frozen
-            .and_then(|f| f.workspace_tier.get(slug).copied())
-            .or_else(|| self.live_workspace.get(slug).map(|s| s.tier as u8))
+            .map(|f| f.workspace_tier.get(slug).copied())
+            .unwrap_or_else(|| self.live_workspace.get(slug).map(|s| s.tier as u8))
             .unwrap_or(u8::MAX)
     }
 }
 
 /// Arm the freeze from what is currently on screen.
 ///
-/// No-op when disabled by config, when the sort mode cannot move rows on its own
-/// (`SortMode::is_computed`), and — importantly — **when one is already armed**:
+/// No-op when disabled by config, when neither the worktree nor workspace sort
+/// can move rows on its own, and — importantly — **when one is already armed**:
 /// re-capturing on every keystroke would track the live keys exactly and freeze
 /// nothing. Holding the original snapshot is the whole mechanism.
 pub(crate) fn arm(sb: &mut crate::handlers::sidebar_persist::SidebarState, status: &SidebarStatus) {
-    if !sb.freeze_sort || !sb.view.sort.is_computed() || sb.view.freeze.is_some() {
+    let computed = sb.view.sort.is_computed()
+        || sb.view.workspace_sort == thegn_core::config::WorkspaceSort::Attention;
+    if !sb.freeze_sort || !computed || sb.view.freeze.is_some() {
         return;
     }
     sb.view.freeze = Some(std::sync::Arc::new(SortFreeze::capture(status)));
@@ -168,6 +166,22 @@ pub(crate) fn rearm(
 ) {
     thaw(sb);
     if sb.focused {
+        arm(sb, status);
+    }
+}
+
+/// Apply a live config change. Enabling while the sidebar is already focused
+/// must synthesize the focus-gain edge that normally arms the snapshot.
+pub(crate) fn set_enabled(
+    sb: &mut crate::handlers::sidebar_persist::SidebarState,
+    enabled: bool,
+    status: &SidebarStatus,
+) {
+    let was_enabled = sb.freeze_sort;
+    sb.freeze_sort = enabled;
+    if !enabled {
+        thaw(sb);
+    } else if !was_enabled && sb.focused {
         arm(sb, status);
     }
 }
@@ -237,10 +251,8 @@ mod tests {
         assert_eq!(keys.workspace_tier("repo"), AttentionTier::Working as u8);
     }
 
-    /// The B6 contract: a worktree the freeze never saw is not on screen, so it
-    /// has no order to protect and must use its real key.
     #[test]
-    fn a_path_missing_from_the_freeze_falls_back_to_the_live_map() {
+    fn a_path_missing_from_the_freeze_gets_stable_unknown_keys() {
         let f = SortFreeze::capture(&status());
         let mut fresh = status();
         fresh.attention_ranks.insert("/new".into(), 0);
@@ -254,17 +266,31 @@ mod tests {
         );
 
         let keys = SortKeys::new(Some(&f), &fresh);
-        assert_eq!(keys.rank("/new"), 0, "a new worktree uses its live rank");
-        assert_eq!(
-            keys.recency("/new"),
-            999.0,
-            "a just-created worktree must not be exiled to the bottom"
-        );
-        assert_eq!(
-            keys.workspace_tier("new-repo"),
-            AttentionTier::Blocked as u8
-        );
+        assert_eq!(keys.rank("/new"), u32::MAX);
+        assert_eq!(keys.recency("/new"), f64::MIN);
+        assert_eq!(keys.workspace_tier("new-repo"), u8::MAX);
         // ...while the rows that WERE on screen stay put.
         assert_eq!(keys.recency("/a"), 100.0);
+    }
+
+    #[test]
+    fn enabling_while_focused_arms_immediately() {
+        let mut sb = crate::handlers::sidebar_persist::SidebarState::default();
+        sb.focused = true;
+        sb.view.sort = crate::sidebar::SortMode::Live;
+        set_enabled(&mut sb, true, &status());
+        assert!(sb.freeze_sort);
+        assert!(sb.view.freeze.is_some());
+    }
+
+    #[test]
+    fn workspace_attention_arms_even_with_manual_worktree_sort() {
+        let mut sb = crate::handlers::sidebar_persist::SidebarState::default();
+        sb.focused = true;
+        sb.freeze_sort = true;
+        sb.view.sort = crate::sidebar::SortMode::Manual;
+        sb.view.workspace_sort = thegn_core::config::WorkspaceSort::Attention;
+        arm(&mut sb, &status());
+        assert!(sb.view.freeze.is_some());
     }
 }

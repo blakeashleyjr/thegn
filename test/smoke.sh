@@ -1536,7 +1536,7 @@ utr_out="$("$SZ" dispatch set-status 3 "done" 2>&1)"
 utr_rc=$?
 set -e
 utr_ok=1
-[[ $utr_rc -ne 0 ]] && grep -q 'does not track' <<<"$utr_out" || utr_ok=0
+[[ $utr_rc -ne 0 ]] && grep -q 'not committed' <<<"$utr_out" || utr_ok=0
 check "set-status done is refused while the artifact is untracked" \
   "[[ $utr_ok -eq 1 ]]"
 git -C "$R" add .thegn/pipeline/SMOKE-7/untracked/3.md
@@ -1546,7 +1546,8 @@ git -C "$R" commit -q -m 'smoke: commit the artifact'
 check "set-status done is refused while the report is missing" \
   "! '$SZ' dispatch set-status 3 done 2>&1 | grep -q '→ done'"
 check "dispatch report files the handoff report" \
-  "'$SZ' dispatch report 3 --text 'verdict: DONE; commits: 1' --json | grep -q '\"bytes\"'"
+  "'$SZ' dispatch report 3 --text 'verdict: DONE; commits: 1
+gate: just smoke -- exit 0' --json | grep -q '\"bytes\"'"
 check "set-status done passes once the artifact is tracked and reported" \
   "'$SZ' dispatch set-status 3 done | grep -q 'done'"
 # `session open` shares the control-client connect path, so it degrades with

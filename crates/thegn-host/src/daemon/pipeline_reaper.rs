@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use thegn_core::issue::AgentDispatchStatus;
 use thegn_core::pipeline_reap::ReapVerdict;
+use thegn_core::store::NotificationStore as _;
 
 use super::service::DaemonService;
 
@@ -80,18 +81,33 @@ async fn reap_loop(svc: Arc<DaemonService>) {
 /// One reconciliation pass. Separated from the timer so the policy is readable
 /// (and so a future caller — `thegn doctor`, say — can run it directly).
 fn reap_pass(db: &super::service::SharedDb, live_ids: &[String]) {
-    let db = match db.lock() {
-        Ok(db) => db,
+    // Snapshot under the shared mutex, then release it before any filesystem
+    // or git work. A large stale roster must not stop unrelated daemon DB
+    // operations for the duration of hundreds of subprocesses.
+    let rows = match db.lock() {
+        Ok(db) => match db.list_dispatches() {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| {
+                    matches!(
+                        r.status,
+                        AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::debug!(target: "thegn::pipeline", error = %e, "reap pass could not snapshot");
+                return;
+            }
+        },
         Err(_) => return,
     };
-    let plan = match crate::cmd::dispatch::reap_plan(&db, live_ids) {
-        Ok(plan) => plan,
-        Err(e) => {
-            tracing::debug!(target: "thegn::pipeline", error = %e, "reap pass could not plan");
-            return;
-        }
-    };
+    let plan = crate::cmd::dispatch::reap_plan_rows(&rows, live_ids);
     for r in &plan {
+        let db = match db.lock() {
+            Ok(db) => db,
+            Err(_) => return,
+        };
         match &r.verdict {
             ReapVerdict::CloseDone => {
                 if matches!(
@@ -231,7 +247,7 @@ mod tests {
         git(&wt, &["add", artifact]);
         git(&wt, &["commit", "-qm", "handoff"]);
         let id = row(&db, &wt, artifact);
-        db.set_dispatch_report(id, "PASS\ngate: just test — passed")
+        db.set_dispatch_report(id, "PASS\ngate: just test — exit 0")
             .unwrap();
         let shared = Arc::new(Mutex::new(db));
 
