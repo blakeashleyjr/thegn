@@ -141,11 +141,43 @@ and this file is stale — fix it. In-flight work lives in `openspec/changes/<na
 and merges into `openspec/specs/` on archive (`/opsx:archive`), at which point the
 corresponding roadmap items flip to `[x]`.
 
-### Linear THE-board sweep — 2026-08-25 (60 change proposals scoped)
+### Current reconciliation — 2026-09-08
+
+The Linear board, `main`, and OpenSpec were reconciled after the August delivery
+sweep. The active portfolio now lives under the **Thegn Alpha Readiness**
+initiative and five Linear projects:
+
+- **Alpha Reliability & State Compatibility** — active; migration authority,
+  per-operation schema compatibility, persistent refusal UX, and sandboxed
+  build reliability.
+- **Spec & Tracker Reconciliation** — active; this truth-up and its durable
+  drift gates.
+- **Client API & Remote Access** — planned; supported client contracts, remote
+  confidentiality/identity, and truthful surface coverage.
+- **Plugin UI Platform** — planned; runtime UI extension points, placement, and
+  plugin contract safety.
+- **Distribution & Release Readiness** — planned; platform bundles,
+  publication channels, and clean-host evidence.
+
+The reconciliation found 29 non-completed Linear issues: 14 had delivered or
+decision-complete scope on `main`, 10 were partial or scope-diverged, and 5 were
+unambiguously outstanding as written. Detailed evidence and the pre-mutation
+snapshot are in
+[`docs/audits/linear-reconciliation-2026-09-08.md`](docs/audits/linear-reconciliation-2026-09-08.md).
+The live post-reconciliation portfolio is
+[`docs/PORTFOLIO.md`](docs/PORTFOLIO.md).
+
+Do not infer delivery from an old unchecked task list or from Linear status.
+Archive a change only after its accepted requirements match the code and tests;
+rewrite deliberately superseded deltas before archiving. `just
+openspec-validate` is the current validation result—hard-coded pass counts below
+are historical snapshots, not live assertions.
+
+### Historical Linear THE-board sweep — 2026-08-25 (60 change proposals scoped)
 
 A full scoping pass over the Linear **THE** board (62 open issues) produced **60
-new `openspec/changes/` proposals**, all validated `--strict` (`160/160` green
-including these). Each change names its `THE-` issue(s) in `proposal.md`; Linear
+new `openspec/changes/` proposals**, which validated `--strict` at that time
+(`160/160` green including these). Each change names its `THE-` issue(s) in `proposal.md`; Linear
 carries a per-issue status comment. **These are proposals, not yet applied** —
 they merge into `openspec/specs/` on `/opsx:archive` as they're implemented, at
 which point the backlog rows below flip to `[x]`. THE-41 (Full Remote Audit) is
@@ -196,8 +228,8 @@ sanctioned revival path; `add-fleet-view` must re-target its data source to it.
 (dependency spine, security findings, per-change size/priority) is the roadmap
 artifact produced with this sweep.
 
-**Capability index (33 specs) → roadmap groups.** Run `just openspec validate --all
---strict` to confirm all specs + changes are green (currently 87/87).
+**Capability index (33 specs) → roadmap groups.** Run `just openspec-validate`
+to verify the live specs and changes; do not copy a pass count into this map.
 
 | OpenSpec capability                                 | Roadmap group(s)                                 |
 | --------------------------------------------------- | ------------------------------------------------ |

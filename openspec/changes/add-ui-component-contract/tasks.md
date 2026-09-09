@@ -72,7 +72,7 @@ list` and the generated keybindings help page show them.
 - [ ] 4.4 Unit tests: badge reorder via config, compat default with no config,
       stale-id skip with warning.
 
-## Phase 5 — plugin surface (api v0.3 + runtime)
+## Phase 5 — plugin surface (api v0.3 + runtime; THE-108)
 
 - [x] 5.1 `plugin_api` v0.3 (DONE, additive): `View.rows` (+ `View::multi`/
       `effective_rows`), `Span.slot` theme-slot name with `StyleRole` fallback
@@ -82,22 +82,32 @@ list` and the generated keybindings help page show them.
       byte-identical single-line serialization, unknown-slot preservation, and
       multi-row round-trip. All fields default → a v0.2 plugin/older host keep
       working (negotiation accepts lower-or-equal minor).
-- [ ] 5.2 (DEFERRED) Runtime: negotiate `PanelSection`, render its cached view through the
+- [ ] 5.2 (DEFERRED, THE-108) Runtime: negotiate `PanelSection`, render its cached view through the
       element path with `SurfaceCache` budget/degrade + host-side row truncation;
       disabled/crashed plugin's section vanishes from the accordion.
-- [ ] 5.3 (DEFERRED) Route plugin-row activation to `on_event` (`kind: Action`,
+- [ ] 5.3 (DEFERRED, THE-108) Route plugin-row activation to `on_event` (`kind: Action`,
       contribution + row id) — never a host action; extend the resident-plugin
       golden test.
-- [ ] 5.4 (DEFERRED) Update `docs/help/plugins.md` for the new surface; claim the
+- [ ] 5.4 (DEFERRED, THE-108; contract cross-check THE-106) Update
+      `docs/help/plugins.md` for the new surface; claim the
       `panel:plugins` context key. (Runtime-gated: lands with 5.2/5.3, since the
       help-context ratchet requires the surface to actually be wired.)
 
-## 6. Validation
+## Phase 6 — other plugin UI boundary decisions (DEFERRED; THE-107)
 
-- [ ] 6.1 Re-record e2e baselines for any altered frames (Phase 2 tabs, and the
+- [ ] 6.1 Decide and publish bounded support states for `SidebarTab`, `Theme`,
+      and plugin key-zone contributions; do not infer support from enum values.
+- [ ] 6.2 If a surface is adopted, create a separate implementation delta with
+      negotiation, permissions, budgets, placement, input ownership, help, and
+      compatibility acceptance criteria. This phase does not duplicate
+      THE-108's `PanelSection` work.
+
+## 7. Validation
+
+- [ ] 7.1 Re-record e2e baselines for any altered frames (Phase 2 tabs, and the
       pin paint if its cell attributes shift) — `just e2e-update`, review the diff.
       (e2e is currently broken/skipped per CLAUDE.md; the pin migration is
       frame-neutral by construction — same glyphs/colors/positions.)
-- [ ] 6.2 Run `just ci` once at the end of each phase (lint incl. the element
+- [ ] 7.2 Run `just ci` once at the end of each phase (lint incl. the element
       ratchet, tests incl. keymap/help/plugin snapshot gates, coverage,
       openspec-validate).

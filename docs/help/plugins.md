@@ -17,7 +17,7 @@ statusbar segment.
 Two equivalent homes:
 
 - A `[[plugins]]` entry in your config (the full spec: id, name, version,
-  `api = "0.2.0"`, `command = ["…"]`, contributions).
+  `api = "0.3.0"`, `command = ["…"]`, contributions).
 - A directory: `<config dir>/plugins/<name>/plugin.toml` with the same
   fields. Its `cwd` defaults to that directory.
 
@@ -40,6 +40,14 @@ notification center; a `PaletteAction` contribution appears as a row in the
 (`kind: Action`) if it is resident, or runs it once if it is one-shot. Lines that are not valid JSON are kept as diagnostics
 (the most common mistake is a stray `echo`) — `thegn plugin check` and the
 log surface them.
+
+Those three rendering/event points plus `IssueProvider` are the extension
+points the general compositor host accepts. `PanelSection`, `SidebarTab`,
+`Theme`, `Automation`, harness/program adapters, and CI/forge providers are
+wire vocabulary only there: `thegn plugin check` rejects them until their host
+runtime lands. `DataSource` has a separate, calendar-account-specific command
+adapter; it is not a general UI contribution. Native theme files and configured
+drawer tools are not runtime plugin surfaces.
 
 ## Provider plugins
 
@@ -65,7 +73,8 @@ A plugin only gets what its manifest declares and the host grants: surfaces
 require their capability (e.g. `surface:statusbar`), and `host.call`
 requests (invoking a host capability like `worktrees.list` by catalog id)
 are checked against the plugin's `scopes` — the same `read`/`write`/`git`/
-`admin` lattice as control-API tokens. Undeclared means denied, and every
+`exec`/`admin` lattice as control-API tokens. `write`, `git`, and `exec` are
+independent; `admin` implies all scopes. Undeclared means denied, and every
 denial is audited.
 
 Crashed resident plugins restart with backoff (three attempts, then disabled

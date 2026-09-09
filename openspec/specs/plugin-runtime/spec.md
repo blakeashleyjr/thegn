@@ -12,7 +12,7 @@ The host SHALL discover plugins from `[[plugins]]` config entries and from `<con
 
 #### Scenario: A directory plugin is discovered
 
-- **WHEN** `<config_dir>/plugins/hello/plugin.toml` declares a valid v0.2 spec and the config declares none
+- **WHEN** `<config_dir>/plugins/hello/plugin.toml` declares a valid v0.3 spec and the config declares none
 - **THEN** the loader returns that spec with `cwd` = the plugin directory, and `thegn plugin list` shows it
 
 #### Scenario: An incompatible api fails check
@@ -45,17 +45,40 @@ Incoming plugin messages SHALL be applied to the core `PluginRuntime`: `register
 
 ### Requirement: host.call is scope-checked and dispatched
 
-A `host.call` request SHALL be checked against the plugin's declared `scopes` using the capability catalog's `required_scope` before dispatch; a failing check answers `RpcError` with code `denied`. Granted calls for verbs the control client exposes SHALL be dispatched off-loop through the daemon control socket and answered with the result; verbs without a dispatch path answer code `unsupported`.
+A `host.call` request SHALL be checked against the plugin's declared `scopes`
+using the capability catalog's `required_scope` before dispatch; a failing
+check answers `RpcError` with code `denied`. The dispatchable set SHALL be
+derived from the catalog — every row listing `Surface::Plugin` except
+streaming rows — and dispatched generically through the same
+capability-to-route spine `thegn api call` uses, off-loop over the daemon
+control socket, so a newly routed catalog verb is callable by plugins with no
+per-verb dispatch code. Capabilities outside the derived set answer code
+`unsupported`; admin-scoped capabilities MUST remain unreachable by
+construction (no admin row lists the plugin surface).
 
 #### Scenario: An unscoped call is denied
 
 - **WHEN** a plugin with `scopes = []` calls `{"cap": "sessions.list"}`
-- **THEN** it receives an `RpcResponse` error with code `denied` and the audit log records the attempt
+- **THEN** it receives an `RpcResponse` error with code `denied` and the
+  audit log records the attempt
 
 #### Scenario: A granted read call answers
 
-- **WHEN** a plugin with the `read` scope calls `worktrees.list` while the daemon is up
+- **WHEN** a plugin with the `read` scope calls `worktrees.list` while the
+  daemon is up
 - **THEN** it receives the worktree list as the `result`
+
+#### Scenario: A newly routed verb needs no plugin-runtime change
+
+- **WHEN** a catalog row listing `Surface::Plugin` gains its control route
+- **THEN** a plugin with the required scope can `host.call` it immediately,
+  with no new dispatch arm
+
+#### Scenario: A granted git call performs the verb
+
+- **WHEN** a plugin with the `git` scope calls `merge.add` for a worktree
+- **THEN** the branch is enqueued exactly as via the HTTP surface, and a
+  plugin holding only `read` receives `denied`
 
 ### Requirement: Palette actions route to their owning plugin
 
@@ -84,3 +107,55 @@ A resident plugin with an accepted `IssueProvider` contribution SHALL be bridged
 
 - **WHEN** a bridged operation gets no reply within the plugin's timeout
 - **THEN** the call returns a classified transport error and a late reply is dropped
+
+### Requirement: Plugin issue capabilities are declared and enforced locally
+
+An accepted `IssueProvider` contribution MAY carry the issue `caps` object.
+Omitted or null caps SHALL mean all false, and unknown cap fields SHALL be
+rejected. The host SHALL pass the declaration to `PluginIssueBackend`.
+Operations behind a false cap SHALL return typed `Unsupported` without a
+`provider.call` round trip. Operations behind a true cap SHALL use the existing
+`provider.call` wire (`seam = "issues"`, operation name, serialized args), and
+an upstream `unsupported` reply SHALL map to typed `Unsupported` as a second
+degradation boundary. The existing five core operations, router composition,
+timeouts, and old manifests remain compatible.
+
+#### Scenario: An omitted optional capability fails locally
+
+- **WHEN** an accepted `IssueProvider` omits `caps` and the host requests an optional comment operation
+- **THEN** the bridge returns typed `Unsupported` without sending a `provider.call`
+
+#### Scenario: A declared capability forwards through the bridge
+
+- **WHEN** an accepted `IssueProvider` declares `caps.comments = true` and the host requests a comment operation
+- **THEN** the bridge sends the existing issues `provider.call` and maps an upstream `unsupported` reply back to typed `Unsupported`
+
+### Requirement: Plugin tracker caps share native conformance
+
+The offline issue conformance suite SHALL cover a plugin bridge with omitted,
+false, and true capability declarations using a scripted fixture. It SHALL
+prove false-cap local refusal and true-cap forwarding without making a network
+request. Standalone `thegn doctor` is not required to start resident plugins;
+plugin manifest inventory is a follow-up.
+
+#### Scenario: Plugin capability conformance stays offline
+
+- **WHEN** the conformance suite exercises omitted, false, and true plugin issue capabilities
+- **THEN** a scripted fixture proves local refusal and forwarding without network access
+
+### Requirement: A resident plugin can subscribe to the control event feed
+
+A resident plugin that declares an event-feed subscription SHALL receive
+control feed events (activity, lease, session-list, exit, pairing) as
+`on_event` notifications, gated by the `read` scope, delivered off-loop
+through the plugin runtime's existing channel + waker path; pane byte streams
+are never delivered this way. An undeclared or under-scoped plugin receives
+nothing.
+
+#### Scenario: A subscribed plugin sees an agent transition
+
+- **WHEN** a `read`-scoped resident plugin has declared a feed subscription
+  and a session's agent state changes
+- **THEN** the plugin receives an `on_event` notification carrying the
+  activity event, without any polling and without waking the idle render
+  loop for a non-subscriber

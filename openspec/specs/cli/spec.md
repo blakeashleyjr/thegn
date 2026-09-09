@@ -139,3 +139,97 @@ MUST list candidates and exit 3.
 
 - **WHEN** a command prints `serde_json::to_string_pretty(..)` directly and its file is not pinned
 - **THEN** `just lint`'s `json-emit` ratchet fails
+
+### Requirement: CLI worktree creation uses the shared submodule initializer
+
+After `wt new` creates a checkout, it SHALL invoke the same `[git].submodules`
+post-checkout initializer as UI and remote creation. In `auto`, initialization
+SHALL run only for valid metadata and after the repository's current submodule
+request is approved; in `off`, it SHALL be skipped. Failure SHALL be surfaced
+without deleting the successfully-created worktree.
+
+#### Scenario: Initialization is pending approval
+
+- **WHEN** `wt new` creates a worktree whose repo declares submodule URLs not
+  yet approved
+- **THEN** the worktree remains created, init does not run, and the CLI reports
+  the pending trust action
+
+### Requirement: Agent orchestration is drivable from the CLI
+
+thegn SHALL expose the orchestration loop headlessly: `session open` launches a
+configured agent by name into a worktree (prompt, headless/interactive, and
+worktree-binding flags mirroring the control-plane launch), `wt new
+--from-issue <id>` creates and links a worktree from a tracker issue,
+`dispatch list` and `dispatch set-status` read and advance the durable roster,
+and `issue list` accepts status and limit filters. List-shaped reads MUST emit
+`--json` through the one-emitter convention under the documented exit-code
+contract, so a supervisor can drive the whole loop with no MCP transport.
+
+#### Scenario: Opening a worker headlessly
+
+- **WHEN** `thegn session open --agent claude --prompt <p> --worktree <w>
+--headless` runs against the daemon
+- **THEN** the agent launches through the same composition as a TUI launch and
+  the session id is printed (JSON when requested)
+
+#### Scenario: The roster is scriptable
+
+- **WHEN** `thegn dispatch list --json` runs
+- **THEN** every dispatch row is emitted with its issue, worktree, agent, and
+  parseable status
+
+#### Scenario: Filtering issues for the next batch
+
+- **WHEN** `thegn issue list --status todo --limit 3 --json` runs
+- **THEN** at most three issues with the requested status are emitted,
+  machine-readable
+
+### Requirement: The roster is writable from the CLI, pipeline columns included
+
+The CLI SHALL append a dispatch row — issue, worktree, agent — and SHALL accept
+the pipeline fields (stage, parent row, session, artifact path) on that same
+command, so recording a pipeline dispatch needs no second verb and no HTTP
+transport. A parent that names no existing row MUST be rejected before anything
+is written. The command SHALL support machine-readable output under the CLI's
+one-document `--json` convention, and the human roster listing SHALL show each
+row's stage and parent.
+
+#### Scenario: Recording a chunk dispatch
+
+- **WHEN** `thegn dispatch put <issue> <worktree> <agent> --stage code --parent
+<id> --session <s> --artifact <p> --json` runs
+- **THEN** one row is appended and emitted with its new id, its queued status,
+  and all four pipeline fields
+
+#### Scenario: A parent that does not exist
+
+- **WHEN** `thegn dispatch put … --parent <unknown-id>` runs
+- **THEN** the command fails naming that id, and no row is written
+
+#### Scenario: Listing a mixed roster
+
+- **WHEN** `thegn dispatch list` runs over a roster holding both pipeline and
+  plain dispatches
+- **THEN** each row shows its stage and parent, with absent values rendered as a
+  placeholder so the table stays aligned
+
+### Requirement: A CLI-launched agent can be adopted into a pane
+
+`thegn session open` SHALL accept a flag asking a running compositor to graft the
+new session into a real pane, instead of leaving it headless. The flag SHALL
+default to off, so a fan-out never takes over the user's screen unasked, and
+requesting it MUST remain a nudge rather than a dependency: with no compositor
+running the session still opens and stays headless.
+
+#### Scenario: Opening a watchable stage agent
+
+- **WHEN** `thegn session open --agent <a> --worktree <w> --adopt` runs against
+  the daemon
+- **THEN** the session opens and the request to graft it into a pane is recorded
+  for the compositor
+
+#### Scenario: Opening with no compositor attached
+
+- **WHEN** the same command runs with no compositor attached
+- **THEN** the session still opens headless and the command succeeds

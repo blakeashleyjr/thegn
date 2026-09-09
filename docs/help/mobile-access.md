@@ -17,9 +17,10 @@ deliver to your phone as a **push** channel. It uses
 with stock mobile apps, so a notification reaches your phone with **no
 companion app and no inbound port**.
 
-Enable it under `[notifications.push]`: pick a `kind` (`ntfy` today;
-`telegram`/`gotify`/`pushover`/`webhook` are reserved), a `server`, and an
-unguessable `topic`. Then subscribe to that topic in the ntfy app.
+Enable it under `[notifications.push]`: choose a named `ntfy`, generic
+`webhook`, `discord`, or `slack` sink. `telegram`, `gotify`, and `pushover`
+remain reserved. For ntfy, configure a server and an unguessable topic, then
+subscribe to that topic in the ntfy app.
 
 Push is just another channel: the same `[[notifications.rules]]`, DND, and
 per-kind priorities decide what reaches you. Add `"push"` to a rule's

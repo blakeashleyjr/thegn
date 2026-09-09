@@ -25,19 +25,27 @@ thegn SHALL derive a test-only pseudolocale from the en-US bundle (non-ASCII, ce
 - **WHEN** a user sets `[ui] language` to the pseudolocale identifier
 - **THEN** it is treated as an unknown locale (per-key fallback to en-US), not served
 
-### Requirement: en-US is the translation key schema
+### Requirement: en-US is the exact translation key schema
 
-Every embedded locale SHALL be validated against the en-US key set by a unit test: a key present in another locale but absent from en-US (orphan) MUST fail the test; keys missing from a locale are per-key fallback (allowed) and MUST be reported, with `thegn doctor` printing the resolved locale and per-locale key coverage.
+Every shipped embedded locale SHALL have exactly the en-US key set, enforced by
+a unit test: both orphan and missing keys MUST fail naming the locale and key.
+Runtime per-key fallback SHALL remain defensive compatibility behavior, and
+`thegn doctor` SHALL print the resolved locale and parity/coverage status.
 
 #### Scenario: Orphan key fails
 
 - **WHEN** a locale file adds a key that en-US does not define
 - **THEN** the parity test fails naming the locale and key
 
-#### Scenario: Partial locale is usable
+#### Scenario: Missing shipped key fails the gate
 
-- **WHEN** the active locale lacks a key
-- **THEN** the en-US string renders for that key and `thegn doctor` shows the locale's coverage below 100%
+- **WHEN** ja-JP lacks a key present in en-US
+- **THEN** the parity test fails before the incomplete bundle can ship
+
+#### Scenario: Defensive fallback remains compatible
+
+- **WHEN** runtime lookup cannot find a localized value
+- **THEN** the en-US value renders rather than an empty label or panic
 
 ### Requirement: Relative times and calendar names localize through one core layer
 

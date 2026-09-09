@@ -1,62 +1,81 @@
-# merge-queue (delta)
-
-## MODIFIED Requirements
-
-### Requirement: Worktree branches can be assigned to the merge queue
-
-Assigning a worktree SHALL enqueue its current branch against the target repo's
-queue. When the worktree is on a **remote host** (a sprite) whose target repo
-lives on another host, the destination of the row SHALL be selected by
-`[merge_queue] remote_mode`:
-
-- `route_to_host` — the row is written into the **target host's** queue via the
-  host daemon's control plane, not the sprite's local DB.
-- `push` — the row is written into the sprite's **local** queue (the sprite will
-  drain its own clone and push).
-
-For an on-host worktree the behavior is unchanged (local enqueue), regardless of
-`remote_mode`.
-
-#### Scenario: route-to-host enqueue reaches the host DB
-
-- **WHEN** `merge add` runs in a sprite whose target repo is off-host and
-  `remote_mode = route_to_host`, with a control endpoint + `MergeAdd`-scoped
-  token injected
-- **THEN** thegn POSTs the enqueue to the host daemon's `/v1/merge/add`, the row
-  appears in the **host's** queue carrying the sprite's `location`, and the
-  operator sees confirmation naming the host
-- **AND** nothing is written to the sprite's local queue
-
-#### Scenario: route-to-host with no reachable host defers with guidance
-
-- **WHEN** `remote_mode = route_to_host` but no control endpoint/token is present
-  or the host is unreachable
-- **THEN** the enqueue fails with a clear message (how to provision the token /
-  which host is unreachable) and does not silently fall back to a local row
-
-#### Scenario: push-mode enqueue stays local
-
-- **WHEN** `merge add` runs in a sprite with `remote_mode = push`
-- **THEN** the branch is queued in the sprite's local queue for a local drain
+# Merge queue
 
 ## ADDED Requirements
 
-### Requirement: Push mode lands the sprite's own clone and pushes to origin
+### Requirement: Push mode lands locally and pushes origin
 
-When `[merge_queue] remote_mode = push`, draining on the sprite SHALL fold, gate,
-and advance the sprite's **local** target branch — even if the target reads
-off-host (the remote-target guard is bypassed) — and then SHALL `git push` the
-advanced target to `origin`. A push failure SHALL defer the affected work with a
-surfaced reason, never report a false success.
+When `[merge_queue] remote_mode = "push"`, a remote/provider worktree SHALL
+enqueue into its local queue, fold/gate/advance its local target clone, and push
+the advanced target to `origin`. A rejected/non-fast-forward push MUST surface
+the failure and MUST NOT report the branch landed upstream.
 
-#### Scenario: a clean branch lands on origin via push
+#### Scenario: Push converges through origin
 
-- **WHEN** a sprite with `remote_mode = push` drains a queued, conflict-free branch
-- **THEN** its local target advances and is pushed to `origin`, so the host and
-  other clones converge by fetching `origin`
+- **WHEN** a conflict-free sprite queue drains in push mode
+- **THEN** its local target advances and is pushed to origin
 
-#### Scenario: a rejected push does not report success
+#### Scenario: Rejection is not success
 
-- **WHEN** the post-advance `git push` is rejected (e.g. non-fast-forward)
-- **THEN** the drain reports the push failure with its reason and the branch is
-  not marked landed upstream
+- **WHEN** origin rejects the target update
+- **THEN** drain exits with the push reason and origin remains unchanged
+
+### Requirement: Route-to-host writes only the target host queue
+
+When a worktree is off-host and `remote_mode = "route_to_host"`, merge add
+SHALL call the target host's control plane using the host-canonical worktree ID
+and SHALL create the row only in the host-owned queue with the registered
+remote location. Missing/unreachable endpoint, invalid authorization, unknown
+worktree, stale location, or remote branch failure MUST be explicit and MUST
+NOT fall back to a sprite-local row. On-host worktrees remain local.
+
+#### Scenario: A true remote enqueue is host-owned
+
+- **WHEN** merge add runs from a provisioned off-host worktree
+- **THEN** only the host DB receives a row containing its remote location
+
+#### Scenario: Forwarding failure has no fallback
+
+- **WHEN** the host endpoint cannot be reached
+- **THEN** add fails with recovery guidance and neither DB gains a fallback row
+
+### Requirement: Provisioning supplies least-privilege return credentials
+
+Remote/provider provisioning SHALL mint and inject a revocable token scoped
+only to `MergeAdd` plus the reachable host control URL. Token lifetime,
+ownership, rotation, reprovision, and destroy revocation SHALL be defined. The
+secret MUST NOT appear in argv, logs, DB audit text, or generated artifacts,
+and the endpoint MUST satisfy the remote control confidentiality policy.
+
+#### Scenario: Destroy revokes the sprite token
+
+- **WHEN** the remote worktree/provider environment is destroyed
+- **THEN** its return token can no longer enqueue and no broader scope was ever
+  granted
+
+### Requirement: Host enqueue resolves registered remote metadata
+
+The host merge-add handler SHALL resolve target repository membership, current
+branch, and remote location from registered DB/provider metadata for a
+non-local worktree. It MUST NOT invoke local filesystem or Git operations on
+the remote path. Branch lookup failures and stale metadata SHALL fail before a
+queue row is committed.
+
+#### Scenario: The remote path is absent on the host
+
+- **WHEN** the registered worktree path exists only in the provider environment
+- **THEN** host enqueue uses registered/remote metadata and never stats or runs
+  Git against that host-local path
+
+### Requirement: Route-to-host is proven end to end
+
+Tests SHALL use distinct host and remote filesystem paths to enqueue through a
+serving host, observe the row only in the host DB, ingest the remote tip during
+drain, and verify final disposition. Documentation SHALL cover configuration,
+serving/TLS prerequisites, token boundary/recovery, explicit failures, and the
+push alternative.
+
+#### Scenario: Full route-to-host lifecycle
+
+- **WHEN** a true remote branch is enqueued and drained through the host
+- **THEN** host ownership, remote tip ingestion, gate/advance, and final row
+  disposition are verified without a bind-mounted fake-local path

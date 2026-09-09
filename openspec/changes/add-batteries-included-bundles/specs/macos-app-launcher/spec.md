@@ -1,37 +1,24 @@
-# macos-app-launcher
+# macOS app launcher
 
 ## ADDED Requirements
 
-### Requirement: Batteries provisioning at install time
+### Requirement: macOS offers a rehearsed batteries-included artifact
 
-`install.sh --batteries` and `just macos-app --batteries` SHALL ensure a
-full-fidelity emulator and the profile's Nerd Font are present before
-generating the launcher: detecting what already exists, provisioning missing
-pieces through an available package manager (brew casks or a nix-darwin
-package) only with explicit user confirmation, and otherwise printing the
-exact packages required and exiting nonzero without registering a launcher.
-The generated bundle SHALL pin the provisioned emulator and launch it with
-thegn's bundled profile, and SHALL remain locally generated — the standing
-Gatekeeper rule that a distributed bundle must be signed and notarized is
-unchanged.
+The macOS batteries artifact SHALL compose the Thegn binary, an explicitly
+selected terminal, Fira Code Nerd Font (or a documented equivalent), and a
+generated writable terminal configuration into one launcher/app flow. The
+launcher SHALL use THE-52's verified release binary, preserve existing terminal
+preferences, and pass a clean-host launch rehearsal before publication.
 
-#### Scenario: Provisioning via brew
+#### Scenario: Finder launch uses bundled components
 
-- **WHEN** `install.sh --batteries` runs on a Mac with brew and no
-  acceptable emulator or Nerd Font
-- **THEN** it installs the named emulator and font casks after confirmation,
-  generates the `.app` pinned to that emulator with the bundled profile, and
-  prints a per-item provisioned/present summary
+- **WHEN** a user opens the batteries app on a clean supported macOS host
+- **THEN** its launcher starts the bundled/configured terminal with the
+  generated config and runs the verified Thegn binary without requiring prior
+  terminal or font installation
 
-#### Scenario: No package manager available
+#### Scenario: Existing Alacritty config is preserved
 
-- **WHEN** `--batteries` runs with neither brew nor nix available and pieces
-  are missing
-- **THEN** it names each missing piece and the command that provides it,
-  exits nonzero, and writes no launcher artifacts
-
-#### Scenario: Batteries dry run
-
-- **WHEN** `install.sh --batteries --dry-run` is invoked
-- **THEN** it prints the detection results and the provisioning plan and
-  changes no files
+- **WHEN** the user already has an Alacritty configuration
+- **THEN** the artifact uses its own writable generated copy and does not
+  overwrite the user's file
