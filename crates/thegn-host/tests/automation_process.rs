@@ -30,6 +30,10 @@ fn fixture(kind: &str) -> String {
 fn automation_dry_run_leaves_an_empty_state_home_empty() {
     let state = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "process integration test synchronously waits for the isolated CLI under test"
+    )]
     let output = Command::new(env!("CARGO_BIN_EXE_thegn"))
         .args([
             "automations",
@@ -92,6 +96,10 @@ body = "forwarded: {message}"
 "#,
     )
     .unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "process integration test synchronously waits for the isolated CLI under test"
+    )]
     let output = Command::new(env!("CARGO_BIN_EXE_thegn"))
         .args([
             "--config",

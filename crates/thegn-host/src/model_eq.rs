@@ -19,7 +19,8 @@ impl FrameModel {
     /// every input `sidebar::build_rows` reads MUST be compared here, or the
     /// rows carry-over serves stale rows without a repaint.
     pub fn hydration_eq(&self, other: &Self) -> bool {
-        self.worktree == other.worktree
+        self.state_db == other.state_db
+            && self.worktree == other.worktree
             && self.tabs == other.tabs
             && self.active_tab == other.active_tab
             && self.sidebar_workspaces == other.sidebar_workspaces
@@ -103,6 +104,16 @@ mod tests {
     #[test]
     fn hydration_eq_detects_real_changes() {
         let base = FrameModel::default();
+        let mut db_state_changed = base.clone();
+        db_state_changed.state_db = crate::chrome::StateDbAvailability::SchemaRefused {
+            observed: 68,
+            build: 67,
+        };
+        assert!(
+            !base.hydration_eq(&db_state_changed),
+            "availability change must repaint persistent chrome"
+        );
+
         let mut panel_changed = base.clone();
         panel_changed.panel.branch = "feature".into();
         assert!(

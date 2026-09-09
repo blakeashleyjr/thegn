@@ -730,6 +730,43 @@ mod tests {
             (root, feat_wt)
         }
 
+        /// A cleanly foldable linked branch, used to reach commit signing
+        /// without first taking the conflict/agent path.
+        fn clean_repo(tag: &str) -> (PathBuf, PathBuf) {
+            let root = std::env::temp_dir().join(format!(
+                "tg-drive-{tag}-{}-{}",
+                std::process::id(),
+                util::now()
+            ));
+            let feat_wt = root.with_extension("feat");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&feat_wt);
+            std::fs::create_dir_all(&root).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.name", "t"]);
+            git(&root, &["config", "user.email", "t@e"]);
+            git(&root, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(root.join("base.txt"), "base\n").unwrap();
+            git(&root, &["add", "-A"]);
+            git(&root, &["commit", "-q", "-m", "c0"]);
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feat",
+                    feat_wt.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            std::fs::write(feat_wt.join("feat.txt"), "feat\n").unwrap();
+            git(&feat_wt, &["add", "-A"]);
+            git(&feat_wt, &["commit", "-q", "-m", "feat"]);
+            (root, feat_wt)
+        }
+
         fn cfg(agent_command: &str, max: u32) -> MergeQueueConfig {
             // Hermetic shell for run_agent's `$SHELL -lc` wrapper (nextest isolates
             // env per test process).
@@ -808,6 +845,41 @@ mod tests {
             assert_eq!(out(&root, &["rev-parse", "main"]), before, "main held");
             let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
             let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        }
+
+        #[test]
+        fn signing_infrastructure_failure_never_blames_branch_or_wakes_agent() {
+            let (root, feat_wt) = clean_repo("sign-infra");
+            let before_main = out(&root, &["rev-parse", "main"]);
+            let before_feat = out(&root, &["rev-parse", "feat"]);
+            git(&root, &["config", "gpg.program", "false"]);
+            let sentinel = root.join("agent-must-not-run");
+            let mut mq = cfg(&format!("touch {}", sentinel.display()), 1);
+            mq.sign_commits = true;
+            let db = Db::open_memory().unwrap();
+            let mut statuses = Vec::new();
+            let outcome = drive_queue(
+                &mq,
+                &Config::default(),
+                &root,
+                &db,
+                vec![QueueItem {
+                    worktree: feat_wt.to_string_lossy().into(),
+                    branch: "feat".into(),
+                    location: String::new(),
+                    agent_attempts: 0,
+                }],
+                |step| statuses.push(step.status.to_string()),
+            );
+            assert_eq!(outcome.gate_error, ["feat"]);
+            assert!(outcome.needs_human.is_empty(), "{outcome:?}");
+            assert!(!sentinel.exists(), "signing failure woke the fixing agent");
+            assert!(statuses.iter().any(|status| status == "gate_error"));
+            assert!(!statuses.iter().any(|status| status == "needs_human"));
+            assert_eq!(out(&root, &["rev-parse", "main"]), before_main);
+            assert_eq!(out(&root, &["rev-parse", "feat"]), before_feat);
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&feat_wt);
         }
 
         /// The fixing script, as a `sh` one-liner. Ends in `&& true` so the

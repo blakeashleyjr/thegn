@@ -35,10 +35,10 @@ pub fn repo_root_of(worktree: &Path) -> Option<PathBuf> {
 /// root's own `location`. The merge queue is anchored to this host: the drain
 /// must run co-located with it (a remote target can't be folded in-process —
 /// see `is_remote_target`).
-pub fn target_loc(db: &Db, repo_root: &Path) -> GitLoc {
+pub fn target_loc(db: &Db, repo_root: &Path) -> Result<GitLoc> {
     let root_s = repo_root.to_string_lossy();
-    let loc_str = db.location_for(&root_s).ok().flatten();
-    GitLoc::from_db(&root_s, loc_str.as_deref())
+    let loc_str = db.location_for(&root_s)?;
+    Ok(GitLoc::from_db(&root_s, loc_str.as_deref()))
 }
 
 /// A short human label for a target store's host (ssh host / provider prefix),
@@ -61,15 +61,17 @@ pub fn target_host_label(loc: &GitLoc) -> Option<String> {
 /// on the target host over ssh/iroh — needs remote-daemon reach that isn't wired
 /// yet; see tasks.md J128/129. Running the drain on the target host is the
 /// supported workflow until then.)
-pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Option<String> {
-    let loc = target_loc(db, repo_root);
-    let host = target_host_label(&loc)?;
-    Some(format!(
+pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Result<Option<String>> {
+    let loc = target_loc(db, repo_root)?;
+    let Some(host) = target_host_label(&loc) else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
         "This repo's target branch lives on another host ({host}). \
          The merge queue folds in the target's object store, so the drain must \
          run there — open a shell on {host} and run `thegn merge drain` (branches \
          queued from other hosts are fetched in automatically)."
-    ))
+    )))
 }
 
 /// Push the advanced target branch to `origin` — the `push` `remote_mode`'s

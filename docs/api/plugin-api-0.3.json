@@ -484,7 +484,7 @@
         },
         "scopes": {
           "default": [],
-          "description": "Host-capability scopes this plugin holds for `host.call` — the same lattice as control-API tokens (`read` / `write` / `git` / `admin`), so a plugin is authorised exactly like a paired phone.",
+          "description": "Host-capability scopes this plugin holds for `host.call` — the same lattice as control-API tokens (`read` / `write` / `git` / `exec` / `admin`), so a plugin is authorised exactly like a paired client. Write, Git, and Exec are independent; Admin implies all of them.",
           "items": {
             "$ref": "#/definitions/Scope"
           },
@@ -759,6 +759,334 @@
     }
   },
   "x-thegn-api-version": "0.3.0",
+  "x-thegn-extension-support": [
+    {
+      "cadences": [
+        "on_demand",
+        "interval"
+      ],
+      "callbacks": [
+        "activate",
+        "render",
+        "deactivate"
+      ],
+      "extension_point": "StatusBarSegment",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "general compositor statusbar runtime",
+      "required_capability": "surface:statusbar",
+      "since": "0.1.0",
+      "state": "wired"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "PanelSection",
+      "modes": [],
+      "owner": "THE-108",
+      "required_capability": "surface:panel",
+      "since": "0.3.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "SidebarTab",
+      "modes": [],
+      "owner": "THE-107",
+      "required_capability": "surface:sidebar",
+      "since": "0.1.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [
+        "on_demand"
+      ],
+      "callbacks": [
+        "activate",
+        "on_event",
+        "deactivate"
+      ],
+      "extension_point": "PaletteAction",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "general compositor palette runtime",
+      "required_capability": "surface:palette",
+      "since": "0.1.0",
+      "state": "wired"
+    },
+    {
+      "cadences": [
+        "on_demand",
+        "interval"
+      ],
+      "callbacks": [
+        "activate",
+        "render",
+        "deactivate"
+      ],
+      "extension_point": "NotificationSource",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "general compositor notification runtime",
+      "required_capability": "surface:notification",
+      "since": "0.1.0",
+      "state": "wired"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "HarnessAdapter",
+      "modes": [],
+      "owner": "add-agent-harness-seam",
+      "required_capability": "surface:harness",
+      "since": "0.1.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "ProgramAdapter",
+      "modes": [],
+      "owner": "no accepted runtime owner",
+      "required_capability": "surface:program",
+      "since": "0.1.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "Theme",
+      "modes": [],
+      "owner": "THE-107",
+      "required_capability": "surface:theme",
+      "since": "0.1.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "Automation",
+      "modes": [],
+      "owner": "native automation engine; no plugin adapter",
+      "required_capability": "surface:automation",
+      "since": "0.1.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "DataSource",
+      "modes": [],
+      "owner": "calendar command-account adapter",
+      "required_capability": "surface:data",
+      "since": "0.1.0",
+      "state": "separate_adapter"
+    },
+    {
+      "cadences": [
+        "on_demand"
+      ],
+      "callbacks": [
+        "activate",
+        "deactivate"
+      ],
+      "extension_point": "IssueProvider",
+      "modes": [
+        "resident"
+      ],
+      "owner": "issue provider bridge",
+      "required_capability": "surface:provider",
+      "since": "0.2.0",
+      "state": "wired"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "CiProvider",
+      "modes": [],
+      "owner": "no dynamic CI provider selector",
+      "required_capability": "surface:provider",
+      "since": "0.2.0",
+      "state": "reserved"
+    },
+    {
+      "cadences": [],
+      "callbacks": [],
+      "extension_point": "ForgeProvider",
+      "modes": [],
+      "owner": "no dynamic forge provider selector",
+      "required_capability": "surface:provider",
+      "since": "0.2.0",
+      "state": "reserved"
+    }
+  ],
+  "x-thegn-host-call-capabilities": [
+    "sessions.list",
+    "sessions.open",
+    "sessions.fork",
+    "sessions.detach",
+    "sessions.input",
+    "sessions.resize",
+    "sessions.snapshot",
+    "sessions.kill",
+    "sessions.wait",
+    "sessions.split",
+    "worktrees.list",
+    "worktrees.open",
+    "editor.open",
+    "preview.fetch",
+    "git.status",
+    "git.stage",
+    "git.commit",
+    "merge.list",
+    "merge.add",
+    "merge.clear",
+    "pr.status",
+    "calendar.events",
+    "calendar.clocks",
+    "calendar.ingest",
+    "notify.push",
+    "automations.list",
+    "automations.test",
+    "tools.run",
+    "agent.sessions",
+    "leases.list",
+    "me",
+    "issues.list",
+    "issues.get",
+    "issues.update",
+    "issues.comment",
+    "dispatches.list",
+    "dispatches.put",
+    "dispatches.set_status",
+    "worktrees.create"
+  ],
+  "x-thegn-host-verb-support": [
+    {
+      "authority": "surface:<contribution>",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "plugin runtime",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "register"
+    },
+    {
+      "authority": "none",
+      "modes": [
+        "resident"
+      ],
+      "owner": "event bridge",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "subscribe"
+    },
+    {
+      "authority": "surface:<registered>",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "surface cache",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "update"
+    },
+    {
+      "authority": "surface:<registered>",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "surface cache",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "invalidate"
+    },
+    {
+      "authority": "declared scheme:target capability",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "plugin runtime",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "io"
+    },
+    {
+      "authority": "notify:<source>",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "notification bridge",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "notify"
+    },
+    {
+      "authority": "none",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "event bridge",
+      "since": "0.1.0",
+      "state": "wired",
+      "verb": "emit"
+    },
+    {
+      "authority": "state:<plugin>",
+      "modes": [
+        "resident"
+      ],
+      "owner": "namespaced state",
+      "since": "0.2.0",
+      "state": "wired",
+      "verb": "state.get"
+    },
+    {
+      "authority": "state:<plugin>",
+      "modes": [
+        "one_shot",
+        "resident"
+      ],
+      "owner": "namespaced state",
+      "since": "0.2.0",
+      "state": "wired",
+      "verb": "state.set"
+    },
+    {
+      "authority": "none",
+      "modes": [
+        "resident"
+      ],
+      "owner": "host value projection",
+      "since": "0.2.0",
+      "state": "wired",
+      "verb": "host.value"
+    },
+    {
+      "authority": "catalog-required control scope",
+      "modes": [
+        "resident"
+      ],
+      "owner": "capability catalog dispatcher",
+      "since": "0.2.0",
+      "state": "wired",
+      "verb": "host.call"
+    }
+  ],
   "x-thegn-host-verbs": [
     "register",
     "subscribe",

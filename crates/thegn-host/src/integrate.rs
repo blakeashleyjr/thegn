@@ -1654,7 +1654,10 @@ mod tests {
         };
         let report = build_report("main", "base", &plan, &[], GateOutcome::Skipped, 0);
         assert_eq!(report.deferred[0].paths, ["vendor/lib"]);
-        assert_eq!(report.deferred[0].submodule_conflicts, [conflict.clone()]);
+        assert_eq!(
+            report.deferred[0].submodule_conflicts,
+            std::slice::from_ref(&conflict)
+        );
         assert_eq!(
             conflict_details(
                 &["src/lib.rs".into(), "vendor/lib".into()],
@@ -1789,6 +1792,134 @@ mod tests {
         }
         // main did not move — nothing landed.
         assert_eq!(repo.out(&["rev-parse", "main"]), before);
+    }
+
+    /// Real signing proof, not a fake signer: generate an isolated throwaway
+    /// OpenPGP key with loopback pinentry, fold one branch, and have gpg verify
+    /// the resulting commit. A capable host must run this; only a genuinely
+    /// absent `gpg` binary skips it.
+    #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn signed_fold_has_gpgsig_and_verifies_with_loopback_pinentry() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let availability = std::process::Command::new("gpg")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match availability {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("gpg exists but could not be probed: {error}"),
+            Ok(status) if !status.success() => panic!("gpg --version failed: {status}"),
+            Ok(_) => {}
+        }
+
+        let repo = Repo::new("signed-fold");
+        repo.feature("b1", "signed.txt", "signed\n");
+        let gpg_home = repo.dir.join("gnupg-fixture");
+        std::fs::create_dir(&gpg_home).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&gpg_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = "Thegn Fixture <thegn-fixture@example.invalid>";
+        let generated = std::process::Command::new("gpg")
+            .args([
+                "--homedir",
+                gpg_home.to_str().unwrap(),
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                identity,
+                "ed25519",
+                "sign",
+                "0",
+            ])
+            .output()
+            .expect("gpg was already proved present");
+        assert!(
+            generated.status.success(),
+            "throwaway key generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let listed = std::process::Command::new("gpg")
+            .args([
+                "--homedir",
+                gpg_home.to_str().unwrap(),
+                "--batch",
+                "--with-colons",
+                "--list-secret-keys",
+                identity,
+            ])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let listing = String::from_utf8_lossy(&listed.stdout);
+        let fingerprint = listing
+            .lines()
+            .find_map(|line| {
+                let fields: Vec<_> = line.split(':').collect();
+                (fields.first() == Some(&"fpr"))
+                    .then(|| fields.get(9).copied())
+                    .flatten()
+            })
+            .expect("generated key has a fingerprint");
+        #[cfg(unix)]
+        let (wrapper, wrapper_script) = (
+            repo.dir.join("gpg-loopback.sh"),
+            format!(
+                "#!/bin/sh\nexec gpg --homedir {} --batch --pinentry-mode loopback --passphrase '' \"$@\"\n",
+                thegn_core::util::sh_quote(&gpg_home.to_string_lossy())
+            ),
+        );
+        #[cfg(windows)]
+        let (wrapper, wrapper_script) = (
+            repo.dir.join("gpg-loopback.cmd"),
+            format!(
+                "@echo off\r\ngpg --homedir \"{}\" --batch --pinentry-mode loopback --passphrase \"\" %*\r\n",
+                gpg_home.display()
+            ),
+        );
+        std::fs::write(&wrapper, wrapper_script).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &repo.dir,
+            &["config", "gpg.program", wrapper.to_str().unwrap()],
+        );
+        git(&repo.dir, &["config", "user.signingkey", fingerprint]);
+
+        let before = repo.out(&["rev-parse", "main"]);
+        let mut config = cfg("");
+        config.sign_commits = true;
+        let outcome =
+            attempt_land(&config, &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap();
+        assert!(
+            matches!(outcome, AttemptOutcome::Landed { .. }),
+            "{outcome:?}"
+        );
+        assert_ne!(repo.out(&["rev-parse", "main"]), before);
+        let raw = repo.out(&["cat-file", "-p", "main"]);
+        assert!(raw.contains("gpgsig"), "signed commit lacks gpgsig: {raw}");
+
+        let verified = util::git_cmd(&repo.dir)
+            .args([
+                "-c",
+                &format!("gpg.program={}", wrapper.display()),
+                "verify-commit",
+                "main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            verified.status.success(),
+            "git verify-commit failed: {}{}",
+            String::from_utf8_lossy(&verified.stdout),
+            String::from_utf8_lossy(&verified.stderr)
+        );
     }
 
     #[test]

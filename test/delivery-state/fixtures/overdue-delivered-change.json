@@ -1,0 +1,29 @@
+{
+  "name": "overdue-delivered-change",
+  "active_changes": {
+    "finished-change": "# Tasks\n\n- [x] implement\n- [x] verify\n"
+  },
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": [
+      "Fixture Project"
+    ],
+    "entries": [
+      {
+        "change": "finished-change",
+        "lifecycle": "delivered-awaiting-archive",
+        "delivered_at": "2000-01-01",
+        "disposition": "alpha-delivery",
+        "owners": [
+          {
+            "issue": "THE-1",
+            "project": "Fixture Project"
+          }
+        ],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "expected_error": "exceeded the 7-day archive reconciliation window"
+}

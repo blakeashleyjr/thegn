@@ -12,9 +12,10 @@
 use std::collections::BTreeMap;
 
 use thegn_core::plugin_api::{
-    API_VERSION, Alert, Capability, Contribution, Event, EventKind, ExtensionPoint, HostVerb,
-    IoRequest, NegotiatedManifest, PluginApiError, PluginId, PluginRuntime, PluginSpec, RpcError,
-    RpcErrorCode, RpcMessage, RpcResponse, SurfaceId, View,
+    API_VERSION, Alert, AuditDecision, Capability, Contribution, Event, EventKind, ExtensionPoint,
+    HOST_VERB_SUPPORT, HostVerb, IoRequest, NegotiatedManifest, PluginApiError, PluginId,
+    PluginRuntime, PluginSpec, RpcError, RpcErrorCode, RpcMessage, RpcResponse, SupportState,
+    SurfaceId, View,
 };
 use thegn_svc::issue::IssueCaps;
 use thegn_svc::plugin::{LoadedPlugin, SessionEvent, SessionWriter};
@@ -98,6 +99,49 @@ pub(crate) fn host_call_check(spec: &PluginSpec, cap: &str) -> Result<(), RpcErr
             format!("{cap} requires the {need:?} scope, which this plugin was not granted"),
         ))
     }
+}
+
+/// Enforce the canonical verb support/mode row before dispatch. A one-shot
+/// process can print any valid wire verb, but resident-only request/reply verbs
+/// must not become accidentally supported merely because decoding succeeds.
+fn host_verb_check(spec: &PluginSpec, verb: HostVerb) -> Result<(), RpcError> {
+    let row = HOST_VERB_SUPPORT
+        .iter()
+        .find(|row| row.verb == verb)
+        .expect("HostVerb::ALL and HOST_VERB_SUPPORT are pinned to the same set");
+    if row.state == SupportState::Wired && row.modes.contains(&spec.mode) {
+        return Ok(());
+    }
+    Err(RpcError::new(
+        RpcErrorCode::Unsupported,
+        format!(
+            "{} is not supported for {} plugins; supported modes: {}",
+            verb.method_name(),
+            spec.mode.wire_name(),
+            row.modes
+                .iter()
+                .map(|mode| mode.wire_name())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    ))
+}
+
+/// Apply the pure scope decision and record it in the plugin runtime's audit
+/// stream before any control dispatch. Both successful and denied calls use
+/// this path, including unknown or deliberately unexposed capabilities.
+fn authorize_host_call(entry: &mut PluginEntry, cap: &str) -> Result<(), RpcError> {
+    let result = host_call_check(&entry.plugin.spec, cap);
+    entry.runtime.record_host_call_decision(
+        entry.plugin.spec.manifest.id.clone(),
+        cap,
+        if result.is_ok() {
+            AuditDecision::Granted
+        } else {
+            AuditDecision::Denied
+        },
+    );
+    result
 }
 
 /// The grant set a plugin's [`PluginRuntime`] is built with. The negotiated
@@ -480,7 +524,9 @@ fn handle_exit(
 fn rpc_error_of(e: PluginApiError) -> RpcError {
     let code = match &e {
         PluginApiError::CapabilityDenied { .. } => RpcErrorCode::Denied,
-        PluginApiError::UnknownExtensionPoint(_) => RpcErrorCode::Invalid,
+        PluginApiError::UnsupportedExtensionPoint(_) | PluginApiError::UnknownExtensionPoint(_) => {
+            RpcErrorCode::Invalid
+        }
         PluginApiError::IncompatibleApi { .. } => RpcErrorCode::Other,
     };
     RpcError::new(code, e.to_string())
@@ -528,15 +574,26 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
         }
         return false;
     };
+    let Some(entry) = state.plugins.get(plugin) else {
+        tracing::debug!(target: "thegn::plugin", plugin = %plugin, "message from unknown plugin");
+        return false;
+    };
+    if let Err(error) = host_verb_check(&entry.plugin.spec, verb) {
+        tracing::debug!(target: "thegn::plugin", plugin = %plugin, verb = verb.method_name(), error = %error.message, "verb rejected by support contract");
+        if let Some(id) = msg.id {
+            respond(entry, RpcResponse::err(id, error));
+        }
+        return false;
+    }
     // host.call needs `&mut state` for the lazy dispatcher, so it is handled
     // before the per-entry borrow below.
     if verb == HostVerb::HostCall {
         return apply_host_call(state, plugin, msg);
     }
-    let Some(entry) = state.plugins.get_mut(plugin) else {
-        tracing::debug!(target: "thegn::plugin", plugin = %plugin, "message from unknown plugin");
-        return false;
-    };
+    let entry = state
+        .plugins
+        .get_mut(plugin)
+        .expect("plugin existence checked before verb dispatch");
     let pid = PluginId::new(plugin);
     let params = msg.params;
     // The verb's effect, plus the value (if any) an id-bearing request gets
@@ -688,7 +745,7 @@ fn apply_message(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> boo
 /// `host.call`: scope-check on the loop, dispatch on the dispatcher thread,
 /// answer directly through the plugin's writer.
 fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> bool {
-    let Some(entry) = state.plugins.get(plugin) else {
+    let Some(entry) = state.plugins.get_mut(plugin) else {
         return false;
     };
     let Some(id) = msg.id else {
@@ -707,7 +764,7 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> b
         );
         return false;
     };
-    if let Err(e) = host_call_check(&entry.plugin.spec, &cap) {
+    if let Err(e) = authorize_host_call(entry, &cap) {
         tracing::debug!(target: "thegn::plugin", plugin = %plugin, cap = %cap, error = %e.message, "host.call denied");
         respond(entry, RpcResponse::err(id, e));
         return false;
@@ -926,13 +983,24 @@ mod tests {
     }
 
     fn spec(id: &str, contributions: Vec<Contribution>, scopes: Vec<Scope>) -> PluginSpec {
+        let mut capabilities = contributions
+            .iter()
+            .filter_map(|contribution| {
+                thegn_svc::plugin::loader::host_contract()
+                    .support_for(&contribution.extension_point)
+                    .and_then(|row| row.required_capability)
+                    .and_then(Capability::parse)
+            })
+            .collect::<Vec<_>>();
+        capabilities.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        capabilities.dedup();
         PluginSpec {
             manifest: PluginManifest {
                 id: PluginId::new(id),
                 name: id.into(),
                 version: "1".into(),
                 api: ApiVersion::new(0, 2, 0),
-                capabilities: Vec::new(),
+                capabilities,
                 contributions,
             },
             command: vec!["true".into()],
@@ -1172,6 +1240,13 @@ mod tests {
         let bare = seg_spec("p");
         let err = host_call_check(&bare, "sessions.list").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
+        let mut entry = build_entry(loaded_state(bare.clone()));
+        let err = authorize_host_call(&mut entry, "sessions.list").unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Denied);
+        let audit = entry.runtime.audit_log().last().unwrap();
+        assert_eq!(audit.decision, AuditDecision::Denied);
+        assert_eq!(audit.operation, "host.call");
+        assert_eq!(audit.capability.as_str(), "host:sessions.list");
         // Read scope → every read-verb plugin cap passes the scope check.
         let read = spec("p", Vec::new(), vec![Scope::Read]);
         for cap in thegn_core::plugin_api::plugin_host_call_caps() {
@@ -1185,6 +1260,18 @@ mod tests {
         // A write cap needs the write scope: denied for a read-only plugin.
         let err = host_call_check(&read, "sessions.kill").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
+        // Exec is independent from both write and surface capabilities.
+        for scopes in [vec![Scope::Read], vec![Scope::Write], vec![Scope::Git]] {
+            let without_exec = spec("p", Vec::new(), scopes);
+            let err = host_call_check(&without_exec, "tools.run").unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Denied);
+        }
+        let exec = spec("p", Vec::new(), vec![Scope::Exec]);
+        assert!(host_call_check(&exec, "tools.run").is_ok());
+        // launch.preset has no generic control route yet and is deliberately
+        // absent from the plugin surface even for an exec-scoped plugin.
+        let err = host_call_check(&exec, "launch.preset").unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Unsupported);
         // A read cap the generic dispatcher now serves passes.
         assert!(host_call_check(&read, "sessions.snapshot").is_ok());
         // Unknown cap → Invalid.
@@ -1196,6 +1283,27 @@ mod tests {
         for cap in ["pairings.issue", "daemon.shutdown"] {
             let err = host_call_check(&admin, cap).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Unsupported, "{cap}");
+        }
+    }
+
+    #[test]
+    fn host_verb_modes_follow_the_canonical_support_matrix() {
+        let resident = seg_spec("resident");
+        let mut one_shot = seg_spec("one-shot");
+        one_shot.mode = PluginMode::OneShot;
+        for row in HOST_VERB_SUPPORT {
+            assert_eq!(
+                host_verb_check(&resident, row.verb).is_ok(),
+                row.state == SupportState::Wired && row.modes.contains(&PluginMode::Resident),
+                "resident mode drift for {}",
+                row.verb.method_name()
+            );
+            assert_eq!(
+                host_verb_check(&one_shot, row.verb).is_ok(),
+                row.state == SupportState::Wired && row.modes.contains(&PluginMode::OneShot),
+                "one-shot mode drift for {}",
+                row.verb.method_name()
+            );
         }
     }
 

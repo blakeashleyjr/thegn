@@ -376,11 +376,50 @@ pub struct PreviewView {
     pub status: thegn_core::preview::PreviewStatus,
 }
 
+/// Hydration's typed view of the shared state database. Schema refusal is
+/// durable loop-owned state: it is deliberately not a transient status string,
+/// because acting on a model produced by an older schema reader is unsafe.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StateDbAvailability {
+    #[default]
+    Available,
+    SchemaRefused {
+        observed: i64,
+        build: i64,
+    },
+    Unavailable {
+        detail: String,
+    },
+}
+
+impl StateDbAvailability {
+    pub fn schema_refused(&self) -> bool {
+        matches!(self, Self::SchemaRefused { .. })
+    }
+
+    pub fn mutations_allowed(&self) -> bool {
+        !self.schema_refused()
+    }
+
+    pub fn banner(&self) -> Option<String> {
+        let Self::SchemaRefused { observed, build } = self else {
+            return None;
+        };
+        Some(format!(
+            "DB REFUSED: disk v{observed} > build v{build}; rebuild/reinstall + restart host/daemon"
+        ))
+    }
+}
+
 /// What the chrome needs to paint a frame. Populated from session state + DB +
 /// git by the host; kept renderer-agnostic so it's unit-testable.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct FrameModel {
+    /// Typed state-DB availability from the most recent hydration attempt.
+    /// A schema refusal remains on the last known-good model until a compatible
+    /// hydration succeeds, and drives the persistent status-bar warning.
+    pub state_db: StateDbAvailability,
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
     /// App-wide network connectivity (from [`thegn_core::connectivity`]). Drives
@@ -1970,7 +2009,26 @@ pub fn statusbar_left_budget(model: &FrameModel, rect: Rect) -> usize {
 /// and the zoom/lock badges as inverse chips always outermost-right.
 pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     use crate::seg::{Line, Tok, draw_line};
-    if rect.rows == 0 {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+
+    // Schema incompatibility outranks every transient status and widget. It is
+    // painted at the normal chrome chokepoint on every frame, so a subsequent
+    // notification cannot erase the only visible explanation for disabled
+    // state mutations.
+    if let Some(message) = model.state_db.banner() {
+        let bg = col(S::ActivityWaiting);
+        fill(surface, rect, bg);
+        draw_text_bold(
+            surface,
+            rect.x + usize::from(rect.cols > 1),
+            rect.y,
+            &message,
+            col(S::Bg0),
+            bg,
+            rect.cols.saturating_sub(2),
+        );
         return;
     }
 

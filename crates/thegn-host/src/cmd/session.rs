@@ -262,12 +262,6 @@ pub enum SessionAction {
         #[arg(long)]
         json: bool,
     },
-    /// Command the preview browser (reserved contract slot).
-    Browse {
-        #[arg(long)]
-        session: Option<String>,
-        url: String,
-    },
     /// Show relay leases (detached sessions kept warm, and until when).
     Leases {
         #[arg(long)]
@@ -736,16 +730,6 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     );
                 }
             }
-        }
-        SessionAction::Browse { session, url } => {
-            // The reserved drive-browser slot: surface the server's verdict.
-            let res = client
-                .send_browse(session.as_deref(), &url)
-                .await
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "ok".into());
-            outln!("{res}");
         }
         SessionAction::Leases { json } => {
             let v = client.leases().await?;
@@ -1723,11 +1707,20 @@ pub fn cli_control_caps() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod catalog_tests {
+    use clap::Parser as _;
     use thegn_core::capability::{Surface, coverage_problems};
 
     #[test]
     fn cli_control_verbs_cover_catalog() {
         let problems = coverage_problems(Surface::Cli, &super::cli_control_caps());
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn removed_browser_subcommand_is_not_advertised_by_clap() {
+        assert!(
+            crate::Cli::try_parse_from(["thegn", "session", "browse", "http://localhost:3000/",])
+                .is_err()
+        );
     }
 }

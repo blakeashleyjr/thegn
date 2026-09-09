@@ -102,7 +102,6 @@ pub static ROUTES: &[Route] = &[
         &["dispatches.set_status"],
         || post(http::dispatch_set_status),
     ),
-    route("/v1/browser", &["browser.drive"], || post(http::browser)),
     route("/v1/preview/fetch", &["preview.fetch"], || {
         post(http::preview_fetch)
     }),
@@ -197,7 +196,6 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
         "POST",
         "/v1/dispatches/{id}/status",
     ),
-    ("browser.drive", "POST", "/v1/browser"),
     ("preview.fetch", "POST", "/v1/preview/fetch"),
     ("git.status", "GET", "/v1/git/status"),
     ("git.stage", "POST", "/v1/git/stage"),
@@ -391,6 +389,10 @@ mod tests {
 
     #[test]
     fn build_call_rejects_unknown_streaming_and_missing_placeholder() {
+        assert_eq!(
+            build_call("browser.drive", Default::default()).unwrap_err(),
+            "unknown capability browser.drive — see `thegn api list`"
+        );
         assert!(
             build_call("nope.nope", Default::default())
                 .unwrap_err()

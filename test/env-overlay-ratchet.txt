@@ -395,10 +395,18 @@ search.structural
 semantic.index_max_files
 semantic.map_budget_lines
 semantic.worktree_index
+# serve.* controls the remote-control trust boundary. Keep endpoint/topology,
+# local-admin/CORS/pairing policy, and especially the plaintext escape hatch in
+# reviewed global config (or the dedicated CLI flags) rather than ambient
+# process environment that a repository shell/direnv could inherit and widen.
+serve.advertise_host
+serve.advertise_port
 serve.bind
 serve.cors_origins
 serve.local_admin
 serve.require_approval
+serve.topology
+serve.unsafe_allow_plaintext_non_loopback
 session.focus_on_create
 session.resident_pool_limit
 session.restore_grace_secs

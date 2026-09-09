@@ -1,0 +1,28 @@
+{
+  "name": "archived-but-referenced",
+  "archived_changes": [
+    "2026-09-09-old-change"
+  ],
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": [
+      "Fixture Project"
+    ],
+    "entries": [
+      {
+        "change": "old-change",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [
+          {
+            "issue": "THE-1",
+            "project": "Fixture Project"
+          }
+        ],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "expected_error": "archived change is still listed as active"
+}

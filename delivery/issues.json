@@ -1,0 +1,388 @@
+{
+  "$schema": "./issues-schema.json",
+  "schema_version": 1,
+  "scope": "Reviewed active Linear delivery issues; this is the issue-side source for offline coverage.",
+  "issues": [
+    {
+      "issue": "THE-15",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "add-batteries-included-bundles"
+      ]
+    },
+    {
+      "issue": "THE-21",
+      "project": "Spec & Tracker Reconciliation",
+      "changes": [
+        "add-automation-rules"
+      ]
+    },
+    {
+      "issue": "THE-41",
+      "project": "Client API & Remote Access",
+      "changes": [],
+      "no_spec_rationale": "Tracking epic only: its bounded delivery children THE-98 through THE-101 own the normative OpenSpec changes."
+    },
+    {
+      "issue": "THE-51",
+      "project": "Plugin UI Platform",
+      "changes": [
+        "extend-localization-surfaces"
+      ]
+    },
+    {
+      "issue": "THE-52",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "add-package-manager-releases"
+      ]
+    },
+    {
+      "issue": "THE-92",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "detect-active-network-kind"
+      ]
+    },
+    {
+      "issue": "THE-93",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "make-sidebar-mode-visible"
+      ]
+    },
+    {
+      "issue": "THE-97",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "verify-stage-worker-containment"
+      ]
+    },
+    {
+      "issue": "THE-98",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "audit-remote-surface-map"
+      ]
+    },
+    {
+      "issue": "THE-99",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "add-remote-enqueue-modes"
+      ]
+    },
+    {
+      "issue": "THE-102",
+      "project": "Plugin UI Platform",
+      "changes": [
+        "define-debugger-adapter-surface"
+      ]
+    },
+    {
+      "issue": "THE-104",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "define-external-ide-inbound-boundary"
+      ]
+    },
+    {
+      "issue": "THE-105",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "publish-observer-event-contract"
+      ]
+    },
+    {
+      "issue": "THE-107",
+      "project": "Plugin UI Platform",
+      "changes": [
+        "decide-plugin-ui-extension-surfaces"
+      ]
+    },
+    {
+      "issue": "THE-108",
+      "project": "Plugin UI Platform",
+      "changes": [
+        "add-ui-component-contract"
+      ]
+    },
+    {
+      "issue": "THE-110",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-remote-provision-hooks"
+      ]
+    },
+    {
+      "issue": "THE-111",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-runtime-session-split"
+      ]
+    },
+    {
+      "issue": "THE-112",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-skills-registry"
+      ]
+    },
+    {
+      "issue": "THE-113",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-sandbox-policy-engine"
+      ]
+    },
+    {
+      "issue": "THE-114",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-ci-logs-and-autofix"
+      ]
+    },
+    {
+      "issue": "THE-115",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-host-as-resource"
+      ]
+    },
+    {
+      "issue": "THE-116",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "improve-agent-pipeline-v2"
+      ]
+    },
+    {
+      "issue": "THE-117",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-agent-harness-seam"
+      ]
+    },
+    {
+      "issue": "THE-118",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-agent-model-env-selection"
+      ]
+    },
+    {
+      "issue": "THE-119",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-crash-reporting-and-traceability"
+      ]
+    },
+    {
+      "issue": "THE-120",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-oci-runtime-tiers"
+      ]
+    },
+    {
+      "issue": "THE-121",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "harden-pipeline-slot-accounting"
+      ]
+    },
+    {
+      "issue": "THE-122",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "add-credential-broker"
+      ]
+    },
+    {
+      "issue": "THE-123",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "resurrect-model-proxy"
+      ]
+    },
+    {
+      "issue": "THE-124",
+      "project": "Cross-Platform Support & Verification",
+      "changes": [
+        "verify-sandbox-mounts"
+      ]
+    },
+    {
+      "issue": "THE-125",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-issue-driven-worktrees"
+      ]
+    },
+    {
+      "issue": "THE-126",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-generic-tracker-model"
+      ]
+    },
+    {
+      "issue": "THE-127",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-issue-autopilot"
+      ]
+    },
+    {
+      "issue": "THE-128",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-pr-review-viewed-stacked"
+      ]
+    },
+    {
+      "issue": "THE-129",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-observability-dashboards"
+      ]
+    },
+    {
+      "issue": "THE-130",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-osc-attention-signaling"
+      ]
+    },
+    {
+      "issue": "THE-132",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-multi-repo-projects"
+      ]
+    },
+    {
+      "issue": "THE-133",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-scm-workflow-customization"
+      ]
+    },
+    {
+      "issue": "THE-134",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-scm-workflow-customization"
+      ]
+    },
+    {
+      "issue": "THE-135",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-viewers-and-quick-open",
+        "add-workspace-search-replace"
+      ]
+    },
+    {
+      "issue": "THE-136",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-scm-workflow-customization"
+      ]
+    },
+    {
+      "issue": "THE-137",
+      "project": "Agent & Workflow Platform",
+      "changes": [
+        "add-scm-workflow-customization"
+      ]
+    },
+    {
+      "issue": "THE-138",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "make-usage-overlay-scannable"
+      ]
+    },
+    {
+      "issue": "THE-139",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-workspace-zones"
+      ]
+    },
+    {
+      "issue": "THE-140",
+      "project": "Cross-Platform Support & Verification",
+      "changes": [
+        "add-windows-ci-distribution"
+      ]
+    },
+    {
+      "issue": "THE-141",
+      "project": "Cross-Platform Support & Verification",
+      "changes": [
+        "audit-sandbox-cross-platform",
+        "mark-unverified-backends"
+      ]
+    },
+    {
+      "issue": "THE-142",
+      "project": "Cross-Platform Support & Verification",
+      "changes": [
+        "add-vps-providers"
+      ]
+    },
+    {
+      "issue": "THE-143",
+      "project": "Cross-Platform Support & Verification",
+      "changes": [
+        "package-shell-completions",
+        "rework-shell-completions"
+      ]
+    },
+    {
+      "issue": "THE-144",
+      "project": "Proposal Retirement & Cleanup",
+      "changes": [
+        "add-fleet-view",
+        "add-localization",
+        "package-shell-completions"
+      ]
+    },
+    {
+      "issue": "THE-145",
+      "project": "Cross-Platform Support & Verification",
+      "changes": [
+        "add-windows-compositor-validation",
+        "add-windows-daemon-ipc",
+        "add-windows-job-objects",
+        "add-windows-native-compile",
+        "add-windows-parity"
+      ]
+    },
+    {
+      "issue": "THE-146",
+      "project": "Proposal Retirement & Cleanup",
+      "changes": [
+        "add-merge-queue-tui",
+        "add-terminal-presets",
+        "complete-devcontainer-support"
+      ]
+    },
+    {
+      "issue": "THE-147",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "expand-media-surfaces"
+      ]
+    },
+    {
+      "issue": "THE-148",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "add-voice-mode"
+      ]
+    }
+  ]
+}

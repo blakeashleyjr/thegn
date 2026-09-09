@@ -154,18 +154,28 @@ mod tests {
     #[test]
     fn disabled_budget_and_disabled_caps_are_ignored() {
         let r = row("global", 100, 10.0);
-        assert!(classify_breaches(&BudgetConfig::default(), &[r.clone()], 100).is_empty());
+        assert!(
+            classify_breaches(&BudgetConfig::default(), std::slice::from_ref(&r), 100).is_empty()
+        );
         assert!(classify_breaches(&config(&[("global", None, None)]), &[r], 100).is_empty());
     }
 
     #[test]
     fn token_and_cost_caps_classify_independently() {
         let r = row("global", 10, 2.0);
-        let tokens = classify_breaches(&config(&[("global", Some(10), None)]), &[r.clone()], 100);
+        let tokens = classify_breaches(
+            &config(&[("global", Some(10), None)]),
+            std::slice::from_ref(&r),
+            100,
+        );
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].dimension, BudgetDimension::Tokens);
 
-        let cost = classify_breaches(&config(&[("global", None, Some(2.0))]), &[r.clone()], 100);
+        let cost = classify_breaches(
+            &config(&[("global", None, Some(2.0))]),
+            std::slice::from_ref(&r),
+            100,
+        );
         assert_eq!(cost.len(), 1);
         assert_eq!(cost[0].dimension, BudgetDimension::Cost);
 
@@ -195,8 +205,11 @@ mod tests {
         let mut rolling = config(&[("global", Some(1), None)]);
         rolling.window_secs = 1;
         let r = row("global", 1, 0.0);
-        assert_eq!(classify_breaches(&rolling, &[r.clone()], 1_099).len(), 1);
-        assert!(classify_breaches(&rolling, &[r.clone()], 1_100).is_empty());
+        assert_eq!(
+            classify_breaches(&rolling, std::slice::from_ref(&r), 1_099).len(),
+            1
+        );
+        assert!(classify_breaches(&rolling, std::slice::from_ref(&r), 1_100).is_empty());
 
         let cumulative = config(&[("global", Some(1), None)]);
         assert_eq!(classify_breaches(&cumulative, &[r], i64::MAX).len(), 1);

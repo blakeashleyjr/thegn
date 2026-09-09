@@ -2,6 +2,10 @@ use super::*;
 use crate::hydrate_tuning::DEFAULT_MODEL_REFRESH_MS;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test fixture mirrors the flat GlyphRow fields so call sites remain readable"
+)]
 fn glyph_row(
     dirty: bool,
     ahead: usize,

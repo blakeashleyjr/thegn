@@ -282,7 +282,9 @@ pub use crate::editor::EditorProvider;
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
 pub use crate::config_activity::ActivityConfig;
-pub use crate::config_daemon::{DaemonConfig, ServeConfig};
+pub use crate::config_daemon::{
+    DaemonConfig, ServeConfig, ServeExposure, ServeTopology, ServeTransportPolicy,
+};
 pub use crate::config_drawer::{DrawerOccupant, DrawerPolicy, DrawerScope};
 pub use crate::config_notifications::{
     DndConfig, NotificationMode, NotificationRule, NotificationsConfig, NotificationsOverlay,
@@ -381,6 +383,15 @@ config_enum! {
     pub enum Network: "sandbox network" {
         Nat = "nat", Host = "host", None = "none",
     } default = Nat;
+}
+config_enum! {
+    /// `[sandbox] compiler_cache` is the sole authority for carrying a compiler
+    /// cache wrapper into a sandbox. `off` strips inherited sccache state;
+    /// `auto` retains it only when the resolved containment can use it safely.
+    pub enum SandboxCompilerCache: "sandbox compiler cache" {
+        Off = "off" | "none" | "disabled",
+        Auto = "auto",
+    } default = Off;
 }
 config_enum! {
     /// Sandbox hardening preset — a named bundle of OS-isolation knobs
@@ -3940,6 +3951,9 @@ pub struct SandboxConfig {
     pub env_passthrough: Vec<String>,
     /// Add common language build caches to `worktree_plus_caches` sandboxes.
     pub auto_caches: bool,
+    /// Whether a compiler cache wrapper may run inside the sandbox. This is
+    /// independent of `[disk].sccache`, which only supplies host-side inputs.
+    pub compiler_cache: SandboxCompilerCache,
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     /// Host-side setup commands run (off-loop, via `sh -lc` in the worktree)
@@ -4062,6 +4076,7 @@ impl Default for SandboxConfig {
             .map(|s| s.to_string())
             .collect(),
             auto_caches: true,
+            compiler_cache: SandboxCompilerCache::Off,
             // THE-66 tightening: `/run/user` is NO LONGER mounted by default.
             // It carries the user session bus (⇒ Secret Service ⇒ the OS keyring)
             // and the ssh-agent socket, so mounting it made the keyring and the
@@ -4368,6 +4383,7 @@ pub struct SandboxOverlay {
     pub compose: Option<String>,
     pub env_passthrough: Option<Vec<String>>,
     pub auto_caches: Option<bool>,
+    pub compiler_cache: Option<SandboxCompilerCache>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub prepare: Option<Vec<String>>,
@@ -5741,6 +5757,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             v.trim(),
             "THEGN_SANDBOX_PROFILE",
             SandboxProfile::from_str_validated,
+        );
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_COMPILER_CACHE") {
+        o.sandbox.compiler_cache = parse_enum_env(
+            v.trim(),
+            "THEGN_SANDBOX_COMPILER_CACHE",
+            SandboxCompilerCache::from_str_validated,
         );
     }
     if let Some(v) = env.get("THEGN_SANDBOX_ON_DORMANT") {

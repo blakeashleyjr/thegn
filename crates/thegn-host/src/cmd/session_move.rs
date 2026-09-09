@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use thegn_core::config::Config;
 use thegn_core::db::Db;
@@ -21,6 +22,8 @@ use thegn_svc::control::client::ControlClient;
 use super::session::SessionAction;
 
 const OPAQUE_PAYLOAD_WARNING: &str = "opaque pane commands, scrollback, dispatch reports, and notes are carried unchanged and are not included in this audit";
+const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const KILL_CONFIRM_POLL: Duration = Duration::from_millis(25);
 
 trait MigrationControl {
     fn health(&self) -> BoxFuture<'_, Result<()>>;
@@ -367,6 +370,27 @@ async fn kill_and_relist(
     worktree: &str,
     audit: &mut MigrationAudit,
 ) -> Result<()> {
+    kill_and_relist_with_timeout(
+        control,
+        live_ids,
+        references,
+        worktree,
+        audit,
+        KILL_CONFIRM_TIMEOUT,
+        KILL_CONFIRM_POLL,
+    )
+    .await
+}
+
+async fn kill_and_relist_with_timeout(
+    control: &dyn MigrationControl,
+    live_ids: &BTreeSet<String>,
+    references: &BTreeSet<String>,
+    worktree: &str,
+    audit: &mut MigrationAudit,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
     for id in live_ids {
         control
             .kill(id)
@@ -374,18 +398,30 @@ async fn kill_and_relist(
             .with_context(|| format!("kill source daemon session {id}"))?;
         audit.killed_ids.push(id.clone());
     }
-    let after = control
-        .sessions()
-        .await
-        .context("confirm source daemon sessions were killed")?;
-    let survivors = live_session_ids(&after, references, worktree);
-    if survivors.is_empty() {
-        Ok(())
-    } else {
-        bail!(
-            "source daemon sessions survived --kill: {}",
-            survivors.into_iter().collect::<Vec<_>>().join(", ")
-        )
+
+    // The control API acknowledges once Kill is queued. Actor teardown then
+    // publishes a tombstone and removes the live row asynchronously, so one
+    // immediate re-list can legitimately observe the old row. Keep the source
+    // migration fence held and wait a bounded interval for that authoritative
+    // transition; target import still cannot start while any source is live.
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let after = control
+            .sessions()
+            .await
+            .context("confirm source daemon sessions were killed")?;
+        let survivors = live_session_ids(&after, references, worktree);
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "source daemon sessions survived --kill: {}",
+                survivors.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        tokio::time::sleep(poll.min(remaining)).await;
     }
 }
 
@@ -649,6 +685,7 @@ mod tests {
     struct FakeControl {
         health_error: Option<String>,
         listings: Arc<Mutex<Vec<Vec<SessionInfo>>>>,
+        sticky_listing: Vec<SessionInfo>,
         killed: Arc<Mutex<Vec<String>>>,
         notifications: Arc<Mutex<Vec<String>>>,
     }
@@ -666,7 +703,8 @@ mod tests {
 
         fn sessions(&self) -> BoxFuture<'_, Result<Vec<SessionInfo>>> {
             let listings = Arc::clone(&self.listings);
-            Box::pin(async move { Ok(listings.lock().unwrap().pop().unwrap_or_default()) })
+            let sticky = self.sticky_listing.clone();
+            Box::pin(async move { Ok(listings.lock().unwrap().pop().unwrap_or(sticky)) })
         }
 
         fn kill(&self, session: &str) -> BoxFuture<'_, Result<()>> {
@@ -795,27 +833,53 @@ mod tests {
         assert_eq!(live_move_refusal(&live, true), None);
     }
 
-    #[test]
-    fn control_seam_kills_and_relists_before_import() {
+    #[tokio::test]
+    async fn control_seam_waits_for_async_kill_teardown_before_import() {
         let control = FakeControl {
             listings: Arc::new(Mutex::new(vec![
-                vec![live_session("daemon-1", "/worktree")],
                 Vec::new(),
+                vec![live_session("daemon-1", "/worktree")],
             ])),
             ..Default::default()
         };
         let refs = BTreeSet::from(["daemon-1".to_string()]);
         let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
 
-        futures::executor::block_on(kill_and_relist(
+        kill_and_relist(
             &control,
             &BTreeSet::from(["daemon-1".to_string()]),
             &refs,
             "/worktree",
             &mut audit,
-        ))
+        )
+        .await
         .unwrap();
         assert_eq!(*control.killed.lock().unwrap(), vec!["daemon-1"]);
+        assert_eq!(audit.killed_ids, vec!["daemon-1"]);
+    }
+
+    #[tokio::test]
+    async fn control_seam_fails_closed_when_killed_session_never_tombstones() {
+        let still_live = live_session("daemon-1", "/worktree");
+        let control = FakeControl {
+            sticky_listing: vec![still_live],
+            ..Default::default()
+        };
+        let refs = BTreeSet::from(["daemon-1".to_string()]);
+        let mut audit = MigrationAudit::new("source", "target", "/worktree", false);
+
+        let error = kill_and_relist_with_timeout(
+            &control,
+            &BTreeSet::from(["daemon-1".to_string()]),
+            &refs,
+            "/worktree",
+            &mut audit,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("survived --kill"), "{error:#}");
         assert_eq!(audit.killed_ids, vec!["daemon-1"]);
     }
 

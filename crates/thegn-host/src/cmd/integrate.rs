@@ -53,12 +53,12 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     // its host). In `route_to_host` mode the fold still runs in the target repo's
     // object store, so a remote target must be folded on its own host.
     let push_mode = resolved.remote_mode == thegn_core::config::MergeRemoteMode::Push;
-    if !push_mode
-        && let Ok(db) = Db::open()
-        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &repo_root)
-    {
-        outln!("{msg}");
-        return Ok(());
+    if !push_mode {
+        let db = Db::open().context("remote-target guard database unavailable")?;
+        if let Some(msg) = crate::merge_ops::remote_target_guard(&db, &repo_root)? {
+            outln!("{msg}");
+            return Ok(());
+        }
     }
     let mq = &resolved;
     let target = integrate::resolve_target(mq, &repo_root);

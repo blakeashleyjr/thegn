@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use thegn_core::config::Config;
 use thegn_core::plugin_api::{
-    API_VERSION, ExtensionPoint, HostContract, NegotiatedManifest, PluginSpec,
+    API_VERSION, Capability, HOST_EXTENSION_SUPPORT, HostContract, NegotiatedManifest, PluginSpec,
+    SupportState,
 };
 
 /// The extension points this host build actually renders/consumes. The wire
@@ -15,24 +16,17 @@ use thegn_core::plugin_api::{
 /// host runtime, placement, and activation path has landed.
 pub fn host_contract() -> HostContract {
     HostContract::new(API_VERSION)
-        .with_extension_points([
-            ExtensionPoint::StatusBarSegment,
-            ExtensionPoint::NotificationSource,
-            ExtensionPoint::PaletteAction,
-            // CiProvider/ForgeProvider are wire vocabulary only for now:
-            // their seams select by closed config kinds, so they negotiate
-            // unsupported until a dynamic-selection story lands.
-            ExtensionPoint::IssueProvider,
-        ])
-        // The surface capabilities those extension points require: declaring
-        // the point implies granting its surface (registration would
-        // otherwise always be denied).
-        .with_grants([
-            thegn_core::plugin_api::Capability::new("surface", "statusbar"),
-            thegn_core::plugin_api::Capability::new("surface", "notification"),
-            thegn_core::plugin_api::Capability::new("surface", "palette"),
-            thegn_core::plugin_api::Capability::new("surface", "provider"),
-        ])
+        .with_extension_support(HOST_EXTENSION_SUPPORT.iter().cloned())
+        // Derive surface grants from the same rows that decide negotiation.
+        // A newly wired point therefore cannot be accepted while its required
+        // capability is accidentally left in a second hand-maintained list.
+        .with_grants(
+            HOST_EXTENSION_SUPPORT
+                .iter()
+                .filter(|row| row.state == SupportState::Wired)
+                .filter_map(|row| row.required_capability)
+                .filter_map(Capability::parse),
+        )
 }
 
 /// One discovered plugin: where it came from and what to run.
@@ -143,7 +137,7 @@ pub fn broken_manifests(config_dir: &Path) -> Vec<SpecProblem> {
 /// Negotiate one spec against the host contract.
 pub fn negotiate(spec: &PluginSpec) -> Result<NegotiatedManifest, String> {
     host_contract()
-        .negotiate(&spec.manifest)
+        .negotiate_spec(spec)
         .map_err(|e| e.to_string())
 }
 
@@ -185,11 +179,11 @@ pub fn check_spec(p: &LoadedPlugin) -> Vec<SpecProblem> {
     match negotiate(&p.spec) {
         Err(e) => push(e),
         Ok(neg) => {
-            for c in &neg.unsupported_contributions {
+            for rejected in &neg.rejected_contributions {
                 push(format!(
-                    "contribution {:?} targets unsupported extension point {}",
-                    c.id.as_str(),
-                    format_args!("{:?}", c.extension_point)
+                    "contribution {:?} rejected: {}",
+                    rejected.contribution.id.as_str(),
+                    rejected.reason
                 ));
             }
         }
@@ -222,7 +216,7 @@ pub fn check_specs(cfg: &Config, config_dir: &Path) -> Vec<SpecProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::plugin_api::{ApiVersion, Contribution, PluginManifest};
+    use thegn_core::plugin_api::{ApiVersion, Contribution, ExtensionPoint, PluginManifest};
 
     fn spec(id: &str, command: Vec<String>) -> PluginSpec {
         PluginSpec {
@@ -336,5 +330,68 @@ mod tests {
                 .any(|p| p.problem.contains("does not parse")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn canonical_support_table_drives_the_loader_and_public_docs() {
+        let contract = host_contract();
+        let developer_guide = include_str!("../../../../docs/extending/plugin.md");
+        let help = include_str!("../../../../docs/help/plugins.md");
+        for row in HOST_EXTENSION_SUPPORT {
+            let name = row.extension_point.wire_name();
+            assert!(
+                developer_guide.contains(name),
+                "developer guide omits {name}"
+            );
+            assert!(help.contains(name), "plugin help omits {name}");
+            assert_eq!(
+                contract
+                    .available_extension_points
+                    .contains(&row.extension_point),
+                row.state == thegn_core::plugin_api::SupportState::Wired,
+                "loader support differs from the canonical row for {name}"
+            );
+            if let Some(required) = row.required_capability {
+                let expected_grant = HOST_EXTENSION_SUPPORT.iter().any(|candidate| {
+                    candidate.state == SupportState::Wired
+                        && candidate.required_capability == Some(required)
+                });
+                assert_eq!(
+                    contract
+                        .granted_capabilities
+                        .contains(&Capability::parse(required).unwrap()),
+                    expected_grant,
+                    "loader grant differs from the canonical rows for {required} (observed at {name})"
+                );
+            }
+            let state = match row.state {
+                SupportState::Wired => "wired",
+                SupportState::SeparateAdapter => "separate adapter",
+                SupportState::Reserved => "reserved",
+            };
+            let documented_state = developer_guide.lines().find_map(|line| {
+                let cells = line
+                    .strip_prefix('|')?
+                    .split('|')
+                    .map(str::trim)
+                    .collect::<Vec<_>>();
+                (cells.len() > 1 && cells[0].trim_matches('`') == name).then_some(cells[1])
+            });
+            assert_eq!(
+                documented_state,
+                Some(state),
+                "developer guide support state differs for {name}"
+            );
+        }
+        assert!(developer_guide.contains("x-thegn-extension-support"));
+        assert!(developer_guide.contains("x-thegn-host-verb-support"));
+        assert!(developer_guide.contains("x-thegn-host-call-capabilities"));
+
+        let example: PluginSpec = toml::from_str(include_str!(
+            "../../../../examples/plugins/hello/plugin.toml"
+        ))
+        .unwrap();
+        assert_eq!(example.manifest.api, API_VERSION);
+        assert!(negotiate(&example).is_ok());
     }
 }

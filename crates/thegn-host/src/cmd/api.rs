@@ -277,4 +277,17 @@ mod tests {
     fn cli_ledger_includes_the_event_tail_projection() {
         assert!(cli_control_caps().contains(&"events.subscribe"));
     }
+
+    #[test]
+    fn every_advertised_plugin_host_call_has_a_generic_control_route() {
+        for cap in thegn_core::plugin_api::plugin_host_call_caps() {
+            let (method, _) = thegn_svc::control::routes::api_call_for(cap)
+                .unwrap_or_else(|| panic!("plugin host.call {cap} has no generic control route"));
+            assert_ne!(method, "WS", "streaming cap {cap} cannot be a host.call");
+        }
+        assert!(
+            !thegn_core::plugin_api::plugin_host_call_caps().contains(&"launch.preset"),
+            "CLI-first launch.preset stays excluded until its control route lands"
+        );
+    }
 }

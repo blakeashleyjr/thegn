@@ -410,6 +410,7 @@ pub fn classify_repo_overlay(
         compose,
         env_passthrough,
         auto_caches,
+        compiler_cache,
         mounts,
         init_script,
         prepare: _,
@@ -622,6 +623,20 @@ pub fn classify_repo_overlay(
                 RepoFieldRule::Floor,
                 json!(true),
                 "a repo may not enable host build-cache mounts",
+            ));
+        }
+    }
+    // compiler_cache: off is stricter (no wrapper, endpoint, or cache grant).
+    if let Some(v) = compiler_cache {
+        if v == crate::config::SandboxCompilerCache::Off {
+            out.compiler_cache = Some(v);
+        } else {
+            events.push(ClampEvent::deny(
+                layer,
+                "sandbox.compiler_cache",
+                RepoFieldRule::Floor,
+                json!(v.to_string()),
+                "a repo may not authorize a host compiler cache inside the sandbox",
             ));
         }
     }
@@ -1705,6 +1720,29 @@ mod tests {
         o.file_access = Some(FileAccess::Worktree);
         let r = classify_repo_overlay(o, &base(), &Approvals::deny_all());
         assert_eq!(r.sanctioned.file_access, Some(FileAccess::Worktree));
+    }
+
+    #[test]
+    fn repo_can_disable_but_not_authorize_sandbox_compiler_cache() {
+        let mut trusted = base();
+        trusted.compiler_cache = crate::config::SandboxCompilerCache::Auto;
+        let mut disable = overlay();
+        disable.compiler_cache = Some(crate::config::SandboxCompilerCache::Off);
+        let r = classify_repo_overlay(disable, &trusted, &Approvals::deny_all());
+        assert_eq!(
+            r.sanctioned.compiler_cache,
+            Some(crate::config::SandboxCompilerCache::Off)
+        );
+
+        let mut enable = overlay();
+        enable.compiler_cache = Some(crate::config::SandboxCompilerCache::Auto);
+        let r = classify_repo_overlay(enable, &base(), &Approvals::deny_all());
+        assert!(r.sanctioned.compiler_cache.is_none());
+        assert!(
+            r.events
+                .iter()
+                .any(|event| event.key == "sandbox.compiler_cache")
+        );
     }
 
     // ---- Ceiling / three-valued list semantics --------------------------

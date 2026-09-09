@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thegn.dev/schemas/delivery-index-v1.json",
+  "title": "Thegn delivery index",
+  "type": "object",
+  "required": ["schema_version", "projects", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "projects": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "change",
+          "lifecycle",
+          "disposition",
+          "owners",
+          "summary"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "change": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "lifecycle": {
+            "enum": [
+              "proposed",
+              "active",
+              "delivered-awaiting-archive",
+              "archived"
+            ]
+          },
+          "disposition": {
+            "enum": [
+              "alpha-delivery",
+              "strategic-unstarted",
+              "residual-split",
+              "superseded-retire",
+              "verification-gated"
+            ]
+          },
+          "owners": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "object",
+              "required": ["issue", "project"],
+              "additionalProperties": false,
+              "properties": {
+                "issue": {
+                  "type": "string",
+                  "pattern": "^THE-[1-9][0-9]*$"
+                },
+                "project": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          },
+          "untracked_rationale": {
+            "type": "string",
+            "minLength": 20
+          },
+          "successors": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^openspec/changes/(?:archive/[0-9]{4}-[0-9]{2}-[0-9]{2}-)?[a-z0-9]+(?:-[a-z0-9]+)*/$"
+            }
+          },
+          "archive_path": {
+            "type": "string",
+            "pattern": "^openspec/changes/archive/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*/$"
+          },
+          "delivered_at": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 20
+          }
+        }
+      }
+    }
+  }
+}

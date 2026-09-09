@@ -170,55 +170,6 @@
       ],
       "type": "object"
     },
-    "BrowserAction": {
-      "oneOf": [
-        {
-          "enum": [
-            "reload",
-            "back"
-          ],
-          "type": "string"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "navigate": {
-              "properties": {
-                "url": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "url"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "navigate"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "BrowserCommand": {
-      "description": "The preview-browser verb payload — defined now so the contract is stable; v1 always answers [`ControlError::Unimplemented`].",
-      "properties": {
-        "action": {
-          "$ref": "#/definitions/BrowserAction"
-        },
-        "session": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "action"
-      ],
-      "type": "object"
-    },
     "CiLogsReply": {
       "description": "One cache-first CI log projection. Entries contain only the bounded, redacted cache shape; the response metadata makes a provider fill explicit.",
       "properties": {
@@ -1463,11 +1414,6 @@
       "path": "/v1/dispatches/{id}/status"
     },
     {
-      "cap": "browser.drive",
-      "method": "POST",
-      "path": "/v1/browser"
-    },
-    {
       "cap": "preview.fetch",
       "method": "POST",
       "path": "/v1/preview/fetch"
@@ -1608,12 +1554,6 @@
     },
     "AutomationTestRequest": {
       "$ref": "#/definitions/AutomationTestRequest"
-    },
-    "BrowserAction": {
-      "$ref": "#/definitions/BrowserAction"
-    },
-    "BrowserCommand": {
-      "$ref": "#/definitions/BrowserCommand"
     },
     "CiLogsReply": {
       "$ref": "#/definitions/CiLogsReply"

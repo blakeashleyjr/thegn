@@ -210,7 +210,7 @@ Resources mirror these: `thegn://help/<id>` per page, `thegn://config/current`,
 resources/tools never serve secrets — token/key/credential fields are masked
 before `get_config` / `thegn://config/current` go out.
 
-Beyond the docs tools, `--scopes` (comma-separated `read,write,git,admin`,
+Beyond the docs tools, `--scopes` (comma-separated `read,write,git,exec,admin`,
 default `read`) gates a set of **state tools** that talk to a running pane
 daemon — default-deny: a tool neither appears in `tools/list` nor is callable
 until its scope is granted.

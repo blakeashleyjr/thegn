@@ -246,19 +246,21 @@ mod tests {
 
     #[test]
     fn dry_run_evaluates_without_opening_a_store() {
-        let mut cfg = Config::default();
-        cfg.automations = AutomationsConfig {
-            enabled: true,
-            rules: vec![AutomationRuleConfig {
-                name: "say-done".into(),
-                when: "agent_finished".into(),
-                then: AutomationActionConfig {
-                    cap: "notify.push".into(),
-                    body: Some("{message}".into()),
+        let cfg = Config {
+            automations: AutomationsConfig {
+                enabled: true,
+                rules: vec![AutomationRuleConfig {
+                    name: "say-done".into(),
+                    when: "agent_finished".into(),
+                    then: AutomationActionConfig {
+                        cap: "notify.push".into(),
+                        body: Some("{message}".into()),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
+                }],
                 ..Default::default()
-            }],
+            },
             ..Default::default()
         };
         let fixture = serde_json::json!({

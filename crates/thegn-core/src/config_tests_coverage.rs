@@ -1140,6 +1140,7 @@ fn sandbox_overlay_apply_covers_remaining_fields() {
         )])),
         compose: Some("docker-compose.yml".into()),
         auto_caches: Some(false),
+        compiler_cache: Some(crate::config::SandboxCompilerCache::Auto),
         shell: Some("zsh".into()),
         network_audit: Some(true),
         ..Default::default()
@@ -1154,6 +1155,10 @@ fn sandbox_overlay_apply_covers_remaining_fields() {
     assert_eq!(base.volumes.get("vol").map(String::as_str), Some("/data"));
     assert_eq!(base.compose.as_deref(), Some("docker-compose.yml"));
     assert!(!base.auto_caches);
+    assert_eq!(
+        base.compiler_cache,
+        crate::config::SandboxCompilerCache::Auto
+    );
     assert_eq!(base.shell, "zsh");
     assert!(base.network_audit);
 }

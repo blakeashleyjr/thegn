@@ -7,9 +7,9 @@
 //! THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test control_schema
 //! ```
 //!
-//! Within /v1 the snapshot may only be regenerated when the change is
-//! additive (new optional fields, new variants with defaults) — the same
-//! compatibility rule as the plugin wire.
+//! Within /v1 the snapshot is normally additive-only. A removal requires an
+//! accepted compatibility decision proving the operation has no success path;
+//! THE-103 is that decision for the former browser-driving stub.
 
 use thegn_core::control_wire::FeedFilter;
 use thegn_svc::control::*;
@@ -35,8 +35,6 @@ fn wire_schema() -> serde_json::Value {
         OpenSpec,
         ForkSpec,
         AttachKind,
-        BrowserCommand,
-        BrowserAction,
         PreviewFetchRequest,
         PreviewFetchReply,
         WaitCondition,
@@ -99,4 +97,16 @@ fn control_wire_matches_the_committed_snapshot() {
          If the change is additive, regenerate the snapshot (THEGN_UPDATE_SNAPSHOTS=1); \
          otherwise revert the wire change."
     );
+}
+
+#[test]
+fn removed_browser_drive_is_absent_from_generated_contract_inputs() {
+    let schema = wire_schema().to_string();
+    assert!(!schema.contains("browser.drive"));
+    assert!(!schema.contains("BrowserCommand"));
+    assert!(!schema.contains("BrowserAction"));
+
+    let proto = include_str!("../proto/thegn/control/v1/control.proto");
+    assert!(!proto.contains("DriveBrowser"));
+    assert!(!proto.contains("DriveBrowserRequest"));
 }

@@ -405,6 +405,52 @@ impl NotificationKind {
     }
 }
 
+pub const MAX_REVIEW_NOTIFICATION_CHARS: usize = 1024;
+
+/// Bounded audit text for a newly queued or revised review task.
+pub fn review_task_queued_message(
+    event: &crate::pr_review_tasks::ReviewTaskEvent,
+    revised: bool,
+) -> String {
+    let action = if revised { "revised" } else { "queued" };
+    let location = match event.line {
+        Some(line) if !event.path.is_empty() => format!("{}:{line}", event.path),
+        _ if event.path.is_empty() => "unanchored".to_string(),
+        _ => event.path.clone(),
+    };
+    bounded_notification(&format!(
+        "PR #{} review task {action}: {} [{} @ {}; rev {}]",
+        event.pr_number, location, event.thread_id, event.head_oid, event.source_revision
+    ))
+}
+
+/// Bounded audit text for a successfully resolved review thread.
+pub fn review_thread_resolved_message(
+    transition: &crate::pr_review_tasks::ReviewTaskResolution,
+) -> String {
+    let location = match transition.line {
+        Some(line) if !transition.path.is_empty() => format!("{}:{line}", transition.path),
+        _ if transition.path.is_empty() => "unanchored".to_string(),
+        _ => transition.path.clone(),
+    };
+    bounded_notification(&format!(
+        "PR #{} review thread resolved: {} [{} @ {}; rev {}]",
+        transition.pr_number,
+        location,
+        transition.thread_id,
+        transition.head_oid,
+        transition.source_revision
+    ))
+}
+
+fn bounded_notification(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_REVIEW_NOTIFICATION_CHARS)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,50 +635,4 @@ mod tests {
             assert_eq!(Priority::parse(p.as_str()), Some(p));
         }
     }
-}
-
-pub const MAX_REVIEW_NOTIFICATION_CHARS: usize = 1024;
-
-/// Bounded audit text for a newly queued or revised review task.
-pub fn review_task_queued_message(
-    event: &crate::pr_review_tasks::ReviewTaskEvent,
-    revised: bool,
-) -> String {
-    let action = if revised { "revised" } else { "queued" };
-    let location = match event.line {
-        Some(line) if !event.path.is_empty() => format!("{}:{line}", event.path),
-        _ if event.path.is_empty() => "unanchored".to_string(),
-        _ => event.path.clone(),
-    };
-    bounded_notification(&format!(
-        "PR #{} review task {action}: {} [{} @ {}; rev {}]",
-        event.pr_number, location, event.thread_id, event.head_oid, event.source_revision
-    ))
-}
-
-/// Bounded audit text for a successfully resolved review thread.
-pub fn review_thread_resolved_message(
-    transition: &crate::pr_review_tasks::ReviewTaskResolution,
-) -> String {
-    let location = match transition.line {
-        Some(line) if !transition.path.is_empty() => format!("{}:{line}", transition.path),
-        _ if transition.path.is_empty() => "unanchored".to_string(),
-        _ => transition.path.clone(),
-    };
-    bounded_notification(&format!(
-        "PR #{} review thread resolved: {} [{} @ {}; rev {}]",
-        transition.pr_number,
-        location,
-        transition.thread_id,
-        transition.head_oid,
-        transition.source_revision
-    ))
-}
-
-fn bounded_notification(message: &str) -> String {
-    message
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(MAX_REVIEW_NOTIFICATION_CHARS)
-        .collect()
 }

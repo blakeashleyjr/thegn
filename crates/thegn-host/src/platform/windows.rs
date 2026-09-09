@@ -175,6 +175,31 @@ pub fn restrict_dir_owner_only_checked(_path: &std::path::Path) -> std::io::Resu
     Ok(())
 }
 
+/// POSIX shell wrappers are not a Windows cache transport. Returning an
+/// explicit unsupported error lets the portable cache policy fail soft to a
+/// direct compiler without materializing a script Windows cannot execute.
+pub(crate) fn publish_private_executable(
+    _temporary: &std::path::Path,
+    _path: &std::path::Path,
+    _contents: &[u8],
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "executable shell wrappers are unavailable on Windows",
+    ))
+}
+
+/// Windows named pipes rely on the current user's inherited endpoint ACL and
+/// local pipe identity rather than Unix effective-uid peer credentials.
+pub(crate) fn local_control_security(_path: &std::path::Path) -> super::LocalControlSecurity {
+    super::LocalControlSecurity {
+        auth: "local-pipe-or-token",
+        peer_identity: "local-only-named-pipe",
+        hardening: "platform-acl",
+        error: None,
+    }
+}
+
 /// Open an existing path without traversing a final-component reparse point.
 /// `FILE_FLAG_OPEN_REPARSE_POINT` is kept local to the platform seam rather
 /// than enabling another windows-sys feature for one constant.

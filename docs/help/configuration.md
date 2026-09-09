@@ -128,6 +128,22 @@ for its lifetime, so a rebuilt controller refuses to migrate until controllers
 using the old schema have exited. Stop the old host/daemon, rebuild, then start
 the pinned controller to upgrade.
 
+An operation that deliberately supports an older schema uses a separate,
+operation-declared compatibility handle; this never grants migration authority.
+For example, `thegn land` can evaluate its remote-target guard and (when
+enabled) update sidebar lifecycle folders against schema v66 while a v67
+controller upgrade is pending. The handle holds the shared schema lease for the
+whole operation and verifies its required tables and columns before the first
+operation query. An unsupported or malformed older schema is reported by name;
+the command does not silently skip its safety guard.
+
+If a running host observes a database schema newer than its own build, it keeps
+the last successfully hydrated sidebar and panel but disables state-changing
+host actions. The bottom chrome shows a persistent `DB REFUSED` banner
+with the on-disk and build schema versions. Rebuild or reinstall `thegn`, then
+restart both the host and daemon from that build. The banner is not a timed
+notification: it clears only after a compatible hydration succeeds.
+
 These keys are accepted only from trusted user/profile config (or the
 `THEGN_DATABASE_MIGRATION_AUTHORITY` and
 `THEGN_DATABASE_MIGRATION_EXECUTABLE` launcher overrides), never from a repo

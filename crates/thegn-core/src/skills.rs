@@ -1139,7 +1139,7 @@ mod tests {
         let current = plan_seed(
             &current_registry,
             &target(&[]),
-            &[applied.clone()],
+            std::slice::from_ref(&applied),
             GateState::default(),
         );
         assert!(current.is_empty());

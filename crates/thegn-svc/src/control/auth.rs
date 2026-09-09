@@ -13,6 +13,8 @@ use thegn_core::control::{
 };
 use thegn_core::store::{ControlStore, PairingRow};
 
+use crate::ipc::PeerIdentity;
+
 /// The authenticated caller adapters attach to a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthCtx {
@@ -23,8 +25,8 @@ pub struct AuthCtx {
 }
 
 impl AuthCtx {
-    /// A local same-uid unix-socket peer (`[serve] local_admin`): full access,
-    /// no token row behind it.
+    /// A transport-authenticated local peer (`[serve] local_admin`): full
+    /// access, with no token row behind it.
     pub fn local_admin() -> Self {
         AuthCtx {
             pairing_id: "local".into(),
@@ -40,6 +42,28 @@ impl AuthCtx {
         } else {
             Err(super::ControlError::NoScope { need })
         }
+    }
+}
+
+/// Decide whether transport authentication is sufficient for implicit admin.
+/// A Unix listener is not itself an identity: the accepted stream must carry
+/// a kernel-authenticated effective uid equal to the daemon's. Unknown and
+/// mismatched identities deliberately return false so the caller can try the
+/// ordinary scoped-token path.
+pub fn implicit_local_admin(
+    enabled: bool,
+    daemon_euid: Option<u32>,
+    peer: Option<&PeerIdentity>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match peer {
+        Some(PeerIdentity::UnixEuid(peer_euid)) => daemon_euid == Some(*peer_euid),
+        // Windows named pipes reject remote clients at creation time. Internal
+        // dispatch is separately authenticated before entering the router.
+        Some(PeerIdentity::LocalPipe | PeerIdentity::TrustedInternal) => true,
+        Some(PeerIdentity::Unavailable(_)) | None => false,
     }
 }
 
@@ -183,6 +207,28 @@ mod tests {
     use super::*;
     use thegn_core::control::Scope;
     use thegn_core::db::Db;
+
+    #[test]
+    fn implicit_admin_requires_enabled_authenticated_matching_peer() {
+        let same = PeerIdentity::UnixEuid(1000);
+        let other = PeerIdentity::UnixEuid(1001);
+        let unknown = PeerIdentity::Unavailable("unsupported".into());
+        assert!(implicit_local_admin(true, Some(1000), Some(&same)));
+        assert!(!implicit_local_admin(false, Some(1000), Some(&same)));
+        assert!(!implicit_local_admin(true, Some(1000), Some(&other)));
+        assert!(!implicit_local_admin(true, Some(1000), Some(&unknown)));
+        assert!(!implicit_local_admin(true, Some(1000), None));
+        assert!(implicit_local_admin(
+            true,
+            None,
+            Some(&PeerIdentity::LocalPipe)
+        ));
+        assert!(implicit_local_admin(
+            true,
+            Some(1000),
+            Some(&PeerIdentity::TrustedInternal)
+        ));
+    }
 
     #[test]
     fn mint_verify_round_trip_and_rejections() {

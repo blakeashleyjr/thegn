@@ -2,24 +2,25 @@
 
 This is the live repository-side index for the Thegn team's delivery portfolio.
 It was reconciled against `main`, OpenSpec, tests, public documentation, and
-Linear on 2026-09-08 (America/Los_Angeles). Linear owns workflow state and full
+Linear on 2026-09-09 (America/Los_Angeles). Linear owns workflow state and full
 acceptance criteria; this file owns the durable cross-links and architectural
 context that must remain reviewable with the code.
 
 The pre-reconciliation evidence and issue-by-issue audit is preserved in
 [`docs/audits/linear-reconciliation-2026-09-08.md`](audits/linear-reconciliation-2026-09-08.md).
+The ongoing lifecycle and closure rules are in
+[`docs/delivery-governance.md`](delivery-governance.md).
 
 ## Portfolio at a glance
 
 - [Thegn Alpha Readiness](https://linear.app/blakeashley/initiative/thegn-alpha-readiness-457f46d97d92)
-  is Active, High priority, and owns 25 release-bound issues.
+  is the release-bound initiative.
 - [Thegn Post-Alpha Roadmap](https://linear.app/blakeashley/initiative/thegn-post-alpha-roadmap-61e4a807e68f)
-  is Planned, Medium priority, and owns 38 detailed issues covering the
-  greenfield, residual, verification, and retirement work in the 45-change
-  set that was previously outside Linear.
-- Ten projects and twenty milestones cover every open Thegn issue.
-- The live queue contains 63 issues: 2 In Progress, 8 Todo, and 53 Backlog.
-- The priority distribution is 1 Urgent, 20 High, 38 Medium, and 4 Low.
+  owns deferred greenfield, residual, verification, and retirement work.
+- `python3 scripts/delivery_state.py report` derives current change, lifecycle,
+  disposition, project-link, and task totals from the checked-in delivery index.
+- Add `--linear-json <read-only-export.json>` to compare a separately exported
+  Linear snapshot without making the default report depend on the network.
 - Every open issue has a project, milestone, priority, and bounded outcome.
 - Every In Progress and Todo issue is assigned to Blake Ashley; unassigned
   backlog work receives an issue owner when it is promoted for execution.
@@ -51,13 +52,16 @@ work and proposal retirement.
 
 ### API and remote clients
 
-The control-plane architecture is strong: a central capability catalog, stable
-scope and error vocabularies, generated schema, transport projections, and a
-shrink-only surface-gap ratchet. It is not feature-equivalent across HTTP,
-gRPC, CLI, MCP, and plugins. `browser.drive` remains a published stub; the
-generic observer feed does not carry terminal snapshot/delta bytes; remote
-enqueue is incomplete for true remote worktrees; plaintext TCP serving is still
-possible; and Unix-socket owner mode does not yet verify peer credentials.
+The control-plane architecture has a central capability catalog, stable scope
+and error vocabularies, generated schema, transport projections, and a
+shrink-only surface-gap ratchet. Unix connections now verify peer credentials
+before granting implicit local administration. Remotely reachable endpoints
+must use an explicitly declared TLS-terminated or tunnel topology; direct
+non-loopback plaintext requires a conspicuous unsafe opt-in. It is still not
+feature-equivalent across HTTP, gRPC, CLI, MCP, and plugins. Browser driving is
+deliberately absent until a provider-backed session lifecycle exists; the
+generic observer feed does not carry terminal snapshot/delta bytes; and remote
+enqueue remains incomplete for true remote worktrees.
 
 The honest product claim is therefore **useful bounded client API**, not
 **complete native-client parity**. The governing contract is
@@ -74,20 +78,23 @@ key zones, drawers, overlays, or top-level apps. `PanelSection` is reserved
 v0.3 wire vocabulary rather than a wired runtime surface. The calendar
 `DataSource` adapter is a specialized provider seam, not a general UI host.
 
-THE-106 owns contract consistency. THE-102, THE-107, and THE-108 own explicit
-product/runtime decisions rather than allowing config-driven features such as
-themes or drawers to be mistaken for arbitrary plugin UI support. See
+The v0.3 contract now derives its advertised extensions, host calls, scope
+lattice, loader grants, and generated schema from canonical matrices. THE-102,
+THE-107, and THE-108 own explicit product/runtime growth rather than allowing
+config-driven features such as themes or drawers to be mistaken for arbitrary
+plugin UI support. See
 [`docs/help/plugins.md`](help/plugins.md).
 
 ### Configuration
 
 Configuration remains one of the strongest subsystems: typed models, strict
 validation, layered provenance, trust clamps, generated references, and hot
-reload. Its alpha risk is lifecycle complexity, not a missing foundation.
-Runtime fallback and shared-database compatibility must remain visible and
-fail closed where authority is absent. THE-95, THE-96, THE-94, THE-90, and
-THE-51 cover those concrete boundaries; broad rewrites of the configuration
-system are not currently justified.
+reload. Shared-state migration now fails closed without explicit authority,
+operations declare the schema contract they require, and the TUI preserves a
+typed sticky refusal without discarding its last good model. Sandboxed compiler
+caching is explicitly `off` or `auto`, trusted-config only, fail-soft, and
+diagnosable. THE-51 retains the bounded localization/config integration work;
+broad rewrites of the configuration system are not currently justified.
 
 ## Open issue ledger
 
@@ -98,19 +105,14 @@ the work shipped.
 
 ### Alpha Reliability & State Compatibility
 
-| Milestone                                 | Issue                                                   | State / priority | Remaining outcome                                                                                                         | Spec/change                                                                                     |
-| ----------------------------------------- | ------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| R1: Shared state safety                   | [THE-95](https://linear.app/blakeashley/issue/THE-95)   | Todo / Urgent    | Make migration authority fail closed for the canonical shared database while keeping isolated temporary databases usable. | [`harden-state-db-compatibility`](../openspec/changes/harden-state-db-compatibility/)           |
-| R1: Shared state safety                   | [THE-96](https://linear.app/blakeashley/issue/THE-96)   | Backlog / High   | Let operations declare the schema capabilities they need instead of coupling every database open to the newest migration. | [`harden-state-db-compatibility`](../openspec/changes/harden-state-db-compatibility/)           |
-| R1: Shared state safety                   | [THE-94](https://linear.app/blakeashley/issue/THE-94)   | Backlog / High   | Preserve the last good model and show a typed, sticky schema-refusal state instead of silently emptying the sidebar.      | [`harden-state-db-compatibility`](../openspec/changes/harden-state-db-compatibility/)           |
-| R2: Contained toolchain and visible state | [THE-90](https://linear.app/blakeashley/issue/THE-90)   | Todo / High      | Make compiler caching inside sandboxes explicit, fail-soft, diagnosable, and covered by a contained build smoke test.     | [`make-sandbox-build-cache-fail-soft`](../openspec/changes/make-sandbox-build-cache-fail-soft/) |
-| R2: Contained toolchain and visible state | [THE-97](https://linear.app/blakeashley/issue/THE-97)   | Backlog / Medium | Continuously prove that a staged agent can commit without escaping the configured worktree sandbox.                       | [`verify-stage-worker-containment`](../openspec/changes/verify-stage-worker-containment/)       |
-| R2: Contained toolchain and visible state | [THE-131](https://linear.app/blakeashley/issue/THE-131) | Backlog / High   | Prevent daemon/background Git commits from hanging on interactive signing prompts or misclassifying signing failures.     | [`add-scm-workflow-customization`](../openspec/changes/add-scm-workflow-customization/)         |
-| R2: Contained toolchain and visible state | [THE-93](https://linear.app/blakeashley/issue/THE-93)   | Backlog / Medium | Render the persisted flat/grouped sidebar mode continuously, including narrow layouts.                                    | [`make-sidebar-mode-visible`](../openspec/changes/make-sidebar-mode-visible/)                   |
-| R2: Contained toolchain and visible state | [THE-92](https://linear.app/blakeashley/issue/THE-92)   | Backlog / Low    | Classify active connectivity and render truthful Ethernet, Wi-Fi, or generic fallback semantics cross-platform.           | [`detect-active-network-kind`](../openspec/changes/detect-active-network-kind/)                 |
+| Milestone                                 | Issue                                                 | State / priority | Remaining outcome                                                                                               | Spec/change                                                                               |
+| ----------------------------------------- | ----------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| R2: Contained toolchain and visible state | [THE-97](https://linear.app/blakeashley/issue/THE-97) | Backlog / Medium | Continuously prove that a staged agent can commit without escaping the configured worktree sandbox.             | [`verify-stage-worker-containment`](../openspec/changes/verify-stage-worker-containment/) |
+| R2: Contained toolchain and visible state | [THE-93](https://linear.app/blakeashley/issue/THE-93) | Backlog / Medium | Render the persisted flat/grouped sidebar mode continuously, including narrow layouts.                          | [`make-sidebar-mode-visible`](../openspec/changes/make-sidebar-mode-visible/)             |
+| R2: Contained toolchain and visible state | [THE-92](https://linear.app/blakeashley/issue/THE-92) | Backlog / Low    | Classify active connectivity and render truthful Ethernet, Wi-Fi, or generic fallback semantics cross-platform. | [`detect-active-network-kind`](../openspec/changes/detect-active-network-kind/)           |
 
-Dependency order is THE-95 before THE-96 and THE-94. THE-90 and THE-97 are
-separate fail-soft and containment guarantees, not substitutes for one another.
+The shared-state safety and sandbox cache remediations are complete. THE-97 is
+the separate continuous worker-containment proof, not a substitute for either.
 
 ### Client API & Remote Access
 
@@ -119,9 +121,6 @@ separate fail-soft and containment guarantees, not substitutes for one another.
 | C1: Remote control security      | [THE-41](https://linear.app/blakeashley/issue/THE-41)   | Backlog / High   | Close the remote-access epic only after its four bounded children establish the transport, identity, routing, and parity decisions. | Children THE-98–THE-101                                                                             |
 | C1: Remote control security      | [THE-98](https://linear.app/blakeashley/issue/THE-98)   | Backlog / Medium | Persist a generated surface map and make explicit product-parity decisions for remote consumers.                                    | [`audit-remote-surface-map`](../openspec/changes/audit-remote-surface-map/)                         |
 | C1: Remote control security      | [THE-99](https://linear.app/blakeashley/issue/THE-99)   | Backlog / High   | Complete `route_to_host` enqueue semantics for true remote worktrees.                                                               | [`add-remote-enqueue-modes`](../openspec/changes/add-remote-enqueue-modes/)                         |
-| C1: Remote control security      | [THE-100](https://linear.app/blakeashley/issue/THE-100) | Todo / High      | Verify Unix IPC peer identity before granting the local administrative scope.                                                       | [`enforce-unix-control-peer-identity`](../openspec/changes/enforce-unix-control-peer-identity/)     |
-| C1: Remote control security      | [THE-101](https://linear.app/blakeashley/issue/THE-101) | Todo / High      | Define and enforce the TLS/confidentiality contract for remotely reachable control endpoints.                                       | [`secure-remote-control-transport`](../openspec/changes/secure-remote-control-transport/)           |
-| C2: Client contract truthfulness | [THE-103](https://linear.app/blakeashley/issue/THE-103) | Backlog / High   | Implement one bounded `browser.drive` contract or remove the advertised capability everywhere.                                      | [`remove-browser-drive-stub`](../openspec/changes/remove-browser-drive-stub/)                       |
 | C2: Client contract truthfulness | [THE-104](https://linear.app/blakeashley/issue/THE-104) | Backlog / Medium | Decide and publish whether external IDEs have an inbound handoff/control contract.                                                  | [`define-external-ide-inbound-boundary`](../openspec/changes/define-external-ide-inbound-boundary/) |
 | C2: Client contract truthfulness | [THE-105](https://linear.app/blakeashley/issue/THE-105) | Backlog / High   | Publish a truthful observer bootstrap/filter contract, including which stream owns terminal snapshots and deltas.                   | [`publish-observer-event-contract`](../openspec/changes/publish-observer-event-contract/)           |
 
@@ -131,16 +130,15 @@ published promises to what current surfaces can actually do.
 
 ### Plugin UI Platform
 
-| Milestone               | Issue                                                   | State / priority   | Remaining outcome                                                                                                               | Spec/change                                                                                       |
-| ----------------------- | ------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| P1: Contract baseline   | [THE-106](https://linear.app/blakeashley/issue/THE-106) | In Progress / High | Align v0.3 docs, JSON schemas, scope rules, wire vocabulary, and the host's accepted contributions.                             | [`align-plugin-v03-contract`](../openspec/changes/align-plugin-v03-contract/)                     |
-| P1: Contract baseline   | [THE-51](https://linear.app/blakeashley/issue/THE-51)   | Todo / Medium      | Complete runtime TUI localization and define how plugin-provided user-visible strings participate.                              | [`extend-localization-surfaces`](../openspec/changes/extend-localization-surfaces/)               |
-| P2: Runtime UI surfaces | [THE-108](https://linear.app/blakeashley/issue/THE-108) | Backlog / Medium   | Wire the already-declared `PanelSection` contribution end to end with lifecycle, safety, and tests.                             | [`add-ui-component-contract`](../openspec/changes/add-ui-component-contract/)                     |
-| P2: Runtime UI surfaces | [THE-107](https://linear.app/blakeashley/issue/THE-107) | Backlog / Medium   | Decide bounded contracts for sidebar, themes, and key zones without promising arbitrary rendering.                              | [`decide-plugin-ui-extension-surfaces`](../openspec/changes/decide-plugin-ui-extension-surfaces/) |
-| P2: Runtime UI surfaces | [THE-102](https://linear.app/blakeashley/issue/THE-102) | Backlog / Medium   | Decide and expose a provider-neutral debugger adapter/DAP surface; do not treat the BugStalker audit as broad debugger support. | [`define-debugger-adapter-surface`](../openspec/changes/define-debugger-adapter-surface/)         |
+| Milestone               | Issue                                                   | State / priority | Remaining outcome                                                                                                               | Spec/change                                                                                       |
+| ----------------------- | ------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| P1: Contract baseline   | [THE-51](https://linear.app/blakeashley/issue/THE-51)   | Todo / Medium    | Complete runtime TUI localization and define how plugin-provided user-visible strings participate.                              | [`extend-localization-surfaces`](../openspec/changes/extend-localization-surfaces/)               |
+| P2: Runtime UI surfaces | [THE-108](https://linear.app/blakeashley/issue/THE-108) | Backlog / Medium | Wire the already-declared `PanelSection` contribution end to end with lifecycle, safety, and tests.                             | [`add-ui-component-contract`](../openspec/changes/add-ui-component-contract/)                     |
+| P2: Runtime UI surfaces | [THE-107](https://linear.app/blakeashley/issue/THE-107) | Backlog / Medium | Decide bounded contracts for sidebar, themes, and key zones without promising arbitrary rendering.                              | [`decide-plugin-ui-extension-surfaces`](../openspec/changes/decide-plugin-ui-extension-surfaces/) |
+| P2: Runtime UI surfaces | [THE-102](https://linear.app/blakeashley/issue/THE-102) | Backlog / Medium | Decide and expose a provider-neutral debugger adapter/DAP surface; do not treat the BugStalker audit as broad debugger support. | [`define-debugger-adapter-surface`](../openspec/changes/define-debugger-adapter-surface/)         |
 
-P1 establishes a truthful contract before P2 grows it. Runtime extension points
-must remain bounded typed contributions; this project is not a promise of an
+The v0.3 baseline is truthful before P2 grows it. Runtime extension points must
+remain bounded typed contributions; this project is not a promise of an
 unrestricted DOM, terminal-frame, or arbitrary-code UI layer.
 
 ### Distribution & Release Readiness
@@ -156,31 +154,28 @@ possible operating system or package manager is supportable.
 
 ### Spec & Tracker Reconciliation
 
-| Milestone                       | Issue                                                   | State / priority     | Remaining outcome                                                                                                                              | Spec/change                                                                                     |
-| ------------------------------- | ------------------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| S1: One-time truth-up           | [THE-21](https://linear.app/blakeashley/issue/THE-21)   | In Progress / Medium | Make the shipped typed-event/catalog-action automation model normative and explicitly retain or reject missing triggers and operator controls. | [`add-automation-rules`](../openspec/changes/add-automation-rules/)                             |
-| S2: Continuous drift prevention | [THE-109](https://linear.app/blakeashley/issue/THE-109) | Todo / High          | Add machine-checkable drift gates for active/archived OpenSpec state, Linear delivery state, generated contracts, and public claims.           | [`enforce-delivery-state-drift-gates`](../openspec/changes/enforce-delivery-state-drift-gates/) |
+| Milestone             | Issue                                                 | State / priority     | Remaining outcome                                                                                                                              | Spec/change                                                         |
+| --------------------- | ----------------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| S1: One-time truth-up | [THE-21](https://linear.app/blakeashley/issue/THE-21) | In Progress / Medium | Make the shipped typed-event/catalog-action automation model normative and explicitly retain or reject missing triggers and operator controls. | [`add-automation-rules`](../openspec/changes/add-automation-rules/) |
 
 ## Whole-repository OpenSpec state
 
 The alpha initiative does not silently absorb the entire product idea backlog.
-As of the 2026-09-08 reconciliation, 66 active changes remain. All 66 contain
-unchecked implementation or decision work; there are
-zero mechanically complete or taskless changes left waiting to be archived.
-The active task ledger contains 452 checked and 517 unchecked tasks. The final
-strict validation snapshot is 141 passed and zero failed: 66 active changes and
-75 accepted capability specs.
+Every directory currently under `openspec/changes/` is intentionally classified
+in [`delivery/index.json`](../delivery/index.json). The index distinguishes
+proposed, active, delivered-awaiting-archive, superseded, and
+verification-gated work. Live totals are derived with
+`python3 scripts/delivery_state.py report`; this document does not copy them.
 
-The original 21 alpha changes map to 24 alpha issues. One shipped-path signing
-bug extracted from `add-scm-workflow-customization` adds THE-131, for 25 alpha
-issues total. The 45-change set previously outside Linear maps to 38 detailed
-Backlog issues in the Post-Alpha Roadmap; that SCM change spans both initiatives
-because its High bug and Medium greenfield features have different urgency.
+The alpha changes map to the issue ledger above. The shipped-path signing fix
+is complete; `add-scm-workflow-customization` remains active only for four
+separately bounded, deferred greenfield workflows. The prior outside-Linear
+change set is represented in the Post-Alpha Roadmap rather than silently
+expanding alpha scope.
 Overlapping or superseded changes share a consolidation/retirement owner rather
 than producing duplicate work.
 
-The post-alpha priority mix is 6 High, 29 Medium, and 3 Low. Medium is the
-normal priority for comparable greenfield capabilities. The six High issues are
+Medium is the normal priority for comparable greenfield capabilities. High is
 limited to demonstrated pipeline correctness, credential custody,
 billable-provider leak safety, and Windows release/support evidence. No
 post-alpha issue is In Progress or Todo, assigned, scheduled, or an alpha
@@ -205,6 +200,12 @@ THE-17, THE-19, THE-20, THE-22, THE-26, THE-27, THE-32, THE-34, THE-40,
 THE-49, THE-55, THE-60, THE-62, THE-69, and THE-91. Each closure includes code,
 test, or accepted-spec evidence in Linear. Broader residual promises were split
 into THE-97 through THE-109 rather than hidden inside completed work.
+
+The 2026-09-09 remediation completed THE-90, THE-94, THE-95, THE-96, THE-100,
+THE-101, THE-103, THE-106, THE-109, and THE-131. Seven standalone OpenSpec
+changes were reconciled into accepted specifications; THE-131's completed
+signing slice was removed from the still-active shared SCM change without
+closing its four Medium-priority greenfield owners.
 
 The reconciliation archived 62 delivered OpenSpec changes. The initial
 issue-linked set was:
@@ -300,6 +301,6 @@ ticket with a shipped slice and a real residual should be split, not partially
 closed by prose. A new capability must link its Linear issue in the proposal and
 its active OpenSpec path in Linear.
 
-Run `just openspec-validate` for strict spec validation. THE-109 owns the
-remaining automation needed to make this policy a CI-enforced invariant rather
-than a periodic manual audit.
+Run `just delivery-check` for the repository/Linear ownership graph and
+generated-contract drift gates, and `just openspec-validate` for strict spec
+validation.

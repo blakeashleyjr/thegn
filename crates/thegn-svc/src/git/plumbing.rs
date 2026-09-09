@@ -7,7 +7,7 @@
 //! These are the seams `thegn-core::fold` drives through a thin adapter; the
 //! fold *algorithm* lives in core (pure, gated tests), the *I/O* lives here.
 
-use super::{GitBackend, gpg_args, run, run_stdin, run_w};
+use super::{GitBackend, gpg_args, run, run_background_commit_stdin, run_w};
 use anyhow::{Context, Result};
 use thegn_core::fold::{Author, CommitMeta};
 use thegn_core::remote::GitLoc;
@@ -151,10 +151,11 @@ pub trait PlumbingOps: GitBackend {
     /// [`commit_tree`](Self::commit_tree) with two policy knobs:
     ///
     /// - `sign` ⇒ pass `-S` (honoring the active identity's `gpg.format` /
-    ///   `user.signingkey`). Signing is **non-interactive**: `run_stdin` sets
-    ///   `GIT_TERMINAL_PROMPT=0` and a null stdin, so a gpg/ssh-agent that would
-    ///   prompt fails fast rather than hanging the daemon fold — the caller
-    ///   classifies that failure as infrastructure, never a bad branch.
+    ///   `user.signingkey`). Signing is **non-interactive**: the dedicated
+    ///   background-commit runner closes the message pipe, exposes no tty /
+    ///   askpass/display surface, and bounds the operation. It reaps Git on all
+    ///   platforms and kills its isolated process group on Unix. The caller
+    ///   classifies failure as infrastructure, never a bad branch.
     /// - `author` ⇒ preserve the original author (name/email/date) while the
     ///   committer stays the ambient identity — how a `rebase` land keeps
     ///   authorship, exactly like `git rebase`.
@@ -187,9 +188,11 @@ pub trait PlumbingOps: GitBackend {
                 env.push(("GIT_AUTHOR_DATE", a.date.as_str()));
             }
         }
-        Ok(run_stdin(loc, &env, &args, msg.as_bytes())?
-            .trim()
-            .to_string())
+        Ok(
+            run_background_commit_stdin(loc, &env, &args, msg.as_bytes())?
+                .trim()
+                .to_string(),
+        )
     }
 
     /// [`merge_tree`](Self::merge_tree) with an **explicit** merge base
@@ -310,7 +313,7 @@ pub trait PlumbingOps: GitBackend {
         // `-c commit.gpgSign=false …` must precede the subcommand — prepend it.
         let mut args: Vec<&str> = gpg_args(override_gpg).to_vec();
         args.extend_from_slice(&["commit", "--no-verify", "-F", "-"]);
-        run_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())?;
+        run_background_commit_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())?;
         Ok(Some(self.rev_parse(loc, "HEAD")?))
     }
 }
@@ -508,9 +511,15 @@ mod tests {
         // Without the override, the ambient gpgsign makes the very same snapshot
         // fail (a real agent would hang instead) — this is what the fix guards.
         std::fs::write(repo.dir.join("f.txt"), "edited-again\n").unwrap();
+        let before_failed_snapshot = repo.head();
         assert!(
             CliGit.snapshot_worktree(&loc, "snap gpg 2", false).is_err(),
             "without override_gpg, an ambient commit.gpgSign snapshots must not succeed silently"
+        );
+        assert_eq!(
+            repo.head(),
+            before_failed_snapshot,
+            "a failed ambient signature must not advance the branch"
         );
     }
 }

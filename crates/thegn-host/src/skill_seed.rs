@@ -1089,8 +1089,10 @@ mod tests {
 
     #[test]
     fn unknown_configured_harness_does_not_fall_back_to_claude() {
-        let mut cfg = Config::default();
-        cfg.agents = vec![named("custom", "missing-harness")];
+        let cfg = Config {
+            agents: vec![named("custom", "missing-harness")],
+            ..Default::default()
+        };
         let (harnesses, diagnostics) = configured_harnesses(&cfg);
         assert!(harnesses.is_empty(), "{harnesses:?}");
         assert!(
@@ -1103,14 +1105,22 @@ mod tests {
     #[test]
     fn seeds_each_configured_harness_in_its_native_layout() {
         let wt = worktree();
-        let mut cfg = Config::default();
-        cfg.agents = vec![
-            named("claude", "claude"),
-            named("codex", "codex"),
-            named("pi", "pi"),
-        ];
-        cfg.merge_queue.enabled = true;
-        cfg.pipeline.stages.push(Default::default());
+        let cfg = Config {
+            agents: vec![
+                named("claude", "claude"),
+                named("codex", "codex"),
+                named("pi", "pi"),
+            ],
+            merge_queue: thegn_core::config::MergeQueueConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            pipeline: thegn_core::config_pipeline::Pipeline {
+                stages: vec![Default::default()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let report = seed(&cfg, wt.path(), SeedPhase::Explicit).unwrap();
         for root in [".claude/skills", ".agents/skills", ".pi/skills"] {
             assert!(wt.path().join(root).join("mq/SKILL.md").is_file(), "{root}");

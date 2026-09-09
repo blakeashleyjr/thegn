@@ -12,7 +12,7 @@ use tokio::task;
 
 use termwiz::terminal::TerminalWaker;
 
-use crate::chrome::{FrameModel, LoadStep};
+use crate::chrome::{FrameModel, LoadStep, StateDbAvailability};
 use crate::glyph_types::GlyphRow;
 use crate::hydrate_tuning::{bg_glyph_ttl, model_refresh_interval};
 use crate::run::now_secs;
@@ -3507,6 +3507,24 @@ fn needs_fallback_send<T>(outcome: &std::thread::Result<Option<T>>) -> bool {
     !matches!(outcome, Ok(Some(_)))
 }
 
+/// Preserve the schema-specific refusal across the worker boundary without
+/// parsing its operator-facing message. All unrelated open failures remain a
+/// distinct generic-unavailable state.
+fn classify_db_open_error(error: &anyhow::Error) -> StateDbAvailability {
+    match error.downcast_ref::<thegn_core::db::MigrationAccessError>() {
+        Some(thegn_core::db::MigrationAccessError::NewerSchema {
+            observed,
+            supported,
+        }) => StateDbAvailability::SchemaRefused {
+            observed: *observed,
+            build: *supported,
+        },
+        _ => StateDbAvailability::Unavailable {
+            detail: error.to_string(),
+        },
+    }
+}
+
 /// `gen` tags the result so the event loop can drop models that were spawned
 /// before a workspace/worktree switch but land after it (spawn_blocking tasks
 /// complete out of order; a stale model would resurrect the old sidebar).
@@ -3538,6 +3556,7 @@ pub(crate) fn spawn_model_hydration(
         // catch panics, and on any failure fall back to the cheap first-frame model
         // (still tagged `generation`) so the gate clears and the UI degrades to
         // last-known/cached data instead of freezing.
+        let mut db_failure = None;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // THE-78: the startup git heal runs concurrently on its own thread; a
             // stray `core.worktree` in the shared `.git/config` makes every git
@@ -3550,12 +3569,17 @@ pub(crate) fn spawn_model_hydration(
                     crate::startup_heal::BARRIER_TIMEOUT_MS,
                 ));
             }
-            let Ok(db) = thegn_core::db::Db::open() else {
-                tracing::warn!(
-                    target: "thegn::hydrate",
-                    "Db::open failed during model hydration — falling back to cheap model"
-                );
-                return None;
+            let db = match thegn_core::db::Db::open() {
+                Ok(db) => db,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "thegn::hydrate",
+                        error = %error,
+                        "Db::open failed during model hydration — preserving typed availability"
+                    );
+                    db_failure = Some(classify_db_open_error(&error));
+                    return None;
+                }
             };
             let first = {
                 let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
@@ -3603,7 +3627,10 @@ pub(crate) fn spawn_model_hydration(
             );
         }
         if needs_fallback_send(&outcome) {
-            let fallback = build_initial_model(&session, None);
+            let mut fallback = build_initial_model(&session, None);
+            fallback.state_db = db_failure.unwrap_or_else(|| StateDbAvailability::Unavailable {
+                detail: "model hydration panicked".into(),
+            });
             if tx.send((generation, fallback)).is_ok()
                 && let Some(w) = &waker
             {

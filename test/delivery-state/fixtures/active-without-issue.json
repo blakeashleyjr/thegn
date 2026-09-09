@@ -1,0 +1,36 @@
+{
+  "name": "active-without-issue",
+  "active_changes": {
+    "unowned-change": "# Tasks\n\n- [ ] implement\n"
+  },
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": [
+      "Fixture Project"
+    ],
+    "entries": [
+      {
+        "change": "unowned-change",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "issue_inventory": {
+    "$schema": "./issues-schema.json",
+    "schema_version": 1,
+    "scope": "Synthetic active issue inventory for an unowned-change fixture.",
+    "issues": [
+      {
+        "issue": "THE-2",
+        "project": "Fixture Project",
+        "changes": [],
+        "no_spec_rationale": "Tracking-only synthetic issue with no normative product change."
+      }
+    ]
+  },
+  "expected_error": "neither Linear/project owner nor reviewed rationale"
+}

@@ -519,6 +519,8 @@
         # worktrees / branch switches; it and Cargo incremental are mutually
         # exclusive, so CARGO_INCREMENTAL=0 lets it work (the fast single-crate
         # iterative path is `just quick <crate>`).
+        # Host/dev-shell input only. `[sandbox].compiler_cache` is the sole
+        # authority at the containment boundary and strips this by default.
         export RUSTC_WRAPPER=sccache
         export CARGO_INCREMENTAL=0
         # Bound the sccache cache so it can't creep unbounded on the dev box

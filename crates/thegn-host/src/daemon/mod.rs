@@ -100,12 +100,12 @@ pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
 /// direct analogue.
 ///
 /// Vetted, not trusted: `$TMPDIR` is attacker-settable in a hostile environment,
-/// and the local control plane grants admin to any socket peer
-/// ([`thegn_core::config::ServeConfig::local_admin`]) — so a world-writable or
-/// foreign-owned directory here would let someone else bind the socket first and
-/// impersonate the daemon. Require a real directory, owned by us, with no group
-/// or other access. Anything less ⇒ `None` ⇒ no relocation, and the caller
-/// degrades to in-process panes instead.
+/// and the local control plane can grant same-EUID peers implicit admin
+/// ([`thegn_core::config::ServeConfig::local_admin`]). A world-writable or
+/// foreign-owned directory would still permit endpoint replacement or daemon
+/// impersonation. Require a real directory, owned by us, with no group or other
+/// access. Anything less ⇒ `None` ⇒ no relocation, and the caller degrades to
+/// in-process panes instead.
 fn short_runtime_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -129,6 +129,12 @@ pub(crate) struct ServeOpts {
     pub bind: Option<String>,
     /// Skip minting + printing the startup pairing URL.
     pub no_pair_url: bool,
+    /// Dedicated trusted CLI escape hatch for plaintext non-loopback serving.
+    pub unsafe_allow_plaintext_non_loopback: bool,
+    /// Trusted CLI override for the client-facing host.
+    pub advertise_host: Option<String>,
+    /// Trusted CLI override for the client-facing port.
+    pub advertise_port: Option<u16>,
 }
 
 /// Entry point for the hidden `thegn daemon` subcommand: builds the runtime
@@ -175,14 +181,28 @@ async fn run(
         log.file = cfg.log.file || std::env::var_os("THEGN_LOG").is_some();
         thegn_core::log_trace::install(thegn_core::log_trace::Role::Daemon, &log);
     }
+    let serve_transport = serve
+        .as_ref()
+        .map(|options| {
+            let mut effective = cfg.serve.clone();
+            if let Some(host) = &options.advertise_host {
+                effective.advertise_host = host.clone();
+            }
+            if let Some(port) = options.advertise_port {
+                effective.advertise_port = port;
+            }
+            effective.resolve_transport(
+                options.bind.as_deref(),
+                options.unsafe_allow_plaintext_non_loopback,
+            )
+        })
+        .transpose()
+        .map_err(anyhow::Error::msg)
+        .context("invalid remote control transport")?;
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
-        std::fs::create_dir_all(parent).ok(); // best-effort: dir prep: a later write reports the real failure
-        // Owner-only (0700) on the run-dir holding the control socket: the
-        // XDG_RUNTIME_DIR path is already 0700, but the state-dir fallback
-        // (`$XDG_STATE_HOME/thegn/run`, used when XDG_RUNTIME_DIR is unset —
-        // ssh-without-logind, cron, containers) inherits the umask. Best-effort.
-        let _ = thegn_core::fsperm::restrict_dir_to_owner(parent);
+        thegn_svc::ipc::prepare_control_directory(parent, cfg.serve.local_admin)
+            .with_context(|| format!("harden control directory {}", parent.display()))?;
     }
     // Pre-check the `sun_path` bound. The compositor degrades to in-process
     // panes on this (see `handlers::startup::daemon_active`), but a DIRECT
@@ -207,9 +227,12 @@ async fn run(
     // The endpoint is the lock (unix socket / Windows named pipe — see
     // `thegn_svc::ipc`). A connectable endpoint ⇒ a live daemon ⇒ exit 0
     // (the spawn race's loser); a stale socket file is unlinked in the seam.
-    let listener = match thegn_svc::ipc::IpcListener::bind_exclusive(&ep)
-        .await
-        .with_context(|| format!("bind {}", ep.display()))?
+    let listener = match thegn_svc::ipc::IpcListener::bind_exclusive_with_hardening(
+        &ep,
+        cfg.serve.local_admin,
+    )
+    .await
+    .with_context(|| format!("bind {}", ep.display()))?
     {
         thegn_svc::ipc::BindOutcome::Bound(l) => l,
         thegn_svc::ipc::BindOutcome::AlreadyRunning => {
@@ -362,22 +385,34 @@ async fn run(
         api: svc.clone(),
         store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
         local_admin: cfg.serve.local_admin,
+        daemon_euid: thegn_svc::ipc::effective_uid(),
         require_approval: cfg.serve.require_approval,
         server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
         // The unix-socket listener is local-only; browsers never dial it, so no
         // CORS is applied here (the allowlist rides the TCP listener below).
         cors_origins: Vec::new(),
     };
-    let app = thegn_svc::control::http::router(state);
+    let local_grpc = thegn_svc::control::grpc::GrpcControl {
+        api: svc.clone(),
+        store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: cfg.serve.local_admin,
+        daemon_euid: thegn_svc::ipc::effective_uid(),
+        server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
+    };
+    let app = thegn_svc::control::http::router(state).merge(
+        tonic::service::Routes::new(thegn_svc::control::grpc::ControlServer::new(local_grpc))
+            .into_axum_router(),
+    );
 
-    // Serve mode: a TCP listener for remote thin clients — the same HTTP/WS
-    // surface merged with the gRPC service, bearer tokens REQUIRED (never
-    // local_admin on TCP) — plus a startup pairing URL. v1 is plaintext:
-    // bind to a trusted interface (tailscale/wireguard) or reach it over
-    // `ssh -L`; every request is still token-gated.
+    // Serve mode: one policy-controlled TCP listener for HTTP/WS/SSE + gRPC,
+    // with bearer tokens REQUIRED (never local_admin on TCP). Native transport
+    // is plaintext: direct mode is loopback-only; declared TLS termination and
+    // tunnel modes also keep the backend loopback and advertise their actual
+    // public scheme. Non-loopback plaintext requires the explicit unsafe flag.
     if let Some(opts) = serve {
-        let bind = opts.bind.unwrap_or_else(|| cfg.serve.bind.clone());
-        let tcp = tokio::net::TcpListener::bind(&bind)
+        let transport = serve_transport.expect("serve transport resolved with serve options");
+        let bind = transport.bind;
+        let tcp = tokio::net::TcpListener::bind(bind)
             .await
             .with_context(|| format!("bind {bind}"))?;
         let actual = tcp.local_addr().context("serve local_addr")?;
@@ -395,6 +430,7 @@ async fn run(
             api: svc.clone(),
             store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
             local_admin: false,
+            daemon_euid: None,
             require_approval: cfg.serve.require_approval,
             server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
             // Browser-hosted thin clients opt in per `[serve] cors_origins`
@@ -406,6 +442,7 @@ async fn run(
             api: svc.clone(),
             store: db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
             local_admin: false,
+            daemon_euid: None,
             server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
         };
         let tcp_app = thegn_svc::control::http::router(tcp_state).merge(
@@ -422,7 +459,21 @@ async fn run(
             }
         });
 
-        thegn_core::outln!("thegn control plane listening on {actual} (HTTP/WS + gRPC)");
+        let advertised = transport.advertised_origin(actual.port());
+        thegn_core::outln!(
+            "thegn control backend listening on {actual} (HTTP/WS + gRPC; scoped tokens required)"
+        );
+        thegn_core::outln!(
+            "remote transport: {} · advertised {advertised} · WebSocket {} · gRPC {}",
+            transport.exposure.as_str(),
+            transport.websocket_scheme(),
+            transport.grpc_scheme(),
+        );
+        if transport.exposure == thegn_core::config::ServeExposure::UnsafePlaintext {
+            thegn_core::outln!(
+                "WARNING: explicit unsafe plaintext non-loopback exposure is enabled; bearer credentials and terminal traffic are observable in transit"
+            );
+        }
         if !opts.no_pair_url {
             let now = now_ms();
             let minted = thegn_svc::control::auth::mint(
@@ -438,9 +489,10 @@ async fn run(
                 db.put_pairing(&minted.row)?;
             }
             let url = thegn_core::control::PairingUrl {
-                host: hostname(),
-                port: actual.port(),
+                host: transport.advertise_host.clone(),
+                port: transport.advertise_port(actual.port()),
                 code: minted.token,
+                secure: transport.http_scheme() == "https",
                 fp: None,
             };
             thegn_core::outln!("pair a client (single-use, read scope, 15 min):");
@@ -454,8 +506,11 @@ async fn run(
 
     tracing::info!(target: "thegn::daemon", %daemon_id, "pane daemon serving on {}", ep.display());
     let shutdown_wait = shutdown.clone();
-    let serve = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown_wait.notified().await });
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+    )
+    .with_graceful_shutdown(async move { shutdown_wait.notified().await });
     let result = serve.await;
 
     // Cleanup: registry row + socket file. Leases stay only if sessions do —

@@ -67,6 +67,9 @@ for a branch already merged. Within that, `[merge_queue]` lets you shape it:
   that would prompt stops the drain as an _infrastructure_ error with a
   reason — it never marks the branch `needs_human` and never wakes the
   fixing agent, because a signing fault is not the branch's fault.
+  Automated commits have a 120-second internal fail-safe: Git is killed and
+  the timeout is reported without advancing either ref (on Unix, the isolated
+  signer/hook process group is killed too).
   `thegn doctor` probes signing readiness when this is on.
 - **`rerere`** — reuse recorded conflict resolutions across drains
   (shared `rr-cache`), so a conflict resolved once auto-resolves next
@@ -124,6 +127,14 @@ expiry-swept — only branches landed through the queue (a `landed` row) are
 collected. Remove such a worktree yourself once you're done with it. (Under
 `on_landed = "off"` a `thegn land` instead clears any stale _Merging_ /
 _Needs attention_ membership, so a fold-actor land never strands it.)
+
+`thegn land` declares the exact state-DB capabilities needed for the remote
+target guard and this folder bookkeeping. It may therefore operate on the
+supported older schema without migrating it. If the guard or schema preflight
+is unavailable, land refuses before moving git refs. If an I/O failure occurs
+only after git has already landed but before the folder update, the command
+prints an explicit `sidebar lifecycle bookkeeping unavailable` degraded result
+instead of silently claiming that every side effect completed.
 
 The fold advances the ref without checking anything out, so any worktree
 sitting **on** the target would be left with a stale working tree. Every

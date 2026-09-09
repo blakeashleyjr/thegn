@@ -141,8 +141,9 @@ search	replace
 secret rm	name
 secret set	name
 secret ssh rotate	account
+serve	advertise_host
+serve	advertise_port
 serve	bind
-session browse	url
 session open	prompt
 session send	text
 session split	argv

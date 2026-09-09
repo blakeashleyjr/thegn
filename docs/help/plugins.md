@@ -24,6 +24,10 @@ Two equivalent homes:
 Check what thegn sees with `thegn plugin list`; validate everything (api
 compatibility, command presence, contribution acceptance) with
 `thegn plugin check` — it exits non-zero on problems, so it fits a hook.
+For each enabled plugin, `check` prints the negotiated plugin/host API versions,
+host-call scopes, granted and missing capabilities, and every accepted or
+rejected contribution with its rejection reason. Inspection never starts the
+plugin process.
 
 ## Modes and rendering
 
@@ -43,11 +47,22 @@ log surface them.
 
 Those three rendering/event points plus `IssueProvider` are the extension
 points the general compositor host accepts. `PanelSection`, `SidebarTab`,
-`Theme`, `Automation`, harness/program adapters, and CI/forge providers are
-wire vocabulary only there: `thegn plugin check` rejects them until their host
-runtime lands. `DataSource` has a separate, calendar-account-specific command
-adapter; it is not a general UI contribution. Native theme files and configured
-drawer tools are not runtime plugin surfaces.
+`Theme`, `Automation`, `HarnessAdapter`, `ProgramAdapter`, `CiProvider`, and
+`ForgeProvider` are wire vocabulary only there: `thegn plugin check` rejects
+them until their host runtime lands. `DataSource` has a separate,
+calendar-account-specific command adapter; it is not a general UI
+contribution. Native theme files and configured drawer tools are not runtime
+plugin surfaces.
+
+The machine-readable source for this classification is embedded in
+`docs/api/plugin-api-0.3.json` as `x-thegn-extension-support`; its companion
+`x-thegn-host-verb-support` table names verb authority and permitted modes, and
+`x-thegn-host-call-capabilities` is the exact set of dispatchable catalog ids.
+`StatusBarSegment`, `NotificationSource`, and `PaletteAction` accept one-shot
+or resident plugins. `IssueProvider` is resident-only because provider calls
+need a reply channel. Palette actions and providers are on-demand; status and
+notification contributions may also use an interval. Other cadence/mode
+combinations fail `plugin check` with an actionable reason.
 
 ## Provider plugins
 
@@ -75,7 +90,9 @@ requests (invoking a host capability like `worktrees.list` by catalog id)
 are checked against the plugin's `scopes` — the same `read`/`write`/`git`/
 `exec`/`admin` lattice as control-API tokens. `write`, `git`, and `exec` are
 independent; `admin` implies all scopes. Undeclared means denied, and every
-denial is audited.
+denial is audited. `tools.run` is the current exec-scoped plugin call;
+`launch.preset` remains CLI-first and is not advertised to plugins until its
+generic control route exists.
 
 Crashed resident plugins restart with backoff (three attempts, then disabled
 until config reload). Plugin processes are _not_ sandboxed — treat a plugin

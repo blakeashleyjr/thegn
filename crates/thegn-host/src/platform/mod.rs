@@ -43,6 +43,16 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+/// Platform-owned details for the daemon's local administrative endpoint.
+/// The doctor owns presentation; this seam owns the OS identity primitive and
+/// endpoint-hardening check that give those labels their meaning.
+pub(crate) struct LocalControlSecurity {
+    pub(crate) auth: &'static str,
+    pub(crate) peer_identity: &'static str,
+    pub(crate) hardening: &'static str,
+    pub(crate) error: Option<String>,
+}
+
 #[cfg(test)]
 pub(crate) fn test_assert_owner_only_permissions(
     file: &std::path::Path,

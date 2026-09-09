@@ -98,6 +98,9 @@ impl SandboxOverlay {
         if let Some(v) = self.auto_caches {
             base.auto_caches = v;
         }
+        if let Some(v) = self.compiler_cache {
+            base.compiler_cache = v;
+        }
         if let Some(v) = self.mounts {
             base.mounts = v;
         }
@@ -177,6 +180,7 @@ impl SandboxOverlay {
             && self.compose.is_none()
             && self.env_passthrough.is_none()
             && self.auto_caches.is_none()
+            && self.compiler_cache.is_none()
             && self.mounts.is_none()
             && self.init_script.is_none()
             && self.prepare.is_none()

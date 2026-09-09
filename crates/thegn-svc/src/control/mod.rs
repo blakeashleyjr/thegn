@@ -315,22 +315,6 @@ pub struct AttachReply {
     pub frames: tokio::sync::mpsc::Receiver<EventFrame>,
 }
 
-/// The preview-browser verb payload — defined now so the contract is stable;
-/// v1 always answers [`ControlError::Unimplemented`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct BrowserCommand {
-    pub session: Option<String>,
-    pub action: BrowserAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum BrowserAction {
-    Navigate { url: String },
-    Reload,
-    Back,
-}
-
 /// A bounded, credential-free preview fetch request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PreviewFetchRequest {
@@ -898,9 +882,6 @@ pub trait ControlApi: Send + Sync + 'static {
     ) -> BoxFuture<'_, ControlResult<()>> {
         Box::pin(async { Err(ControlError::Unimplemented("open_editor")) })
     }
-
-    /// Command the preview browser. v1: always `Err(Unimplemented)`.
-    fn drive_browser(&self, cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>>;
 
     /// Perform one bounded, credential-free HTTP GET for `preview.fetch`.
     fn preview_fetch(

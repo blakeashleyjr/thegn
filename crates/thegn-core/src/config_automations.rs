@@ -677,9 +677,11 @@ urgency = "alert"
 
     #[test]
     fn active_profile_is_trusted_but_repo_automation_is_only_warned() {
-        let mut cfg = crate::config::Config::default();
-        cfg.automations = valid();
-        cfg.profile = "work".into();
+        let mut cfg = crate::config::Config {
+            automations: valid(),
+            profile: "work".into(),
+            ..Default::default()
+        };
         cfg.profiles.insert(
             "work".into(),
             crate::config::ProfileConfig {

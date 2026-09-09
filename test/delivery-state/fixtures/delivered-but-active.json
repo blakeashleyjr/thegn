@@ -1,0 +1,28 @@
+{
+  "name": "delivered-but-active",
+  "active_changes": {
+    "finished-change": "# Tasks\n\n- [x] implement\n- [x] verify\n"
+  },
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": [
+      "Fixture Project"
+    ],
+    "entries": [
+      {
+        "change": "finished-change",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [
+          {
+            "issue": "THE-1",
+            "project": "Fixture Project"
+          }
+        ],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "expected_error": "all tracked tasks are complete but lifecycle is active"
+}

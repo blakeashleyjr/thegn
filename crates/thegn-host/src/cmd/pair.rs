@@ -15,7 +15,7 @@ pub enum PairAction {
     /// Mint a single-use pairing code and print its pairing URL. The code is
     /// shown ONCE (only its hash is stored).
     New {
-        /// Scopes the redeemed token will hold (csv of read,write,git,admin).
+        /// Scopes the redeemed token will hold (csv of read,write,git,exec,admin).
         #[arg(long, default_value = "read")]
         scope: String,
         /// Human label shown in `pair list` and approval prompts.
@@ -24,12 +24,13 @@ pub enum PairAction {
         /// Code lifetime in minutes.
         #[arg(long, default_value_t = 15)]
         ttl_mins: i64,
-        /// Host to embed in the printed pairing URL (defaults to this
-        /// machine's hostname — override with the address clients reach).
+        /// Host to embed in the printed pairing URL (defaults to
+        /// `[serve] advertise_host` or the concrete bind IP). Safe direct mode
+        /// accepts only a loopback IP or localhost name.
         #[arg(long)]
         host: Option<String>,
-        /// Port to embed in the printed pairing URL (`[serve] bind`'s port
-        /// by default).
+        /// Port to embed in the printed pairing URL (the resolved public port
+        /// by default: 443 for TLS termination, otherwise the backend port).
         #[arg(long)]
         port: Option<u16>,
     },
@@ -51,8 +52,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-use thegn_core::util::hostname;
-
 pub fn run(cfg: &Config, action: PairAction) -> Result<()> {
     let db = Db::open()?;
     match action {
@@ -63,9 +62,24 @@ pub fn run(cfg: &Config, action: PairAction) -> Result<()> {
             host,
             port,
         } => {
+            // Treat URL overrides as inputs to the same validated policy as
+            // startup. In particular, `--host` must not bypass host-only URL
+            // validation and accidentally place a path/query beside a secret.
+            let mut effective_serve = cfg.serve.clone();
+            if let Some(host) = host {
+                effective_serve.advertise_host = host;
+            }
+            if let Some(port) = port {
+                effective_serve.advertise_port = port;
+            }
+            let transport = effective_serve
+                .resolve_transport(None, false)
+                .map_err(anyhow::Error::msg)?;
             let scopes = ScopeSet::parse(&scope);
             if scopes.is_empty() {
-                anyhow::bail!("no valid scopes in {scope:?} (use csv of read,write,git,admin)");
+                anyhow::bail!(
+                    "no valid scopes in {scope:?} (use csv of read,write,git,exec,admin)"
+                );
             }
             let now = now_ms();
             let minted = auth::mint(
@@ -77,18 +91,11 @@ pub fn run(cfg: &Config, action: PairAction) -> Result<()> {
                 now,
             );
             db.put_pairing(&minted.row)?;
-            let port = port.unwrap_or_else(|| {
-                cfg.serve
-                    .bind
-                    .rsplit(':')
-                    .next()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(5380)
-            });
             let url = PairingUrl {
-                host: host.unwrap_or_else(hostname),
-                port,
+                host: transport.advertise_host.clone(),
+                port: transport.advertise_port(transport.bind.port()),
                 code: minted.token,
+                secure: transport.http_scheme() == "https",
                 fp: None,
             };
             outln!("pairing id : {}", minted.row.pairing_id);

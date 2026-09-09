@@ -12,6 +12,7 @@
 //! handler reaps the orphaned tab via the typed, off-loop reconciliation result
 //! — nothing in `apply` touches the session.
 
+use anyhow::Result;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,13 +44,40 @@ pub(crate) fn apply(
     if Path::new(worktree) == repo_root {
         return;
     }
-    match decide(cfg, event) {
-        LifecycleAction::Noop => {}
+    let result = match decide(cfg, event) {
+        LifecycleAction::Noop => Ok(()),
         LifecycleAction::FileInto(folder) => file_into(db, repo_root, worktree, branch, &folder),
         LifecycleAction::RemoveWorktree { delete_branch } => {
-            remove_landed(db, repo_root, worktree, branch, delete_branch)
+            remove_landed(db, repo_root, worktree, branch, delete_branch);
+            Ok(())
         }
         LifecycleAction::Unfile => unfile(cfg, db, repo_root, worktree),
+    };
+    if let Err(error) = result {
+        thegn_core::msg::warn(&format!("merge lifecycle bookkeeping unavailable: {error}"));
+    }
+}
+
+/// Checked execution for the one-shot `thegn land` path. Unlike the queue's
+/// best-effort lifecycle, the caller receives every database failure and must
+/// either fail before landing or explicitly report degraded post-land state.
+pub(crate) fn apply_landed_in_place_checked(
+    cfg: &MergeQueueConfig,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+) -> Result<()> {
+    if Path::new(worktree) == repo_root {
+        return Ok(());
+    }
+    match decide(cfg, LifecycleEvent::LandedInPlace) {
+        LifecycleAction::Noop => Ok(()),
+        LifecycleAction::FileInto(folder) => file_into(db, repo_root, worktree, branch, &folder),
+        LifecycleAction::Unfile => unfile(cfg, db, repo_root, worktree),
+        LifecycleAction::RemoveWorktree { .. } => {
+            anyhow::bail!("land-in-place lifecycle unexpectedly requested worktree removal")
+        }
     }
 }
 
@@ -59,29 +87,25 @@ pub(crate) fn apply(
 /// so it only clears membership of a folder the lifecycle itself manages: if the
 /// user has since hand-filed the worktree into a folder of their own, it is left
 /// alone. Best-effort — sidebar bookkeeping must never fail a queue mutation.
-fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) {
+fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) -> Result<()> {
     // The worktree's current folder, if any. No row / no folder ⇒ nothing to do.
-    let Some(fid) = db.worktrees().ok().and_then(|rows| {
-        rows.into_iter()
-            .find(|w| w.worktree == worktree)
-            .and_then(|w| w.folder_id)
-    }) else {
-        return;
+    let Some(fid) = db
+        .worktrees()?
+        .into_iter()
+        .find_map(|w| (w.worktree == worktree).then_some(w.folder_id).flatten())
+    else {
+        return Ok(());
     };
     // Resolve that folder's name (keyed by the worktree's own workspace string,
     // the same resolution `file_into` uses) and only un-file when it is one the
     // lifecycle manages.
-    let recorded = db.repo_root_for(worktree).ok().flatten();
-    let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref());
+    let recorded = db.repo_root_for(worktree)?;
+    let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref())?;
     let name = db
-        .folders_for_workspace(&repo_path)
-        .ok()
-        .and_then(|folders| {
-            folders
-                .into_iter()
-                .find(|f| f.folder_id == fid)
-                .map(|f| f.name)
-        });
+        .folders_for_workspace(&repo_path)?
+        .into_iter()
+        .find(|f| f.folder_id == fid)
+        .map(|f| f.name);
     let is_lifecycle_folder = |n: &str| {
         let n = n.trim();
         !n.is_empty()
@@ -90,8 +114,9 @@ fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) {
                 || n == cfg.merged_folder.trim())
     };
     if name.as_deref().map(is_lifecycle_folder).unwrap_or(false) {
-        let _ = db.set_worktree_folder(worktree, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        db.set_worktree_folder(worktree, None)?;
     }
+    Ok(())
 }
 
 /// The exact `workspaces.repo_path` string the sidebar keys folders by, for the
@@ -102,42 +127,38 @@ fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) {
 /// recorded path or `repo_root`) then by canonicalized path; fall back to the
 /// recorded worktree path, then `repo_root`. Runs off-loop, so the `canonicalize`
 /// stat is fine.
-fn workspace_repo_path(db: &Db, repo_root: &Path, recorded: Option<&str>) -> String {
-    if let Ok(rows) = db.workspaces() {
-        let want = std::fs::canonicalize(repo_root).ok(); // best-effort: optional input: a vanished path just fails the match; the caller falls back to the raw root
-        if let Some(w) = rows.iter().find(|w| {
-            Some(w.repo_path.as_str()) == recorded
-                || Path::new(&w.repo_path) == repo_root
-                || (want.is_some() && std::fs::canonicalize(&w.repo_path).ok() == want)
-        }) {
-            return w.repo_path.clone();
-        }
+fn workspace_repo_path(db: &Db, repo_root: &Path, recorded: Option<&str>) -> Result<String> {
+    let rows = db.workspaces()?;
+    let want = std::fs::canonicalize(repo_root).ok(); // best-effort: optional input: a vanished path just fails the match; the caller falls back to the raw root
+    if let Some(w) = rows.iter().find(|w| {
+        Some(w.repo_path.as_str()) == recorded
+            || Path::new(&w.repo_path) == repo_root
+            || (want.is_some() && std::fs::canonicalize(&w.repo_path).ok() == want)
+    }) {
+        return Ok(w.repo_path.clone());
     }
-    recorded
+    Ok(recorded
         .map(str::to_owned)
-        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned()))
 }
 
 /// File `worktree` into the named sidebar folder (find-or-create), scoped to the
 /// worktree's own workspace so it lands under the right repo in the tree.
-fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &str) {
+fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &str) -> Result<()> {
     // `repo_root_for` doubles as the "is this worktree in the DB cache?" probe:
     // it reads the row's `repo_path`, so `None` means there is no row.
-    let recorded = db.repo_root_for(worktree).ok().flatten();
+    let recorded = db.repo_root_for(worktree)?;
     // File under the SAME `repo_path` string the sidebar keys folders by. The
     // sidebar renders a folder only when `folders.repo_path == workspaces.repo_path`
     // byte-for-byte (see `hydrate::workspace_list` + `sidebar::build_rows`), so a
     // folder created under a divergent string (a worktree row registered by an
     // external tool, a trailing slash, a symlinked path) yields no header and the
     // filed worktree is orphaned. Resolve to the workspace's own string.
-    let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref());
-    // best-effort throughout: sidebar filing is cosmetic and must never fail a merge.
-    let Ok(fid) = db.ensure_folder(&repo_path, folder) else {
-        return;
-    };
+    let repo_path = workspace_repo_path(db, repo_root, recorded.as_deref())?;
+    let fid = db.ensure_folder(&repo_path, folder)?;
     if recorded.is_some() {
         // Row already cached: a narrow update that leaves every other column intact.
-        let _ = db.set_worktree_folder(worktree, Some(fid)); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        db.set_worktree_folder(worktree, Some(fid))?;
     } else {
         // No cache row — the worktree was created via git / the `wt` CLI, not the
         // in-app wizard/provision path that calls `put_worktree`. A bare
@@ -145,10 +166,21 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
         // rows, so the filing would silently vanish. Register the row instead,
         // with the canonical `{slug}/{branch}` tab name the sidebar joins live
         // tabs to (`db_by_tab`), so the folder actually shows.
-        let slug = thegn_core::repo::repo_slug_with(db, Path::new(&repo_path));
+        let base = {
+            let slug = thegn_core::util::slugify(&thegn_core::repo::repo_name_from_path(
+                Path::new(&repo_path),
+            ));
+            if slug.is_empty() {
+                "repo".to_string()
+            } else {
+                slug
+            }
+        };
+        let slug = db.slug_for_repo(&repo_path, &base)?;
         let tab = thegn_core::repo::branch_tab(&slug, branch);
-        let _ = db.put_worktree(&tab, &repo_path, worktree, branch, None, Some(fid)); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+        db.put_worktree(&tab, &repo_path, worktree, branch, None, Some(fid))?;
     }
+    Ok(())
 }
 
 /// Does this worktree have uncommitted work (staged, unstaged, or untracked)?
@@ -426,7 +458,7 @@ mod tests {
         // A worktree row whose recorded repo_path diverges (trailing slash) from
         // the workspace's canonical string must still file under the workspace
         // string, so the sidebar's byte-for-byte folder filter matches.
-        let got = workspace_repo_path(&db, Path::new("/repos/app"), Some("/repos/app/"));
+        let got = workspace_repo_path(&db, Path::new("/repos/app"), Some("/repos/app/")).unwrap();
         assert_eq!(got, "/repos/app");
     }
 
@@ -435,11 +467,11 @@ mod tests {
         let db = Db::open_memory().unwrap();
         // No workspace registered: fall back to the recorded path, else repo_root.
         assert_eq!(
-            workspace_repo_path(&db, Path::new("/repos/none"), Some("/repos/rec")),
+            workspace_repo_path(&db, Path::new("/repos/none"), Some("/repos/rec")).unwrap(),
             "/repos/rec"
         );
         assert_eq!(
-            workspace_repo_path(&db, Path::new("/repos/none"), None),
+            workspace_repo_path(&db, Path::new("/repos/none"), None).unwrap(),
             "/repos/none"
         );
     }
@@ -726,6 +758,30 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    }
+
+    #[test]
+    fn checked_land_lifecycle_surfaces_an_unavailable_write() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("thegn.db");
+        let db = Db::open_at(&path).unwrap();
+        let (root, feat) = repo_with_feat(&db, "lip-readonly");
+        let feat_s = feat.to_string_lossy().to_string();
+        drop(db);
+
+        let read_only = Db::open_read_only_wal_at(&path)
+            .unwrap()
+            .expect("existing state DB");
+        let error =
+            apply_landed_in_place_checked(&cfg(OnLanded::Move), &read_only, &root, &feat_s, "feat")
+                .expect_err("checked land must not swallow a failed folder write");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("readonly"),
+            "write failure must remain actionable: {error:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root); // best-effort: test cleanup
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: test cleanup
     }
 
     // With `on_landed = "off"` a land-in-place clears a stranded lifecycle-folder

@@ -173,9 +173,19 @@ machine (or another window) can attach.
 `thegn pair list` shows every pairing and its state; `thegn pair revoke
 <id>` kills one (live streams drop on the next event).
 
-> **v1 serves plaintext.** The control plane carries full PTY I/O, so the
-> default bind is loopback. Put it behind a tailnet, VPN, or firewall
-> before binding anything wider.
+> **The native backend is plaintext.** The control plane carries full PTY I/O
+> and bearer credentials, so direct mode is loopback-only. For remote access,
+> use `[serve] topology = "tls-terminated"` with a same-host TLS proxy, or
+> `topology = "tunnel"` with an encrypted tunnel; both require a loopback
+> backend plus an explicit `advertise_host`. A non-loopback direct bind is
+> refused unless `unsafe_allow_plaintext_non_loopback = true` (or the matching
+> CLI flag) is deliberately supplied.
+
+TLS termination owns the public certificate and must proxy HTTP, WebSocket,
+SSE, and gRPC to the same loopback backend. Tunnel mode advertises the endpoint
+the client sees at its end of the encrypted tunnel. `thegn doctor` reports the
+resolved state and advertised schemes. Encryption never replaces scoped bearer
+authorization.
 
 Local unix-socket peers of the same user get implicit admin, so local
 verbs need no token; tokens are always required over TCP. Set

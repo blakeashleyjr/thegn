@@ -10,6 +10,7 @@ use thegn_core::gitrefs::{BranchInfo, Commit, StashEntry};
 use thegn_core::reflog::ReflogEntry;
 use thegn_core::remote::GitLoc;
 
+mod background_commit;
 mod bisect;
 mod branch;
 mod cherry;
@@ -24,6 +25,8 @@ mod stash;
 mod submodule;
 mod undo;
 
+pub use background_commit::BackgroundCommitTimeout;
+pub(crate) use background_commit::run as run_background_commit_stdin;
 pub use bisect::BisectOps;
 pub use branch::{BranchOps, ForceMode};
 pub use cherry::CherryOps;
@@ -1180,6 +1183,11 @@ pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Resul
 }
 
 /// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
+///
+/// This general mutation runner is deliberately unbounded: callers include
+/// patch/index operations, while other write runners carry fetch/push traffic
+/// for which a short local timeout would be destructive. Automated commit
+/// creation uses [`run_background_commit_stdin`] instead.
 pub(crate) fn run_stdin(
     loc: &GitLoc,
     envs: &[(&str, &str)],

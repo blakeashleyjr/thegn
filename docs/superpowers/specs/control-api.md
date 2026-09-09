@@ -6,10 +6,17 @@ against. Thegn ships no first-party companion application. One service seam
 the pane daemon) exposed over three transports:
 
 - **HTTP + WebSocket** (primary): the routes below, served on the daemon's
-  owner-mode unix socket (local requests are treated as admin by listener
-  policy unless `[serve] local_admin = false`; v1 does not independently
-  verify peer credentials) and on `thegn serve`'s TCP listener (bearer token
-  **required**).
+  owner-only unix socket. With `[serve] local_admin = true`, the listener reads
+  native credentials from each accepted stream and grants implicit admin only
+  when the peer effective UID equals the daemon effective UID. A mismatch or
+  unavailable credential must present an ordinary scoped bearer token. Set
+  `local_admin = false` to require tokens for every Unix-socket request (for
+  example, `curl --unix-socket PATH -H 'Authorization: Bearer …'`); TCP always
+  requires a bearer token. Native TCP is plaintext, so direct mode is
+  loopback-only by default. A remote deployment selects `tls-terminated` or
+  `tunnel`; both keep the backend on loopback and derive every advertised
+  HTTP/WS/gRPC scheme from that single policy. See
+  [Remote control transport security](control-transport-security.md).
 - **SSE** (`GET /v1/events/sse`): the generic broadcast feed as JSON
   envelopes—a curl-friendly convenience. Pane snapshots/deltas use the
   per-session attach stream, not this endpoint; WS is primary.
@@ -17,23 +24,24 @@ the pane daemon) exposed over three transports:
   mirror for external tooling. See
   `crates/thegn-svc/proto/thegn/control/v1/control.proto`.
 
-Transport security (v1): the TCP listener is **plaintext** — bind it to a
-trusted network (tailscale/wireguard) or tunnel over `ssh -L`. Every request
-is still token-gated. The pairing-URL format reserves `fp=<cert-fingerprint>`
-so TLS + pinning lands later without a format break.
+Transport security (v1): Thegn's native TCP backend is plaintext and direct
+mode is therefore loopback-only. Remote access declares either a same-host TLS
+terminator or an encrypted tunnel; both retain a loopback backend. Direct
+non-loopback plaintext requires the explicitly unsafe global setting or CLI
+flag and is reported as unsafe. Every TCP request remains token-gated.
 
 ## Scopes
 
 Every token holds a scope set (csv in `pairings.scope`). The verb→scope table
 is `thegn_core::control::required_scope` — the single tested policy source.
 
-| Scope   | Grants                                                                                                      |
-| ------- | ----------------------------------------------------------------------------------------------------------- |
-| `read`  | list sessions/leases, snapshots, `/v1/me`, the event feed, git status                                       |
-| `write` | open/attach/detach/kill sessions, terminal input, resize, open-worktree; `browser.drive` is a reserved stub |
-| `git`   | stage + commit through the GitBackend seam (implies read, **not** write)                                    |
-| `exec`  | run a trusted configured tool or launch preset (implies read, not write or git)                             |
-| `admin` | pairing management, daemon shutdown (implies everything)                                                    |
+| Scope   | Grants                                                                                   |
+| ------- | ---------------------------------------------------------------------------------------- |
+| `read`  | list sessions/leases, snapshots, `/v1/me`, event feed, git status, bounded preview fetch |
+| `write` | open/attach/detach/kill sessions, terminal input, resize, open-worktree                  |
+| `git`   | stage + commit through the GitBackend seam (implies read, **not** write)                 |
+| `exec`  | run a trusted configured tool or launch preset (implies read, not write or git)          |
+| `admin` | pairing management, daemon shutdown (implies everything)                                 |
 
 `git`, `write`, and `exec` are independent: a companion that can commit must
 not be able to type into terminals or execute configured tools. Read-only
@@ -45,8 +53,10 @@ action runs** (403 / `PERMISSION_DENIED`).
 - Control token: `tgc1_<id:8hex>_<secret:64hex>` — the bearer credential
   (`Authorization: Bearer …` or `x-api-key`). Only `sha256(secret)` is stored.
 - Pairing code: `tgp1_…` — single-use, short-TTL, embedded in a pairing URL:
-  - app scheme: `thegn://pair?host=H&port=P&t=tgp1_…[&fp=…]`
-  - web form: `http://H:P/pair#t=tgp1_…` (fragment ⇒ never in server logs)
+  - app scheme: `thegn://pair?host=H&port=P&t=tgp1_…[&secure=1][&fp=…]`
+  - web form: `http[s]://H:P/pair#t=tgp1_…` (fragment ⇒ never in server logs)
+  - `secure=1` and HTTPS are emitted only for the declared TLS-terminated
+    topology; tunnel mode correctly advertises its client-local HTTP endpoint.
 - Redeem: `POST /v1/pair {code, label}` (unauthenticated — possession of the
   single-use code is the credential) → `{token, pairing_id, scopes, approved}`.
   With `[serve] require_approval` the token parks (`approved: false`) until
@@ -73,7 +83,7 @@ action runs** (403 / `PERMISSION_DENIED`).
 | `GET /v1/leases`                                                                      | read       | relay leases (detached sessions kept warm)                                                                          |
 | `GET /v1/worktrees`                                                                   | read       | worktrees registered with thegn: `{path, branch, repo_root, location, created_at}`                                  |
 | `POST /v1/worktrees/open`                                                             | write      | `{repo, branch?}` → the running compositor's intent mailbox                                                         |
-| `POST /v1/browser`                                                                    | write      | **reserved**: v1 always 501                                                                                         |
+| `POST /v1/preview/fetch`                                                              | read       | bounded credential-free HTTP fetch; this does not create or drive a browser session                                 |
 | `GET /v1/git/status?worktree=`                                                        | read       | porcelain codes per changed file                                                                                    |
 | `POST /v1/git/stage`                                                                  | git        | `{worktree, paths}` — GitBackend seam; git stays source of truth                                                    |
 | `POST /v1/git/commit`                                                                 | git        | `{worktree, message}` → `{commit}`                                                                                  |
@@ -82,6 +92,12 @@ action runs** (403 / `PERMISSION_DENIED`).
 | `POST /v1/merge/clear`                                                                | git        | `{worktree}` → `{cleared}` — empty the queue for the worktree's repo                                                |
 | `GET/POST /v1/pairings`, `DELETE /v1/pairings/{id}`, `POST /v1/pairings/{id}/approve` | admin      | pairing lifecycle                                                                                                   |
 | `POST /v1/push/register`                                                              | —          | **reserved** for push notifications (AI 422/423); absent in v1                                                      |
+
+Browser automation is not part of v1: there is no browser provider or session
+lifecycle to navigate. Local preview discovery and the UI's external-browser
+open action remain product features, and `preview.fetch` remains the bounded
+control operation. A future browser-driving API requires a new provider-backed
+contract rather than reserving an inert route.
 
 ## The event wire
 

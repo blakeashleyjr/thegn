@@ -605,9 +605,9 @@ pub enum Command {
     },
     /// Serve this machine's thegn to remote thin clients: runs the pane
     /// daemon in the foreground with a TCP control listener (HTTP/WS + gRPC,
-    /// scoped bearer tokens) and prints a single-use pairing URL. v1 listens
-    /// in PLAINTEXT — bind to a trusted network (tailscale/wireguard) or
-    /// tunnel over `ssh -L`.
+    /// scoped bearer tokens) and prints a single-use pairing URL. The backend
+    /// is loopback-only unless a strict terminator/tunnel topology or the
+    /// explicitly unsafe plaintext escape hatch is selected.
     Serve {
         /// TCP bind address (defaults to `[serve] bind`, e.g. 127.0.0.1:5380).
         #[arg(long)]
@@ -615,6 +615,16 @@ pub enum Command {
         /// Skip minting + printing the startup pairing URL.
         #[arg(long)]
         no_pair_url: bool,
+        /// Permit plaintext on a non-loopback bind. Exposes bearer credentials,
+        /// terminal contents, and commands to network interception.
+        #[arg(long)]
+        unsafe_allow_plaintext_non_loopback: bool,
+        /// Host clients dial; overrides `[serve] advertise_host`.
+        #[arg(long)]
+        advertise_host: Option<String>,
+        /// Port clients dial; overrides `[serve] advertise_port`.
+        #[arg(long)]
+        advertise_port: Option<u16>,
     },
     /// Drive a running pane daemon: list sessions, send input, dump
     /// snapshots, stream output, inspect relay leases.
@@ -1242,7 +1252,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             Some(DoctorAction::Bundle { args }) => {
                 cmd::bundle::run(&cfg, args, config_path, repo_context.clone())
             }
-            None => cmd::doctor::run(&cfg, json, config_path, repo_context),
+            None => cmd::doctor::run(&cfg, json, config_path, repo_context, &cli.overrides),
         },
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
@@ -1276,9 +1286,22 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let _ = std::io::stdout().write_all(&buf);
             Ok(())
         }
-        Command::Serve { bind, no_pair_url } => {
-            daemon::serve_blocking(&cfg, daemon::ServeOpts { bind, no_pair_url })
-        }
+        Command::Serve {
+            bind,
+            no_pair_url,
+            unsafe_allow_plaintext_non_loopback,
+            advertise_host,
+            advertise_port,
+        } => daemon::serve_blocking(
+            &cfg,
+            daemon::ServeOpts {
+                bind,
+                no_pair_url,
+                unsafe_allow_plaintext_non_loopback,
+                advertise_host,
+                advertise_port,
+            },
+        ),
         Command::Session { action } => cmd::session::run(&cfg, action),
         Command::Events { action } => cmd::events::run(&cfg, action),
         Command::Attach { session } => cmd::attach::run(&cfg, session),

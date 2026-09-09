@@ -3437,6 +3437,10 @@ pub fn launch_spec_full(
     // and died unable to write a file — a silent worker death, not a config error.
     // Reserve the entry's keys so the same env wins on both paths.
     let agent_env_keys = eff_agent.as_ref().map(|eff| &eff.env);
+    let agent_env = eff_agent
+        .as_ref()
+        .map(|eff| eff.expanded_env())
+        .unwrap_or_default();
 
     // The sandbox path reverses the same precedence by a different mechanism:
     // `env_overrides` are emitted as `export KEY='…'` lines inside the wrap
@@ -3465,6 +3469,23 @@ pub fn launch_spec_full(
                     cache: false,
                 });
             }
+        }
+        let cache = crate::build_cache::apply_sandbox_compiler_cache(
+            sandbox_spec,
+            cfg,
+            &repo_root,
+            &agent_env,
+        );
+        crate::build_cache::record_sandbox_cache_decision(
+            cfg,
+            &repo_root,
+            sandbox_spec.backend,
+            &cache,
+        );
+        if cfg.sandbox.compiler_cache == thegn_core::config::SandboxCompilerCache::Auto
+            && !cache.active
+        {
+            outcome.warnings.push(cache.reason);
         }
     }
 

@@ -20,8 +20,8 @@ use thegn_core::editor::EditorTarget;
 use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
-    AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult, ForkSpec,
-    GitFileStatus, OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
+    AttachKind, AttachReply, ControlApi, ControlError, ControlResult, ForkSpec, GitFileStatus,
+    OpenSpec, PreviewFetchReply, PreviewFetchRequest, RecordSpec, RecordStatus,
     SessionActivityEvent, SessionInfo, ToolRunRequest, WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
@@ -789,10 +789,6 @@ impl ControlApi for DaemonService {
             })
             .await
         })
-    }
-
-    fn drive_browser(&self, _cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>> {
-        Box::pin(async move { Err(ControlError::Unimplemented("drive-browser")) })
     }
 
     fn preview_fetch(
@@ -2666,13 +2662,18 @@ mod tests {
             api: svc.clone(),
             store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
             local_admin: true,
+            daemon_euid: thegn_svc::ipc::effective_uid(),
             require_approval: false,
             server_label: "test thegn".into(),
             cors_origins: Vec::new(),
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await; // best-effort: test scaffolding: a dead server fails the client assertions below
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<thegn_svc::ipc::IpcConnectInfo>(),
+            )
+            .await; // best-effort: test scaffolding: a dead server fails the client assertions below
         });
 
         let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
