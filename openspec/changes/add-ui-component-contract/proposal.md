@@ -148,7 +148,9 @@ shippable increment rather than a half-rewrite.
   frame-touching migration, which needs an e2e re-record), the one zone
   key-table shape (with the `run.rs` dispatch-match → table-lookup swap and the
   deletion of the source-text drift test), the placement grammar for badges +
-  plugin ids, and the plugin API v0.3 + runtime `PanelSection` surface. Each is
+  plugin ids, and the plugin API v0.3 + runtime `PanelSection` surface. The
+  complete PanelSection negotiation/render/cache/placement slice is tracked by
+  **THE-108** inside this change; it remains deferred. Each is
   additive on the Phase 1 substrate; none is blocked by another.
 
 The one contract, the glyph tokens, and the ratchet are the load-bearing
@@ -163,7 +165,8 @@ exactly as the tree's own history says works.
 - **Rebindable zone keys** — zone tables gain one shape and honest zone
   attribution in `thegn keys list`; making them user-rebindable is a
   follow-up once the shape exists.
-- **Plugin sidebar tabs / theme plugins** — `SidebarTab` and `Theme` stay
-  declared-but-unsupported wire vocabulary; wiring them is future work on
-  top of this contract.
+- **Plugin sidebar tabs / theme plugins / plugin key zones** — these remain
+  declared/reserved or absent rather than implied working surfaces. The bounded
+  support decisions are tracked by **THE-107**; any adopted runtime wiring gets
+  its own delta after that decision.
 - **Touching `render_plan`, damage channels, or the 0%-idle loop.**

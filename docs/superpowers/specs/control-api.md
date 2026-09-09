@@ -1,15 +1,18 @@
 # The thegn control API (v1)
 
-The contract a thin client — desktop, web, or the mobile companion — builds
-against. One service seam (`thegn_svc::control::ControlApi`, implemented by
+The contract a current tool or future desktop/web/mobile thin client builds
+against. Thegn ships no first-party companion application. One service seam
+(`thegn_svc::control::ControlApi`, implemented by
 the pane daemon) exposed over three transports:
 
 - **HTTP + WebSocket** (primary): the routes below, served on the daemon's
-  unix socket (local; same-uid peers are implicitly admin unless
-  `[serve] local_admin = false`) and on `thegn serve`'s TCP listener
-  (bearer token **required**).
-- **SSE** (`GET /v1/events/sse`): the same feed as JSON envelopes
-  (pane bytes base64) — a curl-friendly convenience; WS is primary.
+  owner-mode unix socket (local requests are treated as admin by listener
+  policy unless `[serve] local_admin = false`; v1 does not independently
+  verify peer credentials) and on `thegn serve`'s TCP listener (bearer token
+  **required**).
+- **SSE** (`GET /v1/events/sse`): the generic broadcast feed as JSON
+  envelopes—a curl-friendly convenience. Pane snapshots/deltas use the
+  per-session attach stream, not this endpoint; WS is primary.
 - **gRPC** (`thegn.control.v1.Control`, same TCP port): a mechanical
   mirror for external tooling. See
   `crates/thegn-svc/proto/thegn/control/v1/control.proto`.
@@ -24,17 +27,18 @@ so TLS + pinning lands later without a format break.
 Every token holds a scope set (csv in `pairings.scope`). The verb→scope table
 is `thegn_core::control::required_scope` — the single tested policy source.
 
-| Scope   | Grants                                                                                 |
-| ------- | -------------------------------------------------------------------------------------- |
-| `read`  | list sessions/leases, snapshots, `/v1/me`, the event feed, git status                  |
-| `write` | open/attach/detach/kill sessions, terminal input, resize, open-worktree, drive-browser |
-| `git`   | stage + commit through the GitBackend seam (implies read, **not** write)               |
-| `admin` | pairing management, daemon shutdown (implies everything)                               |
+| Scope   | Grants                                                                                                      |
+| ------- | ----------------------------------------------------------------------------------------------------------- |
+| `read`  | list sessions/leases, snapshots, `/v1/me`, the event feed, git status                                       |
+| `write` | open/attach/detach/kill sessions, terminal input, resize, open-worktree; `browser.drive` is a reserved stub |
+| `git`   | stage + commit through the GitBackend seam (implies read, **not** write)                                    |
+| `exec`  | run a trusted configured tool or launch preset (implies read, not write or git)                             |
+| `admin` | pairing management, daemon shutdown (implies everything)                                                    |
 
-`git` deliberately does not imply `write`: a companion that can commit must
-not be able to type into terminals. Read-only views require only `read` —
-an under-scoped request is rejected **before any action runs** (403 /
-`PERMISSION_DENIED`).
+`git`, `write`, and `exec` are independent: a companion that can commit must
+not be able to type into terminals or execute configured tools. Read-only
+views require only `read`—an under-scoped request is rejected **before any
+action runs** (403 / `PERMISSION_DENIED`).
 
 ## Tokens & pairing
 
@@ -88,10 +92,14 @@ bytes, `seq`), `Activity` (JSON), `Lease` (opened/refreshed/released/reaped),
 `Pairing` (requested/approved/revoked), `Sessions` (re-list), `SessionExit`,
 and opt-in `Lagged { missed }`.
 
-Event subscriptions accept the same bounded `kinds` vocabulary (`hello`,
-`snapshot`, `delta`, `activity`, `lease`, `pairing`, `sessions`, `exit`,
-`lagged`) and an optional session id. Filters are applied independently after
-the shared broadcast and can only narrow the read-scoped feed; omitted filters
+The generic event subscription parser accepts the bounded `kinds` vocabulary
+(`hello`, `snapshot`, `delta`, `activity`, `lease`, `pairing`, `sessions`,
+`exit`, `lagged`) and an optional session id. Generic HTTP/WS/SSE broadcasts do
+not carry `snapshot` or `delta` frames in v1, so those two filters currently
+match nothing there; snapshots/deltas are available only on a session attach
+stream. The accepted-but-empty generic filters are tracked contract debt, not
+a client bootstrap mechanism. Filters are applied independently after the
+shared broadcast and can only narrow the read-scoped feed; omitted filters
 retain the legacy full feed. Unknown or empty kinds and overlong session ids
 are rejected as `bad_request` (or gRPC `invalid_argument`). A connection that
 sets `signal_lag=1` receives a `Lagged` marker with the count skipped and then

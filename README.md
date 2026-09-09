@@ -429,8 +429,10 @@ settled. See
 testing the TUI itself — by hand, in CI, or from an agent.
 
 Contributor docs: [`CLAUDE.md`](CLAUDE.md) (architecture + invariants),
-[`tasks.md`](tasks.md) (roadmap), `openspec/specs/` (behavior specs),
-`docs/superpowers/{plans,specs}/` (design docs per feature).
+[`docs/PORTFOLIO.md`](docs/PORTFOLIO.md) (live alpha projects and issue/spec
+links), [`tasks.md`](tasks.md) (long-horizon roadmap), `openspec/specs/`
+(accepted behavior), and `docs/superpowers/{plans,specs}/` (design docs per
+feature).
 
 ## Security
 

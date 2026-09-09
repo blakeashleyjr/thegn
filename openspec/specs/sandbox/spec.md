@@ -652,10 +652,13 @@ the clamped repo base.
 
 The system SHALL gate additive sandbox requests from a repo overlay (extra
 mounts, volumes, `init_script`, `prepare`, `image`, `ports`, `gpu`,
-`nix_daemon`): such a request MUST NOT be applied unless a matching approval has
-been recorded. An unapproved additive request is surfaced as pending, not
-applied, and the worktree still opens. Approval is matched by the request's
-canonical form, so a later edit that changes the requested set re-prompts.
+`nix_daemon`) and repo-authored lifecycle hooks (`[hooks]` entries, gated per
+event as `hooks.<event>` categories): such a request MUST NOT be applied
+unless a matching approval has been recorded. An unapproved additive request
+is surfaced as pending, not applied, and the worktree still opens — an
+unapproved hook in particular MUST NOT run and MUST NOT block the lifecycle
+operation it is attached to. Approval is matched by the request's canonical
+form, so a later edit that changes the requested set re-prompts.
 
 #### Scenario: An unapproved mount is not applied
 
@@ -667,6 +670,13 @@ canonical form, so a later edit that changes the requested set re-prompts.
 
 - **WHEN** the same requested set has been approved
 - **THEN** the request is applied at the next worktree launch
+
+#### Scenario: An unapproved repo hook neither runs nor blocks
+
+- **WHEN** a repo `.thegn.toml` declares `[hooks] pre_destroy` entries with no
+  recorded approval and the user deletes the worktree
+- **THEN** the hooks do not run, the removal proceeds, and the request is
+  surfaced as pending
 
 ### Requirement: A key's resolution is explainable
 
@@ -795,3 +805,303 @@ be configurable for users who want one answer every time.
   `auto`, or the worktree is pinned to the host
 - **THEN** no prompt is raised and the launch proceeds, because that policy is a
   standing answer to the same question
+
+### Requirement: Mise declarations activate through an explicit provider policy
+
+For a detected mise/asdf declaration, `[toolchain.mise] inject` SHALL select
+`auto`, `shims`, `env`, or `off`. Shims SHALL be available without evaluating
+repository configuration; `auto` and `env` SHALL use the resolved environment
+only after its current config-set identity is approved, otherwise degrading to
+shims. `off` SHALL contribute no activation layer.
+
+#### Scenario: Unapproved auto mode stays safe
+
+- **WHEN** a repository has mise config but its current identity is unapproved
+- **THEN** a launch may add mise shims but does not run or consume `mise env`
+
+#### Scenario: Off means no layer
+
+- **WHEN** `inject = "off"`
+- **THEN** mise contributes no PATH or environment values
+
+### Requirement: Mise trust is content-bound and owned by Thegn
+
+Host/target `mise env` resolution and explicit `mise install` SHALL require an
+approved `mise.env` gated request derived from the canonical detected config
+set and `mise.lock` contents. A changed input SHALL invalidate approval and
+cache use. Thegn MUST NOT invoke `mise trust`; explicit installation SHALL run
+only `mise install` after revalidating the target identity and approval.
+
+#### Scenario: An edit reopens the gate
+
+- **WHEN** an approved `mise.toml` or `mise.lock` changes
+- **THEN** environment resolution and installation are refused until the new
+  content identity is approved
+
+#### Scenario: Thegn does not widen ambient mise trust
+
+- **WHEN** an operator approves the Thegn request and installs the toolchain
+- **THEN** Thegn invokes `mise install` without invoking `mise trust`
+
+### Requirement: Local and remote detection agree
+
+Local detection and the remote detection probe SHALL recognize the same
+bounded project configuration, `conf.d`, `MISE_ENV`, `.tool-versions`, and
+language-pin surface, and SHALL expose the detected file list for identity and
+diagnostics.
+
+#### Scenario: A nested config is detected remotely
+
+- **WHEN** a target worktree contains only `.config/mise/config.toml`
+- **THEN** both local and remote detection classify it as mise-managed and
+  include that relative path in the identity
+
+### Requirement: Launch activation never waits for mise
+
+Mise detection/resolution and target probes SHALL run off the event loop and
+write identity-stamped owner-only cache files. Pane launch SHALL perform no
+mise child process or remote call; a cold/mismatched cache SHALL return shims
+or reserved safe-base state and schedule an off-loop refresh whose completion
+pulses the existing refresh/waker path.
+
+#### Scenario: A cold remote cache cannot delay a pane
+
+- **WHEN** a remote worktree has no cached toolchain facts
+- **THEN** launch uses the safe base environment while detection is scheduled
+  outside the launch/event loop
+
+### Requirement: Mise composes below trusted user and devshell layers
+
+Activation SHALL order PATH layers as bound bundle, repo devshell, mise, then
+curated base. Mise environment variables SHALL fill unset keys only and SHALL
+discard credential-like keys such as `*_TOKEN`, `*_KEY`, `*_SECRET`, and
+`*_PASSWORD`.
+
+#### Scenario: A bundle value wins
+
+- **WHEN** a bundle and approved mise environment both set `FOO`
+- **THEN** the bundle value is retained, while credential-shaped mise values
+  are omitted
+
+### Requirement: Mise diagnostics are cache-safe and explanatory
+
+Doctor SHALL report the provider, provisioning tier, injection mode, provider
+state, trust state, detected files, shims, and degradation reason using bounded
+presence/cached facts. It MUST NOT execute repo-authored resolution merely to
+produce diagnostics.
+
+#### Scenario: Pending trust is visible
+
+- **WHEN** an unapproved mise config is selected in auto mode
+- **THEN** doctor reports shims/safe fallback and the pending trust reason
+
+### Requirement: machine0 is an MCP-native managed-sandbox provider
+
+thegn SHALL support machine0 (machine0.io) as a first-class
+`Provider::Machine0` whose control plane is machine0's remote **MCP** endpoint
+and whose data plane is ssh. An `[env.<name>.provider]` with
+`provider = "machine0"` SHALL, using only MCP `tools/call` over HTTP (auth via
+an `x-api-key` header — **no `machine0` CLI binary**), create a VM
+(`vm_create`), poll it to RUNNING (`vm_get_by_name`), and make it reachable over
+thegn's managed ssh keypair (imported via `ssh_key_create`), so the standard
+provisioning pipeline runs over the ssh exec/files transport that satisfies the
+provider `files` capability. Secrets MUST NOT appear on any command line (the
+api key rides the `x-api-key` header; the ssh private key stays host-side).
+
+#### Scenario: Provisioning a machine0 env yields an interactive pane over ssh
+
+- **WHEN** a worktree resolves to a `provider = "machine0"` env with its
+  `MACHINE0_API_KEY` set and is provisioned
+- **THEN** a VM is created via the MCP `vm_create` tool with thegn's imported
+  ssh key, the pipeline runs over ssh to the VM, and the pane attaches over ssh
+  (`ExecKind::Ssh`) — with no `machine0` binary invoked
+
+#### Scenario: The MCP client tolerates both HTTP response shapes
+
+- **WHEN** the machine0 MCP endpoint answers a `tools/call` with either an
+  `application/json` body or a one-shot `text/event-stream` frame
+- **THEN** thegn decodes the JSON-RPC response from either, unwraps the tool
+  result (`structuredContent` or the text content block), and surfaces an
+  `isError` result or a JSON-RPC error as a failure
+
+#### Scenario: Destroy is idempotent
+
+- **WHEN** a machine0 sandbox is destroyed but the VM no longer exists
+- **THEN** the destroy resolves the VM by name, treats a not-found as success,
+  and never leaks or errors
+
+### Requirement: machine0 provisions NixOS VMs from a Nix flake
+
+thegn SHALL support NixOS on machine0: an env MAY set
+`template = "nixos-25-11-loaded"` (or any machine0 NixOS image) and a
+`provision_flake` ref. After the VM is RUNNING and reachable, thegn SHALL apply
+the flake with `nixos-rebuild switch --flake <ref>` over ssh (there is no
+provider tool for provisioning). A local `path#attr` ref SHALL be uploaded to the
+VM first and rebuilt from the uploaded directory; a flake URL SHALL be applied
+verbatim. A failed apply SHALL fail create loudly and leave the VM for debugging.
+
+#### Scenario: A NixOS env applies its flake on create
+
+- **WHEN** a `provider = "machine0"` env with a NixOS `template` and a
+  `provision_flake` is provisioned
+- **THEN** after the VM reaches RUNNING, thegn runs `nixos-rebuild switch
+--flake <ref>` over ssh and only returns the sandbox handle once the apply
+  succeeds
+
+#### Scenario: A NixOS env without a provision flake skips the rebuild
+
+- **WHEN** `provision_flake` is empty
+- **THEN** create performs no `nixos-rebuild` step and returns the running VM
+
+### Requirement: machine0 supports snapshots and scale-to-zero
+
+thegn SHALL expose machine0's image snapshots as provider checkpoints
+(`caps().checkpoints`): `checkpoint` creates an image (`image_create`),
+`list_checkpoints` lists images (`image_list`), and `restore` recreates the VM
+from a saved image (`vm_destroy` + `vm_create --image` — machine0 has no
+in-place restore). thegn SHALL treat machine0 as **scale-to-zero**: an idle
+sandbox is suspended (`vm_suspend`, billed only for storage), not destroyed, and
+resumed (`vm_start`) on claim, with `provider_scale_to_zero("machine0")` as the
+single source of truth. machine0 is NOT a commodity-VPS kind and NOT a
+WSS-native exec provider.
+
+#### Scenario: A checkpoint snapshots the VM and restore recreates it
+
+- **WHEN** `thegn env snapshot` runs against a machine0 sandbox and `env
+restore <image>` is later invoked
+- **THEN** an `image_create` captures the VM, and restore destroys the VM and
+  recreates it from the saved image under the same sandbox name
+
+#### Scenario: An idle machine0 sandbox suspends instead of being destroyed
+
+- **WHEN** a machine0 sandbox is idle past the warm-pool TTL
+- **THEN** it is suspended (`vm_suspend`) and resumed (`vm_start`) on next
+  claim, because `provider_scale_to_zero` classifies machine0 as scale-to-zero
+
+### Requirement: machine0 panes and chrome reads reach the VM over ssh
+
+thegn SHALL route a machine0 env's interactive pane AND its chrome git/fs
+control reads to the VM through a `machine0-ssh` self-bridge (the role `vps-ssh`
+plays for VPS), so `control_command_template` yields a non-empty prefix and the
+persisted `GitLoc::Provider` resolves into the VM rather than the host. The
+bridge SHALL resolve the VM address + ssh user via the provider (`vm_get`),
+waking a suspended VM only for an interactive attach (resume-on-open) and never
+for a control read (which serves cached state when the VM is parked).
+
+#### Scenario: Opening a machine0 worktree attaches a shell on the VM
+
+- **WHEN** a worktree bound to a `provider = "machine0"` env opens its pane
+- **THEN** `thegn machine0-ssh <id>` resolves the VM's IP + ssh user and execs an
+  interactive shell ON THE VM (waking it first if it was parked), not on the host
+
+#### Scenario: An idle machine0 VM is explicitly parked
+
+- **WHEN** the warm/idle reconcile decides to suspend an idle machine0 worktree
+- **THEN** thegn calls `Provider::suspend` (`vm_suspend`) — because machine0 does
+  not self-suspend (`provider_self_suspends` is false) — before dropping the
+  bridge, and reopening the worktree resumes it via the pane bridge
+
+### Requirement: machine0 interactive panes default to mosh with ssh fallback
+
+thegn SHALL default the machine0 (and provider-over-ssh) interactive pane
+transport to **mosh** (`[env.<name>.provider] transport`, default `mosh`),
+emitting `mosh --ssh="<ssh opts>" <user>@<ip>` when a local mosh client and the
+VM's `mosh-server` are both present, and falling back to plain ssh otherwise.
+The control plane MUST remain ssh (mosh cannot pipe non-interactive commands).
+
+#### Scenario: A pane uses mosh when available, ssh otherwise
+
+- **WHEN** a machine0 pane opens with the default `transport = "mosh"`
+- **THEN** it attaches over mosh if the VM has `mosh-server` (and the host has
+  `mosh`), otherwise it transparently falls back to ssh — never failing the pane
+
+### Requirement: Tailnet host discovery is a provider seam
+
+thegn SHALL discover remote-host candidates from the user's mesh VPN through a
+`host_discovery` provider seam (object-safe trait, config `kind`
+implemented-or-`reserved`, errors classified per `thegn_core::seam`), whose
+first implemented kind is `tailnet`: enumerate peer devices from the **local**
+tailscale client (`tailscale status --json`), yielding for each candidate its
+MagicDNS name, OS, online state, tags, stable node id, and whether Tailscale
+SSH is advertised. Parsing MUST be pure `thegn-core` logic (unit-tested);
+the subprocess is the I/O seam. Discovery MUST run only on explicit user
+action through `thegn host discover` in this cut, outside the compositor —
+never as a background scan or polling timer. Candidates MUST NOT be persisted;
+the tailnet is the source of truth. A headscale control plane SHALL be served
+by the same seam and kind (the local client is control-plane-agnostic);
+control-plane differences are reported by the probe, never assumed. A future
+TUI picker is additive follow-up scope and is not required here.
+
+#### Scenario: Discovering candidates from a logged-in tailnet
+
+- **WHEN** the user runs `thegn host discover` on a machine whose tailscale
+  client is logged in (to Tailscale or a headscale `login_server`)
+- **THEN** thegn lists the tailnet's peer devices as host candidates with
+  name, OS, online state, tags, and SSH advertisement — prompting for no
+  credential and writing nothing to config or the DB
+
+#### Scenario: Missing client degrades cleanly
+
+- **WHEN** `tailscale` is not on PATH (or tailscaled is not running)
+- **THEN** discovery fails with a classified error naming what is missing
+  (`NotInstalled` / `Transient`), with no panic and no partial candidate list
+
+### Requirement: Discovered hosts connect credential-free over Tailscale SSH
+
+Promoting a tailnet candidate SHALL be an explicit user action that produces a
+`[host.<name>]`-shaped entry with `reach = "ssh"` and an `SshTarget` of the
+MagicDNS FQDN on port 22 carrying **no identity file, password, token, or any
+stored secret**: when the target runs Tailscale SSH, authentication and
+authorization are delegated to tailscaled and the tailnet's ACLs; a target
+running plain sshd over the tailnet rides the identical target through the
+user's own ssh agent/config. Promotion MUST write global config only (repo
+overlays cannot define hosts), MUST leave `install_runtime` consent at its
+default (`ask`), and connect MUST honor ssh host-key verification (never
+disabling strict checking). An ACL or sshd refusal SHALL surface as a
+classified `Auth` error with no credential prompt and no retry storm.
+
+#### Scenario: Promote and connect without stored credentials
+
+- **WHEN** the user promotes candidate `nuc.tail1234.ts.net` and opens a
+  worktree pane on it
+- **THEN** the pane's connect argv references the MagicDNS name with no `-i`,
+  no password, and no thegn-minted key, and the session succeeds iff the
+  tailnet ACLs (or the host's sshd) allow it
+
+#### Scenario: ACL denial is surfaced, not retried
+
+- **WHEN** the tailnet ACLs deny ssh from this device to the promoted host
+- **THEN** the failure surfaces as an auth-classified error naming the host,
+  and thegn neither prompts for a credential nor loops reconnecting
+
+### Requirement: The tailnet seam probes in thegn doctor
+
+`thegn doctor` SHALL print a `host_discovery`/`tailnet` probe conforming to
+the provider-seams probe shape: `Ready` (client present, daemon up, logged in
+— notes carry the tailnet/control URL and peer count), `Degraded` (reachable
+but nothing advertises Tailscale SSH — plain-sshd fallback named), or
+`Unavailable` (binary missing / logged out, with the reason). The probe MUST
+report the control URL verbatim (surfacing headscale deployments) and MUST
+report Tailscale-SSH availability from peer advertisement, marking it unknown
+when the client version does not expose it.
+
+#### Scenario: Doctor on a headscale-backed client
+
+- **WHEN** `thegn doctor` runs where the tailscale client is logged into a
+  headscale `login_server`
+- **THEN** the `host_discovery`/`tailnet` row is `Ready` with the headscale
+  control URL and peer count in its notes — same seam, same kind, no separate
+  headscale backend
+
+### Requirement: Host discovery is a capability-catalog row
+
+The discovery verb SHALL exist as one `thegn_core::capability::CATALOG` row
+(`host.discover`, read scope) projected to its surfaces (CLI at minimum),
+gated by `required_scope(verb)` — never a second policy table — and its list
+output SHALL support `--json`.
+
+#### Scenario: The verb is catalog-routed
+
+- **WHEN** the capability catalog is enumerated (`thegn api list`)
+- **THEN** `host.discover` appears with its surfaces and required scope, and
+  the CLI verb resolves through the same catalog row

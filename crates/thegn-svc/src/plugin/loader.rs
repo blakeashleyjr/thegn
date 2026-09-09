@@ -10,9 +10,9 @@ use thegn_core::plugin_api::{
     API_VERSION, ExtensionPoint, HostContract, NegotiatedManifest, PluginSpec,
 };
 
-/// The extension points this host build actually renders/consumes. Grows as
-/// surfaces land (PaletteAction/SidebarTab are next; providers are the
-/// provider-as-plugin phase).
+/// The extension points this host build actually renders/consumes. The wire
+/// enum is intentionally broader; a point belongs here only after its complete
+/// host runtime, placement, and activation path has landed.
 pub fn host_contract() -> HostContract {
     HostContract::new(API_VERSION)
         .with_extension_points([

@@ -169,11 +169,10 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum ExtensionPoint {
     StatusBarSegment,
-    /// A plugin-contributed accordion section in the info panel — the second
-    /// wired rendering surface beside [`ExtensionPoint::StatusBarSegment`]
-    /// (v0.3). Its cached [`View`] renders through the host's element path; the
-    /// runtime wiring (host-side accordion placement + row activation as
-    /// `on_event`) lands with the panel-section runtime work.
+    /// Reserved v0.3 vocabulary for a plugin-contributed accordion section in
+    /// the info panel. The wire shape and cached [`View`] model are stable, but
+    /// current hosts negotiate this point as unsupported until host-side
+    /// accordion placement and row activation land.
     PanelSection,
     SidebarTab,
     PaletteAction,

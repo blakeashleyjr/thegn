@@ -2,95 +2,72 @@
 
 ## ADDED Requirements
 
-### Requirement: Batteries editions compose upstream terminals, never embed one
+### Requirement: The Nix batteries package is self-contained and user-local
 
-A batteries-included edition SHALL be a composition of a pinned upstream
-terminal emulator, a pinned Nerd Font, thegn's bundled terminal profile, and
-the thegn binary with its runtime tools. thegn SHALL NOT fork, vendor, or
-embed a terminal emulator, and a batteries edition SHALL NOT introduce any
-render backend beside the existing compositor. The only thegn-owned
-artifacts in a batteries edition are the bundled profiles, wrappers, and
-pins; emulator and font security updates flow from bumping the upstream pin,
-not from a thegn release.
+The Nix batteries package SHALL compose the pinned Thegn binary, Alacritty, and
+Fira Code Nerd Font, generate Fontconfig state for that font, create a writable
+user-local Alacritty configuration from the immutable template, and launch
+Thegn through Alacritty with `THEGN_ALACRITTY_CONFIG`. It MUST NOT replace an
+existing terminal or install system-wide fonts/configuration.
 
-#### Scenario: Emulator CVE response
+#### Scenario: Nix batteries launches without host terminal setup
 
-- **WHEN** the pinned emulator publishes a security fix
-- **THEN** updating the pin (flake.lock / cask version) delivers it, with no
-  change to any thegn source or release artifact
+- **WHEN** a compatible host runs `nix run .#batteries`
+- **THEN** the packaged terminal starts Thegn using the packaged font and a
+  writable generated configuration
 
-#### Scenario: No embedded emulator
+### Requirement: Supported batteries paths are explicit
 
-- **WHEN** the batteries edition's contents are enumerated
-- **THEN** the emulator and font are upstream packages referenced by pin,
-  and no emulator source or binary is vendored into this repository
+Release documentation SHALL publish a matrix for Linux (Nix and non-Nix),
+macOS, and Windows. For each path it MUST identify bundled, generated
+user-local, and host-delegated terminal/font/config components and whether the
+path is shipped, partial, or deferred. Unsupported paths MUST provide a clear
+fallback rather than imply parity.
 
-### Requirement: The nix batteries output is the reference edition
+#### Scenario: An undecided Windows path is not advertised
 
-The flake SHALL expose a `batteries` output composing a pinned emulator, the
-Nerd Font named by the bundled profiles (scoped to the launch via
-fontconfig, not installed user-wide), the bundled profile, and the wrapped
-stable-channel `thegn` with its pinned runtime tools. Launching it on a host
-with no preinstalled terminal, font, or runtime tool SHALL yield a fully
-working session. The profile the font picker patches SHALL be a writable
-per-user copy, since the store copy is immutable.
+- **WHEN** no Windows batteries artifact has passed rehearsal
+- **THEN** the matrix marks it deferred, links a bounded decision/implementation
+  issue, and provides fallback instructions
 
-#### Scenario: Clean-host launch
+### Requirement: Standalone Linux has an opt-in deterministic batteries path
 
-- **WHEN** `.#batteries` is run on a host with no terminal emulator, no Nerd
-  Font, and none of thegn's runtime tools installed
-- **THEN** a terminal window opens running thegn with every `thegn doctor`
-  runtime-tool probe green
+The standalone Linux installer SHALL expose an explicit batteries mode or
+document and test a deterministic package-native equivalent. It MUST NOT
+silently replace the user's default terminal or mutate system-wide font
+configuration, and repeated installation SHALL have defined upgrade/uninstall
+behavior.
 
-#### Scenario: Font switch from the batteries edition
+#### Scenario: Ordinary install preserves terminal choice
 
-- **WHEN** the user invokes the font picker from a batteries launch
-- **THEN** it patches the writable per-user profile copy the wrapper
-  launched with, and the next launch reflects the change
+- **WHEN** a user performs a standard non-batteries install
+- **THEN** existing terminal/font configuration is unchanged and missing
+  requirements are reported actionably
 
-### Requirement: A batteries launch guarantees full-fidelity terminal capabilities
+### Requirement: Claimed artifacts use verified release inputs and rehearsals
 
-Launching any batteries edition SHALL place thegn in an environment where
-capability detection resolves truecolor, full Unicode glyphs, and undercurl,
-where the configured Nerd Font is present, and where Alt-based chords
-deliver (option-as-alt on macOS via the bundled profile). A missing piece at
-provisioning time SHALL be reported as a provisioning failure, never left as
-a silent degradation.
+Every batteries artifact SHALL consume the checksummed/attested release inputs
+owned by THE-52 and SHALL be exercised on a clean representative host/VM before
+being advertised. The rehearsal record MUST name artifact identity, exact
+install/launch commands, terminal/font/config diagnostics, and recovery or
+uninstall behavior.
 
-#### Scenario: Detection from a batteries window
+#### Scenario: A rendered artifact is not yet supported
 
-- **WHEN** `thegn doctor` runs inside a batteries-launched session
-- **THEN** it reports truecolor color depth, full glyph level, and undercurl
-  support
+- **WHEN** an artifact builds but has no recorded clean-host rehearsal
+- **THEN** installation documentation does not advertise it as a supported
+  batteries path
 
-#### Scenario: Font missing at provisioning
+### Requirement: Diagnostics cover the complete launch chain
 
-- **WHEN** a batteries install cannot provide the Nerd Font
-- **THEN** the installer names the missing font and the command that fixes
-  it and does not report the batteries install as complete
+For each supported path, startup and `thegn doctor` SHALL distinguish missing
+terminal, unavailable Nerd Font, unwritable generated configuration, absent
+launcher component, and an invalid/unverified binary input, with path-specific
+recovery guidance.
 
-### Requirement: Batteries platform scope is explicit and staged
+#### Scenario: Generated config is unwritable
 
-Batteries editions SHALL ship the stable channel only. The supported paths
-are the nix `batteries` output (Linux and macOS) and install-time
-provisioning via `install.sh --batteries`; each SHALL appear in the install
-matrix only after a recorded clean-host rehearsal, per the
-verified-before-advertised rule. Deferred forms SHALL be tracked with entry
-criteria, not instructions: a Windows batteries edition behind a green
-windows-msvc release leg (its shape — a Windows Terminal profile plus a
-winget dependency story — is decided inside the windows track), and portable
-Linux formats (flatpak, AppImage, `nix bundle`) behind the GL/driver
-portability question and actual demand. No downloadable macOS app bundle
-SHALL ship unless signed and notarized.
-
-#### Scenario: No dev-channel batteries
-
-- **WHEN** batteries outputs and installers are enumerated
-- **THEN** every one launches the stable-channel binary and none packages
-  `thegn-dev`
-
-#### Scenario: Deferred forms stay undocumented
-
-- **WHEN** the windows-msvc release leg has not produced a verified asset
-- **THEN** the install matrix carries no Windows batteries instructions, and
-  the deferral records its entry criterion
+- **WHEN** the selected batteries launcher cannot create or update its
+  user-local terminal configuration
+- **THEN** startup/doctor names the path and corrective action rather than
+  silently falling back to an unrelated terminal configuration

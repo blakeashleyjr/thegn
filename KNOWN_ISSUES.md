@@ -53,9 +53,23 @@ control-plane worktree-path confinement, protocol version-skew handshake, no
 idle-exit while serving, no scrollback re-replay on reconnect, TOCTOU-safe
 socket election), and disabling the daemon with persisted daemon-backed panes
 now claims each persisted session exactly once (respawning it in-process and
-stopping the daemon copy) instead of duplicating panes. No open issues are
-tracked here at release time — treat surprises on this surface as reportable
-bugs, not known limitations.
+stopping the daemon copy) instead of duplicating panes.
+
+The September remote/client reconciliation records these known limitations:
+
+- TCP serving is plaintext; bearer tokens provide authorization, not
+  confidentiality. Use loopback, a VPN, or an SSH/TLS terminator.
+- Local unix-socket admin trust is protected by owner-only directory/socket
+  modes, not an independent peer-credential check; the chmod steps are
+  best-effort.
+- The default `route_to_host` merge path is not end-to-end complete for true
+  remote worktrees: control credential provisioning and target-host path
+  handling remain open.
+- The broad remote surface/parity audit is being decomposed under Linear
+  THE-41; RDP/VNC/Telnet/SFTP/serial/public-sharing/multi-user parity is not a
+  current product promise.
+
+Treat additional surprises on this surface as reportable bugs.
 
 Note: launching with `THEGN_NO_DAEMON=1` while daemon-backed sessions are
 persisted now actively stops those daemon sessions as it claims them (previously
