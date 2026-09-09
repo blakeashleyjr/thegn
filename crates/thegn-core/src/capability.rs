@@ -141,8 +141,8 @@ pub struct HostCapability {
     /// Set when the row is kept only for compatibility; names the replacement.
     pub deprecated: Option<&'static str>,
     /// Set when the row is *routed on every surface but answers
-    /// `Unimplemented` unconditionally* — a reserved contract slot with no
-    /// behavior yet (`browser.drive` today). Names what the row waits on. A
+    /// `Unimplemented` unconditionally* — a reserved compatibility slot with
+    /// no behavior yet. Names what the row waits on. A
     /// stub is still projected by the surface tables (so it is "covered"), but
     /// the coverage report counts it apart from working capabilities so
     /// routed-but-inert never reads as done; removing the last `Unimplemented`
@@ -164,20 +164,6 @@ const fn cap(
         since: "1",
         deprecated: None,
         stub: None,
-    }
-}
-
-/// A [`cap`] that is a routed-but-inert stub (see [`HostCapability::stub`]).
-const fn stub_cap(
-    id: &'static str,
-    verb: Verb,
-    surfaces: SurfaceSet,
-    summary: &'static str,
-    waits_on: &'static str,
-) -> HostCapability {
-    HostCapability {
-        stub: Some(waits_on),
-        ..cap(id, verb, surfaces, summary)
     }
 }
 
@@ -302,7 +288,10 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "launch.preset",
         Verb::LaunchPreset,
-        SurfaceSet::ALL,
+        // CLI-first: there is no generic HTTP route for the intents-mailbox
+        // launch yet, so plugin `host.call` must not advertise it as
+        // dispatchable. `tools.run` is the current exec-scoped plugin path.
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Mcp]),
         "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
     ),
     cap(
@@ -310,13 +299,6 @@ pub const CATALOG: &[HostCapability] = &[
         Verb::PreviewFetch,
         SurfaceSet::ALL,
         "Fetch a preview URL with bounded, credential-free HTTP",
-    ),
-    stub_cap(
-        "browser.drive",
-        Verb::DriveBrowser,
-        SurfaceSet::ALL,
-        "Drive the preview browser (navigate, reload)",
-        "no preview browser to drive yet (answers 501 on every surface)",
     ),
     // --- git / merge queue ----------------------------------------------------
     cap(
@@ -789,13 +771,16 @@ pub const CATALOG: &[HostCapability] = &[
     cap(
         "containers.list",
         Verb::ContainersList,
-        SurfaceSet::ALL,
+        // The TUI calls the container service in-process. No generic control
+        // route exists yet, so plugins must not advertise this as a callable
+        // `host.call` capability.
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Mcp]),
         "List thegn's containers across backends (owned first; foreign read-only)",
     ),
     cap(
         "containers.control",
         Verb::ContainersControl,
-        SurfaceSet::ALL,
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli, Surface::Mcp]),
         "Lifecycle on an owned container: stop/start/restart/logs",
     ),
     cap(
@@ -1133,11 +1118,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP exec-scoped tools land in the MCP write-tools phase",
     ),
     (
-        "browser.drive",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "git.status",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -1281,8 +1261,8 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // -- containers: the TUI Containers tab + `thegn sandbox gc/prune` are the
     //    surfaces this change ships; the external control/MCP doors land with
     //    the client-API / MCP scope-gating phase. `containers.prune` (admin,
-    //    OPERATOR-only) IS wired on the CLI (`thegn sandbox gc/prune`), and the
-    //    plugin door is generic (no excuse).
+    //    OPERATOR-only) IS wired on the CLI (`thegn sandbox gc/prune`). The
+    //    plugin door is omitted until these verbs have generic control routes.
     (
         "containers.list",
         Surface::Http,
@@ -1733,26 +1713,22 @@ mod tests {
     }
 
     #[test]
-    fn browser_drive_is_the_only_stub_and_is_not_deprecated() {
-        let stubbed: Vec<&str> = stubs().map(|c| c.id.0).collect();
-        assert_eq!(stubbed, ["browser.drive"]);
-        // A stub is a live-but-inert slot, never a compatibility shim.
-        for c in stubs() {
-            assert!(
-                c.deprecated.is_none(),
-                "{} is both a stub and deprecated",
-                c.id
-            );
-        }
+    fn advertised_supported_operations_have_no_universal_stubs() {
+        let stubbed: Vec<(&str, &str)> = stubs()
+            .map(|capability| (capability.id.0, capability.stub.unwrap_or_default()))
+            .collect();
+        assert!(
+            stubbed.is_empty(),
+            "advertised operations must have a success path; remove or implement universal stubs: {stubbed:?}"
+        );
     }
 
     #[test]
     fn ledger_counts_stub_apart_from_working() {
-        // The HTTP surface routes browser.drive (a stub) plus real verbs.
-        let http_impl = ["sessions.list", "browser.drive"];
+        let http_impl = ["sessions.list"];
         let l = ledger(Surface::Http, &http_impl);
         assert_eq!(l.implemented, 1, "sessions.list is working");
-        assert_eq!(l.stub, 1, "browser.drive is a routed stub");
+        assert_eq!(l.stub, 0, "no universally inert row is advertised");
         // HTTP is no longer excuse-free: the CLI-first operator families
         // (`secret.*`, `project.*`, `containers.*`, `doctor.bundle`,
         // `launch.preset`) declare an HTTP surface whose route is still owed.

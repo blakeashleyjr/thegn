@@ -279,31 +279,29 @@ impl WorkspaceStore for Db {
 
     /// The remote-location descriptor for a worktree (None/empty = local).
     fn location_for(&self, wt: &str) -> Result<Option<String>> {
-        let r = self
-            .conn()
+        self.conn()
             .query_row(
                 "SELECT location FROM worktrees WHERE worktree=?1",
                 params![wt],
                 |r| r.get::<_, Option<String>>(0),
             )
-            .ok()
-            .flatten();
-        Ok(r)
+            .optional()
+            .map(|row| row.flatten())
+            .map_err(Into::into)
     }
 
     /// The (local) repo root recorded for a worktree — needed for the per-repo
     /// `.thegn` overlay when the worktree itself lives remote.
     fn repo_root_for(&self, wt: &str) -> Result<Option<String>> {
-        let r = self
-            .conn()
+        self.conn()
             .query_row(
                 "SELECT repo_path FROM worktrees WHERE worktree=?1",
                 params![wt],
                 |r| r.get::<_, Option<String>>(0),
             )
-            .ok()
-            .flatten();
-        Ok(r)
+            .optional()
+            .map(|row| row.flatten())
+            .map_err(Into::into)
     }
 
     /// The recorded agent for a worktree (for `pick-agent --resume` on restart).

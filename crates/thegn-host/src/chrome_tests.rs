@@ -11,6 +11,39 @@ fn lines(s: &Surface) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn schema_refusal_banner_owns_statusbar_until_compatible_hydration() {
+    let mut model = FrameModel {
+        state_db: StateDbAvailability::SchemaRefused {
+            observed: 72,
+            build: 67,
+        },
+        status: "transient notification that must not hide refusal".into(),
+        ..Default::default()
+    };
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    let mut surface = Surface::new(rect.cols, rect.rows);
+    draw_statusbar(&mut surface, rect, &model);
+    let text = surface.screen_chars_to_string();
+    assert!(text.contains("disk v72 > build v67"), "{text:?}");
+    assert!(text.contains("rebuild/reinstall"), "{text:?}");
+    assert!(text.contains("restart host/daemon"), "{text:?}");
+    assert!(!text.contains("transient notification"), "{text:?}");
+
+    model.state_db = StateDbAvailability::Available;
+    let mut recovered = Surface::new(rect.cols, rect.rows);
+    draw_statusbar(&mut recovered, rect, &model);
+    assert!(
+        !recovered.screen_chars_to_string().contains("DB REFUSED"),
+        "successful compatible hydration clears the banner"
+    );
+}
+
 /// Build a minimal sidebar row for renderer tests.
 fn row(kind: crate::sidebar::RowKind, label: &str) -> crate::sidebar::SidebarRow {
     crate::sidebar::SidebarRow {

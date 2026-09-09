@@ -97,6 +97,7 @@ pub fn spawn(
         // in-process handler's transport-auth — it grants no policy the
         // admission didn't already permit.
         local_admin: true,
+        daemon_euid: thegn_svc::ipc::effective_uid(),
         require_approval: false,
         server_label,
         // Not an HTTP server: the inbox dispatches in-process, so there is no

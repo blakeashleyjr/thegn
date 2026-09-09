@@ -31,6 +31,79 @@ use crate::naming::issue_branch_tail;
 use crate::session::{GroupKind, Session, WorktreeGroup};
 
 #[test]
+fn schema_refusal_is_sticky_and_retains_the_last_good_model_until_recovery() {
+    use crate::chrome::StateDbAvailability;
+
+    let mut current = FrameModel {
+        worktree: "last-good".into(),
+        sidebar_rows: vec![crate::sidebar::SidebarRow::base(
+            crate::sidebar::RowKind::Worktree,
+            1,
+            "kept-row",
+            "/repo/wt",
+        )],
+        ..Default::default()
+    };
+    let refused = FrameModel {
+        state_db: StateDbAvailability::SchemaRefused {
+            observed: 72,
+            build: 67,
+        },
+        ..Default::default()
+    };
+    assert!(retain_model_for_hydration_failure(&mut current, &refused));
+    assert_eq!(current.worktree, "last-good");
+    assert_eq!(current.sidebar_rows[0].label, "kept-row");
+    assert!(!current.state_db.mutations_allowed());
+
+    let generic_failure = FrameModel {
+        state_db: StateDbAvailability::Unavailable {
+            detail: "locked".into(),
+        },
+        ..Default::default()
+    };
+    assert!(retain_model_for_hydration_failure(
+        &mut current,
+        &generic_failure
+    ));
+    assert_eq!(current.state_db, refused.state_db);
+
+    let recovered = FrameModel::default();
+    assert!(!retain_model_for_hydration_failure(
+        &mut current,
+        &recovered
+    ));
+    current = recovered;
+    assert_eq!(current.state_db, StateDbAvailability::Available);
+}
+
+#[test]
+fn first_hydration_refusal_is_explicit_and_mutating_actions_fail_closed() {
+    use crate::chrome::StateDbAvailability;
+    use crate::keymap::Action;
+
+    let mut first_frame = FrameModel::default();
+    let refused = FrameModel {
+        state_db: StateDbAvailability::SchemaRefused {
+            observed: 68,
+            build: 67,
+        },
+        ..Default::default()
+    };
+    assert!(retain_model_for_hydration_failure(
+        &mut first_frame,
+        &refused
+    ));
+    let banner = first_frame.state_db.banner().expect("visible refusal");
+    assert!(banner.contains("disk v68 > build v67"), "{banner}");
+    assert!(banner.contains("rebuild/reinstall"), "{banner}");
+    assert!(banner.contains("restart host/daemon"), "{banner}");
+    assert!(!action_allowed_during_schema_refusal(&Action::NewWorktree));
+    assert!(action_allowed_during_schema_refusal(&Action::Help));
+    assert!(action_allowed_during_schema_refusal(&Action::Quit));
+}
+
+#[test]
 fn claimed_intents_are_drained_before_a_stale_hydration_is_rejected() {
     let row = |id, kind: &str| thegn_core::store::IntentRow {
         id,

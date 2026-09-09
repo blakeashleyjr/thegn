@@ -26,6 +26,53 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// OS-authenticated identity attached to an accepted local-control stream.
+/// This is created by the listener, never from request headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerIdentity {
+    /// Effective uid returned by the Unix peer-credential syscall.
+    UnixEuid(u32),
+    /// A local-only Windows named pipe (`reject_remote_clients(true)`).
+    LocalPipe,
+    /// A daemon-internal dispatch whose caller already authenticated it.
+    TrustedInternal,
+    /// The platform could not authenticate this peer. Such a peer must use a
+    /// normal scoped token even when implicit local admin is enabled.
+    Unavailable(String),
+}
+
+/// Connection metadata propagated to HTTP/WebSocket and gRPC request
+/// extensions by `into_make_service_with_connect_info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcConnectInfo {
+    pub endpoint: String,
+    pub peer: PeerIdentity,
+}
+
+impl IpcConnectInfo {
+    /// Identity for daemon-internal calls routed through the HTTP adapters.
+    pub fn trusted_internal() -> Self {
+        Self {
+            endpoint: "in-process".into(),
+            peer: PeerIdentity::TrustedInternal,
+        }
+    }
+}
+
+/// The daemon's effective uid on Unix. `None` on platforms without Unix uid
+/// credentials; kept here so platform-specific identity knowledge has one
+/// home.
+pub fn effective_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// The Windows named-pipe namespace prefix.
 pub const PIPE_PREFIX: &str = r"\\.\pipe\";
 
@@ -227,6 +274,17 @@ impl IpcListener {
     /// Bind the endpoint, treating it as the single-daemon lock (see the
     /// module docs). `AlreadyRunning` is the spawn-race loser's clean exit.
     pub async fn bind_exclusive(ep: &IpcEndpoint) -> io::Result<BindOutcome> {
+        Self::bind_exclusive_with_hardening(ep, false).await
+    }
+
+    /// Bind the endpoint and require owner-only endpoint hardening when
+    /// `require_hardening` is true. The strict form is used whenever the
+    /// listener can grant implicit local admin; token-only listeners retain
+    /// the portable best-effort permission behavior.
+    pub async fn bind_exclusive_with_hardening(
+        ep: &IpcEndpoint,
+        require_hardening: bool,
+    ) -> io::Result<BindOutcome> {
         match ep {
             IpcEndpoint::Unix(sock) => {
                 #[cfg(unix)]
@@ -258,14 +316,20 @@ impl IpcListener {
                         }
                         match std::os::unix::net::UnixListener::bind(&sock) {
                             Ok(l) => {
-                                // Owner-only (0600) on the socket: the local control
-                                // plane grants admin to any connector, so the umask
-                                // must not leave it cross-user-connectable. On Linux a
-                                // 0600 socket inode denies connect(2) to other uids —
-                                // defense in depth for the state-dir fallback path
-                                // (no XDG_RUNTIME_DIR). Best-effort: a chmod failure
-                                // must not down the daemon.
-                                let _ = thegn_core::fsperm::restrict_to_owner(&sock); // best-effort: chmod failure must not down the daemon (see comment above)
+                                // Filesystem isolation is defense in depth; runtime
+                                // peer credentials are the authority. When this
+                                // listener may grant implicit admin, however, a
+                                // hardening failure is a startup error rather than a
+                                // silently weakened deployment.
+                                if let Err(e) = thegn_core::fsperm::restrict_to_owner(&sock)
+                                    .and_then(|()| verify_unix_owner_mode(&sock, 0o600, false))
+                                {
+                                    if require_hardening {
+                                        let _ = std::fs::remove_file(&sock);
+                                        return Err(e);
+                                    }
+                                    tracing::warn!(target: "thegn::daemon", path = %sock.display(), "could not harden control socket: {e}");
+                                }
                                 l.set_nonblocking(true)?;
                                 Ok(UnixBind::Bound(l))
                             }
@@ -357,12 +421,26 @@ impl IpcListener {
         }
     }
 
-    /// Accept one connection. (Named `accept_stream` so the inherent method
-    /// doesn't shadow `axum::serve::Listener::accept`.)
-    pub async fn accept_stream(&mut self) -> io::Result<IpcStream> {
+    /// Accept one stream together with listener-authenticated peer metadata.
+    pub async fn accept_stream_with_info(&mut self) -> io::Result<(IpcStream, IpcConnectInfo)> {
         match self {
             #[cfg(unix)]
-            IpcListener::Unix(l) => Ok(IpcStream::Unix(l.accept().await?.0)),
+            IpcListener::Unix(l) => {
+                let (stream, _) = l.accept().await?;
+                let peer = match stream.peer_cred() {
+                    Ok(cred) => PeerIdentity::UnixEuid(cred.uid()),
+                    Err(error) => PeerIdentity::Unavailable(error.to_string()),
+                };
+                let endpoint = l
+                    .local_addr()
+                    .ok()
+                    .and_then(|addr| {
+                        addr.as_pathname()
+                            .map(|path| path.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
+                Ok((IpcStream::Unix(stream), IpcConnectInfo { endpoint, peer }))
+            }
             #[cfg(windows)]
             IpcListener::Pipe { name, next } => {
                 use tokio::net::windows::named_pipe::ServerOptions;
@@ -377,10 +455,24 @@ impl IpcListener {
                 *next = ServerOptions::new()
                     .reject_remote_clients(true)
                     .create(&*name)
-                    .ok(); // best-effort: failure surfaces via the on-demand create's `?` in the next accept
-                Ok(IpcStream::PipeServer(server))
+                    .ok();
+                Ok((
+                    IpcStream::PipeServer(server),
+                    IpcConnectInfo {
+                        endpoint: name.clone(),
+                        peer: PeerIdentity::LocalPipe,
+                    },
+                ))
             }
         }
+    }
+
+    /// Accept one connection. (Named `accept_stream` so the inherent method
+    /// doesn't shadow `axum::serve::Listener::accept`.)
+    pub async fn accept_stream(&mut self) -> io::Result<IpcStream> {
+        self.accept_stream_with_info()
+            .await
+            .map(|(stream, _)| stream)
     }
 
     /// The endpoint's stable string form (registry row / log lines).
@@ -403,12 +495,12 @@ impl IpcListener {
 /// listener impls).
 impl axum::serve::Listener for IpcListener {
     type Io = IpcStream;
-    type Addr = String;
+    type Addr = IpcConnectInfo;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            match self.accept_stream().await {
-                Ok(stream) => return (stream, self.endpoint_display()),
+            match self.accept_stream_with_info().await {
+                Ok(accepted) => return accepted,
                 Err(e) => {
                     tracing::warn!(target: "thegn::daemon", "ipc accept failed: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -418,8 +510,84 @@ impl axum::serve::Listener for IpcListener {
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        Ok(self.endpoint_display())
+        Ok(IpcConnectInfo {
+            endpoint: self.endpoint_display(),
+            peer: PeerIdentity::Unavailable("listener address has no peer".into()),
+        })
     }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, IpcListener>>
+    for IpcConnectInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, IpcListener>) -> Self {
+        stream.remote_addr().clone()
+    }
+}
+
+/// Create and owner-restrict a Unix socket's parent directory. This is strict
+/// when implicit local admin is requested, and otherwise retains the existing
+/// best-effort portability behavior.
+pub fn prepare_control_directory(path: &Path, require_hardening: bool) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let result = thegn_core::fsperm::restrict_dir_to_owner(path);
+    #[cfg(unix)]
+    let result = result.and_then(|()| verify_unix_owner_mode(path, 0o700, true));
+    if require_hardening {
+        result
+    } else {
+        if let Err(error) = result {
+            tracing::warn!(target: "thegn::daemon", path = %path.display(), "could not harden control directory: {error}");
+        }
+        Ok(())
+    }
+}
+
+/// Read-only hardening status used by `thegn doctor`.
+pub fn control_endpoint_hardening(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control socket has no parent directory",
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        verify_unix_owner_mode(parent, 0o700, true)?;
+        verify_unix_owner_mode(path, 0o600, false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn verify_unix_owner_mode(path: &Path, expected_mode: u32, directory: bool) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    let metadata = std::fs::metadata(path)?;
+    let correct_kind = if directory {
+        metadata.is_dir()
+    } else {
+        metadata.file_type().is_socket()
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    let uid = metadata.uid();
+    let expected_uid = effective_uid().expect("unix has an effective uid");
+    if !correct_kind || uid != expected_uid || mode != expected_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be an owner-owned {} with mode {:04o} (found uid {uid}, mode {mode:04o}); set owner uid {expected_uid} and mode {:04o}, or set [serve] local_admin = false to require tokens",
+                path.display(),
+                if directory { "directory" } else { "socket" },
+                expected_mode,
+                expected_mode,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -482,7 +650,12 @@ mod tests {
         ));
         // That liveness probe connected once; drain it from the backlog so the
         // round-trip below accepts the real client.
-        drop(listener.accept_stream().await.unwrap());
+        let (probe, probe_info) = listener.accept_stream_with_info().await.unwrap();
+        assert_eq!(
+            probe_info.peer,
+            PeerIdentity::UnixEuid(effective_uid().unwrap())
+        );
+        drop(probe);
 
         // Round-trip a byte each way through connect/accept.
         let client = tokio::spawn({
@@ -495,7 +668,11 @@ mod tests {
                 buf
             }
         });
-        let mut server_side = listener.accept_stream().await.unwrap();
+        let (mut server_side, peer_info) = listener.accept_stream_with_info().await.unwrap();
+        assert_eq!(
+            peer_info.peer,
+            PeerIdentity::UnixEuid(effective_uid().unwrap())
+        );
         let mut buf = [0u8; 2];
         server_side.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hi");
@@ -510,6 +687,34 @@ mod tests {
             BindOutcome::Bound(_)
         ));
         let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_hardening_is_verified_and_doctor_detects_regression() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("thegn-ipc-hardening-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        prepare_control_directory(&dir, true).unwrap();
+        let sock = dir.join("d.sock");
+        let ep = IpcEndpoint::for_socket_path(&sock);
+        let listener = match IpcListener::bind_exclusive_with_hardening(&ep, true)
+            .await
+            .unwrap()
+        {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("fresh socket must bind"),
+        };
+        control_endpoint_hardening(&sock).expect("strict bind leaves a hardened endpoint");
+
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error = control_endpoint_hardening(&sock).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("mode 0666"));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The stale-socket TOCTOU: N binders racing one stale socket file must

@@ -137,9 +137,16 @@ pub(crate) fn spawn_drive(
         };
         // The fold runs in the target repo's object store; a remote target must
         // be drained on its own host (see the guidance).
-        if let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root) {
-            send(DriveMsg::Failed(msg));
-            return;
+        match crate::merge_ops::remote_target_guard(&db, &root) {
+            Ok(Some(msg)) => {
+                send(DriveMsg::Failed(msg));
+                return;
+            }
+            Err(error) => {
+                send(DriveMsg::Failed(format!("remote-target guard: {error}")));
+                return;
+            }
+            Ok(None) => {}
         }
         let items: Vec<QueueItem> = merge_driver::rows_for_repo(&db, &root)
             .into_iter()

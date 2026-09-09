@@ -267,7 +267,12 @@ fn conflicts(issue: &str, summary: bool, json: bool, decision_args: &[String]) -
 
 /// Ask Git for raw, NUL-delimited paths. Newline parsing and Git's display
 /// quoting both corrupt valid filenames, particularly on Unix where paths are
-/// arbitrary byte strings.
+/// arbitrary byte strings. This is the blocking seam for the synchronous
+/// `thegn merge conflicts` CLI action; it is never called by the compositor.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "CLI-only merge-conflict inspection blocks synchronously on its Git query"
+)]
 fn conflicted_paths(root: &Path) -> Result<Vec<PathBuf>> {
     let output = thegn_core::util::git_cmd(root)
         .args(["diff", "--name-only", "--diff-filter=U", "-z"])
@@ -525,12 +530,12 @@ fn drain(cfg: &Config, all: bool, json: bool) -> Result<()> {
     // `push` mode drains this clone locally and pushes to origin, so it skips the
     // remote-target guard; `route_to_host` keeps the fold on the target host.
     let push_mode = mq.remote_mode == thegn_core::config::MergeRemoteMode::Push;
-    if !push_mode
-        && let Ok(db) = Db::open()
-        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
-    {
-        // Guard refusal: bail so the exit code is non-zero for scripting/CI.
-        anyhow::bail!("{msg}");
+    if !push_mode {
+        let db = Db::open().context("remote-target guard database unavailable")?;
+        if let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)? {
+            // Guard refusal: bail so the exit code is non-zero for scripting/CI.
+            anyhow::bail!("{msg}");
+        }
     }
     // `--json` means EXACTLY one document on stdout (see `cmd::emit_json`), so
     // every human line below is suppressed under it — including the enqueue
@@ -715,10 +720,9 @@ fn first_line(detail: &str) -> &str {
 fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = crate::merge_ops::canonical_worktree(&super::resolve_worktree(worktree));
     let wt_s = wt.to_string_lossy().to_string();
-    if let Ok(db) = Db::open()
-        && let Some(root) = integrate::main_checkout(&wt)
-        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
-    {
+    let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
+    let guard_db = Db::open().context("remote-target guard database unavailable")?;
+    if let Some(msg) = crate::merge_ops::remote_target_guard(&guard_db, &root)? {
         // Guard refusal: bail so the exit code is non-zero for scripting/CI.
         anyhow::bail!("{msg}");
     }

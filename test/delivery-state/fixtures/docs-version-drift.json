@@ -1,0 +1,62 @@
+{
+  "name": "docs-version-drift",
+  "active_changes": {
+    "docs-change": "# Tasks\n\n- [ ] implement\n"
+  },
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": [
+      "Fixture Project"
+    ],
+    "entries": [
+      {
+        "change": "docs-change",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [
+          {
+            "issue": "THE-1",
+            "project": "Fixture Project"
+          }
+        ],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "plugin_contract": {
+    "source": "pub const API_VERSION: ApiVersion = ApiVersion {\n    major: 0,\n    minor: 3,\n    patch: 0,\n};\n",
+    "snapshot_path": "docs/api/plugin-api-0.3.json",
+    "snapshot": {
+      "x-thegn-api-version": "0.3.0",
+      "x-thegn-extension-support": [
+        {
+          "extension_point": "FixturePoint",
+          "state": "wired",
+          "required_capability": "surface:fixture",
+          "modes": [
+            "resident"
+          ],
+          "cadences": [
+            "on_demand"
+          ]
+        }
+      ],
+      "definitions": {
+        "Scope": {
+          "oneOf": [
+            {
+              "enum": [
+                "read"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "developer_doc": "# Plugin API\n\nContract version, currently \"0.2.0\".\n\n## Current host support (API 0.2)\n\n| Extension point | State | Required capability | Modes | Cadence | Owner |\n| --- | --- | --- | --- | --- | --- |\n| `FixturePoint` | wired | `surface:fixture` | resident | on-demand | fixture |\n\nScope: `read`.\n",
+    "help_doc": "Use api = \"0.2.0\" and plugin-api-0.2.json with `read`.\n"
+  },
+  "contracts": true,
+  "expected_error": "plugin docs version drift"
+}

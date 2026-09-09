@@ -366,6 +366,9 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
 /// is rejected: the control API is bearer-token authenticated, and `*` must
 /// never be paired with credentialed cross-origin fetch.
 fn check_serve(cfg: &Config, errs: &mut Vec<String>) {
+    if let Err(error) = cfg.serve.resolve_transport(None, false) {
+        errs.push(format!("serve transport: {error}"));
+    }
     for origin in &cfg.serve.cors_origins {
         if origin.trim() == "*" {
             errs.push(
@@ -942,9 +945,13 @@ mod tests {
         // still present, so the ledger records them in turn.
         // 98 → 99 (THE-32): `[git] submodules` (SubmoduleMode) — lifecycle
         // initialization policy, trusted config only.
+        // 99 → 101 (THE-90, THE-101): `[sandbox] compiler_cache`
+        // (SandboxCompilerCache) makes cache enablement explicit and trusted,
+        // while `[serve] topology` (ServeTopology) distinguishes direct,
+        // TLS-terminated, and tunnel-only control-plane deployments.
         assert_eq!(
             defs.len(),
-            99,
+            101,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -1297,6 +1304,44 @@ sidebar_workspace_sort = "attention"
         assert!(ok.is_empty(), "{ok:#?}");
         // Empty (the default) is clean.
         assert!(validate_str("[serve]\ncors_origins = []\n").is_empty());
+    }
+
+    #[test]
+    fn serve_transport_rejects_accidental_plaintext_widening() {
+        let widened = validate_str("[serve]\nbind = \"0.0.0.0:5380\"\n");
+        assert!(
+            widened.iter().any(|error| {
+                error.contains("plaintext non-loopback")
+                    && error.contains("unsafe_allow_plaintext_non_loopback")
+            }),
+            "{widened:#?}"
+        );
+        let opted_in = validate_str(
+            "[serve]\nbind = \"0.0.0.0:5380\"\nadvertise_host = \"host.example\"\nunsafe_allow_plaintext_non_loopback = true\n",
+        );
+        assert!(opted_in.is_empty(), "{opted_in:#?}");
+    }
+
+    #[test]
+    fn serve_transport_validates_strict_termination_boundary() {
+        let missing = validate_str("[serve]\ntopology = \"tls-terminated\"\n");
+        assert!(
+            missing.iter().any(|error| error.contains("advertise_host")),
+            "{missing:#?}"
+        );
+        let exposed_backend = validate_str(
+            "[serve]\ntopology = \"tls-terminated\"\nbind = \"0.0.0.0:5380\"\nadvertise_host = \"host.example\"\n",
+        );
+        assert!(
+            exposed_backend
+                .iter()
+                .any(|error| error.contains("loopback backend")),
+            "{exposed_backend:#?}"
+        );
+        let valid = validate_str(
+            "[serve]\ntopology = \"tls-terminated\"\nbind = \"127.0.0.1:5380\"\nadvertise_host = \"host.example\"\n",
+        );
+        assert!(valid.is_empty(), "{valid:#?}");
     }
 
     /// `[[pipeline.stages]]` reaches `validate_str` through all three channels:

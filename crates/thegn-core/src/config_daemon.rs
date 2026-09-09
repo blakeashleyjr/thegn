@@ -6,7 +6,106 @@
 //! shapes `thegn serve`: remote thin-client listening and the pairing policy.
 
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+
+use crate::config::{config_enum, config_warn};
+
+config_enum! {
+    /// Confidentiality boundary for `thegn serve`. `direct` is plaintext and
+    /// therefore loopback-only unless the separately named unsafe opt-in is
+    /// set. The secure modes keep Thegn's plaintext backend on loopback and
+    /// delegate the public encrypted hop to the declared boundary.
+    pub enum ServeTopology : "serve transport topology" {
+        Direct        = "direct",
+        TlsTerminated = "tls-terminated" | "tls_terminated",
+        Tunnel        = "tunnel",
+    } default = Direct;
+}
+
+/// Resolved, valid remote-control exposure. One value drives listener setup,
+/// advertised URLs, pairing, diagnostics, and all HTTP/WS/gRPC surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeExposure {
+    SafeLoopback,
+    TlsTerminated,
+    Tunnel,
+    UnsafePlaintext,
+}
+
+impl ServeExposure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SafeLoopback => "safe-loopback",
+            Self::TlsTerminated => "tls-terminated",
+            Self::Tunnel => "tunnel",
+            Self::UnsafePlaintext => "unsafe-plaintext",
+        }
+    }
+}
+
+/// Validated projection of `[serve]` plus trusted CLI overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeTransportPolicy {
+    pub bind: SocketAddr,
+    pub exposure: ServeExposure,
+    pub advertise_host: String,
+    configured_advertise_port: u16,
+}
+
+impl ServeTransportPolicy {
+    pub fn http_scheme(&self) -> &'static str {
+        if self.exposure == ServeExposure::TlsTerminated {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    pub fn websocket_scheme(&self) -> &'static str {
+        if self.exposure == ServeExposure::TlsTerminated {
+            "wss"
+        } else {
+            "ws"
+        }
+    }
+
+    pub fn grpc_scheme(&self) -> &'static str {
+        if self.exposure == ServeExposure::TlsTerminated {
+            "grpcs"
+        } else {
+            "grpc"
+        }
+    }
+
+    /// Public port, substituting the actual listener port when a direct/tunnel
+    /// backend was configured with port zero. TLS termination defaults to 443.
+    pub fn advertise_port(&self, actual_bind_port: u16) -> u16 {
+        if self.configured_advertise_port != 0 {
+            self.configured_advertise_port
+        } else if self.exposure == ServeExposure::TlsTerminated {
+            443
+        } else if self.bind.port() != 0 {
+            self.bind.port()
+        } else {
+            actual_bind_port
+        }
+    }
+
+    pub fn advertised_origin(&self, actual_bind_port: u16) -> String {
+        let host = if self.advertise_host.contains(':') && !self.advertise_host.starts_with('[') {
+            format!("[{}]", self.advertise_host)
+        } else {
+            self.advertise_host.clone()
+        };
+        format!(
+            "{}://{}:{}",
+            self.http_scheme(),
+            host,
+            self.advertise_port(actual_bind_port)
+        )
+    }
+}
 
 /// `[daemon]` — the pane daemon. ON by default: new local center panes route
 /// through the daemon and survive quitting the UI (bare `thegn`
@@ -153,18 +252,36 @@ pub fn check_socket_path_len(
 #[serde(default)]
 pub struct ServeConfig {
     /// Default TCP bind for `thegn serve` (overridable with `--bind`). Loopback
-    /// by default — the control plane carries full PTY I/O over plaintext HTTP,
-    /// so exposing it beyond localhost is opt-in. For remote thin clients, front
-    /// it with a tailnet/VPN address or an explicit `--bind 0.0.0.0` behind a
-    /// firewall + TLS terminator.
+    /// by default — the control plane carries full PTY I/O over plaintext HTTP.
+    /// A non-loopback direct bind is rejected unless the dedicated unsafe opt-in
+    /// is set; secure remote topologies keep this backend on loopback.
     pub bind: String,
+    /// Public confidentiality topology. `direct` is plaintext and normally
+    /// loopback-only. `tls-terminated` and `tunnel` require Thegn's backend to
+    /// remain loopback so an arbitrary network peer cannot impersonate the
+    /// declared boundary.
+    pub topology: ServeTopology,
+    /// Host clients actually dial. Required for a declared TLS terminator or
+    /// tunnel; optional for direct mode, where the concrete bind IP is used.
+    /// This is host-only (no scheme, path, credentials, query, or fragment).
+    pub advertise_host: String,
+    /// Port clients actually dial. Zero derives the backend port, except that
+    /// TLS termination defaults to 443.
+    pub advertise_port: u16,
+    /// Explicit escape hatch for plaintext on a non-loopback address. This is
+    /// a global user config / CLI authority only: repo overlays have no
+    /// `[serve]` surface and cannot set it. Never implied by `bind`.
+    pub unsafe_allow_plaintext_non_loopback: bool,
     /// Redeemed pairings wait for in-app / `thegn pair approve` approval
     /// instead of auto-approving (possession of the single-use URL is the
     /// credential by default).
     pub require_approval: bool,
-    /// Unix-socket peers get implicit admin so local CLI verbs need zero setup.
-    /// The socket is created owner-only (0600) and its run-dir 0700, so on unix
-    /// only the same uid can connect. Tokens are always required on TCP.
+    /// Unix-socket peers get implicit admin only when native peer credentials
+    /// report the daemon's effective uid. The socket is also created owner-only
+    /// (0600) in a 0700 run-dir; hardening failure aborts startup while this is
+    /// enabled. Set false to require ordinary scoped tokens on every request,
+    /// including Unix sockets (the portability escape hatch). TCP always
+    /// requires tokens.
     pub local_admin: bool,
     /// Cross-origin allowlist for browser-hosted thin clients. Empty (the
     /// default) means NO cross-origin access — a browser script from another
@@ -182,11 +299,108 @@ impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:5380".into(),
+            topology: ServeTopology::Direct,
+            advertise_host: String::new(),
+            advertise_port: 0,
+            unsafe_allow_plaintext_non_loopback: false,
             require_approval: false,
             local_admin: true,
             cors_origins: Vec::new(),
         }
     }
+}
+
+impl ServeConfig {
+    /// Resolve the common confidentiality policy. `unsafe_cli` is the
+    /// dedicated trusted command-line opt-in; a bind override alone cannot
+    /// widen plaintext exposure.
+    pub fn resolve_transport(
+        &self,
+        bind_override: Option<&str>,
+        unsafe_cli: bool,
+    ) -> Result<ServeTransportPolicy, String> {
+        let bind_text = bind_override.unwrap_or(&self.bind);
+        let bind = bind_text.parse::<SocketAddr>().map_err(|_| {
+            format!(
+                "serve.bind must be a numeric IP:port so loopback policy is unambiguous (found {bind_text:?})"
+            )
+        })?;
+        let unsafe_allowed = self.unsafe_allow_plaintext_non_loopback || unsafe_cli;
+        if self.topology != ServeTopology::Direct && unsafe_allowed {
+            return Err(
+                "serve.unsafe_allow_plaintext_non_loopback applies only to topology = \"direct\"; remove it from a secure topology"
+                    .into(),
+            );
+        }
+        if self.topology != ServeTopology::Direct && !bind.ip().is_loopback() {
+            return Err(format!(
+                "serve.topology = {:?} requires a loopback backend bind; use 127.0.0.1:PORT or [::1]:PORT so only the declared terminator/tunnel reaches plaintext",
+                self.topology.as_str()
+            ));
+        }
+        if self.topology == ServeTopology::Direct && !bind.ip().is_loopback() && !unsafe_allowed {
+            return Err(
+                "plaintext non-loopback control exposure is refused; keep serve.bind on loopback, select topology = \"tls-terminated\" or \"tunnel\", or explicitly set unsafe_allow_plaintext_non_loopback = true"
+                    .into(),
+            );
+        }
+        if self.topology != ServeTopology::Direct && self.advertise_host.trim().is_empty() {
+            return Err(format!(
+                "serve.advertise_host is required for topology = {:?}; set the host clients reach through that boundary",
+                self.topology.as_str()
+            ));
+        }
+        let advertise_host = if self.advertise_host.trim().is_empty() {
+            if bind.ip().is_unspecified() {
+                return Err(
+                    "serve.advertise_host is required when bind uses an unspecified address".into(),
+                );
+            }
+            bind.ip().to_string()
+        } else {
+            validate_advertise_host(&self.advertise_host)?;
+            self.advertise_host.trim().to_string()
+        };
+        if self.topology == ServeTopology::Direct
+            && bind.ip().is_loopback()
+            && !is_loopback_advertise_host(&advertise_host)
+        {
+            return Err(
+                "topology = \"direct\" with a loopback backend may advertise only a loopback IP or localhost name; select \"tls-terminated\" or \"tunnel\" before advertising a remote host"
+                    .into(),
+            );
+        }
+        let exposure = match self.topology {
+            ServeTopology::Direct if bind.ip().is_loopback() => ServeExposure::SafeLoopback,
+            ServeTopology::Direct => ServeExposure::UnsafePlaintext,
+            ServeTopology::TlsTerminated => ServeExposure::TlsTerminated,
+            ServeTopology::Tunnel => ServeExposure::Tunnel,
+        };
+        Ok(ServeTransportPolicy {
+            bind,
+            exposure,
+            advertise_host,
+            configured_advertise_port: self.advertise_port,
+        })
+    }
+}
+
+fn is_loopback_advertise_host(host: &str) -> bool {
+    let host = host.trim();
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    literal
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+        || literal.eq_ignore_ascii_case("localhost")
+        || literal.to_ascii_lowercase().ends_with(".localhost")
+}
+
+fn validate_advertise_host(host: &str) -> Result<(), String> {
+    crate::control::validate_control_host(host)
+        .map_err(|reason| format!("serve.advertise_host {reason}"))
 }
 
 #[cfg(test)]
@@ -342,7 +556,151 @@ mod tests {
     fn serve_defaults() {
         let s = ServeConfig::default();
         assert_eq!(s.bind, "127.0.0.1:5380");
+        assert_eq!(s.topology, ServeTopology::Direct);
+        assert!(!s.unsafe_allow_plaintext_non_loopback);
+        let policy = s.resolve_transport(None, false).unwrap();
+        assert_eq!(policy.exposure, ServeExposure::SafeLoopback);
+        assert_eq!(policy.http_scheme(), "http");
         assert!(!s.require_approval);
         assert!(s.local_admin);
+    }
+
+    #[test]
+    fn non_loopback_plaintext_requires_the_named_unsafe_opt_in() {
+        let serve = ServeConfig {
+            bind: "0.0.0.0:5380".into(),
+            advertise_host: "control.example.test".into(),
+            ..ServeConfig::default()
+        };
+        let error = serve.resolve_transport(None, false).unwrap_err();
+        assert!(error.contains("plaintext non-loopback"));
+        assert!(error.contains("unsafe_allow_plaintext_non_loopback"));
+
+        let policy = serve.resolve_transport(None, true).unwrap();
+        assert_eq!(policy.exposure, ServeExposure::UnsafePlaintext);
+        assert_eq!(policy.http_scheme(), "http");
+        assert_eq!(policy.websocket_scheme(), "ws");
+        assert_eq!(policy.grpc_scheme(), "grpc");
+    }
+
+    #[test]
+    fn bind_override_alone_cannot_widen_plaintext_exposure() {
+        let mut serve = ServeConfig::default();
+        assert!(
+            serve
+                .resolve_transport(Some("0.0.0.0:5380"), false)
+                .is_err()
+        );
+        serve.advertise_host = "control.example.test".into();
+        assert_eq!(
+            serve
+                .resolve_transport(Some("0.0.0.0:5380"), true)
+                .unwrap()
+                .exposure,
+            ServeExposure::UnsafePlaintext
+        );
+    }
+
+    #[test]
+    fn safe_direct_cannot_advertise_an_unverified_remote_endpoint() {
+        let mut serve = ServeConfig {
+            advertise_host: "public.example.test".into(),
+            ..ServeConfig::default()
+        };
+        let error = serve.resolve_transport(None, false).unwrap_err();
+        assert!(error.contains("may advertise only a loopback IP or localhost"));
+
+        for local in ["localhost", "thegn.localhost", "127.0.0.2", "[::1]"] {
+            serve.advertise_host = local.into();
+            assert_eq!(
+                serve.resolve_transport(None, false).unwrap().exposure,
+                ServeExposure::SafeLoopback
+            );
+        }
+
+        serve.topology = ServeTopology::TlsTerminated;
+        serve.advertise_host = "public.example.test".into();
+        assert_eq!(
+            serve.resolve_transport(None, false).unwrap().exposure,
+            ServeExposure::TlsTerminated
+        );
+    }
+
+    #[test]
+    fn tls_termination_requires_loopback_boundary_and_advertises_secure_schemes() {
+        let mut serve = ServeConfig {
+            topology: ServeTopology::TlsTerminated,
+            advertise_host: "control.example.test".into(),
+            ..ServeConfig::default()
+        };
+        let policy = serve.resolve_transport(None, false).unwrap();
+        assert_eq!(policy.exposure, ServeExposure::TlsTerminated);
+        assert_eq!(policy.http_scheme(), "https");
+        assert_eq!(policy.websocket_scheme(), "wss");
+        assert_eq!(policy.grpc_scheme(), "grpcs");
+        assert_eq!(
+            policy.advertised_origin(policy.bind.port()),
+            "https://control.example.test:443"
+        );
+
+        serve.bind = "10.0.0.2:5380".into();
+        assert!(serve.resolve_transport(None, false).is_err());
+    }
+
+    #[test]
+    fn declared_secure_topology_must_be_complete_and_non_contradictory() {
+        let mut serve = ServeConfig {
+            topology: ServeTopology::Tunnel,
+            ..ServeConfig::default()
+        };
+        assert!(
+            serve
+                .resolve_transport(None, false)
+                .unwrap_err()
+                .contains("advertise_host")
+        );
+        serve.advertise_host = "127.0.0.1".into();
+        assert_eq!(
+            serve.resolve_transport(None, false).unwrap().exposure,
+            ServeExposure::Tunnel
+        );
+        serve.unsafe_allow_plaintext_non_loopback = true;
+        assert!(serve.resolve_transport(None, false).is_err());
+    }
+
+    #[test]
+    fn advertised_host_is_host_only_and_ipv6_safe() {
+        let mut serve = ServeConfig {
+            topology: ServeTopology::TlsTerminated,
+            advertise_host: "control.example.test:8443".into(),
+            ..ServeConfig::default()
+        };
+        assert!(
+            serve
+                .resolve_transport(None, false)
+                .unwrap_err()
+                .contains("must not include a port")
+        );
+
+        serve.advertise_host = "2001:db8::1".into();
+        serve.advertise_port = 8443;
+        assert_eq!(
+            serve
+                .resolve_transport(None, false)
+                .unwrap()
+                .advertised_origin(5380),
+            "https://[2001:db8::1]:8443"
+        );
+
+        for injected in [
+            "evil&secure=1",
+            "evil=1",
+            "evil%26secure%3D1",
+            "[::1",
+            "-bad.example",
+        ] {
+            serve.advertise_host = injected.into();
+            assert!(serve.resolve_transport(None, false).is_err(), "{injected}");
+        }
     }
 }

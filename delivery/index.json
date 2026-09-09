@@ -1,0 +1,751 @@
+{
+  "$schema": "./schema.json",
+  "schema_version": 1,
+  "projects": [
+    "Alpha Reliability & State Compatibility",
+    "Client API & Remote Access",
+    "Plugin UI Platform",
+    "Distribution & Release Readiness",
+    "Spec & Tracker Reconciliation",
+    "Agent & Workflow Platform",
+    "Workspace Product & Observability",
+    "Runtime Security & Host Architecture",
+    "Cross-Platform Support & Verification",
+    "Proposal Retirement & Cleanup"
+  ],
+  "entries": [
+    {
+      "change": "add-agent-harness-seam",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-117",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Broad cross-harness adapter and session-resume work remains deferred."
+    },
+    {
+      "change": "add-agent-model-env-selection",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-118",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Runtime model selection shipped; pipeline-board presentation remains."
+    },
+    {
+      "change": "add-automation-rules",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-21",
+          "project": "Spec & Tracker Reconciliation"
+        }
+      ],
+      "summary": "Reconcile the shipped typed-event automation engine with its accepted contract."
+    },
+    {
+      "change": "add-batteries-included-bundles",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-15",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "Complete reproducible batteries-included platform bundles and clean-host proof."
+    },
+    {
+      "change": "add-ci-logs-and-autofix",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-114",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "CI-log caching and guarded autofix are unstarted deferred product work."
+    },
+    {
+      "change": "add-crash-reporting-and-traceability",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-119",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Crash core shipped; fallback notification and end-to-end evidence remain."
+    },
+    {
+      "change": "add-credential-broker",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-122",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Broker core shipped; remaining credential consumers, auditing, and rotation are security work."
+    },
+    {
+      "change": "add-fleet-view",
+      "lifecycle": "proposed",
+      "disposition": "superseded-retire",
+      "owners": [
+        {
+          "issue": "THE-144",
+          "project": "Proposal Retirement & Cleanup"
+        }
+      ],
+      "summary": "The stale fleet-view design was superseded by the delivered pipeline board.",
+      "successors": [
+        "openspec/changes/archive/2026-09-09-add-pipeline-board/"
+      ]
+    },
+    {
+      "change": "add-generic-tracker-model",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-126",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "A capability-gated provider-neutral tracker model remains strategic greenfield work."
+    },
+    {
+      "change": "add-host-as-resource",
+      "lifecycle": "active",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-115",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Host substrate exists; readiness UI, warm volumes, and cloud lowering remain."
+    },
+    {
+      "change": "add-issue-autopilot",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-127",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Opt-in issue-to-PR autopilot with durable claims remains unstarted."
+    },
+    {
+      "change": "add-issue-driven-worktrees",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-125",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Tracker-driven worktree and optional agent launch remain unstarted."
+    },
+    {
+      "change": "add-localization",
+      "lifecycle": "proposed",
+      "disposition": "superseded-retire",
+      "owners": [
+        {
+          "issue": "THE-144",
+          "project": "Proposal Retirement & Cleanup"
+        }
+      ],
+      "summary": "The duplicate localization substrate was absorbed by the canonical localization change.",
+      "successors": [
+        "openspec/changes/extend-localization-surfaces/"
+      ]
+    },
+    {
+      "change": "add-merge-queue-tui",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-146",
+          "project": "Proposal Retirement & Cleanup"
+        }
+      ],
+      "summary": "The merge-queue TUI is delivered; only final integration evidence and archive reconciliation remain."
+    },
+    {
+      "change": "add-multi-repo-projects",
+      "lifecycle": "active",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-132",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Program storage exists; multi-repository navigation and feature-set workflows remain."
+    },
+    {
+      "change": "add-observability-dashboards",
+      "lifecycle": "active",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-129",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The Observe baseline exists; editing, variables, transforms, SQL, and richer panels remain."
+    },
+    {
+      "change": "add-oci-runtime-tiers",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-120",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Runtime selection shipped; gVisor and libkrun graduation require live proof."
+    },
+    {
+      "change": "add-osc-attention-signaling",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-130",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Bounded OSC and CLI attention signaling remain unstarted product work."
+    },
+    {
+      "change": "add-package-manager-releases",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-52",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "Produce reproducible release artifacts, metadata, attestations, and publication rehearsal."
+    },
+    {
+      "change": "add-pr-review-viewed-stacked",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-128",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Synced viewed-file state and commit-by-commit review remain unstarted."
+    },
+    {
+      "change": "add-remote-enqueue-modes",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-99",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Complete remote worktree enqueue routing without weakening local semantics."
+    },
+    {
+      "change": "add-remote-provision-hooks",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-110",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Per-task remote provisioning and teardown hooks remain deferred."
+    },
+    {
+      "change": "add-runtime-session-split",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-111",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Daemon-owned semantic session architecture has no implementation yet."
+    },
+    {
+      "change": "add-sandbox-policy-engine",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-113",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "A brokered sandbox operation-policy engine remains unstarted."
+    },
+    {
+      "change": "add-scm-workflow-customization",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-133",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-134",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-136",
+          "project": "Agent & Workflow Platform"
+        },
+        {
+          "issue": "THE-137",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Background signing safety is delivered; four bounded SCM workflow capabilities remain deferred."
+    },
+    {
+      "change": "add-skills-registry",
+      "lifecycle": "proposed",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-112",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "A versioned proxy-backed registry remains distinct from shipped embedded skills."
+    },
+    {
+      "change": "add-terminal-presets",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-146",
+          "project": "Proposal Retirement & Cleanup"
+        }
+      ],
+      "summary": "Terminal presets are delivered; only final verification and archive reconciliation remain."
+    },
+    {
+      "change": "add-ui-component-contract",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-108",
+          "project": "Plugin UI Platform"
+        }
+      ],
+      "summary": "Wire the bounded PanelSection contribution end to end without promising arbitrary UI."
+    },
+    {
+      "change": "add-viewers-and-quick-open",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-135",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Viewer and ranking foundations shipped; preview fallbacks and drag targets remain."
+    },
+    {
+      "change": "add-voice-mode",
+      "lifecycle": "proposed",
+      "disposition": "superseded-retire",
+      "owners": [
+        {
+          "issue": "THE-148",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The stale cpal and whisper draft must be rewritten around the accepted command-backed provider."
+    },
+    {
+      "change": "add-vps-providers",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-142",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Hetzner lifecycle and billable-resource leak safety require live-account verification."
+    },
+    {
+      "change": "add-windows-ci-distribution",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-140",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "A native Windows release artifact requires repeatable MSVC CI and smoke evidence."
+    },
+    {
+      "change": "add-windows-compositor-validation",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-145",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Interactive compositor behavior still requires real Windows validation."
+    },
+    {
+      "change": "add-windows-daemon-ipc",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-145",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "The daemon IPC implementation requires a real Windows two-terminal race proof."
+    },
+    {
+      "change": "add-windows-job-objects",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-145",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Job-object containment requires Windows CI and on-machine evidence."
+    },
+    {
+      "change": "add-windows-native-compile",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-145",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Native compilation is partial; full Windows integration and waker behavior remain."
+    },
+    {
+      "change": "add-windows-parity",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-145",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Activity and attention parity require on-machine Windows validation."
+    },
+    {
+      "change": "add-workspace-search-replace",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-135",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Search and replace shipped; document, archive, and binary preview routes remain."
+    },
+    {
+      "change": "add-workspace-zones",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-139",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Zone policy and config shipped; sidebar, palette, and detail discoverability remain."
+    },
+    {
+      "change": "audit-remote-surface-map",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-98",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Persist a generated remote surface map and record explicit parity decisions."
+    },
+    {
+      "change": "audit-sandbox-cross-platform",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-141",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "The isolation matrix shipped; smolvm and WSL still need real-host verification."
+    },
+    {
+      "change": "complete-devcontainer-support",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-146",
+          "project": "Proposal Retirement & Cleanup"
+        }
+      ],
+      "summary": "Implementation is accepted but its remaining scoped host verification must be reconciled before archive."
+    },
+    {
+      "change": "decide-plugin-ui-extension-surfaces",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-107",
+          "project": "Plugin UI Platform"
+        }
+      ],
+      "summary": "Bound sidebar, theme, and key-zone plugin contracts without claiming arbitrary rendering."
+    },
+    {
+      "change": "define-debugger-adapter-surface",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-102",
+          "project": "Plugin UI Platform"
+        }
+      ],
+      "summary": "Define a provider-neutral debugger adapter without overstating the prior debugger audit."
+    },
+    {
+      "change": "define-external-ide-inbound-boundary",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-104",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Decide and publish the external IDE inbound handoff and control boundary."
+    },
+    {
+      "change": "detect-active-network-kind",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-92",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Classify active Ethernet, Wi-Fi, and generic network fallback semantics truthfully."
+    },
+    {
+      "change": "expand-media-surfaces",
+      "lifecycle": "proposed",
+      "disposition": "superseded-retire",
+      "owners": [
+        {
+          "issue": "THE-147",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The stale overlay and cava draft must be rewritten around the accepted docked media panel."
+    },
+    {
+      "change": "extend-localization-surfaces",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-51",
+          "project": "Plugin UI Platform"
+        }
+      ],
+      "summary": "Complete runtime TUI localization and define plugin-visible string participation."
+    },
+    {
+      "change": "harden-pipeline-slot-accounting",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-121",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Delivered slot-accounting repairs need a focused end-to-end oversubscription regression."
+    },
+    {
+      "change": "improve-agent-pipeline-v2",
+      "lifecycle": "active",
+      "disposition": "strategic-unstarted",
+      "owners": [
+        {
+          "issue": "THE-116",
+          "project": "Agent & Workflow Platform"
+        }
+      ],
+      "summary": "Native pipeline verification, waiting, and stage dispatch remain substantial deferred work."
+    },
+    {
+      "change": "make-sidebar-mode-visible",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-93",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Render the persisted flat or grouped sidebar mode continuously and at narrow widths."
+    },
+    {
+      "change": "make-usage-overlay-scannable",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-138",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "The scannable UI partially shipped; compact defaults and a read-only snapshot remain."
+    },
+    {
+      "change": "mark-unverified-backends",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-141",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Truthful backend caveats shipped; smolvm and WSL remain unverified until real-host proof."
+    },
+    {
+      "change": "package-shell-completions",
+      "lifecycle": "proposed",
+      "disposition": "superseded-retire",
+      "owners": [
+        {
+          "issue": "THE-143",
+          "project": "Cross-Platform Support & Verification"
+        },
+        {
+          "issue": "THE-144",
+          "project": "Proposal Retirement & Cleanup"
+        }
+      ],
+      "summary": "The static packaging proposal is superseded by the live completion engine and awaits coordinated retirement.",
+      "successors": [
+        "openspec/changes/rework-shell-completions/"
+      ]
+    },
+    {
+      "change": "publish-observer-event-contract",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-105",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Publish truthful observer filters, bootstrap, recovery, and attach ownership semantics."
+    },
+    {
+      "change": "resurrect-model-proxy",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-123",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Proxy restoration shipped; end-to-end failover, accounting, and gate evidence remain."
+    },
+    {
+      "change": "rework-shell-completions",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-143",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "The live completion engine shipped; packaging verification and cleanup remain."
+    },
+    {
+      "change": "verify-sandbox-mounts",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-124",
+          "project": "Cross-Platform Support & Verification"
+        }
+      ],
+      "summary": "Preflight and remedies shipped; Docker Desktop and WSL mount fixtures remain unverified."
+    },
+    {
+      "change": "verify-stage-worker-containment",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-97",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Continuously prove staged workers can commit without escaping configured containment."
+    }
+  ]
+}

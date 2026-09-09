@@ -392,6 +392,43 @@ openspec-setup:
 openspec-validate:
     OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec validate --all --strict
 
+# Offline delivery truth: schema + every active OpenSpec directory + lifecycle,
+# Linear/project ownership, stale archive links, live-count prose, and the public
+# plugin/control contract projections. The fixture pass deliberately removes
+# tracker credentials; this command has no network client and never mutates Linear.
+delivery-check:
+    python3 scripts/delivery_state.py validate
+    env -u LINEAR_API_KEY -u LINEAR_TOKEN python3 scripts/delivery_state.py fixtures
+
+# Derive portfolio totals from the index and task files. An optional JSON export
+# from a read-only Linear query can be supplied as `--linear-json path`; the
+# command never fetches or writes tracker data itself.
+delivery-report *args:
+    python3 scripts/delivery_state.py report {{args}}
+
+# These generated/runtime ratchets deliberately name their owning capability on
+# failure. They are also selected by the full workspace test below, but keeping
+# this focused preflight explicit prevents a future test-layout change from
+# silently removing contract drift detection from the normal gate.
+contract-ratchets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_gate() {
+      label="$1"
+      owner="$2"
+      shift 2
+      if ! "$@"; then
+        echo "ERROR: $label drifted; owning capability/change: $owner" >&2
+        return 1
+      fi
+    }
+    run_gate "plugin API schema and accepted extension points" "plugin-api / align-plugin-v03-contract" \
+      cargo nextest run -p thegn-core -E 'binary(/plugin_api_wire/)'
+    run_gate "control v1 generated schema" "control-plane / audit-remote-surface-map" \
+      cargo nextest run -p thegn-svc -E 'binary(/control_schema/)'
+    run_gate "cross-client surface-gap ledger" "capability-catalog / audit-remote-surface-map" \
+      cargo nextest run -p thegn-core -E 'test(ratchet_pins_surface_gaps)'
+
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
 ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
@@ -556,7 +593,7 @@ coverage-html:
 #
 # The Rust-side ratchets (platform-cfg, hostkey, surface-gaps, completion-slot,
 # help) are Rust tests and run in `just test`.
-ratchets:
+ratchets: delivery-check
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
@@ -692,7 +729,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test:
+test: contract-ratchets
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is

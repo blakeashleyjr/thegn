@@ -8305,6 +8305,7 @@ dependencies = [
  "once_cell",
  "regex",
  "rusqlite",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

@@ -1,0 +1,31 @@
+{
+  "expected_error": "owner THE-1 is missing from active delivery issue inventory",
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": ["Fixture Project"],
+    "entries": [
+      {
+        "change": "orphaned-change-owner",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [{"issue": "THE-1", "project": "Fixture Project"}],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "issue_inventory": {
+    "$schema": "./issues-schema.json",
+    "schema_version": 1,
+    "scope": "Synthetic active issue inventory omitting the change owner on purpose.",
+    "issues": [
+      {
+        "issue": "THE-2",
+        "project": "Fixture Project",
+        "changes": [],
+        "no_spec_rationale": "Tracking-only synthetic issue with no normative product change."
+      }
+    ]
+  },
+  "active_changes": {"orphaned-change-owner": "# Tasks\n\n- [ ] pending\n"}
+}

@@ -31,7 +31,6 @@
 #             `containers.*` ships as the TUI Containers tab this change.
 
 agent.sessions	grpc	not yet mirrored in control.proto
-browser.drive	mcp	MCP state tools land in the client-API phase
 calendar.clocks	mcp	MCP state tools land in the client-API phase
 calendar.events	mcp	MCP state tools land in the client-API phase
 calendar.ingest	mcp	MCP state tools land in the client-API phase

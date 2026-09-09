@@ -187,6 +187,53 @@ pub fn restrict_dir_owner_only_checked(path: &std::path::Path) -> std::io::Resul
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Publish a shell wrapper atomically and make both the staged and published
+/// file owner-executable. The portable caller owns the script contents; this
+/// seam owns Unix mode bits.
+pub(crate) fn publish_private_executable(
+    temporary: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(temporary)?;
+        file.write_all(contents)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        drop(file);
+        std::fs::rename(temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+/// Report the native identity and filesystem hardening behind a Unix-domain
+/// local control endpoint.
+pub(crate) fn local_control_security(path: &std::path::Path) -> super::LocalControlSecurity {
+    let (hardening, error) = if path.exists() {
+        match thegn_svc::ipc::control_endpoint_hardening(path) {
+            Ok(()) => ("ok", None),
+            Err(error) => ("failed", Some(error.to_string())),
+        }
+    } else {
+        ("endpoint-not-running", None)
+    };
+    super::LocalControlSecurity {
+        auth: "same-euid-or-token",
+        peer_identity: "native-effective-uid",
+        hardening,
+        error,
+    }
+}
+
 /// Open an existing path without following a symlink in its final component.
 /// Callers must validate the returned handle's metadata before consuming it.
 pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {

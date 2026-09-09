@@ -1159,16 +1159,17 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
                     outln!("dispatch {} → done", r.id);
                 }
             }
-            pipeline_reap::ReapVerdict::MarkFailed { why } => {
+            pipeline_reap::ReapVerdict::MarkFailed { why }
                 if db.compare_and_set_dispatch_status(
                     r.id,
                     r.observed_status,
                     AgentDispatchStatus::Failed,
                     Some(&format!("reaped: {why}")),
-                )? {
-                    outln!("dispatch {} → failed", r.id);
-                }
+                )? =>
+            {
+                outln!("dispatch {} → failed", r.id);
             }
+            pipeline_reap::ReapVerdict::MarkFailed { .. } => {}
             _ => {}
         }
     }
@@ -1177,20 +1178,20 @@ fn reap(cfg: &Config, apply: bool, json: bool) -> Result<()> {
 
 /// Live (non-tombstone) session ids, plus whether the daemon answered at all.
 async fn live_session_ids(cfg: &Config) -> (Vec<String>, bool) {
-    match crate::cmd::session::connect(cfg).await {
-        Ok(client) => match client.sessions().await {
-            Ok(sessions) => (
-                sessions
-                    .into_iter()
-                    .filter(|s| s.exited_at_ms.is_none())
-                    .map(|s| s.id)
-                    .collect(),
-                true,
-            ),
-            Err(_) => (Vec::new(), false),
-        },
-        Err(_) => (Vec::new(), false),
-    }
+    let Ok(client) = crate::cmd::session::connect(cfg).await else {
+        return (Vec::new(), false);
+    };
+    let Ok(sessions) = client.sessions().await else {
+        return (Vec::new(), false);
+    };
+    (
+        sessions
+            .into_iter()
+            .filter(|s| s.exited_at_ms.is_none())
+            .map(|s| s.id)
+            .collect(),
+        true,
+    )
 }
 
 fn verify(id: i64, json: bool) -> Result<()> {

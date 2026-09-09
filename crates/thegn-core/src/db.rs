@@ -248,6 +248,226 @@ pub enum MigrationActor {
     Client,
 }
 
+/// A typed refusal to advance the canonical shared database schema.
+///
+/// Callers that need to preserve schema-specific failure state (notably the
+/// compositor hydration path) can downcast an [`anyhow::Error`] to this type
+/// instead of parsing its operator-facing message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MigrationAccessError {
+    /// The database was advanced by a newer build. This is intentionally typed
+    /// so long-lived clients can surface durable operator guidance instead of
+    /// reducing the refusal to a generic "database unavailable" state.
+    NewerSchema { observed: i64, supported: i64 },
+    /// The process reached an existing shared schema without first installing
+    /// the startup migration policy.
+    PolicyUninstalled {
+        database: PathBuf,
+        observed: i64,
+        required: i64,
+    },
+}
+
+impl std::fmt::Display for MigrationAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewerSchema {
+                observed,
+                supported,
+            } => f.write_str(
+                &schema_refusal(*observed, *supported, false)
+                    .expect("a newer-schema refusal always has observed > supported"),
+            ),
+            Self::PolicyUninstalled {
+                database,
+                observed,
+                required,
+            } => write!(
+                f,
+                "refusing to migrate canonical shared database {} from schema v{observed} to v{required}: no database migration policy is installed; an explicit migration grant is required. Launch the configured controller after rebuilding it",
+                database.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationAccessError {}
+
+/// The kind of database access an operation requires from a compatibility
+/// handle.  This is deliberately separate from migration authority: being
+/// allowed to use an already-supported shape never grants permission to
+/// advance that shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaRequirementAccess {
+    Read,
+    ReadWrite,
+}
+
+impl std::fmt::Display for SchemaRequirementAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read => f.write_str("read"),
+            Self::ReadWrite => f.write_str("read/write"),
+        }
+    }
+}
+
+/// A closed catalog of shared-state operations which may deliberately run on
+/// an older schema.  Adding a compatibility path therefore requires adding a
+/// typed declaration here; callers cannot manufacture an undeclared operation
+/// name or version at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemaOperation {
+    /// Resolve whether the target repository is hosted remotely before a
+    /// one-shot `thegn land` mutates git refs.
+    LandRemoteTargetGuard,
+    /// Resolve the remote-target guard and update sidebar folder bookkeeping
+    /// for a successful one-shot `thegn land`.
+    LandLifecycleBookkeeping,
+}
+
+impl SchemaOperation {
+    /// Every operation presently admitted by the compatibility API. Kept
+    /// public so catalog-completeness tests do not duplicate the variants.
+    pub const ALL: [Self; 2] = [Self::LandRemoteTargetGuard, Self::LandLifecycleBookkeeping];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::LandRemoteTargetGuard => "land.remote_target_guard",
+            Self::LandLifecycleBookkeeping => "land.lifecycle_bookkeeping",
+        }
+    }
+
+    pub const fn access(self) -> SchemaRequirementAccess {
+        match self {
+            Self::LandRemoteTargetGuard => SchemaRequirementAccess::Read,
+            Self::LandLifecycleBookkeeping => SchemaRequirementAccess::ReadWrite,
+        }
+    }
+
+    /// Oldest schema whose declared read shape is supported by this build.
+    pub const fn minimum_read_schema(self) -> i64 {
+        match self {
+            Self::LandRemoteTargetGuard | Self::LandLifecycleBookkeeping => 66,
+        }
+    }
+
+    /// Oldest schema whose declared write shape is supported, or `None` for a
+    /// read-only operation.
+    pub const fn minimum_write_schema(self) -> Option<i64> {
+        match self {
+            Self::LandRemoteTargetGuard => None,
+            Self::LandLifecycleBookkeeping => Some(66),
+        }
+    }
+
+    const fn required_features(self) -> &'static [SchemaFeature] {
+        match self {
+            Self::LandRemoteTargetGuard => LAND_GUARD_FEATURES,
+            Self::LandLifecycleBookkeeping => LAND_LIFECYCLE_FEATURES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SchemaFeature {
+    table: &'static str,
+    columns: &'static [&'static str],
+}
+
+const LAND_GUARD_FEATURES: &[SchemaFeature] = &[SchemaFeature {
+    table: "worktrees",
+    columns: &["worktree", "location"],
+}];
+
+// These are the exact named columns used by the existing WorkspaceStore calls
+// in the land-in-place lifecycle. Schema v67 adds only CI-log tables, so v66 is
+// a genuine older supported window rather than a version-stamp exemption.
+const LAND_LIFECYCLE_FEATURES: &[SchemaFeature] = &[
+    SchemaFeature {
+        table: "worktrees",
+        columns: &[
+            "worktree",
+            "branch",
+            "agent",
+            "created_at",
+            "repo_path",
+            "tab_name",
+            "session_name",
+            "location",
+            "position",
+            "sandbox_backend",
+            "observed_backend",
+            "folder_id",
+            "env_name",
+        ],
+    },
+    SchemaFeature {
+        table: "workspaces",
+        columns: &[
+            "repo_path",
+            "name",
+            "created_at",
+            "last_active",
+            "kind",
+            "position",
+        ],
+    },
+    SchemaFeature {
+        table: "folders",
+        columns: &["folder_id", "repo_path", "name", "position", "created_at"],
+    },
+    SchemaFeature {
+        table: "repo_slugs",
+        columns: &["repo_path", "slug"],
+    },
+];
+
+/// A typed refusal emitted before an operation-specific SQL statement can run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemaCompatibilityError {
+    InsufficientVersion {
+        operation: &'static str,
+        access: SchemaRequirementAccess,
+        required: i64,
+        observed: i64,
+    },
+    MissingCapability {
+        operation: &'static str,
+        required: String,
+        observed_schema: i64,
+    },
+}
+
+impl std::fmt::Display for SchemaCompatibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientVersion {
+                operation,
+                access,
+                required,
+                observed,
+            } => write!(
+                f,
+                "database operation {operation} requires {access} compatibility with schema v{required}, but the database is v{observed}"
+            ),
+            Self::MissingCapability {
+                operation,
+                required,
+                observed_schema,
+            } => write!(
+                f,
+                "database operation {operation} requires capability {required}, but it is absent from schema v{observed_schema}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchemaCompatibilityError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MigrationPolicy {
     authority: crate::config::MigrationAuthority,
@@ -417,6 +637,57 @@ fn query_user_version(conn: &Connection) -> i64 {
         .unwrap_or(0)
 }
 
+fn validate_schema_operation(
+    conn: &Connection,
+    operation: SchemaOperation,
+    observed: i64,
+) -> Result<()> {
+    let required = operation
+        .minimum_write_schema()
+        .unwrap_or_else(|| operation.minimum_read_schema());
+    if observed < required {
+        return Err(SchemaCompatibilityError::InsufficientVersion {
+            operation: operation.name(),
+            access: operation.access(),
+            required,
+            observed,
+        }
+        .into());
+    }
+
+    for feature in operation.required_features() {
+        let table_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [feature.table],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Err(SchemaCompatibilityError::MissingCapability {
+                operation: operation.name(),
+                required: format!("table {}", feature.table),
+                observed_schema: observed,
+            }
+            .into());
+        }
+
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let columns = stmt.query_map([feature.table], |row| row.get::<_, String>(0))?;
+        let columns: std::collections::HashSet<String> =
+            columns.collect::<rusqlite::Result<_>>()?;
+        for column in feature.columns {
+            if !columns.contains(*column) {
+                return Err(SchemaCompatibilityError::MissingCapability {
+                    operation: operation.name(),
+                    required: format!("{}.{}", feature.table, column),
+                    observed_schema: observed,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Holds both the in-process lease slot and the cross-process exclusive lock
 /// throughout the entire migration batch. A successful migration calls
 /// [`MigrationGuard::finish`] to join the lifetime shared lease and re-check the
@@ -442,9 +713,13 @@ impl MigrationGuard {
         file.lock_shared()
             .map_err(|e| anyhow::anyhow!("join shared schema lease: {e}"))?;
         let observed = query_user_version(conn);
-        if let Some(msg) = schema_refusal(observed, SCHEMA_VERSION, false) {
+        if schema_refusal(observed, SCHEMA_VERSION, false).is_some() {
             let _ = file.unlock();
-            anyhow::bail!(msg);
+            return Err(MigrationAccessError::NewerSchema {
+                observed,
+                supported: SCHEMA_VERSION,
+            }
+            .into());
         }
         *self.slot = Some(MigrationLease {
             database: self.database.clone(),
@@ -473,8 +748,18 @@ struct SchemaAccess {
 /// after the lock is held to close the check/lock race.
 fn prepare_schema_access(conn: &Connection, database: &Path, initial: i64) -> Result<SchemaAccess> {
     let Some(runtime) = MIGRATION_RUNTIME.get() else {
-        // Library/tests that do not install a production policy retain the
-        // explicit-path API's historical behavior.
+        // Bootstrap is explicitly allowed: there is no prior application
+        // schema to advance and therefore no stale reader to protect. A
+        // current/newer schema also needs no migration authority. The unsafe
+        // case is an existing canonical schema that this build would advance.
+        if initial > 0 && initial < SCHEMA_VERSION {
+            return Err(MigrationAccessError::PolicyUninstalled {
+                database: database.to_path_buf(),
+                observed: initial,
+                required: SCHEMA_VERSION,
+            }
+            .into());
+        }
         return Ok(SchemaAccess {
             version: initial,
             _migration: None,
@@ -569,6 +854,25 @@ pub struct Db {
     conn: Connection,
     /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
     pub(crate) schema_mismatch: Option<i64>,
+}
+
+/// A no-migration handle for one cataloged operation on an already-existing
+/// schema. The held shared lease prevents an authorized controller from
+/// migrating the file while this operation is using the older shape.
+pub struct CompatibleDb {
+    db: Db,
+    operation: SchemaOperation,
+    _schema_lease: std::fs::File,
+}
+
+impl CompatibleDb {
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    pub const fn operation(&self) -> SchemaOperation {
+        self.operation
+    }
 }
 
 impl Db {
@@ -670,6 +974,40 @@ fn db_path() -> PathBuf {
     util::xdg_state_home().join("thegn/thegn.db")
 }
 
+/// Return the normalized shared path when `candidate` names, or might name,
+/// the canonical state DB. `None` means the candidate is proven distinct.
+///
+/// This check runs after SQLite has opened the candidate, so both lexical
+/// aliases and filesystem aliases (symlinks and hard links) have concrete file
+/// identities. Ambiguous identity-resolution failures fail closed as shared
+/// state; the explicit-path exemption is granted only when distinctness can
+/// actually be established.
+fn canonical_shared_database(candidate: &Path) -> Option<PathBuf> {
+    let shared = db_path();
+    let normalized_shared = std::fs::canonicalize(&shared).unwrap_or_else(|_| shared.clone());
+
+    if candidate == shared {
+        return Some(normalized_shared);
+    }
+
+    match same_file::is_same_file(candidate, &shared) {
+        Ok(true) => Some(normalized_shared),
+        Ok(false) => None,
+        // The opened candidate cannot alias a canonical path which does not
+        // exist. This is the other positively-proven-distinct case.
+        Err(_)
+            if std::fs::metadata(candidate).is_ok()
+                && std::fs::metadata(&shared)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        // `candidate` was just opened, so any other result is a race or an
+        // access failure. Do not turn uncertainty into migration authority.
+        Err(_) => Some(normalized_shared),
+    }
+}
+
 /// How [`Db::init`] treats a connection, decided from the on-disk
 /// `user_version`. `Fast` (on-disk >= [`SCHEMA_VERSION`]) skips the
 /// schema batch, migrations, and startup prunes entirely — safe because
@@ -718,7 +1056,9 @@ impl Db {
             // `kaneo_auth` row now holds only a `file:`/`env:` SecretRef.)
             let _ = crate::fsperm::restrict_dir_to_owner(dir); // best-effort: hardening: a failed chmod must never block DB open
         }
-        let db = Self::init_shared(Self::open_connection(&path)?, &path)?;
+        let conn = Self::open_connection(&path)?;
+        let shared = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let db = Self::init_shared(conn, &shared)?;
         let _ = crate::fsperm::restrict_to_owner(&path); // best-effort: hardening: a failed chmod must never block DB open
         // The common fast-path init (user_version already current) skips the
         // startup prunes so a plain open takes NO write lock. Run them once
@@ -746,15 +1086,76 @@ impl Db {
             std::fs::create_dir_all(dir)?;
             let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        if path == db_path() {
-            let db = Self::init_shared(Self::open_connection(path)?, path)?;
+        let conn = Self::open_connection(path)?;
+        if let Some(shared) = canonical_shared_database(path) {
+            let db = Self::init_shared(conn, &shared)?;
             let _ = crate::fsperm::restrict_to_owner(path); // best-effort: hardening: a failed chmod must never block DB open
             Ok(db)
         } else {
-            let db = Self::init(Self::open_connection(path)?)?;
+            let db = Self::init(conn)?;
             let _ = crate::fsperm::restrict_to_owner(path); // best-effort: hardening: a failed chmod must never block DB open
             Ok(db)
         }
+    }
+
+    /// Open the canonical state DB for one explicitly cataloged operation,
+    /// without creating it and without running initialization, migrations,
+    /// startup pruning, journal pragmas, or a `user_version` write.
+    ///
+    /// `None` means the database does not exist yet. Callers which support
+    /// first-run bootstrap must make that separate, migration-authorized choice
+    /// before retrying this compatibility-only opener.
+    pub fn open_compatible(operation: SchemaOperation) -> Result<Option<CompatibleDb>> {
+        Self::open_compatible_at(&db_path(), operation)
+    }
+
+    /// Explicit-path form of [`Self::open_compatible`], used by the
+    /// compatibility matrix and by callers operating on a named state file.
+    pub fn open_compatible_at(
+        path: &std::path::Path,
+        operation: SchemaOperation,
+    ) -> Result<Option<CompatibleDb>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+
+        // Normalize aliases onto the same lease used by the canonical
+        // migration path. A proven-distinct explicit DB gets its own sibling
+        // lease, which also makes the race behavior testable without touching
+        // real user state.
+        let database = canonical_shared_database(path)
+            .unwrap_or_else(|| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        let lease = open_schema_lock(&database)?;
+        try_shared_lock(&lease, &database)?;
+
+        let flags = match operation.access() {
+            SchemaRequirementAccess::Read => rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            SchemaRequirementAccess::ReadWrite => rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        } | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+
+        // Re-read only after joining the lease: if a controller won the race,
+        // this observes its completed stamp; if we won, the controller cannot
+        // advance the shape until the returned handle is dropped.
+        let observed = query_user_version(&conn);
+        if schema_refusal(observed, SCHEMA_VERSION, false).is_some() {
+            return Err(MigrationAccessError::NewerSchema {
+                observed,
+                supported: SCHEMA_VERSION,
+            }
+            .into());
+        }
+        validate_schema_operation(&conn, operation, observed)?;
+
+        Ok(Some(CompatibleDb {
+            db: Db {
+                conn,
+                schema_mismatch: None,
+            },
+            operation,
+            _schema_lease: lease,
+        }))
     }
 
     /// Open an existing DB read-only while participating in its WAL locking.
@@ -850,7 +1251,9 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        Self::init_with(Self::open_connection(path)?, true, None)
+        let conn = Self::open_connection(path)?;
+        let shared = canonical_shared_database(path);
+        Self::init_with(conn, true, shared.as_deref())
     }
 
     fn init_with(
@@ -882,8 +1285,12 @@ impl Db {
             // behaviour (warn + carry on read-only) is what let a v57 runtime
             // drive a v62 roster; it survives only behind the explicit
             // `ALLOW_OLD_BUILD_ENV` override, which still warns exactly once.
-            if let Some(msg) = schema_refusal(ver, SCHEMA_VERSION, allow_downgrade) {
-                anyhow::bail!(msg);
+            if schema_refusal(ver, SCHEMA_VERSION, allow_downgrade).is_some() {
+                return Err(MigrationAccessError::NewerSchema {
+                    observed: ver,
+                    supported: SCHEMA_VERSION,
+                }
+                .into());
             }
             static MISMATCH_WARNED: std::sync::Once = std::sync::Once::new();
             MISMATCH_WARNED.call_once(|| {

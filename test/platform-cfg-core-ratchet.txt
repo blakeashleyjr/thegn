@@ -19,3 +19,9 @@ config_repo.rs
 # toolchain_activation.rs: one symlink-only test (#[cfg(unix)]); detection is
 # runtime-platform-neutral and rejects symlinks through file metadata.
 toolchain_activation.rs
+# TEST-ONLY cfg: migration-policy alias regressions create real symlink and
+# hardlink aliases around the SQLite state file. The production migration
+# authority and compatibility paths remain platform-neutral; hiding these
+# fixtures behind production substrate code would weaken the path-identity
+# assertion they exist to make.
+db_tests.rs

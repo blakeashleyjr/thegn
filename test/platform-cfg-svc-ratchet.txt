@@ -1,9 +1,12 @@
 # Files in crates/thegn-svc/src that carry a platform #[cfg]. ipc.rs is the
-# intended per-OS seam (unix socket vs named pipe); the rest is debt.
+# intended transport seam (unix socket vs named pipe). The background-commit
+# runner is the one process-control seam: Unix isolates/kills a process group,
+# while other platforms kill and reap the direct Git child. The rest is debt.
 #
 # SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
 # crates/thegn-svc/src/platform_ratchet_tests.rs; `just ratchet-update`.
 
+git/background_commit.rs
 git/commit.rs
 ipc.rs
 plugin/proc.rs

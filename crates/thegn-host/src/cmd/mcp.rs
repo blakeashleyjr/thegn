@@ -109,7 +109,7 @@ pub enum Action {
     /// `claude mcp add thegn -- thegn mcp serve`.
     Serve {
         /// Scopes granted to the live-state tools (comma-separated:
-        /// read,write,git,admin). When omitted, the ceiling is resolved from
+        /// read,write,git,exec,admin). When omitted, the ceiling is resolved from
         /// config — the global `[mcp.serve] scopes`, narrowed by the active
         /// profile overlay — defaulting to `read` when nothing is configured;
         /// when given, it intersects that ceiling (clamp-only, never widening).

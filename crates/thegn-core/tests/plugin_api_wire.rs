@@ -1,15 +1,16 @@
 //! The plugin API wire contract is versioned by a committed JSON-schema
 //! snapshot: `docs/api/plugin-api-<major>.<minor>.json` must match the schema
-//! generated from the current wire types. Change a wire type and this fails
-//! until you either revert, or bump `API_VERSION` and regenerate:
+//! generated from the current wire types and host support tables. A wire-type
+//! change requires an API-version decision; a support-state/doc correction may
+//! retain the version but must still regenerate and review the snapshot:
 //!
 //! ```sh
 //! THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-core --test plugin_api_wire
 //! ```
 //!
-//! (Within one minor version the snapshot may only be regenerated when the
-//! change is additive — new optional fields, new variants with defaults —
-//! which is the compatibility rule `docs/plugin-api.md` states.)
+//! Within one minor version wire changes may only be additive (new optional
+//! fields or defaulted variants). Host support metadata can narrow only when it
+//! corrects an inaccurate claim or removes a runtime capability fail-closed.
 
 use schemars::schema::RootSchema;
 use thegn_core::plugin_api::*;
@@ -61,6 +62,44 @@ fn wire_schema() -> serde_json::Value {
             .map(|h| serde_json::Value::String(h.method_name().to_string()))
             .collect(),
     );
+    v["x-thegn-extension-support"] = serde_json::Value::Array(
+        HOST_EXTENSION_SUPPORT
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "extension_point": row.extension_point.wire_name(),
+                    "since": row.since.to_string(),
+                    "state": row.state.as_str(),
+                    "required_capability": row.required_capability,
+                    "modes": row.mode_names(),
+                    "cadences": row.cadence_names(),
+                    "callbacks": row.callbacks.iter().map(|callback| callback.method_name()).collect::<Vec<_>>(),
+                    "owner": row.owner,
+                })
+            })
+            .collect(),
+    );
+    v["x-thegn-host-verb-support"] = serde_json::Value::Array(
+        HOST_VERB_SUPPORT
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "verb": row.verb.method_name(),
+                    "since": row.since.to_string(),
+                    "state": row.state.as_str(),
+                    "authority": row.authority,
+                    "modes": row.modes.iter().map(|mode| mode.wire_name()).collect::<Vec<_>>(),
+                    "owner": row.owner,
+                })
+            })
+            .collect(),
+    );
+    v["x-thegn-host-call-capabilities"] = serde_json::Value::Array(
+        plugin_host_call_caps()
+            .into_iter()
+            .map(|capability| serde_json::Value::String(capability.to_string()))
+            .collect(),
+    );
     v["properties"] = serde_json::Value::Object(props);
     v
 }
@@ -98,9 +137,10 @@ fn wire_schema_matches_the_committed_snapshot() {
     );
     assert!(
         committed == current,
-        "plugin API wire types changed but API_VERSION is still {API_VERSION}.\n\
-         If the change is additive, regenerate the snapshot (THEGN_UPDATE_SNAPSHOTS=1) \
-         after bumping the minor version; if it is breaking, bump the major.\n\
+        "plugin API wire or host-support contract changed at {API_VERSION}.\n\
+         Review the diff. Bump the API for a wire change (minor if additive, major if \
+         breaking); support-state/documentation corrections may retain the version. Then \
+         regenerate with THEGN_UPDATE_SNAPSHOTS=1.\n\
          Snapshot: {}",
         path.display()
     );

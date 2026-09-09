@@ -40,7 +40,7 @@ impl std::fmt::Display for ApiVersion {
 }
 
 impl ApiVersion {
-    pub fn new(major: u32, minor: u32, patch: u32) -> Self {
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
             minor,
@@ -53,9 +53,22 @@ impl<'de> Deserialize<'de> for ApiVersion {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         let mut parts = s.split('.');
-        let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let parse_part = |part: Option<&str>| {
+            part.and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom(
+                        "plugin API version must be major.minor.patch with numeric components",
+                    )
+                })
+        };
+        let major = parse_part(parts.next())?;
+        let minor = parse_part(parts.next())?;
+        let patch = parse_part(parts.next())?;
+        if parts.next().is_some() {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "plugin API version must contain exactly three numeric components",
+            ));
+        }
         Ok(Self::new(major, minor, patch))
     }
 }
@@ -198,12 +211,44 @@ pub enum ExtensionPoint {
     Unknown(String),
 }
 
+impl ExtensionPoint {
+    /// Stable wire spelling used by contract inspection and diagnostics.
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Self::StatusBarSegment => "StatusBarSegment",
+            Self::PanelSection => "PanelSection",
+            Self::SidebarTab => "SidebarTab",
+            Self::PaletteAction => "PaletteAction",
+            Self::NotificationSource => "NotificationSource",
+            Self::HarnessAdapter => "HarnessAdapter",
+            Self::ProgramAdapter => "ProgramAdapter",
+            Self::Theme => "Theme",
+            Self::Automation => "Automation",
+            Self::DataSource => "DataSource",
+            Self::IssueProvider => "IssueProvider",
+            Self::CiProvider => "CiProvider",
+            Self::ForgeProvider => "ForgeProvider",
+            Self::Unknown(name) => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CadenceHint {
     OnDemand,
     Interval { millis: u64 },
     OnEvent { events: Vec<String> },
+}
+
+impl CadenceHint {
+    pub fn kind(&self) -> CadenceKind {
+        match self {
+            Self::OnDemand => CadenceKind::OnDemand,
+            Self::Interval { .. } => CadenceKind::Interval,
+            Self::OnEvent { .. } => CadenceKind::OnEvent,
+        }
+    }
 }
 
 /// A plugin's request to claim a single ExtensionPoint instance.
@@ -259,6 +304,15 @@ pub enum PluginMode {
     Resident,
 }
 
+impl PluginMode {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::OneShot => "one_shot",
+            Self::Resident => "resident",
+        }
+    }
+}
+
 fn default_timeout_secs() -> u64 {
     30
 }
@@ -288,8 +342,9 @@ pub struct PluginSpec {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Host-capability scopes this plugin holds for `host.call` — the same
-    /// lattice as control-API tokens (`read` / `write` / `git` / `admin`), so
-    /// a plugin is authorised exactly like a paired phone.
+    /// lattice as control-API tokens (`read` / `write` / `git` / `exec` /
+    /// `admin`), so a plugin is authorised exactly like a paired client.
+    /// Write, Git, and Exec are independent; Admin implies all of them.
     #[serde(default)]
     pub scopes: Vec<crate::control::Scope>,
     #[serde(default)]
@@ -315,6 +370,7 @@ pub enum PluginApiError {
         capability: Capability,
         operation: String,
     },
+    UnsupportedExtensionPoint(String),
     UnknownExtensionPoint(String),
 }
 
@@ -334,6 +390,9 @@ impl Display for PluginApiError {
                     capability.0, operation
                 )
             }
+            Self::UnsupportedExtensionPoint(s) => {
+                write!(f, "unsupported extension point: {s}")
+            }
             Self::UnknownExtensionPoint(s) => write!(f, "unknown extension point: {s}"),
         }
     }
@@ -346,7 +405,19 @@ pub struct NegotiatedManifest {
     pub granted: std::collections::HashSet<Capability>,
     pub denied: std::collections::HashSet<Capability>,
     pub accepted_contributions: Vec<Contribution>,
+    /// Compatibility projection retained for callers that only distinguish
+    /// accepted from unsupported contributions. New inspection surfaces use
+    /// [`NegotiatedManifest::rejected_contributions`] for stable reasons.
     pub unsupported_contributions: Vec<Contribution>,
+    pub rejected_contributions: Vec<ContributionRejection>,
+    /// Every point this host contract will permit for runtime `register`.
+    pub supported_extension_points: std::collections::HashSet<ExtensionPoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributionRejection {
+    pub contribution: Contribution,
+    pub reason: String,
 }
 
 impl NegotiatedManifest {
@@ -363,6 +434,7 @@ pub struct HostContract {
     pub api_version: ApiVersion,
     pub available_extension_points: std::collections::HashSet<ExtensionPoint>,
     pub granted_capabilities: std::collections::HashSet<Capability>,
+    extension_support: Vec<ExtensionPointSupport>,
 }
 
 impl HostContract {
@@ -371,6 +443,7 @@ impl HostContract {
             api_version: api,
             available_extension_points: Default::default(),
             granted_capabilities: Default::default(),
+            extension_support: Vec::new(),
         }
     }
 
@@ -379,9 +452,36 @@ impl HostContract {
         self
     }
 
+    /// Install the complete support table for one host build. Only `wired`
+    /// rows become negotiable; reserved and separately-owned vocabulary stays
+    /// inspectable without accidentally becoming runtime support.
+    pub fn with_extension_support(
+        mut self,
+        rows: impl IntoIterator<Item = ExtensionPointSupport>,
+    ) -> Self {
+        self.extension_support.extend(rows);
+        self.available_extension_points.extend(
+            self.extension_support
+                .iter()
+                .filter(|row| row.state == SupportState::Wired)
+                .map(|row| row.extension_point.clone()),
+        );
+        self
+    }
+
     pub fn with_grants(mut self, caps: impl IntoIterator<Item = Capability>) -> Self {
         self.granted_capabilities.extend(caps);
         self
+    }
+
+    pub fn extension_support(&self) -> &[ExtensionPointSupport] {
+        &self.extension_support
+    }
+
+    pub fn support_for(&self, point: &ExtensionPoint) -> Option<&ExtensionPointSupport> {
+        self.extension_support
+            .iter()
+            .find(|row| &row.extension_point == point)
     }
 
     pub fn negotiate(
@@ -399,6 +499,7 @@ impl HostContract {
 
         let mut neg = NegotiatedManifest {
             api: manifest.api,
+            supported_extension_points: self.available_extension_points.clone(),
             ..Default::default()
         };
 
@@ -411,16 +512,90 @@ impl HostContract {
         }
 
         for contrib in &manifest.contributions {
-            if self
+            let reason = if !self
                 .available_extension_points
                 .contains(&contrib.extension_point)
             {
-                neg.accepted_contributions.push(contrib.clone());
+                self.support_for(&contrib.extension_point)
+                    .map(ExtensionPointSupport::unavailable_reason)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "unsupported extension point {}: not present in this host contract",
+                            contrib.extension_point.wire_name()
+                        )
+                    })
+                    .into()
+            } else if let Some(required) = self
+                .support_for(&contrib.extension_point)
+                .and_then(|row| row.required_capability)
+                && !manifest
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap.as_str() == required)
+            {
+                Some(format!(
+                    "extension point {} requires declared capability {required}",
+                    contrib.extension_point.wire_name()
+                ))
             } else {
+                None
+            };
+            if let Some(reason) = reason {
                 neg.unsupported_contributions.push(contrib.clone());
+                neg.rejected_contributions.push(ContributionRejection {
+                    contribution: contrib.clone(),
+                    reason,
+                });
+            } else {
+                neg.accepted_contributions.push(contrib.clone());
             }
         }
 
+        Ok(neg)
+    }
+
+    /// Negotiate a runnable plugin spec, adding mode and cadence checks that
+    /// cannot be decided from a manifest alone.
+    pub fn negotiate_spec(&self, spec: &PluginSpec) -> Result<NegotiatedManifest, PluginApiError> {
+        let mut neg = self.negotiate(&spec.manifest)?;
+        // Runtime `register` may repeat or add a contribution after startup.
+        // Keep that path on the same mode boundary as manifest negotiation.
+        neg.supported_extension_points.retain(|point| {
+            self.support_for(point).is_some_and(|row| {
+                row.state == SupportState::Wired && row.modes.contains(&spec.mode)
+            })
+        });
+        let accepted = std::mem::take(&mut neg.accepted_contributions);
+        for contribution in accepted {
+            let rejection = self.support_for(&contribution.extension_point).and_then(|row| {
+                if !row.modes.contains(&spec.mode) {
+                    Some(format!(
+                        "extension point {} does not support mode {}; supported modes: {}",
+                        contribution.extension_point.wire_name(),
+                        spec.mode.wire_name(),
+                        row.mode_names().join(",")
+                    ))
+                } else if !row.cadences.contains(&contribution.cadence.kind()) {
+                    Some(format!(
+                        "extension point {} does not support cadence {}; supported cadences: {}",
+                        contribution.extension_point.wire_name(),
+                        contribution.cadence.kind().as_str(),
+                        row.cadence_names().join(",")
+                    ))
+                } else {
+                    None
+                }
+            });
+            if let Some(reason) = rejection {
+                neg.unsupported_contributions.push(contribution.clone());
+                neg.rejected_contributions.push(ContributionRejection {
+                    contribution,
+                    reason,
+                });
+            } else {
+                neg.accepted_contributions.push(contribution);
+            }
+        }
         Ok(neg)
     }
 }
@@ -560,6 +735,15 @@ impl PluginRuntime {
         plugin: PluginId,
         contribution: Contribution,
     ) -> Result<(), PluginApiError> {
+        if !self
+            .manifest
+            .supported_extension_points
+            .contains(&contribution.extension_point)
+        {
+            return Err(PluginApiError::UnsupportedExtensionPoint(
+                contribution.extension_point.wire_name().to_string(),
+            ));
+        }
         if let Some(cap) = surface_capability_for(&contribution.extension_point) {
             self.audit(plugin, cap, "register")?;
         }
@@ -707,6 +891,26 @@ impl PluginRuntime {
 
     pub fn audit_log(&self) -> &[AuditLogEntry] {
         &self.audit
+    }
+
+    /// Record the independent control-scope decision for a `host.call` before
+    /// the request crosses onto the generic control dispatcher. Host calls do
+    /// not use manifest `Capability` grants, so they cannot go through
+    /// [`PluginRuntime::audit`]; `host:<catalog-id>` keeps these decisions in
+    /// the same audit stream as surface and I/O grants.
+    pub fn record_host_call_decision(
+        &mut self,
+        plugin: PluginId,
+        capability_id: &str,
+        decision: AuditDecision,
+    ) {
+        self.audit.push(AuditLogEntry {
+            plugin,
+            capability: Capability::new("host", capability_id),
+            operation: "host.call".into(),
+            decision,
+            timestamp_ms: 0,
+        });
     }
 }
 
@@ -886,7 +1090,7 @@ impl SurfaceCache {
 // Transport
 // ----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HostVerb {
     Register,
@@ -1031,6 +1235,346 @@ impl PluginCallback {
         }
     }
 }
+
+/// Stable support classification for extension-point and verb inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportState {
+    Wired,
+    SeparateAdapter,
+    Reserved,
+}
+
+impl SupportState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wired => "wired",
+            Self::SeparateAdapter => "separate_adapter",
+            Self::Reserved => "reserved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CadenceKind {
+    OnDemand,
+    Interval,
+    OnEvent,
+}
+
+impl CadenceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on_demand",
+            Self::Interval => "interval",
+            Self::OnEvent => "on_event",
+        }
+    }
+}
+
+/// One authoritative fact row for extension-point negotiation in the general
+/// compositor host. This is deliberately not a wire type: it describes what
+/// the current host implements, while the wire enum remains forward-compatible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionPointSupport {
+    pub extension_point: ExtensionPoint,
+    pub since: ApiVersion,
+    pub state: SupportState,
+    pub required_capability: Option<&'static str>,
+    pub modes: &'static [PluginMode],
+    pub cadences: &'static [CadenceKind],
+    pub callbacks: &'static [PluginCallback],
+    pub owner: &'static str,
+}
+
+impl ExtensionPointSupport {
+    pub fn unavailable_reason(&self) -> String {
+        match self.state {
+            SupportState::Wired => format!(
+                "unsupported extension point {}: not enabled by this host contract",
+                self.extension_point.wire_name()
+            ),
+            SupportState::SeparateAdapter => format!(
+                "unsupported extension point {} in the general plugin host: available only through {}",
+                self.extension_point.wire_name(),
+                self.owner
+            ),
+            SupportState::Reserved => format!(
+                "unsupported extension point {}: reserved by {}",
+                self.extension_point.wire_name(),
+                self.owner
+            ),
+        }
+    }
+
+    pub fn mode_names(&self) -> Vec<&'static str> {
+        self.modes.iter().map(|mode| mode.wire_name()).collect()
+    }
+
+    pub fn cadence_names(&self) -> Vec<&'static str> {
+        self.cadences
+            .iter()
+            .map(|cadence| cadence.as_str())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostVerbSupport {
+    pub verb: HostVerb,
+    pub since: ApiVersion,
+    pub state: SupportState,
+    pub authority: &'static str,
+    pub modes: &'static [PluginMode],
+    pub owner: &'static str,
+}
+
+const BOTH_MODES: &[PluginMode] = &[PluginMode::OneShot, PluginMode::Resident];
+const RESIDENT_MODE: &[PluginMode] = &[PluginMode::Resident];
+const ON_DEMAND_INTERVAL: &[CadenceKind] = &[CadenceKind::OnDemand, CadenceKind::Interval];
+const ON_DEMAND: &[CadenceKind] = &[CadenceKind::OnDemand];
+const NO_CALLBACKS: &[PluginCallback] = &[];
+const RESIDENT_LIFECYCLE: &[PluginCallback] = &[
+    PluginCallback::Activate,
+    PluginCallback::Render,
+    PluginCallback::Deactivate,
+];
+const PALETTE_CALLBACKS: &[PluginCallback] = &[
+    PluginCallback::Activate,
+    PluginCallback::OnEvent,
+    PluginCallback::Deactivate,
+];
+const PROVIDER_CALLBACKS: &[PluginCallback] =
+    &[PluginCallback::Activate, PluginCallback::Deactivate];
+
+/// Complete current-host extension vocabulary. Consumers MUST derive runtime
+/// negotiation and public support output from this table instead of matching
+/// the wire enum independently.
+pub static HOST_EXTENSION_SUPPORT: &[ExtensionPointSupport] = &[
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::StatusBarSegment,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        required_capability: Some("surface:statusbar"),
+        modes: BOTH_MODES,
+        cadences: ON_DEMAND_INTERVAL,
+        callbacks: RESIDENT_LIFECYCLE,
+        owner: "general compositor statusbar runtime",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::PanelSection,
+        since: ApiVersion::new(0, 3, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:panel"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "THE-108",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::SidebarTab,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:sidebar"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "THE-107",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::PaletteAction,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        required_capability: Some("surface:palette"),
+        modes: BOTH_MODES,
+        cadences: ON_DEMAND,
+        callbacks: PALETTE_CALLBACKS,
+        owner: "general compositor palette runtime",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::NotificationSource,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        required_capability: Some("surface:notification"),
+        modes: BOTH_MODES,
+        cadences: ON_DEMAND_INTERVAL,
+        callbacks: RESIDENT_LIFECYCLE,
+        owner: "general compositor notification runtime",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::HarnessAdapter,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:harness"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "add-agent-harness-seam",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::ProgramAdapter,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:program"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "no accepted runtime owner",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::Theme,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:theme"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "THE-107",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::Automation,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:automation"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "native automation engine; no plugin adapter",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::DataSource,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::SeparateAdapter,
+        required_capability: Some("surface:data"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "calendar command-account adapter",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::IssueProvider,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Wired,
+        required_capability: Some("surface:provider"),
+        modes: RESIDENT_MODE,
+        cadences: ON_DEMAND,
+        callbacks: PROVIDER_CALLBACKS,
+        owner: "issue provider bridge",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::CiProvider,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:provider"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "no dynamic CI provider selector",
+    },
+    ExtensionPointSupport {
+        extension_point: ExtensionPoint::ForgeProvider,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Reserved,
+        required_capability: Some("surface:provider"),
+        modes: &[],
+        cadences: &[],
+        callbacks: NO_CALLBACKS,
+        owner: "no dynamic forge provider selector",
+    },
+];
+
+/// Complete plugin→host verb contract. `host.call` is resident-only because a
+/// one-shot process has no reply channel; the remaining request/notification
+/// verbs are handled by the runtime dispatcher in both modes.
+pub static HOST_VERB_SUPPORT: &[HostVerbSupport] = &[
+    HostVerbSupport {
+        verb: HostVerb::Register,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "surface:<contribution>",
+        modes: BOTH_MODES,
+        owner: "plugin runtime",
+    },
+    HostVerbSupport {
+        verb: HostVerb::Subscribe,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "none",
+        modes: RESIDENT_MODE,
+        owner: "event bridge",
+    },
+    HostVerbSupport {
+        verb: HostVerb::Update,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "surface:<registered>",
+        modes: BOTH_MODES,
+        owner: "surface cache",
+    },
+    HostVerbSupport {
+        verb: HostVerb::Invalidate,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "surface:<registered>",
+        modes: BOTH_MODES,
+        owner: "surface cache",
+    },
+    HostVerbSupport {
+        verb: HostVerb::Io,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "declared scheme:target capability",
+        modes: BOTH_MODES,
+        owner: "plugin runtime",
+    },
+    HostVerbSupport {
+        verb: HostVerb::Notify,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "notify:<source>",
+        modes: BOTH_MODES,
+        owner: "notification bridge",
+    },
+    HostVerbSupport {
+        verb: HostVerb::Emit,
+        since: ApiVersion::new(0, 1, 0),
+        state: SupportState::Wired,
+        authority: "none",
+        modes: BOTH_MODES,
+        owner: "event bridge",
+    },
+    HostVerbSupport {
+        verb: HostVerb::StateGet,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Wired,
+        authority: "state:<plugin>",
+        modes: RESIDENT_MODE,
+        owner: "namespaced state",
+    },
+    HostVerbSupport {
+        verb: HostVerb::StateSet,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Wired,
+        authority: "state:<plugin>",
+        modes: BOTH_MODES,
+        owner: "namespaced state",
+    },
+    HostVerbSupport {
+        verb: HostVerb::HostValue,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Wired,
+        authority: "none",
+        modes: RESIDENT_MODE,
+        owner: "host value projection",
+    },
+    HostVerbSupport {
+        verb: HostVerb::HostCall,
+        since: ApiVersion::new(0, 2, 0),
+        state: SupportState::Wired,
+        authority: "catalog-required control scope",
+        modes: RESIDENT_MODE,
+        owner: "capability catalog dispatcher",
+    },
+];
 
 // ----------------------------------------------------------------------------
 // Replies (v0.2)
@@ -1347,6 +1891,26 @@ command = ["sh", "hello.sh"]
     }
 
     #[test]
+    fn malformed_api_versions_fail_instead_of_negotiating_as_zero() {
+        for api in ["not-a-version", "0.3", "0.3.0.1", "0.three.0"] {
+            let source = format!(
+                r#"
+id = "bad-version"
+name = "Bad version"
+version = "1.0.0"
+api = "{api}"
+command = ["true"]
+"#
+            );
+            let error = toml::from_str::<PluginSpec>(&source).unwrap_err();
+            assert!(
+                error.to_string().contains("plugin API version"),
+                "{api}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn plugin_spec_scopes_use_the_token_lattice() {
         let spec: PluginSpec = toml::from_str(
             r#"
@@ -1385,11 +1949,8 @@ timeout_secs = 5
         );
         assert_eq!(m.contributions[1].caps, serde_json::Value::Null);
         assert!(m.contributions[1].chord.is_none());
-        let host = HostContract {
-            api_version: API_VERSION,
-            available_extension_points: [ExtensionPoint::StatusBarSegment].into_iter().collect(),
-            granted_capabilities: Default::default(),
-        };
+        let host = HostContract::new(API_VERSION)
+            .with_extension_points([ExtensionPoint::StatusBarSegment]);
         let neg = host.negotiate(&m).unwrap();
         assert_eq!(neg.accepted_contributions.len(), 1);
         assert_eq!(neg.unsupported_contributions.len(), 1);
@@ -1445,6 +2006,13 @@ timeout_secs = 5
         );
         assert!(set.contains(&"sessions.list"));
         assert!(set.contains(&"git.commit"));
+        assert!(set.contains(&"tools.run"));
+        for local_only in ["launch.preset", "containers.list", "containers.control"] {
+            assert!(
+                !set.contains(&local_only),
+                "{local_only} has no generic control route and must not be advertised to plugins"
+            );
+        }
         // No admin row reaches the plugin surface (pinned in the catalog too).
         for cap in &set {
             let c = crate::capability::lookup(cap).unwrap();
@@ -1454,5 +2022,162 @@ timeout_secs = 5
                 "{cap} is admin-scoped but plugin-callable"
             );
         }
+    }
+
+    fn current_host_contract() -> HostContract {
+        HostContract::new(API_VERSION)
+            .with_extension_support(HOST_EXTENSION_SUPPORT.iter().cloned())
+            .with_grants(
+                HOST_EXTENSION_SUPPORT
+                    .iter()
+                    .filter_map(|row| row.required_capability)
+                    .filter_map(Capability::parse),
+            )
+    }
+
+    fn support_spec(
+        point: ExtensionPoint,
+        capabilities: Vec<Capability>,
+        mode: PluginMode,
+    ) -> PluginSpec {
+        PluginSpec {
+            manifest: PluginManifest {
+                id: PluginId::new("support-test"),
+                name: "Support test".into(),
+                version: "1.0.0".into(),
+                api: API_VERSION,
+                capabilities,
+                contributions: vec![Contribution {
+                    id: ContributionId::new("support-test.row"),
+                    extension_point: point,
+                    label: "Support test".into(),
+                    surface: Some(SurfaceId::new("support-test.surface")),
+                    cadence: CadenceHint::OnDemand,
+                    metadata: Default::default(),
+                    caps: serde_json::Value::Null,
+                    chord: None,
+                }],
+            },
+            command: vec!["true".into()],
+            cwd: String::new(),
+            env: Default::default(),
+            timeout_secs: 5,
+            scopes: Vec::new(),
+            mode,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn current_host_support_tables_are_complete_and_unique() {
+        let expected_points = [
+            "StatusBarSegment",
+            "PanelSection",
+            "SidebarTab",
+            "PaletteAction",
+            "NotificationSource",
+            "HarnessAdapter",
+            "ProgramAdapter",
+            "Theme",
+            "Automation",
+            "DataSource",
+            "IssueProvider",
+            "CiProvider",
+            "ForgeProvider",
+        ];
+        let actual = HOST_EXTENSION_SUPPORT
+            .iter()
+            .map(|row| row.extension_point.wire_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual.len(), HOST_EXTENSION_SUPPORT.len());
+        assert_eq!(actual, expected_points.into_iter().collect());
+
+        let verbs = HOST_VERB_SUPPORT
+            .iter()
+            .map(|row| row.verb)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(verbs.len(), HOST_VERB_SUPPORT.len());
+        assert_eq!(verbs, HostVerb::ALL.iter().copied().collect());
+    }
+
+    #[test]
+    fn support_negotiation_reports_missing_reserved_and_mode_reasons() {
+        let host = current_host_contract();
+        let missing = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            Vec::new(),
+            PluginMode::OneShot,
+        );
+        let neg = host.negotiate_spec(&missing).unwrap();
+        assert!(neg.accepted_contributions.is_empty());
+        assert_eq!(
+            neg.rejected_contributions[0].reason,
+            "extension point StatusBarSegment requires declared capability surface:statusbar"
+        );
+
+        let reserved = support_spec(
+            ExtensionPoint::PanelSection,
+            vec![Capability::new("surface", "panel")],
+            PluginMode::Resident,
+        );
+        let neg = host.negotiate_spec(&reserved).unwrap();
+        assert_eq!(
+            neg.rejected_contributions[0].reason,
+            "unsupported extension point PanelSection: reserved by THE-108"
+        );
+
+        let one_shot_provider = support_spec(
+            ExtensionPoint::IssueProvider,
+            vec![Capability::new("surface", "provider")],
+            PluginMode::OneShot,
+        );
+        let neg = host.negotiate_spec(&one_shot_provider).unwrap();
+        assert!(
+            !neg.rejected_contributions[0]
+                .reason
+                .contains("requires declared capability")
+        );
+        assert!(
+            neg.rejected_contributions[0]
+                .reason
+                .contains("does not support mode one_shot")
+        );
+    }
+
+    #[test]
+    fn runtime_register_cannot_bypass_negotiated_support() {
+        let host = current_host_contract();
+        let spec = support_spec(
+            ExtensionPoint::IssueProvider,
+            vec![Capability::new("surface", "provider")],
+            PluginMode::Resident,
+        );
+        let negotiated = host.negotiate_spec(&spec).unwrap();
+        let mut runtime = PluginRuntime::new(negotiated);
+        let mut forged = spec.manifest.contributions[0].clone();
+        forged.extension_point = ExtensionPoint::CiProvider;
+        let error = runtime
+            .register(PluginId::new("support-test"), forged)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginApiError::UnsupportedExtensionPoint(ref point) if point == "CiProvider"
+        ));
+
+        let one_shot_provider = support_spec(
+            ExtensionPoint::IssueProvider,
+            vec![Capability::new("surface", "provider")],
+            PluginMode::OneShot,
+        );
+        let negotiated = host.negotiate_spec(&one_shot_provider).unwrap();
+        let contribution = one_shot_provider.manifest.contributions[0].clone();
+        let mut runtime = PluginRuntime::new(negotiated);
+        let error = runtime
+            .register(PluginId::new("support-test"), contribution)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginApiError::UnsupportedExtensionPoint(ref point) if point == "IssueProvider"
+        ));
     }
 }

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thegn.dev/schemas/delivery-issues-v1.json",
+  "title": "Thegn active delivery issue inventory",
+  "type": "object",
+  "required": ["schema_version", "scope", "issues"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 20
+    },
+    "issues": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["issue", "project", "changes"],
+        "additionalProperties": false,
+        "properties": {
+          "issue": {
+            "type": "string",
+            "pattern": "^THE-[1-9][0-9]*$"
+          },
+          "project": {
+            "type": "string",
+            "minLength": 1
+          },
+          "changes": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+            }
+          },
+          "no_spec_rationale": {
+            "type": "string",
+            "minLength": 20
+          }
+        }
+      }
+    }
+  }
+}

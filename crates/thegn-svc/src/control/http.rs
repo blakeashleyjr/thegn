@@ -12,10 +12,10 @@
 use axum::{
     Router,
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        ConnectInfo, FromRequestParts, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap as HttpHeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response, sse},
 };
 use base64::Engine as _;
@@ -31,9 +31,10 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, ControlErrorCode, EditorOpenRequest,
-    ForkSpec, OpenSpec, PreviewFetchRequest, RecordSpec, SplitDir, WaitCondition,
+    AttachKind, ControlApi, ControlError, ControlErrorCode, EditorOpenRequest, ForkSpec, OpenSpec,
+    PreviewFetchRequest, RecordSpec, SplitDir, WaitCondition,
 };
+use crate::ipc::{IpcConnectInfo, PeerIdentity};
 
 /// Shared state for the control router. One instance per listener, so the
 /// unix-socket listener can carry `local_admin` while the TCP one never does.
@@ -43,6 +44,9 @@ pub struct ControlState {
     pub store: Arc<Mutex<dyn ControlStore + Send>>,
     /// This listener's peers get implicit admin (unix socket, same uid).
     pub local_admin: bool,
+    /// Daemon EUID captured when this listener is built. Unix implicit admin
+    /// requires an exact match with the accepted stream's peer EUID.
+    pub daemon_euid: Option<u32>,
     /// `[serve] require_approval`: redeemed tokens park until approved.
     pub require_approval: bool,
     /// Human-readable server identity for `Hello` frames.
@@ -52,6 +56,37 @@ pub struct ControlState {
     /// layer on the TCP listener only.
     pub cors_origins: Vec<String>,
 }
+
+/// Authentication inputs extracted from transport-owned request extensions
+/// plus the ordinary HTTP headers. Missing connect metadata is represented as
+/// unknown (and therefore fails closed to token auth), not as an extractor
+/// rejection.
+pub(super) struct RequestAuth {
+    headers: HttpHeaderMap,
+    peer: Option<PeerIdentity>,
+}
+
+impl<S> FromRequestParts<S> for RequestAuth
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<IpcConnectInfo>>()
+            .map(|ConnectInfo(info)| info.peer.clone());
+        Ok(Self {
+            headers: parts.headers.clone(),
+            peer,
+        })
+    }
+}
+
+// Keep handler signatures compact: every former bare HeaderMap extractor now
+// also carries non-spoofable connection identity.
+type HeaderMap = RequestAuth;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -143,7 +178,7 @@ pub async fn dispatch_local(
             .body(axum::body::Body::from(b.to_string())),
         None => builder.body(axum::body::Body::empty()),
     };
-    let Ok(request) = request else {
+    let Ok(mut request) = request else {
         return (
             StatusCode::BAD_REQUEST,
             serde_json::to_value(super::ErrorBody {
@@ -153,6 +188,9 @@ pub async fn dispatch_local(
             .expect("ErrorBody serialization is infallible"),
         );
     };
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(IpcConnectInfo::trusted_internal()));
     let response = match router(state).oneshot(request).await {
         Ok(r) => r,
         // The router service is infallible (`Error = Infallible`); this arm is
@@ -197,6 +235,7 @@ impl IntoResponse for ControlError {
 /// proxy's convention).
 fn bearer(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers
+        .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         && let Some(rest) = v.strip_prefix("Bearer ")
@@ -204,6 +243,7 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         return Some(rest.trim().to_string());
     }
     headers
+        .headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
@@ -230,7 +270,11 @@ pub(super) fn authed_target(
     verb: Verb,
     target: &str,
 ) -> Result<AuthCtx, Response> {
-    let ctx = if state.local_admin {
+    let ctx = if auth::implicit_local_admin(
+        state.local_admin,
+        state.daemon_euid,
+        headers.peer.as_ref(),
+    ) {
         AuthCtx::local_admin()
     } else {
         let Some(token) = bearer(headers) else {
@@ -1019,20 +1063,6 @@ pub(super) async fn open_editor(
     };
     match state.api.open_editor(target).await {
         Ok(()) => axum::Json(json!({ "queued": true })).into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
-pub(super) async fn browser(
-    State(state): State<ControlState>,
-    headers: HeaderMap,
-    body: axum::Json<BrowserCommand>,
-) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::DriveBrowser) {
-        return r;
-    }
-    match state.api.drive_browser(body.0).await {
-        Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
         Err(e) => e.into_response(),
     }
 }

@@ -896,9 +896,11 @@ mod tests {
                 .into_iter()
                 .map(|request| request.canonical()),
         );
-        let mut sandbox = thegn_core::config::SandboxConfig::default();
-        sandbox.profile = thegn_core::config::SandboxProfile::Open;
-        sandbox.image = "trusted-image".into();
+        let sandbox = thegn_core::config::SandboxConfig {
+            profile: thegn_core::config::SandboxProfile::Open,
+            image: "trusted-image".into(),
+            ..Default::default()
+        };
         let status = status_for_selected(
             config,
             &selection,

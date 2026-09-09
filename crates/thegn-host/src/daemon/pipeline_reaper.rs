@@ -178,6 +178,10 @@ mod tests {
     use thegn_core::issue::NewDispatch;
     use thegn_core::store::NotificationStore;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture setup is synchronous and runs no production or event-loop code"
+    )]
     fn git(dir: &std::path::Path, args: &[&str]) {
         let status = thegn_core::util::git_cmd(dir).args(args).status().unwrap();
         assert!(status.success(), "git {args:?} failed");

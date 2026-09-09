@@ -388,10 +388,10 @@ impl PushInboxConfig {
         }
         for word in &self.scopes {
             let w = word.trim().to_ascii_lowercase();
-            if !w.is_empty() && !matches!(w.as_str(), "read" | "write" | "git" | "admin") {
+            if !w.is_empty() && !matches!(w.as_str(), "read" | "write" | "git" | "exec" | "admin") {
                 errs.push(format!(
                     "[notifications.push.inbox] scopes has unknown scope {word:?} \
-                     (expected: read, write, git, admin)"
+                     (expected: read, write, git, exec, admin)"
                 ));
             }
         }
@@ -463,13 +463,15 @@ mod tests {
 
     #[test]
     fn explicit_sinks_materialize_and_validate_without_echoing_urls() {
-        let mut c = PushConfig::default();
-        c.sinks = vec![PushSinkConfig {
-            name: "oncall".into(),
-            kind: PushKind::Slack,
-            url: "https://hooks.slack.test/SECRET_SENTINEL".into(),
+        let c = PushConfig {
+            sinks: vec![PushSinkConfig {
+                name: "oncall".into(),
+                kind: PushKind::Slack,
+                url: "https://hooks.slack.test/SECRET_SENTINEL".into(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         assert_eq!(c.effective_sinks().len(), 1);
         assert!(c.is_configured());
         let errors = c.validate_errors();

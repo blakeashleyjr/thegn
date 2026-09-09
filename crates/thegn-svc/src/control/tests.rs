@@ -21,8 +21,8 @@ use thegn_core::store::LeaseRow;
 use super::auth;
 use super::http::{ControlState, router};
 use super::{
-    AttachKind, AttachReply, BrowserCommand, ControlApi, ControlResult, GitFileStatus, OpenSpec,
-    PreviewFetchReply, PreviewFetchRequest, SessionInfo,
+    AttachKind, AttachReply, ControlApi, ControlResult, GitFileStatus, OpenSpec, PreviewFetchReply,
+    PreviewFetchRequest, SessionInfo,
 };
 
 /// Records every trait call; returns minimal canned data.
@@ -166,10 +166,6 @@ impl ControlApi for FakeApi {
     ) -> BoxFuture<'a, ControlResult<()>> {
         self.record("open_worktree");
         Box::pin(async { Ok(()) })
-    }
-    fn drive_browser(&self, _cmd: BrowserCommand) -> BoxFuture<'_, ControlResult<()>> {
-        self.record("drive_browser");
-        Box::pin(async { Err(super::ControlError::Unimplemented("drive-browser")) })
     }
     fn preview_fetch(
         &self,
@@ -324,6 +320,7 @@ fn rig(local_admin: bool) -> Rig {
         api: api.clone(),
         store: db.clone(),
         local_admin,
+        daemon_euid: Some(1000),
         require_approval: false,
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
@@ -347,17 +344,41 @@ fn token(rig: &Rig, scopes: &str) -> String {
 }
 
 async fn call(rig: &Rig, method: &str, path: &str, bearer: Option<&str>) -> StatusCode {
+    call_as(
+        rig,
+        method,
+        path,
+        bearer,
+        Some(crate::ipc::PeerIdentity::UnixEuid(1000)),
+    )
+    .await
+}
+
+async fn call_as(
+    rig: &Rig,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    peer: Option<crate::ipc::PeerIdentity>,
+) -> StatusCode {
     let mut req = Request::builder().method(method).uri(path);
     if let Some(t) = bearer {
         req = req.header("authorization", format!("Bearer {t}"));
     }
-    let req = if method == "POST" {
+    let mut req = if method == "POST" {
         req.header("content-type", "application/json")
             .body(Body::from(default_body(path)))
             .unwrap()
     } else {
         req.body(Body::empty()).unwrap()
     };
+    if let Some(peer) = peer {
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(crate::ipc::IpcConnectInfo {
+                endpoint: "test".into(),
+                peer,
+            }));
+    }
     router(rig.state.clone())
         .oneshot(req)
         .await
@@ -376,8 +397,6 @@ fn default_body(path: &str) -> &'static str {
         r#"{"client_id":"c"}"#
     } else if path.contains("/worktrees/open") {
         r#"{"repo":"r"}"#
-    } else if path.contains("/browser") {
-        r#"{"session":null,"action":"reload"}"#
     } else if path.contains("/preview/fetch") {
         r#"{"url":"http://localhost:3000/"}"#
     } else if path.contains("/git/stage") {
@@ -481,7 +500,6 @@ async fn under_scoped_requests_are_rejected_with_zero_side_effects() {
         ("POST", "/v1/sessions/s1/detach"),
         ("DELETE", "/v1/sessions/s1"),
         ("POST", "/v1/worktrees/open"),
-        ("POST", "/v1/browser"),
         ("POST", "/v1/git/stage"),
         ("POST", "/v1/git/commit"),
         ("POST", "/v1/merge/add"),
@@ -722,6 +740,7 @@ async fn pairing_lifecycle_publishes_feed_frames() {
         api: api.clone(),
         store: db.clone(),
         local_admin: true,
+        daemon_euid: Some(1000),
         require_approval: true, // redeemed tokens park ⇒ Requested
         server_label: "test thegn".into(),
         cors_origins: Vec::new(),
@@ -772,6 +791,12 @@ async fn pairing_lifecycle_publishes_feed_frames() {
             .uri(&path)
             .body(Body::empty())
             .unwrap();
+        let mut req = req;
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(crate::ipc::IpcConnectInfo {
+                endpoint: "test".into(),
+                peer: crate::ipc::PeerIdentity::UnixEuid(1000),
+            }));
         let res = router(state.clone()).oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK, "{method} {path}");
     }
@@ -957,19 +982,75 @@ fn pr_status_row_and_pushed_note_serde_round_trip() {
 }
 
 #[tokio::test]
-async fn local_admin_listener_needs_no_token_and_drive_browser_is_501() {
+async fn removed_browser_route_is_stably_unknown_while_preview_remains_available() {
     let r = rig(true);
     assert_eq!(call(&r, "GET", "/v1/sessions", None).await, StatusCode::OK);
     assert_eq!(call(&r, "GET", "/v1/pairings", None).await, StatusCode::OK);
-    // The reserved verb answers 501 (defined contract, no behavior yet).
+    // Old HTTP clients get the router's stable unknown-route behavior, not an
+    // advertised operation that can only answer Unimplemented.
+    let calls_before_removed_route = r.api.calls();
     assert_eq!(
         call(&r, "POST", "/v1/browser", None).await,
-        StatusCode::NOT_IMPLEMENTED
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(r.api.calls(), calls_before_removed_route);
+
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "POST", "/v1/preview/fetch", Some(&read)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.api.calls().last().map(String::as_str),
+        Some("preview_fetch")
     );
     // Push registration is reserved for AI 422/423 — absent in v1 (404).
     assert_eq!(
         call(&r, "POST", "/v1/push/register", None).await,
         StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn local_admin_fails_closed_for_mismatched_or_unknown_peer_but_tokens_escape() {
+    let r = rig(true);
+    let read = token(&r, "read");
+    let mismatch = Some(crate::ipc::PeerIdentity::UnixEuid(1001));
+    let unavailable = Some(crate::ipc::PeerIdentity::Unavailable("test failure".into()));
+
+    assert_eq!(
+        call_as(&r, "GET", "/v1/sessions", None, mismatch.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call_as(&r, "GET", "/v1/sessions", Some(&read), mismatch).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_as(&r, "GET", "/v1/sessions", None, unavailable.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call_as(&r, "GET", "/v1/sessions", Some(&read), unavailable).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_as(&r, "GET", "/v1/sessions", None, None).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn local_admin_off_requires_token_even_for_same_uid() {
+    let r = rig(false);
+    assert_eq!(
+        call(&r, "GET", "/v1/sessions", None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "GET", "/v1/sessions", Some(&read)).await,
+        StatusCode::OK
     );
 }
 

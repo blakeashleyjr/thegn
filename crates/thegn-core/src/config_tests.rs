@@ -718,6 +718,46 @@ fn sandbox_profile_defaults_and_env_overlay() {
 }
 
 #[test]
+fn sandbox_compiler_cache_is_off_by_default_and_env_authoritative() {
+    assert_eq!(
+        SandboxConfig::default().compiler_cache,
+        crate::config::SandboxCompilerCache::Off
+    );
+    let o = env_overlay(&map_env(&[("THEGN_SANDBOX_COMPILER_CACHE", "auto")]));
+    assert_eq!(
+        o.sandbox.compiler_cache,
+        Some(crate::config::SandboxCompilerCache::Auto)
+    );
+    assert!(
+        crate::config_validate::validate_str("[sandbox]\ncompiler_cache = \"auto\"\n").is_empty()
+    );
+    assert!(
+        !crate::config_validate::validate_str("[sandbox]\ncompiler_cache = \"always\"\n")
+            .is_empty()
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "thegn-compiler-cache-config-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, "[sandbox]\ncompiler_cache = \"off\"\n").unwrap();
+    let first = Config::load_layered(&MapEnv::default(), &[], Some(path.clone()));
+    assert_eq!(
+        first.sandbox.compiler_cache,
+        crate::config::SandboxCompilerCache::Off
+    );
+    std::fs::write(&path, "[sandbox]\ncompiler_cache = \"auto\"\n").unwrap();
+    let reloaded = Config::load_layered(&MapEnv::default(), &[], Some(path));
+    assert_eq!(
+        reloaded.sandbox.compiler_cache,
+        crate::config::SandboxCompilerCache::Auto
+    );
+    let _ = std::fs::remove_dir_all(&dir); // best-effort: test scratch cleanup
+}
+
+#[test]
 fn devcontainer_mode_round_trips_and_repo_can_only_opt_out() {
     let cfg: Config = toml::from_str("[sandbox]\ndevcontainer = \"off\"\n").unwrap();
     assert_eq!(cfg.sandbox.devcontainer, DevcontainerMode::Off);
@@ -1546,6 +1586,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_ENABLED", "off"),
         ("THEGN_SANDBOX_REMOTE_HOST", "user@box"),
         ("THEGN_SANDBOX_PROFILE", "sealed"),
+        ("THEGN_SANDBOX_COMPILER_CACHE", "auto"),
         ("THEGN_SANDBOX_ON_DORMANT", "cancel"),
         ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
         ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
@@ -1629,6 +1670,10 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.sandbox.enabled);
     assert_eq!(c.sandbox.remote.host, "user@box");
     assert_eq!(c.sandbox.profile, SandboxProfile::Sealed);
+    assert_eq!(
+        c.sandbox.compiler_cache,
+        crate::config::SandboxCompilerCache::Auto
+    );
     assert_eq!(
         c.sandbox.on_dormant,
         crate::config_placement::OnDormant::Cancel

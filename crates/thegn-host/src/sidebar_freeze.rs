@@ -275,9 +275,14 @@ mod tests {
 
     #[test]
     fn enabling_while_focused_arms_immediately() {
-        let mut sb = crate::handlers::sidebar_persist::SidebarState::default();
-        sb.focused = true;
-        sb.view.sort = crate::sidebar::SortMode::Live;
+        let mut sb = crate::handlers::sidebar_persist::SidebarState {
+            focused: true,
+            view: crate::sidebar::ViewState {
+                sort: crate::sidebar::SortMode::Live,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         set_enabled(&mut sb, true, &status());
         assert!(sb.freeze_sort);
         assert!(sb.view.freeze.is_some());
@@ -285,11 +290,16 @@ mod tests {
 
     #[test]
     fn workspace_attention_arms_even_with_manual_worktree_sort() {
-        let mut sb = crate::handlers::sidebar_persist::SidebarState::default();
-        sb.focused = true;
-        sb.freeze_sort = true;
-        sb.view.sort = crate::sidebar::SortMode::Manual;
-        sb.view.workspace_sort = thegn_core::config::WorkspaceSort::Attention;
+        let mut sb = crate::handlers::sidebar_persist::SidebarState {
+            focused: true,
+            freeze_sort: true,
+            view: crate::sidebar::ViewState {
+                sort: crate::sidebar::SortMode::Manual,
+                workspace_sort: thegn_core::config::WorkspaceSort::Attention,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         arm(&mut sb, &status());
         assert!(sb.view.freeze.is_some());
     }

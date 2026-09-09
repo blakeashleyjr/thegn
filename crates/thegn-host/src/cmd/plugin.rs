@@ -16,6 +16,7 @@ use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::outln;
+use thegn_svc::plugin::LoadedPlugin;
 use thegn_svc::plugin::{check_specs, discover, negotiate};
 
 #[derive(Subcommand, Clone)]
@@ -37,6 +38,62 @@ fn config_dir(config_path: &Path) -> PathBuf {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default()
+}
+
+fn inspection_lines(plugin: &LoadedPlugin) -> Vec<String> {
+    let id = plugin.spec.manifest.id.as_str();
+    if !plugin.spec.enabled {
+        return vec![format!("plugin {id}: disabled (not negotiated)")];
+    }
+    let negotiated = match negotiate(&plugin.spec) {
+        Ok(negotiated) => negotiated,
+        Err(error) => {
+            return vec![format!(
+                "plugin {id}: api {} rejected by host {}: {error}",
+                plugin.spec.manifest.api,
+                thegn_core::plugin_api::API_VERSION
+            )];
+        }
+    };
+    let mut granted = negotiated
+        .granted
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut missing = negotiated
+        .denied
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    granted.sort();
+    missing.sort();
+    let scopes = plugin.spec.scope_set().to_csv();
+    let mut lines = vec![format!(
+        "plugin {id}: api {} negotiated with host {}; host-call scopes [{}]",
+        negotiated.api,
+        thegn_core::plugin_api::API_VERSION,
+        scopes
+    )];
+    lines.push(format!(
+        "  capabilities: granted [{}]; missing [{}]",
+        granted.join(","),
+        missing.join(",")
+    ));
+    for contribution in &negotiated.accepted_contributions {
+        lines.push(format!(
+            "  contribution {}: accepted {}",
+            contribution.id.as_str(),
+            contribution.extension_point.wire_name()
+        ));
+    }
+    for rejected in &negotiated.rejected_contributions {
+        lines.push(format!(
+            "  contribution {}: rejected {}",
+            rejected.contribution.id.as_str(),
+            rejected.reason
+        ));
+    }
+    lines
 }
 
 pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
@@ -107,9 +164,15 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
             Ok(())
         }
         Action::Check => {
+            let loaded = discover(cfg, &dir);
+            for plugin in &loaded {
+                for line in inspection_lines(plugin) {
+                    outln!("{line}");
+                }
+            }
             let problems = check_specs(cfg, &dir);
             if problems.is_empty() {
-                outln!("plugins: ok ({} discovered)", discover(cfg, &dir).len());
+                outln!("plugins: ok ({} discovered)", loaded.len());
                 return Ok(());
             }
             for p in &problems {
@@ -123,12 +186,74 @@ pub fn run(cfg: &Config, action: Action, config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::plugin_api::{
+        API_VERSION, CadenceHint, Contribution, ContributionId, ExtensionPoint, PluginId,
+        PluginManifest, PluginMode, PluginSpec,
+    };
 
     #[test]
     fn config_dir_is_the_config_files_parent() {
         assert_eq!(
             config_dir(&PathBuf::from("/home/u/.config/thegn/config.toml")),
             PathBuf::from("/home/u/.config/thegn")
+        );
+    }
+
+    fn inspected_plugin(point: ExtensionPoint, capabilities: &[&str]) -> LoadedPlugin {
+        LoadedPlugin {
+            spec: PluginSpec {
+                manifest: PluginManifest {
+                    id: PluginId::new("inspect"),
+                    name: "Inspect".into(),
+                    version: "1.0.0".into(),
+                    api: API_VERSION,
+                    capabilities: capabilities
+                        .iter()
+                        .map(|cap| thegn_core::plugin_api::Capability::parse(cap).unwrap())
+                        .collect(),
+                    contributions: vec![Contribution {
+                        id: ContributionId::new("inspect.row"),
+                        extension_point: point,
+                        label: "Inspect".into(),
+                        surface: None,
+                        cadence: CadenceHint::OnDemand,
+                        metadata: Default::default(),
+                        caps: serde_json::Value::Null,
+                        chord: None,
+                    }],
+                },
+                command: vec!["true".into()],
+                cwd: String::new(),
+                env: Default::default(),
+                timeout_secs: 5,
+                scopes: vec![thegn_core::control::Scope::Exec],
+                mode: PluginMode::Resident,
+                enabled: true,
+            },
+            dir: None,
+        }
+    }
+
+    #[test]
+    fn check_inspection_reports_api_scopes_grants_and_acceptance() {
+        let plugin = inspected_plugin(ExtensionPoint::PaletteAction, &["surface:palette"]);
+        let text = inspection_lines(&plugin).join("\n");
+        assert!(
+            text.contains("api 0.3.0 negotiated with host 0.3.0"),
+            "{text}"
+        );
+        assert!(text.contains("host-call scopes [exec]"), "{text}");
+        assert!(text.contains("granted [surface:palette]"), "{text}");
+        assert!(text.contains("accepted PaletteAction"), "{text}");
+    }
+
+    #[test]
+    fn check_inspection_reports_stable_reserved_reason() {
+        let plugin = inspected_plugin(ExtensionPoint::PanelSection, &["surface:panel"]);
+        let text = inspection_lines(&plugin).join("\n");
+        assert!(
+            text.contains("rejected unsupported extension point PanelSection: reserved by THE-108"),
+            "{text}"
         );
     }
 }

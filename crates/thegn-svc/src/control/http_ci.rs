@@ -6,14 +6,12 @@
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use thegn_core::control::Verb;
 
-use super::http::ControlState;
-use super::http::authed_target;
+use super::http::{ControlState, RequestAuth, authed_target};
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct CiRunsQuery {
@@ -33,7 +31,7 @@ pub(super) struct CiLogsQuery {
 
 pub(super) async fn ci_runs(
     State(state): State<ControlState>,
-    headers: HeaderMap,
+    headers: RequestAuth,
     Query(query): Query<CiRunsQuery>,
 ) -> Response {
     if let Err(response) = authed_target(&state, &headers, Verb::CiRuns, &query.worktree) {
@@ -51,7 +49,7 @@ pub(super) async fn ci_runs(
 
 pub(super) async fn ci_logs(
     State(state): State<ControlState>,
-    headers: HeaderMap,
+    headers: RequestAuth,
     Query(query): Query<CiLogsQuery>,
 ) -> Response {
     if let Err(response) = authed_target(&state, &headers, Verb::CiLogs, &query.worktree) {

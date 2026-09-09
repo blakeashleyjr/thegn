@@ -171,8 +171,9 @@ excuse. Each surface's implemented set is one table (`API_CALLS`, `GRPC_CAPS`,
 `cli_control_caps()`, `MCP_STATE_CAPS`, `plugin_host_call_caps()` — derived from
 the catalog) that `coverage_problems` arbitrates; `thegn api coverage` prints
 the per-surface ledger (implemented / **stub** / excused / declared — a
-routed-but-inert row like `browser.drive` carries a `stub` marker so it never
-reads as done) and `thegn doctor` the one-line summary. Plugin `host.call`
+routed-but-inert compatibility row carries a `stub` marker so it never reads as
+done; the catalog currently has no such rows) and `thegn doctor` the one-line
+summary. Plugin `host.call`
 dispatches any routed non-streaming plugin row generically through the
 `API_CALLS` spine; the event feed is bridged to resident plugins as `on_event`.
 Every mutating control call and every auth/scope rejection emits a structured

@@ -1,0 +1,31 @@
+{
+  "expected_error": "active delivery issue has neither a mapped change nor an explicit no-spec rationale",
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": ["Fixture Project"],
+    "entries": [
+      {
+        "change": "mapped-change",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [{"issue": "THE-1", "project": "Fixture Project"}],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "issue_inventory": {
+    "$schema": "./issues-schema.json",
+    "schema_version": 1,
+    "scope": "Synthetic active issue inventory with one deliberately unmapped issue.",
+    "issues": [
+      {
+        "issue": "THE-1",
+        "project": "Fixture Project",
+        "changes": ["mapped-change"]
+      },
+      {"issue": "THE-2", "project": "Fixture Project", "changes": []}
+    ]
+  },
+  "active_changes": {"mapped-change": "# Tasks\n\n- [ ] pending\n"}
+}

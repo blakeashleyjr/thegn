@@ -159,9 +159,10 @@ pub fn verify_report(f: &VerifyFacts) -> VerifyReport {
         ));
     }
     if f.report_present && !f.report_gate_valid {
-        reasons.push(format!(
+        reasons.push(
             "row claims PASS but cites no successful gate result — update it with `thegn dispatch report <id>`"
-        ));
+                .into(),
+        );
     }
     VerifyReport {
         ok: reasons.is_empty(),

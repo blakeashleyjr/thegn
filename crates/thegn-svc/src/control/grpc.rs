@@ -11,6 +11,7 @@
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use axum::extract::ConnectInfo;
 use futures_util::Stream;
 use tonic::{Request, Response, Status};
 
@@ -21,9 +22,10 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, EditorOpenRequest,
-    ForkSpec, OpenSpec, PreviewFetchRequest, SplitDir, WaitCondition,
+    AttachKind, ControlApi, ControlError, EditorOpenRequest, ForkSpec, OpenSpec,
+    PreviewFetchRequest, SplitDir, WaitCondition,
 };
+use crate::ipc::IpcConnectInfo;
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
 #[allow(clippy::all, clippy::pedantic)]
@@ -40,6 +42,9 @@ pub struct GrpcControl {
     pub store: Arc<Mutex<dyn ControlStore + Send>>,
     /// This listener's peers get implicit admin (unix socket, same uid).
     pub local_admin: bool,
+    /// Daemon EUID captured with the listener; compared to accepted-stream
+    /// credentials before implicit admin is granted.
+    pub daemon_euid: Option<u32>,
     pub server_label: String,
 }
 
@@ -76,7 +81,11 @@ impl GrpcControl {
     // The Err IS the RPC's whole response; produced once per request.
     #[allow(clippy::result_large_err)]
     fn authed<T>(&self, req: &Request<T>, verb: Verb) -> Result<AuthCtx, Status> {
-        let ctx = if self.local_admin {
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<IpcConnectInfo>>()
+            .map(|ConnectInfo(info)| &info.peer);
+        let ctx = if auth::implicit_local_admin(self.local_admin, self.daemon_euid, peer) {
             AuthCtx::local_admin()
         } else {
             let Some(token) = req
@@ -519,29 +528,6 @@ impl Control for GrpcControl {
         Ok(Response::new(info_to_proto(&info)))
     }
 
-    async fn drive_browser(
-        &self,
-        req: Request<proto::DriveBrowserRequest>,
-    ) -> Result<Response<proto::Empty>, Status> {
-        self.authed(&req, Verb::DriveBrowser)?;
-        let r = req.into_inner();
-        let action = match r.action {
-            Some(proto::drive_browser_request::Action::NavigateUrl(url)) => {
-                BrowserAction::Navigate { url }
-            }
-            Some(proto::drive_browser_request::Action::Back(_)) => BrowserAction::Back,
-            _ => BrowserAction::Reload,
-        };
-        self.api
-            .drive_browser(BrowserCommand {
-                session: (!r.session.is_empty()).then_some(r.session),
-                action,
-            })
-            .await
-            .map_err(Status::from)?;
-        Ok(Response::new(proto::Empty {}))
-    }
-
     async fn preview_fetch(
         &self,
         req: Request<proto::PreviewFetchRequest>,
@@ -927,7 +913,6 @@ pub const GRPC_CAPS: &[&str] = &[
     "worktrees.list",
     "worktrees.open",
     "editor.open",
-    "browser.drive",
     "preview.fetch",
     "git.status",
     "git.stage",
@@ -961,6 +946,21 @@ mod tests {
 
     use super::*;
     use thegn_core::control_wire::Hello;
+
+    #[test]
+    fn tonic_request_carries_listener_peer_identity() {
+        let mut request = Request::new(proto::MeRequest {});
+        request.extensions_mut().insert(ConnectInfo(IpcConnectInfo {
+            endpoint: "/tmp/thegn.sock".into(),
+            peer: crate::ipc::PeerIdentity::UnixEuid(42),
+        }));
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<IpcConnectInfo>>()
+            .map(|ConnectInfo(info)| &info.peer);
+        assert!(auth::implicit_local_admin(true, Some(42), peer));
+        assert!(!auth::implicit_local_admin(true, Some(7), peer));
+    }
 
     /// proto `Event` → `EventFrame`, for the round-trip test (lossy on
     /// unknown strings by construction — the wire enums are ours).

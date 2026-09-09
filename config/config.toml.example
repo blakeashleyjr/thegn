@@ -1333,7 +1333,7 @@ command = "aider --model sonnet"
 # flag, defaulting to `read`, decides); an unknown/empty list serves docs only.
 # `thegn doctor` prints the effective ceiling and which level clamped it.
 # [mcp.serve]
-# scopes = ["read"]     # read | write | git | admin  (read = listing/observing
+# scopes = ["read"]     # read | write | git | exec | admin (read = listing/observing
 #                       #   tools; write adds session open/kill)
 
 [[agents]]
@@ -1782,8 +1782,8 @@ command = "git diff"
 #                              #   a running build, and anything touched in the last hour.
 #                              #   Trades an unexpected cold rebuild for headroom — which is
 #                              #   the right trade only when the disk is genuinely full.
-# sccache = false              # inject RUSTC_WRAPPER=sccache into panes (no-op if not on PATH);
-#                              #   shares dependency compilation across worktrees
+# sccache = false              # inject RUSTC_WRAPPER=sccache into host panes (no-op if not on PATH);
+#                              #   sandbox use is separately authorized by [sandbox].compiler_cache
 # sccache_dir = ""             # SCCACHE_DIR ("" = sccache default); ~ and repo-relative paths ok
 # shared_target_dir = ""       # one CARGO_TARGET_DIR shared across a repo's worktrees.
 #                              #   Biggest disk win, BUT cargo's per-target build lock
@@ -2611,6 +2611,19 @@ file_access = "worktree_plus_caches"
 # Mount common language build caches from the host when file_access is
 # worktree_plus_caches. Disable to get a fully cold cache on every pane.
 auto_caches = true
+
+# Compiler-cache policy INSIDE sandboxes. This is the sole authority: `[disk]`
+# and a Nix devShell may supply sccache paths/settings, but cannot authorize the
+# wrapper across the containment boundary.
+#   off  — default; strip inherited sccache wrappers/endpoints and use rustc.
+#   auto — for a local bwrap sandbox, probe the executable and writable data
+#          path in the actual sandbox, use a private /tmp UDS, and fall back to
+#          rustc only when a bounded compiler-version transport probe confirms
+#          a server/transport I/O error. Compiler failures are preserved
+#          without retry. Other backends are currently reported as not proven
+#          and use rustc directly.
+# One-run override: THEGN_SANDBOX_COMPILER_CACHE=auto.
+compiler_cache = "off"
 
 # Extra bind mounts beyond what file_access provides.
 # Formats: "host_path"              → rw at same path inside container
@@ -3980,21 +3993,37 @@ idle_exit_secs = 1800
 lease_grace_secs = 0
 
 # `thegn serve`: pair remote thin clients (desktop/web/mobile) over a pairing
-# URL and let them attach through the scoped control API. v1 serves PLAINTEXT —
-# bind to a trusted network interface (tailscale/wireguard) or reach it over
-# `ssh -L`; every request is still token-gated.
+# URL and let them attach through the scoped control API. Thegn's native TCP
+# backend is plaintext, so direct mode is loopback-only by default. For remote
+# use, declare a loopback TLS terminator or encrypted tunnel topology below;
+# every request remains token-gated independently of transport encryption.
 [serve]
-# Default TCP bind (override per-run with `thegn serve --bind`). Loopback by
-# default — the control plane carries full PTY I/O over plaintext, so exposing
-# it beyond localhost is opt-in. For remote clients, front it with a
-# tailnet/VPN address or an explicit `bind = "0.0.0.0:5380"` behind a firewall.
+# Backend TCP bind (override per-run with `thegn serve --bind`). A bind override
+# alone can never authorize plaintext non-loopback exposure.
 bind = "127.0.0.1:5380"
+# `direct`: plaintext and loopback-only. `tls-terminated`: a TLS reverse proxy
+# on this same machine owns certificates and forwards HTTP, WebSocket, and gRPC
+# to the loopback backend. `tunnel`: an SSH/other encrypted tunnel exposes a
+# client-local plaintext endpoint while the backend remains loopback.
+topology = "direct"
+# Host/port clients actually dial. `advertise_host` is required for
+# tls-terminated/tunnel. Port 0 derives the backend port, except TLS defaults to
+# 443. Pairing URLs derive http/https and ws/wss/grpc/grpcs from this policy.
+advertise_host = ""
+advertise_port = 0
+# Emergency-only direct plaintext exposure. Without this exact opt-in, any
+# non-loopback direct bind is rejected by config validation and startup. This
+# global user setting is not present in repository overlay schemas.
+unsafe_allow_plaintext_non_loopback = false
 # Require in-app / `thegn pair approve` approval before a redeemed pairing
 # token becomes usable. Default off: possession of the single-use pairing URL
 # is the credential.
 require_approval = false
-# Local unix-socket peers (same uid) get implicit admin, so local CLI verbs
-# (`thegn session …`) need no token. Tokens are always required on TCP.
+# Local unix-socket peers get implicit admin only when native peer credentials
+# match the daemon's effective uid. The 0700 run-dir and 0600 socket are strict
+# startup invariants in this mode. Set false to require scoped bearer tokens on
+# Unix too (useful where peer credentials or filesystem modes are unavailable).
+# Tokens are always required on TCP.
 local_admin = true
 # Cross-origin allowlist for a browser-hosted thin client. Empty (default) = NO
 # cross-origin access: a browser script from another origin gets no CORS grant
@@ -4171,6 +4200,9 @@ sign_commits = false          # sign the fold/land commits thegn creates (commit
                               # Always NON-INTERACTIVE: a would-prompt / agent-locked /
                               # missing-key failure stops the drain as an infrastructure
                               # error and NEVER blames the branch or wakes the fixing agent.
+                              # A wedged background commit is killed after the internal
+                              # 120-second deadline (its whole process group on Unix);
+                              # fetch/push deadlines are unchanged.
                               # `thegn doctor` probes signing readiness when this is on.
                               # (Which key / whose GNUPGHOME signs is the active identity's
                               # business — see [identities]; this key only decides WHETHER.)

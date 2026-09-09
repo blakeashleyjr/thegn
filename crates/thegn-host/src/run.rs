@@ -619,15 +619,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cli.config.clone(),
     );
     // Establish schema ownership before `load_or_seed_session` (the first DB
-    // consumer). This explicit open is a preflight: migration refusal must
-    // abort startup and restore the terminal, never be swallowed by the
-    // session loader's cache-unavailable fallback (the failure mode that made
-    // most workspaces, git state, disk size, and LOC appear to vanish).
+    // consumer). The actual open is deliberately left to the ordinary startup
+    // + hydration paths: a newer-schema refusal must reach visible chrome, not
+    // abort after the terminal has entered the alternate screen.
     thegn_core::db::install_migration_policy(
         &cfg.database,
         thegn_core::db::MigrationActor::Controller,
     )?;
-    drop(thegn_core::db::Db::open()?);
     // Off-loop hydration loads must build the SAME config (overrides + DB
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
@@ -9724,6 +9722,14 @@ async fn event_loop<T: Terminal>(
                 &mut pending_editor_opens,
             );
             if generation != hydration_gen {
+                continue;
+            }
+            // A failed hydration is a completion signal, not a replacement
+            // model. Keep the last good sidebar/panel and stamp its typed DB
+            // availability. In particular, a later generic outage cannot
+            // erase a schema refusal; only an Available hydration may do that.
+            if retain_model_for_hydration_failure(&mut model, &next_model) {
+                dirty = true;
                 continue;
             }
             // A review snapshot may be fetched after the Changes modal opens.
@@ -19947,6 +19953,16 @@ async fn event_loop<T: Terminal>(
                                 NavMove::NextWorktree => Action::NextWorktree,
                             };
                         }
+                        if !model.state_db.mutations_allowed()
+                            && !action_allowed_during_schema_refusal(&action)
+                        {
+                            // The persistent banner already carries the
+                            // remediation. Fail closed at the shared host-action
+                            // chokepoint so incompatible state mutations cannot
+                            // be initiated from either keybinds or the palette.
+                            dirty = true;
+                            continue;
+                        }
                         match action {
                             Action::VoiceToggle => {
                                 model.status = crate::handlers::voice::toggle(
@@ -23286,6 +23302,78 @@ fn drain_hydration_intents(
     }
     pending_adopts.append(&mut model.adopt_intents);
     pending_editor_opens.append(&mut model.open_editor_intents);
+}
+
+/// Apply only the availability portion of a failed hydration. Returns true
+/// when the caller must retain the current model rather than swap in the cheap
+/// fallback payload.
+fn retain_model_for_hydration_failure(
+    current: &mut crate::chrome::FrameModel,
+    incoming: &crate::chrome::FrameModel,
+) -> bool {
+    use crate::chrome::StateDbAvailability;
+    match &incoming.state_db {
+        StateDbAvailability::Available => false,
+        StateDbAvailability::SchemaRefused { .. } => {
+            current.state_db = incoming.state_db.clone();
+            true
+        }
+        StateDbAvailability::Unavailable { detail } => {
+            if !current.state_db.schema_refused() {
+                current.state_db = incoming.state_db.clone();
+                current.status = format!("State DB unavailable: {detail}");
+            }
+            true
+        }
+    }
+}
+
+/// Conservative read-only action surface while this build cannot interpret the
+/// shared DB. Unknown and custom actions fail closed.
+fn action_allowed_during_schema_refusal(action: &crate::keymap::Action) -> bool {
+    use crate::keymap::Action;
+    matches!(
+        action,
+        Action::Redraw
+            | Action::Help
+            | Action::Quit
+            | Action::Detach
+            | Action::QuitKill
+            | Action::FocusLeft
+            | Action::FocusRight
+            | Action::FocusUp
+            | Action::FocusDown
+            | Action::NavLeft
+            | Action::NavRight
+            | Action::NavUp
+            | Action::NavDown
+            | Action::NextTab
+            | Action::PrevTab
+            | Action::NextWorktree
+            | Action::PrevWorktree
+            | Action::NextWorkspace
+            | Action::PrevWorkspace
+            | Action::ToggleRegion
+            | Action::FocusSidebar
+            | Action::FocusPanel
+            | Action::OpenCi
+            | Action::OpenMergeQueue
+            | Action::OpenPrQueue
+            | Action::OpenUsage
+            | Action::OpenMonitor
+            | Action::OpenPipelineBoard
+            | Action::OpenCalendar
+            | Action::OpenShares
+            | Action::Diff
+            | Action::ScrollUp
+            | Action::ScrollDown
+            | Action::CopyPane
+            | Action::SearchPane
+            | Action::SearchGlobal
+            | Action::EnterReplay
+            | Action::SwitchMode(_)
+            | Action::ToggleKeyLock
+    )
 }
 
 #[cfg(test)]

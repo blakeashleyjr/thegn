@@ -100,6 +100,234 @@ fn creating_a_fresh_database_is_not_advancing_one() {
     );
 }
 
+const MIGRATION_POLICY_CHILD_CASE: &str = "THEGN_TEST_MIGRATION_POLICY_CHILD_CASE";
+const MIGRATION_POLICY_CHILD_DONE: &str = "migration-policy-child.done";
+
+fn stored_user_version(path: &std::path::Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Build a structurally current DB and then rewind only its version stamp. The
+/// resulting file exercises a real migration without coupling this regression
+/// to the historical shape of any one migration rung.
+fn seed_stale_database(path: &std::path::Path) {
+    let staging = path.with_extension("staging.db");
+    drop(Db::open_at(&staging).unwrap());
+    let conn = Connection::open(&staging).unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(conn);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::rename(staging, path).unwrap();
+}
+
+fn assert_uninstalled_policy_refusal(path: &std::path::Path) {
+    let before = std::fs::read(path).unwrap();
+    let error = match Db::open_at(path) {
+        Ok(_) => panic!("canonical migration must fail closed"),
+        Err(error) => error,
+    };
+    let refusal = error
+        .downcast_ref::<MigrationAccessError>()
+        .expect("migration refusal remains typed");
+    assert!(matches!(
+        refusal,
+        MigrationAccessError::PolicyUninstalled {
+            observed,
+            required,
+            ..
+        } if *observed == SCHEMA_VERSION - 1 && *required == SCHEMA_VERSION
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("an explicit migration grant is required"),
+        "refusal must name the operator action: {error:#}"
+    );
+    assert_eq!(stored_user_version(path), SCHEMA_VERSION - 1);
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        before,
+        "refusal must happen before any schema write"
+    );
+}
+
+// This test is invoked in a fresh subprocess by
+// `canonical_migration_without_policy_is_file_backed_and_fail_closed`. A
+// subprocess is necessary because both XDG_STATE_HOME and the installed
+// migration runtime are process-global startup state.
+#[test]
+fn migration_policy_subprocess_child() {
+    let Ok(case) = std::env::var(MIGRATION_POLICY_CHILD_CASE) else {
+        return;
+    };
+    let state_home = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+    let canonical = state_home.join("thegn/thegn.db");
+
+    match case.as_str() {
+        "canonical" => {
+            seed_stale_database(&canonical);
+            assert_uninstalled_policy_refusal(&canonical);
+        }
+        "lexical-alias" => {
+            seed_stale_database(&canonical);
+            let alias = state_home.join("thegn/../thegn/thegn.db");
+            assert_uninstalled_policy_refusal(&alias);
+        }
+        #[cfg(unix)]
+        "symlink-alias" => {
+            seed_stale_database(&canonical);
+            let alias = state_home.join("state-link.db");
+            std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+            assert_uninstalled_policy_refusal(&alias);
+        }
+        #[cfg(unix)]
+        "hardlink-alias" => {
+            seed_stale_database(&canonical);
+            let alias = state_home.join("state-hardlink.db");
+            std::fs::hard_link(&canonical, &alias).unwrap();
+            assert_uninstalled_policy_refusal(&alias);
+        }
+        "tolerant-api" => {
+            seed_stale_database(&canonical);
+            let before = std::fs::read(&canonical).unwrap();
+            let error = match Db::open_at_allowing_older_build(&canonical) {
+                Ok(_) => panic!("the newer-schema override must not grant migration authority"),
+                Err(error) => error,
+            };
+            assert!(error.downcast_ref::<MigrationAccessError>().is_some());
+            assert_eq!(stored_user_version(&canonical), SCHEMA_VERSION - 1);
+            assert_eq!(std::fs::read(&canonical).unwrap(), before);
+        }
+        "bootstrap" => {
+            let db = Db::open().expect("a fresh canonical DB may bootstrap without a controller");
+            assert_eq!(query_user_version(db.conn()), SCHEMA_VERSION);
+            drop(db);
+            drop(Db::open().expect("a current canonical DB needs no migration grant"));
+            assert_eq!(stored_user_version(&canonical), SCHEMA_VERSION);
+        }
+        "temporary" => {
+            let temporary = state_home.join("isolated/test.db");
+            seed_stale_database(&temporary);
+            drop(Db::open_at(&temporary).expect("a proven-distinct DB remains frictionless"));
+            assert_eq!(stored_user_version(&temporary), SCHEMA_VERSION);
+        }
+        "controller" | "client" | "any" | "disabled" | "pin-match" | "pin-mismatch" => {
+            use crate::config::{DatabaseConfig, MigrationAuthority};
+
+            seed_stale_database(&canonical);
+            let before = std::fs::read(&canonical).unwrap();
+            let mut config = DatabaseConfig::default();
+            let actor = match case.as_str() {
+                "client" => MigrationActor::Client,
+                "any" => {
+                    config.migration_authority = MigrationAuthority::Any;
+                    MigrationActor::Client
+                }
+                "disabled" => {
+                    config.migration_authority = MigrationAuthority::Disabled;
+                    MigrationActor::Controller
+                }
+                "pin-match" => {
+                    config.migration_executable = std::fs::canonicalize(
+                        crate::util::self_exe_path().expect("test executable has a path"),
+                    )
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                    MigrationActor::Controller
+                }
+                "pin-mismatch" => {
+                    let other = state_home.join("different-thegn");
+                    std::fs::write(&other, "not this test executable").unwrap();
+                    config.migration_executable = std::fs::canonicalize(other)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    MigrationActor::Controller
+                }
+                _ => MigrationActor::Controller,
+            };
+            install_migration_policy(&config, actor).unwrap();
+
+            match case.as_str() {
+                "controller" | "any" | "pin-match" => {
+                    drop(Db::open().expect("the explicit authority permits migration"));
+                    assert_eq!(stored_user_version(&canonical), SCHEMA_VERSION);
+                }
+                "client" | "disabled" | "pin-mismatch" => {
+                    let error = match Db::open() {
+                        Ok(_) => panic!("the installed policy must refuse this actor"),
+                        Err(error) => error,
+                    };
+                    let expected = match case.as_str() {
+                        "client" => "ordinary CLI processes are not database migration controllers",
+                        "disabled" => "automatic database migrations are disabled",
+                        _ => "this executable is not the configured migration executable",
+                    };
+                    assert!(error.to_string().contains(expected), "{error:#}");
+                    assert_eq!(stored_user_version(&canonical), SCHEMA_VERSION - 1);
+                    assert_eq!(std::fs::read(&canonical).unwrap(), before);
+                }
+                _ => unreachable!(),
+            }
+        }
+        unknown => panic!("unknown migration-policy child case {unknown}"),
+    }
+
+    std::fs::write(state_home.join(MIGRATION_POLICY_CHILD_DONE), case).unwrap();
+}
+
+#[test]
+fn canonical_migration_without_policy_is_file_backed_and_fail_closed() {
+    let mut cases = vec![
+        "canonical",
+        "lexical-alias",
+        "tolerant-api",
+        "bootstrap",
+        "temporary",
+        "controller",
+        "client",
+        "any",
+        "disabled",
+        "pin-match",
+        "pin-mismatch",
+    ];
+    #[cfg(unix)]
+    cases.extend(["symlink-alias", "hardlink-alias"]);
+
+    for case in cases {
+        let state_home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::tests::migration_policy_subprocess_child",
+                "--nocapture",
+            ])
+            .env(MIGRATION_POLICY_CHILD_CASE, case)
+            .env("XDG_STATE_HOME", state_home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "migration-policy case {case} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_home.path().join(MIGRATION_POLICY_CHILD_DONE)).unwrap(),
+            case,
+            "the exact child regression must have run"
+        );
+    }
+}
+
 fn db() -> Db {
     Db::open_memory().unwrap()
 }
@@ -164,6 +392,221 @@ fn read_only_open_does_not_create_or_migrate_state_files() {
             "immutable read-only open created wal.db{suffix}"
         );
     }
+}
+
+fn compatible_v66_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.db");
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.put_workspace("/repo", "repo", "git").unwrap();
+        db.put_worktree(
+            "repo/home",
+            "/repo",
+            "/repo",
+            "main",
+            Some(r#"{"kind":"ssh","host":"builder"}"#),
+            None,
+        )
+        .unwrap();
+    }
+    // Materialize the actual v66 boundary: v67 consists only of these two
+    // unrelated CI cache tables, while every declared land capability remains.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE ci_log_cache;
+         DROP TABLE ci_autofix_dedupe;
+         PRAGMA user_version = 66;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    (dir, path)
+}
+
+fn table_exists(path: &std::path::Path, table: &str) -> bool {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn compatibility_catalog_declares_read_and_write_requirements() {
+    let mut names = std::collections::HashSet::new();
+    for operation in SchemaOperation::ALL {
+        assert!(
+            names.insert(operation.name()),
+            "operation names must be unique"
+        );
+        assert!(operation.minimum_read_schema() > 0);
+        assert!(operation.minimum_read_schema() < SCHEMA_VERSION);
+        match operation.access() {
+            SchemaRequirementAccess::Read => {
+                assert_eq!(operation.minimum_write_schema(), None)
+            }
+            SchemaRequirementAccess::ReadWrite => assert!(
+                operation.minimum_write_schema().is_some_and(|v| v > 0),
+                "write operations must declare a writable floor"
+            ),
+        }
+        assert!(
+            !operation.required_features().is_empty(),
+            "a catalog entry cannot receive a handle without declaring features"
+        );
+    }
+    // There is intentionally no string/open-by-version API: the closed enum is
+    // the only way to request a compatibility handle, so undeclared access is
+    // rejected by the type system rather than a fallible naming convention.
+    assert_eq!(names.len(), SchemaOperation::ALL.len());
+}
+
+#[test]
+fn compatible_read_op_uses_v66_read_only_and_never_migrates() {
+    let (dir, path) = compatible_v66_fixture();
+    let absent = dir.path().join("absent.db");
+    assert!(
+        Db::open_compatible_at(&absent, SchemaOperation::LandRemoteTargetGuard)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !absent.exists(),
+        "compatibility access must never bootstrap"
+    );
+
+    let db = Db::open_compatible_at(&path, SchemaOperation::LandRemoteTargetGuard)
+        .unwrap()
+        .expect("v66 supports the land guard");
+    assert_eq!(
+        db.db().location_for("/repo").unwrap().as_deref(),
+        Some(r#"{"kind":"ssh","host":"builder"}"#)
+    );
+    assert!(
+        db.db()
+            .conn()
+            .execute("UPDATE worktrees SET location=NULL", [])
+            .is_err(),
+        "the guard handle must be physically read-only"
+    );
+    drop(db);
+    assert_eq!(stored_user_version(&path), 66);
+    assert!(
+        !table_exists(&path, "ci_log_cache"),
+        "opening v66 must not install the v67 schema"
+    );
+}
+
+#[test]
+fn compatible_write_op_updates_declared_v66_shape_without_migrating() {
+    let (_dir, path) = compatible_v66_fixture();
+    let db = Db::open_compatible_at(&path, SchemaOperation::LandLifecycleBookkeeping)
+        .unwrap()
+        .expect("v66 supports land lifecycle writes");
+    let folder = db.db().ensure_folder("/repo", "Merged").unwrap();
+    db.db().set_worktree_folder("/repo", Some(folder)).unwrap();
+    assert_eq!(
+        db.db()
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree == "/repo")
+            .unwrap()
+            .folder_id,
+        Some(folder)
+    );
+    drop(db);
+    assert_eq!(stored_user_version(&path), 66);
+    assert!(!table_exists(&path, "ci_autofix_dedupe"));
+}
+
+#[test]
+fn incompatible_version_is_typed_and_refused_before_operation_sql() {
+    let (_dir, path) = compatible_v66_fixture();
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", 65).unwrap();
+    conn.execute("CREATE TABLE compatibility_marker(value TEXT)", [])
+        .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+
+    let error = match Db::open_compatible_at(&path, SchemaOperation::LandLifecycleBookkeeping) {
+        Ok(_) => panic!("v65 must not receive a v66 lifecycle handle"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.downcast_ref::<SchemaCompatibilityError>(),
+        Some(SchemaCompatibilityError::InsufficientVersion {
+            operation: "land.lifecycle_bookkeeping",
+            access: SchemaRequirementAccess::ReadWrite,
+            required: 66,
+            observed: 65,
+        })
+    ));
+    assert_eq!(stored_user_version(&path), 65);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn missing_declared_column_is_typed_before_guard_sql() {
+    let (_dir, path) = compatible_v66_fixture();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE worktrees;
+         CREATE TABLE worktrees(worktree TEXT PRIMARY KEY);
+         PRAGMA user_version = 66;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+
+    let error = match Db::open_compatible_at(&path, SchemaOperation::LandRemoteTargetGuard) {
+        Ok(_) => panic!("a stamped-but-missing feature must not receive a handle"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.downcast_ref::<SchemaCompatibilityError>(),
+        Some(SchemaCompatibilityError::MissingCapability {
+            operation: "land.remote_target_guard",
+            required,
+            observed_schema: 66,
+        }) if required == "worktrees.location"
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn compatibility_handle_and_controller_lease_exclude_each_other() {
+    let (_dir, path) = compatible_v66_fixture();
+    let lock = open_schema_lock(&path.canonicalize().unwrap()).unwrap();
+    try_exclusive_lock(&lock, &path).unwrap();
+    let error = match Db::open_compatible_at(&path, SchemaOperation::LandRemoteTargetGuard) {
+        Ok(_) => panic!("compatibility access must not pass an active migration"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("migration is currently in progress")
+    );
+    lock.unlock().unwrap();
+
+    let db = Db::open_compatible_at(&path, SchemaOperation::LandLifecycleBookkeeping)
+        .unwrap()
+        .expect("compatible handle");
+    assert!(
+        try_exclusive_lock(&lock, &path).is_err(),
+        "a controller cannot migrate under a compatible operation"
+    );
+    drop(db);
+    try_exclusive_lock(&lock, &path).unwrap();
+    lock.unlock().unwrap();
+    assert_eq!(stored_user_version(&path), 66);
+    assert!(!table_exists(&path, "ci_log_cache"));
 }
 
 #[test]
@@ -3491,10 +3934,19 @@ fn opening_a_newer_database_fails_with_the_actionable_error() {
             .unwrap();
     }
     // `Db` is not `Debug`, so unwrap the error by hand rather than `expect_err`.
-    let msg = match Db::open_at(&path) {
+    let error = match Db::open_at(&path) {
         Ok(_) => panic!("a newer on-disk schema must refuse the open"),
-        Err(e) => e.to_string(),
+        Err(e) => e,
     };
+    assert_eq!(
+        error.downcast_ref::<MigrationAccessError>(),
+        Some(&MigrationAccessError::NewerSchema {
+            observed: SCHEMA_VERSION + 5,
+            supported: SCHEMA_VERSION,
+        }),
+        "schema identity must survive Db::open for compositor hydration"
+    );
+    let msg = error.to_string();
     assert!(msg.contains("Refusing to run"), "{msg}");
     assert!(
         msg.contains(&format!("v{}", SCHEMA_VERSION + 5)),

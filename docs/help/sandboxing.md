@@ -226,6 +226,18 @@ node-modules   = "/root/.npm"
 Named volumes survive container recreation, so a package cache does not
 cold-start on every build.
 
+`[sandbox] compiler_cache = "off"` is the default and is the only switch that
+authorizes an sccache wrapper inside containment. It removes inherited sccache
+wrappers and endpoint variables even when `[disk].sccache` or the Nix dev shell
+sets them; unrelated custom `RUSTC_WRAPPER` values are preserved. Set it to
+`"auto"` to let a local bwrap sandbox probe sccache, mount only its data
+directory, and use a sandbox-private Unix socket. A failed probe or later
+server/transport I/O error degrades visibly to plain rustc instead of failing
+the Cargo build; a real compiler error is preserved and is never retried or
+reported as cache degradation. `thegn doctor` shows the host inputs and the last contained
+reachability/write probe separately. Backends without a proven transport use
+plain rustc.
+
 ## Network
 
 By default a `hardened` sandbox keeps networking so fetch, clone, build,

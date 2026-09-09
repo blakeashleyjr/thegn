@@ -1,0 +1,34 @@
+{
+  "index": {
+    "$schema": "./schema.json",
+    "schema_version": 1,
+    "projects": ["Fixture Project"],
+    "entries": [
+      {
+        "change": "known-change",
+        "lifecycle": "active",
+        "disposition": "alpha-delivery",
+        "owners": [{"issue": "THE-1", "project": "Fixture Project"}],
+        "summary": "Fixture classification with enough detail for schema validation."
+      }
+    ]
+  },
+  "issue_inventory": {
+    "$schema": "./issues-schema.json",
+    "schema_version": 1,
+    "scope": "Synthetic active issue inventory for read-only snapshot comparison.",
+    "issues": [
+      {
+        "issue": "THE-1",
+        "project": "Fixture Project",
+        "changes": ["known-change"]
+      }
+    ]
+  },
+  "active_changes": {"known-change": "# Tasks\n\n- [ ] pending\n"},
+  "linear_snapshot": [
+    {"identifier": "THE-1", "project": "Fixture Project", "status": "Todo"},
+    {"identifier": "THE-2", "project": "Fixture Project", "status": "Backlog"}
+  ],
+  "expected_linear_error": "THE-2: active Linear delivery issue is absent from checked-in issue inventory"
+}

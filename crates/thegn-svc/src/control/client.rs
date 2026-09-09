@@ -28,12 +28,26 @@ use super::{
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
 
 /// Where the daemon is and how to authenticate to it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ControlAddr {
-    /// Local unix socket (implicit same-uid auth).
+    /// Local unix socket (implicit auth only after the daemon verifies the
+    /// accepted stream's effective uid).
     Unix(PathBuf),
     /// Remote serve-mode listener; every request carries the bearer token.
     Tcp { addr: String, token: String },
+}
+
+impl std::fmt::Debug for ControlAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unix(path) => f.debug_tuple("Unix").field(path).finish(),
+            Self::Tcp { addr, .. } => f
+                .debug_struct("Tcp")
+                .field("addr", addr)
+                .field("token", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// Discover a live local daemon for `scope` (the canonical state dir) from the
@@ -638,20 +652,6 @@ impl ControlClient {
         .map(|_| ())
     }
 
-    /// The reserved drive-browser verb (v1 answers 501 Unimplemented).
-    pub async fn send_browse(&self, session: Option<&str>, url: &str) -> Result<()> {
-        self.request(
-            "POST",
-            "/v1/browser",
-            Some(json!({
-                "session": session,
-                "action": { "navigate": { "url": url } },
-            })),
-        )
-        .await
-        .map(|_| ())
-    }
-
     pub async fn pair(&self, code: &str, label: &str) -> Result<Value> {
         self.request(
             "POST",
@@ -1049,6 +1049,21 @@ where
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    #[test]
+    fn remote_address_debug_redacts_the_bearer() {
+        let token = "tgc1_public_secret";
+        let rendered = format!(
+            "{:?}",
+            ControlAddr::Tcp {
+                addr: "control.example.test:443".into(),
+                token: token.into(),
+            }
+        );
+        assert!(rendered.contains("control.example.test:443"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains(token));
+    }
 
     #[test]
     fn control_error_request_code_is_optional_for_old_servers() {

@@ -39,10 +39,15 @@ replays land). The land commit message SHALL be rendered from a configurable
 When `[merge_queue] sign_commits = true`, fold/land commits SHALL be created
 with `-S` (deferring key and format — GPG or SSH — to the user's git config
 under the active identity). Signing MUST be non-interactive: the invocation
-runs with terminal prompts disabled, and a signing failure SHALL be
-classified as an infrastructure error that stops the drain with a clear
-reason — it MUST NOT mark the branch `needs_human` and MUST NOT dispatch the
-fixing agent. Independent of that key, the `snapshot_dirty` snapshot commit
+runs with terminal/askpass/display prompts disabled, explicitly closes its
+commit-message pipe before waiting, and has a dedicated bounded deadline. On
+timeout its Unix process group (or direct child on other platforms) SHALL be
+killed and the child reaped. Output capture MUST be bounded and MUST NOT wait
+for inherited pipe handles retained by a signer/hook descendant after Git
+exits. A signing failure SHALL be classified as an infrastructure error that
+stops the drain with a clear reason — it MUST NOT mark the branch `needs_human`
+and MUST NOT dispatch the fixing agent.
+Independent of that key, the `snapshot_dirty` snapshot commit
 SHALL honor `[git] override_gpg` like every other background history
 operation, so an ambient `commit.gpgSign = true` can never hang a background
 snapshot on a passphrase prompt.
@@ -59,6 +64,21 @@ snapshot on a passphrase prompt.
 - **WHEN** signing fails (agent locked, key missing, would-prompt)
 - **THEN** the drain stops with a signing-infrastructure reason, the branch
   keeps its status, and no agent is dispatched
+
+#### Scenario: A would-prompt signer reaches the commit deadline
+
+- **WHEN** an automated fold signer or hook does not exit before the dedicated
+  background-commit deadline
+- **THEN** thegn terminates and reaps the commit process, reports an actionable
+  infrastructure timeout, leaves target and branch refs unchanged, and does
+  not dispatch an agent
+
+#### Scenario: A failed hook leaves an output-holding descendant
+
+- **WHEN** a commit hook exits but a forked descendant retains its stdout or
+  stderr handle
+- **THEN** thegn returns Git's failure without waiting for that descendant,
+  and leaves refs unchanged
 
 #### Scenario: Snapshot commit cannot hang
 

@@ -64,3 +64,8 @@ vps_bridge.rs
 # the provider production path is platform-free and the tests have no
 # unprivileged Windows equivalent.
 devcontainer_provider.rs
+# TEST-ONLY cfg: one regression executes the fail-soft POSIX shell wrapper and
+# the explicit host smoke executes real Linux bwrap+sccache containment. The
+# production mode-bit/script publication is behind `platform::`; moving these
+# fixtures there would obscure the wrapper and sandbox boundary they assert.
+build_cache.rs

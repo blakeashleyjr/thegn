@@ -39,15 +39,20 @@ Run tests with `cargo nextest run -p <crate> <filter>`, never bare
 
 ## 3. Signing (thegn-svc / thegn-host)
 
-- [ ] 3.1 `snapshot_worktree` gains `gpg_args(override_gpg)` (bug fix,
+- [x] 3.1 `snapshot_worktree` gains `gpg_args(override_gpg)` (bug fix,
       independent of the new keys).
-- [ ] 3.2 `commit_tree` grows a `sign: bool` (⇒ `-S`), null-stdin +
-      `GIT_TERMINAL_PROMPT=0`; wire from `[merge_queue] sign_commits`.
-- [ ] 3.3 Signing failure classifies as infrastructure error in
+- [x] 3.2 `commit_tree` grows a `sign: bool` (⇒ `-S`) wired from
+      `[merge_queue] sign_commits`; its dedicated background runner writes and
+      closes the message pipe, removes terminal/askpass/display prompt
+      surfaces, kills/reaps Git on its commit-only deadline, and kills the
+      isolated process group on Unix. Bounded regular-file output capture never
+      waits for pipe handles retained by a forked signer/hook descendant.
+- [x] 3.3 Signing failure classifies as infrastructure error in
       `attempt_land` — drain stops with reason, branch never blamed, agent
       never woken; table-test the classification.
-- [ ] 3.4 Loopback-pinentry fixture proving a signed fold produces a `gpgsig`
-      header (smoke tier); disabled-signing fixtures stay the default
+- [x] 3.4 A real loopback-pinentry GPG fixture proves a signed fold has a
+      `gpgsig` header and passes `git verify-commit`; it skips only when the
+      `gpg` executable is absent. Disabled-signing fixtures stay the default
       everywhere else.
 
 ## 4. doctor posture (thegn-host)

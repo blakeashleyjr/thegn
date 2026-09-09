@@ -33,6 +33,7 @@ ignore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
 # git reads go native via gix (Phase 2); GitHub via octocrab GraphQL (Phase 4).
 gix.workspace = true
 octocrab.workspace = true
@@ -90,7 +91,6 @@ libc.workspace = true
 # everything else in this test binary instead of growing a private copy.
 thegn-core = { workspace = true, features = ["test-utils"] }
 criterion.workspace = true
-tempfile.workspace = true
 
 # The per-worktree git hot path (is_dirty / ahead_behind / current_branch) that
 # the 2s model-refresh ticker fans across every worktree — the dominant idle

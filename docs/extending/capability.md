@@ -34,7 +34,8 @@ Every external door projects `thegn_core::capability::CATALOG`
 5. **Wire schema**: new wire types derive `schemars::JsonSchema`, join
    `tests/control_schema.rs`'s list, and the snapshot is regenerated
    (`THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test
-control_schema`) — additive changes only within /v1.
+control_schema`). Changes are additive within `/v1` unless an accepted
+   compatibility decision removes an operation that never had a success path.
 6. **Scope test** in `control/tests.rs`: under-scoped calls are rejected
    before the API runs.
 7. **Docs**: the route table in `docs/superpowers/specs/control-api.md`.

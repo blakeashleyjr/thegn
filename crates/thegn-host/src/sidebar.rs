@@ -2070,6 +2070,8 @@ mod tests {
     use super::*;
     use crate::session::{GroupKind, Session, WorktreeGroup};
 
+    type WorkspaceFixtureRows = Vec<(String, String, String, String)>;
+
     #[test]
     fn strip_prompt_sigil_drops_trailing_prompt_chars() {
         assert_eq!(strip_prompt_sigil("thegn dev $"), "thegn dev");
@@ -2779,11 +2781,7 @@ mod tests {
     }
 
     /// The registry order `a, b, c`, and a workspace that owns it.
-    fn manual_fixture() -> (
-        Vec<(String, String, String, String)>,
-        Vec<DbWorktree>,
-        SidebarStatus,
-    ) {
+    fn manual_fixture() -> (WorkspaceFixtureRows, Vec<DbWorktree>, SidebarStatus) {
         let ws = vec![(
             "app".to_string(),
             "app".to_string(),
@@ -2920,11 +2918,7 @@ mod tests {
     }
 
     /// Fixture for the freeze tests: three worktrees, `urgent` most recent.
-    fn freeze_fixture() -> (
-        crate::session::Session,
-        Vec<(String, String, String, String)>,
-        SidebarStatus,
-    ) {
+    fn freeze_fixture() -> (crate::session::Session, WorkspaceFixtureRows, SidebarStatus) {
         let s = session(
             vec![
                 tab("app/home", "/wt/home"),

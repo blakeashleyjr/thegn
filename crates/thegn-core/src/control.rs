@@ -158,7 +158,13 @@ impl ScopeSet {
     /// down from). `Admin` is inert on the MCP surface — the catalog forbids
     /// admin caps there — but included so the base is the true universe.
     pub fn universe() -> ScopeSet {
-        ScopeSet::of(&[Scope::Read, Scope::Write, Scope::Git, Scope::Admin])
+        ScopeSet::of(&[
+            Scope::Read,
+            Scope::Write,
+            Scope::Git,
+            Scope::Exec,
+            Scope::Admin,
+        ])
     }
 }
 
@@ -259,7 +265,6 @@ pub enum Verb {
     OpenEditor,
     /// Fetch one preview URL with the bounded, credential-free host executor.
     PreviewFetch,
-    DriveBrowser,
     /// Block until a session reaches a state — observes only.
     Wait,
     /// Create a sibling pane/session — a write-side effect like `OpenSession`.
@@ -438,7 +443,6 @@ impl Verb {
         Verb::OpenWorktree,
         Verb::OpenEditor,
         Verb::PreviewFetch,
-        Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
         Verb::LaunchPreset,
@@ -578,7 +582,6 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::KillSession
         | Verb::OpenWorktree
         | Verb::OpenEditor
-        | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
         | Verb::McpProxyReload
@@ -699,26 +702,99 @@ pub fn parse_token(s: &str) -> Option<(TokenKind, TokenParts)> {
 
 // --- pairing URL ------------------------------------------------------------
 
+/// Validate a host that will occupy either the authority or a pairing URL's
+/// unescaped `host=` field. Keeping this parser deliberately narrower than a
+/// general URI host prevents delimiters from becoming new pairing parameters.
+pub(crate) fn validate_control_host(host: &str) -> Result<(), &'static str> {
+    if host.is_empty()
+        || host != host.trim()
+        || !host.is_ascii()
+        || host.chars().any(char::is_whitespace)
+        || host
+            .chars()
+            .any(|ch| matches!(ch, '/' | '?' | '#' | '@' | '&' | '=' | '%'))
+    {
+        return Err(
+            "must contain only a DNS name or IP, without scheme, credentials, port, path, query, fragment, or URL escapes",
+        );
+    }
+
+    let bracketed = host.starts_with('[') || host.ends_with(']');
+    if bracketed {
+        let Some(literal) = host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err("has mismatched IPv6 brackets");
+        };
+        return literal
+            .parse::<std::net::Ipv6Addr>()
+            .map(|_| ())
+            .map_err(|_| "contains malformed bracketed IPv6");
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if host.contains(':') {
+        return Err("must not include a port; set the port separately");
+    }
+
+    let dns = host.strip_suffix('.').unwrap_or(host);
+    if dns.is_empty()
+        || dns.len() > 253
+        || dns.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err("contains a malformed DNS name");
+    }
+    Ok(())
+}
+
 /// A pairing URL: everything a thin client needs to redeem a code against a
-/// `thegn serve` instance. `fp` is reserved for a TLS certificate fingerprint
-/// (v1 serves plaintext behind a trusted network; the slot keeps v2 pinning an
-/// additive change, not a format break).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `thegn serve` instance. `secure` records whether the client-facing endpoint
+/// is HTTPS/WSS/gRPC-TLS; the backend may remain loopback plaintext behind the
+/// declared trusted terminator. `fp` is reserved for native certificate
+/// pinning; external termination owns normal certificate verification.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairingUrl {
     pub host: String,
     pub port: u16,
     /// The full `tgp1_…` pairing code.
     pub code: String,
+    pub secure: bool,
     pub fp: Option<String>,
 }
 
+impl std::fmt::Debug for PairingUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingUrl")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("code", &"[REDACTED]")
+            .field("secure", &self.secure)
+            .field("fp", &self.fp)
+            .finish()
+    }
+}
+
 impl PairingUrl {
-    /// The app-scheme form: `thegn://pair?host=H&port=P&t=tgp1_…[&fp=…]`.
+    /// The app-scheme form:
+    /// `thegn://pair?host=H&port=P&t=tgp1_…[&secure=1][&fp=…]`.
     pub fn encode(&self) -> String {
         let mut s = format!(
             "thegn://pair?host={}&port={}&t={}",
             self.host, self.port, self.code
         );
+        if self.secure {
+            s.push_str("&secure=1");
+        }
         if let Some(fp) = &self.fp {
             s.push_str("&fp=");
             s.push_str(fp);
@@ -726,10 +802,16 @@ impl PairingUrl {
         s
     }
 
-    /// The web-redeem form: `http://H:P/pair#t=tgp1_…`. The code rides in the
-    /// fragment so it never appears in server request logs.
+    /// The web-redeem form. The code rides in the fragment so it never appears
+    /// in HTTP access logs; the scheme reflects the resolved public topology.
     pub fn web_form(&self) -> String {
-        format!("http://{}:{}/pair#t={}", self.host, self.port, self.code)
+        let scheme = if self.secure { "https" } else { "http" };
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{scheme}://{host}:{}/pair#t={}", self.port, self.code)
     }
 
     /// Parse the app-scheme form. Hosts are restricted to URL-safe chars by
@@ -739,13 +821,14 @@ impl PairingUrl {
         let mut host = None;
         let mut port = None;
         let mut code = None;
+        let mut secure = None;
         let mut fp = None;
         for kv in rest.split('&') {
             let (k, v) = kv.split_once('=')?;
             match k {
-                "host" if !v.is_empty() => host = Some(v.to_string()),
-                "port" => port = Some(v.parse::<u16>().ok()?),
-                "t" => {
+                "host" if host.is_none() && !v.is_empty() => host = Some(v.to_string()),
+                "port" if port.is_none() => port = Some(v.parse::<u16>().ok()?),
+                "t" if code.is_none() => {
                     // Must be a well-formed pairing code, not a control token.
                     let (kind, _) = parse_token(v)?;
                     if kind != TokenKind::PairingCode {
@@ -753,14 +836,18 @@ impl PairingUrl {
                     }
                     code = Some(v.to_string());
                 }
-                "fp" if !v.is_empty() => fp = Some(v.to_string()),
+                "secure" if secure.is_none() && v == "1" => secure = Some(true),
+                "fp" if fp.is_none() && !v.is_empty() => fp = Some(v.to_string()),
                 _ => return None,
             }
         }
+        let host = host?;
+        validate_control_host(&host).ok()?;
         Some(PairingUrl {
-            host: host?,
+            host,
             port: port?,
             code: code?,
+            secure: secure.unwrap_or(false),
             fp,
         })
     }
@@ -824,7 +911,14 @@ mod tests {
 
     #[test]
     fn scope_set_parse_csv_round_trip() {
-        for csv in ["read", "read,write", "read,git", "read,write,git,admin", ""] {
+        for csv in [
+            "read",
+            "read,write",
+            "read,git",
+            "read,exec",
+            "read,write,git,exec,admin",
+            "",
+        ] {
             assert_eq!(ScopeSet::parse(csv).to_csv(), csv);
         }
         // Whitespace and unknown names are tolerated; unknowns only narrow.
@@ -921,7 +1015,6 @@ mod tests {
             KillSession,
             OpenWorktree,
             OpenEditor,
-            DriveBrowser,
             Split,
             RecordSession,
             CalendarIngest,
@@ -1091,7 +1184,7 @@ mod tests {
         let rw = ScopeSet::of(&[Scope::Read, Scope::Write]);
         let rg = ScopeSet::of(&[Scope::Read, Scope::Git]);
         assert_eq!(rw.intersect(rg).to_csv(), "read");
-        assert_eq!(ScopeSet::universe().to_csv(), "read,write,git,admin");
+        assert_eq!(ScopeSet::universe().to_csv(), "read,write,git,exec,admin");
         assert!(ScopeSet::universe().intersect(rw) == rw);
     }
 
@@ -1140,6 +1233,7 @@ mod tests {
                 host: "studio.tail1234.ts.net".into(),
                 port: 5380,
                 code: code.clone(),
+                secure: fp.is_some(),
                 fp: fp.clone(),
             };
             let parsed = PairingUrl::parse(&u.encode()).unwrap();
@@ -1150,9 +1244,19 @@ mod tests {
             host: "10.0.0.5".into(),
             port: 80,
             code: code.clone(),
+            secure: false,
             fp: None,
         };
         assert_eq!(u.web_form(), format!("http://10.0.0.5:80/pair#t={code}"));
+        let secure = PairingUrl {
+            secure: true,
+            ..u.clone()
+        };
+        assert_eq!(
+            secure.web_form(),
+            format!("https://10.0.0.5:80/pair#t={code}")
+        );
+        assert!(!format!("{secure:?}").contains(&code));
     }
 
     #[test]
@@ -1168,6 +1272,12 @@ mod tests {
             format!("thegn://pair?host=h&port=notaport&t={code}"),
             format!("thegn://pair?host=h&port=1&t={control}"), // control token, not a code
             format!("thegn://pair?host=h&port=1&t={code}&evil=1"), // unknown param
+            format!("thegn://pair?host=evil%26secure%3D1&port=1&t={code}"),
+            format!("thegn://pair?host=evil=secure&port=1&t={code}"),
+            format!("thegn://pair?host=[::1&port=1&t={code}"),
+            format!("thegn://pair?host=-bad.example&port=1&t={code}"),
+            format!("thegn://pair?host=good&host=evil&port=1&t={code}"),
+            format!("thegn://pair?host=good&port=1&t={code}&secure=1&secure=1"),
         ] {
             assert!(PairingUrl::parse(&bad).is_none(), "should reject {bad:?}");
         }

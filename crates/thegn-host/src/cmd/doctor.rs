@@ -744,7 +744,52 @@ fn exposure_report(cfg: &Config) {
 
 /// One-line control-surface coverage summary (cells implemented / declared,
 /// gap count). The full per-surface ledger is `thegn api coverage`.
-fn control_surface_report() {
+fn local_control_security_json(cfg: &Config) -> serde_json::Value {
+    let socket = crate::daemon::socket_path(&cfg.daemon);
+    let endpoint = thegn_svc::ipc::IpcEndpoint::for_socket_path(&socket);
+    if !cfg.serve.local_admin {
+        return serde_json::json!({
+            "endpoint": endpoint.display(),
+            "auth": "token-required",
+            "peer_identity": "not-used",
+            "hardening": "not-required",
+        });
+    }
+    let security = crate::platform::local_control_security(&socket);
+    serde_json::json!({
+        "endpoint": endpoint.display(),
+        "auth": security.auth,
+        "peer_identity": security.peer_identity,
+        "hardening": security.hardening,
+        "error": security.error,
+    })
+}
+
+fn remote_control_transport_json(cfg: &Config) -> serde_json::Value {
+    match cfg.serve.resolve_transport(None, false) {
+        Ok(policy) => serde_json::json!({
+            "status": policy.exposure.as_str(),
+            "topology": cfg.serve.topology.as_str(),
+            "backend_bind": policy.bind.to_string(),
+            "advertised_origin": policy.advertised_origin(policy.bind.port()),
+            "http": policy.http_scheme(),
+            "websocket": policy.websocket_scheme(),
+            "grpc": policy.grpc_scheme(),
+            "scoped_tokens_required": true,
+            "unsafe_opt_in": cfg.serve.unsafe_allow_plaintext_non_loopback,
+        }),
+        Err(error) => serde_json::json!({
+            "status": "invalid",
+            "topology": cfg.serve.topology.as_str(),
+            "backend_bind": cfg.serve.bind,
+            "scoped_tokens_required": true,
+            "unsafe_opt_in": cfg.serve.unsafe_allow_plaintext_non_loopback,
+            "error": error,
+        }),
+    }
+}
+
+fn control_surface_report(cfg: &Config) {
     let ledgers = crate::cmd::api::surface_ledgers();
     let implemented: usize = ledgers.iter().map(|l| l.implemented + l.stub).sum();
     let declared: usize = ledgers.iter().map(|l| l.declared).sum();
@@ -755,6 +800,41 @@ fn control_surface_report() {
         "  cells         {implemented}/{declared} implemented ({stubs} stub, {gaps} excused gap{})",
         if gaps == 1 { "" } else { "s" }
     );
+    let local = local_control_security_json(cfg);
+    outln!(
+        "  local auth    {}",
+        local["auth"].as_str().unwrap_or("unknown")
+    );
+    outln!(
+        "  peer identity {}",
+        local["peer_identity"].as_str().unwrap_or("unknown")
+    );
+    match local["hardening"].as_str().unwrap_or("unknown") {
+        "failed" => outln!(
+            "  hardening     FAILED: {}",
+            local["error"].as_str().unwrap_or("unknown error")
+        ),
+        status => outln!("  hardening     {status}"),
+    }
+    let remote = remote_control_transport_json(cfg);
+    outln!(
+        "  remote        {} ({})",
+        remote["status"].as_str().unwrap_or("invalid"),
+        remote["topology"].as_str().unwrap_or("unknown")
+    );
+    if remote["status"] == "invalid" {
+        outln!(
+            "  remediation   {}",
+            remote["error"].as_str().unwrap_or("invalid [serve] config")
+        );
+    } else {
+        outln!(
+            "  advertised    {} · WebSocket {} · gRPC {}",
+            remote["advertised_origin"].as_str().unwrap_or("unknown"),
+            remote["websocket"].as_str().unwrap_or("unknown"),
+            remote["grpc"].as_str().unwrap_or("unknown"),
+        );
+    }
 }
 
 /// Where shell completions are installed for `thegn` and `tg`, and whether they
@@ -1452,6 +1532,14 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
 }
 
 pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> serde_json::Value {
+    doctor_json_with_health_and_overrides(cfg, health, &[])
+}
+
+fn doctor_json_with_health_and_overrides(
+    cfg: &Config,
+    health: &ConfigHealth,
+    cli_overrides: &[String],
+) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
     let resolved = crate::run::resolve_termcaps(cfg);
@@ -1498,6 +1586,11 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
             "ctrl_digits_reportable": probe.as_ref().and_then(|p| p.ctrl_digit_reportable()),
         },
         "sandbox": sandbox_json(cfg),
+        "compiler_cache": crate::build_cache::sandbox_cache_doctor_json(
+            cfg,
+            Some(health.main_path.clone()),
+            cli_overrides,
+        ),
         "toolchain": toolchain_json(cfg),
         "devcontainer": devcontainer_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
@@ -1517,6 +1610,8 @@ pub(crate) fn doctor_json_with_health(cfg: &Config, health: &ConfigHealth) -> se
         "skills": super::skills_doctor::inspect(cfg, &super::resolve_worktree(None)),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
+        "local_control": local_control_security_json(cfg),
+        "remote_control": remote_control_transport_json(cfg),
         "lifecycle_hooks": lifecycle_hooks_json(cfg),
     })
 }
@@ -1720,12 +1815,17 @@ pub fn run(
     json: bool,
     config_path: std::path::PathBuf,
     repo_context: Option<std::path::PathBuf>,
+    cli_overrides: &[String],
 ) -> Result<()> {
     let health = super::config_health::collect(&config_path, repo_context.as_deref());
     if json {
         outln!(
             "{}",
-            serde_json::to_string_pretty(&doctor_json_with_health(cfg, &health))?
+            serde_json::to_string_pretty(&doctor_json_with_health_and_overrides(
+                cfg,
+                &health,
+                cli_overrides,
+            ))?
         );
         return Ok(());
     }
@@ -1822,7 +1922,7 @@ pub fn run(
     exposure_report(cfg);
 
     outln!("");
-    control_surface_report();
+    control_surface_report(cfg);
 
     outln!("");
     completions_report();
@@ -1878,6 +1978,8 @@ pub fn run(
 
     outln!("");
     sandbox_report(cfg);
+    outln!("");
+    compiler_cache_report(cfg, &config_path, cli_overrides);
 
     outln!("");
     devcontainer_report(cfg);
@@ -3026,6 +3128,104 @@ fn sandbox_report(cfg: &Config) {
     enforcement_matrix_report(cfg);
 }
 
+fn compiler_cache_report(cfg: &Config, config_path: &std::path::Path, cli_overrides: &[String]) {
+    let report = crate::build_cache::sandbox_cache_doctor_json(
+        cfg,
+        Some(config_path.to_path_buf()),
+        cli_overrides,
+    );
+    let wrapper = &report["wrapper"];
+    let candidates = &report["candidate_inputs"];
+    let data = &report["data"];
+    let transport = &report["transport"];
+    let contained = &report["contained"];
+    outln!("Sandbox compiler cache");
+    outln!(
+        "  authority     [sandbox].compiler_cache ({})",
+        report["origin"].as_str().unwrap_or("unknown origin")
+    );
+    outln!(
+        "  mode          {}",
+        report["mode"].as_str().unwrap_or("off")
+    );
+    outln!(
+        "  host wrapper  {}{}",
+        if wrapper["host_available"].as_bool() == Some(true) {
+            "available"
+        } else {
+            "missing"
+        },
+        wrapper["host_path"]
+            .as_str()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default()
+    );
+    outln!(
+        "  inputs        disk={} · devshell={} · process={} (inputs are not authority)",
+        yn(candidates["disk_sccache"].as_bool() == Some(true)),
+        candidates["devshell_wrapper"].as_str().unwrap_or("(none)"),
+        candidates["process_wrapper"].as_str().unwrap_or("(none)"),
+    );
+    outln!(
+        "  host data     {} ({})",
+        data["host_path"].as_str().unwrap_or("unresolved"),
+        if data["host_exists"].as_bool() == Some(true) {
+            if data["host_read_only"].as_bool() == Some(true) {
+                "read-only"
+            } else {
+                "present; writable by permission bits"
+            }
+        } else {
+            "not created"
+        }
+    );
+    outln!(
+        "  transport     {} · fallback {}",
+        transport["kind"].as_str().unwrap_or("none"),
+        transport["fail_soft"].as_str().unwrap_or("plain rustc")
+    );
+    let grants = contained["grants"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    outln!(
+        "  grants        {}",
+        if grants.is_empty() { "(none)" } else { &grants }
+    );
+    if let Some(last) = contained["last_launch_probe"].as_object() {
+        outln!(
+            "  contained     {}: {} ({})",
+            last.get("backend")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            if last.get("active").and_then(|v| v.as_bool()) == Some(true) {
+                "reachable + writable"
+            } else {
+                "fallback"
+            },
+            last.get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no reason")
+        );
+    } else {
+        outln!("  contained     not yet proven (next sandbox launch records the probe)");
+    }
+    if let Some(fallback) = report["last_runtime_fallback"].as_str() {
+        outln!("  last fallback {fallback}");
+    }
+    outln!("  backend scope bwrap proven; other backends fall back to plain rustc");
+    outln!(
+        "  remediation   {}",
+        report["remediation"].as_str().unwrap_or("use plain rustc")
+    );
+}
+
 /// The derived enforcement matrix for THIS host: what each reachable backend
 /// actually enforces (filesystem / network isolation, resource-ceiling strength,
 /// process scoping, honest class), plus the demanded isolation floor and whether
@@ -3534,8 +3734,8 @@ mod tests {
     #[test]
     fn run_does_not_panic_on_default_config() {
         let cfg = Config::default();
-        assert!(run(&cfg, false, Config::path(), None).is_ok());
-        assert!(run(&cfg, true, Config::path(), None).is_ok());
+        assert!(run(&cfg, false, Config::path(), None, &[]).is_ok());
+        assert!(run(&cfg, true, Config::path(), None, &[]).is_ok());
     }
 
     /// THE-70. The three states must read differently — "unknown" in
@@ -3597,6 +3797,55 @@ mod tests {
         // Tests never own a tty, so the probe is skipped and every field is
         // null — which is exactly the "unknown ⇒ assume it works" state.
         assert!(kb["ctrl_digits_reportable"].is_null());
+    }
+
+    #[test]
+    fn doctor_json_exposes_local_control_identity_and_hardening() {
+        let local = doctor_json(&Config::default())["local_control"].clone();
+        assert!(local["endpoint"].is_string());
+        assert!(matches!(
+            (local["auth"].as_str(), local["peer_identity"].as_str()),
+            (Some("same-euid-or-token"), Some("native-effective-uid"))
+                | (Some("local-pipe-or-token"), Some("local-only-named-pipe"))
+        ));
+        assert!(local["hardening"].is_string());
+    }
+
+    #[test]
+    fn doctor_distinguishes_safe_secure_unsafe_and_incomplete_remote_transport() {
+        let safe = remote_control_transport_json(&Config::default());
+        assert_eq!(safe["status"], "safe-loopback");
+        assert_eq!(safe["http"], "http");
+        assert_eq!(safe["websocket"], "ws");
+        assert_eq!(safe["grpc"], "grpc");
+
+        let mut secure_cfg = Config::default();
+        secure_cfg.serve.topology = thegn_core::config::ServeTopology::TlsTerminated;
+        secure_cfg.serve.advertise_host = "control.example.test".into();
+        let secure = remote_control_transport_json(&secure_cfg);
+        assert_eq!(secure["status"], "tls-terminated");
+        assert_eq!(secure["http"], "https");
+        assert_eq!(secure["websocket"], "wss");
+        assert_eq!(secure["grpc"], "grpcs");
+
+        secure_cfg.serve.advertise_host.clear();
+        let incomplete = remote_control_transport_json(&secure_cfg);
+        assert_eq!(incomplete["status"], "invalid");
+        assert!(
+            incomplete["error"]
+                .as_str()
+                .unwrap()
+                .contains("advertise_host")
+        );
+
+        let mut unsafe_cfg = Config::default();
+        unsafe_cfg.serve.bind = "0.0.0.0:5380".into();
+        unsafe_cfg.serve.advertise_host = "host.example".into();
+        unsafe_cfg.serve.unsafe_allow_plaintext_non_loopback = true;
+        assert_eq!(
+            remote_control_transport_json(&unsafe_cfg)["status"],
+            "unsafe-plaintext"
+        );
     }
 
     #[test]

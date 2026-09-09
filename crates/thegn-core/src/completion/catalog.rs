@@ -398,7 +398,6 @@ pub const CATALOG: &[Slot] = &[
     slot("dispatch put", "session", SourceKind::Session),
     slot("events tail", "session", SourceKind::Session),
     slot("session attach", "session", SourceKind::Session),
-    slot("session browse", "session", SourceKind::Session),
     slot("session fork", "session", SourceKind::Session),
     // A native harness id is not enumerable through the daemon session source;
     // recorded rows are selected through `agent.sessions` and the remaining

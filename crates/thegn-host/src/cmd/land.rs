@@ -19,8 +19,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use thegn_core::config::Config;
-use thegn_core::db::Db;
-use thegn_core::merge_lifecycle::LifecycleEvent;
+use thegn_core::db::{CompatibleDb, Db, SchemaOperation};
+use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
 use thegn_core::{outln, util};
 
 use crate::integrate::{self, AttemptOutcome};
@@ -51,12 +51,24 @@ pub(crate) fn land_branch(
 
 pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let wt = super::resolve_worktree(worktree);
-    if let Ok(db) = Db::open()
-        && let Some(root) = integrate::main_checkout(&wt)
-        && let Some(msg) = crate::merge_ops::remote_target_guard(&db, &root)
-    {
-        outln!("{msg}");
-        return Ok(());
+    let root = integrate::main_checkout(&wt).context("not inside a git repository")?;
+    let mq = cfg.repo_merge_queue(&root);
+    let lifecycle_required = Path::new(&wt) != root
+        && !matches!(
+            decide(&mq, LifecycleEvent::LandedInPlace),
+            LifecycleAction::Noop
+        );
+    let operation = if lifecycle_required {
+        SchemaOperation::LandLifecycleBookkeeping
+    } else {
+        SchemaOperation::LandRemoteTargetGuard
+    };
+    // Keep the compatibility handle (and therefore its shared schema lease)
+    // through the git fold and the post-land write. A controller can migrate
+    // either before this preflight or after the operation, never in between.
+    let db = open_land_db(operation)?;
+    if let Some(msg) = crate::merge_ops::remote_target_guard(db.db(), &root)? {
+        anyhow::bail!("{msg}");
     }
     let (branch, target, outcome) = land_branch(cfg, &wt)?;
     // On a successful land, file the worktree into the Merged folder — the same
@@ -69,37 +81,46 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
     // must not delete the caller's cwd. Under `on_landed = "off"` it instead
     // clears any stale "Merging"/"Needs attention" membership its enqueue left, so
     // a fold-actor land never strands the worktree — the sidebar/queue de-sync.
-    // Best-effort and guarded host-side to lifecycle folders, so a user-filed
-    // folder is left alone and a DB hiccup never fails the land. It writes no queue
-    // row, so the worktree it files is never an expiry-sweep candidate.
-    let file_landed = |branch: &str| {
-        if let Ok(db) = Db::open()
-            && let Some(root) = integrate::main_checkout(&wt)
-        {
-            crate::merge_lifecycle::apply(
-                // Repo-resolved, so a `[workspace.<slug>]` folder setting is
-                // honored here as well as on the land itself.
-                &cfg.repo_merge_queue(&root),
-                &db,
-                &root,
-                &wt.to_string_lossy(),
-                branch,
-                LifecycleEvent::LandedInPlace,
-            );
+    // The schema/feature preflight above means an older compatible DB cannot
+    // silently skip this write. A later I/O failure occurs after git has already
+    // landed, so report an explicit degraded result rather than returning an
+    // ambiguous non-zero status that encourages a destructive retry.
+    let file_landed = |branch: &str| -> Option<String> {
+        if !lifecycle_required {
+            return None;
         }
+        crate::merge_lifecycle::apply_landed_in_place_checked(
+            // Repo-resolved, so a `[workspace.<slug>]` folder setting is
+            // honored here as well as on the land itself.
+            &mq,
+            db.db(),
+            &root,
+            &wt.to_string_lossy(),
+            branch,
+        )
+        .err()
+        .map(|error| format!("sidebar lifecycle bookkeeping unavailable: {error}"))
     };
     match outcome {
         AttemptOutcome::Landed { commit, resyncs } => {
-            file_landed(&branch);
+            let degraded = file_landed(&branch);
             outln!(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
             );
+            if let Some(detail) = degraded {
+                thegn_core::msg::warn(&format!("{branch} landed, but {detail}"));
+                outln!("! {detail}");
+            }
             crate::integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate => {
-            file_landed(&branch);
+            let degraded = file_landed(&branch);
             outln!("{branch} already in {target}.");
+            if let Some(detail) = degraded {
+                thegn_core::msg::warn(&format!("{branch} is up to date, but {detail}"));
+                outln!("! {detail}");
+            }
         }
         // A failed land must exit non-zero: `thegn land` is scripted (CI, the
         // fold-actor, git aliases), so an exit-0 conflict/gate-red would look
@@ -141,6 +162,19 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Compatibility access itself never creates or migrates. On a truly fresh
+/// install, bootstrap is an explicit, separately-authorized normal open; the
+/// retry then returns the same declared no-migration handle as every other
+/// `land` invocation.
+fn open_land_db(operation: SchemaOperation) -> Result<CompatibleDb> {
+    if let Some(db) = Db::open_compatible(operation)? {
+        return Ok(db);
+    }
+    drop(Db::open().context("initializing state DB for land")?);
+    Db::open_compatible(operation)?
+        .with_context(|| "state DB disappeared while preparing land compatibility access")
 }
 
 /// Pull the actionable lines out of a gate log: nextest `FAIL [...]` rows,
