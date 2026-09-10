@@ -508,7 +508,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let term_restore = crate::platform::capture_terminal_restore();
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
-    term.enter_alternate_screen().context("alt screen")?;
+    // Flushed immediately — frames bypass termwiz's buffer (see `enter_alt_screen`).
+    crate::frame_write::enter_alt_screen(&mut term).context("alt screen")?;
     // We now own the raw/alternate screen. Register the idempotent, non-panicking
     // restore callback: on a main-thread panic the hook runs it FIRST, before any
     // logging or report writing, so the terminal is always left usable. The
