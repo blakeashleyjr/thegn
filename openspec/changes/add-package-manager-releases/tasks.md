@@ -26,11 +26,12 @@
 
 ## 3. Decisions and documentation
 
-- [ ] 3.1 Decide Windows publication after its artifact leg is enabled; create
+- [x] 3.1 Defer Scoop/winget until THE-140's artifact leg and THE-145's native
+      parity evidence are green; create
       bounded Scoop/winget work or explicitly defer both.
-- [ ] 3.2 Decide hosted apt/rpm repositories and crates.io; create bounded
-      follow-ups only for accepted channels.
-- [ ] 3.3 Update installation docs to advertise only successfully rehearsed
+- [x] 3.2 Defer hosted apt/rpm repositories and crates.io through public alpha;
+      create bounded follow-ups only if their operational cost is accepted.
+- [x] 3.3 Update installation docs to advertise only successfully rehearsed
       channels and preserve evidence/commands in release documentation.
 
 ## 4. Reconciliation

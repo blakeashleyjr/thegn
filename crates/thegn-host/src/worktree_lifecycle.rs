@@ -800,6 +800,23 @@ fn teardown_runtime(
     let path = worktree.to_string_lossy().into_owned();
     let mut failures = Vec::new();
 
+    if let thegn_core::placement::Placement::Ssh(ssh) = &env.placement {
+        let target = thegn_core::remote::SshTarget {
+            host: ssh.host.clone(),
+            port: ssh.port,
+            forward_agent: ssh.forward_agent,
+            ssh_config: ssh.ssh_config.clone(),
+            jump_host: ssh.jump_host.clone(),
+            identity: ssh.identity.clone(),
+            extra_args: ssh.extra_args.clone(),
+        };
+        // Revoke while the DB row still retains the environment/host ownership
+        // tuple. A failure blocks physical deletion rather than orphaning a live
+        // return grant whose owner metadata is about to disappear.
+        if let Err(error) = crate::remote_enqueue_auth::revoke_for_ssh(&target, &path) {
+            failures.push(format!("SSH route credential: {error:#}"));
+        }
+    }
     if !env.placement.is_local()
         && let Err(error) =
             crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)

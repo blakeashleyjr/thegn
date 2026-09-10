@@ -323,7 +323,7 @@ pub fn host_base_env() -> Vec<(String, String)> {
 /// this repo's normal worktree-per-agent workflow.
 const DELETED_EXE_MARKER: &str = " (deleted)";
 
-/// Strip [`DELETED_EXE_MARKER`] from a raw `current_exe()` result, yielding the
+/// Strip `DELETED_EXE_MARKER` from a raw `current_exe()` result, yielding the
 /// path the binary occupied before it was replaced. `None` when unmarked.
 ///
 /// `std::env::current_exe()` on Linux is a verbatim `readlink("/proc/self/exe")`

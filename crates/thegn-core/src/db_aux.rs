@@ -11,6 +11,56 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::params;
 
+impl Db {
+    /// Enqueue a remotely prepared worktree only while every registry fact
+    /// verified before the provider/SSH round trip is still authoritative.
+    /// `BEGIN IMMEDIATE` closes the final read/write gap: a concurrent rebind
+    /// either wins before this transaction and returns `false`, or waits until
+    /// the queue row has captured the verified metadata.
+    pub fn enqueue_merge_if_worktree_matches(
+        &self,
+        worktree: &str,
+        branch: &str,
+        repo_root: &str,
+        location: &str,
+        target_branch: &str,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<bool> {
+            let matches: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM worktrees \
+                 WHERE worktree=?1 AND COALESCE(branch,'')=?2 \
+                   AND COALESCE(repo_path,'')=?3 AND COALESCE(location,'')=?4)",
+                params![worktree, branch, repo_root, location],
+                |row| row.get(0),
+            )?;
+            if !matches {
+                return Ok(false);
+            }
+            let now = util::now();
+            conn.execute(
+                r#"INSERT INTO merge_queue
+                     (worktree,branch,target_branch,status,queued_at,updated_at,
+                      result_oid,conflict_paths,error_detail,location)
+                   VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL,?5)
+                   ON CONFLICT(worktree) DO UPDATE SET
+                     branch=?2, target_branch=?3, status='queued',
+                     queued_at=?4, updated_at=?4,
+                     result_oid=NULL, conflict_paths=NULL, error_detail=NULL,
+                     location=?5"#,
+                params![worktree, branch, target_branch, now, location],
+            )?;
+            Ok(true)
+        })();
+        match &result {
+            Ok(true) => conn.execute_batch("COMMIT")?,
+            _ => conn.execute_batch("ROLLBACK")?,
+        }
+        result
+    }
+}
+
 impl WorktreeAuxStore for Db {
     // --- registers (persisted yank registers, v27) ------------------------
     /// Persist a register's value (upsert). The single-char `name` is the

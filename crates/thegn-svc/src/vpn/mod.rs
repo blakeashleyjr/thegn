@@ -21,9 +21,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::time::{Duration, Instant};
-use thegn_core::config::expand_env_ref;
 use thegn_core::config::{VpnDnsMode, VpnMode, VpnProviderKind};
 use thegn_core::sandbox::{VpnParams, VpnSpec};
+use thegn_core::secretref::{BareAs, SecretRef};
 
 /// How to invoke the container CLI for the sidecar — the same runtime the
 /// worktree container uses, so the two share a user namespace and `--network
@@ -320,8 +320,12 @@ fn dns_for(spec: &VpnSpec) -> DnsConfig {
 
 /// Resolve a secrets-ref, erroring with context when a *required* one is missing.
 fn require_secret(value: &str, what: &str) -> Result<String> {
-    expand_env_ref(value).ok_or_else(|| {
-        anyhow!("vpn: could not resolve {what} (set the env var or file referenced by '{value}')")
+    let reference = SecretRef::parse(value, BareAs::Literal);
+    crate::secret::resolve_ref(&reference, &format!("vpn:{what}")).ok_or_else(|| {
+        anyhow!(
+            "vpn: could not resolve {what} (secret ref `{}` is missing or unavailable)",
+            reference.audit_name()
+        )
     })
 }
 
@@ -643,8 +647,14 @@ fn plan_custom(
         bail!("vpn: custom provider requires an `up` command");
     }
     let up = expand_templates(&c.up, container, &spec.hostname);
-    let mut env: Vec<(String, String)> =
-        c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut env: Vec<(String, String)> = c
+        .env
+        .iter()
+        .map(|(k, v)| {
+            let value = require_secret(v, &format!("custom env {k}"))?;
+            Ok((k.clone(), value))
+        })
+        .collect::<Result<_>>()?;
     env.sort();
     let ready = if c.ready_check.trim().is_empty() {
         ReadyProbe {
@@ -721,24 +731,9 @@ fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
     remove_stale_sidecar(rt, &plan.container);
 
     let staged = stage_files(plan)?;
+    let env_file = stage_env_file(plan)?;
 
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        plan.container.clone(),
-    ];
-    args.extend(plan.run_flags.iter().cloned());
-    for (k, v) in &plan.env {
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
-    }
-    for (host, dest) in plan.mounts.iter().chain(staged.iter()) {
-        args.push("-v".into());
-        args.push(format!("{host}:{dest}:ro"));
-    }
-    args.push(plan.image.clone());
-    args.extend(plan.command.iter().cloned());
+    let args = sidecar_run_args(plan, &staged, env_file.as_deref());
 
     let argv = rt.argv(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     let out = std::process::Command::new(&argv[0])
@@ -755,6 +750,64 @@ fn run_sidecar(rt: &OciRuntime, plan: &SidecarPlan) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn sidecar_run_args(
+    plan: &SidecarPlan,
+    staged: &[(String, String)],
+    env_file: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        plan.container.clone(),
+    ];
+    args.extend(plan.run_flags.iter().cloned());
+    if let Some(path) = env_file {
+        args.push("--env-file".into());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    for (host, dest) in plan.mounts.iter().chain(staged.iter()) {
+        args.push("-v".into());
+        args.push(format!("{host}:{dest}:ro"));
+    }
+    args.push(plan.image.clone());
+    args.extend(plan.command.iter().cloned());
+    args
+}
+
+/// Materialize all sidecar environment in a 0600 file and pass only its path
+/// to the OCI runtime. Provider auth keys therefore never appear in the
+/// parent/child process argv (and cannot leak through process listings).
+fn stage_env_file(plan: &SidecarPlan) -> Result<Option<std::path::PathBuf>> {
+    if plan.env.is_empty() {
+        return Ok(None);
+    }
+    let dir = staged_dir(&plan.container);
+    std::fs::create_dir_all(&dir).with_context(|| format!("vpn: mkdir {}", dir.display()))?;
+    thegn_core::fsperm::restrict_dir_to_owner(&dir)
+        .with_context(|| format!("vpn: restrict {}", dir.display()))?;
+    let mut body = String::new();
+    for (key, value) in &plan.env {
+        if key.is_empty()
+            || !key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            || key.as_bytes()[0].is_ascii_digit()
+        {
+            bail!("vpn: invalid environment key {key:?}");
+        }
+        if value.contains(['\n', '\r', '\0']) {
+            bail!("vpn: environment value for {key} contains a line delimiter");
+        }
+        body.push_str(key);
+        body.push('=');
+        body.push_str(value);
+        body.push('\n');
+    }
+    let path = dir.join("environment");
+    write_secret_0600(&path, body.as_bytes())
+        .with_context(|| format!("vpn: write {}", path.display()))?;
+    Ok(Some(path))
 }
 
 /// If a container with this name exists but isn't running, `rm -f` it so the
@@ -791,8 +844,8 @@ fn stage_files(plan: &SidecarPlan) -> Result<Vec<(String, String)>> {
     }
     let dir = staged_dir(&plan.container);
     std::fs::create_dir_all(&dir).with_context(|| format!("vpn: mkdir {}", dir.display()))?;
-    // best-effort: 0700 so the secret files aren't traversable by other users.
-    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir); // best-effort: 0700 so secret files are not traversable (see above)
+    thegn_core::fsperm::restrict_dir_to_owner(&dir)
+        .with_context(|| format!("vpn: restrict {}", dir.display()))?;
     let mut out = Vec::new();
     for (i, f) in plan.files.iter().enumerate() {
         let host = dir.join(format!("f{i}"));
@@ -817,30 +870,10 @@ pub fn cleanup_staged(container: &str) {
     let _ = std::fs::remove_dir_all(&dir); // best-effort: secret-file teardown; a leftover dir is a security issue but must not down teardown (see above)
 }
 
-/// Write `contents` to `path` with mode 0600 set at creation time (unix), so the
-/// secret is never briefly world-readable under the process umask. On non-unix
-/// falls back to write-then-restrict (the existing best-effort DACL path).
+/// Atomically write `contents` with strict owner-only permissions applied before
+/// any secret bytes become visible on every supported platform.
 fn write_secret_0600(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // Replace any stale file so create-with-mode governs the perms.
-        let _ = std::fs::remove_file(path); // best-effort: stale-file replace; the create-with-mode below governs perms
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(contents)?;
-        f.flush()
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)?;
-        set_0600(path);
-        Ok(())
-    }
+    thegn_core::fsperm::write_owner_only_atomic(path, contents)
 }
 
 fn state_dir() -> std::path::PathBuf {
@@ -853,12 +886,6 @@ fn state_dir() -> std::path::PathBuf {
             std::path::PathBuf::from(home).join(".local/state")
         });
     base.join("thegn").join("vpn")
-}
-
-#[cfg(not(unix))]
-fn set_0600(path: &std::path::Path) {
-    // best-effort: owner-only DACL on Windows (unix uses create-with-mode).
-    let _ = thegn_core::fsperm::restrict_to_owner(path); // best-effort: owner-only DACL on Windows (see above)
 }
 
 /// Is the sidecar already running? (`inspect` exits 0 only for live containers.)

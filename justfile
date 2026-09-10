@@ -903,8 +903,10 @@ term-check: build
       local out; out="$(env -i "${base[@]}" "$@" "$bin" doctor 2>&1)"
       local caps color glyph
       caps="$(printf '%s\n' "$out" | sed -n '/Resolved capabilities/,/Summary/p')"
-      color="$(printf '%s\n' "$caps" | awk '/^  color /{print $2; exit}')"
-      glyph="$(printf '%s\n' "$caps" | awk '/^  glyphs /{print $2; exit}')"
+      # Consume the whole stream: under `pipefail`, an early awk exit can send
+      # SIGPIPE to printf and turn a correct capability result into exit 141.
+      color="$(printf '%s\n' "$caps" | awk '/^  color / && !found {print $2; found=1}')"
+      glyph="$(printf '%s\n' "$caps" | awk '/^  glyphs / && !found {print $2; found=1}')"
       if [ "$color" = "$ec" ] && [ "$glyph" = "$eg" ]; then
         printf '  PASS  %-11s color=%-10s glyphs=%s\n' "$name" "$color" "$glyph"
       else

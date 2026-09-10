@@ -353,7 +353,14 @@ mod tests {
     #[test]
     fn local_admin_holds_every_scope() {
         let ctx = AuthCtx::local_admin();
-        for s in [Scope::Read, Scope::Write, Scope::Git, Scope::Admin] {
+        for s in [
+            Scope::Read,
+            Scope::Write,
+            Scope::Git,
+            Scope::MergeAdd,
+            Scope::Exec,
+            Scope::Admin,
+        ] {
             assert!(ctx.require(s).is_ok());
         }
     }

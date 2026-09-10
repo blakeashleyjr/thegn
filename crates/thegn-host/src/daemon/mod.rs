@@ -137,6 +137,13 @@ pub(crate) struct ServeOpts {
     pub advertise_port: Option<u16>,
 }
 
+fn registry_control_origin(
+    transport: &thegn_core::config_daemon::ServeTransportPolicy,
+    actual_bind_port: u16,
+) -> String {
+    transport.advertised_origin(actual_bind_port)
+}
+
 /// Entry point for the hidden `thegn daemon` subcommand: builds the runtime
 /// and serves until shutdown. Exits 0 immediately if another daemon already
 /// owns the socket.
@@ -287,6 +294,7 @@ async fn run(
         // `\\.\pipe\…` name on Windows. Discovery classifies by prefix.
         endpoint: ep.display(),
         tcp_addr: None,
+        control_origin: None,
         hostname: hostname(),
         version: format!(
             "{}{}",
@@ -416,15 +424,18 @@ async fn run(
             .await
             .with_context(|| format!("bind {bind}"))?;
         let actual = tcp.local_addr().context("serve local_addr")?;
-        // Advertise the TCP address on our registry row (`put_daemon` replaces
-        // by daemon_id). Surfaced with `?`: a serve invocation that can't
-        // register its address is undiscoverable and should fail loudly.
+        // Preserve the actual bound socket for status/discovery contracts, and
+        // persist the exact client-facing origin after every CLI override has
+        // been applied. Route-to-host provisioning runs in another process and
+        // must not reconstruct this from its static config (which would lose
+        // `serve --advertise-host/--advertise-port`).
         daemon_row.tcp_addr = Some(actual.to_string());
+        daemon_row.control_origin = Some(registry_control_origin(&transport, actual.port()));
         daemon_row.heartbeat_at = now_ms();
         {
             let db = db.lock().expect("daemon db lock");
             db.put_daemon(&daemon_row)
-                .context("record serve tcp_addr in the daemon registry")?;
+                .context("record serve addresses in the daemon registry")?;
         }
         let tcp_state = thegn_svc::control::http::ControlState {
             api: svc.clone(),
@@ -673,11 +684,27 @@ mod tests {
             scope: scope.into(),
             endpoint: format!("/run/{id}.sock"),
             tcp_addr: None,
+            control_origin: None,
             hostname: "h".into(),
             version: "0".into(),
             started_at: 0,
             heartbeat_at: 0,
         }
+    }
+
+    #[test]
+    fn daemon_registry_persists_effective_advertised_origin() {
+        let serve = thegn_core::config::ServeConfig {
+            topology: thegn_core::config::ServeTopology::TlsTerminated,
+            advertise_host: "cli-override.example".into(),
+            advertise_port: 8443,
+            ..Default::default()
+        };
+        let transport = serve.resolve_transport(None, false).unwrap();
+        assert_eq!(
+            registry_control_origin(&transport, 5380),
+            "https://cli-override.example:8443"
+        );
     }
 
     /// The boot sweep removes exactly the same-scope rows whose pid is dead:

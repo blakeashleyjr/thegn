@@ -109,7 +109,7 @@ fn snapshot_key(repo_root: &Path, worktree: &str, env: &str) -> SnapshotKey {
 
 /// Open the configured snapshot store with the host secret chain.
 pub(crate) fn open_store(cfg: &SnapshotStoreConfig) -> anyhow::Result<Box<dyn SnapshotStore>> {
-    thegn_svc::snapshot::open_store(cfg, &|r| crate::secret::resolve(r))
+    thegn_svc::snapshot::open_store(cfg, &crate::secret::resolve_ref_for)
 }
 
 /// Throttled entry, called from the hydration thread next to the reapers.
@@ -268,6 +268,17 @@ fn finish_destroy(cfg: &Config, row: &HibernationRow) {
     let Some(provider) = crate::agent::provider_for_named(&env.provider, &row.sandbox_name) else {
         return;
     };
+    if let Err(error) = crate::remote_enqueue_auth::revoke_for_sandbox(
+        &env.provider,
+        &row.sandbox_name,
+        Some(&row.worktree_path),
+    ) {
+        thegn_core::msg::warn(&format!(
+            "hibernate: refusing to destroy {} because route-to-host credential revocation failed: {error:#}",
+            row.sandbox_name
+        ));
+        return;
+    }
     match block_on_provider(|| async { provider.destroy(&row.sandbox_name).await }) {
         Ok(()) => {
             if let Ok(db) = thegn_core::db::Db::open() {

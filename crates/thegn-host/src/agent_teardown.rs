@@ -65,6 +65,11 @@ pub fn destroy_provider_sandbox_with(
     else {
         return Ok(());
     };
+    // Revoke before recycle/destroy. If SQLite is unavailable, fail closed and
+    // leave the sandbox intact so the lifecycle can retry rather than orphaning
+    // an unrevoked return credential with no remaining owner metadata.
+    crate::remote_enqueue_auth::revoke_for_sandbox(pc, &name, Some(worktree))
+        .map_err(|error| format!("revoke route-to-host credential: {error:#}"))?;
     // A CLAIMED pool spare with a fresh provisioned-base checkpoint is RECYCLED
     // back into the pool (restore-in-place, row → `ready`) instead of destroyed
     // — see `lifecycle::recycle_claimed_on_delete`. `false` ⇒ destroy as usual.

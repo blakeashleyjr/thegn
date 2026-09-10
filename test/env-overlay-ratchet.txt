@@ -100,7 +100,6 @@ clipboard.keep_hours
 clipboard.max_image_bytes
 clipboard.remote_dir
 confirm_delete
-credentials.audit_file
 daemon.enabled
 daemon.idle_exit_secs
 daemon.lease_grace_secs

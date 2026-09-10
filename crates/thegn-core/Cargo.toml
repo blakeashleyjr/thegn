@@ -78,6 +78,9 @@ unicode-width = "0.2"
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 # macOS activity scanner (src/activity.rs): libproc — `proc_listallpids` +
 # `proc_pidinfo` for cwd and CPU time, plus `mach_timebase_info` to convert mach
 # absolute units. The direct syscall seam is ~1 call per process instead of

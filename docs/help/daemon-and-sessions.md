@@ -147,15 +147,25 @@ thegn events tail --kinds activity,exit
 thegn events tail --session "$SESSION" --signal-lag --json
 ```
 
-`--kinds` and `--session` use the control API's bounded narrowing vocabulary.
-The greeting is always the first frame. `--signal-lag` makes dropped frames
-visible as a `lagged` frame with a count; without it, legacy consumers retain
-silent skip behavior. JSON output is NDJSON, one canonical frame per line.
+`--kinds` and `--session` use the control API's bounded observer-filter
+vocabulary: `activity`, `lease`, `pairing`, `sessions`, and `exit`.
+Pane `snapshot` and `delta` frames belong only to an authenticated session
+attach and are rejected as observer filters. `hello` is the mandatory first
+frame on WebSocket, SSE, gRPC, and CLI subscriptions rather than a filter;
+`lagged` is controlled by `--signal-lag`. That flag makes
+dropped frames visible as a `lagged` frame with a count; without it, legacy
+consumers retain silent skip behavior. JSON output is NDJSON, one canonical
+frame per line.
 
-This feed is ephemeral and has no replay or journal. After a lag or reconnect,
-re-list with `sessions.list` and `worktrees.list` (or their CLI equivalents)
-before relying on cached state. The command is read-only and never interacts
-with `--allow-session-input`.
+This feed is ephemeral and has no replay or journal. Bootstrap by listing the
+resources you need, subscribing to the applicable observer kinds, and listing
+again after a `sessions` change, an opted-in `lagged` frame, or a reconnect.
+The initial list and subscription are not atomic: a change can land between
+them, so reconcile re-list results idempotently by stable session and worktree
+ids. No synthetic snapshot is implied by this feed. Pane attach has a separate
+contract: its `hello` is followed by the current emulator `snapshot`, then
+ordered live `delta` frames (and a terminal `exit`). The command is read-only
+and never interacts with `--allow-session-input`.
 
 The local Unix socket keeps same-user authentication. A remote TCP client must
 present the existing bearer token with read scope; filters cannot broaden that

@@ -346,6 +346,8 @@ pub struct DaemonStatus {
     pub endpoint: String,
     /// `host:port` when the daemon is serving remote thin clients, else empty.
     pub tcp_addr: String,
+    /// Canonical client-facing HTTP(S) origin after advertise overrides.
+    pub control_origin: String,
     /// Daemon start time (Unix ms), for the uptime line.
     pub started_at_ms: i64,
     /// Last registry heartbeat (Unix ms). Age against `now` is the daemon's

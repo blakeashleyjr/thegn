@@ -162,23 +162,25 @@ Mac when touching anything platform-sensitive; it covers what neither
 ## Windows (native) notes
 
 Native Windows is a build target **under development**, not a supported
-platform, and no Windows binaries ship in `v0.1.0-alpha.1`. Current state, from
-the msvc CI runs:
+platform, and no Windows binaries ship in the current public alpha. Current
+repository state, pending the first recorded native CI run:
 
-- `cargo check --workspace` **passes** — the port compiles.
-- The named-pipe daemon IPC tests **pass**. They used to fail on
+- The Linux-side `x86_64-pc-windows-gnu` cross-check covers cfg/compile
+  regressions, but it is not evidence that the MSVC workspace check passes.
+- Native named-pipe daemon IPC tests exist. They used to fail on
   `pipe_bind_is_the_lock_and_round_trips`: Windows keeps a pipe _name_ reserved
   for a few milliseconds after the last handle of an instance that carried a
   connection closes, and `bind_exclusive` read that window as a rival daemon.
   It now retries briefly (`crates/thegn-svc/src/ipc.rs`).
-- The Job-Object process-scoping tests **pass**.
-- The release build has **not** completed inside the job budget yet, and nobody
-  has run thegn interactively on Windows. Those are the remaining gaps before
-  the platform can be called supported — see
+- Native Job-Object process-scoping tests exist, but neither test group has a
+  recorded green run in the current CI configuration.
+- A successful opt-in job is configured to build and upload `thegn.exe`, then
+  a separate job downloads and smokes that artifact. No such run has completed,
+  and nobody has run thegn interactively on Windows. Those are remaining gaps
+  before the platform can be called supported — see
   `openspec/changes/add-windows-compositor-validation`.
-- The msvc job is opt-in: dispatch, or `[ci-windows]` in the commit subject.
-  Careful — the marker is matched anywhere in the commit _message_, so merely
-  mentioning it in a body will trigger the job.
+- The MSVC and artifact-smoke jobs are opt-in: manually dispatch `ci.yml` with
+  `extras: true`.
 
 No WSL is required. The dev experience differs from unix — nix and the justfile
 don't apply:
@@ -203,10 +205,11 @@ don't apply:
   WSL2 if you want sandboxed panes; native panes run on the host, scoped by
   kill-on-close Job Objects), the SIGUSR2 flamegraph profiler, and the
   merge-queue headless agent (POSIX quoting).
-- **CI:** every PR cross-checks the whole workspace for
-  `x86_64-pc-windows-gnu` on Linux (`just check-cross`); the full
-  `windows-latest` msvc job (check + IPC/Job-Object kernel tests) is opt-in —
-  add `[ci-windows]` to a commit message or dispatch the workflow.
+- **CI:** `just check-cross` includes the Linux-side
+  `x86_64-pc-windows-gnu` workspace check. Remote CI is currently dispatch-only;
+  the full `windows-latest` MSVC job (check + IPC/Job-Object kernel tests,
+  release build, and downloaded-artifact smoke) runs only when `ci.yml` is
+  dispatched with `extras: true`.
 
 ## Where things live
 

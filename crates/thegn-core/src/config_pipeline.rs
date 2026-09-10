@@ -57,10 +57,10 @@ pub struct PipelineStage {
     /// [`crate::agent_task::STAGE_VARS`]; **rendering is the Lead's job** —
     /// thegn never expands this itself.
     pub prompt: String,
-    /// How many workers of this stage the Lead may run at once. Advisory: an
-    /// **agent-side** budget, counted by the Lead from the roster's active rows,
-    /// never enforced by thegn. `0` is a config error (a stage that can never
-    /// run is a typo, not a way to disable one).
+    /// How many workers of this stage may run at once. The Lead still decides
+    /// what work to dispatch, while the atomic claim and `session open --stage`
+    /// enforce this ceiling from the roster's active rows. `0` is a config error
+    /// (a stage that can never run is a typo, not a way to disable one).
     pub concurrency: u32,
     /// How long the Lead should wait on this stage's session before treating it
     /// as blocked, in seconds. **Advisory — thegn never fires this timer**; the
@@ -670,9 +670,20 @@ mod tests {
                 .any(|e| e.contains("transport_signatures") && e.contains(": empty")),
             "a whitespace signature matches everything: {errs:?}"
         );
+        cfg.pipeline.transport_retry.transport_signatures.pop();
+        cfg.pipeline
+            .transport_retry
+            .limit_signatures
+            .push("\t".into());
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("limit_signatures") && e.contains(": empty")),
+            "a whitespace limit signature matches everything: {errs:?}"
+        );
         // `max_attempts = 0` is legal exactly when the section is disabled.
         cfg.pipeline.transport_retry.enabled = false;
-        cfg.pipeline.transport_retry.transport_signatures.pop();
+        cfg.pipeline.transport_retry.limit_signatures.pop();
         assert!(validate_pipeline(&cfg).is_empty());
     }
 

@@ -1,11 +1,12 @@
 # thegn
 
 > **Status: public alpha** (`0.1.0-alpha.2`). **x86_64 Linux is the supported
-> platform.** macOS on Apple silicon now builds, tests and runs, has a generated
+> platform.** macOS on Apple silicon has build/test coverage and a generated
 > `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
 > it as best-effort, not supported: its CI job is opt-in and the interactive
-> on-device checklist is unfinished. Windows compiles and passes its tests on
-> msvc but has never been run interactively, and ships no binaries. Expect rough
+> on-device checklist is unfinished. Windows source paths and targeted tests
+> exist, but no recorded native CI run or interactive rehearsal has passed and
+> no binary is published. Expect rough
 > edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
@@ -173,6 +174,20 @@ downloadable unsigned macOS app, Windows Terminal profile, or
 Flatpak/AppImage/nix-bundle. Each needs its relevant host, signing, or driver
 rehearsal before it becomes an install instruction.
 
+### Platform bundle status
+
+“Bundled” below means owned by the artifact; “generated” is writable user-local
+state; “host” remains the user's responsibility. A buildable path is not called
+supported until its clean-host rehearsal is recorded.
+
+| Path                        | Terminal                                            | Font                       | Config                                                   | Binary                                | Status and fallback                                                                                                                                                                                   |
+| --------------------------- | --------------------------------------------------- | -------------------------- | -------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux, Nix batteries        | bundled Alacritty                                   | bundled FiraCode Nerd Font | generated user-local copy                                | flake-built Thegn                     | shipped x86_64 Linux path; run `nix run github:blakeashleyjr/thegn#batteries`                                                                                                                         |
+| Linux, standalone installer | host terminal; host Alacritty for `tg --standalone` | host                       | generated Thegn config; checkout-bound Alacritty profile | installed source build                | partial; use the ordinary current-terminal path or the Nix batteries path                                                                                                                             |
+| macOS, Nix batteries        | bundled Alacritty                                   | bundled FiraCode Nerd Font | generated user-local copy                                | flake-built Thegn                     | composition exists, but remains best-effort until the macOS clean-host checklist passes                                                                                                               |
+| macOS app launcher          | selected host terminal                              | host                       | generated Thegn config and local `.app` launcher         | installed source build or PATH binary | partial; use Nix or the source install while signing and full bundle rehearsal remain open                                                                                                            |
+| Windows native              | host Windows Terminal                               | host                       | host                                                     | source build only                     | deferred to [THE-140](https://linear.app/blakeashley/issue/THE-140) and [THE-145](https://linear.app/blakeashley/issue/THE-145); use a supported x86_64 Linux host when verified behavior is required |
+
 ### nix-darwin (macOS)
 
 The home-manager module above works on darwin unchanged. nix-darwin has no
@@ -203,12 +218,15 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 
 ### Prebuilt binary (no Nix)
 
-Each tagged release attaches a `thegn` binary for **x86_64 Linux (gnu + musl)**
-and **Apple silicon (aarch64-apple-darwin)** to the [releases page][releases].
-Download the archive, verify the `.sha256`, and drop `thegn` on your `PATH`.
-Windows binaries are not published yet.
+The next successful tagged-release workflow is configured to attach a `thegn`
+binary for **x86_64 Linux (gnu + musl)** and best-effort **Apple silicon
+(aarch64-apple-darwin)** to the [releases page][releases]. Download the archive,
+verify the `.sha256`, and drop `thegn` on your `PATH`. The current public alpha
+has not published a macOS or Windows binary.
 
-**On macOS, prefer Homebrew or Nix.** The archives are deliberately unsigned, and
+**On macOS, prefer Nix or a local source build.** Homebrew metadata exists but
+the public tap is not advertised until its real-release rehearsal passes. The
+archives are deliberately unsigned, and
 a tarball downloaded through a browser is quarantined by Gatekeeper — it needs
 `xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
 downloads, Nix store paths, and the locally generated `thegn.app` are not
@@ -261,9 +279,10 @@ after moving or reinstalling the binary (the launcher falls back to searching
 the usual prefixes, but the baked path is what it prefers).
 
 **macOS and Windows are unvalidated in this release.** Neither has been run
-through a full interactive checklist. Windows compiles on msvc and passes its
-IPC and Job-Object tests; macOS builds, tests and runs on Apple silicon, but its
-CI job has never been run and no binaries are published (see
+through a full interactive checklist. Windows has MSVC implementations and
+targeted IPC/Job-Object tests awaiting their first recorded native CI pass;
+macOS has local build/test evidence on Apple silicon, but its CI job has never
+been run and no binaries are published (see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Treat both as work-in-progress:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
@@ -273,7 +292,10 @@ CI job has never been run and no binaries are published (see
   Tools installed, `cargo install --path crates/thegn-host`. Run it inside
   [Windows Terminal](https://aka.ms/terminal). Container sandboxing is a
   Linux/WSL2 feature — native panes run host-side, scoped by Job Objects. See
-  CONTRIBUTING "Windows (native) notes" for details.
+  CONTRIBUTING "Windows (native) notes" for details. An opt-in CI run is
+  configured to retain `thegn-x86_64-pc-windows-msvc` after a separate job
+  downloads and smokes it; until the first green run is recorded, that artifact
+  is not an available or supported install path.
 
 Reports (and fixes) from either platform are welcome — that is how they graduate.
 

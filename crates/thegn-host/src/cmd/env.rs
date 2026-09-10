@@ -4,7 +4,7 @@
 //! and a *data* mode. Selection layers worktree → workspace → repo `.thegn.*`
 //! → global `[sandbox] default_env` → the implicit `default`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
@@ -311,6 +311,22 @@ fn deprovision(
     env: Option<String>,
     yes: bool,
 ) -> Result<()> {
+    let provider_config = match env.as_deref() {
+        Some(name) => cfg
+            .env
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("no [env.{name}] defined"))?
+            .provider
+            .clone(),
+        None => {
+            let resolved = resolve_for(cfg, worktree.clone());
+            cfg.env
+                .get(&resolved.name)
+                .ok_or_else(|| anyhow::anyhow!("the default env has no API provider configured"))?
+                .provider
+                .clone()
+        }
+    };
     let provider = match env.as_deref() {
         Some(name) => {
             let envc = cfg
@@ -323,7 +339,7 @@ fn deprovision(
                 )
             })?
         }
-        None => api_provider(cfg, worktree)?,
+        None => api_provider(cfg, worktree.clone())?,
     };
     if all {
         let ids = crate::agent::block_on_provider(|| async { provider.list().await })
@@ -348,6 +364,14 @@ fn deprovision(
         }
         let mut destroyed = 0usize;
         for id in &ids {
+            if let Err(e) =
+                crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, id, None)
+            {
+                msg::warn(&format!(
+                    "destroy {id} refused: route-to-host credential revocation failed: {e:#}"
+                ));
+                continue;
+            }
             match crate::agent::block_on_provider(|| async { provider.destroy(id).await }) {
                 Ok(()) => {
                     destroyed += 1;
@@ -360,6 +384,8 @@ fn deprovision(
         return Ok(());
     }
     let id = id.ok_or_else(|| anyhow::anyhow!("provide a sandbox id, or pass --all"))?;
+    crate::remote_enqueue_auth::revoke_for_sandbox(&provider_config, &id, worktree.as_deref())
+        .context("route-to-host credential revocation failed; sandbox left intact")?;
     crate::agent::block_on_provider(|| async { provider.destroy(&id).await })
         .map_err(|e| anyhow::anyhow!("destroy {id} failed: {e}"))?;
     outln!("destroyed sandbox: {id}");
@@ -424,11 +450,10 @@ fn api_provider(cfg: &Config, worktree: Option<String>) -> Result<thegn_svc::pro
             let token = crate::secret::resolve(key_env).ok_or_else(|| {
                 anyhow::anyhow!("the Sprites API token {key_env:?} could not be resolved")
             })?;
-            Ok(Provider::Sprites(SpritesProvider::new(
-                &pc.api_base,
-                &token,
-                &pc.id,
-            )))
+            Ok(Provider::Sprites(
+                SpritesProvider::new(&pc.api_base, &token, &pc.id)
+                    .with_custody_accounts(crate::provider_factory::managed_custody_accounts(pc)),
+            ))
         }
         vps if thegn_core::config::vps_provider_kind(vps) => {
             // The per-worktree resolved sandbox id (the placement bakes it) —

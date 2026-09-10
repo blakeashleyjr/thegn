@@ -231,6 +231,10 @@ pub struct SpritesProvider {
     token: String,
     /// The sprite name to create/attach (caller-chosen; sprites are persistent).
     name: String,
+    /// Exact value-free custody namespace for managed SSH teardown. Direct
+    /// service consumers may omit it; in that case teardown is allowed only
+    /// when the provider+instance row is unique across accounts.
+    custody_accounts: Vec<String>,
     client: reqwest::Client,
 }
 
@@ -265,8 +269,32 @@ impl SpritesProvider {
             },
             token: token.to_string(),
             name: name.trim().to_string(),
+            custody_accounts: Vec::new(),
             client: provider_http_client(),
         }
+    }
+
+    pub fn with_custody_accounts(mut self, accounts: impl IntoIterator<Item = String>) -> Self {
+        self.custody_accounts = accounts.into_iter().collect();
+        self
+    }
+
+    fn custody_account(&self, id: &str) -> Result<Option<String>> {
+        if self.custody_accounts.is_empty() {
+            return thegn_core::managed_ssh::read_unique_instance("sprites", id)
+                .map(|record| record.map(|record| record.account));
+        }
+        let mut matches = Vec::new();
+        for account in &self.custody_accounts {
+            if thegn_core::managed_ssh::read("sprites", account, id)?.is_some() {
+                matches.push(account.clone());
+            }
+        }
+        anyhow::ensure!(
+            matches.len() <= 1,
+            "sprites: managed SSH custody for {id} is ambiguous across configured scope namespaces"
+        );
+        Ok(matches.pop())
     }
 
     // --- pure request/response shaping (unit-tested) ------------------------
@@ -373,6 +401,10 @@ impl RemoteProvider for SpritesProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // Validate custody before the irreversible remote delete. A corrupt
+            // row may be the only evidence of an authorized key and must never
+            // be collapsed into "missing" by lifecycle cleanup.
+            let custody_account = self.custody_account(id)?;
             // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
             // teardown (the observed "sprites destroy failed (500)") is retried a few
             // times with a short backoff rather than immediately leaking a paid
@@ -392,6 +424,10 @@ impl RemoteProvider for SpritesProvider {
                 let status = resp.status();
                 // 404 = already gone — idempotent teardown.
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                    if let Some(account) = custody_account.as_deref() {
+                        thegn_core::managed_ssh::record_revoked("sprites", account, id)
+                            .context("sprites: retire managed SSH custody")?;
+                    }
                     return Ok(());
                 }
                 last_status = Some(status);
