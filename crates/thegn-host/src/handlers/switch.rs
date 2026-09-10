@@ -396,6 +396,7 @@ mod tests {
             pane_cmds: Default::default(),
             pane_sessions: Default::default(),
             pane_scrollback: Default::default(),
+            grow: Default::default(),
         });
         let (mut light_model, mut light_sb) =
             built(&session, crate::sidebar::SortMode::Manual, &[]);

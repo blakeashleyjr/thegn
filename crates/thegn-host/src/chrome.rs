@@ -2521,17 +2521,22 @@ pub fn render_panes<'a>(
         } else {
             col(S::Text)
         };
-        crate::borders::draw_pane_frames(
+        let frame_style = crate::borders::FrameStyle {
+            border: col(S::Border),
+            focus: ring,
+            bg: col(S::Panel),
+            title: col(S::Dim),
+            title_focused: ring,
+        };
+        crate::borders::draw_pane_frames(surface, &frames, Some(focused), &frame_style, title_of);
+        // A stacked (zoomed) tab: every collapsed sibling is a one-row title
+        // bar above/below the expanded pane — the "there's more here" cue.
+        // Bars sit outside every content rect, so the incremental pane paths
+        // never paint over them; any zoom/focus change is a full frame.
+        crate::borders::draw_stack_bars(
             surface,
-            &frames,
-            Some(focused),
-            &crate::borders::FrameStyle {
-                border: col(S::Border),
-                focus: ring,
-                bg: col(S::Panel),
-                title: col(S::Dim),
-                title_focused: ring,
-            },
+            &center.stack_bars(chrome.center),
+            &frame_style,
             title_of,
         );
         // Drag-rearrange affordance: light up the pane a drop would land on

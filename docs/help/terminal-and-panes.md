@@ -86,7 +86,28 @@ you want a direct key.
   switches to the previous / next worktree within the current project. This
   never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
+  → tiled (see Zoom below)
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
+
+### Zoom
+
+`Ctrl-Alt-z` grows the focused pane in two steps: **maximized** fills the
+center while the sidebar, panel and bars stay; **full-window** hides the side
+chrome too, keeping only the bars `[ui] fullscreen_keep_masthead` /
+`fullscreen_keep_statusbar` leave up. A third press goes back to the split.
+
+- While zoomed the tab is drawn as a **stack**: the focused pane expanded, and
+  every other pane collapsed to a one-row title bar above or below it, in
+  order. The statusbar shows `MAX` / `ZOOM`.
+- **Click a collapsed bar** to expand that pane. `Alt-↑/↓` and `Ctrl-↑/↓` walk
+  the stack bar by bar, and past either end they carry on as usual (worktree
+  switch / bars). `←/→` keep following the split.
+- Zoom is **per tab**: each worktree tab remembers its own zoom and pane. Leave
+  a zoomed worktree and come back, and the same pane is still zoomed. Other
+  worktrees keep their own layout. Moving focus to the sidebar or panel from a
+  full-window tab brings the chrome back until focus returns. A restart comes
+  back tiled.
+- Mouse selection, the wheel and pane apps all target the expanded pane.
 
 ## Launch menu
 

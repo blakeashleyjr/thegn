@@ -29,10 +29,29 @@ pub enum CenterTree {
     Leaf(PaneId),
     /// Tiled children with per-child weights (the vertical/horizontal arrangements).
     Split { dir: Dir, children: Vec<Branch> },
-    /// Tabbed panes; only `active` is visible and fills the rect (the stacked
-    /// arrangement).
+    /// Stacked panes (zellij-style): only `active` is expanded; every other
+    /// member collapses to a one-row title bar above or below it, in order
+    /// (see [`CenterTree::stack_bars`]).
     Stack { panes: Vec<PaneId>, active: usize },
 }
+
+/// A tab's zoom level — the `Ctrl+Alt+z` cycle, remembered per tab so leaving a
+/// worktree and coming back restores exactly the zoom (and pane) you left.
+/// Deliberately not persisted: a restart comes back tiled.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Grow {
+    /// The normal split layout.
+    #[default]
+    Tiled,
+    /// The focused pane fills the center region; all chrome stays.
+    Maximized,
+    /// The focused pane takes the whole window (only the configured bars stay).
+    Fullscreen,
+}
+
+/// The fewest rows a stack's expanded member keeps before its siblings'
+/// collapsed title bars are dropped (frame ring + a couple of content rows).
+pub const STACK_MIN_EXPANDED_ROWS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Branch {
@@ -47,20 +66,66 @@ impl CenterTree {
     }
 
     /// Lay the tree out within `rect`, yielding `(pane, rect)` for every visible
-    /// pane (stack members other than `active` are omitted — they're suspended).
+    /// pane (stack members other than `active` are omitted — they're collapsed
+    /// to the title bars [`CenterTree::stack_bars`] yields).
     pub fn layout(&self, rect: Rect) -> Vec<(PaneId, Rect)> {
         let mut out = Vec::new();
-        self.layout_into(rect, &mut out);
+        self.layout_into(rect, &mut out, &mut Vec::new());
         out
     }
 
-    fn layout_into(&self, rect: Rect, out: &mut Vec<(PaneId, Rect)>) {
+    /// The one-row title bars of every collapsed stack member, `(pane, bar
+    /// rect)`, laid out by the same pass as [`CenterTree::layout`] so the two
+    /// always agree. Empty for a tree without stacks.
+    pub fn stack_bars(&self, rect: Rect) -> Vec<(PaneId, Rect)> {
+        let mut bars = Vec::new();
+        self.layout_into(rect, &mut Vec::new(), &mut bars);
+        bars
+    }
+
+    fn layout_into(
+        &self,
+        rect: Rect,
+        out: &mut Vec<(PaneId, Rect)>,
+        bars: &mut Vec<(PaneId, Rect)>,
+    ) {
         match self {
             CenterTree::Leaf(p) => out.push((*p, rect)),
             CenterTree::Stack { panes, active } => {
-                if let Some(p) = panes.get(*active).or_else(|| panes.first()) {
-                    out.push((*p, rect));
+                if panes.is_empty() {
+                    return;
                 }
+                let a = if *active < panes.len() { *active } else { 0 };
+                let collapsed = panes.len() - 1;
+                // Too short to keep a usable expanded pane under the bars: the
+                // active member fills the rect alone.
+                if collapsed == 0 || rect.rows < collapsed + STACK_MIN_EXPANDED_ROWS {
+                    out.push((panes[a], rect));
+                    return;
+                }
+                let bar = |y: usize| Rect {
+                    x: rect.x,
+                    y,
+                    cols: rect.cols,
+                    rows: 1,
+                };
+                let bottom = rect.y + rect.rows;
+                for (i, p) in panes.iter().enumerate() {
+                    if i < a {
+                        bars.push((*p, bar(rect.y + i)));
+                    } else if i > a {
+                        bars.push((*p, bar(bottom - (panes.len() - i))));
+                    }
+                }
+                out.push((
+                    panes[a],
+                    Rect {
+                        x: rect.x,
+                        y: rect.y + a,
+                        cols: rect.cols,
+                        rows: rect.rows - collapsed,
+                    },
+                ));
             }
             CenterTree::Split { dir, children } => {
                 if children.is_empty() {
@@ -106,7 +171,7 @@ impl CenterTree {
                             rows: size,
                         },
                     };
-                    b.child.layout_into(child_rect, out);
+                    b.child.layout_into(child_rect, out, bars);
                     offset += size;
                 }
             }
@@ -129,6 +194,24 @@ impl CenterTree {
                     b.child.collect_ids(v);
                 }
             }
+        }
+    }
+
+    /// Expand `pane` in whichever stack holds it (a click on its collapsed
+    /// title bar). Returns whether `pane` is a stack member at all.
+    pub fn activate_stack_member(&mut self, pane: PaneId) -> bool {
+        match self {
+            CenterTree::Leaf(_) => false,
+            CenterTree::Stack { panes, active } => match panes.iter().position(|p| *p == pane) {
+                Some(i) => {
+                    *active = i;
+                    true
+                }
+                None => false,
+            },
+            CenterTree::Split { children, .. } => children
+                .iter_mut()
+                .any(|b| b.child.activate_stack_member(pane)),
         }
     }
 
@@ -675,14 +758,162 @@ mod tests {
     }
 
     #[test]
-    fn stack_shows_only_the_active_pane() {
+    fn stack_expands_the_active_pane_between_collapsed_bars() {
         let t = CenterTree::Stack {
             panes: vec![10, 11, 12],
             active: 1,
         };
+        // Only the active member is a laid-out pane; the two others each give
+        // up one row to a title bar (10 above, 12 below).
         let l = t.layout(full());
-        assert_eq!(l, vec![(11, full())]);
+        assert_eq!(
+            l,
+            vec![(
+                11,
+                Rect {
+                    x: 0,
+                    y: 1,
+                    cols: 100,
+                    rows: 38
+                }
+            )]
+        );
+        let bar = |y| Rect {
+            x: 0,
+            y,
+            cols: 100,
+            rows: 1,
+        };
+        assert_eq!(t.stack_bars(full()), vec![(10, bar(0)), (12, bar(39))]);
         assert_eq!(t.pane_ids(), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn stack_bars_and_expanded_pane_tile_the_rect_exactly() {
+        // Every active position: bars + expanded pane cover the rect's rows
+        // once each — no gap, no overlap.
+        for active in 0..4 {
+            let t = CenterTree::Stack {
+                panes: vec![1, 2, 3, 4],
+                active,
+            };
+            let mut rows: Vec<(usize, usize)> = t
+                .layout(full())
+                .into_iter()
+                .chain(t.stack_bars(full()))
+                .map(|(_, r)| (r.y, r.rows))
+                .collect();
+            rows.sort();
+            let mut y = 0;
+            for (ry, rr) in rows {
+                assert_eq!(ry, y, "gap/overlap at active {active}");
+                y += rr;
+            }
+            assert_eq!(y, 40);
+            // Bars before the active member sit above it, the rest below.
+            let pane = t.layout(full())[0].1;
+            for (id, b) in t.stack_bars(full()) {
+                let idx = [1, 2, 3, 4].iter().position(|p| *p == id).unwrap();
+                assert_eq!(idx < active, b.y < pane.y, "bar {id} side");
+            }
+        }
+    }
+
+    #[test]
+    fn stack_drops_bars_when_too_short_and_for_a_single_member() {
+        let short = Rect {
+            x: 0,
+            y: 0,
+            cols: 50,
+            rows: 2 + STACK_MIN_EXPANDED_ROWS - 1,
+        };
+        let t = CenterTree::Stack {
+            panes: vec![1, 2, 3],
+            active: 2,
+        };
+        assert_eq!(t.layout(short), vec![(3, short)]);
+        assert!(t.stack_bars(short).is_empty());
+        // Exactly enough rows: the bars come back.
+        let fits = Rect {
+            rows: 2 + STACK_MIN_EXPANDED_ROWS,
+            ..short
+        };
+        assert_eq!(t.stack_bars(fits).len(), 2);
+        // A one-member stack is just its pane.
+        let one = CenterTree::Stack {
+            panes: vec![9],
+            active: 0,
+        };
+        assert_eq!(one.layout(full()), vec![(9, full())]);
+        assert!(one.stack_bars(full()).is_empty());
+        // An out-of-range active index falls back to the first member.
+        let stale = CenterTree::Stack {
+            panes: vec![5, 6],
+            active: 7,
+        };
+        assert_eq!(stale.layout(full())[0].0, 5);
+    }
+
+    #[test]
+    fn stack_bars_follow_a_stack_nested_in_a_split() {
+        // Row[ Leaf(1), Stack{[2,3], active 1} ] — the bar lives in the right column.
+        let t = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(1),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Stack {
+                        panes: vec![2, 3],
+                        active: 1,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            t.stack_bars(full()),
+            vec![(
+                2,
+                Rect {
+                    x: 50,
+                    y: 0,
+                    cols: 50,
+                    rows: 1
+                }
+            )]
+        );
+        let l = t.layout(full());
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[1].0, 3);
+        assert_eq!(l[1].1.y, 1);
+    }
+
+    #[test]
+    fn activate_stack_member_expands_the_clicked_pane() {
+        let mut t = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(1),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Stack {
+                        panes: vec![2, 3],
+                        active: 1,
+                    },
+                },
+            ],
+        };
+        assert!(t.activate_stack_member(2));
+        assert_eq!(t.layout(full())[1].0, 2);
+        // A tiled leaf is not a stack member; a missing pane isn't either.
+        assert!(!t.activate_stack_member(1));
+        assert!(!t.activate_stack_member(99));
     }
 
     #[test]
