@@ -80,7 +80,7 @@ impl GrpcControl {
     /// and outcome.
     // The Err IS the RPC's whole response; produced once per request.
     #[allow(clippy::result_large_err)]
-    fn authed<T>(&self, req: &Request<T>, verb: Verb) -> Result<AuthCtx, Status> {
+    fn checked_auth<T>(&self, req: &Request<T>, verb: Verb) -> Result<AuthCtx, Status> {
         let peer = req
             .extensions()
             .get::<ConnectInfo<IpcConnectInfo>>()
@@ -113,9 +113,40 @@ impl GrpcControl {
             grpc_audit(&ctx.pairing_id, &ctx.label, verb, AuditOutcome::NoScope);
             return Err(Status::from(e));
         }
+        Ok(ctx)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authed<T>(&self, req: &Request<T>, verb: Verb) -> Result<AuthCtx, Status> {
+        let ctx = self.checked_auth(req, verb)?;
         if is_audited(verb) {
             grpc_audit(&ctx.pairing_id, &ctx.label, verb, AuditOutcome::Ok);
         }
+        Ok(ctx)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authed_merge_add<T>(&self, req: &Request<T>, worktree: &str) -> Result<AuthCtx, Status> {
+        let ctx = self.checked_auth(req, Verb::MergeAdd)?;
+        if !thegn_core::control::route_to_host_token_allows_worktree(
+            ctx.scopes, &ctx.label, worktree,
+        ) {
+            grpc_audit(
+                &ctx.pairing_id,
+                &ctx.label,
+                Verb::MergeAdd,
+                AuditOutcome::NoScope,
+            );
+            return Err(Status::permission_denied(
+                "route-to-host token is not authorized for this worktree",
+            ));
+        }
+        grpc_audit(
+            &ctx.pairing_id,
+            &ctx.label,
+            Verb::MergeAdd,
+            AuditOutcome::Ok,
+        );
         Ok(ctx)
     }
 }
@@ -227,6 +258,17 @@ pub fn frame_to_proto(frame: &EventFrame) -> proto::Event {
         },
         kind: Some(kind),
     }
+}
+
+/// Parse the generic observer subscription request through the same canonical
+/// vocabulary used by HTTP/SSE and the CLI.
+fn observer_filter(request: proto::EventsRequest) -> Result<FeedFilter, Box<Status>> {
+    FeedFilter::from_parts(
+        (!request.kinds.is_empty()).then_some(request.kinds),
+        (!request.session.is_empty()).then_some(request.session),
+        request.signal_lag,
+    )
+    .map_err(|error| Box::new(Status::invalid_argument(error.to_string())))
 }
 
 fn info_to_proto(i: &super::SessionInfo) -> proto::SessionInfo {
@@ -623,7 +665,7 @@ impl Control for GrpcControl {
         &self,
         req: Request<proto::MergeAddRequest>,
     ) -> Result<Response<proto::MergeAddReply>, Status> {
-        self.authed(&req, Verb::MergeAdd)?;
+        self.authed_merge_add(&req, &req.get_ref().worktree)?;
         let r = req.into_inner();
         let message = self
             .api
@@ -701,20 +743,21 @@ impl Control for GrpcControl {
         req: Request<proto::EventsRequest>,
     ) -> Result<Response<Self::EventsStream>, Status> {
         let ctx = self.authed(&req, Verb::Events)?;
-        let request = req.into_inner();
-        let filter = FeedFilter::from_parts(
-            (!request.kinds.is_empty()).then_some(request.kinds),
-            (!request.session.is_empty()).then_some(request.session),
-            request.signal_lag,
-        )
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let filter = observer_filter(req.into_inner()).map_err(|status| *status)?;
         let hello = frame_to_proto(&EventFrame::Hello(thegn_core::control_wire::Hello {
             proto: thegn_core::control_wire::PROTO_VERSION,
             server: self.server_label.clone(),
-            scopes: [Scope::Read, Scope::Write, Scope::Git, Scope::Admin]
-                .into_iter()
-                .filter(|s| ctx.scopes.contains(*s))
-                .collect(),
+            scopes: [
+                Scope::Read,
+                Scope::Write,
+                Scope::Git,
+                Scope::MergeAdd,
+                Scope::Exec,
+                Scope::Admin,
+            ]
+            .into_iter()
+            .filter(|s| ctx.scopes.contains(*s))
+            .collect(),
         }));
         let mut rx = self.api.subscribe();
         let stream = async_stream(move |tx| async move {
@@ -962,6 +1005,34 @@ mod tests {
         assert!(!auth::implicit_local_admin(true, Some(7), peer));
     }
 
+    #[test]
+    fn grpc_observer_rejects_attach_only_kinds_with_supported_set() {
+        for kind in ["snapshot", "delta"] {
+            let error = observer_filter(proto::EventsRequest {
+                kinds: vec![kind.into()],
+                session: String::new(),
+                signal_lag: false,
+            })
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("supported observer kinds:"));
+            assert!(error.message().contains("activity"));
+        }
+    }
+
+    #[test]
+    fn grpc_accepts_the_complete_canonical_observer_vocabulary() {
+        for kind in thegn_core::control_wire::OBSERVER_KINDS {
+            let filter = observer_filter(proto::EventsRequest {
+                kinds: vec![(*kind).into()],
+                session: String::new(),
+                signal_lag: false,
+            })
+            .unwrap();
+            assert_eq!(filter.kinds, Some(vec![(*kind).to_string()]));
+        }
+    }
+
     /// proto `Event` → `EventFrame`, for the round-trip test (lossy on
     /// unknown strings by construction — the wire enums are ours).
     fn proto_to_frame(e: &proto::Event) -> EventFrame {
@@ -977,6 +1048,7 @@ mod tests {
                         "read" => Some(Scope::Read),
                         "write" => Some(Scope::Write),
                         "git" => Some(Scope::Git),
+                        "merge_add" => Some(Scope::MergeAdd),
                         "exec" => Some(Scope::Exec),
                         "admin" => Some(Scope::Admin),
                         _ => None,

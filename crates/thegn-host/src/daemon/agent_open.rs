@@ -124,12 +124,11 @@ fn resolve_inner(
     launch: &AgentLaunch,
     fork_command: Option<&str>,
 ) -> Result<LaunchSpec> {
-    // NOTE: `cfg` is already per-request fresh — `service.rs` re-loads the
-    // layered config through `config_source::fresh()` (the daemon records its
-    // real `--set`/`--config` source at startup) and falls back to the boot
-    // snapshot when the file no longer loads. An `[[agents]]` entry added
-    // after the daemon started is honoured by the next dispatch; this module
-    // never keeps a second re-loader.
+    // NOTE: `cfg` already carries the per-request agent/tool/pipeline registry:
+    // `service.rs` re-loads the recorded config source, narrowly overlays those
+    // registries on the boot snapshot, and falls back to that snapshot when the
+    // file no longer loads. An `[[agents]]` entry added after daemon start is
+    // honoured without changing unrelated boot-fixed policy.
     let worktree = spec
         .worktree
         .clone()

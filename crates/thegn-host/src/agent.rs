@@ -17,7 +17,7 @@ use thegn_core::db::Db;
 
 // Teardown fns live in a sibling (kept flat); same call paths.
 pub use crate::agent_teardown::checkpoint_on_close;
-use thegn_core::remote::GitLoc;
+use thegn_core::remote::{GitLoc, SshTarget};
 use thegn_core::store::{PoolStore, WorkspaceStore};
 use thegn_core::{bundle, devenv, repo, sandbox};
 use thegn_svc::projection::ProjectionBackend;
@@ -197,6 +197,10 @@ pub struct SandboxOutcome {
     /// so the chrome stops routing git/fs reads into the dead provider and the
     /// tab chip stops claiming the pane is remote when it is running on the host.
     pub degraded_from_provider: bool,
+    /// The exact trusted SSH control target for an off-host pane. Carried out
+    /// of environment preparation so route-credential installation cannot
+    /// accidentally re-resolve a different host/config after bring-up.
+    pub route_ssh_target: Option<SshTarget>,
 }
 
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
@@ -290,6 +294,22 @@ pub fn prepare_sandbox_env(
         placement.clone()
     };
     let mut env_is_remote = environment.is_remote() && cwd_override.is_none();
+    let mut route_ssh_target = if env_is_remote {
+        match &placement {
+            thegn_core::placement::Placement::Ssh(ssh) => Some(SshTarget {
+                host: ssh.host.clone(),
+                port: ssh.port,
+                forward_agent: ssh.forward_agent,
+                ssh_config: ssh.ssh_config.clone(),
+                jump_host: ssh.jump_host.clone(),
+                identity: ssh.identity.clone(),
+                extra_args: ssh.extra_args.clone(),
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
     // Set when a provider bring-up failure degrades this open to the host (below),
     // so the outcome can heal a stale remote `worktrees.location` back to local.
     let mut degraded_from_provider = false;
@@ -373,6 +393,7 @@ pub fn prepare_sandbox_env(
                         cwd_override: None,
                         location: None,
                         degraded_from_provider: false,
+                        route_ssh_target: None,
                     });
                 }
                 Err(error) => {
@@ -452,6 +473,7 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
+        route_ssh_target = None;
         // The pane now runs on the host, so the worktree is NOT at the provider
         // location computed above — drop it (and flag the degrade) so the DB row
         // heals to local instead of routing chrome reads at the dead provider.
@@ -488,6 +510,7 @@ pub fn prepare_sandbox_env(
         placement = thegn_core::placement::Placement::Local;
         exec_placement = thegn_core::placement::Placement::Local;
         env_is_remote = false;
+        route_ssh_target = None;
         // Same as the auto-provision degrade above: heal the location to local
         // and drop any latched explicit backend so the host fallback runs.
         location = None;
@@ -576,6 +599,7 @@ pub fn prepare_sandbox_env(
                     cwd_override,
                     location,
                     degraded_from_provider,
+                    route_ssh_target,
                 });
             }
             if let Some(expected) = explicit_backend
@@ -681,6 +705,7 @@ pub fn prepare_sandbox_env(
                         cwd_override,
                         location,
                         degraded_from_provider,
+                        route_ssh_target,
                     });
                 }
                 Err(e) => {
@@ -823,6 +848,7 @@ pub fn prepare_sandbox_env(
         cwd_override,
         location,
         degraded_from_provider,
+        route_ssh_target,
     })
 }
 
@@ -1109,7 +1135,8 @@ impl NativeShell {
     }
 }
 
-/// Resolve `(provider, sandbox id, workdir)` for a worktree's PROVIDER env — for
+/// Resolve `(provider, sandbox id, workdir, provider kind, custody account)` for
+/// a worktree's PROVIDER env — for
 /// the SSH-over-WSS proxy path (`[env.<name>.provider] connect = "ssh"`). Unlike
 /// [`native_shell_exec`] it does NOT gate on the exec mode/health: it only needs
 /// the provider handle + the resolved sandbox id to open the TCP proxy. `None`
@@ -1118,7 +1145,13 @@ impl NativeShell {
 pub fn provider_proxy_target(
     cfg: &Config,
     worktree: &str,
-) -> Option<(thegn_svc::provider::Provider, String, String)> {
+) -> Option<(
+    thegn_svc::provider::Provider,
+    String,
+    String,
+    String,
+    String,
+)> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
         .ok()
@@ -1149,12 +1182,21 @@ pub fn provider_proxy_target(
         .unwrap_or_else(|| p.id.clone());
     let provider = provider_for_named(pc, &id)?;
     let workdir = crate::provider_workdir::resolve(pc, &id);
-    Some((provider, id, workdir))
+    let provider_kind = pc.provider.trim().to_string();
+    let custody_account = match crate::provider_factory::managed_custody_record(pc, &id) {
+        Ok(Some(record)) => record.account,
+        Ok(None) => crate::provider_factory::managed_custody_account(pc),
+        // Ambiguous custody cannot prove the exact account selected by the
+        // worktree, so fail closed before opening a transport.
+        Err(_) => return None,
+    };
+    Some((provider, id, workdir, provider_kind, custody_account))
 }
 
 pub(crate) use crate::agent_ssh::{
-    SPRITE_SSHD_PORT, mosh_setup_script, sprite_ssh_argv, sprite_ssh_connect, sprite_ssh_keypair,
-    sprite_sshd_setup_script, sprite_sshd_start_script,
+    SPRITE_SSHD_PORT, SpriteSshCustody, generate_managed_keypair_at, managed_ssh_keypair,
+    mosh_setup_script, sprite_ssh_argv, sprite_ssh_argv_for_custody, sprite_ssh_connect,
+    sprite_ssh_keypair, sprite_sshd_setup_script, sprite_sshd_start_script,
 };
 
 /// Decide whether `worktree`'s interactive shell should attach via a provider's
@@ -1293,7 +1335,8 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     };
     // Point each agent CLI at the ACTIVE account's uploaded credential home.
     let inner = format!(
-        "{}{inner}",
+        "{}{}{inner}",
+        crate::remote_enqueue_auth::source_prefix(worktree),
         crate::agent_configs::account_pane_env_exports(cfg, worktree)
     );
     // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
@@ -1669,16 +1712,8 @@ pub fn provision_provider_env_named(
     let (sprite_home, workdir) = crate::provider_workdir::probe_and_resolve(&provider, &id, pc);
     let marker = EnvPlan::marker_path(&workdir);
 
-    // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
-    // still refresh auth creds: the host's OAuth token rotates, so the
-    // provision-time snapshot goes stale and the in-sandbox agent 401s.
-    if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
-        crate::provider_workdir::mark_provisioned(&id);
-        crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, env_name);
-        return Ok((true, None));
-    }
-
-    // Resolve the repo origin so the sprite can clone it.
+    // Host-local repository membership is needed both by provisioning and by
+    // the post-checkpoint return-credential policy.
     let repo_root: PathBuf = Db::open()
         .ok()
         .and_then(|db| db.repo_root_for(worktree).ok().flatten())
@@ -1687,6 +1722,25 @@ pub fn provision_provider_env_named(
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
 
+    // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint) — but
+    // still refresh auth creds: the host's OAuth token rotates, so the
+    // provision-time snapshot goes stale and the in-sandbox agent 401s.
+    if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
+        crate::provider_workdir::mark_provisioned(&id);
+        crate::agent_configs::resync_agent_auth(&provider, &id, cfg, worktree, env_name);
+        crate::remote_enqueue_auth::reconcile_provider_credential(
+            cfg,
+            &provider,
+            pc,
+            &id,
+            &repo_root,
+            worktree,
+            name_override.is_none(),
+        )?;
+        return Ok((true, None));
+    }
+
+    // Resolve the repo origin so the sprite can clone it.
     let req = envplan::detect(Path::new(worktree));
     // Host secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) carried into every provisioning
     // command so the clone authenticates against private repos and setup steps can
@@ -1736,10 +1790,22 @@ pub fn provision_provider_env_named(
     // the personal-layer setup so it's baked into the checkpoint. The daemon is
     // (re)started at connect time by the `sprite-proxy` ProxyCommand.
     let mut setup = resolve_setup(&home);
-    if pc.connect == thegn_core::config::ProviderConnect::Ssh
-        && let Ok((_key, pubkey)) = sprite_ssh_keypair()
-    {
-        setup.push(sprite_sshd_setup_script(&pubkey));
+    let managed_ssh = (pc.connect == thegn_core::config::ProviderConnect::Ssh)
+        .then(|| {
+            let account = crate::provider_factory::managed_key_account(pc);
+            managed_ssh_keypair(
+                cfg.credentials.ssh.managed_key_scope,
+                &pc.provider,
+                &account,
+            )
+            .map(|(key, public)| {
+                let custody_account = thegn_core::managed_ssh::account_label(&key);
+                (custody_account, key, public)
+            })
+        })
+        .transpose()?;
+    if let Some((_, _, pubkey)) = &managed_ssh {
+        setup.push(sprite_sshd_setup_script(pubkey));
     }
     // mosh transport: install mosh-server (else the pane falls back to plain ssh).
     if pc.transport == thegn_core::config::RemoteTransport::Mosh
@@ -2072,8 +2138,48 @@ pub fn provision_provider_env_named(
         progress(&views);
     }
 
+    // Install only after the base checkpoint step so a bearer token is never
+    // captured in a reusable image/artifact. This is a fatal provisioning
+    // boundary: route mode must not open a remote shell that could silently
+    // enqueue into a sprite-local queue.
+    crate::remote_enqueue_auth::reconcile_provider_credential(
+        cfg,
+        &provider,
+        pc,
+        &id,
+        &repo_root,
+        worktree,
+        name_override.is_none(),
+    )?;
+
     // Drop the marker (+ local mirror for the attach gate) so a later open skips it.
     let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await }); // best-effort: marker write: a failed write just re-provisions on the next open
+    if let Some((account, key, public)) = &managed_ssh {
+        // Verify that the exact key made it into the remote authorization file
+        // before publishing custody. A failed SSH setup must not become an
+        // apparently-authorized ledger row.
+        let script = format!(
+            "grep -qF -- {} \"$HOME/.ssh/authorized_keys\"",
+            thegn_core::util::sh_quote(public)
+        );
+        let argv = vec!["sh".to_string(), "-lc".to_string(), script];
+        let (code, _) =
+            block_on_provider(|| async { provider.run_exec(&id, &argv, None, &[]).await })?;
+        if code != 0 {
+            anyhow::bail!(
+                "managed SSH key was not authorized on {} sandbox {id}",
+                pc.provider
+            );
+        }
+        thegn_core::managed_ssh::record_authorized_with_proxy_worktree(
+            pc.provider.trim(),
+            account,
+            &id,
+            key,
+            public,
+            Some(worktree),
+        )?;
+    }
     crate::provider_workdir::mark_provisioned(&id);
     // Record the provisioned-base checkpoint per (repo, env), keyed by the
     // flake.lock hash so a lockfile change invalidates it (see env_base_snapshots).
@@ -2903,6 +3009,14 @@ pub fn compose_spec(
     // A provider pane lands at $HOME; prefix `cd <workdir>` so direnv/devShell load.
     let placement = sb.spec.as_ref().map(|s| &s.placement);
     let cmd = crate::provider_workdir::with_workdir_cd(choice, placement, cmd);
+    let cmd = if sb.is_remote {
+        format!(
+            "{}{cmd}",
+            crate::remote_enqueue_auth::source_prefix(worktree)
+        )
+    } else {
+        cmd
+    };
     // A projected data mode (sshfs/sync) pins the pane to its local mountpoint;
     // otherwise a local worktree runs in its own dir and a remote/provider one
     // has none — the placement cd's on the target — so the pane cwd stays unset.
@@ -3252,6 +3366,9 @@ pub fn launch_spec_full(
         saved_is_override,
         selected_env.as_deref(),
     )?;
+    if let Some(target) = outcome.route_ssh_target.as_ref() {
+        crate::remote_enqueue_auth::reconcile_ssh_credential(cfg, target, &repo_root, worktree)?;
+    }
     // NB: the resolved backend is intentionally NOT written back. `sandbox_backend`
     // is a deliberate-override store (mirrors `env_name`, sole writer = the
     // wizard's divergence check); auto-stamping it would pin every auto worktree.

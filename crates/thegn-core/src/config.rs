@@ -2621,7 +2621,9 @@ impl ManagedKeyScope {
                 })
                 .collect::<String>()
                 .trim_matches('-')
-                .to_string()
+                .chars()
+                .take(32)
+                .collect::<String>()
         };
         match self {
             ManagedKeyScope::Shared => "sprite_ed25519".to_string(),
@@ -2633,11 +2635,17 @@ impl ManagedKeyScope {
                 } else {
                     p
                 };
-                if a.is_empty() {
-                    format!("{p}_ed25519")
+                let a = if a.is_empty() {
+                    "default".to_string()
                 } else {
-                    format!("{p}-{a}_ed25519")
-                }
+                    a
+                };
+                // The readable slug alone is not an identity: `env:A/B` and
+                // `env:A-B` sanitize to the same text (and case-folding file
+                // systems add more aliases). Bind the filename to the exact,
+                // value-free provider/account tuple with a stable suffix.
+                let identity = crate::util::short_hash(&format!("{provider}\0{account}"), 16);
+                format!("{p}-{a}-{identity}_ed25519")
             }
         }
     }
@@ -2653,17 +2661,12 @@ pub struct CredentialsConfig {
     /// SSH managed-key custody.
     #[serde(skip_serializing_if = "CredentialsSshConfig::is_default")]
     pub ssh: CredentialsSshConfig,
-    /// Write a value-free JSONL audit sink under the state dir. Off by default —
-    /// the tracing events (`thegn::secret::audit`) and the doctor presence pass
-    /// are the primary trail; this is metadata only, never a secret value.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub audit_file: bool,
 }
 
 impl CredentialsConfig {
     /// True when nothing is set (so serialization skips the table).
     pub fn is_default(&self) -> bool {
-        self.ssh.is_default() && !self.audit_file
+        self.ssh.is_default()
     }
 }
 
@@ -6394,8 +6397,9 @@ impl Config {
 
     /// Warn when an untrusted repo overlay tries to install automation rules.
     /// The raw top-level table is inspected separately because
-    /// [`RepoConfigFile`] intentionally has no `automations` field, ensuring
-    /// rule content can never enter effective config even after detection.
+    /// the internal repo-config representation intentionally has no
+    /// `automations` field, ensuring rule content can never enter effective
+    /// config even after detection.
     pub fn repo_automation_warnings(&self, repo_root: &std::path::Path) -> Vec<String> {
         let Some(path) = repo_overlay_with_automations(repo_root) else {
             return Vec::new();

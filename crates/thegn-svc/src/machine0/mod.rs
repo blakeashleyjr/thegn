@@ -681,6 +681,14 @@ impl RemoteProvider for Machine0Provider {
             // leaving a permanently half-provisioned VM.
             self.ensure_provisioned(&name).await?;
             let host = vm.address.unwrap_or_default();
+            thegn_core::managed_ssh::record_authorized(
+                "machine0",
+                &thegn_core::managed_ssh::account_label(&self.spec.key_path),
+                &name,
+                &self.spec.key_path,
+                &self.spec.pubkey,
+            )
+            .context("machine0: record managed SSH key custody")?;
             Ok(SandboxHandle {
                 id: name,
                 exec: ExecKind::Ssh(SshTarget::plain(host, 22, false)),
@@ -690,16 +698,27 @@ impl RemoteProvider for Machine0Provider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+            thegn_core::managed_ssh::read("machine0", &custody_account, id)
+                .context("machine0: validate managed SSH custody before destroy")?;
             let Some(vm) = self.vm_by_name(id).await? else {
+                thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
+                    .context("machine0: retire managed SSH custody")?;
                 return Ok(()); // already gone
             };
             if vm.id.is_empty() {
+                thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
+                    .context("machine0: retire managed SSH custody")?;
                 return Ok(());
             }
             *self.endpoint.lock().unwrap() = None;
             match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
-                Ok(_) => Ok(()),
-                Err(e) if is_not_found(&e.to_string()) => Ok(()),
+                Ok(_) => thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
+                    .context("machine0: retire managed SSH custody"),
+                Err(e) if is_not_found(&e.to_string()) => {
+                    thegn_core::managed_ssh::record_revoked("machine0", &custody_account, id)
+                        .context("machine0: retire managed SSH custody")
+                }
                 Err(e) => Err(e),
             }
         })

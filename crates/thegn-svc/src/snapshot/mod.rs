@@ -18,6 +18,7 @@ pub mod s3;
 
 use anyhow::Result;
 use thegn_core::config_env_tables::{SnapshotBackend, SnapshotStoreConfig};
+use thegn_core::secretref::SecretRef;
 use thegn_core::snapshot_meta::{SnapshotKey, SnapshotManifest};
 
 pub trait SnapshotStore: Send + Sync {
@@ -36,13 +37,12 @@ pub trait SnapshotStore: Send + Sync {
     fn delete(&self, key: &SnapshotKey, id: &str) -> Result<()>;
 }
 
-/// Open the configured snapshot store. `resolve_secret` maps a secret ref
-/// (`env:VAR` / `keyring:<name>` / `file:/path` / bare env-var name) to its
-/// value — injected by the host so its keyring→file→env chain stays out of
-/// svc (and tests can stub it).
+/// Open the configured snapshot store. `resolve_secret` receives an already
+/// parsed ref and a stable consumer tag — injected by the host so the typed
+/// keyring/file/env/literal broker and its audit trail stay out of svc.
 pub fn open_store(
     cfg: &SnapshotStoreConfig,
-    resolve_secret: &dyn Fn(&str) -> Option<String>,
+    resolve_secret: &dyn Fn(&SecretRef, &str) -> Option<String>,
 ) -> Result<Box<dyn SnapshotStore>> {
     match cfg.backend {
         SnapshotBackend::Local => Ok(Box::new(fs::FsSnapshotStore::new(cfg))),

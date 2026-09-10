@@ -433,6 +433,22 @@ pub enum AgentDispatchStatus {
     Unknown,
 }
 
+/// Result of publishing an already-opened worker onto its reserved roster row.
+/// The caller owns the process, so every non-`Published` outcome is actionable:
+/// it must tear the process down rather than leave an unrecorded worker live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchRunPublishOutcome {
+    /// The queued/spawning reservation became the running worker atomically.
+    Published,
+    /// The reservation vanished while the process was opening.
+    Missing,
+    /// A concurrent supervisor moved the row; its newer verdict was preserved.
+    StateChanged {
+        /// The status that prevented publication.
+        status: AgentDispatchStatus,
+    },
+}
+
 impl AgentDispatchStatus {
     pub fn as_str(self) -> &'static str {
         match self {

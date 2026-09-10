@@ -429,6 +429,55 @@ impl FlyProvider {
     ) -> Result<(i32, String)> {
         self.shim(id).await?.run_exec(argv, cwd, env).await
     }
+
+    /// Delete the Fly app without retiring local ownership records. Reapers use
+    /// this boundary so a later route-token revocation failure leaves enough
+    /// durable state to retry the complete lifecycle safely.
+    pub async fn destroy_remote_only(&self, id: &str) -> Result<()> {
+        let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+        thegn_core::managed_ssh::read("fly", &custody_account, id)
+            .context("fly: validate managed SSH custody before destroy")?;
+        let base = self.spec.api_base();
+        let url = machines::app_url(&base, &app_name(id));
+        const ATTEMPTS: u32 = 3;
+        let mut last_status = None;
+        for attempt in 0..ATTEMPTS {
+            let resp = self
+                .client
+                .delete(&url)
+                .bearer_auth(&self.spec.token)
+                .send()
+                .await
+                .context("fly: DELETE app")?;
+            let status = resp.status();
+            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            last_status = Some(status);
+            if !crate::provider::transient_status(status) {
+                break;
+            }
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        Err(anyhow!(
+            "fly destroy {id} failed ({})",
+            last_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "no response".into())
+        ))
+    }
+
+    /// Retire local key custody and lifecycle registry only after every remote
+    /// cleanup step owned by the caller succeeded.
+    pub fn retire_destroyed(&self, id: &str) -> Result<()> {
+        let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+        thegn_core::managed_ssh::record_revoked("fly", &custody_account, id)
+            .context("fly: retire managed SSH custody")?;
+        registry::remove(id);
+        Ok(())
+    }
 }
 
 impl RemoteProvider for FlyProvider {
@@ -527,6 +576,14 @@ impl RemoteProvider for FlyProvider {
                 created_at: thegn_core::util::now(),
             })?;
             *self.ip.lock().unwrap() = Some(ip.clone());
+            thegn_core::managed_ssh::record_authorized(
+                "fly",
+                &thegn_core::managed_ssh::account_label(&self.spec.key_path),
+                &name,
+                &self.spec.key_path,
+                &self.spec.pubkey,
+            )
+            .context("fly: record managed SSH key custody")?;
             Ok(SandboxHandle {
                 id: name,
                 exec: ExecKind::Ssh(SshTarget::plain(ip, machines::SSH_PORT, false)),
@@ -536,38 +593,8 @@ impl RemoteProvider for FlyProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            // Deleting the app cascades the machine + releases the dedicated IPv4.
-            let base = self.spec.api_base();
-            let url = machines::app_url(&base, &app_name(id));
-            const ATTEMPTS: u32 = 3;
-            let mut last_status = None;
-            for attempt in 0..ATTEMPTS {
-                let resp = self
-                    .client
-                    .delete(&url)
-                    .bearer_auth(&self.spec.token)
-                    .send()
-                    .await
-                    .context("fly: DELETE app")?;
-                let status = resp.status();
-                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                    registry::remove(id);
-                    return Ok(());
-                }
-                last_status = Some(status);
-                if !crate::provider::transient_status(status) {
-                    break;
-                }
-                if attempt + 1 < ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-            Err(anyhow!(
-                "fly destroy {id} failed ({})",
-                last_status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "no response".into())
-            ))
+            self.destroy_remote_only(id).await?;
+            self.retire_destroyed(id)
         })
     }
 

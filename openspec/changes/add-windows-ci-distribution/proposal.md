@@ -5,18 +5,22 @@
 The final phase of the native Windows port is process, not behavior:
 
 - **CI promotion**: the `windows` job (windows-latest, bare rustup — no nix)
-  moves from opt-in (`[ci-windows]` marker) to **routine** on push/PR: it is
-  the msvc truth gate (workspace `cargo check --locked`) plus the
-  real-kernel semantics tests (named-pipe IPC round-trip/bind-lock, Job
-  Object terminate-/drop-reaps-tree). The per-PR Linux-side
+  is currently opt-in (`workflow_dispatch` with `extras: true`). It is the msvc
+  truth gate (workspace `cargo check --locked`) plus the real-kernel semantics
+  tests (named-pipe IPC round-trip/bind-lock, Job Object
+  terminate-/drop-reaps-tree). A dependent job downloads and smokes the
+  canonical artifact. The job must produce a recorded green run before its
+  opt-in gate is removed. The Linux-side
   `cargo check --workspace --target x86_64-pc-windows-gnu` in
   `just check-cross` remains the cheap cfg-regression gate.
-- **Distribution**: the windows job builds `--release` and uploads a
-  `thegn-x86_64-pc-windows-msvc` artifact (`thegn.exe`) from every run —
-  the native-Windows download until a tagged-release pipeline exists. The
-  documented install paths are `cargo install --path crates/thegn-host`
-  (README "Install → Windows") and the CI artifact; the dev loop is
-  CONTRIBUTING "Windows (native) notes".
+- **Distribution**: an opt-in Windows run builds `--release` and uploads a
+  `thegn-x86_64-pc-windows-msvc` artifact (`thegn.exe`), then a fresh job
+  downloads and executes it. This is not yet an advertised release channel.
+  The current documented install path is
+  `cargo install --path crates/thegn-host` (README "Install → Windows"). The
+  CI artifact is named there but explicitly unavailable until its first green
+  producer-and-consumer run; the dev loop is CONTRIBUTING "Windows (native)
+  notes".
 - **Spec sync**: the five phase changes' `platform-windows` deltas are folded
   into the new main spec `openspec/specs/platform-windows/spec.md`
   (`openspec validate --all --strict` green with the in-flight changes still
@@ -27,7 +31,8 @@ The final phase of the native Windows port is process, not behavior:
 
 ## Impact
 
-- `.github/workflows/ci.yml` (windows job routine + artifact), README
+- `.github/workflows/ci.yml` (opt-in Windows truth gate + downloaded-artifact
+  smoke), README
   (Windows install), `openspec/specs/platform-windows/spec.md` (new
   capability spec), tasks.md AX group notes.
 - No shipped-binary behavior change.

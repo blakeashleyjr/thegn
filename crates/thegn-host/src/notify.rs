@@ -47,8 +47,8 @@ pub struct NotifyState {
     /// startup ([`Self::set_toast_tx`]). `None` before wiring (or in headless tests),
     /// so an emit is a silent no-op rather than a panic.
     toast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>>>,
-    /// Bounded sender to the push-to-phone publisher worker, installed at
-    /// startup ([`Self::set_push_tx`]) only when `[notifications.push]` is
+    /// Bounded sender to the push-to-phone publisher worker, installed with
+    /// the matching notification config only when `[notifications.push]` is
     /// configured. `None` ⇒ push is unconfigured and every emit is a silent
     /// no-op. Bounded so a stalled server can never grow this without limit;
     /// overflow drops (best-effort delivery — the inbox row is the durable

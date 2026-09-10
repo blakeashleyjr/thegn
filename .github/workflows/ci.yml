@@ -393,11 +393,10 @@ jobs:
       - run: nix develop .#ci --command bash -lc "just build && just test"
   windows:
     # The msvc truth gate for the native Windows port. OPT-IN (like `macos`):
-    # dispatch, or a `[ci-windows]` commit-message marker — which is what
-    # CONTRIBUTING "Windows (native) notes" has always documented. It was
-    # briefly routine, but the port has never produced a green run, so leaving
-    # it routine just pins `main` red and hides real regressions in the Linux
-    # gates. Flip it back to routine once it passes.
+    # dispatch with `extras: true`. It was briefly routine, but the port has
+    # never produced a green run, so leaving it routine just pins `main` red
+    # and hides real regressions in the Linux gates. Flip it back to routine
+    # once it passes.
     #
     # The per-PR windows-gnu cross-*check* in `just check-cross` catches cfg
     # regressions cheaply; this job proves msvc + real-kernel semantics and
@@ -426,12 +425,43 @@ jobs:
       # Job Object semantics on a real kernel: terminate() reaps the tree and
       # dropping the last handle (KILL_ON_JOB_CLOSE) reaps it too.
       - run: "cargo test -p thegn-host --locked platform::"
-      # Distribution: a release thegn.exe from every run — the download for
-      # native Windows installs between tagged releases (release.yml ships the
-      # windows-msvc archive on `v*` tags).
+      # Distribution evidence: retain the candidate from every opt-in run.
+      # It is not an install channel and release.yml deliberately excludes
+      # windows-msvc until this producer-and-consumer gate has a recorded green
+      # run and native interactive validation is complete.
       - run: cargo build --release --locked -p thegn-host
       - uses: actions/upload-artifact@v7
         with:
           name: thegn-x86_64-pc-windows-msvc
           path: target/release/thegn.exe
           retention-days: 30
+  windows-artifact-smoke:
+    # Exercise the artifact consumers actually receive, not the build-tree
+    # executable. Keep this behind the same opt-in gate until both jobs have a
+    # recorded green run; only then may the Windows leg become routine.
+    if: ${{ inputs.extras }}
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: thegn-x86_64-pc-windows-msvc
+          path: artifact
+      - name: Smoke downloaded thegn.exe
+        shell: pwsh
+        run: |
+          $binary = Join-Path $PWD "artifact/thegn.exe"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "downloaded artifact does not contain thegn.exe"
+          }
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw "thegn.exe --version failed: $LASTEXITCODE" }
+          # Capture the complete native-process output before truncating what is
+          # printed. Ending a live native pipeline after 20 lines can close its
+          # stdout early and turn an otherwise-good smoke into a broken-pipe
+          # failure.
+          $help = & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw "thegn.exe --help failed: $LASTEXITCODE" }
+          $help | Select-Object -First 20
+          Get-FileHash -Algorithm SHA256 -LiteralPath $binary

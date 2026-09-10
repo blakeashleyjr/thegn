@@ -183,7 +183,15 @@ mod tests {
         reason = "test fixture setup is synchronous and runs no production or event-loop code"
     )]
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let status = thegn_core::util::git_cmd(dir).args(args).status().unwrap();
+        let status = thegn_core::util::git_cmd(dir)
+            // Test repositories must not inherit interactive signing from the
+            // developer's global config. A signed commit would launch pinentry
+            // in this headless test and make the suite depend on workstation
+            // credentials rather than the fixture itself.
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed");
     }
 

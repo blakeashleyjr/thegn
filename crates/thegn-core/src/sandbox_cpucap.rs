@@ -521,7 +521,7 @@ pub fn wrap_provider_pane_argv(
 ///
 /// `--scope` is the discriminator, and it is exact: the cap runs the pane in a
 /// transient *scope*, while the Systemd *backend* runs it as a transient unit
-/// (`--pty`, no `--scope`) — and [`cap_prefix`] refuses to stack on an argv that
+/// (`--pty`, no `--scope`) — and `cap_prefix` refuses to stack on an argv that
 /// already begins with `systemd-run`, so a `--scope` in this position can only
 /// be ours. Stripping therefore can never erase a real systemd sandbox.
 pub fn strip_pane_cap(argv: &[String]) -> &[String] {

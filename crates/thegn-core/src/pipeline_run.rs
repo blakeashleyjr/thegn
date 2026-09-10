@@ -357,6 +357,24 @@ pub fn wait_candidates(
     }
 }
 
+/// `base` with only its agent/tool/pipeline registries replaced from `fresh`.
+///
+/// Deliberately narrow: a long-lived daemon's boot snapshot can carry settings
+/// that must remain fixed for its lifetime. Re-reading the whole config for an
+/// agent launch would make an unrelated on-disk edit silently change sandbox,
+/// network, resource, or control-plane policy under that daemon. Only the
+/// registries consulted while resolving an agent/tool/stage are refreshed.
+pub fn with_fresh_registry(
+    base: &crate::config::Config,
+    fresh: &crate::config::Config,
+) -> crate::config::Config {
+    let mut out = base.clone();
+    out.agents = fresh.agents.clone();
+    out.tools = fresh.tools.clone();
+    out.pipeline = fresh.pipeline.clone();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +770,78 @@ mod tests {
         assert_eq!(got[0].issue_id, "linear:A-1");
         assert_eq!(got[1].stage.as_deref(), Some("review"));
         assert_eq!(got[1].issue_id, "linear:B-2");
+    }
+
+    #[test]
+    fn wait_errors_and_liveness_tokens_are_stable_operator_language() {
+        for (error, expected) in [
+            (
+                WaitSelectError::NoSuchRow(41),
+                "roster row 41 does not exist (see `thegn dispatch list`)",
+            ),
+            (
+                WaitSelectError::NotActive(42, "done"),
+                "roster row 42 is \"done\", not spawning/running",
+            ),
+            (
+                WaitSelectError::NoSession(43),
+                "roster row 43 has no session to wait on",
+            ),
+            (
+                WaitSelectError::NoneActive,
+                "no spawning or running roster row carries a live session",
+            ),
+        ] {
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert_eq!(RowLiveness::Live.token(), "live");
+        assert_eq!(
+            RowLiveness::ExitedUnverified {
+                exit_code: None,
+                since_ms: None,
+            }
+            .token(),
+            "exited-unverified"
+        );
+        assert_eq!(RowLiveness::Closed.token(), "closed");
+    }
+
+    #[test]
+    fn registry_refresh_changes_only_agent_tool_and_pipeline_registries() {
+        let mut base = crate::config::Config::default();
+        base.sandbox.enabled = false;
+        base.daemon.idle_exit_secs = 17;
+
+        let mut fresh: crate::config::Config = toml::from_str(
+            r#"
+[[agents]]
+name = "fresh-agent"
+command = "fresh-command"
+
+[[tools]]
+name = "fresh-tool"
+command = "fresh-tool-command"
+
+[[pipeline.stages]]
+name = "fresh-stage"
+agent = "fresh-agent"
+prompt = "row {row}; thegn dispatch report {row}"
+"#,
+        )
+        .expect("fresh registry config");
+        fresh.sandbox.enabled = true;
+        fresh.daemon.idle_exit_secs = 99;
+
+        let merged = with_fresh_registry(&base, &fresh);
+        assert_eq!(merged.agents.len(), 1);
+        assert_eq!(merged.agents[0].name, "fresh-agent");
+        assert_eq!(merged.tools.len(), 1);
+        assert_eq!(merged.tools[0].name, "fresh-tool");
+        assert_eq!(merged.pipeline, fresh.pipeline);
+        assert!(!merged.sandbox.enabled, "sandbox remains boot-fixed");
+        assert_eq!(
+            merged.daemon.idle_exit_secs, 17,
+            "daemon policy remains boot-fixed"
+        );
     }
 }

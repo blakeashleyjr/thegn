@@ -206,10 +206,6 @@ pub struct NetbirdConfig {
 pub struct ZerotierConfig {
     /// 16-hex network id to join.
     pub network_id: String,
-    /// Self-hosted controller/moon URL. `""` = ZeroTier's hosted controller.
-    pub controller_url: String,
-    /// API token (secrets-ref) used to auto-authorize the joining member.
-    pub api_token: String,
 }
 
 /// `[sandbox.vpn.custom]` — the open escape hatch for any tunnel not modeled

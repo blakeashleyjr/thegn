@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use thegn_core::config_env_tables::SnapshotStoreConfig;
+use thegn_core::secretref::{BareAs, SecretRef};
 use thegn_core::snapshot_meta::{SnapshotKey, SnapshotManifest};
 
 use super::SnapshotStore;
@@ -34,7 +35,7 @@ pub struct S3SnapshotStore {
 impl S3SnapshotStore {
     pub fn new(
         cfg: &SnapshotStoreConfig,
-        resolve_secret: &dyn Fn(&str) -> Option<String>,
+        resolve_secret: &dyn Fn(&SecretRef, &str) -> Option<String>,
     ) -> Result<Self> {
         let name = cfg.bucket.trim();
         if name.is_empty() {
@@ -56,11 +57,19 @@ impl S3SnapshotStore {
             .with_context(|| format!("[lifecycle.snapshot] endpoint {endpoint:?}"))?;
         let bucket = Bucket::new(endpoint, style, name.to_string(), region.to_string())
             .map_err(|e| anyhow::anyhow!("[lifecycle.snapshot] bucket config: {e}"))?;
-        let access = resolve_secret(&cfg.access_key).with_context(|| {
-            format!("snapshot store access_key ({}) unresolved", cfg.access_key)
+        let access_ref = SecretRef::parse(&cfg.access_key, BareAs::Literal);
+        let secret_ref = SecretRef::parse(&cfg.secret_key, BareAs::Literal);
+        let access = resolve_secret(&access_ref, "snapshot:s3:access-key").with_context(|| {
+            format!(
+                "snapshot store access_key ({}) unresolved",
+                access_ref.audit_name()
+            )
         })?;
-        let secret = resolve_secret(&cfg.secret_key).with_context(|| {
-            format!("snapshot store secret_key ({}) unresolved", cfg.secret_key)
+        let secret = resolve_secret(&secret_ref, "snapshot:s3:secret-key").with_context(|| {
+            format!(
+                "snapshot store secret_key ({}) unresolved",
+                secret_ref.audit_name()
+            )
         })?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -246,8 +255,8 @@ mod tests {
         }
     }
 
-    fn resolver(s: &str) -> Option<String> {
-        match s {
+    fn resolver(s: &SecretRef, _consumer: &str) -> Option<String> {
+        match s.audit_name().as_str() {
             "env:TG_TEST_S3_ACCESS" => Some("AKIATEST".into()),
             "env:TG_TEST_S3_SECRET" => Some("sekrit".into()),
             _ => None,
@@ -303,7 +312,7 @@ mod tests {
         c.bucket = String::new();
         assert!(S3SnapshotStore::new(&c, &resolver).is_err());
         let c = cfg("https://minio.local");
-        assert!(S3SnapshotStore::new(&c, &|_| None).is_err());
+        assert!(S3SnapshotStore::new(&c, &|_, _| None).is_err());
     }
 
     #[test]

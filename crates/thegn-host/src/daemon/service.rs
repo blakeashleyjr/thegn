@@ -109,6 +109,29 @@ pub(crate) fn session_identity_env(
     out
 }
 
+/// Registry confinement with an exact opaque-id fast path. Remote worktree ids
+/// are meaningful only to their location adapter, so canonicalization is
+/// reserved for aliases of rows explicitly marked local.
+fn registered_worktree_matches<F>(
+    rows: &[thegn_core::models::WorktreeRow],
+    requested: &str,
+    canonicalize: F,
+) -> bool
+where
+    F: Fn(&str) -> std::path::PathBuf,
+{
+    if rows.iter().any(|row| row.worktree == requested) {
+        return true;
+    }
+    let want = canonicalize(requested);
+    rows.iter()
+        .filter(|row| {
+            let location = row.location.trim();
+            location.is_empty() || location == "local"
+        })
+        .any(|row| canonicalize(&row.worktree) == want)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -349,20 +372,19 @@ impl DaemonService {
     /// Confine a control-plane git/merge verb to a thegn-REGISTERED worktree.
     /// The control plane must never run git against an arbitrary caller-supplied
     /// path — a token-holding remote `serve` client is not the daemon's uid — so
-    /// reject anything absent from the worktree registry (compared canonically to
-    /// tolerate trailing-slash / symlink variation). NotFound, not a hard error,
-    /// so an unknown path reads the same as a gone session.
+    /// reject anything absent from the worktree registry. Only local rows are
+    /// canonicalized to tolerate trailing-slash / symlink variation: a remote
+    /// row's path is an opaque host-canonical identifier and must never trigger
+    /// host filesystem access. NotFound, not a hard error, so an unknown path
+    /// reads the same as a gone session.
     async fn confine_worktree(&self, wt: &str) -> ControlResult<()> {
-        let canon =
-            |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
-        let want = canon(wt);
+        let requested = wt.to_string();
         let known = self
             .with_db(move |db| {
                 use thegn_core::store::WorkspaceStore;
-                Ok(db.worktrees()?.into_iter().any(|r| {
-                    std::fs::canonicalize(&r.worktree)
-                        .unwrap_or_else(|_| std::path::PathBuf::from(&r.worktree))
-                        == want
+                let rows = db.worktrees()?;
+                Ok(registered_worktree_matches(&rows, &requested, |path| {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
                 }))
             })
             .await?;
@@ -461,7 +483,7 @@ impl ControlApi for DaemonService {
                         // not after a restart. The snapshot is the fallback
                         // when the file no longer loads. Both the retained
                         // recipe and the actual resolution use this same cfg.
-                        let fresh = crate::config_source::fresh();
+                        let fresh = crate::config_source::fresh(&snapshot);
                         let cfg = fresh.as_ref().unwrap_or(&snapshot);
                         super::agent_open::ensure_configured_agent(cfg, &launch.agent)?;
                         let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
@@ -1101,11 +1123,33 @@ impl ControlApi for DaemonService {
 
     fn merge_add<'a>(&'a self, worktree: &'a str) -> BoxFuture<'a, ControlResult<String>> {
         Box::pin(async move {
-            self.confine_worktree(worktree).await?;
             let wt = worktree.to_string();
             let cfg = self.config.clone();
+            let lookup = wt.clone();
+            let registered = self
+                .with_db(move |db| crate::merge_ops::registered_remote_worktree(db, &lookup))
+                .await?;
+            if let Some(registered) = registered {
+                // Resolve provider/SSH Git state without holding the daemon DB
+                // mutex, then atomically re-check the registry facts before the
+                // host-owned queue row is written.
+                let prepared = tokio::task::spawn_blocking({
+                    let cfg = cfg.clone();
+                    move || crate::merge_ops::prepare_remote_enqueue(&cfg, registered)
+                })
+                .await
+                .map_err(|e| ControlError::Internal(anyhow::anyhow!("merge task join: {e}")))?
+                .map_err(|e| ControlError::FailedPrecondition(format!("{e:#}")))?;
+                return self
+                    .with_db(move |db| crate::merge_ops::commit_remote_enqueue(&cfg, db, &prepared))
+                    .await;
+            }
+            // Exact remote lookup deliberately precedes local confinement. A
+            // local row (or local path alias) still goes through canonical
+            // membership checking before any Git command is allowed.
+            self.confine_worktree(worktree).await?;
             // Fresh DB handle (like the CLI) so we don't hold the daemon's shared
-            // db lock across the git subprocesses `enqueue_worktree` runs.
+            // db lock across the local git subprocesses `enqueue_worktree` runs.
             tokio::task::spawn_blocking(move || {
                 let db = thegn_core::db::Db::open()?;
                 crate::merge_ops::enqueue_worktree(&cfg, &db, std::path::Path::new(&wt))
@@ -1545,7 +1589,7 @@ impl ControlApi for DaemonService {
             let worktree_for_resolve = worktree.clone();
             let launch = self
                 .with_db(move |db| {
-                    let fresh = crate::config_source::fresh();
+                    let fresh = crate::config_source::fresh(&snapshot);
                     let cfg = fresh.as_ref().unwrap_or(&snapshot);
                     super::agent_open::resolve_tool(cfg, db, &worktree_for_resolve, &name)
                 })
@@ -1965,6 +2009,204 @@ mod tests {
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
+    }
+
+    #[test]
+    fn exact_remote_registry_id_is_accepted_without_host_path_resolution() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        let remote_id = "/provider-only/worktree-that-is-absent-on-host";
+        db.put_worktree(
+            "repo/feature",
+            "/host/repo",
+            remote_id,
+            "feature",
+            Some(r#"{"kind":"provider","control":["provider-exec"],"path":"/workspace"}"#),
+            None,
+        )
+        .unwrap();
+        let rows = db.worktrees().unwrap();
+        assert!(registered_worktree_matches(&rows, remote_id, |_| {
+            panic!("exact remote ids must bypass host canonicalization")
+        }));
+    }
+
+    #[test]
+    fn explicit_local_registry_rows_accept_canonical_aliases() {
+        use thegn_core::store::WorkspaceStore;
+
+        let db = Db::open_memory().unwrap();
+        db.put_worktree(
+            "repo/feature",
+            "/host/repo",
+            "/host/repo-feature",
+            "feature",
+            Some("local"),
+            None,
+        )
+        .unwrap();
+        let rows = db.worktrees().unwrap();
+        assert!(registered_worktree_matches(
+            &rows,
+            "/host/repo-feature/",
+            |path| std::path::PathBuf::from(path.trim_end_matches('/')),
+        ));
+    }
+
+    /// A real route-to-host request crosses the TCP HTTP client, router, and
+    /// daemon-service boundary used by a provisioned environment.
+    /// The caller's checkout and DB remain distinct: only the host DB owns the
+    /// queue row, while the eventual host drain ingests the remote branch tip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_to_host_client_enqueues_and_drains_on_the_authoritative_host() {
+        use thegn_core::remote::GitLoc;
+        use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+        use thegn_svc::control::client::{ControlAddr, ControlClient};
+
+        #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let output = thegn_core::util::git_cmd(dir).args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn init_repo(path: &std::path::Path) {
+            std::fs::create_dir_all(path).unwrap();
+            git(path, &["init", "-q", "-b", "main"]);
+            git(path, &["config", "user.name", "Thegn Test"]);
+            git(path, &["config", "user.email", "thegn@example.invalid"]);
+            git(path, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(path.join("base.txt"), "base\n").unwrap();
+            git(path, &["add", "-A"]);
+            git(path, &["commit", "-q", "-m", "base"]);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let host_repo = temp.path().join("host-repo");
+        let remote_repo = temp.path().join("remote-repo");
+        init_repo(&host_repo);
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                &host_repo.to_string_lossy(),
+                &remote_repo.to_string_lossy(),
+            ],
+        );
+        git(&remote_repo, &["config", "user.name", "Thegn Test"]);
+        git(
+            &remote_repo,
+            &["config", "user.email", "thegn@example.invalid"],
+        );
+        git(&remote_repo, &["config", "commit.gpgsign", "false"]);
+        git(&remote_repo, &["checkout", "-q", "-b", "feat/transport"]);
+        std::fs::write(remote_repo.join("remote.txt"), "through transport\n").unwrap();
+        git(&remote_repo, &["add", "-A"]);
+        git(&remote_repo, &["commit", "-q", "-m", "remote"]);
+
+        let remote_id = temp
+            .path()
+            .join("opaque-host-id")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!std::path::Path::new(&remote_id).exists());
+        let remote_db = Db::open_at(&temp.path().join("remote.db")).unwrap();
+        let location = GitLoc::provider_db_string(&["env".into()], &remote_repo.to_string_lossy());
+        let mut config = thegn_core::config::Config::default();
+        config.merge_queue.organize_folders = false;
+        config.merge_queue.gate_command.clear();
+        let (svc, _events) = service_with_config(0, config.clone());
+        svc.db
+            .lock()
+            .unwrap()
+            .put_worktree(
+                "repo/feat-transport",
+                &host_repo.to_string_lossy(),
+                &remote_id,
+                "feat/transport",
+                Some(&location),
+                None,
+            )
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = listener.local_addr().unwrap();
+        let svc = Arc::new(svc);
+        let now = thegn_core::util::now().saturating_mul(1_000);
+        let minted = thegn_svc::control::auth::mint(
+            thegn_core::control::TokenKind::Control,
+            thegn_core::control::ScopeSet::of(&[thegn_core::control::Scope::MergeAdd]),
+            &thegn_core::control::RouteToHostTokenBinding {
+                owner: "integration-test".into(),
+                worktree: remote_id.clone(),
+            }
+            .label(),
+            None,
+            Some(now + 60_000),
+            now,
+        );
+        svc.db.lock().unwrap().put_pairing(&minted.row).unwrap();
+        let state = thegn_svc::control::http::ControlState {
+            api: svc.clone(),
+            store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+            local_admin: false,
+            daemon_euid: None,
+            require_approval: false,
+            server_label: "test thegn".into(),
+            cors_origins: Vec::new(),
+        };
+        let app = thegn_svc::control::http::router(state);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let reply = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{control_addr}"),
+            token: minted.token,
+        })
+        .merge_add(&remote_id)
+        .await
+        .expect("remote client enqueue through the real handler");
+        assert_eq!(reply["queued"], true);
+        assert_eq!(reply["message"], "queued feat/transport");
+        let rows = svc.db.lock().unwrap().list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].worktree, remote_id);
+        assert_eq!(rows[0].location, location);
+        assert!(remote_db.list_merge_queue().unwrap().is_empty());
+
+        let item = crate::merge_driver::QueueItem {
+            worktree: rows[0].worktree.clone(),
+            branch: rows[0].branch.clone(),
+            location: rows[0].location.clone(),
+            agent_attempts: rows[0].agent_attempts,
+        };
+        let outcome = crate::merge_driver::drive_queue(
+            &config.merge_queue,
+            &config,
+            &host_repo,
+            &svc.db.lock().unwrap(),
+            vec![item],
+            |_| {},
+        );
+        assert_eq!(outcome.landed, vec!["feat/transport"]);
+        assert_eq!(
+            std::fs::read_to_string(host_repo.join("remote.txt")).unwrap(),
+            "through transport\n"
+        );
+        assert_eq!(
+            svc.db.lock().unwrap().list_merge_queue().unwrap()[0].status,
+            "landed"
+        );
+        assert!(remote_db.list_merge_queue().unwrap().is_empty());
+
+        server.abort();
     }
 
     fn leases(svc: &DaemonService) -> Vec<LeaseRow> {
@@ -2627,6 +2869,60 @@ mod tests {
         }
     }
 
+    /// Keep the public observer vocabulary honest by driving every actual
+    /// daemon producer rather than merely constructing each frame variant.
+    /// Session creation/exit supplies `sessions` + `exit`, an agent-bearing
+    /// PTY supplies `activity`, and the service lifecycle methods supply
+    /// `lease` + `pairing`; together they must equal the advertised set.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn advertised_observer_kinds_are_emitted_by_real_daemon_producers() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("claude");
+        let sh = thegn_core::util::which_path("sh").expect("shell on test host");
+        std::fs::copy(sh, &agent).expect("agent-named shell fixture");
+
+        let mut config = thegn_core::config::Config::default();
+        config.activity.spawn_grace_secs = 0.0;
+        let (svc, mut rx) = service_with_config(0, config);
+        let profile_root = svc.profile_root.clone();
+        let session = svc
+            .open(OpenSpec {
+                argv: vec![
+                    agent.to_string_lossy().into_owned(),
+                    "-c".into(),
+                    "printf 'agent output\\n'; sleep 0.2; exit 0".into(),
+                ],
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            })
+            .await
+            .expect("open agent-bearing producer fixture");
+        svc.on_session_idle(&session.id).await;
+        svc.publish_pairing("p1", "phone", "read", PairingState::Requested);
+
+        let expected: std::collections::BTreeSet<&str> = thegn_core::control_wire::OBSERVER_KINDS
+            .iter()
+            .copied()
+            .collect();
+        let mut observed = std::collections::BTreeSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while observed != expected && std::time::Instant::now() < deadline {
+            if let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+                && expected.contains(frame.kind())
+            {
+                observed.insert(frame.kind());
+            }
+        }
+        assert_eq!(
+            observed, expected,
+            "every advertised observer kind must come from a real daemon producer"
+        );
+        let _ = std::fs::remove_dir_all(profile_root);
+    }
+
     /// The daemon WS warm-attach pipeline, end to end and in process: a real
     /// `DaemonService` behind the real axum router on a real unix socket,
     /// attached through the real `ControlClient` WS path. Locks the seq
@@ -3026,6 +3322,89 @@ mod tests {
             other => panic!("fresh configured agent must retain a harness plan: {other:?}"),
         }
         svc.kill(&source_id).await.expect("kill source");
+    }
+
+    /// THE-121: `session open --stage` is headless, so it never reaches the
+    /// compositor's PTY drain. The daemon event observer must stamp both a clean
+    /// and a failed headless process exit, with duplicate observers remaining
+    /// harmless.
+    #[tokio::test]
+    async fn daemon_session_exit_stamps_a_headless_dispatch_once() {
+        use crate::daemon::pipeline_retry;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use thegn_core::store::NotificationStore;
+
+        let (svc, rx) = service(0);
+        let (row_id, failed_row_id) = {
+            let db = svc.db.lock().unwrap();
+            let id = db
+                .put_agent_dispatch(NewDispatch {
+                    session_id: Some("s-headless"),
+                    stage: Some("code"),
+                    ..NewDispatch::new("linear:THE-121", "/wt/121", "claude")
+                })
+                .unwrap();
+            db.update_dispatch_status(id, St::Running).unwrap();
+            let failed = db
+                .put_agent_dispatch(NewDispatch {
+                    session_id: Some("s-headless-failed"),
+                    stage: Some("code"),
+                    ..NewDispatch::new("linear:THE-121", "/wt/122", "claude")
+                })
+                .unwrap();
+            db.update_dispatch_status(failed, St::Running).unwrap();
+            (id, failed)
+        };
+        let svc = Arc::new(svc);
+        pipeline_retry::spawn(svc.clone(), rx);
+        svc.emit(EventFrame::SessionExit {
+            session: "s-headless".into(),
+            code: Some(0),
+        });
+        svc.emit(EventFrame::SessionExit {
+            session: "s-headless-failed".into(),
+            code: Some(9),
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (first, failed) = loop {
+            let (row, failed) = {
+                let db = svc.db.lock().unwrap();
+                (
+                    db.get_dispatch(row_id).unwrap().unwrap(),
+                    db.get_dispatch(failed_row_id).unwrap().unwrap(),
+                )
+            };
+            if row.exited_at_ms.is_some() && failed.exited_at_ms.is_some() {
+                break (row, failed);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exit was not stamped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(first.exit_code, Some(0));
+        assert_eq!(first.status, St::Running, "exit is not a verdict");
+        assert_eq!(failed.exit_code, Some(9));
+        assert_eq!(failed.status, St::Running, "exit is not a verdict");
+
+        // Model the adopted-pane observer seeing the same event after the
+        // daemon observer. The first observation is the durable exit fact.
+        svc.db
+            .lock()
+            .unwrap()
+            .stamp_dispatch_exit(row_id, Some(9))
+            .unwrap();
+        let repeated = svc
+            .db
+            .lock()
+            .unwrap()
+            .get_dispatch(row_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.exit_code, Some(0));
+        assert_eq!(repeated.exited_at_ms, first.exited_at_ms);
     }
 
     /// The transport-retry observer's contract (THE-86), driven as a stub: a

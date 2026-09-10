@@ -59,6 +59,25 @@ pub(crate) fn migrate_v40(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v68: preserve the actual TCP bind address and persist the separately
+/// advertised public origin used by off-host route clients.
+pub(crate) fn migrate_v68(conn: &Connection) -> Result<()> {
+    let has_control_origin: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('daemons') WHERE name = 'control_origin')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_control_origin {
+        conn.execute("ALTER TABLE daemons ADD COLUMN control_origin TEXT", [])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_v68_schema(conn: &Connection) -> Result<()> {
+    conn.prepare("SELECT tcp_addr, control_origin FROM daemons LIMIT 0")?;
+    Ok(())
+}
+
 fn daemon_row(r: &Row<'_>) -> rusqlite::Result<DaemonRow> {
     Ok(DaemonRow {
         daemon_id: r.get(0)?,
@@ -66,15 +85,15 @@ fn daemon_row(r: &Row<'_>) -> rusqlite::Result<DaemonRow> {
         scope: r.get(2)?,
         endpoint: r.get(3)?,
         tcp_addr: r.get(4)?,
-        hostname: r.get(5)?,
-        version: r.get(6)?,
-        started_at: r.get(7)?,
-        heartbeat_at: r.get(8)?,
+        control_origin: r.get(5)?,
+        hostname: r.get(6)?,
+        version: r.get(7)?,
+        started_at: r.get(8)?,
+        heartbeat_at: r.get(9)?,
     })
 }
 
-const DAEMON_COLS: &str =
-    "daemon_id, pid, scope, endpoint, tcp_addr, hostname, version, started_at, heartbeat_at";
+const DAEMON_COLS: &str = "daemon_id, pid, scope, endpoint, tcp_addr, control_origin, hostname, version, started_at, heartbeat_at";
 
 fn lease_row(r: &Row<'_>) -> rusqlite::Result<LeaseRow> {
     Ok(LeaseRow {
@@ -113,14 +132,15 @@ impl ControlStore for Db {
     fn put_daemon(&self, row: &DaemonRow) -> Result<()> {
         self.conn().execute(
             "INSERT OR REPLACE INTO daemons \
-             (daemon_id, pid, scope, endpoint, tcp_addr, hostname, version, started_at, heartbeat_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (daemon_id, pid, scope, endpoint, tcp_addr, control_origin, hostname, version, started_at, heartbeat_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 row.daemon_id,
                 row.pid,
                 row.scope,
                 row.endpoint,
                 row.tcp_addr,
+                row.control_origin,
                 row.hostname,
                 row.version,
                 row.started_at,
@@ -331,6 +351,7 @@ mod tests {
             scope: scope.into(),
             endpoint: format!("/run/{id}.sock"),
             tcp_addr: None,
+            control_origin: None,
             hostname: "testhost".into(),
             version: "0.0-test".into(),
             started_at: 1_000,
@@ -384,6 +405,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn pre_v68_daemon_registry_gains_distinct_control_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thegn.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daemons (
+                    daemon_id TEXT PRIMARY KEY, pid INTEGER NOT NULL,
+                    scope TEXT NOT NULL, endpoint TEXT NOT NULL, tcp_addr TEXT,
+                    hostname TEXT NOT NULL, version TEXT NOT NULL DEFAULT '',
+                    started_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL
+                 );
+                 INSERT INTO daemons VALUES
+                    ('old', 1, '/state', '/run/thegn.sock', '127.0.0.1:8484',
+                     'host', 'old', 1, 2);
+                 PRAGMA user_version = 67;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        let rows = db.daemons().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tcp_addr.as_deref(), Some("127.0.0.1:8484"));
+        assert_eq!(rows[0].control_origin, None);
+        let version: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
     }
 
     #[test]
@@ -528,6 +582,8 @@ mod tests {
     fn migration_is_idempotent() {
         let db = Db::open_memory().unwrap();
         super::migrate_v40(db.conn()).expect("re-migrate");
+        super::migrate_v68(db.conn()).expect("re-migrate v68");
+        super::verify_v68_schema(db.conn()).expect("verify v68");
         db.put_daemon(&daemon("d", "/s", 1)).unwrap();
         assert_eq!(db.daemons().unwrap().len(), 1);
     }
