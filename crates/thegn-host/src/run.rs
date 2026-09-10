@@ -11458,16 +11458,22 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::VanishedTabs(result) => {
+                    let gone: Vec<&str> = result.paths.iter().map(String::as_str).collect();
+                    let landing = crate::handlers::worktree_delete::Landing::plan(
+                        &model, &session, &sb, &gone,
+                    );
                     if crate::merge_lifecycle::apply_vanished_tabs(
                         &mut session,
                         &mut panes,
                         &result.paths,
+                        &landing,
                     ) {
                         model.status = format!(
                             "Worktree dir gone: {} — removed from session",
                             result.paths.join(", ")
                         );
                         refresh_tab_model(&mut model, &session, &mut sb);
+                        landing.place_cursor(&mut model, &mut sb);
                         need_relayout = true;
                         dirty = true;
                         want_model_refresh = true;

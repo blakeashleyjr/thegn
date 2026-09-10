@@ -319,11 +319,14 @@ pub(crate) fn spawn_reconcile_removed_tabs(
 
 /// Apply an off-loop vanished-tab result. This is intentionally pure with
 /// respect to the filesystem and SQLite: it only removes pane/session objects,
-/// queues the resulting layout cache write, and restores focus by group name.
+/// queues the resulting layout cache write, and restores focus by group name —
+/// or, when the active group itself vanished, lands per `landing` (planned by
+/// the caller against the pre-removal sidebar rows).
 pub(crate) fn apply_vanished_tabs(
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
     paths: &[String],
+    landing: &crate::handlers::worktree_delete::Landing,
 ) -> bool {
     let gone = vanished_group_indices(session, paths);
     if gone.is_empty() {
@@ -342,10 +345,11 @@ pub(crate) fn apply_vanished_tabs(
             panes.table.remove(&id);
         }
     }
-    if let Some(name) = prior
-        && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
-    {
-        session.switch_to(idx);
+    match prior.and_then(|name| session.worktrees.iter().position(|g| g.name == name)) {
+        Some(idx) => session.switch_to(idx),
+        // The active group was reaped: its visual neighbour, not the home row
+        // `prune_vanished_group` parked focus on.
+        None => landing.land(session),
     }
     let snapshot = session.layout_snapshot(&session.id, crate::run::now_secs());
     crate::db_task::persist(move |db| {

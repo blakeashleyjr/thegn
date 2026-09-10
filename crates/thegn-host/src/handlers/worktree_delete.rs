@@ -94,10 +94,6 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         return;
     }
 
-    // Capture the *name* of the active group before deletion, because its
-    // index will shift as groups below it are removed.
-    let active_group_name = cx.session.active_group().map(|g| g.name.clone());
-
     // Capture the groups and worktree paths being closed BEFORE the loop shifts indices, so
     // we can optimistically drop their merge-queue rows from the in-memory model
     // (the authoritative DB delete happens in `forget_worktree_group`; this keeps
@@ -139,30 +135,17 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
         }
     });
 
-    // Close from the highest index down so earlier indices stay valid.
+    // Plan the landing against the rows still on screen, then close from the
+    // highest index down so earlier indices stay valid.
+    let removed: Vec<&str> = removed_paths.iter().map(String::as_str).collect();
+    let landing = Landing::plan(cx.model, cx.session, cx.sb, &removed);
     targets.sort_unstable_by(|a, b| b.cmp(a));
+    let mut active_removed = false;
     for gi in targets {
-        if gi < cx.session.worktrees.len() {
-            for tab in &cx.session.worktrees[gi].tabs {
-                for id in tab.center.pane_ids() {
-                    cx.panes.table.remove(&id);
-                }
-            }
-            cx.session.switch_to(gi);
-            cx.session.close_active_group();
-        }
+        active_removed |= remove_group(cx.session, cx.panes, gi);
     }
-
-    // Restore focus to the group that was active before the bulk close (if it
-    // survived). If it was closed, `close_active_group()` already clamped.
-    if let Some(target_name) = active_group_name
-        && let Some(new_idx) = cx
-            .session
-            .worktrees
-            .iter()
-            .position(|g| g.name == target_name)
-    {
-        cx.session.switch_to(new_idx);
+    if active_removed {
+        landing.land(cx.session);
     }
 
     cx.model
@@ -182,7 +165,7 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
             session_end_errors.join("; ")
         );
     }
-    cx.sb.focus_active_row(cx.model);
+    landing.place_cursor(cx.model, cx.sb);
     *cx.need_relayout = true;
     if let Some(dir) = crate::run::active_cwd(cx.session) {
         cx.drawer_runtime
@@ -268,16 +251,7 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
     perform_delete(&mut cx, targets);
 }
 
-/// Delete `targets` from disk (keep_files = false) and rebuild sidebar/drawer
-/// state, preserving focus across index shifts by stable group name.
-/// `delete_groups` sorts targets descending internally, so no pre-sort here.
-///
-/// Focus landing (when the active worktree is itself deleted): move to the
-/// **next** worktree within the same workspace in sidebar-visual order — or the
-/// **previous** one when the deleted worktree was last — mirroring
-/// `NextWorktree` navigation. `landing_for_slug` (home-first, then global) is
-/// only the last-resort fallback for edge cases where that neighbor can't be
-/// resolved (collapsed workspace, terminal-active, cross-workspace).
+/// Delete `targets` from disk (keep_files = false).
 fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     confirm_delete_worktrees(cx, targets, false, false);
 }
@@ -285,47 +259,19 @@ fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
 /// The `ConfirmDeleteWorktrees` menu-Pick path from `run.rs`: same body as
 /// `perform_delete` but honoring the chooser's `keep_files` (Close-keeps-files
 /// vs delete-from-disk). Exposed so the loop's confirm arm delegates here
-/// instead of re-inlining `delete_groups` + refresh with a weaker re-pin (which
-/// stranded focus on a surviving-but-wrong group → splash over a live pane).
+/// instead of re-inlining `delete_groups` + refresh.
+///
+/// This only *schedules* the teardown: the groups stay in the session until the
+/// destroy worker reports success, so neither focus nor the sidebar cursor
+/// moves here. The landing happens when the group actually leaves —
+/// `worktree_lifecycle::apply_completions` plans a [`Landing`] against the rows
+/// on screen at that moment.
 pub(crate) fn confirm_delete_worktrees(
     cx: &mut DeleteCtx<'_>,
     targets: Vec<usize>,
     keep_files: bool,
     force: bool,
 ) {
-    // Remember the active group's name AND workspace slug up front: `delete_groups`
-    // removes groups and leaves `session.active` pointing at whatever slid into the
-    // deleted slot — which may be a Terminal.
-    let active_name = cx.session.active_group().map(|g| g.name.clone());
-    let active_slug = active_name
-        .as_deref()
-        .and_then(|n| crate::sidebar::split_tab(n).map(|(s, _)| s));
-
-    // Compute the neighbor to land on BEFORE deleting (the pre-delete
-    // `sidebar_rows` still reflect the on-screen order; `refresh_tab_model` runs
-    // later). Confine to the active workspace's slug so we never cross into
-    // another workspace, exactly like the `NextWorktree` handler. Capture the
-    // neighbor as a stable name because `delete_groups` shifts indices.
-    let neighbor_name = {
-        let order: Vec<usize> = crate::run::sidebar_worktree_order(cx.model)
-            .into_iter()
-            .filter(|&g| {
-                cx.session
-                    .worktrees
-                    .get(g)
-                    .and_then(|w| crate::sidebar::split_tab(&w.name).map(|(s, _)| s))
-                    .as_deref()
-                    == active_slug.as_deref()
-            })
-            .collect();
-        let deleted: std::collections::HashSet<usize> = targets.iter().copied().collect();
-        order
-            .iter()
-            .position(|&g| g == cx.session.active)
-            .and_then(|pos| next_or_prev(&order, pos, &deleted))
-            .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
-    };
-
     cx.model.status = crate::run::delete_groups_with_mode(
         cx.session,
         cx.panes,
@@ -334,31 +280,164 @@ pub(crate) fn confirm_delete_worktrees(
         crate::worktree_lifecycle::mode_for_user(force, false),
         Some(cx.waker.clone()),
     );
-    // Restore focus: (a) keep the still-living active group (it survived the
-    // delete); (b) if it was deleted, land on the next/prev worktree in the same
-    // workspace (sidebar-visual order); (c) fall back to the workspace home, then
-    // the first non-terminal group anywhere.
-    let target = active_name
-        .as_deref()
-        .and_then(|name| cx.session.worktrees.iter().position(|g| g.name == name))
-        .or_else(|| {
-            neighbor_name
-                .as_deref()
-                .and_then(|name| cx.session.worktrees.iter().position(|g| g.name == name))
-        })
-        .or_else(|| landing_for_slug(cx.session, active_slug.as_deref()));
-    if let Some(idx) = target {
-        cx.session.switch_to(idx);
-    }
-
     cx.sb.marked.clear();
     crate::run::refresh_tab_model(cx.model, cx.session, cx.sb);
-    cx.sb.focus_active_row(cx.model);
     *cx.need_relayout = true;
-    if let Some(dir) = crate::run::active_cwd(cx.session) {
-        cx.drawer_runtime
-            .reconcile(cx.cfg, &dir, cx.panes, cx.center);
+}
+
+/// Where focus goes when worktree rows leave the tree, planned against the
+/// PRE-removal sidebar rows — the order the user was looking at.
+///
+/// The removal primitive (`switch_to` + `close_active_group`) lands the active
+/// pointer on whatever slid into the freed *session* slot, and session order is
+/// not display order (sort, pins, folders, home-first), so on screen that read
+/// as a jump to a random row — often the home row at the very top — and
+/// `focus_active_row` then dragged a focused cursor there too. Instead:
+///
+/// - a surviving active worktree stays active ([`remove_group`] re-pins it by
+///   name), whichever worktree was removed;
+/// - a removed active worktree hands focus to its **next** visible worktree in
+///   the same workspace, else the **previous** one — the `NextWorktree` rule —
+///   with [`landing_for_slug`] as the last resort (row not visible, no live
+///   neighbour);
+/// - a focused cursor that sat on a removed row moves to that row's neighbour
+///   by the same rule; anywhere else, `SidebarState::rebuild`'s identity
+///   re-anchor keeps it on its row. An unfocused cursor follows the active row
+///   as it always does.
+#[derive(Debug, Default)]
+pub(crate) struct Landing {
+    /// Group name of the active row's surviving live neighbour.
+    active: Option<String>,
+    /// The active worktree's workspace slug, for the fallback.
+    slug: Option<String>,
+    /// `pin_key` of the row a focused cursor on a removed row moves to.
+    cursor: Option<String>,
+}
+
+impl Landing {
+    /// Plan against `model.sidebar_rows` as currently built for `session`,
+    /// before any of the worktrees at `removed` (paths) leave it.
+    pub(crate) fn plan(
+        model: &crate::chrome::FrameModel,
+        session: &crate::session::Session,
+        sb: &crate::run::SidebarState,
+        removed: &[&str],
+    ) -> Self {
+        use crate::sidebar::{RowKind, RowTarget, SidebarRow};
+        let rows: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
+        let gone = |r: &SidebarRow| {
+            r.worktree_path
+                .as_deref()
+                .is_some_and(|p| removed.contains(&p))
+        };
+        // The nearest surviving worktree row of `at`'s workspace that passes
+        // `keep`: after `at` first, else before it.
+        let neighbour = |at: usize, keep: &dyn Fn(&SidebarRow) -> bool| {
+            let slug = &rows[at].workspace_slug;
+            let order: Vec<usize> = (0..rows.len())
+                .filter(|&i| {
+                    i == at
+                        || (rows[i].kind == RowKind::Worktree
+                            && &rows[i].workspace_slug == slug
+                            && keep(rows[i]))
+                })
+                .collect();
+            let deleted: std::collections::HashSet<usize> =
+                order.iter().copied().filter(|&i| gone(rows[i])).collect();
+            let pos = order.iter().position(|&i| i == at)?;
+            next_or_prev(&order, pos, &deleted)
+        };
+
+        let active_group = session.active_group();
+        let slug = active_group.and_then(|g| crate::sidebar::split_tab(&g.name).map(|(s, _)| s));
+        // Resolved by path, not by the row's group index: a batch of worker
+        // completions removes several groups against one plan, and the rows'
+        // `Tab(gi, _)` indices go stale after the first.
+        let active = active_group
+            .filter(|g| !g.path.is_empty() && removed.contains(&g.path.as_str()))
+            .and_then(|g| {
+                rows.iter().position(|r| {
+                    r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some(&g.path)
+                })
+            })
+            .and_then(|at| neighbour(at, &|r| matches!(r.tab_target, Some(RowTarget::Tab(..)))))
+            .and_then(|i| rows[i].worktree_path.as_deref())
+            .and_then(|p| session.worktrees.iter().find(|g| g.path == p))
+            .map(|g| g.name.clone());
+        let cursor = Some(sb.cursor)
+            .filter(|&c| sb.focused && rows.get(c).is_some_and(|r| gone(r)))
+            .and_then(|c| neighbour(c, &|_| true))
+            .map(|i| rows[i].pin_key.clone())
+            .filter(|k| !k.is_empty());
+        Self {
+            active,
+            slug,
+            cursor,
+        }
     }
+
+    /// Re-point `session.active` after the active worktree was removed.
+    pub(crate) fn land(&self, session: &mut crate::session::Session) {
+        let target = self
+            .active
+            .as_deref()
+            .and_then(|name| session.worktrees.iter().position(|g| g.name == name))
+            .or_else(|| landing_for_slug(session, self.slug.as_deref()));
+        if let Some(idx) = target {
+            session.switch_to(idx);
+        }
+    }
+
+    /// Seat a focused cursor that sat on a removed row on the planned
+    /// neighbour. Call after the rows are rebuilt.
+    pub(crate) fn place_cursor(
+        &self,
+        model: &mut crate::chrome::FrameModel,
+        sb: &mut crate::run::SidebarState,
+    ) {
+        if !sb.focused {
+            return;
+        }
+        if let Some(key) = &self.cursor
+            && let Some(idx) = model
+                .sidebar_rows
+                .iter()
+                .filter(|r| r.visible)
+                .position(|r| &r.pin_key == key)
+        {
+            sb.cursor = idx;
+            sb.sync(model);
+        }
+    }
+}
+
+/// Remove group `gi` from the session, reaping its panes, WITHOUT moving focus
+/// off a surviving active group. Returns whether the removed group was the
+/// active one — the caller's cue to [`Landing::land`].
+pub(crate) fn remove_group(
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    gi: usize,
+) -> bool {
+    let Some(group) = session.worktrees.get(gi) else {
+        return false;
+    };
+    for tab in &group.tabs {
+        for id in tab.center.pane_ids() {
+            panes.table.remove(&id);
+        }
+    }
+    let was_active = gi == session.active;
+    let prior = session.active_group().map(|g| g.name.clone());
+    session.switch_to(gi);
+    session.close_active_group();
+    if !was_active
+        && let Some(name) = prior
+        && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
+    {
+        session.switch_to(idx);
+    }
+    was_active
 }
 
 /// Given worktree group indices in sidebar-visual order (`order`), the position
