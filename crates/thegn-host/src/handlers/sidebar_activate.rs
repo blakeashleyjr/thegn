@@ -172,15 +172,13 @@ pub(crate) fn activate_row_target(
             }
         }
     }
-    // When activating a tab via the sidebar, focus the leftmost visible pane
-    // if the tab has more than one pane open.
+    // The tab keeps the pane you left focused — and, when it is zoomed, the
+    // pane you left zoomed. Only a focus id that no longer names a pane in the
+    // tab is repaired, to the leftmost visible one. (This used to reset focus
+    // to the leftmost pane on EVERY activation, so a zoomed worktree came back
+    // zoomed on its first pane.)
     if let Some(tab) = session.active_tab_mut() {
-        let layout = tab.center.layout(center);
-        if layout.len() > 1
-            && let Some((id, _)) = layout.iter().min_by_key(|(_, r)| r.x)
-        {
-            tab.focused_pane = *id;
-        }
+        repair_stale_focus(tab, center);
     }
     if pure_focus {
         crate::handlers::switch::refresh_tab_model_switch(model, session, sb);
@@ -202,6 +200,17 @@ pub(crate) fn activate_row_target(
         persist_active_focus(session);
     }
     workspace_switched
+}
+
+/// Point a tab whose `focused_pane` no longer names one of its panes at the
+/// leftmost visible pane; a valid focus is left exactly as the user left it.
+pub(crate) fn repair_stale_focus(tab: &mut crate::session::Tab, center: Rect) {
+    if tab.center.pane_ids().contains(&tab.focused_pane) {
+        return;
+    }
+    if let Some((id, _)) = tab.center.layout(center).iter().min_by_key(|(_, r)| r.x) {
+        tab.focused_pane = *id;
+    }
 }
 
 #[cfg(test)]
