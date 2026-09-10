@@ -1944,12 +1944,17 @@ fn compose_row_lines(
                 };
                 right.push(seg(tone, format!("{marker}:{}", preview.port)));
             }
-            // Compact open-PR chip (⬡N) — the full `PR #N` moves to the detail line.
+            // Compact open-PR chip (⬡ N) — the full `PR #N` moves to the detail
+            // line. Spaced like the ⚠ chip: ⬡ renders over-wide in most fonts
+            // and would otherwise crowd the number.
             if disp.show_pr_chip
                 && let Some(n) = row.pr_number
             {
                 push_sp(&mut right);
-                right.push(seg(Tok::Hue(theme::Hue::Green), format!("{}{}", gl.hex, n)));
+                right.push(seg(
+                    Tok::Hue(theme::Hue::Green),
+                    format!("{} {}", gl.hex, n),
+                ));
             }
             if row.alert_count > 0 {
                 push_sp(&mut right);
