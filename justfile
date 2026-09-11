@@ -638,8 +638,8 @@ ratchets: delivery-check
     # Guardrail: the idle loop never polls. Every `poll_input(` in the host is
     # either a zero-timeout drain, the attach client's blocking `None`, or THE
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
-    ! grep -rIn 'poll_input(' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -vE 'poll_input\(None\)|Duration::ZERO\)|poll_input\(timeout\)' || (echo 'ERROR: a timed poll_input outside idle_poll::poll_timeout — the idle loop must never poll (CLAUDE.md)' && exit 1)
-    test "$(grep -rIn 'poll_input(timeout)' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l)" = 1 || (echo 'ERROR: expected exactly one poll_input(timeout) site (run.rs)' && exit 1)
+    bash test/idle-poll-guard.sh --self-test
+    bash test/idle-poll-guard.sh
 
 # The complete ratchet contract. Unlike `ratchets`, this also executes the
 # Rust-side platform/host-key/surface/completion/help checks and therefore
@@ -903,8 +903,10 @@ term-check: build
       local out; out="$(env -i "${base[@]}" "$@" "$bin" doctor 2>&1)"
       local caps color glyph
       caps="$(printf '%s\n' "$out" | sed -n '/Resolved capabilities/,/Summary/p')"
-      color="$(printf '%s\n' "$caps" | awk '/^  color /{print $2; exit}')"
-      glyph="$(printf '%s\n' "$caps" | awk '/^  glyphs /{print $2; exit}')"
+      # Consume the whole stream: under `pipefail`, an early awk exit can send
+      # SIGPIPE to printf and turn a correct capability result into exit 141.
+      color="$(printf '%s\n' "$caps" | awk '/^  color / && !found {print $2; found=1}')"
+      glyph="$(printf '%s\n' "$caps" | awk '/^  glyphs / && !found {print $2; found=1}')"
       if [ "$color" = "$ec" ] && [ "$glyph" = "$eg" ]; then
         printf '  PASS  %-11s color=%-10s glyphs=%s\n' "$name" "$color" "$glyph"
       else

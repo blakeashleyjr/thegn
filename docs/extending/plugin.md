@@ -21,7 +21,8 @@ a POSIX shell script with `printf` is enough.
    `update` / `notify` / `state.set` / `host.call` as you need.
 4. **Host calls** are checked against your `scopes` exactly like a control
    token — `sessions.list` needs `read`, `worktrees.open` needs `write`, and
-   exposed predeclared tools need `exec`. `write`, `git`, and `exec` are
+   exposed predeclared tools need `exec`. `merge_add` is the narrow,
+   worktree-bound remote-enqueue grant. `write`, `git`, `merge_add`, and `exec` are
    independent; `admin` implies every scope. Contribution capabilities do not
    grant a host-call scope. `tools.run` is callable today; `launch.preset`
    remains CLI-first and is not advertised to plugins until it has a generic

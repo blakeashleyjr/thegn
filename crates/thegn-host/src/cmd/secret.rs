@@ -8,8 +8,8 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
-use thegn_core::config::{Config, ManagedKeyScope};
+use anyhow::{Context, Result, bail};
+use thegn_core::config::Config;
 use thegn_core::secret_scan;
 use thegn_core::secretref::{BareAs, SecretRef};
 use thegn_core::{config_write, msg, outln};
@@ -63,7 +63,7 @@ pub enum Action {
 pub enum SshAction {
     /// Rotate a managed SSH key across its scope's live instances.
     Rotate {
-        /// Restrict to one provider account (per-account scope).
+        /// Restrict to one recorded account label (`secret audit` lists them).
         #[arg(long)]
         account: Option<String>,
         /// Report the plan without changing anything.
@@ -82,7 +82,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
         }
         Action::List { json } => list(cfg, json),
         Action::Migrate { dry_run } => migrate(cfg, &config_path, dry_run),
-        Action::Audit { json } => list(cfg, json), // audit == list + presence today
+        Action::Audit { json } => audit(cfg, json),
         Action::Ssh { action } => match action {
             SshAction::Rotate { account, dry_run } => ssh_rotate(cfg, account.as_deref(), dry_run),
         },
@@ -150,6 +150,75 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Value-free audit view: configured refs plus the exact managed SSH key
+/// fingerprint authorized on each recorded live instance.
+fn audit(cfg: &Config, json: bool) -> Result<()> {
+    let refs = secret_scan::secret_refs(cfg);
+    let managed =
+        thegn_core::managed_ssh::list().context("read complete managed SSH custody inventory")?;
+    if json {
+        let secret_rows: Vec<_> = refs
+            .iter()
+            .map(|field| {
+                serde_json::json!({
+                    "path": field.path,
+                    "backend": field.reference.backend_kind(),
+                    "consumer": field.consumer,
+                    "name": field.reference.audit_name(),
+                    "present": secret::present(&field.reference),
+                })
+            })
+            .collect();
+        let key_rows: Vec<_> = managed
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "provider": &record.provider,
+                    "account": &record.account,
+                    "instance": &record.instance,
+                    "key": record.key_path.file_name().and_then(|name| name.to_str()),
+                    "fingerprint": &record.key_fingerprint,
+                    "authorized_at": record.authorized_at,
+                    "rotation_recovery": record.rotation_recovery.as_ref().map(|recovery| serde_json::json!({
+                        "key": recovery.key_path.file_name().and_then(|name| name.to_str()),
+                        "fingerprint": &recovery.key_fingerprint,
+                        "authorized": recovery.authorized,
+                        "verified": recovery.verified,
+                        "retiring_started": recovery.retiring_started,
+                        "retiring_completed": recovery.retiring_completed,
+                    })),
+                })
+            })
+            .collect();
+        return crate::cmd::emit_json(&serde_json::json!({
+            "secret_refs": secret_rows,
+            "managed_ssh": key_rows,
+        }));
+    }
+    list(cfg, false)?;
+    if managed.is_empty() {
+        outln!("managed ssh: no live authorization records");
+    } else {
+        outln!("managed ssh authorizations:");
+        for record in managed {
+            let recovery = record
+                .rotation_recovery
+                .as_ref()
+                .map(|state| format!(" recovery={}", state.key_fingerprint))
+                .unwrap_or_default();
+            outln!(
+                "  {:<12} {:<24} {:<24} {}{}",
+                record.provider,
+                record.account,
+                record.instance,
+                record.key_fingerprint,
+                recovery,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Migrate plaintext literals into the store and rewrite the config fields.
 fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     let mut moved = 0usize;
@@ -210,46 +279,22 @@ fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result
     Ok(())
 }
 
-/// Rotate a managed SSH key. The pure key-naming + scope decision is wired; the
-/// live-fleet re-authorization step (authorize new key on every instance in
-/// scope, verify, de-authorize old, retire) rides the provider exec transports
-/// and is reported here as the plan — see the design's partial-failure rules.
-fn ssh_rotate(cfg: &Config, account: Option<&str>, _dry_run: bool) -> Result<()> {
+/// Rotate recorded managed SSH authorizations transactionally. Values and
+/// private-key material never enter output or argv.
+fn ssh_rotate(cfg: &Config, account: Option<&str>, dry_run: bool) -> Result<()> {
     let scope = cfg.credentials.ssh.managed_key_scope;
     outln!("managed_key_scope = {scope}");
-    match scope {
-        ManagedKeyScope::Shared => {
-            outln!(
-                "shared scope: one key ({}) authorizes every managed remote.",
-                scope.managed_key_basename("", "")
-            );
-            msg::warn(
-                "rotating a shared key re-authorizes EVERY managed instance at once. \
-                 Consider `managed_key_scope = \"per-account\"` first for isolated rotation.",
-            );
-        }
-        ManagedKeyScope::PerAccount => {
-            let acct = account.unwrap_or("<account>");
-            outln!(
-                "per-account scope: key basename for this account = {}",
-                scope.managed_key_basename("<provider>", acct)
-            );
-        }
+    let summary = crate::managed_ssh_rotation::rotate(cfg, account, dry_run)?;
+    if summary.dry_run {
+        msg::info(&format!(
+            "dry run: {} key scope(s), {} live authorization(s)",
+            summary.scopes, summary.instances
+        ));
+    } else {
+        msg::info(&format!(
+            "rotated {} key scope(s) across {} live authorization(s)",
+            summary.scopes, summary.instances
+        ));
     }
-    // Emit an audit breadcrumb (value-free) for the rotation intent.
-    tracing::info!(
-        target: "thegn::secret::audit",
-        consumer = "secret.ssh.rotate",
-        account = account.unwrap_or("*"),
-        scope = %scope,
-        "ssh managed-key rotation requested",
-    );
-    msg::info(
-        "plan: generate replacement -> authorize on every live instance in scope -> \
-         verify a connect with the new key -> de-authorize the old -> retire it. \
-         Partial failure leaves BOTH keys authorized (never bricks a fleet). The \
-         live per-instance authorization step is performed via the provider \
-         transports; this build reports the plan and scope.",
-    );
     Ok(())
 }

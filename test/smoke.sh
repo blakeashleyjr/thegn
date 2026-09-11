@@ -1451,14 +1451,79 @@ check "dispatch set-status rejects an unknown dispatch id" \
   "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 # A configured stage backs the `session open --stage` offline refusals below
 # (the prompt-refusal check needs a stage that EXISTS; the roster is DB-direct
-# and unaffected by this block).
+# and unaffected by this block). A deterministic fake worker backs the live
+# daemon check later: it consumes the row/artifact handles from the rendered
+# prompt, commits the artifact, and files the same durable report a real worker
+# must file. Its unknown harness is deliberate — the configured-command
+# fallback runs this local executable with the rendered prompt as one argument.
+mkdir -p "$R/.thegn"
+PIPELINE_WORKER="$R/.thegn/pipeline-worker.sh"
+PIPELINE_GATE="$R/.thegn/pipeline-gate.sh"
+# This fixture tests pipeline composition, not sandbox selection. Its daemon is
+# pinned to the host below, so call the exact absolute binary under test rather
+# than copying a 500+ MiB debug executable into the throwaway worktree (which
+# made the 15-second session wait depend on copy/page-cache timing).
+PIPELINE_THEGN="$SZ"
+cat >"$PIPELINE_GATE" <<'EOF'
+#!/bin/sh
+set -eu
+artifact=${1:?missing artifact path}
+row=${2:?missing dispatch row}
+test -f "$artifact"
+grep -qx "stage worker completed row $row" "$artifact"
+git ls-files --error-unmatch -- "$artifact" >/dev/null
+git diff --quiet HEAD -- "$artifact"
+git diff --check HEAD^ HEAD
+EOF
+chmod +x "$PIPELINE_GATE"
+cat >"$PIPELINE_WORKER" <<'EOF'
+#!/bin/sh
+set -eu
+prompt=${1:?missing rendered stage prompt}
+row=$(printf '%s\n' "$prompt" | sed -n 's/^row=\([0-9][0-9]*\) artifact=.*/\1/p')
+artifact=$(printf '%s\n' "$prompt" | sed -n 's/^row=[0-9][0-9]* artifact=\([^;]*\);.*/\1/p')
+test -n "$row"
+test -n "$artifact"
+mkdir -p "$(dirname "$artifact")"
+printf 'stage worker completed row %s\n' "$row" >"$artifact"
+git add "$artifact"
+git commit -q -m "smoke: complete pipeline row $row"
+.thegn/pipeline-gate.sh "$artifact" "$row"
+"$THEGN_SMOKE_BIN" dispatch report "$row" --text "verdict: DONE
+commits: $(git rev-parse HEAD)
+gate: .thegn/pipeline-gate.sh $artifact $row -- exit 0"
+EOF
+chmod +x "$PIPELINE_WORKER"
 cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+
+[[agents]]
+name = "pipeline-smoke-worker"
+command = "$PIPELINE_WORKER"
+env = { THEGN_SMOKE_BIN = "$PIPELINE_THEGN", GIT_AUTHOR_NAME = "thegn-smoke", GIT_AUTHOR_EMAIL = "thegn-smoke@example.test", GIT_COMMITTER_NAME = "thegn-smoke", GIT_COMMITTER_EMAIL = "thegn-smoke@example.test" }
 
 [[pipeline.stages]]
 name = "smoke"
 agent = "claude"
 prompt = "row {row}: task {issue_number} on {branch} in {worktree}, artifact {artifact}; then run \`thegn dispatch report {row} --text '…'\`"
+next = "smoke-live"
+
+[[pipeline.stages]]
+name = "smoke-live"
+agent = "pipeline-smoke-worker"
+concurrency = 1
+prompt = "row={row} artifact={artifact}; run thegn dispatch report {row} --text DONE"
+next = "smoke-failed-open"
+
+[[pipeline.stages]]
+name = "smoke-failed-open"
+agent = "pipeline-smoke-agent-that-is-not-configured"
+concurrency = 1
+prompt = "row={row} artifact={artifact}; run thegn dispatch report {row} --text DONE"
 EOF
+check "dispatch claim rejects an unknown stage instead of disabling capacity" \
+  "! '$SZ' dispatch claim linear:SMOKE-CLAIM '$R' claude --stage typo-stage >/dev/null 2>&1"
+check "dispatch claim requires a non-empty duplicate override reason" \
+  "! '$SZ' dispatch claim linear:SMOKE-CLAIM '$R' claude --stage smoke-live --allow-duplicate '' >/dev/null 2>&1"
 # `dispatch put` is the roster's writer, and the v56 pipeline columns
 # (stage/parent/session/artifact) ride it — there is no second verb. A parent id
 # that names no row is refused BEFORE the insert, so a typo cannot leave a chunk
@@ -1729,7 +1794,16 @@ check "a done prerequisite satisfies the after gate" \
 # then stop it and verify the registry row + socket are gone.
 if command -v curl >/dev/null 2>&1; then
   DSOCK="$TMP/d.sock"
-  "$SZ" daemon --socket "$DSOCK" &
+  # The global smoke config exercises VPN parsing with a deliberately missing
+  # credential. This daemon additionally launches the deterministic local
+  # worker below, so pin its sandbox and resource controls off and disable VPN
+  # attachment through boot-time overrides; per-request registry refresh must
+  # preserve those overrides.
+  "$SZ" --set sandbox.backend=none \
+    --set sandbox.vpn.provider=none \
+    --set sandbox.limits.cpu=off \
+    --set sandbox.limits.memory=off \
+    --set sandbox.limits.cpu_total=off daemon --socket "$DSOCK" &
   DPID=$!
   for _ in $(seq 1 40); do
     [[ -S $DSOCK ]] && break
@@ -1747,6 +1821,55 @@ if command -v curl >/dev/null 2>&1; then
   snap_ok=1
   "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
   check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+
+  # THE-116/THE-121: the actual stage-dispatch composition, not DB-direct
+  # setup. A daemon-side refusal happens after the atomic roster insert, so it
+  # must name and close that row as failed rather than leaving it queued.
+  set +e
+  failed_stage_out="$($SZ session open --stage smoke-failed-open \
+    --issue linear:SMOKE-FAILED-OPEN --worktree "$R" --json 2>&1)"
+  failed_stage_rc=$?
+  set -e
+  failed_stage_row="$(sed -n 's/.*dispatch \([0-9][0-9]*\) failed.*/\1/p' <<<"$failed_stage_out" | head -1)"
+  failed_stage_ok=1
+  [[ $failed_stage_rc -ne 0 && -n $failed_stage_row ]] || failed_stage_ok=0
+  grep -q 'unknown configured agent' <<<"$failed_stage_out" || failed_stage_ok=0
+  "$SZ" dispatch list --json | grep -Eq \
+    "\{[^}]*\"id\":$failed_stage_row,[^}]*\"status\":\"failed\"" || failed_stage_ok=0
+  check "a failed stage session open names and closes its roster row" \
+    "[[ $failed_stage_ok -eq 1 ]]"
+
+  # The deterministic worker consumes the rendered handles, commits the
+  # artifact, files its report, and exits. The supervisor then observes that
+  # exit, verifies the tracked artifact, and is allowed to record Done. This is
+  # the complete incident-regression loop in one hermetic worktree.
+  live_stage_json="$($SZ session open --stage smoke-live \
+    --issue linear:SMOKE-LIVE --worktree "$R" --json)"
+  live_stage_row="$(sed -n 's/.*\"row\":\([0-9][0-9]*\).*/\1/p' <<<"$live_stage_json")"
+  live_stage_session="$(sed -n 's/.*\"session\":\"\([^\"]*\)\".*/\1/p' <<<"$live_stage_json")"
+  live_stage_artifact="$(sed -n 's/.*\"artifact\":\"\([^\"]*\)\".*/\1/p' <<<"$live_stage_json")"
+  live_handles_ok=1
+  [[ -n $live_stage_row && -n $live_stage_session && -n $live_stage_artifact ]] || live_handles_ok=0
+  check "successful stage dispatch returns row, session, and artifact handles" \
+    "[[ $live_handles_ok -eq 1 ]]"
+  set +e
+  live_stage_wait="$($SZ session wait --session "$live_stage_session" \
+    --until exited --timeout 15000 --json)"
+  live_stage_wait_rc=$?
+  set -e
+  live_stage_exit_ok=1
+  [[ $live_stage_wait_rc -eq 0 ]] || live_stage_exit_ok=0
+  grep -q '"matched": true' <<<"$live_stage_wait" || live_stage_exit_ok=0
+  grep -q '"exit_code": 0' <<<"$live_stage_wait" || live_stage_exit_ok=0
+  if [[ $live_stage_exit_ok -ne 1 ]]; then
+    "$SZ" session snapshot --session "$live_stage_session" --text >&2 || true
+  fi
+  check "stage worker exits cleanly after committing and reporting" \
+    "[[ $live_stage_exit_ok -eq 1 ]]"
+  check "stage worker's artifact is tracked and its report verifies" \
+    "'$SZ' dispatch verify '$live_stage_row' --json | grep -q '\"ok\":true'"
+  check "verified stage-worker row reaches done" \
+    "'$SZ' dispatch set-status '$live_stage_row' done | grep -q 'done'"
 
   # Orchestration control routes over the same socket (THE-57): the dispatch
   # roster records and re-statuses a row, and `worktrees.create` spins up a

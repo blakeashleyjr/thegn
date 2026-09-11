@@ -18,9 +18,13 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                                            |
 | Meta          | `config` · `theme` · `skills` · `doctor` · `setup` · `completions`                                                                 |
 
-`session open --resume-work <row>` resumes a failed pipeline row through the
-roster (THE-86): it re-renders the row's stage prompt, gathers the row's
-artifact/git/screen facts, and opens the finisher dispatch.
+`session open --resume-work <row>` resumes an eligible unfinished pipeline row
+through the roster (THE-86): it refuses an unstamped spawning/running source
+whose worker may still be live, reconciles eligible parked or exited work, and
+atomically admits the finisher against the stage's duplicate/capacity gate
+(refusal leaves the source unchanged). It renders the new row's exact id and
+artifact target into the stage prompt, with the source artifact/git/screen
+facts retained as recovery context.
 
 `session fork <id>` asks the daemon to start a new PTY from a live session.
 Use `--scrollback` for a bounded handoff, `--tab` for a new tab, and

@@ -72,35 +72,55 @@ fn run_lifecycle(kind: VpsKind, token_env: &str) {
             eprintln!("[{name}] created: {:?}", handle.exec);
 
             // The ledger is finalized to `ready` with the vendor id + IP.
-            let rec = registry::read(&name).expect("ledger record after create");
-            assert_eq!(rec.state, "ready", "ledger finalized");
-            assert!(!rec.instance_id.is_empty(), "vendor id recorded");
-            assert!(!rec.ip.is_empty(), "public IP recorded");
+            let rec = registry::read(&name)
+                .ok_or_else(|| anyhow::anyhow!("ledger record missing after create"))?;
+            anyhow::ensure!(rec.state == "ready", "ledger was not finalized: {rec:?}");
+            anyhow::ensure!(!rec.instance_id.is_empty(), "vendor id was not recorded");
+            anyhow::ensure!(!rec.ip.is_empty(), "public IP was not recorded");
             eprintln!("[{name}] ip={} id={}", rec.ip, rec.instance_id);
 
             // list() is server-side scoped to thegn-managed instances.
             let names = prov.list().await?;
-            assert!(names.contains(&name), "list shows our instance: {names:?}");
+            anyhow::ensure!(
+                names.contains(&name),
+                "provider list does not contain {name}: {names:?}"
+            );
 
             // The real proof: run a command over the ssh shim (our injected key).
             let (code, out) = prov
                 .run_exec(&name, &["echo".into(), "tg-live-ok".into()], None, &[])
                 .await?;
-            assert_eq!(code, 0, "remote echo exit 0; out={out}");
-            assert!(out.contains("tg-live-ok"), "remote echo output: {out}");
+            anyhow::ensure!(code == 0, "remote echo exited {code}; out={out}");
+            anyhow::ensure!(out.contains("tg-live-ok"), "remote echo output: {out}");
             eprintln!("[{name}] exec over ssh OK");
             anyhow::Ok(())
         }
         .await;
 
         eprintln!("[{name}] destroying…");
-        prov.destroy(&name).await.expect("destroy");
-        // Ledger cleared and the instance is gone from the vendor list.
-        assert!(registry::read(&name).is_none(), "ledger cleared on destroy");
-        let names = prov.list().await.unwrap_or_default();
-        assert!(!names.contains(&name), "instance gone from list: {names:?}");
-        // A second destroy is idempotent.
-        prov.destroy(&name).await.expect("idempotent destroy");
+        // Collect every teardown observation before asserting. In particular,
+        // still make the idempotent second destroy attempt if the first call or
+        // its verification fails; this test creates a billable public VM and a
+        // failed assertion must not be what leaves it behind.
+        let first_destroy = prov.destroy(&name).await;
+        let names_after_first = prov.list().await;
+        let second_destroy = prov.destroy(&name).await;
+        let names_after_second = prov.list().await;
+        let ledger_after = registry::read(&name);
+
+        first_destroy.expect("destroy");
+        second_destroy.expect("idempotent destroy");
+        assert!(ledger_after.is_none(), "ledger cleared on destroy");
+        let names_after_first = names_after_first.expect("list after destroy");
+        assert!(
+            !names_after_first.contains(&name),
+            "instance remains after destroy: {names_after_first:?}"
+        );
+        let names_after_second = names_after_second.expect("list after idempotent destroy");
+        assert!(
+            !names_after_second.contains(&name),
+            "instance returned after idempotent destroy: {names_after_second:?}"
+        );
 
         result.expect("lifecycle assertions");
         eprintln!("[{name}] ✓ full lifecycle verified");

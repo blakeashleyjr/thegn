@@ -19,7 +19,8 @@ use crate::store::LeaseRow;
 /// not be able to type into a terminal) and vice versa; `Exec` is a third such
 /// independent silo (a client that can trigger pre-declared launches need not be
 /// able to type into terminals, and vice versa). All three imply `Read`.
-/// `Admin` implies everything.
+/// `Admin` implies everything. `MergeAdd` is deliberately narrower than the
+/// usual implication lattice: it does not imply `Read`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -31,6 +32,11 @@ pub enum Scope {
     Write,
     /// Stage/commit through the GitBackend seam.
     Git,
+    /// Enqueue one registered remote worktree on its owning host. This is a
+    /// deliberately single-verb grant used by provisioned environments; it
+    /// cannot stage, commit, list queues, or clear queues.
+    #[serde(rename = "merge_add")]
+    MergeAdd,
     /// Launch a pre-declared `[[presets]]` shape into a workspace
     /// (`open --preset`). Runs configured commands — its own tier so an
     /// `open`/`write` token cannot execute launches, and vice versa.
@@ -39,12 +45,65 @@ pub enum Scope {
     Admin,
 }
 
+/// Label payload for a provider-injected `route_to_host` return token.
+///
+/// This is deliberately part of the shared control model because both HTTP and
+/// gRPC must enforce the same resource boundary before calling the daemon. The
+/// token's scope permits the `merge.add` verb; this binding limits that verb to
+/// the one opaque worktree identifier provisioned into the remote environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteToHostTokenBinding {
+    pub owner: String,
+    pub worktree: String,
+}
+
+/// Reserved label prefix for provider-injected route-to-host tokens.
+pub const ROUTE_TO_HOST_TOKEN_LABEL_PREFIX: &str = "route-to-host:";
+
+impl RouteToHostTokenBinding {
+    pub fn label(&self) -> String {
+        format!(
+            "{ROUTE_TO_HOST_TOKEN_LABEL_PREFIX}{}",
+            serde_json::to_string(self).expect("route-to-host token binding serializes")
+        )
+    }
+
+    /// `None` means this is not a route-to-host token. A malformed prefixed
+    /// label intentionally remains distinguishable from an ordinary token so
+    /// it can fail closed at the authorization boundary.
+    pub fn parse_label(label: &str) -> Option<Result<Self, serde_json::Error>> {
+        label
+            .strip_prefix(ROUTE_TO_HOST_TOKEN_LABEL_PREFIX)
+            .map(serde_json::from_str)
+    }
+}
+
+/// Whether an authenticated scope/label pair may use `merge.add` for
+/// `worktree`.
+///
+/// Git and local-admin callers retain their ordinary authority. A token that
+/// carries the deliberately narrow `MergeAdd` scope must also carry the
+/// reserved provider binding label; generic or malformed labels fail closed.
+pub fn route_to_host_token_allows_worktree(scopes: ScopeSet, label: &str, worktree: &str) -> bool {
+    match RouteToHostTokenBinding::parse_label(label) {
+        // Ordinary Git/Admin callers are not route credentials. In particular,
+        // local admin holds the universe (including `MergeAdd`), so testing only
+        // for the absence of the narrow bit would incorrectly lock out the
+        // daemon's trusted local client. A naked `MergeAdd` grant still fails
+        // closed because it has neither broader authority.
+        None => scopes.contains(Scope::Git) || scopes.contains(Scope::Admin),
+        Some(Ok(binding)) => binding.worktree == worktree,
+        Some(Err(_)) => false,
+    }
+}
+
 impl Scope {
     pub fn as_str(&self) -> &'static str {
         match self {
             Scope::Read => "read",
             Scope::Write => "write",
             Scope::Git => "git",
+            Scope::MergeAdd => "merge_add",
             Scope::Exec => "exec",
             Scope::Admin => "admin",
         }
@@ -55,6 +114,7 @@ impl Scope {
             Scope::Read => 1,
             Scope::Write => 2,
             Scope::Git => 4,
+            Scope::MergeAdd => 32,
             Scope::Admin => 8,
             Scope::Exec => 16,
         }
@@ -96,6 +156,7 @@ impl ScopeSet {
                 "read" => s.insert(Scope::Read),
                 "write" => s.insert(Scope::Write),
                 "git" => s.insert(Scope::Git),
+                "merge_add" => s.insert(Scope::MergeAdd),
                 "exec" => s.insert(Scope::Exec),
                 "admin" => s.insert(Scope::Admin),
                 _ => {}
@@ -111,6 +172,7 @@ impl ScopeSet {
             Scope::Read,
             Scope::Write,
             Scope::Git,
+            Scope::MergeAdd,
             Scope::Exec,
             Scope::Admin,
         ] {
@@ -123,7 +185,8 @@ impl ScopeSet {
 
     /// Does this grant satisfy a verb needing `need`? The implication lattice:
     /// `Admin` ⊇ all; `Write` ⊇ `Read`; `Git` ⊇ `Read`; `Exec` ⊇ `Read`; `Git`,
-    /// `Write` and `Exec` are mutually independent.
+    /// `Write` and `Exec` are mutually independent. `MergeAdd` is a single-verb
+    /// capability and grants no read surface.
     pub fn allows(&self, need: Scope) -> bool {
         if self.contains(Scope::Admin) {
             return true;
@@ -139,6 +202,9 @@ impl ScopeSet {
             }
             Scope::Write => self.contains(Scope::Write),
             Scope::Git => self.contains(Scope::Git),
+            // Existing Git-scoped clients retain merge enqueue access, while a
+            // provisioned return token can hold only this narrower grant.
+            Scope::MergeAdd => self.contains(Scope::MergeAdd) || self.contains(Scope::Git),
             Scope::Exec => self.contains(Scope::Exec),
             Scope::Admin => false,
         }
@@ -162,6 +228,7 @@ impl ScopeSet {
             Scope::Read,
             Scope::Write,
             Scope::Git,
+            Scope::MergeAdd,
             Scope::Exec,
             Scope::Admin,
         ])
@@ -601,11 +668,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Split
         | Verb::RecordSession
         | Verb::SkillsSeed => Scope::Write,
-        Verb::GitStage
-        | Verb::GitCommit
-        | Verb::MergeAdd
-        | Verb::MergeClear
-        | Verb::WorktreeCreate => Scope::Git,
+        Verb::GitStage | Verb::GitCommit | Verb::MergeClear | Verb::WorktreeCreate => Scope::Git,
+        Verb::MergeAdd => Scope::MergeAdd,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
         Verb::LaunchPreset | Verb::ToolsRun => Scope::Exec,
@@ -915,8 +979,9 @@ mod tests {
             "read",
             "read,write",
             "read,git",
+            "merge_add",
             "read,exec",
-            "read,write,git,exec,admin",
+            "read,write,git,merge_add,exec,admin",
             "",
         ] {
             assert_eq!(ScopeSet::parse(csv).to_csv(), csv);
@@ -928,24 +993,42 @@ mod tests {
     }
 
     #[test]
+    fn merge_add_scope_has_one_wire_spelling() {
+        assert_eq!(
+            serde_json::to_string(&Scope::MergeAdd).unwrap(),
+            r#""merge_add""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Scope>(r#""merge_add""#).unwrap(),
+            Scope::MergeAdd
+        );
+    }
+
+    #[test]
     fn scope_lattice() {
         let read = ScopeSet::of(&[Scope::Read]);
         let write = ScopeSet::of(&[Scope::Write]);
         let git = ScopeSet::of(&[Scope::Git]);
+        let merge_add = ScopeSet::of(&[Scope::MergeAdd]);
         let exec = ScopeSet::of(&[Scope::Exec]);
         let admin = ScopeSet::of(&[Scope::Admin]);
 
-        // Read is implied by every non-empty grant.
+        // Read is implied by general-purpose grants. The provisioned
+        // route-to-host grant is intentionally one verb and cannot observe.
         for s in [read, write, git, exec, admin] {
             assert!(s.allows(Scope::Read), "{s:?} should allow read");
         }
         assert!(!ScopeSet::empty().allows(Scope::Read));
+        assert!(!merge_add.allows(Scope::Read));
 
         // Write, Git and Exec are independent silos: a git-scoped phone must not
         // be able to type into a terminal, a write token can't commit, and
         // neither can trigger a preset launch.
         assert!(write.allows(Scope::Write) && !write.allows(Scope::Git));
         assert!(git.allows(Scope::Git) && !git.allows(Scope::Write));
+        assert!(git.allows(Scope::MergeAdd));
+        assert!(merge_add.allows(Scope::MergeAdd));
+        assert!(!merge_add.allows(Scope::Git) && !merge_add.allows(Scope::Write));
         assert!(exec.allows(Scope::Exec) && !exec.allows(Scope::Write));
         assert!(!write.allows(Scope::Exec) && !git.allows(Scope::Exec));
 
@@ -954,12 +1037,13 @@ mod tests {
             Scope::Read,
             Scope::Write,
             Scope::Git,
+            Scope::MergeAdd,
             Scope::Exec,
             Scope::Admin,
         ] {
             assert!(admin.allows(need));
         }
-        for s in [read, write, git, exec] {
+        for s in [read, write, git, merge_add, exec] {
             assert!(!s.allows(Scope::Admin));
         }
     }
@@ -1035,7 +1119,8 @@ mod tests {
             ContainersControl,
             SkillsSeed,
         ];
-        let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
+        let git = [GitStage, GitCommit, MergeClear, WorktreeCreate];
+        let merge_add = [MergeAdd];
         let exec = [LaunchPreset, ToolsRun];
         let admin = [
             MigrateSession,
@@ -1066,6 +1151,9 @@ mod tests {
         for v in git {
             assert_eq!(required_scope(v), Scope::Git, "{v:?}");
         }
+        for v in merge_add {
+            assert_eq!(required_scope(v), Scope::MergeAdd, "{v:?}");
+        }
         for v in exec {
             assert_eq!(required_scope(v), Scope::Exec, "{v:?}");
         }
@@ -1077,7 +1165,13 @@ mod tests {
         for v in read {
             assert!(read_only.allows(required_scope(v)));
         }
-        for v in write.iter().chain(&git).chain(&exec).chain(&admin) {
+        for v in write
+            .iter()
+            .chain(&git)
+            .chain(&merge_add)
+            .chain(&exec)
+            .chain(&admin)
+        {
             assert!(
                 !read_only.allows(required_scope(*v)),
                 "{v:?} leaked to read"
@@ -1090,6 +1184,7 @@ mod tests {
             .iter()
             .chain(&write)
             .chain(&git)
+            .chain(&merge_add)
             .chain(&exec)
             .chain(&admin)
             .copied()
@@ -1184,7 +1279,10 @@ mod tests {
         let rw = ScopeSet::of(&[Scope::Read, Scope::Write]);
         let rg = ScopeSet::of(&[Scope::Read, Scope::Git]);
         assert_eq!(rw.intersect(rg).to_csv(), "read");
-        assert_eq!(ScopeSet::universe().to_csv(), "read,write,git,exec,admin");
+        assert_eq!(
+            ScopeSet::universe().to_csv(),
+            "read,write,git,merge_add,exec,admin"
+        );
         assert!(ScopeSet::universe().intersect(rw) == rw);
     }
 
@@ -1202,6 +1300,52 @@ mod tests {
         }
         assert!(format_token(TokenKind::Control, ID, SECRET).starts_with("tgc1_"));
         assert!(format_token(TokenKind::PairingCode, ID, SECRET).starts_with("tgp1_"));
+    }
+
+    #[test]
+    fn route_to_host_token_binding_is_exact_and_fails_closed_when_malformed() {
+        let binding = RouteToHostTokenBinding {
+            owner: "provider/account/sandbox".into(),
+            worktree: "/opaque/provider/worktree-a".into(),
+        };
+        let label = binding.label();
+        assert_eq!(
+            RouteToHostTokenBinding::parse_label(&label)
+                .expect("route label prefix")
+                .expect("valid binding JSON"),
+            binding
+        );
+        assert!(RouteToHostTokenBinding::parse_label("operator").is_none());
+        assert!(route_to_host_token_allows_worktree(
+            ScopeSet::of(&[Scope::MergeAdd]),
+            &label,
+            "/opaque/provider/worktree-a"
+        ));
+        assert!(!route_to_host_token_allows_worktree(
+            ScopeSet::of(&[Scope::MergeAdd]),
+            &label,
+            "/opaque/provider/worktree-b"
+        ));
+        assert!(!route_to_host_token_allows_worktree(
+            ScopeSet::of(&[Scope::MergeAdd]),
+            "route-to-host:not-json",
+            "/opaque/provider/worktree-a"
+        ));
+        assert!(!route_to_host_token_allows_worktree(
+            ScopeSet::of(&[Scope::MergeAdd]),
+            "operator",
+            "/any/worktree"
+        ));
+        assert!(route_to_host_token_allows_worktree(
+            ScopeSet::of(&[Scope::Git]),
+            "operator",
+            "/any/worktree"
+        ));
+        assert!(route_to_host_token_allows_worktree(
+            ScopeSet::universe(),
+            "local",
+            "/any/worktree"
+        ));
     }
 
     #[test]

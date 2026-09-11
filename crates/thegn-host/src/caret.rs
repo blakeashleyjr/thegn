@@ -82,6 +82,13 @@ pub fn no_covers() -> bool {
     FRAME.with(|f| f.borrow().covers.is_empty())
 }
 
+/// Whether a painted overlay covers this cell in the displayed frame. Unlike
+/// caret resolution, input occlusion ignores cursor claims: an overlay's text
+/// field must not make the pane chrome underneath it clickable.
+pub(crate) fn covered_at(x: usize, y: usize) -> bool {
+    FRAME.with(|f| f.borrow().covers.iter().any(|r| contains(r, x, y)))
+}
+
 /// Resolve this frame's caret against a pane caret, using the recorded state.
 pub fn resolve_frame(pane: Option<(usize, usize)>) -> Option<(usize, usize)> {
     FRAME.with(|f| {

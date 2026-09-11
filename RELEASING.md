@@ -127,6 +127,23 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
 
 ## Install paths this enables
 
+On the supported x86_64 Linux platform, the advertised install paths are Nix,
+source installation, and the x86_64 Linux release archives. Nix and source
+paths on other platforms remain best-effort where README says so. The release
+workflow can render other outputs without making them supported channels:
+
+| Channel                           | Current decision                                                                                                                 |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Homebrew tap / AUR                | pending public repository setup and same-release clean-host rehearsal                                                            |
+| standalone `.deb` / `.rpm` assets | pending clean-system install, upgrade, and uninstall rehearsal; no hosted apt/rpm repository                                     |
+| Scoop / winget                    | deferred until THE-140's Windows artifact gate and THE-145's interactive parity evidence are green                               |
+| hosted apt/rpm repositories       | deferred through the public-alpha cycle; their operational ownership is not justified while standalone assets remain unrehearsed |
+| crates.io / `cargo binstall`      | deferred through the public-alpha cycle; source installs use this repository and no crate-publication contract is accepted       |
+
+Enabling one of the deferred channels requires a separate bounded change with
+an owner, credentials/operational model, and rehearsal evidence. It is not an
+automatic consequence of producing another archive.
+
 - **Prebuilt binary** — download the linux-gnu, linux-musl, or
   aarch64-apple-darwin archive from the release page, verify the `.sha256`,
   extract `thegn` onto your `PATH`. On macOS see the Gatekeeper note below.
@@ -154,9 +171,10 @@ handful of users.
 
 What that decision costs, precisely:
 
-- **Homebrew — unaffected.** Homebrew does not attach `com.apple.quarantine` to
-  formula downloads, so an unsigned binary installed with `brew` opens normally.
-  This is the path to point macOS users at.
+- **Homebrew — unaffected once published.** Homebrew does not attach
+  `com.apple.quarantine` to formula downloads, so an unsigned binary installed
+  with `brew` opens normally. Advertise this path only after the public tap
+  rehearsal above is recorded.
 - **Nix — unaffected.** Same reason: the store path is not quarantined.
 - **`./install.sh` / `just macos-app` — unaffected.** The `thegn.app` bundle is
   generated on the user's own machine, so it carries no quarantine attribute.

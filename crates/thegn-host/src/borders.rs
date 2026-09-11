@@ -56,20 +56,36 @@ pub struct CardStyle {
 /// or the card is too narrow to keep at least a few dashes around it.
 pub fn draw_card(surface: &mut Surface, rect: Rect, title: &str, style: &CardStyle) {
     draw_box_chars(surface, rect, style.border, style.bg);
-    if title.is_empty() || rect.cols < 10 || rect.rows < 2 {
+    if rect.rows < 2 {
         return;
     }
-    // `╭─ title ─…`: corner + 1 dash + padded title, and ≥ 3 trailing cells.
-    let avail = rect.cols - 6;
+    draw_border_title(surface, rect, title, style);
+}
+
+/// The title as it fits a border `cols` wide — `╭─ title ─…`: corner + 1 dash +
+/// padded title, and ≥ 3 trailing cells; ellipsized when too long. `None` when
+/// the title is empty or the border too narrow to keep a few dashes around it.
+fn fitted_title(title: &str, cols: usize) -> Option<String> {
+    if title.is_empty() || cols < 10 {
+        return None;
+    }
+    let avail = cols - 6;
     if avail < 4 {
-        return;
+        return None;
     }
-    let shown: String = if UnicodeWidthStr::width(title) > avail {
+    Some(if UnicodeWidthStr::width(title) > avail {
         let mut t: String = crate::seg::take_cols(title, avail - 1).to_string();
         t.push('…');
         t
     } else {
         title.to_string()
+    })
+}
+
+/// Embed `title` in the top border row of `rect` (see [`fitted_title`]).
+fn draw_border_title(surface: &mut Surface, rect: Rect, title: &str, style: &CardStyle) {
+    let Some(shown) = fitted_title(title, rect.cols) else {
+        return;
     };
     surface.add_change(Change::CursorPosition {
         x: Position::Absolute(rect.x + 2),
@@ -78,6 +94,43 @@ pub fn draw_card(surface: &mut Surface, rect: Rect, title: &str, style: &CardSty
     surface.add_change(Change::Attribute(AttributeChange::Foreground(style.title)));
     surface.add_change(Change::Attribute(AttributeChange::Background(style.bg)));
     surface.add_change(Change::Text(format!(" {shown} ")));
+}
+
+/// Paint the collapsed members of a stacked (zoomed) tab: each is a one-row
+/// title bar `╭─ nvim · feat ─────╮` — the top edge of a card whose body is
+/// folded away, zellij-style — in the unfocused ring colour. `bars` comes from
+/// [`crate::center::CenterTree::stack_bars`]; glyphs degrade with the active
+/// set like every other ring.
+pub fn draw_stack_bars(
+    surface: &mut Surface,
+    bars: &[(PaneId, Rect)],
+    style: &FrameStyle,
+    title_of: &dyn Fn(PaneId) -> String,
+) {
+    let g = crate::caps::active_glyphs();
+    let card = CardStyle {
+        border: style.border,
+        title: style.title,
+        bg: style.bg,
+    };
+    for (id, rect) in bars {
+        if rect.cols < 2 || rect.rows == 0 {
+            continue;
+        }
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(rect.x),
+            y: Position::Absolute(rect.y),
+        });
+        surface.add_change(Change::Attribute(AttributeChange::Foreground(card.border)));
+        surface.add_change(Change::Attribute(AttributeChange::Background(card.bg)));
+        surface.add_change(Change::Text(format!(
+            "{}{}{}",
+            g.box_tl,
+            g.box_h.repeat(rect.cols - 2),
+            g.box_tr
+        )));
+        draw_border_title(surface, *rect, &title_of(*id), &card);
+    }
 }
 
 /// Colors for the pane-frame pass.
@@ -388,6 +441,47 @@ mod tests {
         draw_pane_frames(&mut s, &frames, Some(7), &style(), &|_| String::new());
         assert_eq!(cell_text(&mut s, 2, 1), "╭");
         assert_eq!(cell_text(&mut s, 21, 10), "╯");
+    }
+
+    #[test]
+    fn stack_bars_render_as_one_row_titled_edges() {
+        let tree = CenterTree::Stack {
+            panes: vec![1, 2, 3],
+            active: 1,
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 10,
+        };
+        let mut s = Surface::new(20, 10);
+        draw_stack_bars(&mut s, &tree.stack_bars(area), &style(), &|id| {
+            format!("p{id}")
+        });
+        // Pane 1 collapses above, pane 3 below; each is a single titled edge.
+        assert_eq!(row_text(&mut s, 0), "╭─ p1 ─────────────╮");
+        assert_eq!(row_text(&mut s, 9), "╭─ p3 ─────────────╮");
+        // The expanded pane's rows are untouched by the bar pass.
+        assert_eq!(row_text(&mut s, 1).trim(), "");
+    }
+
+    #[test]
+    fn stack_bars_degrade_to_ascii_and_truncate() {
+        use thegn_core::termcaps::UnicodeLevel;
+        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let bar = Rect {
+                x: 0,
+                y: 0,
+                cols: 14,
+                rows: 1,
+            };
+            let mut s = Surface::new(14, 1);
+            draw_stack_bars(&mut s, &[(1, bar)], &style(), &|_| {
+                "averylongprogramname".into()
+            });
+            assert_eq!(row_text(&mut s, 0), "+- averylo… -+");
+        });
     }
 
     #[test]

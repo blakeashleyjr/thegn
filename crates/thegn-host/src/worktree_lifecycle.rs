@@ -96,6 +96,32 @@ fn apply_completions_from(
     let mut changed = false;
     let mut workspace_failures: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
+    // One landing for the whole batch, planned while the rows still show every
+    // worktree this batch removes (see `worktree_delete::Landing`).
+    let removed: Vec<String> = completions
+        .iter()
+        .filter_map(|completion| match completion {
+            LifecycleCompletion::WorktreeDelete {
+                group_name,
+                path,
+                success: true,
+                ..
+            } => Some(
+                session
+                    .worktrees
+                    .iter()
+                    .find(|g| &g.name == group_name || &g.path == path)
+                    .map_or_else(|| path.clone(), |g| g.path.clone()),
+            ),
+            _ => None,
+        })
+        .collect();
+    let landing = crate::handlers::worktree_delete::Landing::plan(
+        model,
+        session,
+        sb,
+        &removed.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
     for completion in completions {
         // Keep the physical-path ownership claim until the loop consumes the
         // worker result. Releasing it on the worker leaves a window where the
@@ -121,14 +147,16 @@ fn apply_completions_from(
                         .iter()
                         .position(|g| g.name == group_name || g.path == path)
                     {
-                        let group = session.worktrees[gi].clone();
-                        for tab in &group.tabs {
-                            for id in tab.center.pane_ids() {
-                                panes.table.remove(&id);
-                            }
+                        let gone_path = session.worktrees[gi].path.clone();
+                        if crate::handlers::worktree_delete::remove_group(session, panes, gi) {
+                            landing.land(session);
                         }
-                        session.switch_to(gi);
-                        session.close_active_group();
+                        // The worker already forgot the registry row; drop the
+                        // in-memory copy too, or the sidebar's registry union
+                        // keeps a ghost row for it until the next hydration.
+                        model
+                            .sidebar_db_worktrees
+                            .retain(|w| w.path != gone_path && w.path != path);
                         model.status = format!("Deleted worktree {path}");
                         changed = true;
                     }
@@ -147,14 +175,9 @@ fn apply_completions_from(
                 let key = (repo_path.clone(), slug.clone());
                 if success {
                     if let Some(gi) = session.worktrees.iter().position(|g| g.path == path) {
-                        let group = session.worktrees[gi].clone();
-                        for tab in &group.tabs {
-                            for id in tab.center.pane_ids() {
-                                panes.table.remove(&id);
-                            }
-                        }
-                        session.switch_to(gi);
-                        session.close_active_group();
+                        // Focus lands when the workspace finishes
+                        // (`land_after_workspace_removed`), not per worktree.
+                        crate::handlers::worktree_delete::remove_group(session, panes, gi);
                     }
                 } else {
                     workspace_failures
@@ -201,7 +224,7 @@ fn apply_completions_from(
     }
     if changed {
         crate::run::refresh_tab_model(model, session, sb);
-        sb.focus_active_row(model);
+        landing.place_cursor(model, sb);
     }
     changed
 }
@@ -800,6 +823,23 @@ fn teardown_runtime(
     let path = worktree.to_string_lossy().into_owned();
     let mut failures = Vec::new();
 
+    if let thegn_core::placement::Placement::Ssh(ssh) = &env.placement {
+        let target = thegn_core::remote::SshTarget {
+            host: ssh.host.clone(),
+            port: ssh.port,
+            forward_agent: ssh.forward_agent,
+            ssh_config: ssh.ssh_config.clone(),
+            jump_host: ssh.jump_host.clone(),
+            identity: ssh.identity.clone(),
+            extra_args: ssh.extra_args.clone(),
+        };
+        // Revoke while the DB row still retains the environment/host ownership
+        // tuple. A failure blocks physical deletion rather than orphaning a live
+        // return grant whose owner metadata is about to disappear.
+        if let Err(error) = crate::remote_enqueue_auth::revoke_for_ssh(&target, &path) {
+            failures.push(format!("SSH route credential: {error:#}"));
+        }
+    }
     if !env.placement.is_local()
         && let Err(error) =
             crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)
@@ -1809,5 +1849,224 @@ mod tests {
         ));
         assert!(session.worktrees.is_empty());
         assert!(model.sidebar_workspaces.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    //! Where focus and the sidebar cursor land when a delete's worker
+    //! completes. The fixture's session order (home, alpha, zeta, mid) differs
+    //! from its name-sorted display order (home, alpha, mid, zeta), which is
+    //! exactly what made the old slot-based landing read as a random jump.
+    use super::{LifecycleCompletion, apply_completions_from};
+    use crate::chrome::FrameModel;
+    use crate::run::SidebarState;
+    use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    fn tree(active: usize) -> (Session, FrameModel, SidebarState) {
+        let session = Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+                WorktreeGroup::new("app/alpha", GroupKind::Branch, "/tmp/app-alpha"),
+                WorktreeGroup::new("app/zeta", GroupKind::Branch, "/tmp/app-zeta"),
+                WorktreeGroup::new("app/mid", GroupKind::Branch, "/tmp/app-mid"),
+            ],
+            active,
+        };
+        let mut model = crate::hydrate::build_initial_model(&session, None);
+        let mut sb = SidebarState::default();
+        sb.view.sort = crate::sidebar::SortMode::Name;
+        crate::run::refresh_tab_model(&mut model, &session, &mut sb);
+        assert_eq!(
+            worktree_paths(&model),
+            [
+                "/tmp/app",
+                "/tmp/app-alpha",
+                "/tmp/app-mid",
+                "/tmp/app-zeta"
+            ],
+            "fixture: display order must differ from session order"
+        );
+        (session, model, sb)
+    }
+
+    fn worktree_paths(model: &FrameModel) -> Vec<&str> {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Worktree)
+            .filter_map(|r| r.worktree_path.as_deref())
+            .collect()
+    }
+
+    fn focus_cursor_on(model: &mut FrameModel, sb: &mut SidebarState, path: &str) {
+        sb.focused = true;
+        sb.cursor = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .position(|r| r.worktree_path.as_deref() == Some(path))
+            .expect("row on screen");
+        sb.sync(model);
+    }
+
+    fn cursor_path(model: &FrameModel, sb: &SidebarState) -> Option<String> {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .nth(sb.cursor)
+            .and_then(|r| r.worktree_path.clone())
+    }
+
+    fn delete(session: &mut Session, model: &mut FrameModel, sb: &mut SidebarState, name: &str) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut panes = crate::panes::Panes::new(tx);
+        let path = session
+            .worktrees
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| g.path.clone())
+            .expect("group");
+        assert!(apply_completions_from(
+            vec![LifecycleCompletion::WorktreeDelete {
+                group_name: name.into(),
+                path,
+                success: true,
+                message: String::new(),
+            }],
+            session,
+            &mut panes,
+            model,
+            sb,
+        ));
+    }
+
+    fn active_name(session: &Session) -> &str {
+        &session.active_group().expect("active group").name
+    }
+
+    #[test]
+    fn deleting_the_active_worktree_lands_on_its_visual_neighbour() {
+        // Session slot 1 would hand focus to `zeta`; on screen the next row
+        // after `alpha` is `mid`.
+        let (mut session, mut model, mut sb) = tree(1);
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/mid");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-mid"));
+    }
+
+    #[test]
+    fn deleting_effective_active_with_stale_index_uses_visual_neighbour() {
+        let (mut session, mut model, mut sb) = tree(usize::MAX);
+        // Effective active is mid. Its next visual neighbour is zeta, but
+        // removing its last session slot falls back to alpha without landing.
+        session.worktrees.swap(1, 2);
+        crate::run::refresh_tab_model(&mut model, &session, &mut sb);
+        assert_eq!(active_name(&session), "app/mid");
+        delete(&mut session, &mut model, &mut sb, "app/mid");
+        assert_eq!(active_name(&session), "app/zeta");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
+    }
+
+    #[test]
+    fn deleting_another_group_with_stale_index_preserves_effective_active() {
+        let (mut session, mut model, mut sb) = tree(usize::MAX);
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/mid");
+        assert!(session.active < session.worktrees.len());
+    }
+
+    #[test]
+    fn mixed_batch_lands_on_failed_neighbour_independent_of_completion_order() {
+        for reverse in [false, true] {
+            let (mut session, mut model, mut sb) = tree(1);
+            focus_cursor_on(&mut model, &mut sb, "/tmp/app-alpha");
+            let mut completions = vec![
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/alpha".into(),
+                    path: "/tmp/app-alpha".into(),
+                    success: true,
+                    message: String::new(),
+                },
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/mid".into(),
+                    path: "/tmp/app-mid".into(),
+                    success: false,
+                    message: "still in use".into(),
+                },
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/zeta".into(),
+                    path: "/tmp/app-zeta".into(),
+                    success: true,
+                    message: String::new(),
+                },
+            ];
+            if reverse {
+                completions.reverse();
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut panes = crate::panes::Panes::new(tx);
+            assert!(apply_completions_from(
+                completions,
+                &mut session,
+                &mut panes,
+                &mut model,
+                &mut sb,
+            ));
+            assert_eq!(active_name(&session), "app/mid");
+            assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-mid"));
+            assert_eq!(worktree_paths(&model), ["/tmp/app", "/tmp/app-mid"]);
+        }
+    }
+
+    #[test]
+    fn deleting_active_without_visible_row_falls_back_to_workspace_home() {
+        let (mut session, mut model, mut sb) = tree(1);
+        sb.view.filter = "zeta".into();
+        crate::run::refresh_tab_model(&mut model, &session, &mut sb);
+        assert_eq!(worktree_paths(&model), ["/tmp/app-zeta"]);
+        focus_cursor_on(&mut model, &mut sb, "/tmp/app-zeta");
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/home");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
+    }
+
+    #[test]
+    fn deleting_the_last_row_lands_on_the_previous_one() {
+        let (mut session, mut model, mut sb) = tree(2);
+        delete(&mut session, &mut model, &mut sb, "app/zeta");
+        assert_eq!(active_name(&session), "app/mid");
+    }
+
+    #[test]
+    fn deleting_another_worktree_keeps_focus_and_moves_the_cursor_to_its_neighbour() {
+        // The user is working in `home` and deletes `alpha` from the sidebar.
+        // Focus must stay on `home`, and the cursor must stay where the user
+        // was — on the row that replaced `alpha` — not jump to the top.
+        let (mut session, mut model, mut sb) = tree(0);
+        focus_cursor_on(&mut model, &mut sb, "/tmp/app-alpha");
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/home");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-mid"));
+    }
+
+    #[test]
+    fn a_focused_cursor_on_the_last_deleted_row_steps_back_not_off_the_workspace() {
+        let (mut session, mut model, mut sb) = tree(0);
+        focus_cursor_on(&mut model, &mut sb, "/tmp/app-zeta");
+        delete(&mut session, &mut model, &mut sb, "app/zeta");
+        assert_eq!(active_name(&session), "app/home");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-mid"));
+    }
+
+    #[test]
+    fn a_focused_cursor_elsewhere_stays_on_its_row() {
+        let (mut session, mut model, mut sb) = tree(0);
+        focus_cursor_on(&mut model, &mut sb, "/tmp/app-zeta");
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/home");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
     }
 }

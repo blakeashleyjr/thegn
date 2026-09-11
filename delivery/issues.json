@@ -66,13 +66,6 @@
       ]
     },
     {
-      "issue": "THE-99",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "add-remote-enqueue-modes"
-      ]
-    },
-    {
       "issue": "THE-102",
       "project": "Plugin UI Platform",
       "changes": [
@@ -84,13 +77,6 @@
       "project": "Client API & Remote Access",
       "changes": [
         "define-external-ide-inbound-boundary"
-      ]
-    },
-    {
-      "issue": "THE-105",
-      "project": "Client API & Remote Access",
-      "changes": [
-        "publish-observer-event-contract"
       ]
     },
     {
@@ -150,13 +136,6 @@
       ]
     },
     {
-      "issue": "THE-116",
-      "project": "Agent & Workflow Platform",
-      "changes": [
-        "improve-agent-pipeline-v2"
-      ]
-    },
-    {
       "issue": "THE-117",
       "project": "Agent & Workflow Platform",
       "changes": [
@@ -182,20 +161,6 @@
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "add-oci-runtime-tiers"
-      ]
-    },
-    {
-      "issue": "THE-121",
-      "project": "Agent & Workflow Platform",
-      "changes": [
-        "harden-pipeline-slot-accounting"
-      ]
-    },
-    {
-      "issue": "THE-122",
-      "project": "Runtime Security & Host Architecture",
-      "changes": [
-        "add-credential-broker"
       ]
     },
     {
@@ -382,6 +347,48 @@
       "project": "Workspace Product & Observability",
       "changes": [
         "add-voice-mode"
+      ]
+    },
+    {
+      "issue": "THE-149",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "bind-identity-commit-signing"
+      ]
+    },
+    {
+      "issue": "THE-559",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-560",
+      "project": "Spec & Tracker Reconciliation",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-566",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-567",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-568",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
       ]
     }
   ]

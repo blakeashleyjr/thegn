@@ -1,0 +1,91 @@
+# Panes — zoom delta
+
+## ADDED Requirements
+
+### Requirement: Zoom is remembered per tab
+
+thegn SHALL keep the `Ctrl-Alt-z` zoom level (tiled, maximized, full-window)
+on each worktree tab, and SHALL keep each tab's focused pane across tab,
+worktree and workspace switches. Activating a tab MUST NOT move its focus
+unless the remembered pane no longer exists. The chrome MUST follow the active
+tab's level. A full-window tab whose focus moves to the sidebar or panel SHALL
+show that chrome until focus returns to the center. The level is not
+persisted: a restart comes back tiled.
+
+#### Scenario: Returning to a zoomed worktree
+
+- **WHEN** the user zooms the second pane of a split in worktree A, switches
+  to worktree B, and switches back to A
+- **THEN** A shows that same second pane zoomed, and B was shown with its own
+  (unzoomed) layout
+
+#### Scenario: A stale focus is repaired
+
+- **WHEN** a tab is activated whose remembered focused pane is no longer in
+  its tree
+- **THEN** focus moves to the leftmost visible pane
+
+#### Scenario: Keyboard navigation within a saved stack survives restoring tiled
+
+- **WHEN** the user zooms a saved stack, uses Ctrl or Alt vertical navigation
+  to focus a collapsed member, and restores tiled view
+- **THEN** the original stack expands that same member and keyboard input
+  targets the displayed pane, including stacks nested inside splits
+
+### Requirement: A zoomed tab renders as a pane stack
+
+While a tab is maximized or full-window, thegn SHALL draw the focused pane
+expanded and every other pane of the tab as a one-row title bar: panes before
+it in tree order above it, and panes after it below. A left click on a bar
+SHALL focus and expand that pane. When the center is too short to keep a
+usable expanded pane under the bars, the bars SHALL be omitted. Vertical focus
+moves SHALL step through the stack in its visual order; horizontal moves keep
+the split geometry.
+
+#### Scenario: Stack bars show the hidden panes
+
+- **WHEN** the user zooms the middle pane of a three-pane tab
+- **THEN** one collapsed title bar is drawn above the expanded pane and one
+  below it
+
+#### Scenario: Clicking a bar
+
+- **WHEN** the user clicks a collapsed bar while zoomed
+- **THEN** that pane becomes focused and expanded, and the tab stays zoomed
+
+#### Scenario: A stack is too narrow to paint its bars
+
+- **WHEN** a stack is laid out in fewer than two columns
+- **THEN** collapsed bars are omitted from both rendering and hit-testing and
+  the active member keeps the stack's full rect
+
+#### Scenario: A stack bar is not displayed
+
+- **WHEN** an app tab or loading splash replaces the worktree center, or an
+  overlay covers the cell where a collapsed bar would otherwise be drawn
+- **THEN** a click there MUST NOT activate the hidden stack member
+- **AND** existing modal, drawer and pointer-capture routing retains priority
+
+### Requirement: Paired stack geometry uses one layout walk
+
+Rendering and mouse dispatch SHALL obtain pane frames and stack bars from one
+shared layout walk. Callers needing only panes or bars MUST NOT allocate a
+discarded vector for the unrequested output.
+
+#### Scenario: A nested stack is rendered or hit-tested
+
+- **WHEN** the caller needs both pane frames and collapsed bars
+- **THEN** one layout walk supplies both and agrees with the pane-only and
+  bar-only geometry for the same tree and rect
+
+### Requirement: Mouse input targets the pane geometry as drawn
+
+thegn SHALL resolve mouse hits against the pane tree as displayed, which is
+the stack while zoomed, and never against hidden split geometry. Selection
+anchors and drags, wheel scrolling, pane-app mouse forwarding, and border
+gestures MUST use the same rects the renderer drew.
+
+#### Scenario: Selecting text in a zoomed pane
+
+- **WHEN** the user drag-selects inside a zoomed pane
+- **THEN** the selection starts at the cell under the pointer in that pane

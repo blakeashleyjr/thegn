@@ -101,6 +101,9 @@ pub struct Tab {
     /// set for host PTY panes (native-exec streams replay scrollback server-side);
     /// bounded by `[session] scrollback_lines`.
     pub pane_scrollback: std::collections::BTreeMap<u32, String>,
+    /// The tab's `Ctrl+Alt+z` zoom level. Per tab so a zoomed worktree comes
+    /// back zoomed on the pane you left; never persisted (restart = tiled).
+    pub grow: crate::center::Grow,
 }
 
 impl Tab {
@@ -113,6 +116,7 @@ impl Tab {
             pane_cmds: std::collections::BTreeMap::new(),
             pane_sessions: std::collections::BTreeMap::new(),
             pane_scrollback: std::collections::BTreeMap::new(),
+            grow: crate::center::Grow::Tiled,
         }
     }
 
@@ -155,6 +159,7 @@ impl Tab {
             pane_cmds,
             pane_sessions,
             pane_scrollback,
+            grow: crate::center::Grow::Tiled,
         }
     }
 
@@ -668,6 +673,7 @@ impl Session {
                             pane_cmds: Default::default(),
                             pane_sessions: Default::default(),
                             pane_scrollback: Default::default(),
+                            grow: t.grow,
                         })
                         .collect(),
                 })
@@ -1012,6 +1018,7 @@ mod tests {
             pane_cmds: std::collections::BTreeMap::new(),
             pane_sessions: std::collections::BTreeMap::new(),
             pane_scrollback: std::collections::BTreeMap::new(),
+            grow: crate::center::Grow::Tiled,
         };
         let back = Tab::from_row(&tab.to_row("app/feat", 1));
         assert_eq!(tab, back);

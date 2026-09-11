@@ -23,6 +23,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use thegn_core::config::{Config, EnvProviderConfig};
 use thegn_svc::vps::registry;
 
@@ -62,7 +63,6 @@ pub fn tick(cfg: &Config) {
 /// ceiling is taken from the first fly env (mirrors the VPS reaper's per-provider
 /// treatment; a Fly record doesn't record which env minted it).
 fn reap(envs: &[EnvProviderConfig]) {
-    use thegn_svc::provider::RemoteProvider;
     let Some(pc) = envs.first() else { return };
     let now = thegn_core::util::now();
     for rec in registry::list().into_iter().filter(|r| r.provider == "fly") {
@@ -81,21 +81,94 @@ fn reap(envs: &[EnvProviderConfig]) {
                 rec.name,
                 age / 60
             ));
-            if let Some(p) = crate::provider_factory::fly_provider_for(pc, &rec.name)
-                && let Err(e) =
-                    crate::agent::block_on_provider(|| async { p.destroy(&rec.name).await })
-            {
+            let result = complete_reap(
+                crate::provider_factory::fly_provider_for(pc, &rec.name),
+                |provider| {
+                    crate::agent::block_on_provider(|| async {
+                        provider.destroy_remote_only(&rec.name).await
+                    })
+                },
+                || crate::remote_enqueue_auth::revoke_for_sandbox(pc, &rec.name, None).map(|_| ()),
+                |provider| provider.retire_destroyed(&rec.name),
+            );
+            if let Err(error) = result {
                 thegn_core::msg::warn(&format!(
-                    "fly reaper: destroy {} failed: {e}; will retry next pass",
+                    "fly reaper: lifecycle for {} failed: {error:#}; ownership records remain for the next pass",
                     rec.name
                 ));
             }
-            // destroy() clears the ledger; ensure it's gone even if the provider
-            // couldn't be built (missing token) so it doesn't loop forever.
-            registry::remove(&rec.name);
         }
         // A `ready` record under the lifetime ceiling is left alone; a machine
         // destroyed out-of-band leaves only a harmless (non-billing) stale record
         // that the next attach re-resolves — not worth an extra API call here.
+    }
+}
+
+/// Ordered fail-closed lifecycle: provider capability, route-token revocation,
+/// remote deletion, then local ownership retirement. A revocation failure must
+/// never leave a live remote with its return route, and only the final closure
+/// may remove machine/custody records.
+fn complete_reap<P>(
+    provider: Option<P>,
+    mut destroy_remote: impl FnMut(&P) -> Result<()>,
+    mut revoke_route_token: impl FnMut() -> Result<()>,
+    mut retire_ownership: impl FnMut(&P) -> Result<()>,
+) -> Result<()> {
+    let provider = provider.context("provider credentials or managed identity unavailable")?;
+    revoke_route_token().context("route-to-host credential revocation failed")?;
+    destroy_remote(&provider).context("remote destroy failed")?;
+    retire_ownership(&provider).context("local ownership retirement failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn run_with_failure(fail: Option<&str>) -> (Result<()>, Vec<&'static str>) {
+        let calls = RefCell::new(Vec::new());
+        let result = complete_reap(
+            (fail != Some("provider")).then_some(()),
+            |_| {
+                calls.borrow_mut().push("destroy");
+                anyhow::ensure!(fail != Some("destroy"), "injected destroy failure");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("revoke");
+                anyhow::ensure!(fail != Some("revoke"), "injected revoke failure");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("retire");
+                anyhow::ensure!(fail != Some("retire"), "injected retirement failure");
+                Ok(())
+            },
+        );
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn ownership_is_retired_only_after_token_revocation_and_remote_destroy() {
+        let (result, calls) = run_with_failure(None);
+        result.unwrap();
+        assert_eq!(calls, ["revoke", "destroy", "retire"]);
+    }
+
+    #[test]
+    fn every_failure_preserves_the_ownership_retirement_record() {
+        for (failure, expected) in [
+            ("provider", vec![]),
+            ("revoke", vec!["revoke"]),
+            ("destroy", vec!["revoke", "destroy"]),
+            ("retire", vec!["revoke", "destroy", "retire"]),
+        ] {
+            let (result, calls) = run_with_failure(Some(failure));
+            assert!(result.is_err(), "{failure} must surface");
+            assert_eq!(calls, expected, "unexpected lifecycle after {failure}");
+            if failure != "retire" {
+                assert!(!calls.contains(&"retire"));
+            }
+        }
     }
 }

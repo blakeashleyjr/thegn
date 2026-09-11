@@ -802,6 +802,14 @@ impl RemoteProvider for VpsProvider {
             if !ip.is_empty() {
                 *self.ip.lock().unwrap() = Some(ip.clone());
             }
+            thegn_core::managed_ssh::record_authorized(
+                self.spec.kind.as_str(),
+                &thegn_core::managed_ssh::account_label(&self.spec.key_path),
+                &name,
+                &self.spec.key_path,
+                &self.spec.pubkey,
+            )
+            .context("vps: record managed SSH key custody")?;
             Ok(SandboxHandle {
                 id: name,
                 exec: ExecKind::Ssh(SshTarget::plain(ip, 22, false)),
@@ -811,6 +819,9 @@ impl RemoteProvider for VpsProvider {
 
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+            thegn_core::managed_ssh::read(self.spec.kind.as_str(), &custody_account, id)
+                .context("vps: validate managed SSH custody before destroy")?;
             // Resolve name → vendor instance id (registry first, then the API).
             let instance_id = match registry::read(id).filter(|r| !r.instance_id.is_empty()) {
                 Some(r) => Some(r.instance_id),
@@ -819,6 +830,12 @@ impl RemoteProvider for VpsProvider {
             let Some(iid) = instance_id else {
                 // Nothing at the provider — clear any lingering ledger entry.
                 registry::remove(id);
+                thegn_core::managed_ssh::record_revoked(
+                    self.spec.kind.as_str(),
+                    &custody_account,
+                    id,
+                )
+                .context("vps: retire managed SSH custody")?;
                 return Ok(());
             };
             // Retry transient statuses: a leaked VPS bills forever (same policy as
@@ -838,6 +855,12 @@ impl RemoteProvider for VpsProvider {
                 let status = resp.status();
                 if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
                     registry::remove(id);
+                    thegn_core::managed_ssh::record_revoked(
+                        self.spec.kind.as_str(),
+                        &custody_account,
+                        id,
+                    )
+                    .context("vps: retire managed SSH custody")?;
                     return Ok(());
                 }
                 last_status = Some(status);

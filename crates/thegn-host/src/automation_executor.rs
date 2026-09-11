@@ -213,6 +213,8 @@ async fn client() -> Result<ControlClient> {
     })
     .await??;
     match addr {
-        ControlAddr::Unix(_) | ControlAddr::Tcp { .. } => Ok(ControlClient::new(addr)),
+        ControlAddr::Unix(_) | ControlAddr::Tcp { .. } | ControlAddr::HttpOrigin { .. } => {
+            Ok(ControlClient::new(addr))
+        }
     }
 }

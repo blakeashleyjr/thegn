@@ -732,6 +732,30 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileSink {
 mod tests {
     use super::*;
     use crate::config::LogConfig;
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tg-log-{}-{tag}", std::process::id()));
@@ -756,6 +780,7 @@ mod tests {
         for _ in 0..10 {
             sink.write_all(b"0123456789ABCDEF0123456789\n").unwrap();
         }
+        sink.flush().unwrap();
         // Active file + at least one rotated file exist.
         assert!(dir.join("t.log").exists());
         assert!(dir.join("t.log.1").exists());
@@ -769,32 +794,13 @@ mod tests {
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
         assert_eq!(json_escape("l1\nl2\ttab"), "l1\\nl2\\ttab");
+        assert_eq!(json_escape("left\rright"), "left\\rright");
         // Control char below 0x20 → \u escape.
         assert_eq!(json_escape("\u{0007}"), "\\u0007");
     }
 
     #[test]
     fn json_sink_emits_parseable_json_with_timestamp() {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct BufWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for BufWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-            type Writer = BufWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         let buf = Arc::new(Mutex::new(Vec::new()));
         let layer = tracing_subscriber::fmt::layer()
             .with_writer(BufWriter(buf.clone()))
@@ -833,8 +839,27 @@ mod tests {
 
     #[test]
     fn env_filter_prefers_thegn_log() {
-        // Just ensure construction doesn't panic for both paths.
-        let _ = level_filter(LogLevel::Info); // best-effort: test smoke: this path must not panic
+        {
+            let _env = crate::testenv::EnvGuard::unset(&["THEGN_LOG", "THEGN_LOG_LEVEL"]);
+            let filter = level_filter(LogLevel::Info).to_string();
+            assert!(filter.contains("info"), "{filter}");
+            assert!(filter.contains(BRIDGED_LOG_DIRECTIVE), "{filter}");
+            assert!(!env_level_is_set());
+        }
+        {
+            let _env = crate::testenv::EnvGuard::set(&[("THEGN_LOG", "thegn_core=trace")]);
+            assert_eq!(level_filter(LogLevel::Warn).to_string(), "thegn_core=trace");
+            assert!(env_level_is_set());
+        }
+        {
+            let _env = crate::testenv::EnvGuard::mutate_pairs(&[
+                ("THEGN_LOG", Some("   ")),
+                ("THEGN_LOG_LEVEL", Some("debug")),
+            ]);
+            let filter = level_filter(LogLevel::Error).to_string();
+            assert!(filter.contains("error"), "{filter}");
+            assert!(env_level_is_set());
+        }
     }
 
     #[test]
@@ -917,5 +942,319 @@ mod tests {
         // the e2e guard's patterns match
         let re = regex::Regex::new("thread '.*' panicked|index out of bounds").unwrap();
         assert!(re.is_match(&line));
+    }
+
+    #[test]
+    fn role_selects_sink_name_stderr_and_process_kind() {
+        let watch = Role::Watch {
+            session: "Pair Session/One".into(),
+        };
+        assert_eq!(Role::Cli.log_file(), "thegn.log");
+        assert_eq!(watch.log_file(), "watch-pair-session-one.log");
+        assert_eq!(Role::Host.log_file(), "thegn.log");
+        assert_eq!(Role::Daemon.log_file(), "thegn-daemon.log");
+
+        assert!(Role::Cli.wants_stderr());
+        assert!(!watch.wants_stderr());
+        assert!(!Role::Host.wants_stderr());
+        assert!(!Role::Daemon.wants_stderr());
+
+        assert_eq!(Role::Cli.proc_kind(), diagnostics::ProcKind::Cli);
+        assert_eq!(watch.proc_kind(), diagnostics::ProcKind::Cli);
+        assert_eq!(Role::Host.proc_kind(), diagnostics::ProcKind::Host);
+        assert_eq!(Role::Daemon.proc_kind(), diagnostics::ProcKind::Daemon);
+    }
+
+    #[test]
+    fn text_formatter_covers_plain_timestamped_and_ansi_worktree_forms() {
+        let plain = Arc::new(Mutex::new(Vec::new()));
+        let plain_layer = tracing_subscriber::fmt::layer()
+            .with_writer(BufWriter(plain.clone()))
+            .event_format(Brand {
+                ansi: false,
+                timestamp: true,
+                json: false,
+            });
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(plain_layer), || {
+            tracing::info!(target: "thegn::plain", count = 2, "plain message");
+        });
+        let plain = String::from_utf8(plain.lock().unwrap().clone()).unwrap();
+        assert!(plain.contains("INFO  thegn::plain"), "{plain:?}");
+        assert!(plain.contains("proc=cli run="), "{plain:?}");
+        assert!(plain.contains("plain message"), "{plain:?}");
+        assert!(!plain.contains("\u{1b}["), "{plain:?}");
+
+        let ansi = Arc::new(Mutex::new(Vec::new()));
+        let ansi_layer = tracing_subscriber::fmt::layer()
+            .with_writer(BufWriter(ansi.clone()))
+            .event_format(Brand {
+                ansi: true,
+                timestamp: false,
+                json: false,
+            });
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(ansi_layer), || {
+            let _guard = enter_wt("feature-a");
+            tracing::error!(target: "thegn::ansi", reason = "bad", "ansi message");
+        });
+        let ansi = String::from_utf8(ansi.lock().unwrap().clone()).unwrap();
+        assert!(ansi.contains("\u{2726}"), "{ansi:?}");
+        assert!(ansi.contains("\u{1b}[38;2;"), "{ansi:?}");
+        assert!(ansi.contains("wt=feature-a"), "{ansi:?}");
+        assert!(ansi.contains("ansi message"), "{ansi:?}");
+    }
+
+    #[test]
+    fn formatter_hues_cover_every_tracing_level() {
+        assert_eq!(Brand::hue(&Level::ERROR), theme::RED);
+        assert_eq!(Brand::hue(&Level::WARN), theme::AMBER);
+        assert_eq!(Brand::hue(&Level::INFO), theme::DIM);
+        assert_eq!(Brand::hue(&Level::DEBUG), theme::FAINT);
+        assert_eq!(Brand::hue(&Level::TRACE), theme::GHOST);
+    }
+
+    #[test]
+    fn json_formatter_without_worktree_escapes_structured_fields() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(BufWriter(buf.clone()))
+            .event_format(Brand {
+                ansi: false,
+                timestamp: false,
+                json: true,
+            });
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::warn!(
+                target: "thegn::json\"target",
+                detail = "line one\nline two",
+                "quoted \"message\""
+            );
+        });
+        let line = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(value["level"], "WARN");
+        assert_eq!(value["target"], "thegn::json\"target");
+        assert!(value.get("wt").is_none());
+        assert!(value["msg"].as_str().unwrap().contains("quoted"));
+        assert!(value["msg"].as_str().unwrap().contains("line one"));
+    }
+
+    #[test]
+    fn ring_layer_records_message_fields_and_worktree() {
+        let subscriber = tracing_subscriber::registry().with(RingLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let _guard = enter_wt("ring-wt");
+            tracing::warn!(
+                target: "thegn::ring-test",
+                answer = 42,
+                healthy = true,
+                "ring message"
+            );
+        });
+        let snapshot = diagnostics::ring_snapshot();
+        let line = snapshot
+            .iter()
+            .find(|line| line.contains("thegn::ring-test"))
+            .unwrap_or_else(|| panic!("ring event missing from {snapshot:?}"));
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("thegn::ring-test"), "{line}");
+        assert!(line.contains("wt=ring-wt"), "{line}");
+        assert!(line.contains("ring message"), "{line}");
+        assert!(line.contains("answer=42"), "{line}");
+        assert!(line.contains("healthy=true"), "{line}");
+    }
+
+    fn run_install_child(case: &str, dir: &Path) -> Output {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "log_trace::tests::install_child_case",
+                "--nocapture",
+            ])
+            .env("THEGN_LOG_TRACE_INSTALL_CASE", case)
+            .env("THEGN_LOG_TRACE_TEST_DIR", dir)
+            .env("THEGN_DIR", dir.join("thegn-home"))
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("LOCALAPPDATA", dir.join("state"))
+            .env("USERPROFILE", dir.join("home"))
+            .env_remove("THEGN_LOG")
+            .env_remove("THEGN_LOG_LEVEL");
+        if case == "cli" {
+            command.env("THEGN_LOG", "debug");
+        }
+        command.output().unwrap()
+    }
+
+    #[test]
+    fn install_process_paths_are_isolated_and_observable() {
+        for case in [
+            "ring",
+            "host-text",
+            "host-json",
+            "cli",
+            "bad-file",
+            "restore",
+            "poison",
+            "panic",
+        ] {
+            let dir = tmp(&format!("child-{case}"));
+            let output = run_install_child(case, &dir);
+            assert!(
+                output.status.success(),
+                "case={case} status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if case == "host-text" {
+                let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
+                assert!(log.contains("installed host text"), "{log}");
+                assert!(log.contains("proc=host"), "{log}");
+            } else if case == "host-json" {
+                let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
+                let value: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+                assert_eq!(value["msg"], "installed host json");
+                assert_eq!(value["proc"], "host");
+            } else if case == "cli" {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("installed cli stderr"), "{stderr}");
+            } else if case == "bad-file" {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("could not open log file"), "{stderr}");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn install_child_case() {
+        let Ok(case) = std::env::var("THEGN_LOG_TRACE_INSTALL_CASE") else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var_os("THEGN_LOG_TRACE_TEST_DIR").unwrap());
+        match case.as_str() {
+            "ring" => {
+                let audit_dir = dir.join("thegn-home");
+                std::fs::create_dir_all(&audit_dir).unwrap();
+                audit("isolated audit event");
+                let audit_log = std::fs::read_to_string(audit_dir.join("audit.log")).unwrap();
+                assert!(audit_log.contains("isolated audit event"), "{audit_log}");
+                install(Role::Host, &LogConfig::default());
+                assert!(!ready());
+                tracing::warn!(target: "thegn::install-test", "ring-only warning");
+                assert!(
+                    diagnostics::ring_snapshot()
+                        .iter()
+                        .any(|line| line.contains("ring-only warning"))
+                );
+                reload_level(LogLevel::Debug);
+            }
+            "host-text" => {
+                let cfg = LogConfig {
+                    file: true,
+                    dir: dir.to_string_lossy().into_owned(),
+                    ..LogConfig::default()
+                };
+                install(Role::Host, &cfg);
+                assert!(ready());
+                tracing::warn!(target: "thegn::install-test", "installed host text");
+                reload_level(LogLevel::Trace);
+                tracing::trace!(target: "thegn::install-test", "reloaded trace");
+                // A second install exercises the idempotent try-init failure path.
+                install(Role::Daemon, &cfg);
+            }
+            "host-json" => {
+                let cfg = LogConfig {
+                    file: true,
+                    dir: dir.to_string_lossy().into_owned(),
+                    format: LogFormat::Json,
+                    ..LogConfig::default()
+                };
+                install(Role::Host, &cfg);
+                assert!(ready());
+                tracing::error!(target: "thegn::install-test", "installed host json");
+            }
+            "cli" => {
+                install(Role::Cli, &LogConfig::default());
+                assert!(ready());
+                tracing::warn!(target: "thegn::install-test", "installed cli stderr");
+            }
+            "bad-file" => {
+                let invalid_dir = dir.join("not-a-directory");
+                std::fs::write(&invalid_dir, b"file").unwrap();
+                let cfg = LogConfig {
+                    file: true,
+                    dir: invalid_dir.to_string_lossy().into_owned(),
+                    ..LogConfig::default()
+                };
+                install(Role::Host, &cfg);
+                assert!(!ready());
+            }
+            "restore" => {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let callback_calls = calls.clone();
+                register_panic_restore(move || {
+                    callback_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                });
+                run_panic_restore_once();
+                run_panic_restore_once();
+                assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+                clear_panic_restore();
+                RESTORE_DONE.store(false, Ordering::SeqCst);
+                run_panic_restore_once();
+                assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+                let callback_calls = calls.clone();
+                register_panic_restore(move || {
+                    callback_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                });
+                run_panic_restore_once();
+                assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+                clear_panic_restore();
+            }
+            "poison" => {
+                let cfg = LogConfig {
+                    dir: dir.to_string_lossy().into_owned(),
+                    ..LogConfig::default()
+                };
+                let mut sink = FileSink::open(&cfg, "poison.log").unwrap();
+                let inner = sink.0.clone();
+                let _ = std::thread::spawn(move || {
+                    let _guard = inner.lock().unwrap();
+                    panic!("poison the log mutex");
+                })
+                .join();
+                assert_eq!(sink.write(b"x").unwrap_err().kind(), io::ErrorKind::Other);
+                assert_eq!(sink.flush().unwrap_err().kind(), io::ErrorKind::Other);
+            }
+            "panic" => {
+                let restored = Arc::new(AtomicUsize::new(0));
+                let restored_in_hook = restored.clone();
+                register_panic_restore(move || {
+                    restored_in_hook.fetch_add(1, AtomicOrdering::SeqCst);
+                });
+                let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+                let notices_in_hook = notices.clone();
+                register_crash_notice(move |notice| {
+                    notices_in_hook.lock().unwrap().push(notice.to_string());
+                });
+                install_panic_hook();
+                install_panic_hook();
+                let result = std::panic::catch_unwind(|| {
+                    std::panic::panic_any(7_u8);
+                });
+                assert!(result.is_err());
+                assert_eq!(restored.load(AtomicOrdering::SeqCst), 1);
+                assert!(
+                    notices
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|n| n.contains("thegn crashed"))
+                );
+            }
+            other => panic!("unknown install child case: {other}"),
+        }
     }
 }

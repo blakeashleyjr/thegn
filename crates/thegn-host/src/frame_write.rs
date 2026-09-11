@@ -30,6 +30,20 @@ pub(crate) enum FrameWrite {
     Fatal(anyhow::Error),
 }
 
+/// Enter the alternate screen NOW, not at the next termwiz flush.
+///
+/// termwiz's `enter_alternate_screen` only appends `?1049h` to its userspace
+/// write buffer. The wire renderer writes frames straight to fd 1 and never
+/// flushes termwiz, so without this flush the `?1049h` sat buffered until
+/// teardown and the whole session drew on the PRIMARY screen — where alacritty
+/// scrolls the viewport into history on every ED 2, banking a stale frame in
+/// scrollback on each full repaint (resize, refocus, drawer toggle, Redraw).
+pub(crate) fn enter_alt_screen<T: Terminal>(term: &mut T) -> anyhow::Result<()> {
+    term.enter_alternate_screen()?;
+    term.flush()?;
+    Ok(())
+}
+
 /// Render + flush one frame's `wire` change list, then ring the latched bell.
 /// Any write failure is classified as [`FrameWrite::Transient`] (retry) or
 /// [`FrameWrite::Fatal`] (propagate).
@@ -178,6 +192,90 @@ mod tests {
             let e = anyhow::Error::new(std::io::Error::from(kind)).context("write");
             assert!(is_transient_write_error(&e), "{kind:?} should be transient");
         }
+    }
+
+    /// Records the `Terminal` calls `enter_alt_screen` makes, in order.
+    #[derive(Default)]
+    struct RecordingTerminal {
+        calls: Vec<&'static str>,
+        fail_enter: bool,
+        fail_flush: bool,
+    }
+
+    impl Terminal for RecordingTerminal {
+        fn set_raw_mode(&mut self) -> termwiz::Result<()> {
+            unimplemented!()
+        }
+        fn set_cooked_mode(&mut self) -> termwiz::Result<()> {
+            unimplemented!()
+        }
+        fn enter_alternate_screen(&mut self) -> termwiz::Result<()> {
+            self.calls.push("enter");
+            if self.fail_enter {
+                return Err(std::io::Error::other("enter failed").into());
+            }
+            Ok(())
+        }
+        fn exit_alternate_screen(&mut self) -> termwiz::Result<()> {
+            unimplemented!()
+        }
+        fn get_screen_size(&mut self) -> termwiz::Result<termwiz::terminal::ScreenSize> {
+            unimplemented!()
+        }
+        fn set_screen_size(&mut self, _: termwiz::terminal::ScreenSize) -> termwiz::Result<()> {
+            unimplemented!()
+        }
+        fn render(&mut self, _: &[Change]) -> termwiz::Result<()> {
+            unimplemented!()
+        }
+        fn flush(&mut self) -> termwiz::Result<()> {
+            self.calls.push("flush");
+            if self.fail_flush {
+                return Err(std::io::Error::other("flush failed").into());
+            }
+            Ok(())
+        }
+        fn poll_input(
+            &mut self,
+            _: Option<std::time::Duration>,
+        ) -> termwiz::Result<Option<InputEvent>> {
+            unimplemented!()
+        }
+        fn waker(&self) -> termwiz::terminal::TerminalWaker {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn enter_alt_screen_flushes_after_entering() {
+        // The `?1049h` must reach the tty before any frame: frames bypass
+        // termwiz's buffer (direct fd-1 writes), so an unflushed enter would
+        // leave the whole session on the primary screen.
+        let mut term = RecordingTerminal::default();
+        enter_alt_screen(&mut term).unwrap();
+        assert_eq!(term.calls, ["enter", "flush"]);
+    }
+
+    #[test]
+    fn enter_alt_screen_stops_when_enter_fails() {
+        let mut term = RecordingTerminal {
+            fail_enter: true,
+            ..Default::default()
+        };
+        let error = enter_alt_screen(&mut term).unwrap_err();
+        assert!(error.to_string().contains("enter failed"));
+        assert_eq!(term.calls, ["enter"]);
+    }
+
+    #[test]
+    fn enter_alt_screen_propagates_flush_failure() {
+        let mut term = RecordingTerminal {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let error = enter_alt_screen(&mut term).unwrap_err();
+        assert!(error.to_string().contains("flush failed"));
+        assert_eq!(term.calls, ["enter", "flush"]);
     }
 
     #[test]
