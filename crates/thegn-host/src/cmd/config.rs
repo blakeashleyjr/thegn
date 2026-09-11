@@ -72,10 +72,20 @@ pub fn run(
             thegn_core::config_write::set_key(&path, &key, &value)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             let written = std::fs::read_to_string(&path).unwrap_or_default();
-            let parse_err = toml::from_str::<Config>(&written)
-                .err()
-                .map(|e| e.to_string());
-            let enum_errs = thegn_core::config::validate_str(&written);
+            // Runtime loading normalizes accepted aliases/collisions before
+            // serde. Raw serde here would reject an otherwise valid canonical-
+            // wins collision, even for an unrelated edit.
+            let parse_err = thegn_core::config_compat::normalize(&written)
+                .and_then(|normalized| {
+                    toml::from_str::<Config>(&normalized.body).map_err(|e| e.to_string())
+                })
+                .err();
+            let diagnostics = thegn_core::config_validate::validate_diagnostics(&written);
+            let enum_errs: Vec<String> = diagnostics
+                .iter()
+                .filter(|d| d.severity == thegn_core::config_validate::ValidationSeverity::Error)
+                .map(|d| d.message.clone())
+                .collect();
             // Only enum errors this write INTRODUCED should roll it back. A stale
             // bad value in some OTHER (now-covered) key was already
             // warn-defaulting on every load — refusing to set an unrelated key
@@ -118,6 +128,12 @@ pub fn run(
                     path.display(),
                     new_enum_errs.len(),
                 );
+            }
+            for diagnostic in diagnostics
+                .iter()
+                .filter(|d| d.severity == thegn_core::config_validate::ValidationSeverity::Warning)
+            {
+                msg::warn(&format!("{}: {}", path.display(), diagnostic.message));
             }
             // Echo what was actually WRITTEN, not the raw argument: an array
             // argument is now written as a real TOML array, and debug-quoting it
@@ -387,6 +403,63 @@ fn validate(path: &Path, repo_context: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_accepts_advisories_without_rewriting_and_rejects_real_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("private-config");
+        let _env = thegn_core::testenv::EnvGuard::set(&[(
+            "XDG_CONFIG_HOME",
+            config_dir.to_str().unwrap(),
+        )]);
+        let path = dir.path().join("config.toml");
+        let body = "workspaces_dir = '/legacy'\n[workspace.repo]\n";
+        std::fs::write(&path, body).unwrap();
+        assert!(validate(&path, Some(dir.path().to_owned())).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        std::fs::write(&path, "workspaces_dir = '/legacy'\npicker = 42\n").unwrap();
+        let error = validate(&path, Some(dir.path().to_owned())).unwrap_err();
+        assert!(error.to_string().contains("1 problem(s)"), "{error}");
+    }
+
+    #[test]
+    fn config_set_does_not_count_compatibility_warnings_as_new_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "projects_dir = '/canonical'\nworkspaces_dir = '/legacy'\n",
+        )
+        .unwrap();
+        run(
+            &Config::default(),
+            Action::Set {
+                key: "picker".into(),
+                value: "auto".into(),
+            },
+            path.clone(),
+            Some(dir.path().to_owned()),
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(thegn_core::config::validate_str(&written).is_empty());
+        let normalized = thegn_core::config_compat::normalize(&written).unwrap();
+        let config: Config = toml::from_str(&normalized.body).unwrap();
+        assert_eq!(config.workspaces_dir, "/canonical");
+        assert!(
+            run(
+                &Config::default(),
+                Action::Set {
+                    key: "picker".into(),
+                    value: "42".into()
+                },
+                path.clone(),
+                Some(dir.path().to_owned()),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    }
 
     #[test]
     fn show_outputs_toml_and_json_without_panicking() {
