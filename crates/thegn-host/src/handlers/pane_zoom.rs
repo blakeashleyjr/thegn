@@ -274,9 +274,10 @@ pub(crate) fn nav_layout(
     t.center.layout(center)
 }
 
-/// A click on a stack member's collapsed title bar: focus that pane and expand
-/// it. A zoom-derived stack follows focus by itself; a stack that is part of the
-/// tab's real tree (a layout spec) also needs its `active` index moved.
+/// Focus a pane selected by a stack-bar click or directional keyboard routing.
+/// A zoom-derived stack follows focus by itself; a stack in the tab's real tree
+/// also needs its `active` index moved, or restoring tiled would display a
+/// different pane from the one receiving keyboard input.
 pub(crate) fn activate_stack_member(
     session: &mut crate::session::Session,
     focus: &mut FocusState,
@@ -476,5 +477,98 @@ mod tests {
         assert_eq!(t.focused_pane, 3);
         assert_eq!(t.grow, Grow::Fullscreen, "the zoom level is kept");
         assert_eq!(displayed_tree(&session).layout(center_rect())[0].0, 3);
+    }
+
+    #[test]
+    fn keyboard_stack_focus_remains_visible_when_restoring_tiled() {
+        use crate::center::Move;
+        use crate::focus::{FocusMove, NavMove, RouteCtx, resolve_nav, route};
+        for initial in [Grow::Maximized, Grow::Fullscreen] {
+            for alt_navigation in [false, true] {
+                for arrangement in 0..3 {
+                    let mut group = crate::session::WorktreeGroup::terminal("stack");
+                    let original = CenterTree::Stack {
+                        panes: vec![1, 2],
+                        active: 0,
+                    };
+                    group.tabs[0].center = match arrangement {
+                        0 => original,
+                        1 => CenterTree::Split {
+                            dir: Dir::Row,
+                            children: vec![
+                                Branch {
+                                    weight: 1.0,
+                                    child: original,
+                                },
+                                Branch {
+                                    weight: 1.0,
+                                    child: CenterTree::Leaf(3),
+                                },
+                            ],
+                        },
+                        _ => three_panes(),
+                    };
+                    group.tabs[0].focused_pane = 1;
+                    group.tabs[0].grow = initial;
+                    let mut session = crate::session::Session {
+                        worktrees: vec![group],
+                        ..Default::default()
+                    };
+                    let mut f = focus(Zone::Center);
+                    let geometry = nav_layout(session.active_tab(), center_rect(), true);
+                    // Alt first resolves to the directional focus action; Ctrl
+                    // enters that action directly. Both then share route and
+                    // the same mutation seam used by run.rs.
+                    if alt_navigation {
+                        assert_eq!(
+                            resolve_nav(true, Move::Down, &geometry, 1),
+                            NavMove::Focus(Move::Down),
+                        );
+                    }
+                    let resolved = route(
+                        f.zone,
+                        Move::Down,
+                        &RouteCtx {
+                            sidebar_visible: true,
+                            panel_visible: true,
+                            drawer_visible: false,
+                            layout: &geometry,
+                            focused_pane: 1,
+                        },
+                    );
+                    assert_eq!(resolved, FocusMove::CenterPane(2));
+                    let FocusMove::CenterPane(id) = resolved else {
+                        unreachable!()
+                    };
+                    activate_stack_member(&mut session, &mut f, id);
+                    assert_eq!(displayed_tree(&session).layout(center_rect())[0].0, 2);
+                    let mut zone_zoom = None;
+                    while active_grow(&session) != Grow::Tiled {
+                        cycle_or_zoom(
+                            &mut zone_zoom,
+                            &mut session.active_tab_mut().unwrap().grow,
+                            &f,
+                        );
+                    }
+                    let tab = session.active_tab().unwrap();
+                    assert_eq!(tab.focused_pane, 2);
+                    assert!(
+                        tab.center
+                            .layout(center_rect())
+                            .iter()
+                            .any(|(id, _)| *id == tab.focused_pane)
+                    );
+                    if arrangement != 2 {
+                        assert!(
+                            !tab.center
+                                .layout(center_rect())
+                                .iter()
+                                .any(|(id, _)| *id == 1)
+                        );
+                    }
+                    assert_eq!(f.zone, Zone::Center);
+                }
+            }
+        }
     }
 }

@@ -53,6 +53,13 @@ pub enum Grow {
 /// collapsed title bars are dropped (frame ring + a couple of content rows).
 pub const STACK_MIN_EXPANDED_ROWS: usize = 4;
 
+/// Pane frames and collapsed bars from one geometry walk. Rendering and mouse
+/// dispatch consume both, while pane-only callers need not allocate bar storage.
+pub struct FramedLayout {
+    pub frames: Vec<(PaneId, Rect, Rect)>,
+    pub bars: Vec<(PaneId, Rect)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Branch {
     pub weight: f32,
@@ -70,7 +77,7 @@ impl CenterTree {
     /// to the title bars [`CenterTree::stack_bars`] yields).
     pub fn layout(&self, rect: Rect) -> Vec<(PaneId, Rect)> {
         let mut out = Vec::new();
-        self.layout_into(rect, &mut out, &mut Vec::new());
+        self.visit_layout(rect, &mut |p, r| out.push((p, r)), &mut |_, _| {});
         out
     }
 
@@ -79,18 +86,18 @@ impl CenterTree {
     /// always agree. Empty for a tree without stacks.
     pub fn stack_bars(&self, rect: Rect) -> Vec<(PaneId, Rect)> {
         let mut bars = Vec::new();
-        self.layout_into(rect, &mut Vec::new(), &mut bars);
+        self.visit_layout(rect, &mut |_, _| {}, &mut |p, r| bars.push((p, r)));
         bars
     }
 
-    fn layout_into(
+    fn visit_layout(
         &self,
         rect: Rect,
-        out: &mut Vec<(PaneId, Rect)>,
-        bars: &mut Vec<(PaneId, Rect)>,
+        pane: &mut impl FnMut(PaneId, Rect),
+        bar: &mut impl FnMut(PaneId, Rect),
     ) {
         match self {
-            CenterTree::Leaf(p) => out.push((*p, rect)),
+            CenterTree::Leaf(p) => pane(*p, rect),
             CenterTree::Stack { panes, active } => {
                 if panes.is_empty() {
                     return;
@@ -99,11 +106,14 @@ impl CenterTree {
                 let collapsed = panes.len() - 1;
                 // Too short to keep a usable expanded pane under the bars: the
                 // active member fills the rect alone.
-                if collapsed == 0 || rect.rows < collapsed + STACK_MIN_EXPANDED_ROWS {
-                    out.push((panes[a], rect));
+                if collapsed == 0
+                    || rect.cols < 2
+                    || rect.rows < collapsed + STACK_MIN_EXPANDED_ROWS
+                {
+                    pane(panes[a], rect);
                     return;
                 }
-                let bar = |y: usize| Rect {
+                let bar_rect = |y: usize| Rect {
                     x: rect.x,
                     y,
                     cols: rect.cols,
@@ -112,12 +122,12 @@ impl CenterTree {
                 let bottom = rect.y + rect.rows;
                 for (i, p) in panes.iter().enumerate() {
                     if i < a {
-                        bars.push((*p, bar(rect.y + i)));
+                        bar(*p, bar_rect(rect.y + i));
                     } else if i > a {
-                        bars.push((*p, bar(bottom - (panes.len() - i))));
+                        bar(*p, bar_rect(bottom - (panes.len() - i)));
                     }
                 }
-                out.push((
+                pane(
                     panes[a],
                     Rect {
                         x: rect.x,
@@ -125,7 +135,7 @@ impl CenterTree {
                         cols: rect.cols,
                         rows: rect.rows - collapsed,
                     },
-                ));
+                );
             }
             CenterTree::Split { dir, children } => {
                 if children.is_empty() {
@@ -171,7 +181,7 @@ impl CenterTree {
                             rows: size,
                         },
                     };
-                    b.child.layout_into(child_rect, out, bars);
+                    b.child.visit_layout(child_rect, pane, bar);
                     offset += size;
                 }
             }
@@ -327,10 +337,25 @@ impl CenterTree {
     /// `borders::draw_pane_frames` paints; the content rect is what the PTY and
     /// emulator surface get.
     pub fn layout_framed(&self, rect: Rect) -> Vec<(PaneId, Rect, Rect)> {
-        self.layout(rect)
-            .into_iter()
-            .map(|(p, r)| (p, r, inset(r)))
-            .collect()
+        let mut frames = Vec::new();
+        self.visit_layout(
+            rect,
+            &mut |p, r| frames.push((p, r, inset(r))),
+            &mut |_, _| {},
+        );
+        frames
+    }
+
+    /// Both kinds of displayed geometry in one pass, with no discarded vectors.
+    pub fn layout_framed_with_bars(&self, rect: Rect) -> FramedLayout {
+        let mut frames = Vec::new();
+        let mut bars = Vec::new();
+        self.visit_layout(
+            rect,
+            &mut |p, r| frames.push((p, r, inset(r))),
+            &mut |p, r| bars.push((p, r)),
+        );
+        FramedLayout { frames, bars }
     }
 }
 
@@ -889,6 +914,67 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert_eq!(l[1].0, 3);
         assert_eq!(l[1].1.y, 1);
+    }
+
+    #[test]
+    fn stack_omits_unpaintable_narrow_bars() {
+        let t = CenterTree::Stack {
+            panes: vec![1, 2],
+            active: 1,
+        };
+        for cols in 0..=1 {
+            let area = Rect { cols, ..full() };
+            assert_eq!(t.layout(area), vec![(2, area)]);
+            assert!(t.stack_bars(area).is_empty());
+            let paired = t.layout_framed_with_bars(area);
+            assert!(paired.bars.is_empty());
+            assert_eq!(paired.frames, t.layout_framed(area));
+        }
+        let area = Rect { cols: 2, ..full() };
+        assert_eq!(t.stack_bars(area).len(), 1, "two border corners fit");
+    }
+
+    #[test]
+    fn paired_geometry_matches_single_output_walks() {
+        for active in 0..=3 {
+            let tree = CenterTree::Split {
+                dir: Dir::Row,
+                children: vec![
+                    Branch {
+                        weight: 1.0,
+                        child: CenterTree::Leaf(1),
+                    },
+                    Branch {
+                        weight: 1.0,
+                        child: CenterTree::Stack {
+                            panes: vec![2, 3, 4],
+                            active,
+                        },
+                    },
+                ],
+            };
+            for cols in [0, 1, 2, 3, 10, 100] {
+                for rows in [0, 1, 5, 6, 40] {
+                    let area = Rect {
+                        x: 3,
+                        y: 7,
+                        cols,
+                        rows,
+                    };
+                    let paired = tree.layout_framed_with_bars(area);
+                    assert_eq!(paired.frames, tree.layout_framed(area));
+                    assert_eq!(paired.bars, tree.stack_bars(area));
+                    assert_eq!(
+                        paired
+                            .frames
+                            .iter()
+                            .map(|(p, r, _)| (*p, *r))
+                            .collect::<Vec<_>>(),
+                        tree.layout(area),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

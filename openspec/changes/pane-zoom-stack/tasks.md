@@ -32,3 +32,32 @@
 - [x] 4.2 Unit tests for the stack geometry, the Grow cycle, the effective
       zoom, the nav layout, the bar rendering, and the activation round-trip.
 - [ ] 4.3 Pre-push gate (`just test`, clippy, smoke).
+
+## 5. Queue-review repairs (THE-559 / THE-560)
+
+- [x] 5.1 THE-559: gate stack activation on the running app owner, the same
+      splash predicate as rendering, and painted overlay occlusion. Preserve
+      existing modal, drawer, and pointer-capture priority.
+- [x] 5.2 THE-559: run actual `pre_dispatch` regressions for visible stacks,
+      running app takeover, splash, overlays, held presses, drawer and capture.
+- [x] 5.3 THE-560: register real issue/project owners in both delivery ledgers,
+      preserving active/verification-gated status and these unchecked gates.
+- [x] 5.4 THE-560: run delivery validation, negative fixtures and source ratchets
+      without weakening the guards.
+- [ ] 5.5 THE-559 / THE-560: review and verify the candidate integrated with
+      current main; run the remaining full gates and required visual/e2e
+      evidence before queue approval or issue closure.
+
+## 6. Full-feature review repairs (THE-566 / THE-567 / THE-568)
+
+- [x] 6.1 THE-566: share stack activation between keyboard directional focus
+      and mouse activation, preserving the original stack's active member.
+- [x] 6.2 THE-567: omit bars that cannot be painted at widths below two cells,
+      using the shared layout for both rendering and mouse dispatch.
+- [x] 6.3 THE-568: compute paired frame/bar geometry in one visitor pass for
+      rendering and hit-testing; single-output callers allocate only their
+      requested output.
+- [ ] 6.4 Run the keyboard restore, narrow-bar dispatch and paired-geometry
+      regressions along with the prior focused suite, without weakening gates.
+- [ ] 6.5 Review actual-source visual evidence and the fully integrated gates;
+      no merge approval or tracker closure before these pass.

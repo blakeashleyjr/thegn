@@ -13510,6 +13510,7 @@ async fn event_loop<T: Terminal>(
                     cols,
                     rows,
                     &chrome,
+                    &model,
                     &mut app_host,
                     drawer,
                     &mut panes,
@@ -21843,9 +21844,11 @@ async fn event_loop<T: Terminal>(
                                     };
                                     match crate::focus::route(focus.zone, mv, &ctx) {
                                         FocusMove::CenterPane(n) => {
-                                            if let Some(tab) = session.active_tab_mut() {
-                                                tab.focused_pane = n;
-                                            }
+                                            crate::handlers::pane_zoom::activate_stack_member(
+                                                &mut session,
+                                                &mut focus,
+                                                n,
+                                            );
                                             // Follow-focus while grown: the newly
                                             // focused pane must fill the screen.
                                             if crate::handlers::pane_zoom::active_grow(&session)

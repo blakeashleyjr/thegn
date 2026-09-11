@@ -25,6 +25,13 @@ persisted: a restart comes back tiled.
   its tree
 - **THEN** focus moves to the leftmost visible pane
 
+#### Scenario: Keyboard navigation within a saved stack survives restoring tiled
+
+- **WHEN** the user zooms a saved stack, uses Ctrl or Alt vertical navigation
+  to focus a collapsed member, and restores tiled view
+- **THEN** the original stack expands that same member and keyboard input
+  targets the displayed pane, including stacks nested inside splits
+
 ### Requirement: A zoomed tab renders as a pane stack
 
 While a tab is maximized or full-window, thegn SHALL draw the focused pane
@@ -45,6 +52,31 @@ the split geometry.
 
 - **WHEN** the user clicks a collapsed bar while zoomed
 - **THEN** that pane becomes focused and expanded, and the tab stays zoomed
+
+#### Scenario: A stack is too narrow to paint its bars
+
+- **WHEN** a stack is laid out in fewer than two columns
+- **THEN** collapsed bars are omitted from both rendering and hit-testing and
+  the active member keeps the stack's full rect
+
+#### Scenario: A stack bar is not displayed
+
+- **WHEN** an app tab or loading splash replaces the worktree center, or an
+  overlay covers the cell where a collapsed bar would otherwise be drawn
+- **THEN** a click there MUST NOT activate the hidden stack member
+- **AND** existing modal, drawer and pointer-capture routing retains priority
+
+### Requirement: Paired stack geometry uses one layout walk
+
+Rendering and mouse dispatch SHALL obtain pane frames and stack bars from one
+shared layout walk. Callers needing only panes or bars MUST NOT allocate a
+discarded vector for the unrequested output.
+
+#### Scenario: A nested stack is rendered or hit-tested
+
+- **WHEN** the caller needs both pane frames and collapsed bars
+- **THEN** one layout walk supplies both and agrees with the pane-only and
+  bar-only geometry for the same tree and rect
 
 ### Requirement: Mouse input targets the pane geometry as drawn
 

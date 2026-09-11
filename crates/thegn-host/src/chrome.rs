@@ -2496,7 +2496,8 @@ pub fn render_panes<'a>(
     title_of: &dyn Fn(crate::center::PaneId) -> String,
     relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
 ) {
-    let frames = center.layout_framed(chrome.center);
+    let crate::center::FramedLayout { frames, bars } =
+        center.layout_framed_with_bars(chrome.center);
     let show_splash = center_shows_splash(&frames, model, |id| lookup(id).is_some());
     if !show_splash {
         // The pane card owns the full center band. Paint the outside/ring
@@ -2533,12 +2534,7 @@ pub fn render_panes<'a>(
         // bar above/below the expanded pane — the "there's more here" cue.
         // Bars sit outside every content rect, so the incremental pane paths
         // never paint over them; any zoom/focus change is a full frame.
-        crate::borders::draw_stack_bars(
-            surface,
-            &center.stack_bars(chrome.center),
-            &frame_style,
-            title_of,
-        );
+        crate::borders::draw_stack_bars(surface, &bars, &frame_style, title_of);
         // Drag-rearrange affordance: light up the pane a drop would land on
         // (whole ring = swap, one edge = re-anchor). Painted last so it reads on
         // top; colours come from the theme role, not a literal.
