@@ -508,7 +508,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let term_restore = crate::platform::capture_terminal_restore();
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
-    term.enter_alternate_screen().context("alt screen")?;
+    // Flushed immediately — frames bypass termwiz's buffer (see `enter_alt_screen`).
+    crate::frame_write::enter_alt_screen(&mut term).context("alt screen")?;
     // We now own the raw/alternate screen. Register the idempotent, non-panicking
     // restore callback: on a main-thread panic the hook runs it FIRST, before any
     // logging or report writing, so the terminal is always left usable. The
@@ -664,7 +665,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
     // is exactly where a `keyring:` issue token has to resolve (THE-72).
-    thegn_svc::issue::secret::install_keyring_resolver(|r| crate::secret::resolve_for(r, "issue"));
+    thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
@@ -6570,13 +6571,15 @@ async fn event_loop<T: Terminal>(
         .iter()
         .position(|p| *p == keymap.config().theme.preset)
         .unwrap_or(0);
-    // Fullscreen zoom: the zone that owns the whole screen, if any. Toggled
-    // by Ctrl+Alt+z for the CURRENT zone; any zone change clears it.
+    // Sidebar/panel zone zoom: that zone takes (nearly) the whole width.
+    // Toggled by Ctrl+Alt+z on the zone; any zone change clears it. The
+    // center's maximize/fullscreen is per tab (`Tab::grow`), not held here.
     let mut zoom: Option<crate::focus::Zone> = None;
-    // Level-2 pane maximize (the middle stop of Ctrl+Alt+z): the focused pane
-    // fills the center region while all chrome stays. Mutually exclusive with a
-    // `zoom` (the full-window / zone zoom). See `handlers::pane_zoom`.
-    let mut maximized = false;
+    // The zone the chrome is actually grown for: `zoom`, or `Center` while the
+    // active tab is fullscreen with a focused center (`pane_zoom::effective_zoom`).
+    // Re-derived at the loop top — a change recomputes the chrome, which is how
+    // every tab/worktree/workspace switch picks up the new tab's zoom.
+    let mut eff_zoom: Option<crate::focus::Zone> = None;
     // Which bars survive a full-window (`Center`) zoom — seeded from `[ui]` and
     // re-seeded on config reload; consumed by the `recompute_chrome!` macro.
     let mut zoom_keep_masthead = keymap.config().ui.fullscreen_keep_masthead;
@@ -6599,7 +6602,7 @@ async fn event_loop<T: Terminal>(
                 panel_forced,
                 panel_width,
                 sidebar_cols,
-                zoom,
+                eff_zoom,
                 &supervisor,
                 drawer_rows,
                 drawer_full,
@@ -8069,19 +8072,26 @@ async fn event_loop<T: Terminal>(
             && let Some(z) = zoom
             && z != focus.zone
         {
-            // Navigating to another zone un-zooms.
+            // Navigating to another zone un-zooms (the `eff_zoom` derive just
+            // below sees the change and recomputes the chrome).
             zoom = None;
-            chrome = recompute_chrome!();
             need_relayout = true;
             dirty = true;
         }
-        // Leaving the center un-maximizes (its chrome is normal, so only the
-        // tiled tree needs restoring — no chrome recompute).
-        if prev_zone == crate::focus::Zone::Center
-            && focus.zone != crate::focus::Zone::Center
-            && maximized
-        {
-            maximized = false;
+        // The center's zoom is per tab: re-derive the grown zone from the active
+        // tab + focus, and recompute the chrome on any change. One comparison
+        // covers every switch path (sidebar, keys, tab chips, workspaces) and a
+        // focus move off a fullscreen center (its chrome comes back until focus
+        // returns). Leaving the center no longer un-maximizes — the level is
+        // the tab's memory, and a maximized tab keeps all its chrome anyway.
+        let now_zoom = crate::handlers::pane_zoom::effective_zoom(
+            zoom,
+            crate::handlers::pane_zoom::active_grow(&session),
+            focus.zone,
+        );
+        if now_zoom != eff_zoom {
+            eff_zoom = now_zoom;
+            chrome = recompute_chrome!();
             need_relayout = true;
             dirty = true;
         }
@@ -8700,12 +8710,7 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        let tree = crate::handlers::pane_zoom::grown_tree(
-            zoom,
-            maximized,
-            focused_pane_id(&session),
-            session.active_tab().map(|t| t.center.clone()),
-        );
+        let tree = crate::handlers::pane_zoom::displayed_tree(&session);
         if need_relayout || crate::panes::size_drifted(&panes, &tree, chrome.center) {
             let _relayout_span = crate::perf::measure(crate::perf::Subsys::Relayout);
             relayout(&mut panes, &tree, chrome.center);
@@ -11160,7 +11165,7 @@ async fn event_loop<T: Terminal>(
                     // bars apply immediately (the reload relayouts below anyway).
                     zoom_keep_masthead = new_cfg.ui.fullscreen_keep_masthead;
                     zoom_keep_statusbar = new_cfg.ui.fullscreen_keep_statusbar;
-                    if zoom == Some(crate::focus::Zone::Center) {
+                    if eff_zoom == Some(crate::focus::Zone::Center) {
                         chrome = recompute_chrome!();
                     }
                     model.status = keybind_conflict_summary(&new_cfg)
@@ -11458,16 +11463,22 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 RefreshKind::VanishedTabs(result) => {
+                    let gone: Vec<&str> = result.paths.iter().map(String::as_str).collect();
+                    let landing = crate::handlers::worktree_delete::Landing::plan(
+                        &model, &session, &sb, &gone,
+                    );
                     if crate::merge_lifecycle::apply_vanished_tabs(
                         &mut session,
                         &mut panes,
                         &result.paths,
+                        &landing,
                     ) {
                         model.status = format!(
                             "Worktree dir gone: {} — removed from session",
                             result.paths.join(", ")
                         );
                         refresh_tab_model(&mut model, &session, &mut sb);
+                        landing.place_cursor(&mut model, &mut sb);
                         need_relayout = true;
                         dirty = true;
                         want_model_refresh = true;
@@ -12001,8 +12012,10 @@ async fn event_loop<T: Terminal>(
         let mh_items = crate::chrome::masthead_item_spans(&model, &chrome).len();
         model.masthead_sel = model.masthead_sel.min(mh_items.saturating_sub(1));
         model.key_locked = focus.locked;
-        model.zoomed = zoom.is_some();
-        model.maximized = maximized;
+        model.zoomed = eff_zoom.is_some();
+        model.maximized = crate::handlers::pane_zoom::active_grow(&session)
+            != crate::center::Grow::Tiled
+            && eff_zoom != Some(crate::focus::Zone::Center);
         model.sync_panes = sync_panes;
         model.mode_chip =
             crate::voice::mode_chip(mode, current_config.ui.full_mode_chip, voice.is_recording());
@@ -12488,12 +12501,10 @@ async fn event_loop<T: Terminal>(
                 &panel_ui.docs.daemon,
                 model.persistent_pane,
             );
-            let tree = crate::handlers::pane_zoom::grown_tree(
-                zoom,
-                maximized,
-                focused,
-                session.active_tab().map(|t| t.center.clone()),
-            );
+            let tree = session
+                .active_tab()
+                .map(|t| crate::handlers::pane_zoom::grown_tree(t.grow, focused, &t.center))
+                .unwrap_or(crate::center::CenterTree::Leaf(0));
             // Layout changes (panel toggles/expansion, zoom) need NO physical
             // explicit clear: `front` mirrors the wire exactly, so the diff repaints
             // precisely the changed cells — clearing here only caused a
@@ -13506,6 +13517,7 @@ async fn event_loop<T: Terminal>(
                     cols,
                     rows,
                     &chrome,
+                    &model,
                     &mut app_host,
                     drawer,
                     &mut panes,
@@ -13550,6 +13562,16 @@ async fn event_loop<T: Terminal>(
                 }
                 let (hit_pane, frames) = match pre {
                     crate::handlers::overlay::MousePre::Consumed => continue,
+                    crate::handlers::overlay::MousePre::StackBar(id) => {
+                        crate::handlers::pane_zoom::activate_stack_member(
+                            &mut session,
+                            &mut focus,
+                            id,
+                        );
+                        need_relayout = true;
+                        dirty = true;
+                        continue;
+                    }
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
 
@@ -19938,10 +19960,12 @@ async fn event_loop<T: Terminal>(
                             let in_center = focus.zone == Zone::Center;
                             let cur_focused =
                                 session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
-                            let pane_layout = session
-                                .active_tab()
-                                .map(|t| t.center.layout(chrome.center))
-                                .unwrap_or_default();
+                            // While zoomed, ↑/↓ walk the stack's visual order.
+                            let pane_layout = crate::handlers::pane_zoom::nav_layout(
+                                session.active_tab(),
+                                chrome.center,
+                                matches!(dir, Move::Up | Move::Down),
+                            );
                             action = match resolve_nav(in_center, dir, &pane_layout, cur_focused) {
                                 NavMove::Focus(Move::Left) => Action::FocusLeft,
                                 NavMove::Focus(Move::Right) => Action::FocusRight,
@@ -21500,11 +21524,20 @@ async fn event_loop<T: Terminal>(
                             Action::ToggleZoom => {
                                 // On the center, cycle tiled → maximize-in-chrome
                                 // → full-window fullscreen → tiled; on the
-                                // sidebar/panel, the older zone-zoom toggle.
+                                // sidebar/panel, the older zone-zoom toggle. The
+                                // center level lives on the active tab.
+                                let mut no_tab = crate::center::Grow::Tiled;
+                                let grow = match session.active_tab_mut() {
+                                    Some(t) => &mut t.grow,
+                                    None => &mut no_tab,
+                                };
                                 model.status = crate::handlers::pane_zoom::cycle_or_zoom(
-                                    &mut zoom,
-                                    &mut maximized,
-                                    &focus,
+                                    &mut zoom, grow, &focus,
+                                );
+                                eff_zoom = crate::handlers::pane_zoom::effective_zoom(
+                                    zoom,
+                                    crate::handlers::pane_zoom::active_grow(&session),
+                                    focus.zone,
                                 );
                                 chrome = recompute_chrome!();
                                 need_relayout = true;
@@ -21802,10 +21835,13 @@ async fn event_loop<T: Terminal>(
                                         .active_tab()
                                         .map(|t| t.focused_pane)
                                         .unwrap_or(focused);
-                                    let pane_layout = session
-                                        .active_tab()
-                                        .map(|t| t.center.layout(chrome.center))
-                                        .unwrap_or_default();
+                                    // While zoomed, ↑/↓ walk the stack's
+                                    // visual order (bar above / below).
+                                    let pane_layout = crate::handlers::pane_zoom::nav_layout(
+                                        session.active_tab(),
+                                        chrome.center,
+                                        matches!(mv, Move::Up | Move::Down),
+                                    );
                                     let ctx = crate::focus::RouteCtx {
                                         sidebar_visible: want_sidebar && chrome.sidebar.is_some(),
                                         panel_visible: want_panel && chrome.panel.is_some(),
@@ -21815,12 +21851,16 @@ async fn event_loop<T: Terminal>(
                                     };
                                     match crate::focus::route(focus.zone, mv, &ctx) {
                                         FocusMove::CenterPane(n) => {
-                                            if let Some(tab) = session.active_tab_mut() {
-                                                tab.focused_pane = n;
-                                            }
+                                            crate::handlers::pane_zoom::activate_stack_member(
+                                                &mut session,
+                                                &mut focus,
+                                                n,
+                                            );
                                             // Follow-focus while grown: the newly
                                             // focused pane must fill the screen.
-                                            if maximized {
+                                            if crate::handlers::pane_zoom::active_grow(&session)
+                                                != crate::center::Grow::Tiled
+                                            {
                                                 need_relayout = true;
                                             }
                                         }

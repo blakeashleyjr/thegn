@@ -232,6 +232,28 @@ mod tests {
         assert_eq!(filter.kinds, Some(vec!["activity".into(), "exit".into()]));
         assert_eq!(filter.session.as_deref(), Some("s1"));
         assert!(filter.signal_lag);
+        for kind in thegn_core::control_wire::OBSERVER_KINDS {
+            assert!(FeedFilter::parse(Some(kind), None, false).is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn cli_observer_rejects_attach_only_kinds_before_connecting() {
+        for kind in ["snapshot", "delta"] {
+            let error = run(
+                &Config::default(),
+                Action::Tail {
+                    kinds: Some(kind.into()),
+                    session: None,
+                    signal_lag: false,
+                    json: false,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("invalid event filter"));
+            assert!(error.contains("supported observer kinds:"));
+        }
     }
 
     #[test]

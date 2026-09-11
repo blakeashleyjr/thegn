@@ -88,7 +88,8 @@ impl Hub {
             let mut env = BTreeMap::new();
             let mut secret_err = None;
             for (k, v) in &spec.env {
-                match crate::secret::resolve_mcp_env(v) {
+                let consumer = format!("mcp:{name}:{k}");
+                match crate::secret::resolve_mcp_env(v, &consumer) {
                     Ok(val) => {
                         env.insert(k.clone(), val);
                     }

@@ -38,7 +38,20 @@ const T_LAGGED: u8 = 8;
 /// The maximum number of bytes accepted for a session filter.
 pub const MAX_FEED_SESSION_LEN: usize = 256;
 
-/// The stable names used by the control event feed.
+/// Stable kinds accepted by generic observer subscriptions.
+///
+/// Pane snapshots and deltas deliberately do not appear here: they are only
+/// produced by the session-attach stream, whose bootstrap and ordering
+/// contract is different from the lossy observer feed.
+pub const OBSERVER_KINDS: &[&str] = &["activity", "lease", "pairing", "sessions", "exit"];
+
+/// Stable kinds that can appear on a session-attach stream.
+pub const PANE_ATTACH_KINDS: &[&str] = &["hello", "snapshot", "delta", "exit"];
+
+/// Legacy union of every frame name from before observer and pane-attach
+/// vocabularies became distinct. Kept for downstream Rust source compatibility;
+/// new consumers must select the contract for the stream they subscribe to.
+#[deprecated(note = "use OBSERVER_KINDS or PANE_ATTACH_KINDS for the specific stream contract")]
 pub const FEED_KINDS: &[&str] = &[
     "hello", "snapshot", "delta", "activity", "lease", "pairing", "sessions", "exit", "lagged",
 ];
@@ -171,7 +184,7 @@ pub enum EventFrame {
 /// or [`Self::from_parts`] before creating a subscription.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FeedFilter {
-    /// A subset of [`FEED_KINDS`]. `None` means every kind.
+    /// A subset of [`OBSERVER_KINDS`]. `None` means every observer kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<String>>,
     /// Limit session-keyed frames to this session. Unkeyed frames still pass.
@@ -194,9 +207,21 @@ pub enum FeedFilterError {
 impl std::fmt::Display for FeedFilterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyKind => write!(f, "event kind must not be empty"),
-            Self::UnknownKind(kind) => write!(f, "unknown event kind {kind:?}"),
-            Self::TooManyKinds => write!(f, "too many event kinds"),
+            Self::EmptyKind => write!(
+                f,
+                "observer event kind must not be empty; supported observer kinds: {}",
+                OBSERVER_KINDS.join(", ")
+            ),
+            Self::UnknownKind(kind) => write!(
+                f,
+                "unknown observer event kind {kind:?}; supported observer kinds: {}",
+                OBSERVER_KINDS.join(", ")
+            ),
+            Self::TooManyKinds => write!(
+                f,
+                "too many observer event kinds; supported observer kinds: {}",
+                OBSERVER_KINDS.join(", ")
+            ),
             Self::EmptySession => write!(f, "session filter must not be empty"),
             Self::SessionTooLong => write!(
                 f,
@@ -245,7 +270,7 @@ impl FeedFilter {
         if kinds.is_empty() {
             return Err(FeedFilterError::EmptyKind);
         }
-        if kinds.len() > FEED_KINDS.len() {
+        if kinds.len() > OBSERVER_KINDS.len() {
             return Err(FeedFilterError::TooManyKinds);
         }
         let mut validated = Vec::with_capacity(kinds.len());
@@ -253,7 +278,7 @@ impl FeedFilter {
             if kind.is_empty() {
                 return Err(FeedFilterError::EmptyKind);
             }
-            if !FEED_KINDS.contains(&kind.as_str()) {
+            if !OBSERVER_KINDS.contains(&kind.as_str()) {
                 return Err(FeedFilterError::UnknownKind(kind));
             }
             if !validated.iter().any(|seen| seen == &kind) {
@@ -266,13 +291,13 @@ impl FeedFilter {
     fn parse_kinds(kinds: &str) -> Result<Option<Vec<String>>, FeedFilterError> {
         let mut parsed = Vec::new();
         for (index, kind) in kinds.split(',').map(str::trim).enumerate() {
-            if index >= FEED_KINDS.len() {
+            if index >= OBSERVER_KINDS.len() {
                 return Err(FeedFilterError::TooManyKinds);
             }
             if kind.is_empty() {
                 return Err(FeedFilterError::EmptyKind);
             }
-            if !FEED_KINDS.contains(&kind) {
+            if !OBSERVER_KINDS.contains(&kind) {
                 return Err(FeedFilterError::UnknownKind(kind.to_string()));
             }
             if !parsed.iter().any(|seen| seen == kind) {
@@ -284,9 +309,10 @@ impl FeedFilter {
 
     /// Whether a frame should be delivered to this subscription.
     pub fn matches(&self, frame: &EventFrame) -> bool {
-        // Every subscription receives the greeting, including a narrowed one.
-        if frame.kind() == "hello" {
-            return true;
+        // Defend the generic observer boundary even if an attach-only frame is
+        // accidentally published on the shared broadcast channel.
+        if !OBSERVER_KINDS.contains(&frame.kind()) {
+            return false;
         }
         if let Some(kinds) = &self.kinds
             && !kinds.iter().any(|kind| kind == frame.kind())
@@ -304,7 +330,7 @@ impl FeedFilter {
                 EventFrame::Activity { json } => serde_json::from_str::<serde_json::Value>(json)
                     .ok()
                     .and_then(|value| value.get("session")?.as_str().map(str::to_string))
-                    .is_none_or(|session| session == *wanted),
+                    .is_some_and(|session| session == *wanted),
                 // Unkeyed event families pass a session narrowing filter.
                 _ => true,
             },
@@ -824,25 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn frame_kinds_are_the_filter_vocabulary() {
-        let frames = [
-            EventFrame::Hello(Hello {
-                proto: PROTO_VERSION,
-                server: "s".into(),
-                scopes: vec![],
-            }),
-            EventFrame::PaneSnapshot {
-                session: "s".into(),
-                seq: 1,
-                cols: 80,
-                rows: 24,
-                bytes: vec![],
-            },
-            EventFrame::PaneDelta {
-                session: "s".into(),
-                seq: 2,
-                bytes: vec![],
-            },
+    fn observer_and_attach_vocabularies_match_their_producers() {
+        let observer_frames = [
             EventFrame::Activity { json: "{}".into() },
             EventFrame::Lease {
                 session: "s".into(),
@@ -860,18 +869,28 @@ mod tests {
                 session: "s".into(),
                 code: None,
             },
-            EventFrame::Lagged { missed: 1 },
         ];
-        for frame in frames {
-            assert!(FEED_KINDS.contains(&frame.kind()));
+        for frame in observer_frames {
+            assert!(OBSERVER_KINDS.contains(&frame.kind()));
         }
+        assert_eq!(PANE_ATTACH_KINDS, &["hello", "snapshot", "delta", "exit"]);
+        assert!(!OBSERVER_KINDS.contains(&"hello"));
+        assert!(!OBSERVER_KINDS.contains(&"lagged"));
+        assert!(!OBSERVER_KINDS.contains(&"snapshot"));
+        assert!(!OBSERVER_KINDS.contains(&"delta"));
     }
 
     #[test]
-    fn feed_filter_defaults_to_every_frame() {
+    fn feed_filter_defaults_to_every_observer_frame_only() {
         let filter = FeedFilter::default();
         assert!(filter.matches(&EventFrame::Sessions));
-        assert!(filter.matches(&EventFrame::PaneDelta {
+        assert!(!filter.matches(&EventFrame::Hello(Hello {
+            proto: PROTO_VERSION,
+            server: "s".into(),
+            scopes: vec![],
+        })));
+        assert!(!filter.matches(&EventFrame::Lagged { missed: 1 }));
+        assert!(!filter.matches(&EventFrame::PaneDelta {
             session: "s".into(),
             seq: 1,
             bytes: vec![],
@@ -883,6 +902,12 @@ mod tests {
         let filter = FeedFilter::parse(Some("activity,exit"), Some("s1"), false).unwrap();
         assert!(filter.matches(&EventFrame::Activity {
             json: r#"{"session":"s1","state":"working"}"#.into(),
+        }));
+        assert!(!filter.matches(&EventFrame::Activity {
+            json: r#"{"state":"working"}"#.into(),
+        }));
+        assert!(!filter.matches(&EventFrame::Activity {
+            json: "not-json".into(),
         }));
         assert!(filter.matches(&EventFrame::SessionExit {
             session: "s1".into(),
@@ -897,8 +922,8 @@ mod tests {
             kind: LeaseEventKind::Opened,
             expires_at: None,
         }));
-        // The greeting is part of every subscription, even when narrowed.
-        assert!(filter.matches(&EventFrame::Hello(Hello {
+        // The greeting bypasses the broadcaster filter in each transport.
+        assert!(!filter.matches(&EventFrame::Hello(Hello {
             proto: PROTO_VERSION,
             server: "s".into(),
             scopes: vec![],
@@ -911,15 +936,20 @@ mod tests {
             FeedFilter::parse(Some("activty"), None, false),
             Err(FeedFilterError::UnknownKind("activty".into()))
         );
+        for attach_only in ["snapshot", "delta"] {
+            let error = FeedFilter::parse(Some(attach_only), None, false).unwrap_err();
+            assert_eq!(error, FeedFilterError::UnknownKind(attach_only.into()));
+            let message = error.to_string();
+            assert!(message.contains("supported observer kinds:"));
+            assert!(message.contains("activity"));
+        }
         assert_eq!(
             FeedFilter::parse(Some("activity,"), None, false),
             Err(FeedFilterError::EmptyKind)
         );
         assert_eq!(
             FeedFilter::parse(
-                Some(
-                    "activity,activity,activity,activity,activity,activity,activity,activity,activity,activity",
-                ),
+                Some("activity,activity,activity,activity,activity,activity,activity,activity",),
                 None,
                 false
             ),
@@ -933,6 +963,166 @@ mod tests {
         assert_eq!(
             FeedFilter::parse(None, Some(&long), false),
             Err(FeedFilterError::SessionTooLong)
+        );
+    }
+
+    #[test]
+    fn grpc_style_filter_validation_deduplicates_and_fails_closed() {
+        let filter = FeedFilter::from_parts(
+            Some(vec![
+                "activity".into(),
+                "activity".into(),
+                "sessions".into(),
+            ]),
+            Some("s1".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            filter.kinds,
+            Some(vec!["activity".into(), "sessions".into()])
+        );
+        assert_eq!(filter.session.as_deref(), Some("s1"));
+        assert!(filter.signal_lag);
+
+        for (kinds, expected) in [
+            (Vec::new(), FeedFilterError::EmptyKind),
+            (vec![String::new()], FeedFilterError::EmptyKind),
+            (
+                vec!["snapshot".into()],
+                FeedFilterError::UnknownKind("snapshot".into()),
+            ),
+            (
+                vec!["activity".into(); OBSERVER_KINDS.len() + 1],
+                FeedFilterError::TooManyKinds,
+            ),
+        ] {
+            assert_eq!(
+                FeedFilter::from_parts(Some(kinds), None, false),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn filter_errors_name_the_observer_contract() {
+        for (error, expected) in [
+            (FeedFilterError::EmptyKind, "must not be empty"),
+            (
+                FeedFilterError::UnknownKind("snapshot".into()),
+                "unknown observer event kind \"snapshot\"",
+            ),
+            (
+                FeedFilterError::TooManyKinds,
+                "too many observer event kinds",
+            ),
+            (
+                FeedFilterError::EmptySession,
+                "session filter must not be empty",
+            ),
+            (
+                FeedFilterError::SessionTooLong,
+                "session filter exceeds 256-byte limit",
+            ),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message:?}");
+            if matches!(
+                error,
+                FeedFilterError::EmptyKind
+                    | FeedFilterError::UnknownKind(_)
+                    | FeedFilterError::TooManyKinds
+            ) {
+                assert!(message.contains("supported observer kinds:"), "{message:?}");
+                for kind in OBSERVER_KINDS {
+                    assert!(message.contains(kind), "{message:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_frame_reports_its_stream_kind_and_session_key() {
+        let frames = [
+            (
+                EventFrame::Hello(Hello {
+                    proto: PROTO_VERSION,
+                    server: "host".into(),
+                    scopes: vec![],
+                }),
+                "hello",
+                None,
+            ),
+            (
+                EventFrame::PaneSnapshot {
+                    session: "snapshot-session".into(),
+                    seq: 1,
+                    cols: 80,
+                    rows: 24,
+                    bytes: vec![],
+                },
+                "snapshot",
+                Some("snapshot-session"),
+            ),
+            (
+                EventFrame::PaneDelta {
+                    session: "delta-session".into(),
+                    seq: 2,
+                    bytes: vec![],
+                },
+                "delta",
+                Some("delta-session"),
+            ),
+            (EventFrame::Activity { json: "{}".into() }, "activity", None),
+            (
+                EventFrame::Lease {
+                    session: "lease-session".into(),
+                    kind: LeaseEventKind::Opened,
+                    expires_at: None,
+                },
+                "lease",
+                Some("lease-session"),
+            ),
+            (
+                EventFrame::Pairing {
+                    pairing_id: "pairing".into(),
+                    label: "phone".into(),
+                    scope: "read".into(),
+                    state: PairingState::Requested,
+                },
+                "pairing",
+                None,
+            ),
+            (EventFrame::Sessions, "sessions", None),
+            (
+                EventFrame::SessionExit {
+                    session: "exit-session".into(),
+                    code: Some(0),
+                },
+                "exit",
+                Some("exit-session"),
+            ),
+            (EventFrame::Lagged { missed: 3 }, "lagged", None),
+        ];
+        for (frame, kind, session) in frames {
+            assert_eq!(frame.kind(), kind);
+            assert_eq!(frame.session_id(), session);
+        }
+    }
+
+    #[test]
+    fn wire_errors_have_stable_diagnostic_context() {
+        assert_eq!(
+            WireError::UnknownTag(99).to_string(),
+            "unknown control wire tag 99"
+        );
+        assert_eq!(
+            WireError::PayloadTooLarge(1_048_577).to_string(),
+            "control wire payload too large: 1048577"
+        );
+        assert_eq!(
+            WireError::BadPayload(T_SNAPSHOT).to_string(),
+            "malformed control wire payload for tag 1"
         );
     }
 

@@ -179,6 +179,7 @@ pub mod log_redact;
 pub mod log_trace;
 pub mod log_view;
 pub mod lsp_registry;
+pub mod managed_ssh;
 pub mod managed_tool;
 pub mod mcp;
 pub mod media;

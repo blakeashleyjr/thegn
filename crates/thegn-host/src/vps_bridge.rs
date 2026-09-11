@@ -46,7 +46,14 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     use std::io::IsTerminal;
 
     let ip = resolve_ip(cfg, name)?;
-    let (key, _pubkey) = crate::agent::sprite_ssh_keypair()?;
+    let provider_name = registry::read(name)
+        .map(|record| record.provider)
+        .unwrap_or_else(|| "hetzner".to_string());
+    let key = thegn_core::managed_ssh::read_unique_instance(&provider_name, name)?
+        .map(|record| record.key_path)
+        .filter(|path| path.exists())
+        .map(Ok)
+        .unwrap_or_else(|| crate::agent::sprite_ssh_keypair().map(|pair| pair.0))?;
     let shim = ssh_shim::SshShim {
         name: name.to_string(),
         ip,

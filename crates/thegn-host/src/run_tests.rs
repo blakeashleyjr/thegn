@@ -3322,6 +3322,117 @@ fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
     assert!(model.status.is_empty());
 }
 
+/// Zoom a non-first pane in one worktree, switch to another through the
+/// sidebar, and come back: the same pane is still zoomed, and the other
+/// worktree was never zoomed. (Activation used to reset every tab's focus to
+/// its leftmost pane, and zoom was one global flag — so the first pane came
+/// back zoomed, and the zoom leaked into every worktree you visited.)
+#[test]
+fn sidebar_round_trip_keeps_the_zoomed_pane_per_tab() {
+    use crate::center::{CenterTree, Dir, Grow};
+    // Activation persists the active pointer off-loop (`spawn_blocking` →
+    // the REAL state DB): hold ENV_LOCK, redirect XDG_STATE_HOME, and give it
+    // a runtime. The runtime is declared last so it drops first, draining the
+    // blocking write before the env is restored.
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let state_home =
+        std::env::temp_dir().join(format!("tg-run-zoom-trip-{}-state", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state_home); // best-effort: test cleanup: scratch removal must never fail the test
+    std::fs::create_dir_all(state_home.join("thegn")).unwrap();
+    let _xdg = XdgGuard::set(&state_home);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _rt = rt.enter();
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1);
+    let mut panes = Panes::new(tx);
+    let mut session = two_worktree_session();
+    let mut model = FrameModel::default();
+    let mut sb = SidebarState::default();
+    let mut drawer_runtime = DrawerRuntime::default();
+    let mut workspace_pool = WorkspacePool::default();
+    let mut need_relayout = false;
+    let mut clear_on_next_frame = false;
+    let center = crate::compositor::Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 24,
+    };
+    // app/home: a top/bottom split, the BOTTOM pane (2) zoomed.
+    {
+        let tab = &mut session.worktrees[0].tabs[0];
+        let mut tree = CenterTree::single(1);
+        tree.split(1, Dir::Col, 2);
+        tab.center = tree;
+        tab.focused_pane = 2;
+        tab.grow = Grow::Maximized;
+    }
+    // app/feat: a side-by-side split, tiled, focus on its right pane (4).
+    {
+        let tab = &mut session.worktrees[1].tabs[0];
+        let mut tree = CenterTree::single(3);
+        tree.split(3, Dir::Row, 4);
+        tab.center = tree;
+        tab.focused_pane = 4;
+    }
+    let mut activate = |session: &mut Session, gi: usize| {
+        activate_row_target(
+            crate::sidebar::RowTarget::Tab(gi, 0),
+            session,
+            &mut model,
+            &mut sb,
+            &mut panes,
+            &mut drawer_runtime,
+            &mut workspace_pool,
+            &thegn_core::config::Config::default(),
+            center,
+            &mut need_relayout,
+            &mut clear_on_next_frame,
+            None,
+        );
+    };
+
+    activate(&mut session, 1);
+    let feat = session.active_tab().unwrap();
+    assert_eq!(feat.focused_pane, 4, "the other tab keeps its own focus");
+    assert_eq!(feat.grow, Grow::Tiled, "zoom does not leak across tabs");
+
+    activate(&mut session, 0);
+    let home = session.active_tab().unwrap();
+    assert_eq!(home.focused_pane, 2, "the zoomed pane is the one you left");
+    assert_eq!(home.grow, Grow::Maximized, "and it is still zoomed");
+    assert_eq!(
+        crate::handlers::pane_zoom::displayed_tree(&session).layout(center)[0].0,
+        2
+    );
+}
+
+#[test]
+fn activation_repairs_only_a_stale_focus() {
+    use crate::center::{CenterTree, Dir};
+    let center = crate::compositor::Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 24,
+    };
+    let mut tab = crate::session::Tab::new("1");
+    let mut tree = CenterTree::single(1);
+    tree.split(1, Dir::Row, 2);
+    tab.center = tree;
+    tab.focused_pane = 2;
+    crate::handlers::sidebar_activate::repair_stale_focus(&mut tab, center);
+    assert_eq!(tab.focused_pane, 2, "a valid focus is left alone");
+    tab.focused_pane = 77;
+    crate::handlers::sidebar_activate::repair_stale_focus(&mut tab, center);
+    assert_eq!(
+        tab.focused_pane, 1,
+        "a dead id falls back to the leftmost pane"
+    );
+}
+
 /// The regression this whole change exists for: a terminal created in one
 /// project, then activated from ANOTHER, must be REUNITED with its running
 /// shell — not forked into a second group with a fresh one.

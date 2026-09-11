@@ -132,22 +132,25 @@ fn exited(row: &AgentDispatch) -> bool {
 ///
 /// Identity is issue + stage + worktree + artifact, and the artifact is what
 /// makes parallel chunks expressible: the pipeline legitimately runs several
-/// coders in one worktree at one stage, and they differ only by the file they
-/// each produce. Two rows with *no* artifact on either side and the same
-/// issue/stage/worktree are treated as the same job — that is the only shape
-/// where there is nothing else to tell them apart.
+/// coders in one worktree at one stage, and they differ by the file they each
+/// produce. When either side has no artifact yet, the chunk path is the
+/// provisional discriminator: a retrying stage-open claim cannot know its
+/// row-derived artifact before the insert, but must still match the same chunk
+/// after the existing row has been stamped. Once both artifacts exist they
+/// dominate: two chunk descriptions must never claim the same handoff file
+/// concurrently.
 fn same_work(row: &AgentDispatch, req: &ClaimRequest) -> bool {
-    let norm = |s: &Option<String>| {
-        s.as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
+    fn norm(value: &Option<String>) -> Option<&str> {
+        value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+    let same_assignment = match (norm(&row.artifact_path), norm(&req.artifact_path)) {
+        (Some(row_artifact), Some(request_artifact)) => row_artifact == request_artifact,
+        _ => norm(&row.chunk_path) == norm(&req.chunk_path),
     };
     row.issue_id == req.issue_id
         && row.stage.as_deref().map(str::trim) == Some(req.stage.trim())
         && row.worktree_path == req.worktree_path
-        && norm(&row.artifact_path) == norm(&req.artifact_path)
-        && norm(&row.chunk_path) == norm(&req.chunk_path)
+        && same_assignment
 }
 
 /// Decide one claim against the whole roster.
@@ -157,18 +160,26 @@ fn same_work(row: &AgentDispatch, req: &ClaimRequest) -> bool {
 /// of the occupants, "row 289 is already doing this" is a better message than
 /// "the stage is full".
 ///
-/// `limit == 0` is treated as "no budget configured" and only the duplicate rule
-/// applies — a zero budget is a config error caught by `validate_pipeline`, and
-/// refusing every dispatch here would be a second, less legible report of it.
+/// `limit == 0` fails closed. Explicit config validation reports the clearer
+/// configuration error, but a long-running process must not turn an invalid
+/// zero ceiling into unlimited capacity merely because validation was skipped.
 pub fn decide(rows: &[AgentDispatch], req: &ClaimRequest, limit: u32) -> ClaimDecision {
-    if let Some(dup) = rows.iter().find(|r| occupies(r) && same_work(r, req)) {
+    decide_allowing_duplicate(rows, req, limit, false)
+}
+
+/// Decide a claim while allowing an explicitly audited duplicate. The
+/// duplicate override never bypasses the stage capacity budget.
+pub fn decide_allowing_duplicate(
+    rows: &[AgentDispatch],
+    req: &ClaimRequest,
+    limit: u32,
+    allow_duplicate: bool,
+) -> ClaimDecision {
+    if !allow_duplicate && let Some(dup) = rows.iter().find(|r| occupies(r) && same_work(r, req)) {
         return ClaimDecision::DuplicateOf {
             id: dup.id,
             exited: exited(dup),
         };
-    }
-    if limit == 0 {
-        return ClaimDecision::Grant;
     }
     let in_stage: Vec<&AgentDispatch> = rows
         .iter()
@@ -288,6 +299,69 @@ mod tests {
     }
 
     #[test]
+    fn one_artifact_cannot_be_claimed_through_different_chunk_paths() {
+        let mut existing = row(7, "linear:THE-19", "code", "/wt/19", Some("shared-done.md"));
+        existing.chunk_path = Some("chunk-1.md".into());
+        let mut request = req("linear:THE-19", "code", "/wt/19", Some("shared-done.md"));
+        request.chunk_path = Some("chunk-2.md".into());
+        assert!(matches!(
+            decide(&[existing], &request, 3),
+            ClaimDecision::DuplicateOf { id: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn chunk_path_distinguishes_artifactless_provisional_claims() {
+        let mut existing = row(7, "linear:THE-19", "code", "/wt/19", None);
+        existing.chunk_path = Some("chunk-1.md".into());
+        let mut request = req("linear:THE-19", "code", "/wt/19", None);
+        request.chunk_path = Some("chunk-2.md".into());
+        assert_eq!(decide(&[existing], &request, 3), ClaimDecision::Grant);
+    }
+
+    #[test]
+    fn provisional_retry_matches_an_assigned_row_by_chunk() {
+        let mut existing = row(
+            7,
+            "linear:THE-19",
+            "code",
+            "/wt/19",
+            Some("row-derived-done.md"),
+        );
+        existing.chunk_path = Some("chunk-1.md".into());
+        let mut request = req("linear:THE-19", "code", "/wt/19", None);
+        request.chunk_path = Some("chunk-1.md".into());
+        assert!(matches!(
+            decide(&[existing], &request, 3),
+            ClaimDecision::DuplicateOf { id: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_override_still_enforces_capacity() {
+        let rows = vec![row(
+            7,
+            "linear:THE-19",
+            "code",
+            "/wt/19",
+            Some("chunk-1-done.md"),
+        )];
+        assert!(matches!(
+            decide_allowing_duplicate(
+                &rows,
+                &req("linear:THE-19", "code", "/wt/19", Some("chunk-1-done.md")),
+                1,
+                true
+            ),
+            ClaimDecision::AtCapacity {
+                occupied: 1,
+                limit: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn an_exited_unclosed_row_refuses_the_redispatch_and_says_to_reconcile() {
         // The incident in one assertion: the worker exited, nobody closed the
         // row, and the Lead came back to dispatch the same work again.
@@ -378,12 +452,24 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_budget_defers_to_config_validation_and_only_checks_duplicates() {
-        let rows = vec![row(1, "linear:A-1", "code", "/wt/a", Some("a.md"))];
+    fn a_zero_budget_fails_closed_even_when_config_validation_was_skipped() {
         assert_eq!(
-            decide(&rows, &req("linear:A-2", "code", "/wt/b", Some("b.md")), 0),
-            ClaimDecision::Grant
+            decide(&[], &req("linear:A-2", "code", "/wt/b", Some("b.md")), 0,),
+            ClaimDecision::AtCapacity {
+                occupied: 0,
+                limit: 0,
+                stale: 0,
+            }
         );
+        let rows = vec![row(1, "linear:A-1", "code", "/wt/a", Some("a.md"))];
+        assert!(matches!(
+            decide(&rows, &req("linear:A-2", "code", "/wt/b", Some("b.md")), 0),
+            ClaimDecision::AtCapacity {
+                occupied: 1,
+                limit: 0,
+                ..
+            }
+        ));
         assert!(matches!(
             decide(&rows, &req("linear:A-1", "code", "/wt/a", Some("a.md")), 0),
             ClaimDecision::DuplicateOf { .. }

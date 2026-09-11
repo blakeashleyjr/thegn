@@ -87,18 +87,6 @@
       "summary": "Crash core shipped; fallback notification and end-to-end evidence remain."
     },
     {
-      "change": "add-credential-broker",
-      "lifecycle": "active",
-      "disposition": "residual-split",
-      "owners": [
-        {
-          "issue": "THE-122",
-          "project": "Runtime Security & Host Architecture"
-        }
-      ],
-      "summary": "Broker core shipped; remaining credential consumers, auditing, and rotation are security work."
-    },
-    {
       "change": "add-fleet-view",
       "lifecycle": "proposed",
       "disposition": "superseded-retire",
@@ -259,18 +247,6 @@
         }
       ],
       "summary": "Synced viewed-file state and commit-by-commit review remain unstarted."
-    },
-    {
-      "change": "add-remote-enqueue-modes",
-      "lifecycle": "active",
-      "disposition": "alpha-delivery",
-      "owners": [
-        {
-          "issue": "THE-99",
-          "project": "Client API & Remote Access"
-        }
-      ],
-      "summary": "Complete remote worktree enqueue routing without weakening local semantics."
     },
     {
       "change": "add-remote-provision-hooks",
@@ -525,6 +501,18 @@
       "summary": "The isolation matrix shipped; smolvm and WSL still need real-host verification."
     },
     {
+      "change": "bind-identity-commit-signing",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-149",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Identity signing schema exists, but pane injection, enable semantics, precedence evidence, and dedicated help remain."
+    },
+    {
       "change": "complete-devcontainer-support",
       "lifecycle": "active",
       "disposition": "verification-gated",
@@ -609,30 +597,6 @@
       "summary": "Complete runtime TUI localization and define plugin-visible string participation."
     },
     {
-      "change": "harden-pipeline-slot-accounting",
-      "lifecycle": "active",
-      "disposition": "residual-split",
-      "owners": [
-        {
-          "issue": "THE-121",
-          "project": "Agent & Workflow Platform"
-        }
-      ],
-      "summary": "Delivered slot-accounting repairs need a focused end-to-end oversubscription regression."
-    },
-    {
-      "change": "improve-agent-pipeline-v2",
-      "lifecycle": "active",
-      "disposition": "strategic-unstarted",
-      "owners": [
-        {
-          "issue": "THE-116",
-          "project": "Agent & Workflow Platform"
-        }
-      ],
-      "summary": "Native pipeline verification, waiting, and stage dispatch remain substantial deferred work."
-    },
-    {
       "change": "make-sidebar-mode-visible",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -688,16 +652,32 @@
       ]
     },
     {
-      "change": "publish-observer-event-contract",
+      "change": "pane-zoom-stack",
       "lifecycle": "active",
-      "disposition": "alpha-delivery",
+      "disposition": "verification-gated",
       "owners": [
         {
-          "issue": "THE-105",
-          "project": "Client API & Remote Access"
+          "issue": "THE-559",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-560",
+          "project": "Spec & Tracker Reconciliation"
+        },
+        {
+          "issue": "THE-566",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-567",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-568",
+          "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Publish truthful observer filters, bootstrap, recovery, and attach ownership semantics."
+      "summary": "Queue review repairs cover visibility, original-stack keyboard focus, narrow geometry and duplicate layout work; focused, integrated, full-gate and visual verification remain before delivery."
     },
     {
       "change": "resurrect-model-proxy",

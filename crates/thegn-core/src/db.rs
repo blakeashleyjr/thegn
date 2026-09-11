@@ -176,7 +176,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// v67: adds the bounded CI log cache and autofix handoff dedupe table.
 /// Purely additive; CI remains a best-effort cache and the provider is
 /// the source of truth.
-pub const SCHEMA_VERSION: i64 = 67;
+/// v68: separates the daemon's actual TCP bind address from its advertised
+/// client-facing control origin.
+pub const SCHEMA_VERSION: i64 = 68;
 
 /// Escape hatch for [`schema_refusal`] — set to `1`/`true` to run a build older
 /// than the on-disk schema anyway (read-only, as before). Deliberately awkward:
@@ -1976,6 +1978,7 @@ impl Db {
         crate::db_migrate::migrate_v64(&conn)?;
         crate::db_migrate::migrate_v66(&conn)?;
         crate::db_migrate::migrate_v67(&conn)?;
+        crate::db_control::migrate_v68(&conn)?;
         if ver < SCHEMA_VERSION {
             crate::db_migrate::verify_v62_schema(&conn)?;
             crate::db_migrate::verify_v63_schema(&conn)?;
@@ -1983,6 +1986,7 @@ impl Db {
             crate::db_migrate::verify_v65_schema(&conn)?;
             crate::db_migrate::verify_v66_schema(&conn)?;
             crate::db_migrate::verify_v67_schema(&conn)?;
+            crate::db_control::verify_v68_schema(&conn)?;
         }
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /

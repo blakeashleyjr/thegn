@@ -901,6 +901,7 @@ mod tests {
             scope: "/state".into(),
             endpoint: format!("/run/{id}.sock"),
             tcp_addr: None,
+            control_origin: None,
             hostname: "host".into(),
             version: version.into(),
             started_at: 1,

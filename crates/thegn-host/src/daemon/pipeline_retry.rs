@@ -1,9 +1,8 @@
-//! The transport-error retry observer — the daemon's headless half of the
-//! run-completion story (THE-86). `pty_drain` stamps *pane* exits and
-//! explicitly refuses headless ones; a headless stage worker that dies of a
-//! transport failure used to just leave a `running` row nobody would ever
-//! touch. This task gives the daemon that half: on a `SessionExit` with a
-//! nonzero code, classify the final screen (pure core:
+//! The daemon's headless exit observer and transport-error retry policy
+//! (THE-86/THE-121). `pty_drain` sees adopted panes only; every daemon session
+//! emits `SessionExit`, so this task stamps the matching roster row for both
+//! successful and failed headless workers. On a nonzero exit it additionally
+//! classifies the final screen (pure core:
 //! [`thegn_core::pipeline_exit`]) and either relaunch the row or park it.
 //!
 //! # Scope rules (who the observer may act on)
@@ -78,19 +77,42 @@ pub(crate) fn spawn(
         loop {
             match rx.recv().await {
                 Ok(frame) => {
-                    if let EventFrame::SessionExit { session, code } = &*frame
-                        && let Some(code) = *code
-                        && code != 0
-                        && let Err(e) = handle_exit(&svc, session, code, &mut attempts).await
-                    {
-                        // best-effort: a failed retry cycle must not kill the
-                        // observer — the note column records what it could.
-                        tracing::warn!(
-                            target: "thegn::daemon",
-                            session = %session,
-                            code,
-                            "transport retry: {e:#}"
-                        );
+                    if let EventFrame::SessionExit { session, code } = &*frame {
+                        // The CLI learns the server-generated session id only
+                        // after `sessions.open` returns, so a very short-lived
+                        // worker can emit this event just before open_stage
+                        // stamps the row. Retry the association off this
+                        // observer task; raw sessions simply age out of the
+                        // bounded lookup without blocking later exit events.
+                        let stamp_svc = svc.clone();
+                        let stamp_session = session.clone();
+                        let stamp_code = *code;
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                stamp_dispatch_exit(stamp_svc, stamp_session.clone(), stamp_code)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    target: "thegn::daemon",
+                                    session = %stamp_session,
+                                    "dispatch exit stamp: {e:#}"
+                                );
+                            }
+                        });
+
+                        if let Some(code) = *code
+                            && code != 0
+                            && let Err(e) = handle_exit(&svc, session, code, &mut attempts).await
+                        {
+                            // best-effort: a failed retry cycle must not kill the
+                            // observer — the note column records what it could.
+                            tracing::warn!(
+                                target: "thegn::daemon",
+                                session = %session,
+                                code,
+                                "transport retry: {e:#}"
+                            );
+                        }
                     }
                 }
                 // A lagging receiver skipped exits; the row keeps its state and
@@ -103,6 +125,35 @@ pub(crate) fn spawn(
             }
         }
     });
+}
+
+/// Persist a daemon session exit on its dispatch row. The association normally
+/// exists on the first read; the bounded retry closes the server-id publication
+/// race for workers that start and exit before the CLI can stamp the returned
+/// id. The database stamp is one-shot per run, so an adopted pane observing the
+/// same exit is harmless.
+pub(crate) async fn stamp_dispatch_exit(
+    svc: Arc<DaemonService>,
+    session: String,
+    code: Option<i32>,
+) -> anyhow::Result<()> {
+    const LOOKUP_ATTEMPTS: usize = 20;
+    const LOOKUP_RETRY: Duration = Duration::from_millis(25);
+
+    for attempt in 0..LOOKUP_ATTEMPTS {
+        let sid = session.clone();
+        let row = svc.with_db(move |db| db.dispatch_by_session(&sid)).await?;
+        if let Some(row) = row {
+            let id = row.id;
+            svc.with_db(move |db| db.stamp_dispatch_exit(id, code.map(i64::from)))
+                .await?;
+            return Ok(());
+        }
+        if attempt + 1 < LOOKUP_ATTEMPTS {
+            tokio::time::sleep(LOOKUP_RETRY).await;
+        }
+    }
+    Ok(())
 }
 
 /// Handle one nonzero headless exit. Split from [`spawn`] so a stub test can

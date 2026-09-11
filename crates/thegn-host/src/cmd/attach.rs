@@ -85,7 +85,9 @@ async fn interactive(
     // Now own the screen. The daemon sends a full PaneSnapshot as the first
     // frame, so we don't clear — its repaint is authoritative.
     term.set_raw_mode().context("raw mode")?;
-    term.enter_alternate_screen().context("alt screen")?;
+    // Flushed immediately — the daemon's frames are written straight to stdout,
+    // never through termwiz's buffer (see `frame_write::enter_alt_screen`).
+    crate::frame_write::enter_alt_screen(&mut term).context("alt screen")?;
 
     // The input thread blocks on `poll_input(None)`; pulse this waker to make it
     // return so it can observe `done` and tear the terminal down cleanly.

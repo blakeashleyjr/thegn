@@ -521,6 +521,15 @@ mod tests {
         p
     }
 
+    fn recv_from_retry(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        loop {
+            match socket.recv_from(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn server_end_to_end_singleton_and_events() {
         // Exercises get_or_start (cold + warm), the running server thread
@@ -551,7 +560,7 @@ mod tests {
         let q_blocked = build_query(0x1111, "blocked.example");
         client.send_to(&q_blocked, server_addr).unwrap();
         let mut buf = [0u8; 512];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
+        let (n, _) = recv_from_retry(&client, &mut buf).unwrap();
         assert!(n >= 4);
         assert_eq!(&buf[..2], &[0x11, 0x11], "id echoed back");
         assert_eq!(buf[3] & 0x0F, 3, "blocked name returns NXDOMAIN");
@@ -561,13 +570,13 @@ mod tests {
         // SERVFAIL), only that the server replies and logs the event.
         let q_allowed = build_query(0x2222, "allowed.example");
         client.send_to(&q_allowed, server_addr).unwrap();
-        let (n2, _) = client.recv_from(&mut buf).unwrap();
+        let (n2, _) = recv_from_retry(&client, &mut buf).unwrap();
         assert!(n2 >= 4);
 
         // A malformed packet (too short to extract a name) is still handled: the
         // name comes back empty and the server replies rather than crashing.
         client.send_to(&[0u8; 4], server_addr).unwrap();
-        let _ = client.recv_from(&mut buf); // best-effort: test: a dropped reply is fine; the drain below reads the ring
+        let _ = recv_from_retry(&client, &mut buf); // best-effort: test: a dropped reply is fine; the drain below reads the ring
 
         // Drain should surface the logged queries.
         let events = drain_events();

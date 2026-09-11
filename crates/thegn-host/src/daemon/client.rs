@@ -117,6 +117,7 @@ fn start_error_state_bridge(client: &ControlClient) {
     let key = match client.addr() {
         ControlAddr::Unix(path) => format!("unix:{}", path.display()),
         ControlAddr::Tcp { addr, .. } => format!("tcp:{addr}"),
+        ControlAddr::HttpOrigin { origin, .. } => format!("origin:{origin}"),
     };
     let owner = format!("{key}#{}", next_generation());
     if let Ok(mut bridges) = started().lock() {

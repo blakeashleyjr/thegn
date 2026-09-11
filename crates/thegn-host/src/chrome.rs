@@ -346,6 +346,8 @@ pub struct DaemonStatus {
     pub endpoint: String,
     /// `host:port` when the daemon is serving remote thin clients, else empty.
     pub tcp_addr: String,
+    /// Canonical client-facing HTTP(S) origin after advertise overrides.
+    pub control_origin: String,
     /// Daemon start time (Unix ms), for the uptime line.
     pub started_at_ms: i64,
     /// Last registry heartbeat (Unix ms). Age against `now` is the daemon's
@@ -2496,7 +2498,8 @@ pub fn render_panes<'a>(
     title_of: &dyn Fn(crate::center::PaneId) -> String,
     relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
 ) {
-    let frames = center.layout_framed(chrome.center);
+    let crate::center::FramedLayout { frames, bars } =
+        center.layout_framed_with_bars(chrome.center);
     let show_splash = center_shows_splash(&frames, model, |id| lookup(id).is_some());
     if !show_splash {
         // The pane card owns the full center band. Paint the outside/ring
@@ -2521,19 +2524,19 @@ pub fn render_panes<'a>(
         } else {
             col(S::Text)
         };
-        crate::borders::draw_pane_frames(
-            surface,
-            &frames,
-            Some(focused),
-            &crate::borders::FrameStyle {
-                border: col(S::Border),
-                focus: ring,
-                bg: col(S::Panel),
-                title: col(S::Dim),
-                title_focused: ring,
-            },
-            title_of,
-        );
+        let frame_style = crate::borders::FrameStyle {
+            border: col(S::Border),
+            focus: ring,
+            bg: col(S::Panel),
+            title: col(S::Dim),
+            title_focused: ring,
+        };
+        crate::borders::draw_pane_frames(surface, &frames, Some(focused), &frame_style, title_of);
+        // A stacked (zoomed) tab: every collapsed sibling is a one-row title
+        // bar above/below the expanded pane — the "there's more here" cue.
+        // Bars sit outside every content rect, so the incremental pane paths
+        // never paint over them; any zoom/focus change is a full frame.
+        crate::borders::draw_stack_bars(surface, &bars, &frame_style, title_of);
         // Drag-rearrange affordance: light up the pane a drop would land on
         // (whole ring = swap, one edge = re-anchor). Painted last so it reads on
         // top; colours come from the theme role, not a literal.

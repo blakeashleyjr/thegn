@@ -6,6 +6,10 @@ use termwiz::input::{Modifiers, MouseButtons, MouseEvent};
 
 use crate::compositor::Rect;
 
+#[cfg(test)]
+#[path = "overlay_tests.rs"]
+mod tests;
+
 /// Whether cell `(x, y)` falls inside rect `r`.
 fn contains(r: Rect, x: usize, y: usize) -> bool {
     x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows
@@ -18,6 +22,9 @@ pub(crate) enum MousePre {
     /// Nothing consumed it; carry the resolved `hit_pane` and the pane frame
     /// layout into the caller's remaining wheel/press/drag dispatch.
     Fall(Option<(u32, Rect)>, Vec<(u32, Rect, Rect)>),
+    /// A left press on a zoomed tab's collapsed stack bar: the caller focuses
+    /// and expands that pane (`pane_zoom::activate_stack_member`).
+    StackBar(u32),
 }
 
 /// Front-matter of the compositor's mouse handling, extracted from `run.rs`:
@@ -43,6 +50,7 @@ pub(crate) fn pre_dispatch(
     cols: usize,
     rows: usize,
     chrome: &crate::layout::ChromeLayout,
+    model: &crate::chrome::FrameModel,
     app_host: &mut crate::apps::AppHost,
     drawer: Option<u32>,
     panes: &mut crate::panes::Panes,
@@ -214,15 +222,39 @@ pub(crate) fn pre_dispatch(
         }
         // Flag off: fall through to the pane/chrome dispatch, exactly as before.
     }
-    // 2. Resolve the pane (or bottom drawer) under the cursor.
-    let frames = session
-        .active_tab()
-        .map(|t| t.center.layout_framed(chrome.center))
-        .unwrap_or_default();
-    let hit_pane = if app_host.active_tile_mut().is_none()
+    // 2. Resolve the pane (or bottom drawer) under the cursor — against the
+    // tree as DISPLAYED. While a tab is zoomed that is the stack (one expanded
+    // pane + collapsed bars), not the tab's split: hit-testing the split put the
+    // selection anchor, drag clamp, wheel and hidden-seam resize under the
+    // wrong pane/rect.
+    let displayed = crate::handlers::pane_zoom::displayed_tree(session);
+    let crate::center::FramedLayout { frames, bars } =
+        displayed.layout_framed_with_bars(chrome.center);
+    let over_drawer = app_host.active_tile_mut().is_none()
+        && drawer.is_some()
+        && chrome.drawer.is_some_and(|rect| contains(rect, mx, my));
+    // A press expands only a bar the renderer actually displays. App tiles
+    // replace the work band, and render_panes replaces all frames/bars with a
+    // splash while loading. Boxed overlays (including replay and corner cards)
+    // record their painted coverage during compose; cursor claims do not alter
+    // that input occlusion. Existing modal dispatch above still takes priority.
+    if left
+        && !*mouse_left_down
+        && !over_drawer
+        && !sidebar_drag_active
+        && app_host.active_tile_mut().is_none()
+        && !crate::chrome::center_shows_splash(&frames, model, |id| panes.table.contains_key(&id))
+        && !crate::caret::covered_at(mx, my)
+        && let Some((id, _)) = bars.into_iter().find(|(_, r)| contains(*r, mx, my))
+    {
+        *mouse_left_down = true;
+        *mouse_selecting = false;
+        *mouse_sel = None;
+        return MousePre::StackBar(id);
+    }
+    let hit_pane = if over_drawer
         && let Some(drawer_id) = drawer
         && let Some(rect) = chrome.drawer
-        && contains(rect, mx, my)
     {
         Some((drawer_id, rect))
     } else {
