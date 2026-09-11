@@ -383,6 +383,41 @@
       "changes": [
         "add-voice-mode"
       ]
+    },
+    {
+      "issue": "THE-559",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-560",
+      "project": "Spec & Tracker Reconciliation",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-566",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-567",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
+    },
+    {
+      "issue": "THE-568",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "pane-zoom-stack"
+      ]
     }
   ]
 }

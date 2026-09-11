@@ -6,6 +6,10 @@ use termwiz::input::{Modifiers, MouseButtons, MouseEvent};
 
 use crate::compositor::Rect;
 
+#[cfg(test)]
+#[path = "overlay_tests.rs"]
+mod tests;
+
 /// Whether cell `(x, y)` falls inside rect `r`.
 fn contains(r: Rect, x: usize, y: usize) -> bool {
     x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows
@@ -46,6 +50,7 @@ pub(crate) fn pre_dispatch(
     cols: usize,
     rows: usize,
     chrome: &crate::layout::ChromeLayout,
+    model: &crate::chrome::FrameModel,
     app_host: &mut crate::apps::AppHost,
     drawer: Option<u32>,
     panes: &mut crate::panes::Panes,
@@ -223,19 +228,24 @@ pub(crate) fn pre_dispatch(
     // selection anchor, drag clamp, wheel and hidden-seam resize under the
     // wrong pane/rect.
     let displayed = crate::handlers::pane_zoom::displayed_tree(session);
-    let frames = displayed.layout_framed(chrome.center);
+    let crate::center::FramedLayout { frames, bars } =
+        displayed.layout_framed_with_bars(chrome.center);
     let over_drawer = app_host.active_tile_mut().is_none()
         && drawer.is_some()
         && chrome.drawer.is_some_and(|rect| contains(rect, mx, my));
-    // A press on a collapsed stack bar expands that pane.
+    // A press expands only a bar the renderer actually displays. App tiles
+    // replace the work band, and render_panes replaces all frames/bars with a
+    // splash while loading. Boxed overlays (including replay and corner cards)
+    // record their painted coverage during compose; cursor claims do not alter
+    // that input occlusion. Existing modal dispatch above still takes priority.
     if left
         && !*mouse_left_down
         && !over_drawer
         && !sidebar_drag_active
-        && let Some((id, _)) = displayed
-            .stack_bars(chrome.center)
-            .into_iter()
-            .find(|(_, r)| contains(*r, mx, my))
+        && app_host.active_tile_mut().is_none()
+        && !crate::chrome::center_shows_splash(&frames, model, |id| panes.table.contains_key(&id))
+        && !crate::caret::covered_at(mx, my)
+        && let Some((id, _)) = bars.into_iter().find(|(_, r)| contains(*r, mx, my))
     {
         *mouse_left_down = true;
         *mouse_selecting = false;

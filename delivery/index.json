@@ -688,6 +688,34 @@
       ]
     },
     {
+      "change": "pane-zoom-stack",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-559",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-560",
+          "project": "Spec & Tracker Reconciliation"
+        },
+        {
+          "issue": "THE-566",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-567",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-568",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Queue review repairs cover visibility, original-stack keyboard focus, narrow geometry and duplicate layout work; focused, integrated, full-gate and visual verification remain before delivery."
+    },
+    {
       "change": "publish-observer-event-contract",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

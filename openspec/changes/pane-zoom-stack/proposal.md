@@ -40,6 +40,22 @@ defects:
 
 ## Impact
 
+- Runtime repair owner: [THE-559](https://linear.app/blakeashley/issue/THE-559),
+  Workspace Product & Observability. Delivery registration/support owner:
+  [THE-560](https://linear.app/blakeashley/issue/THE-560), Spec & Tracker
+  Reconciliation. Both are required before merge: THE-560 restores source
+  gate eligibility, and THE-559 supplies the visibility repair and focused
+  evidence. Neither replaces integrated/full-gate or visual verification.
+- Lifecycle remains active and verification-gated; the original queued branch
+  and this repair do not establish completion of the remaining gates.
+- Full-feature review also requires THE-566 (keyboard focus must activate a
+  saved stack before restoring tiled), THE-567 (unpaintable narrow bars must
+  not become click targets), and THE-568 (paired geometry must not duplicate
+  layout walks or allocate discarded outputs), all owned by Workspace Product
+  & Observability. These depend on the shared visibility/caller foundation in
+  THE-559 and delivery registration in THE-560; all must pass their focused
+  regressions before the common integrated/full/visual gate.
+
 - `crates/thegn-host/src/{center,borders,chrome,session,run}.rs`
 - `crates/thegn-host/src/handlers/{pane_zoom,overlay,sidebar_activate}.rs`
 - `docs/help/terminal-and-panes.md`
