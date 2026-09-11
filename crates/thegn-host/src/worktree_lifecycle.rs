@@ -1958,6 +1958,82 @@ mod landing_tests {
     }
 
     #[test]
+    fn deleting_effective_active_with_stale_index_uses_visual_neighbour() {
+        let (mut session, mut model, mut sb) = tree(usize::MAX);
+        // Effective active is mid. Its next visual neighbour is zeta, but
+        // removing its last session slot falls back to alpha without landing.
+        session.worktrees.swap(1, 2);
+        crate::run::refresh_tab_model(&mut model, &session, &mut sb);
+        assert_eq!(active_name(&session), "app/mid");
+        delete(&mut session, &mut model, &mut sb, "app/mid");
+        assert_eq!(active_name(&session), "app/zeta");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
+    }
+
+    #[test]
+    fn deleting_another_group_with_stale_index_preserves_effective_active() {
+        let (mut session, mut model, mut sb) = tree(usize::MAX);
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/mid");
+        assert!(session.active < session.worktrees.len());
+    }
+
+    #[test]
+    fn mixed_batch_lands_on_failed_neighbour_independent_of_completion_order() {
+        for reverse in [false, true] {
+            let (mut session, mut model, mut sb) = tree(1);
+            focus_cursor_on(&mut model, &mut sb, "/tmp/app-alpha");
+            let mut completions = vec![
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/alpha".into(),
+                    path: "/tmp/app-alpha".into(),
+                    success: true,
+                    message: String::new(),
+                },
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/mid".into(),
+                    path: "/tmp/app-mid".into(),
+                    success: false,
+                    message: "still in use".into(),
+                },
+                LifecycleCompletion::WorktreeDelete {
+                    group_name: "app/zeta".into(),
+                    path: "/tmp/app-zeta".into(),
+                    success: true,
+                    message: String::new(),
+                },
+            ];
+            if reverse {
+                completions.reverse();
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut panes = crate::panes::Panes::new(tx);
+            assert!(apply_completions_from(
+                completions,
+                &mut session,
+                &mut panes,
+                &mut model,
+                &mut sb,
+            ));
+            assert_eq!(active_name(&session), "app/mid");
+            assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-mid"));
+            assert_eq!(worktree_paths(&model), ["/tmp/app", "/tmp/app-mid"]);
+        }
+    }
+
+    #[test]
+    fn deleting_active_without_visible_row_falls_back_to_workspace_home() {
+        let (mut session, mut model, mut sb) = tree(1);
+        sb.view.filter = "zeta".into();
+        crate::run::refresh_tab_model(&mut model, &session, &mut sb);
+        assert_eq!(worktree_paths(&model), ["/tmp/app-zeta"]);
+        focus_cursor_on(&mut model, &mut sb, "/tmp/app-zeta");
+        delete(&mut session, &mut model, &mut sb, "app/alpha");
+        assert_eq!(active_name(&session), "app/home");
+        assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
+    }
+
+    #[test]
     fn deleting_the_last_row_lands_on_the_previous_one() {
         let (mut session, mut model, mut sb) = tree(2);
         delete(&mut session, &mut model, &mut sb, "app/zeta");
