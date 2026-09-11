@@ -545,9 +545,8 @@ fn chunk_name(chunk_path: &str) -> &str {
 /// `dispatch claim` — the atomic slot check plus insert.
 ///
 /// The stage's budget comes from `[[pipeline.stages]]`, so the number enforced
-/// is the one the operator configured; an unknown stage name has no budget and
-/// only the duplicate rule applies (naming a stage thegn does not know is a
-/// supervisor bug, but refusing every dispatch for it would be a worse one).
+/// is the one the operator configured. An unknown stage is refused rather than
+/// silently receiving unlimited capacity.
 #[allow(clippy::too_many_arguments)]
 fn claim(
     cfg: &Config,
@@ -562,11 +561,12 @@ fn claim(
     json: bool,
 ) -> Result<()> {
     let db = Db::open()?;
-    let limit = cfg
-        .pipeline
-        .stage(stage)
-        .map(|s| s.concurrency)
-        .unwrap_or(0);
+    let Some(stage_config) = cfg.pipeline.stage(stage) else {
+        anyhow::bail!(
+            "unknown pipeline stage {stage:?}; configure it under [[pipeline.stages]] before claiming work"
+        );
+    };
+    let limit = stage_config.concurrency;
     let outcome = db.claim_dispatch(
         NewDispatch {
             issue_id,

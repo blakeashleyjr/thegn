@@ -979,12 +979,11 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     // re-stamps (and re-notifies) work that finished days ago,
                     // and two stages sharing a worktree each get their own row.
                     //
-                    // DIVISION OF LABOUR: this handler only stamps dispatches
-                    // whose worker is a *pane*. A headless session (`session
-                    // open` without `--adopt`) has no pane to exit here — its
-                    // Done/Failed is written by the supervising agent after
-                    // `sessions.wait`, which is the only observer that sees it
-                    // finish.
+                    // DIVISION OF LABOUR: this handler stamps dispatches whose
+                    // worker is an adopted *pane*. The daemon's SessionExit
+                    // observer stamps headless workers. Both can observe an
+                    // adopted session; the DB stamp is first-writer-wins for a
+                    // run, so the duplicate observation is harmless.
                     if let Ok(Some((dispatch_id, issue_id))) =
                         db.dispatch_for_exit(&wt, exited_session.as_deref())
                     {

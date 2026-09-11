@@ -428,7 +428,9 @@ pub fn claim_spare(
             let bare = exists
                 && crate::agent::block_on_provider(|| async { dp.read(&d, &marker).await })
                     .is_err();
-            if bare {
+            if bare
+                && crate::remote_enqueue_auth::revoke_for_sandbox(&env.provider, &d, None).is_ok()
+            {
                 let _ = crate::agent::block_on_provider(|| async { dp.destroy(&d).await }); // best-effort: cleanup: a leftover sandbox dir with no marker; the next claim re-creates it
             }
         }
@@ -494,6 +496,11 @@ pub fn destroy_spare(
     if let Some(env) = cfg.env.get(env_name)
         && let Some(provider) = crate::agent::provider_for_named(&env.provider, name)
     {
+        crate::remote_enqueue_auth::revoke_for_sandbox(&env.provider, name, None).map_err(|error| {
+            anyhow::anyhow!(
+                "refusing to destroy spare {name}: route-to-host credential revocation failed: {error:#}"
+            )
+        })?;
         let _ = crate::agent::block_on_provider(|| async { provider.destroy(name).await }); // best-effort: spare teardown: a failed destroy is reaped by the reconcile scan
     }
     if let Ok(db) = thegn_core::db::Db::open() {

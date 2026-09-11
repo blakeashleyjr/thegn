@@ -10,13 +10,15 @@
 
 ## 2. Platform contract
 
-- [ ] 2.1 Publish the exact Linux Nix/non-Nix, macOS, and Windows support
+- [x] 2.1 Publish the exact Linux Nix/non-Nix, macOS, and Windows support
       matrix, including bundled/delegated components and fallbacks.
 - [ ] 2.2 Add explicit standalone-Linux batteries mode or a deterministic
       package-native equivalent without implicit terminal/font replacement.
 - [ ] 2.3 Complete the macOS terminal/font/config/binary artifact and launcher.
-- [ ] 2.4 Implement Windows batteries support or explicitly defer it to a
-      bounded issue with tested fallback instructions.
+- [x] 2.4 Defer Windows batteries support to THE-140/THE-145 and document the
+      supported Linux-host fallback; implement it only after native evidence
+      is green. This satisfies the explicit-decision branch of the contract,
+      not Windows parity.
 
 ## 3. Diagnostics and evidence
 

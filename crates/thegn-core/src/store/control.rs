@@ -9,8 +9,10 @@
 use anyhow::Result;
 
 /// A running pane daemon, registered so clients can discover and attach.
-/// `endpoint` is the unix control socket; `tcp_addr` is set while `thegn serve`
-/// is listening for remote thin clients. All times are unix **ms**.
+/// `endpoint` is the unix control socket; `tcp_addr` is the actual TCP listener
+/// while `control_origin` is the canonical client-facing HTTP(S) origin after
+/// advertise overrides. Both are set only while `thegn serve` is active. All
+/// times are unix **ms**.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonRow {
     pub daemon_id: String,
@@ -22,6 +24,9 @@ pub struct DaemonRow {
     pub endpoint: String,
     /// `host:port` while serve mode listens for remote clients, else `None`.
     pub tcp_addr: Option<String>,
+    /// Public HTTP(S) origin clients should dial. This can differ from
+    /// `tcp_addr` when TLS terminates or a trusted tunnel fronts loopback.
+    pub control_origin: Option<String>,
     pub hostname: String,
     pub version: String,
     pub started_at: i64,

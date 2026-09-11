@@ -88,7 +88,8 @@ A plugin only gets what its manifest declares and the host grants: surfaces
 require their capability (e.g. `surface:statusbar`), and `host.call`
 requests (invoking a host capability like `worktrees.list` by catalog id)
 are checked against the plugin's `scopes` — the same `read`/`write`/`git`/
-`exec`/`admin` lattice as control-API tokens. `write`, `git`, and `exec` are
+`merge_add`/`exec`/`admin` lattice as control-API tokens. `merge_add` is the
+narrow, worktree-bound remote-enqueue grant. `write`, `git`, `merge_add`, and `exec` are
 independent; `admin` implies all scopes. Undeclared means denied, and every
 denial is audited. `tools.run` is the current exec-scoped plugin call;
 `launch.preset` remains CLI-first and is not advertised to plugins until its

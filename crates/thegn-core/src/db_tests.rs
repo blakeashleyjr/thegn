@@ -5,6 +5,46 @@ use crate::store::{
 };
 use rusqlite::params;
 
+#[test]
+fn remote_enqueue_compare_and_write_is_one_registry_transaction() {
+    let db = Db::open_memory().unwrap();
+    db.put_worktree(
+        "repo-feature",
+        "/repos/project",
+        "/remote/feature",
+        "feature",
+        Some("provider-location-v1"),
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        !db.enqueue_merge_if_worktree_matches(
+            "/remote/feature",
+            "feature",
+            "/repos/project",
+            "provider-location-stale",
+            "main",
+        )
+        .unwrap()
+    );
+    assert!(db.list_merge_queue().unwrap().is_empty());
+
+    assert!(
+        db.enqueue_merge_if_worktree_matches(
+            "/remote/feature",
+            "feature",
+            "/repos/project",
+            "provider-location-v1",
+            "main",
+        )
+        .unwrap()
+    );
+    let rows = db.list_merge_queue().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].location, "provider-location-v1");
+}
+
 /// An EXISTING database (`observed > 0`) is the contended case the policy is for.
 const UPGRADE: i64 = 62;
 
@@ -3786,6 +3826,95 @@ fn claim_allows_parallel_chunks_but_enforces_the_stage_budget() {
     assert_eq!(db.list_dispatches().unwrap().len(), 3);
 }
 
+/// Race two callers against separate connections to the same file-backed DB.
+/// Opening both handles before the barrier is important: this exercises
+/// `claim_dispatch`'s `BEGIN IMMEDIATE` serialization, not database bootstrap.
+fn race_dispatch_claims(
+    left_issue: &'static str,
+    left_artifact: &'static str,
+    right_issue: &'static str,
+    right_artifact: &'static str,
+    limit: u32,
+) -> (
+    Vec<std::result::Result<i64, crate::pipeline_claim::ClaimDecision>>,
+    Vec<crate::issue::AgentDispatch>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("thegn.db");
+    drop(Db::open_at(&path).unwrap());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = [(left_issue, left_artifact), (right_issue, right_artifact)]
+        .into_iter()
+        .map(|(issue, artifact)| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let db = Db::open_at(&path).unwrap();
+                barrier.wait();
+                db.claim_dispatch(
+                    claim_new(issue, "/wt/shared", "code", artifact),
+                    limit,
+                    None,
+                )
+                .unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let decisions = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    let rows = Db::open_at(&path).unwrap().list_dispatches().unwrap();
+    (decisions, rows)
+}
+
+#[test]
+fn simultaneous_distinct_claims_cannot_oversubscribe_a_stage() {
+    let (decisions, rows) =
+        race_dispatch_claims("linear:A-1", "chunk-1.md", "linear:A-2", "chunk-2.md", 1);
+    assert_eq!(
+        decisions.iter().filter(|d| d.is_ok()).count(),
+        1,
+        "exactly one claimant gets the sole slot: {decisions:?}"
+    );
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|d| matches!(
+                d,
+                Err(crate::pipeline_claim::ClaimDecision::AtCapacity { .. })
+            ))
+            .count(),
+        1,
+        "the loser observes the winner inside the transaction: {decisions:?}"
+    );
+    assert_eq!(rows.len(), 1, "the refusal must not create a second row");
+}
+
+#[test]
+fn simultaneous_equivalent_claims_cannot_duplicate_an_artifact() {
+    let (decisions, rows) =
+        race_dispatch_claims("linear:A-1", "chunk-1.md", "linear:A-1", "chunk-1.md", 2);
+    assert_eq!(
+        decisions.iter().filter(|d| d.is_ok()).count(),
+        1,
+        "exactly one equivalent claim is granted: {decisions:?}"
+    );
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|d| matches!(
+                d,
+                Err(crate::pipeline_claim::ClaimDecision::DuplicateOf { .. })
+            ))
+            .count(),
+        1,
+        "the loser sees the artifact-aware duplicate: {decisions:?}"
+    );
+    assert_eq!(rows.len(), 1, "the duplicate refusal must not append a row");
+}
+
 #[test]
 fn an_exited_unclosed_row_keeps_holding_its_slot_across_a_monitor_restart() {
     // The runaway in miniature. A monitor dispatches, the worker exits, the
@@ -3844,6 +3973,40 @@ fn an_authorized_duplicate_is_recorded_rather_than_refused() {
 }
 
 #[test]
+fn duplicate_override_never_bypasses_capacity_and_requires_a_reason() {
+    let db = Db::open_memory().unwrap();
+    db.claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 1, None)
+        .unwrap()
+        .unwrap();
+    let decision = db
+        .claim_dispatch(
+            claim_new("linear:A-1", "/wt/a", "code", "c1.md"),
+            1,
+            Some("intentional retry"),
+        )
+        .unwrap()
+        .expect_err("an override must not create capacity");
+    assert!(
+        matches!(
+            decision,
+            crate::pipeline_claim::ClaimDecision::AtCapacity { limit: 1, .. }
+        ),
+        "{decision:?}"
+    );
+    assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    let error = db
+        .claim_dispatch(
+            claim_new("linear:A-1", "/wt/a", "code", "c1.md"),
+            2,
+            Some("   "),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("non-empty reason"), "{error}");
+    assert_eq!(db.list_dispatches().unwrap().len(), 1);
+}
+
+#[test]
 fn stamping_an_exit_makes_a_running_row_read_as_exited_unverified() {
     let db = Db::open_memory().unwrap();
     let id = db
@@ -3867,6 +4030,21 @@ fn stamping_an_exit_makes_a_running_row_read_as_exited_unverified() {
         ),
         "the row must now be distinguishable from a live worker"
     );
+}
+
+#[test]
+fn duplicate_exit_observers_preserve_the_first_exit_fact() {
+    let db = Db::open_memory().unwrap();
+    let id = db
+        .claim_dispatch(claim_new("linear:A-1", "/wt/a", "code", "c1.md"), 3, None)
+        .unwrap()
+        .unwrap();
+    db.stamp_dispatch_exit(id, Some(0)).unwrap();
+    let first = db.get_dispatch(id).unwrap().unwrap();
+    db.stamp_dispatch_exit(id, Some(9)).unwrap();
+    let repeated = db.get_dispatch(id).unwrap().unwrap();
+    assert_eq!(repeated.exit_code, Some(0));
+    assert_eq!(repeated.exited_at_ms, first.exited_at_ms);
 }
 
 #[test]

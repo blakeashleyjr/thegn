@@ -68,10 +68,10 @@ impl SortFreeze {
     }
 }
 
-/// The key source [`crate::sidebar::sort_groups`] and its flat counterpart read:
-/// the freeze when one is armed. A key absent from an armed snapshot receives
-/// the stable unknown value; consulting its changing live value would let a row
-/// created during the freeze reshuffle the numeric navigation slots.
+/// The grouped and flat sorting paths in [`crate::sidebar::build_rows`] read this
+/// key source: the freeze when one is armed. A key absent from an armed snapshot
+/// receives the stable unknown value; consulting its changing live value would
+/// let a row created during the freeze reshuffle the numeric navigation slots.
 ///
 /// A struct with methods rather than a pair of `&BTreeMap`s so the stable-miss
 /// rule (see [`SortKeys::recency`]) lives in exactly one place and can be tested

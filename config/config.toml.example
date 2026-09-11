@@ -1100,16 +1100,14 @@ crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
 # ── Credential broker ────────────────────────────────────────────────────────
 # Custody + policy for thegn-managed secret material (THE-66). Every field has a
 # safe default, so an absent [credentials] table is the tightened default posture
-# described below. Secrets themselves are NEVER stored here — provider/issue/CI
-# tokens are SecretRefs (`keyring:<account>` / `env:VAR` / `file:PATH`); store a
-# value with `thegn secret set <name>` (reads stdin, prints the ref) and paste
-# the ref into the field. `thegn secret list|audit` show refs + backends (never
-# values); `thegn secret migrate` moves any pasted plaintext token into the
-# keyring. `thegn doctor` prints a Secrets section (backend probes + per-ref
-# presence), the host-key policy table, and the per-tier secret-exposure listing.
-# [credentials]
-# audit_file = false                     # optional value-free JSONL sink under the
-#                                        #   state dir (metadata only, never values)
+# described below. Prefer SecretRefs (`keyring:<account>` / `env:VAR` /
+# `file:PATH`) for every secret field; store a value with `thegn secret set
+# <name>` (reads stdin, prints the ref) and paste the ref into the field.
+# `thegn secret list|audit` show refs + backends (never values); `thegn secret
+# migrate` rewrites legacy issue-account and GitLab CI plaintext tokens. VPN,
+# snapshot-S3, and MCP map entries resolve through the same broker but require a
+# manual ref edit. `thegn doctor` prints a Secrets section (backend probes +
+# per-ref presence), the host-key policy table, and the per-tier exposure list.
 # [credentials.ssh]
 # managed_key_scope = "per-account"      # DEFAULT (THE-66). A newly provisioned
 #                                        #   instance authorizes a key private to
@@ -3131,8 +3129,8 @@ ephemeral = true
 
 # [sandbox.vpn.zerotier]    # provider = "zerotier"
 # network_id = ""                            # 16-hex network id
-# controller_url = ""                        # self-hosted controller/moon
-# api_token = "env:ZT_API_TOKEN"             # to auto-authorize the member
+# The member must already be authorized by the selected ZeroTier controller;
+# automatic controller authorization is not a shipped config surface.
 
 # [sandbox.vpn.custom]      # provider = "custom" — escape hatch for any tunnel
 # up = "..."                                 # establishes the tunnel
@@ -4109,8 +4107,9 @@ enabled = true
 remote_mode = "route_to_host" # how a REMOTE-host (sprite) worktree lands onto the target;
                               # inert for an on-host worktree. "route_to_host": send the
                               # enqueue to the target host's daemon over the control plane so
-                              # the host's queue owns the row (needs a control endpoint +
-                              # merge-scoped token injected into the sprite). "push": the sprite
+                              # the host's queue owns the row (needs a live tls-terminated/tunnel
+                              # [serve] endpoint + merge_add-only token injected at provision).
+                              # "push": the sprite
                               # drains its OWN clone (fold+gate+advance), then `git push`es the
                               # target to origin — no host reach; origin is the convergence point.
 target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default

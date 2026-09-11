@@ -840,7 +840,10 @@ fn managed_key_basename_scopes_per_account() {
     // Per-account scopes the key so one account can be rotated in isolation.
     assert_eq!(
         ManagedKeyScope::PerAccount.managed_key_basename("digitalocean", "work"),
-        "digitalocean-work_ed25519"
+        format!(
+            "digitalocean-work-{}_ed25519",
+            crate::util::short_hash("digitalocean\0work", 16)
+        )
     );
     // Unsafe characters are sanitized so the name can never escape the ssh dir
     // (each non-alphanumeric, non-dash char becomes a dash; edges trimmed).
@@ -848,10 +851,20 @@ fn managed_key_basename_scopes_per_account() {
     assert!(name.ends_with("_ed25519"));
     assert!(!name.contains('/') && !name.contains(' '));
     assert!(name.starts_with("fly-x-a-b"));
-    // Empty account falls back to a provider-only name.
-    assert_eq!(
-        ManagedKeyScope::PerAccount.managed_key_basename("hetzner", ""),
-        "hetzner_ed25519"
+    // Empty account remains explicit, and sanitized aliases cannot collide.
+    let empty = ManagedKeyScope::PerAccount.managed_key_basename("hetzner", "");
+    assert!(empty.starts_with("hetzner-default-"), "{empty}");
+    assert_ne!(
+        ManagedKeyScope::PerAccount.managed_key_basename("fly/x", "a b"),
+        ManagedKeyScope::PerAccount.managed_key_basename("fly-x", "a-b")
+    );
+    // Basenames stay comfortably below common filesystem component limits
+    // even when a credential ref is very long.
+    assert!(
+        ManagedKeyScope::PerAccount
+            .managed_key_basename(&"p".repeat(400), &"a".repeat(400))
+            .len()
+            < 100
     );
     // The default scope is per-account (THE-66 tightening).
     assert_eq!(ManagedKeyScope::default(), ManagedKeyScope::PerAccount);
@@ -1962,7 +1975,6 @@ fn vpn_config_round_trips_through_serialization() {
         provider: VpnProviderKind::Zerotier,
         zerotier: ZerotierConfig {
             network_id: "8056c2e21c000001".into(),
-            ..ZerotierConfig::default()
         },
         ..VpnConfig::default()
     };

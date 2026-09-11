@@ -58,6 +58,11 @@ notify.rs
 panes.rs
 perf.rs
 probe.rs
+# TEST-ONLY cfg: the remote enqueue credential installer regression executes a
+# real POSIX shell and inspects Unix permission bits to prove the streamed
+# secret never lands in argv and is published owner-only. Production credential
+# installation is platform-free; the cfg gates only this OS-specific assertion.
+remote_enqueue_auth.rs
 vps_bridge.rs
 # TEST-ONLY cfg: provider failure-path tests use a POSIX shell fixture and
 # executable permissions to verify stderr preservation and env sanitization;

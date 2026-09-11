@@ -433,3 +433,37 @@ mod git_path_tests {
         assert_eq!(display_git_path(&path), "bad-\\xff-name");
     }
 }
+
+#[cfg(test)]
+mod remote_credential_tests {
+    #[test]
+    #[expect(clippy::disallowed_methods)] // isolated /bin/sh data-safety fixture, test only
+    fn credential_metacharacters_are_read_as_data_not_executed() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = "/host/worktree-a";
+        let credential_path = temp
+            .path()
+            .join(crate::remote_enqueue_auth::credential_path(worktree));
+        std::fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+        let sentinel = temp.path().join("must-not-exist");
+        let origin = format!("https://host.invalid/$(touch {})", sentinel.display());
+        let token = format!("token; touch {}", sentinel.display());
+        std::fs::write(&credential_path, format!("{origin}\n{token}\n")).unwrap();
+        let script = format!(
+            "{}printf '%s\\n%s\\n' \"$THEGN_CONTROL_URL\" \"$THEGN_CONTROL_TOKEN\"",
+            crate::remote_enqueue_auth::source_prefix(worktree)
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("HOME", temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{origin}\n{token}\n")
+        );
+        assert!(!sentinel.exists());
+    }
+}

@@ -2084,4 +2084,283 @@ mod tests {
         assert_eq!(env.name, "default");
         assert!(!env.unresolved_selection);
     }
+
+    #[test]
+    fn repo_overlay_field_matrix_enforces_forbidden_and_floor_rules() {
+        use crate::config::{
+            DevcontainerMode, OnMissing, SandboxBackend, SandboxCompilerCache, SandboxProfile,
+            WarmDirenv,
+        };
+        use crate::config_placement::OnDormant;
+
+        let mut trusted = base();
+        trusted.devcontainer = DevcontainerMode::Off;
+        trusted.profile = SandboxProfile::Sealed;
+        trusted.on_dormant = OnDormant::Cancel;
+        trusted.on_missing = OnMissing::Fail;
+        trusted.warm_direnv = WarmDirenv::Off;
+        trusted.compiler_cache = SandboxCompilerCache::Off;
+
+        let mut request = overlay();
+        request.enabled = Some(true);
+        request.default_backend = Some(SandboxBackend::Docker);
+        request.backend_chain = Some(vec!["none".into()]);
+        request.default_env = Some("repo-default".into());
+        request.main_env = Some("repo-main".into());
+        request.devcontainer = Some(DevcontainerMode::Auto);
+        request.compose = Some("compose.yml".into());
+        request.profile = Some(SandboxProfile::Open);
+        request.on_dormant = Some(OnDormant::Host);
+        request.on_missing = Some(OnMissing::Warn);
+        request.warm_direnv = Some(WarmDirenv::Auto);
+        request.auto_caches = Some(true);
+        request.network_audit = Some(false);
+
+        let classified = classify_repo_overlay(request, &trusted, &Approvals::deny_all());
+        assert_eq!(classified.sanctioned.enabled, Some(true));
+        for key in [
+            "sandbox.default_backend",
+            "sandbox.backend_chain",
+            "sandbox.default_env",
+            "sandbox.main_env",
+            "sandbox.devcontainer",
+            "sandbox.compose",
+            "sandbox.profile",
+            "sandbox.on_dormant",
+            "sandbox.on_missing",
+            "sandbox.warm_direnv",
+            "sandbox.auto_caches",
+            "sandbox.network_audit",
+        ] {
+            assert!(
+                classified.events.iter().any(|event| event.key == key),
+                "missing clamp event for {key}: {:?}",
+                classified
+                    .events
+                    .iter()
+                    .map(|event| event.key.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn restrictiveness_lattices_cover_every_policy_variant() {
+        use crate::config::{
+            FileAccess, IsolationFloor, OnFloorMiss, OnMissing, SandboxProfile, WarmDirenv,
+        };
+        use crate::config_placement::OnDormant;
+
+        assert_eq!(profile_rank(SandboxProfile::Open), 0);
+        assert_eq!(profile_rank(SandboxProfile::Hardened), 1);
+        assert_eq!(profile_rank(SandboxProfile::SealedTunnel), 2);
+        assert_eq!(profile_rank(SandboxProfile::Sealed), 3);
+        assert_eq!(on_dormant_rank(OnDormant::Host), 0);
+        assert_eq!(on_dormant_rank(OnDormant::Ask), 1);
+        assert_eq!(on_dormant_rank(OnDormant::Start), 2);
+        assert_eq!(on_dormant_rank(OnDormant::Cancel), 3);
+        assert_eq!(on_missing_rank(OnMissing::Warn), 0);
+        assert_eq!(on_missing_rank(OnMissing::Prompt), 1);
+        assert_eq!(on_missing_rank(OnMissing::Fail), 2);
+        assert_eq!(isolation_floor_rank(IsolationFloor::Off), 0);
+        assert_eq!(isolation_floor_rank(IsolationFloor::SharedKernel), 1);
+        assert_eq!(isolation_floor_rank(IsolationFloor::UserspaceKernel), 2);
+        assert_eq!(isolation_floor_rank(IsolationFloor::GuestKernel), 3);
+        assert_eq!(on_floor_miss_rank(OnFloorMiss::Degrade), 0);
+        assert_eq!(on_floor_miss_rank(OnFloorMiss::Fail), 1);
+        assert_eq!(warm_direnv_rank(WarmDirenv::Auto), 0);
+        assert_eq!(warm_direnv_rank(WarmDirenv::AllowedOnly), 1);
+        assert_eq!(warm_direnv_rank(WarmDirenv::Off), 2);
+        assert_eq!(
+            file_access_cmp(FileAccess::Host, FileAccess::None),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            file_access_cmp(FileAccess::Worktree, FileAccess::Worktree),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            file_access_cmp(FileAccess::None, FileAccess::All),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            file_access_cmp(FileAccess::Custom, FileAccess::Worktree),
+            None
+        );
+        assert_eq!(
+            file_access_cmp(FileAccess::Worktree, FileAccess::Custom),
+            None
+        );
+    }
+
+    #[test]
+    fn byte_and_cpu_parsers_accept_documented_units_and_reject_bad_input() {
+        assert_eq!(parse_bytes("1024"), Some(1024));
+        assert_eq!(parse_bytes("2k"), Some(2 * 1024));
+        assert_eq!(parse_bytes("3M"), Some(3 * 1024 * 1024));
+        assert_eq!(parse_bytes("1.5g"), Some(1_610_612_736));
+        assert_eq!(parse_bytes("1t"), Some(1024_u64.pow(4)));
+        assert_eq!(parse_bytes("32b"), Some(32));
+        assert_eq!(parse_bytes(""), None);
+        assert_eq!(parse_bytes("unlimited"), None);
+        assert_eq!(parse_bytes("mb"), None);
+
+        assert_eq!(parse_cpu_millis("500m"), Some(500));
+        assert_eq!(parse_cpu_millis(" 250m"), Some(250));
+        assert_eq!(parse_cpu_millis("2"), Some(2000));
+        assert_eq!(parse_cpu_millis("1.5"), Some(1500));
+        assert_eq!(parse_cpu_millis("off"), None);
+        assert_eq!(parse_cpu_millis("xm"), None);
+    }
+
+    #[test]
+    fn every_gated_repo_resource_requires_exact_approval() {
+        let mut request = overlay();
+        request.volumes = Some(std::collections::HashMap::from([(
+            "/host/cache".into(),
+            "/cache".into(),
+        )]));
+        request.init_script = Some("install-tools".into());
+        request.image = Some("registry.example/dev:1".into());
+        request.gpu = Some("all".into());
+        request.ports = Some(vec!["127.0.0.1:8080:80".into(), "8443:443".into()]);
+        request.nix_daemon = Some(true);
+
+        let denied = classify_repo_overlay(request.clone(), &base(), &Approvals::deny_all());
+        assert_eq!(denied.pending.len(), 7);
+        assert!(
+            denied
+                .sanctioned
+                .volumes
+                .as_ref()
+                .is_some_and(|v| v.is_empty())
+        );
+        assert!(denied.sanctioned.ports.is_none());
+        assert!(denied.sanctioned.nix_daemon.is_none());
+
+        let approvals =
+            Approvals::from_canonical(denied.pending.iter().map(GatedRequest::canonical));
+        let granted = classify_repo_overlay(request, &base(), &approvals);
+        assert!(granted.pending.is_empty());
+        assert_eq!(
+            granted
+                .sanctioned
+                .volumes
+                .as_ref()
+                .and_then(|v| v.get("/host/cache")),
+            Some(&"/cache".to_string())
+        );
+        assert_eq!(
+            granted.sanctioned.init_script.as_deref(),
+            Some("install-tools")
+        );
+        assert_eq!(
+            granted.sanctioned.image.as_deref(),
+            Some("registry.example/dev:1")
+        );
+        assert_eq!(granted.sanctioned.gpu.as_deref(), Some("all"));
+        assert_eq!(granted.sanctioned.ports.as_ref().map(Vec::len), Some(2));
+        assert_eq!(granted.sanctioned.nix_daemon, Some(true));
+
+        let mut tightening = overlay();
+        tightening.nix_daemon = Some(false);
+        tightening.image = Some(String::new());
+        let tightened = classify_repo_overlay(tightening, &base(), &Approvals::deny_all());
+        assert_eq!(tightened.sanctioned.nix_daemon, Some(false));
+        assert!(tightened.pending.is_empty());
+    }
+
+    #[test]
+    fn limit_clamping_covers_unbounded_invalid_and_total_memory_cases() {
+        let unbounded = SandboxLimits::default();
+        let request = SandboxLimits {
+            cpu: Some("750m".into()),
+            memory: Some("512m".into()),
+            cpu_total: Some("2".into()),
+            memory_total: Some("4g".into()),
+        };
+        let mut events = Vec::new();
+        let granted = clamp_limits(&request, &unbounded, &mut events, TrustLevel::Repo);
+        assert!(events.is_empty());
+        assert_eq!(granted.cpu.as_deref(), Some("750m"));
+        assert_eq!(granted.memory.as_deref(), Some("512m"));
+        assert_eq!(granted.cpu_total.as_deref(), Some("2"));
+        assert_eq!(granted.memory_total.as_deref(), Some("4g"));
+
+        let trusted = SandboxLimits {
+            cpu: Some("1".into()),
+            memory: Some("1g".into()),
+            cpu_total: Some("4".into()),
+            memory_total: Some("8g".into()),
+        };
+        let invalid = SandboxLimits {
+            cpu: Some("many".into()),
+            memory: Some("much".into()),
+            cpu_total: Some("off".into()),
+            memory_total: Some("off".into()),
+        };
+        let mut events = Vec::new();
+        let kept = clamp_limits(&invalid, &trusted, &mut events, TrustLevel::Repo);
+        assert_eq!(kept.cpu.as_deref(), Some("1"));
+        assert_eq!(kept.memory.as_deref(), Some("1g"));
+        assert_eq!(kept.cpu_total.as_deref(), Some("4"));
+        assert_eq!(kept.memory_total.as_deref(), Some("8g"));
+        assert_eq!(events.len(), 4);
+
+        let wider = SandboxLimits {
+            cpu: Some("2".into()),
+            memory: Some("2g".into()),
+            cpu_total: Some("8".into()),
+            memory_total: Some("16g".into()),
+        };
+        let mut events = Vec::new();
+        let kept = clamp_limits(&wider, &trusted, &mut events, TrustLevel::Repo);
+        assert_eq!(kept.memory_total.as_deref(), Some("8g"));
+        assert_eq!(events.len(), 4);
+
+        let narrower = SandboxLimits {
+            cpu: None,
+            memory: None,
+            cpu_total: None,
+            memory_total: Some("2g".into()),
+        };
+        let mut events = Vec::new();
+        let tightened = clamp_limits(&narrower, &trusted, &mut events, TrustLevel::Repo);
+        assert!(events.is_empty());
+        assert_eq!(tightened.memory_total.as_deref(), Some("2g"));
+    }
+
+    #[test]
+    fn event_summaries_distinguish_denial_from_narrowing_and_label_all_layers() {
+        let denied = ClampEvent::deny(
+            TrustLevel::Repo,
+            "sandbox.network",
+            RepoFieldRule::Floor,
+            json!("host"),
+            "would weaken isolation",
+        );
+        let narrowed = ClampEvent {
+            layer: TrustLevel::Zone,
+            key: "sandbox.network_allow".into(),
+            rule: RepoFieldRule::CeilingIntersect,
+            requested: json!(["a.example", "b.example"]),
+            granted: json!(["a.example"]),
+            reason: "narrowed to trusted hosts".into(),
+        };
+        assert_eq!(
+            summarize_events(&[denied, narrowed]),
+            vec![
+                "[repo] denied sandbox.network: would weaken isolation",
+                "[zone] sandbox.network_allow: narrowed to trusted hosts",
+            ]
+        );
+
+        assert_eq!(TrustLevel::Builtin.as_str(), "builtin");
+        assert_eq!(TrustLevel::UserGlobal.as_str(), "global");
+        assert_eq!(TrustLevel::Profile.as_str(), "profile");
+        assert_eq!(TrustLevel::Zone.as_str(), "zone");
+        assert_eq!(TrustLevel::Workspace.as_str(), "workspace");
+        assert_eq!(TrustLevel::Repo.as_str(), "repo");
+        assert_eq!(TrustLevel::Runtime.as_str(), "runtime");
+    }
 }

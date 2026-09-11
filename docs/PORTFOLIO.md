@@ -57,11 +57,14 @@ and error vocabularies, generated schema, transport projections, and a
 shrink-only surface-gap ratchet. Unix connections now verify peer credentials
 before granting implicit local administration. Remotely reachable endpoints
 must use an explicitly declared TLS-terminated or tunnel topology; direct
-non-loopback plaintext requires a conspicuous unsafe opt-in. It is still not
-feature-equivalent across HTTP, gRPC, CLI, MCP, and plugins. Browser driving is
-deliberately absent until a provider-backed session lifecycle exists; the
-generic observer feed does not carry terminal snapshot/delta bytes; and remote
-enqueue remains incomplete for true remote worktrees.
+non-loopback plaintext requires a conspicuous unsafe opt-in. Registered true
+provider-managed remote worktrees can enqueue into the host-only merge queue through an
+ephemeral, revocable, worktree-bound `merge_add` credential, and the observer
+API now has an explicit list/subscribe/re-list bootstrap and filter contract on
+every transport. It is still not feature-equivalent across HTTP, gRPC, CLI,
+MCP, and plugins. Browser driving is deliberately absent until a
+provider-backed session lifecycle exists, and pane snapshot/delta bytes remain
+on the attach stream rather than the generic observer feed.
 
 The honest product claim is therefore **useful bounded client API**, not
 **complete native-client parity**. The governing contract is
@@ -120,9 +123,7 @@ the separate continuous worker-containment proof, not a substitute for either.
 | -------------------------------- | ------------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | C1: Remote control security      | [THE-41](https://linear.app/blakeashley/issue/THE-41)   | Backlog / High   | Close the remote-access epic only after its four bounded children establish the transport, identity, routing, and parity decisions. | Children THE-98–THE-101                                                                             |
 | C1: Remote control security      | [THE-98](https://linear.app/blakeashley/issue/THE-98)   | Backlog / Medium | Persist a generated surface map and make explicit product-parity decisions for remote consumers.                                    | [`audit-remote-surface-map`](../openspec/changes/audit-remote-surface-map/)                         |
-| C1: Remote control security      | [THE-99](https://linear.app/blakeashley/issue/THE-99)   | Backlog / High   | Complete `route_to_host` enqueue semantics for true remote worktrees.                                                               | [`add-remote-enqueue-modes`](../openspec/changes/add-remote-enqueue-modes/)                         |
 | C2: Client contract truthfulness | [THE-104](https://linear.app/blakeashley/issue/THE-104) | Backlog / Medium | Decide and publish whether external IDEs have an inbound handoff/control contract.                                                  | [`define-external-ide-inbound-boundary`](../openspec/changes/define-external-ide-inbound-boundary/) |
-| C2: Client contract truthfulness | [THE-105](https://linear.app/blakeashley/issue/THE-105) | Backlog / High   | Publish a truthful observer bootstrap/filter contract, including which stream owns terminal snapshots and deltas.                   | [`publish-observer-event-contract`](../openspec/changes/publish-observer-event-contract/)           |
 
 THE-41 is an epic, not a second implementation of its children. C1 must precede
 claims of safe remote operation; C2 may proceed in parallel because it narrows
@@ -206,6 +207,17 @@ THE-101, THE-103, THE-106, THE-109, and THE-131. Seven standalone OpenSpec
 changes were reconciled into accepted specifications; THE-131's completed
 signing slice was removed from the still-active shared SCM change without
 closing its four Medium-priority greenfield owners.
+
+The next-ten remediation completed THE-99, THE-105, THE-116, THE-121, and
+THE-122 in code and accepted OpenSpec. THE-99 includes the user-managed SSH
+lifecycle: off-argv stdin delivery, account/host/worktree isolation, verified
+reuse, atomic rotation, and delete-time revocation. Identity-scoped
+commit-signing execution was separated from credential custody into
+normal-priority THE-149 instead of being hidden under THE-122. THE-15, THE-52,
+THE-140, THE-142, and THE-145 stay open: local hardening and truthful
+support/defer decisions landed, while their remaining criteria require
+clean-host package publication, real Windows runs, or live billable-provider
+evidence.
 
 The reconciliation archived 62 delivered OpenSpec changes. The initial
 issue-linked set was:

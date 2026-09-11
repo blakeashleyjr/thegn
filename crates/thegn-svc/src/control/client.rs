@@ -35,6 +35,12 @@ pub enum ControlAddr {
     Unix(PathBuf),
     /// Remote serve-mode listener; every request carries the bearer token.
     Tcp { addr: String, token: String },
+    /// Client-facing HTTP(S) origin exposed by a TLS terminator or encrypted
+    /// tunnel. Unlike [`Self::Tcp`], this is an origin (`scheme://host:port`),
+    /// not a socket address. HTTP requests use reqwest so `https` receives
+    /// ordinary WebPKI certificate verification; WebSockets derive `ws`/`wss`
+    /// from the same origin.
+    HttpOrigin { origin: String, token: String },
 }
 
 impl std::fmt::Debug for ControlAddr {
@@ -44,6 +50,11 @@ impl std::fmt::Debug for ControlAddr {
             Self::Tcp { addr, .. } => f
                 .debug_struct("Tcp")
                 .field("addr", addr)
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::HttpOrigin { origin, .. } => f
+                .debug_struct("HttpOrigin")
+                .field("origin", origin)
                 .field("token", &"[REDACTED]")
                 .finish(),
         }
@@ -210,7 +221,7 @@ impl ControlClient {
     fn token(&self) -> Option<&str> {
         match &self.addr {
             ControlAddr::Unix(_) => None,
-            ControlAddr::Tcp { token, .. } => Some(token),
+            ControlAddr::Tcp { token, .. } | ControlAddr::HttpOrigin { token, .. } => Some(token),
         }
     }
 
@@ -230,6 +241,9 @@ impl ControlClient {
                     .await
                     .with_context(|| format!("connect control addr {addr}"))?;
                 send_request(stream, method, path, self.token(), body).await?
+            }
+            ControlAddr::HttpOrigin { origin, token } => {
+                send_origin_request(origin, token, method, path, body).await?
             }
         };
         if (200..300).contains(&status) {
@@ -676,14 +690,27 @@ impl ControlClient {
     /// The server-side filter is still constrained to the read-scoped feed;
     /// this method only adds query parameters and keeps the 256-frame buffer.
     pub async fn subscribe_events_opts(&self, filter: &FeedFilter) -> Result<AttachStream> {
-        let (host, token) = match &self.addr {
-            ControlAddr::Unix(_) => ("localhost".to_string(), None),
-            ControlAddr::Tcp { addr, token } => (addr.clone(), Some(token.clone())),
-        };
         let path = events_path(filter);
+        let (host, token, uri) = match &self.addr {
+            ControlAddr::Unix(_) => (
+                "localhost".to_string(),
+                None,
+                format!("ws://localhost{path}"),
+            ),
+            ControlAddr::Tcp { addr, token } => (
+                addr.clone(),
+                Some(token.clone()),
+                format!("ws://{addr}{path}"),
+            ),
+            ControlAddr::HttpOrigin { origin, token } => (
+                origin_authority(origin)?,
+                Some(token.clone()),
+                websocket_url(origin, &path)?,
+            ),
+        };
         let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
             .method("GET")
-            .uri(format!("ws://{host}{path}"))
+            .uri(uri)
             .header("Host", &host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -714,6 +741,12 @@ impl ControlClient {
                     .await
                     .with_context(|| format!("connect control addr {addr}"))?;
                 let (ws, _) = tokio_tungstenite::client_async(req, stream)
+                    .await
+                    .context("events websocket handshake")?;
+                start_attach(ws, frame_tx, ctrl_rx).await?;
+            }
+            ControlAddr::HttpOrigin { .. } => {
+                let (ws, _) = tokio_tungstenite::connect_async(req)
                     .await
                     .context("events websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
@@ -764,13 +797,26 @@ impl ControlClient {
         let path = format!(
             "/v1/sessions/{session}/attach?client_id={client_id}&rows={rows}&cols={cols}&observer={observer}&history={include_history}"
         );
-        let (host, token) = match &self.addr {
-            ControlAddr::Unix(_) => ("localhost".to_string(), None),
-            ControlAddr::Tcp { addr, token } => (addr.clone(), Some(token.clone())),
+        let (host, token, uri) = match &self.addr {
+            ControlAddr::Unix(_) => (
+                "localhost".to_string(),
+                None,
+                format!("ws://localhost{path}"),
+            ),
+            ControlAddr::Tcp { addr, token } => (
+                addr.clone(),
+                Some(token.clone()),
+                format!("ws://{addr}{path}"),
+            ),
+            ControlAddr::HttpOrigin { origin, token } => (
+                origin_authority(origin)?,
+                Some(token.clone()),
+                websocket_url(origin, &path)?,
+            ),
         };
         let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
             .method("GET")
-            .uri(format!("ws://{host}{path}"))
+            .uri(uri)
             .header("Host", &host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -802,6 +848,12 @@ impl ControlClient {
                     .await
                     .with_context(|| format!("connect control addr {addr}"))?;
                 let (ws, _) = tokio_tungstenite::client_async(req, stream)
+                    .await
+                    .context("attach websocket handshake")?;
+                start_attach(ws, frame_tx, ctrl_rx).await?;
+            }
+            ControlAddr::HttpOrigin { .. } => {
+                let (ws, _) = tokio_tungstenite::connect_async(req)
                     .await
                     .context("attach websocket handshake")?;
                 start_attach(ws, frame_tx, ctrl_rx).await?;
@@ -993,6 +1045,103 @@ async fn pump_attach_inner<S>(
     }
 }
 
+/// Parse the client-facing endpoint contract. A remote endpoint is an HTTP(S)
+/// *origin*, never a raw socket address and never a URL with caller-controlled
+/// path/query state. Keeping that distinction explicit prevents a value such as
+/// `https://control.example:443` from being handed to `TcpStream::connect`.
+fn parse_http_origin(origin: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(origin)
+        .with_context(|| format!("invalid control HTTP origin {origin:?}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "control HTTP origin must use http or https"
+    );
+    anyhow::ensure!(url.host_str().is_some(), "control HTTP origin has no host");
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "control HTTP origin must not contain credentials"
+    );
+    anyhow::ensure!(
+        url.path().is_empty() || url.path() == "/",
+        "control HTTP origin must not contain a path"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "control HTTP origin must not contain a query or fragment"
+    );
+    // Normalize the one accepted path spelling so request paths join exactly.
+    url.set_path("/");
+    Ok(url)
+}
+
+fn origin_request_url(origin: &str, path: &str) -> Result<reqwest::Url> {
+    let mut url = parse_http_origin(origin)?;
+    let (request_path, query) = path
+        .split_once('?')
+        .map_or((path, None), |(path, query)| (path, Some(query)));
+    anyhow::ensure!(
+        request_path.starts_with('/'),
+        "control request path must be absolute"
+    );
+    url.set_path(request_path);
+    url.set_query(query);
+    Ok(url)
+}
+
+fn origin_authority(origin: &str) -> Result<String> {
+    let url = parse_http_origin(origin)?;
+    let raw_host = url.host_str().context("control HTTP origin has no host")?;
+    let host = if raw_host.contains(':') {
+        format!("[{raw_host}]")
+    } else {
+        raw_host.to_string()
+    };
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+fn websocket_url(origin: &str, path: &str) -> Result<String> {
+    let mut url = origin_request_url(origin, path)?;
+    let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(scheme)
+        .map_err(|()| anyhow!("could not derive WebSocket control origin"))?;
+    Ok(url.to_string())
+}
+
+/// Send one request to the client-facing HTTP(S) origin. reqwest supplies the
+/// normal WebPKI verification path for `https`; TLS termination remains outside
+/// thegn's plaintext loopback backend.
+async fn send_origin_request(
+    origin: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<(u16, Value)> {
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .with_context(|| format!("invalid control HTTP method {method:?}"))?;
+    let url = origin_request_url(origin, path)?;
+    let client = reqwest::Client::new();
+    let mut request = client.request(method, url).bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.context("control HTTP request")?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .await
+        .context("control HTTP response body")?;
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    Ok((status, value))
+}
+
 /// Send one HTTP/1.1 request over `stream` and collect the JSON body.
 async fn send_request<S>(
     stream: S,
@@ -1063,6 +1212,78 @@ mod tests {
         assert!(rendered.contains("control.example.test:443"));
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains(token));
+
+        let rendered = format!(
+            "{:?}",
+            ControlAddr::HttpOrigin {
+                origin: "https://control.example.test:443".into(),
+                token: token.into(),
+            }
+        );
+        assert!(rendered.contains("https://control.example.test:443"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains(token));
+    }
+
+    #[test]
+    fn http_origin_is_an_origin_not_a_socket_or_arbitrary_url() {
+        assert!(parse_http_origin("https://control.example.test:443").is_ok());
+        assert!(parse_http_origin("control.example.test:443").is_err());
+        assert!(parse_http_origin("ssh://control.example.test:443").is_err());
+        assert!(parse_http_origin("https://user@control.example.test:443").is_err());
+        assert!(parse_http_origin("https://control.example.test:443/prefix").is_err());
+        assert!(parse_http_origin("https://control.example.test:443?token=nope").is_err());
+        assert_eq!(
+            websocket_url("https://control.example.test:443", "/v1/events").unwrap(),
+            "wss://control.example.test/v1/events"
+        );
+        assert_eq!(
+            websocket_url("http://127.0.0.1:5380", "/v1/events?kinds=exit").unwrap(),
+            "ws://127.0.0.1:5380/v1/events?kinds=exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_origin_merge_add_crosses_a_real_tcp_listener_with_bearer() {
+        use axum::Json;
+        use axum::extract::Request;
+        use axum::routing::post;
+
+        async fn echo(request: Request) -> Json<Value> {
+            let authorization = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let bytes = axum::body::to_bytes(request.into_body(), 8 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            Json(json!({
+                "authorization": authorization,
+                "worktree": body["worktree"],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/v1/merge/add", post(echo)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ControlClient::new(ControlAddr::HttpOrigin {
+            origin: format!("http://{addr}"),
+            token: "route-token".into(),
+        });
+        let reply = client.merge_add("/registered/remote").await.unwrap();
+        assert_eq!(reply["authorization"], "Bearer route-token");
+        assert_eq!(reply["worktree"], "/registered/remote");
+        server.abort();
     }
 
     #[test]
@@ -1090,6 +1311,7 @@ mod tests {
             scope: scope.into(),
             endpoint: endpoint.into(),
             tcp_addr: None,
+            control_origin: None,
             hostname: "h".into(),
             version: "0".into(),
             started_at: 0,

@@ -73,6 +73,11 @@ fn sprite_ssh_argv_wraps_proxycommand_and_remote_shell() {
         "{joined}"
     );
     assert!(joined.contains("-i /state/sprite_ed25519"));
+    assert!(joined.contains("-F /dev/null"), "{joined}");
+    assert!(joined.contains("BatchMode=yes"), "{joined}");
+    assert!(joined.contains("IdentitiesOnly=yes"), "{joined}");
+    assert!(joined.contains("ControlMaster=no"), "{joined}");
+    assert!(joined.contains("ControlPath=none"), "{joined}");
     assert!(joined.contains(&format!("-p {SPRITE_SSHD_PORT}")));
     assert!(argv.iter().any(|a| a == "sprite@sprite"));
     // The remote command cd's into the workdir then execs the user's login
@@ -92,6 +97,13 @@ fn sprite_sshd_setup_script_authorizes_key_and_writes_config() {
     assert!(s.contains("ssh-ed25519 AAAA")); // the pubkey is embedded (quoted)
     assert!(s.contains(&format!("Port {SPRITE_SSHD_PORT}")));
     assert!(s.contains("sprite_host_ed25519") && s.contains("sprite_sshd_config"));
+    assert!(s.contains("mkdir -p \"$HOME/.ssh\" || exit 73"));
+    assert!(s.contains("chmod 700 \"$HOME/.ssh\" || exit 73"));
+    assert!(s.contains("chmod 600 \"$HOME/.ssh/authorized_keys\" || exit 73"));
+    assert!(
+        !s.ends_with("true"),
+        "a final true must not mask setup failure"
+    );
 }
 
 #[test]
@@ -723,6 +735,7 @@ fn compose_spec_host_fallback_is_login_shell() {
         cwd_override: None,
         location: None,
         degraded_from_provider: false,
+        route_ssh_target: None,
     };
     let spec = compose_spec(
         &cfg,
@@ -890,6 +903,7 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
         cwd_override: None,
         location: None,
         degraded_from_provider: false,
+        route_ssh_target: None,
     };
     let spec = compose_spec(
         &cfg,
@@ -928,6 +942,34 @@ fn prepare_sandbox_none_backend_falls_to_host() {
     )
     .unwrap();
     assert!(out.spec.is_none());
+}
+
+#[test]
+fn prepare_remote_ssh_carries_exact_target_for_route_credential() {
+    let mut cfg = Config::default();
+    cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+    let target = SshTarget {
+        host: "alice@build.example".into(),
+        port: 2222,
+        forward_agent: false,
+        ssh_config: Some("/host/ssh-config".into()),
+        jump_host: Some("bastion".into()),
+        identity: Some("/host/key".into()),
+        extra_args: vec!["-o".into(), "IdentitiesOnly=yes".into()],
+    };
+    let location = GitLoc::remote_db_string_for(&target, "/remote/worktree");
+    let loc = GitLoc::from_db("/host/worktree", Some(&location));
+    let out = prepare_sandbox_env(
+        &cfg,
+        Path::new("/repo"),
+        "/host/worktree",
+        &loc,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.route_ssh_target, Some(target));
 }
 
 // Regression (fc68338 merge dropped `choice_is_explicit`): a fresh wizard

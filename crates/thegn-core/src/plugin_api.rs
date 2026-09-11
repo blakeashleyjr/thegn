@@ -896,8 +896,8 @@ impl PluginRuntime {
     /// Record the independent control-scope decision for a `host.call` before
     /// the request crosses onto the generic control dispatcher. Host calls do
     /// not use manifest `Capability` grants, so they cannot go through
-    /// [`PluginRuntime::audit`]; `host:<catalog-id>` keeps these decisions in
-    /// the same audit stream as surface and I/O grants.
+    /// the runtime's private capability-audit helper; `host:<catalog-id>` keeps
+    /// these decisions in the same audit stream as surface and I/O grants.
     pub fn record_host_call_decision(
         &mut self,
         plugin: PluginId,
@@ -1723,6 +1723,74 @@ mod wire_tests {
     }
 
     #[test]
+    fn capability_helpers_and_every_surface_mapping_are_stable() {
+        assert_eq!(ApiVersion::new(1, 2, 3).to_string(), "1.2.3");
+        assert!(Capability::parse("network").is_none());
+        let parsed = Capability::parse("network:api.example.com:443").unwrap();
+        assert_eq!(parsed.kind(), "network");
+        assert_eq!(parsed.target(), "api.example.com:443");
+        assert_eq!(parsed.as_str(), "network:api.example.com:443");
+        assert_eq!(parsed.to_string(), "network:api.example.com:443");
+
+        for (point, target) in [
+            (ExtensionPoint::StatusBarSegment, Some("statusbar")),
+            (ExtensionPoint::PanelSection, Some("panel")),
+            (ExtensionPoint::SidebarTab, Some("sidebar")),
+            (ExtensionPoint::PaletteAction, Some("palette")),
+            (ExtensionPoint::NotificationSource, Some("notification")),
+            (ExtensionPoint::IssueProvider, Some("provider")),
+            (ExtensionPoint::CiProvider, Some("provider")),
+            (ExtensionPoint::ForgeProvider, Some("provider")),
+            (ExtensionPoint::HarnessAdapter, Some("harness")),
+            (ExtensionPoint::ProgramAdapter, Some("program")),
+            (ExtensionPoint::Theme, Some("theme")),
+            (ExtensionPoint::Automation, Some("automation")),
+            (ExtensionPoint::DataSource, Some("data")),
+            (ExtensionPoint::Unknown("future".into()), None),
+        ] {
+            assert_eq!(
+                surface_capability_for(&point)
+                    .as_ref()
+                    .map(Capability::target),
+                target,
+                "{}",
+                point.wire_name()
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_api_errors_have_actionable_diagnostics() {
+        let cases = [
+            (
+                PluginApiError::IncompatibleApi {
+                    required: ApiVersion::new(0, 3, 0),
+                    got: ApiVersion::new(1, 0, 0),
+                },
+                "incompatible api: host ApiVersion { major: 0, minor: 3, patch: 0 }, plugin ApiVersion { major: 1, minor: 0, patch: 0 }",
+            ),
+            (
+                PluginApiError::CapabilityDenied {
+                    capability: Capability::new("network", "api.example.com"),
+                    operation: "io.network".into(),
+                },
+                "denied: capability \"network:api.example.com\" required for io.network",
+            ),
+            (
+                PluginApiError::UnsupportedExtensionPoint("PanelSection".into()),
+                "unsupported extension point: PanelSection",
+            ),
+            (
+                PluginApiError::UnknownExtensionPoint("FutureSurface".into()),
+                "unknown extension point: FutureSurface",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn v0_2_view_json_still_decodes_into_a_single_line() {
         // A v0.2 wire view — only `spans`, role styling, no `slot`/`rows` — must
         // decode unchanged (an older plugin never sends the new fields).
@@ -1970,6 +2038,32 @@ timeout_secs = 5
     }
 
     #[test]
+    fn callback_notifications_and_events_round_trip() {
+        for (callback, method) in [
+            (PluginCallback::Activate, "activate"),
+            (PluginCallback::OnEvent, "on_event"),
+            (PluginCallback::Render, "render"),
+            (PluginCallback::Deactivate, "deactivate"),
+        ] {
+            let message = RpcMessage::notification(callback, serde_json::json!({"key": method}));
+            assert_eq!(message.id, None);
+            assert_eq!(message.method(), Some(method));
+            let encoded = serde_json::to_string(&message).unwrap();
+            assert_eq!(
+                Frame::parse_line(&encoded).unwrap(),
+                Frame::Message(message)
+            );
+        }
+
+        let event = Event::new(
+            EventKind::WorktreeChanged,
+            serde_json::json!({"path": "/work", "branch": "feature"}),
+        );
+        assert_eq!(event.kind, EventKind::WorktreeChanged);
+        assert_eq!(event.payload["branch"], "feature");
+    }
+
+    #[test]
     fn host_verb_method_names_round_trip() {
         let mut seen = std::collections::HashSet::new();
         for v in HostVerb::ALL {
@@ -2022,6 +2116,265 @@ timeout_secs = 5
                 "{cap} is admin-scoped but plugin-callable"
             );
         }
+    }
+
+    fn runtime_contribution(
+        id: &str,
+        point: ExtensionPoint,
+        surface: Option<&str>,
+    ) -> Contribution {
+        Contribution {
+            id: ContributionId::new(id),
+            extension_point: point,
+            label: id.into(),
+            surface: surface.map(SurfaceId::new),
+            cadence: CadenceHint::OnDemand,
+            metadata: Default::default(),
+            caps: serde_json::Value::Null,
+            chord: None,
+        }
+    }
+
+    #[test]
+    fn runtime_enforces_capabilities_and_records_all_plugin_interactions() {
+        let plugin = PluginId::new("runtime-test");
+        let primary_surface = SurfaceId::new("runtime-test.primary");
+        let manifest = NegotiatedManifest {
+            api: API_VERSION,
+            granted: [
+                Capability::new("surface", "statusbar"),
+                Capability::new("network", "api.example.com"),
+                Capability::new("run", "git"),
+                Capability::new("notify", "build"),
+                Capability::new("state", plugin.as_str()),
+            ]
+            .into_iter()
+            .collect(),
+            accepted_contributions: vec![runtime_contribution(
+                "primary",
+                ExtensionPoint::StatusBarSegment,
+                Some("runtime-test.primary"),
+            )],
+            supported_extension_points: [ExtensionPoint::StatusBarSegment].into_iter().collect(),
+            ..NegotiatedManifest::default()
+        };
+        let mut runtime = PluginRuntime::new(manifest)
+            .with_host_value("theme", serde_json::json!({"name": "dark"}));
+
+        assert_eq!(
+            runtime.host_value(plugin.clone(), "theme").unwrap(),
+            Some(serde_json::json!({"name": "dark"}))
+        );
+        assert_eq!(runtime.host_value(plugin.clone(), "missing").unwrap(), None);
+
+        assert!(runtime.is_dirty(&primary_surface));
+        let first = View::line([Span::styled("ready", StyleRole::Accent)]);
+        assert!(
+            runtime
+                .update(plugin.clone(), primary_surface.clone(), first.clone())
+                .unwrap()
+                .changed
+        );
+        assert!(!runtime.is_dirty(&primary_surface));
+        assert_eq!(runtime.view(&primary_surface), Some(&first));
+        assert!(
+            !runtime
+                .update(plugin.clone(), primary_surface.clone(), first)
+                .unwrap()
+                .changed
+        );
+        runtime
+            .invalidate(plugin.clone(), primary_surface.clone())
+            .unwrap();
+        assert!(runtime.is_dirty(&primary_surface));
+
+        let secondary_surface = SurfaceId::new("runtime-test.secondary");
+        runtime
+            .register(
+                plugin.clone(),
+                runtime_contribution(
+                    "secondary",
+                    ExtensionPoint::StatusBarSegment,
+                    Some("runtime-test.secondary"),
+                ),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .update(
+                    plugin.clone(),
+                    secondary_surface.clone(),
+                    View::line([Span::styled("secondary", StyleRole::Default)]),
+                )
+                .unwrap()
+                .changed
+        );
+
+        let unsupported = runtime
+            .register(
+                plugin.clone(),
+                runtime_contribution("sidebar", ExtensionPoint::SidebarTab, Some("sidebar")),
+            )
+            .unwrap_err();
+        assert_eq!(
+            unsupported,
+            PluginApiError::UnsupportedExtensionPoint("SidebarTab".into())
+        );
+
+        let unknown_surface = SurfaceId::new("runtime-test.unknown");
+        let denied_update = match runtime.update(
+            plugin.clone(),
+            unknown_surface.clone(),
+            View::line([Span::styled("denied", StyleRole::Error)]),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an unregistered surface must be denied"),
+        };
+        assert_eq!(
+            denied_update,
+            PluginApiError::CapabilityDenied {
+                capability: Capability::new("surface", "unknown"),
+                operation: "update".into(),
+            }
+        );
+        assert!(runtime.invalidate(plugin.clone(), unknown_surface).is_err());
+
+        runtime
+            .subscribe(plugin.clone(), EventKind::FocusChanged)
+            .unwrap();
+        runtime
+            .subscribe(plugin.clone(), EventKind::FocusChanged)
+            .unwrap();
+        assert_eq!(runtime.subscriptions().len(), 1);
+
+        let event = Event::new(EventKind::Action, serde_json::json!({"id": "build"}));
+        runtime.emit(plugin.clone(), event.clone()).unwrap();
+        assert_eq!(runtime.events(), &[event]);
+
+        let network = IoRequest::network(
+            "POST",
+            "https://user@api.example.com:8443/v1/jobs?wait=true",
+        );
+        assert_eq!(network.payload, serde_json::json!({"method": "POST"}));
+        assert_eq!(
+            network.required_capability(),
+            Capability::new("network", "api.example.com")
+        );
+        assert_eq!(
+            runtime.io(plugin.clone(), network).unwrap(),
+            IoResult {
+                status: IoStatus::Accepted,
+                body: None,
+            }
+        );
+
+        let run = IoRequest::run("git", ["status", "--short"]);
+        assert_eq!(
+            run.payload,
+            serde_json::json!({"args": ["status", "--short"]})
+        );
+        assert_eq!(run.required_capability(), Capability::new("run", "git"));
+        assert_eq!(
+            runtime.io(plugin.clone(), run).unwrap().status,
+            IoStatus::Accepted
+        );
+
+        let denied_io = runtime
+            .io(
+                plugin.clone(),
+                IoRequest {
+                    scheme: "file".into(),
+                    target: "/etc/shadow".into(),
+                    payload: serde_json::Value::Null,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            denied_io,
+            PluginApiError::CapabilityDenied { ref capability, ref operation }
+                if capability == &Capability::new("file", "/etc/shadow") && operation == "io.file"
+        ));
+
+        let alert = Alert::new("build", "completed");
+        assert_eq!(alert.message, "completed");
+        runtime.notify(plugin.clone(), alert).unwrap();
+        assert!(
+            runtime
+                .notify(plugin.clone(), Alert::new("security", "denied"))
+                .is_err()
+        );
+
+        runtime
+            .state_set(plugin.clone(), "count", serde_json::json!(2))
+            .unwrap();
+        assert_eq!(
+            runtime.state_get(plugin.clone(), "count").unwrap(),
+            Some(serde_json::json!(2))
+        );
+        assert_eq!(runtime.state_get(plugin.clone(), "missing").unwrap(), None);
+        assert!(
+            runtime
+                .state_get(PluginId::new("other-plugin"), "count")
+                .is_err()
+        );
+
+        runtime.record_host_call_decision(plugin.clone(), "sessions.list", AuditDecision::Granted);
+        runtime.record_host_call_decision(plugin.clone(), "sessions.kill", AuditDecision::Denied);
+
+        let audit = runtime.audit_log();
+        assert!(audit.iter().any(|entry| {
+            entry.plugin == plugin
+                && entry.capability == Capability::new("network", "api.example.com")
+                && entry.operation == "io.network"
+                && entry.decision == AuditDecision::Granted
+                && entry.timestamp_ms == 0
+        }));
+        assert!(audit.iter().any(|entry| {
+            entry.capability == Capability::new("host", "sessions.kill")
+                && entry.operation == "host.call"
+                && entry.decision == AuditDecision::Denied
+        }));
+    }
+
+    #[test]
+    fn io_capability_parsing_strips_credentials_ports_and_paths() {
+        for (url, host) in [
+            ("https://api.example.com/v1", "api.example.com"),
+            ("https://user@api.example.com:8443/v1", "api.example.com"),
+            ("api.example.com?query=1", "api.example.com"),
+            ("api.example.com#fragment", "api.example.com"),
+        ] {
+            assert_eq!(host_from_url(url), host);
+            assert_eq!(
+                IoRequest::network("GET", url).required_capability(),
+                Capability::new("network", host)
+            );
+        }
+    }
+
+    #[test]
+    fn surface_cache_tracks_changes_invalidation_and_degradation() {
+        let mut cache = SurfaceCache::default();
+        let missing = SurfaceId::new("missing");
+        assert!(cache.is_dirty(&missing));
+        assert!(cache.view(&missing).is_none());
+        let degraded = cache.degrade(&missing, DegradeReason::Crash);
+        assert!(degraded.degraded);
+        assert_eq!(degraded.text_content(), "⚠");
+
+        let surface = SurfaceId::new("status");
+        let original = View::line([Span::styled("working", StyleRole::Default)]);
+        assert!(cache.update(surface.clone(), original.clone()).changed);
+        assert!(!cache.update(surface.clone(), original.clone()).changed);
+        assert_eq!(cache.view(&surface), Some(&original));
+        assert!(!cache.is_dirty(&surface));
+        cache.invalidate(&surface);
+        assert!(cache.is_dirty(&surface));
+
+        let degraded = cache.degrade(&surface, DegradeReason::RenderBudgetExceeded);
+        assert!(degraded.degraded);
+        assert_eq!(degraded.text_content(), "working ⚠");
+        assert_eq!(cache.view(&surface), Some(&original));
     }
 
     fn current_host_contract() -> HostContract {
@@ -2141,6 +2494,87 @@ timeout_secs = 5
             neg.rejected_contributions[0]
                 .reason
                 .contains("does not support mode one_shot")
+        );
+    }
+
+    #[test]
+    fn negotiation_validates_versions_grants_cadence_and_support_metadata() {
+        let host = current_host_contract();
+        assert_eq!(host.extension_support().len(), HOST_EXTENSION_SUPPORT.len());
+
+        for incompatible in [ApiVersion::new(1, 0, 0), ApiVersion::new(0, 4, 0)] {
+            let mut spec = support_spec(
+                ExtensionPoint::StatusBarSegment,
+                vec![Capability::new("surface", "statusbar")],
+                PluginMode::OneShot,
+            );
+            spec.manifest.api = incompatible;
+            let error = match host.negotiate(&spec.manifest) {
+                Err(error) => error,
+                Ok(_) => panic!("incompatible plugin API must be rejected"),
+            };
+            assert_eq!(
+                error,
+                PluginApiError::IncompatibleApi {
+                    required: API_VERSION,
+                    got: incompatible,
+                }
+            );
+        }
+
+        let granted = Capability::new("surface", "statusbar");
+        let denied = Capability::new("network", "private.example.com");
+        let spec = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![granted.clone(), denied.clone()],
+            PluginMode::OneShot,
+        );
+        let negotiated = host.negotiate(&spec.manifest).unwrap();
+        assert!(negotiated.is_capability_granted(&granted));
+        assert!(negotiated.is_capability_denied(&denied));
+        assert!(!negotiated.is_capability_denied(&granted));
+
+        let mut wrong_cadence = support_spec(
+            ExtensionPoint::StatusBarSegment,
+            vec![Capability::new("surface", "statusbar")],
+            PluginMode::Resident,
+        );
+        wrong_cadence.manifest.contributions[0].cadence = CadenceHint::OnEvent {
+            events: vec!["focus_changed".into()],
+        };
+        let negotiated = host.negotiate_spec(&wrong_cadence).unwrap();
+        assert!(negotiated.accepted_contributions.is_empty());
+        assert_eq!(
+            negotiated.rejected_contributions[0].reason,
+            "extension point StatusBarSegment does not support cadence on_event; supported cadences: on_demand,interval"
+        );
+        assert_eq!(
+            CadenceHint::Interval { millis: 1 }.kind(),
+            CadenceKind::Interval
+        );
+        assert_eq!(
+            CadenceHint::OnEvent { events: vec![] }.kind(),
+            CadenceKind::OnEvent
+        );
+
+        for (state, name) in [
+            (SupportState::Wired, "wired"),
+            (SupportState::SeparateAdapter, "separate_adapter"),
+            (SupportState::Reserved, "reserved"),
+        ] {
+            assert_eq!(state.as_str(), name);
+        }
+        let statusbar = host.support_for(&ExtensionPoint::StatusBarSegment).unwrap();
+        assert_eq!(statusbar.mode_names(), vec!["one_shot", "resident"]);
+        assert_eq!(statusbar.cadence_names(), vec!["on_demand", "interval"]);
+        assert_eq!(
+            statusbar.unavailable_reason(),
+            "unsupported extension point StatusBarSegment: not enabled by this host contract"
+        );
+        let data = host.support_for(&ExtensionPoint::DataSource).unwrap();
+        assert_eq!(
+            data.unavailable_reason(),
+            "unsupported extension point DataSource in the general plugin host: available only through calendar command-account adapter"
         );
     }
 
