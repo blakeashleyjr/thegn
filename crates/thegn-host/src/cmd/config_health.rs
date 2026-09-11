@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-use thegn_core::config;
 use thegn_core::config_repo::RepoOverlayDiscovery;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,13 +126,22 @@ fn validate_toml_file(health: &mut ConfigHealth, layer: Layer, path: &Path) {
         }
     };
 
-    for message in config::validate_str(&body) {
-        add_problem(health, layer, path, message);
+    for diagnostic in thegn_core::config_validate::validate_diagnostics(&body) {
+        match diagnostic.severity {
+            thegn_core::config_validate::ValidationSeverity::Warning => {
+                add_warning(health, path, diagnostic.message);
+            }
+            thegn_core::config_validate::ValidationSeverity::Error => {
+                add_problem(health, layer, path, diagnostic.message);
+            }
+        }
     }
 
     // Plaintext secrets remain advisory: validation reports them without
     // making an otherwise parseable layer fail.
-    if let Ok(cfg) = toml::from_str::<thegn_core::config::Config>(&body) {
+    if let Ok(cfg) = thegn_core::config_compat::normalize(&body).and_then(|normalized| {
+        toml::from_str::<thegn_core::config::Config>(&normalized.body).map_err(|e| e.to_string())
+    }) {
         for literal in thegn_core::secret_scan::literal_refs(&cfg) {
             add_warning(
                 health,
@@ -236,6 +244,65 @@ pub(crate) fn render_findings(health: &ConfigHealth) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_compatibility_warnings_keep_typed_severity_in_every_toml_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let body = "projects_dir = '/canonical'\nworkspaces_dir = '/legacy'\n[workspace.repo]\n[ci.gitlab]\ntoken = 'private-test-literal'\n";
+        std::fs::write(&path, body).unwrap();
+        for layer in [Layer::Main, Layer::Profile] {
+            let mut health = ConfigHealth {
+                main_path: path.clone(),
+                profile_path: None,
+                repo_path: None,
+                main_present: false,
+                findings: vec![],
+                main_problems: 0,
+                profile_problems: 0,
+                repo_problems: 0,
+                warnings: 0,
+            };
+            validate_toml_file(&mut health, layer, &path);
+            assert_eq!(health.problems(), 0);
+            assert_eq!(health.warnings, 3);
+            assert!(
+                health
+                    .findings()
+                    .any(|finding| finding.message.contains("plaintext secret"))
+            );
+            assert!(
+                health
+                    .findings()
+                    .all(|finding| !finding.message.contains("private-test-literal"))
+            );
+            assert!(
+                health
+                    .findings()
+                    .all(|finding| finding.warning && finding.path == path)
+            );
+            assert_eq!(health.json()["problem_count"], 0);
+            assert_eq!(health.json()["warning_count"], 3);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        }
+        std::fs::write(&path, "workspaces_dir = '/legacy'\npicker = 42\n").unwrap();
+        let mut health = ConfigHealth {
+            main_path: path.clone(),
+            profile_path: None,
+            repo_path: None,
+            main_present: false,
+            findings: vec![],
+            main_problems: 0,
+            profile_problems: 0,
+            repo_problems: 0,
+            warnings: 0,
+        };
+        validate_toml_file(&mut health, Layer::Profile, &path);
+        assert_eq!(health.main_problems, 0);
+        assert_eq!(health.profile_problems, 1);
+        assert_eq!(health.warnings, 1);
+        assert_eq!(health.json()["problem_count"], 1);
+    }
 
     #[test]
     fn main_diagnostics_are_owned_by_the_main_path() {
