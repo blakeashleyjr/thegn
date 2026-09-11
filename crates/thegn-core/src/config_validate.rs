@@ -34,18 +34,62 @@ fn config_schema() -> &'static RootSchema {
 /// for `config validate` (the only place a bad value is treated as an error
 /// rather than warned-and-defaulted). Returns the list of problems (empty = ok).
 pub fn validate_str(body: &str) -> Vec<String> {
-    let mut errs = Vec::new();
+    validate_diagnostics(body)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == ValidationSeverity::Error)
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+/// Severity is data, never inferred from a human-readable message prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationDiagnostic {
+    pub severity: ValidationSeverity,
+    pub message: String,
+}
+
+/// Validate the same normalized document that runtime loading accepts, retaining
+/// advisory compatibility diagnostics separately from actual admission errors.
+/// Canonical/legacy collisions remain warnings: normalization deliberately
+/// chooses the canonical value at runtime and this API preserves that policy.
+pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
     let normalized = match crate::config_compat::normalize(body) {
-        Ok(v) => v,
-        Err(e) => return vec![format!("TOML syntax error: {e}")],
+        Ok(value) => value,
+        Err(error) => {
+            return vec![ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message: format!("TOML syntax error: {error}"),
+            }];
+        }
     };
-    errs.extend(
-        normalized
-            .diagnostics
-            .iter()
-            .map(|d| format!("warning: {d}")),
+    let mut diagnostics: Vec<_> = normalized
+        .diagnostics
+        .iter()
+        .map(|message| ValidationDiagnostic {
+            severity: ValidationSeverity::Warning,
+            message: message.clone(),
+        })
+        .collect();
+    diagnostics.extend(
+        validate_normalized(&normalized.body)
+            .into_iter()
+            .map(|message| ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message,
+            }),
     );
-    let val: toml::Value = match normalized.body.parse() {
+    diagnostics
+}
+
+fn validate_normalized(body: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    let val: toml::Value = match body.parse() {
         Ok(v) => v,
         Err(e) => return vec![format!("TOML syntax error: {e}")],
     };
@@ -53,7 +97,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
     // deserialize into `Config`, the entire file is discarded for defaults.
     // This catches shape/type errors; the schema walk below catches the
     // warn-and-default enum values `Deserialize` never rejects.
-    let load_error = match toml::from_str::<Config>(&normalized.body) {
+    let load_error = match toml::from_str::<Config>(body) {
         Err(e) => Some(e),
         // Templates are strings as far as the schema is concerned, so their
         // placeholders can only be checked once the file has deserialized.
@@ -1238,14 +1282,21 @@ pre_create = [
 
     #[test]
     fn legacy_project_config_keys_are_known_compatibility_diagnostics() {
-        let errs = validate_str(
-            r#"workspaces_dir = "/legacy"
+        let body = r#"workspaces_dir = "/legacy"
 [ui]
 confirm_delete_workspace = false
 sidebar_workspace_sort = "attention"
 [workspace.repo]
-"#,
+"#;
+        assert!(validate_str(body).is_empty());
+        let diagnostics = validate_diagnostics(body);
+        assert_eq!(diagnostics.len(), 4);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity == ValidationSeverity::Warning)
         );
+        let errs: Vec<_> = diagnostics.into_iter().map(|d| d.message).collect();
         assert!(!errs.iter().any(|e| e.contains("unknown key")), "{errs:?}");
         assert!(
             errs.iter()
@@ -1255,6 +1306,33 @@ sidebar_workspace_sort = "attention"
             errs.iter()
                 .any(|e| e.contains("workspace.repo") && e.contains("project.repo"))
         );
+    }
+
+    #[test]
+    fn compatibility_warning_does_not_hide_real_errors_or_change_collision_policy() {
+        let body = "projects_dir = '/canonical'\nworkspaces_dir = '/legacy'\npicker = 'invalid'\n";
+        let diagnostics = validate_diagnostics(body);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.severity == ValidationSeverity::Warning)
+                .count(),
+            1
+        );
+        let errors = validate_str(body);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("picker"));
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == ValidationSeverity::Warning)
+            .collect();
+        assert!(warnings[0].message.contains("using canonical"));
+        assert!(
+            validate_str("projects_dir = '/canonical'\nworkspaces_dir = '/legacy'\n").is_empty()
+        );
+        let syntax = validate_diagnostics("x = =");
+        assert_eq!(syntax.len(), 1);
+        assert_eq!(syntax[0].severity, ValidationSeverity::Error);
     }
 
     /// Walker matching == `from_str_validated` matching by construction: both
