@@ -36,7 +36,9 @@ pub struct SidebarDisplay {
     pub icon_ahead: String,
     pub icon_behind: String,
     pub icon_status: String,
-    /// Whether workspace separator gaps render (`[ui] sidebar_dividers`, THE-64).
+    /// Whether consecutive project blocks alternate their background tint
+    /// (`[ui] sidebar_dividers`). Costs no layout rows — it replaced THE-64's
+    /// blank separator row.
     pub dividers: bool,
 }
 
@@ -443,13 +445,13 @@ fn draw_sidebar_rail(surface: &mut Surface, rect: Rect, model: &FrameModel) {
 
 /// A laid-out sidebar row: which visible-row it is, where it sits, how tall it
 /// is, and the composed line(s) + background to paint. The cursor row may be
-/// two lines tall (the expanded detail tier); a section heading — and, dividers
-/// on, a workspace header — carries a leading blank gap.
+/// two lines tall (the expanded detail tier); a section heading carries a
+/// leading blank gap.
 pub(crate) struct SidebarPlacement {
     pub visible_index: usize,
     pub y: usize,
     pub height: usize,
-    /// Blank lines at the head of `lines`: the separator/breathing gap this
+    /// Blank lines at the head of `lines`: the banner's breathing gap this
     /// placement owns. Paint renders them on the plain list background (not
     /// `bg`), and the mouse path gates the caret cell below them. 0 in rail
     /// mode and whenever the clipped-tail trim dropped the gap.
@@ -658,8 +660,8 @@ fn sidebar_geom_from(
     // away — O(all worktrees) waste on every Full frame. The only
     // variable-height cases are a Worktree row's detail tier (probed via
     // `compose_detail_line`, and only when `show_detail` can be true — the
-    // sidebar must be focused) and the lead gaps (`lead_gap_rows`: the
-    // SectionHeading breathing gap and THE-64's workspace separator); every
+    // sidebar must be focused) and the lead gap (`lead_gap_rows`: the
+    // SectionHeading breathing gap, the only one left); every
     // other row is exactly one line. `compose_row_lines` is the source of truth
     // for that rule — a debug assertion in `build_sidebar` keeps them lockstep.
     let heights: Vec<usize> = visible
@@ -858,10 +860,9 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
                 &model.sidebar_display,
             )
         };
-        // Lead gaps — a section banner's breathing space, and (config on) a
-        // workspace header's separator — come from `lead_gap_rows`, the same
-        // source the height pass reads, so the lockstep assertion below holds
-        // by construction.
+        // The lead gap — a section banner's breathing space — comes from
+        // `lead_gap_rows`, the same source the height pass reads, so the
+        // lockstep assertion below holds by construction.
         let lead_gap = lead_gap_rows(model, &visible, i);
         for _ in 0..lead_gap {
             lines.insert(0, crate::seg::Line::Blank);
@@ -878,7 +879,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         let height = heights[i].min(bottom - y); // clip a partly-fitting tail row
         // `draw_lines` keeps a clipped row's FIRST `height` lines, which is
         // right for a worktree (name before detail) and wrong for a gapped row
-        // (section heading or workspace header), whose line 0 is the blank —
+        // (a section heading), whose line 0 is the blank —
         // the banner/label is what got dropped, so the row painted as an
         // invisible blank that still ate a screen row. Trim the gap instead.
         // Strictly AFTER the lockstep assertion above, which must keep seeing
@@ -1330,7 +1331,7 @@ pub(crate) struct RowHit {
     /// The x of the collapse caret cell, for collapsible rows: clicking it
     /// toggles collapse instead of activating.
     pub caret_x: Option<usize>,
-    /// Blank rows at the head of this hit box (the separator/breathing gap).
+    /// Blank rows at the head of this hit box (the banner's breathing gap).
     /// The caret cell only counts on the label lines below them — nothing is
     /// under a blank line, so a gap click must not toggle collapse.
     pub lead_gap: usize,
@@ -2862,6 +2863,123 @@ mod tests {
                 m.sidebar_filtering,
                 m.sidebar_filter
             );
+        }
+    }
+
+    #[test]
+    fn no_interaction_state_puts_a_blank_row_between_projects() {
+        // The blank separator row THE-64 put above each project header is gone
+        // (the block tint replaced it), and nothing a user does to the sidebar
+        // may bring it back: focus, a drag, a filter, a scroll or the all-rows
+        // detail tier. Every placement must tile the list with no blank line in
+        // it — the only lead gap left is the TERMINALS banner's, absent here.
+        use crate::sidebar::SidebarRow;
+        let rows = || -> Vec<SidebarRow> {
+            ["alpha", "beta", "gamma"]
+                .into_iter()
+                .flat_map(|ws| {
+                    [
+                        SidebarRow::base(RowKind::Workspace, 0, ws, ws),
+                        SidebarRow::base(RowKind::Worktree, 1, "home", ws),
+                        SidebarRow::base(RowKind::Worktree, 1, "tg/feature", ws),
+                    ]
+                })
+                .collect()
+        };
+        let tall = Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 40,
+        };
+        // header + blank ⇒ 6 list rows for 9 visible rows, so it scrolls.
+        let short = Rect { rows: 8, ..tall };
+        let mk = |edit: &dyn Fn(&mut FrameModel)| {
+            let mut m = FrameModel {
+                sidebar_rows: rows(),
+                sidebar_display: SidebarDisplay {
+                    focus_detail: thegn_core::config::FocusDetail::Cursor,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            edit(&mut m);
+            m
+        };
+        let cases: Vec<(&str, FrameModel, Rect, usize)> = vec![
+            ("at rest", mk(&|_| {}), tall, 0),
+            ("focused", mk(&|m| m.sidebar_focused = true), tall, 0),
+            (
+                "focused on a worktree",
+                mk(&|m| {
+                    m.sidebar_focused = true;
+                    m.sidebar_selected = 4;
+                }),
+                tall,
+                0,
+            ),
+            (
+                "mid-drag",
+                mk(&|m| {
+                    m.sidebar_focused = true;
+                    m.sidebar_selected = 1;
+                    m.sidebar_drag_lock = Some(SidebarLayoutLock {
+                        detail_focused: true,
+                        detail_cursor: 1,
+                    });
+                    m.sidebar_drag = Some(SidebarDragViz {
+                        source: Some(1),
+                        spot: DragSpotViz::InsertBefore(2),
+                    });
+                }),
+                tall,
+                0,
+            ),
+            ("filtering", mk(&|m| m.sidebar_filtering = true), tall, 0),
+            ("filtered", mk(&|m| m.sidebar_filter = "tg".into()), tall, 0),
+            (
+                "scrolled",
+                mk(&|m| {
+                    m.sidebar_focused = true;
+                    m.sidebar_scroll = 2;
+                }),
+                short,
+                2,
+            ),
+            (
+                "focused, all-rows detail",
+                mk(&|m| {
+                    m.sidebar_focused = true;
+                    m.sidebar_display.focus_detail = thegn_core::config::FocusDetail::All;
+                }),
+                tall,
+                0,
+            ),
+        ];
+        for (name, model, rect, scroll) in &cases {
+            let frame = build_sidebar(model, *rect, *scroll);
+            assert!(!frame.rows.is_empty(), "{name}: laid out nothing");
+            for p in &frame.rows {
+                assert_eq!(
+                    p.lead_gap, 0,
+                    "{name}: row {} carries a gap",
+                    p.visible_index
+                );
+                assert!(
+                    !p.lines.iter().any(|l| matches!(l, crate::seg::Line::Blank)),
+                    "{name}: row {} paints a blank line",
+                    p.visible_index
+                );
+            }
+            for w in frame.rows.windows(2) {
+                assert_eq!(
+                    w[1].y,
+                    w[0].y + w[0].height,
+                    "{name}: a hole opened between rows {} and {}",
+                    w[0].visible_index,
+                    w[1].visible_index
+                );
+            }
         }
     }
 
