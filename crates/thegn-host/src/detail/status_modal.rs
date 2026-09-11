@@ -255,7 +255,7 @@ fn identity_cells(
         Tok::Slot(S::Dim),
     ));
     kv.push((
-        "serving".into(),
+        "TCP listener".into(),
         if d.tcp_addr.is_empty() {
             "—".into()
         } else {
@@ -267,6 +267,13 @@ fn identity_cells(
             Tok::Hue(Hue::Blue)
         },
     ));
+    if !d.control_origin.is_empty() {
+        kv.push((
+            "public origin".into(),
+            d.control_origin.clone(),
+            Tok::Hue(Hue::Blue),
+        ));
+    }
     // The endpoint and scope are long paths; at narrow widths they'd swallow a
     // grid column, so give them a generous budget only when there is room.
     let path_w = if wide { 46 } else { 30 };

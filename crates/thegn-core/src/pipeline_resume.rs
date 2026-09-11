@@ -22,12 +22,15 @@ pub const SCREEN_TAIL_LINES: usize = 8;
 pub struct FinisherInput<'a> {
     /// The `[[pipeline.stages]]` name being resumed (e.g. `"code"`).
     pub stage_name: &'a str,
-    /// The RENDERED original task — the stage template rendered against the
-    /// row's own bindings, verbatim. The finisher reads it to know what
-    /// "finished" means; the host rendered it, this module only embeds it.
+    /// The rendered task for the new finisher row. Its dispatch id and artifact
+    /// bindings MUST name the finisher, not the source attempt.
     pub stage_prompt: &'a str,
-    /// The row's handoff artifact path. `""` when the row carries none.
+    /// The source attempt's handoff artifact path. `""` when it carries none.
+    /// Its state is useful recovery context, but it is not this run's target.
     pub artifact: &'a str,
+    /// The new finisher row's exact handoff artifact path. This is the path the
+    /// worker must commit and the roster's completion gate will verify.
+    pub target_artifact: &'a str,
     /// Whether the artifact file exists in the row's worktree (a regular
     /// file — the same symlink-strict rule the done gate applies).
     pub artifact_exists: bool,
@@ -61,6 +64,7 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     let stage = sanitize(i.stage_name);
     let task = sanitize(i.stage_prompt);
     let artifact = sanitize(i.artifact);
+    let target_artifact = sanitize(i.target_artifact);
 
     let mut p = String::with_capacity(1024);
     p.push_str(&format!(
@@ -69,7 +73,7 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
          Complete the stage from where it stands — do not restart the task \
          from scratch.\n\n"
     ));
-    p.push_str("The original task, as the previous worker received it (verbatim):\n\n");
+    p.push_str("The stage task for this finisher dispatch:\n\n");
     p.push_str(task.trim_end());
     p.push_str("\n\n");
 
@@ -77,8 +81,11 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     // blend — the finisher must know unambiguously whether the handoff is
     // missing, uncommitted, or committed-but-maybe-stale.
     p.push_str(&format!(
-        "Artifact state: {}\n\n",
+        "Previous attempt artifact state: {}\n\n",
         artifact_sentence(&artifact, i.artifact_exists, i.artifact_tracked)
+    ));
+    p.push_str(&format!(
+        "This finisher's required handoff artifact is `{target_artifact}`.\n\n"
     ));
 
     // Worktree facts, each in a fenced block — and only when non-empty: a
@@ -123,10 +130,10 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     // A worker that exits cleanly without a committed artifact is precisely
     // the failure the resume exists to recover from, so the rule is stated,
     // not implied.
-    let target = if artifact.is_empty() {
+    let target = if target_artifact.is_empty() {
         "the stage's handoff artifact".to_string()
     } else {
-        format!("the handoff artifact at `{artifact}`")
+        format!("the handoff artifact at `{target_artifact}`")
     };
     p.push_str(&format!(
         "Finish the stage, do not merely exit: a zero exit code is not a done \
@@ -236,6 +243,7 @@ mod tests {
             stage_name: "code",
             stage_prompt: "Implement the parser fix; commit on this branch",
             artifact: ".thegn/pipeline/THE-86/code/7.md",
+            target_artifact: ".thegn/pipeline/THE-86/code/8.md",
             artifact_exists: false,
             artifact_tracked: false,
             git_status: "",
@@ -356,6 +364,7 @@ mod tests {
             stage_name: "",
             stage_prompt: "",
             artifact: "",
+            target_artifact: "",
             artifact_exists: false,
             artifact_tracked: false,
             git_status: "",
@@ -405,9 +414,22 @@ mod tests {
     }
 
     #[test]
+    fn sanitizer_consumes_every_supported_escape_terminator_without_leaking_payload() {
+        assert_eq!(sanitize("before\x1b[31mred\x1b[0mafter"), "beforeredafter");
+        assert_eq!(sanitize("before\x1b]title\u{7}after"), "beforeafter");
+        assert_eq!(sanitize("before\x1b]title\x1b\\after"), "beforeafter");
+        assert_eq!(sanitize("before\x1bcafter"), "beforeafter");
+        assert_eq!(sanitize("before\0after"), "beforeafter");
+        assert_eq!(sanitize("before\x1b[31"), "before");
+        assert_eq!(sanitize("before\x1b]unterminated"), "before");
+    }
+
+    #[test]
     fn the_closer_carries_the_exit0_rule_and_the_commit_instruction() {
         let p = finisher_prompt(&input());
         assert!(p.contains("a zero exit code is not a done stage"));
         assert!(p.contains("committed on the branch"));
+        assert!(p.contains("the handoff artifact at `.thegn/pipeline/THE-86/code/8.md`"));
+        assert!(!p.contains("the handoff artifact at `.thegn/pipeline/THE-86/code/7.md`"));
     }
 }

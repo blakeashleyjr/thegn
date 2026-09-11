@@ -59,12 +59,20 @@ thegn events tail --kinds activity,exit --session "$SESSION"
 thegn events tail --signal-lag --json | jq -c 'select(.kind == "activity")'
 ```
 
-`--kinds` accepts the same comma-separated frame kinds as the control API and
-`--session` narrows session-keyed frames. `--signal-lag` opts into an explicit
-`lagged` frame when the bounded feed has dropped events. JSON mode emits one
-canonical frame per line, with the daemon `hello` frame first. The feed has no
-replay: after loss or reconnect, use `sessions.list` and `worktrees.list` to
-resynchronize state.
+`--kinds` accepts the control API's comma-separated observer-filter kinds:
+`activity`, `lease`, `pairing`, `sessions`, and `exit`.
+`snapshot` and `delta` are attach-only and are rejected here. `--session`
+narrows session-keyed frames. `--signal-lag` opts into an explicit `lagged`
+frame when the bounded feed has dropped events. JSON mode emits one canonical
+frame per line, with the non-filterable daemon `hello` frame first on every
+transport.
+
+The feed has no replay. Bootstrap by listing the resources you need, subscribe,
+then re-list after `sessions`, opted-in `lagged`, or reconnect signals. Listing
+and subscribing are not atomic, so clients must idempotently reconcile by
+stable session/worktree ids. Pane attach is separate: it supplies the current
+emulator `snapshot` followed by live `delta` frames; the observer feed does not
+promise a synthetic state snapshot.
 
 The local Unix socket uses the current same-user policy. A TCP `serve` endpoint
 uses its existing bearer token and read scope; filters only narrow an already

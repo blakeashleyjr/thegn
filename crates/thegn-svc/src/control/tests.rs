@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::future::BoxFuture;
+use http_body_util::BodyExt as _;
 use tower::ServiceExt;
 
-use thegn_core::control::{ScopeSet, TokenKind};
+use thegn_core::control::{RouteToHostTokenBinding, ScopeSet, TokenKind};
 use thegn_core::control_wire::EventFrame;
 use thegn_core::db::Db;
 use thegn_core::store::LeaseRow;
@@ -343,6 +344,37 @@ fn token(rig: &Rig, scopes: &str) -> String {
     m.token
 }
 
+fn token_with_label(rig: &Rig, scopes: &str, label: String) -> String {
+    let m = auth::mint(
+        TokenKind::Control,
+        ScopeSet::parse(scopes),
+        &label,
+        None,
+        None,
+        1_000,
+    );
+    use thegn_core::store::ControlStore;
+    rig.db.lock().unwrap().put_pairing(&m.row).unwrap();
+    m.token
+}
+
+async fn merge_add_for(rig: &Rig, bearer: &str, worktree: &str) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/merge/add")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "worktree": worktree }).to_string(),
+        ))
+        .unwrap();
+    router(rig.state.clone())
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status()
+}
+
 async fn call(rig: &Rig, method: &str, path: &str, bearer: Option<&str>) -> StatusCode {
     call_as(
         rig,
@@ -609,6 +641,147 @@ async fn git_scope_commits_but_cannot_type_into_terminals() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(r.api.calls().len(), 4, "rejections added no calls");
+}
+
+#[tokio::test]
+async fn merge_add_scope_reaches_only_the_return_route() {
+    let r = rig(false);
+    let token = token(&r, "merge_add");
+    assert_eq!(
+        call(&r, "POST", "/v1/merge/add", Some(&token)).await,
+        StatusCode::FORBIDDEN,
+        "a generic MergeAdd token has no worktree binding and must fail closed"
+    );
+    for (method, path) in [
+        ("GET", "/v1/merge/list?worktree=%2Fw"),
+        ("POST", "/v1/merge/clear"),
+        ("POST", "/v1/git/stage"),
+        ("POST", "/v1/git/commit"),
+        ("GET", "/v1/worktrees"),
+    ] {
+        assert_eq!(
+            call(&r, method, path, Some(&token)).await,
+            StatusCode::FORBIDDEN,
+            "{method} {path} escaped the merge-add-only grant"
+        );
+    }
+    assert!(
+        r.api.calls().is_empty(),
+        "rejections must not reach the API"
+    );
+}
+
+#[tokio::test]
+async fn route_to_host_token_cannot_enqueue_another_remote_or_local_worktree() {
+    let r = rig(false);
+    let token = token_with_label(
+        &r,
+        "merge_add",
+        RouteToHostTokenBinding {
+            owner: "provider/account/sandbox-a".into(),
+            worktree: "/opaque/remote-a".into(),
+        }
+        .label(),
+    );
+
+    assert_eq!(
+        merge_add_for(&r, &token, "/opaque/remote-a").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        merge_add_for(&r, &token, "/opaque/remote-b").await,
+        StatusCode::FORBIDDEN,
+        "a route token must not enqueue another remote worktree"
+    );
+    assert_eq!(
+        merge_add_for(&r, &token, "/host/local-worktree").await,
+        StatusCode::FORBIDDEN,
+        "a route token must not enqueue a registered local worktree"
+    );
+    assert_eq!(r.api.calls(), ["merge_add"]);
+}
+
+#[cfg(feature = "control-grpc")]
+#[tokio::test]
+async fn grpc_generic_merge_add_token_without_a_worktree_binding_fails_closed() {
+    use super::grpc::{GrpcControl, proto};
+    use proto::control_server::Control;
+    use thegn_core::store::ControlStore;
+
+    let r = rig(false);
+    let token = token(&r, "merge_add");
+    let grpc = GrpcControl {
+        api: r.api.clone(),
+        store: r.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+        local_admin: false,
+        daemon_euid: None,
+        server_label: "test thegn".into(),
+    };
+    let mut request = tonic::Request::new(proto::MergeAddRequest {
+        worktree: "/host/local-worktree".into(),
+    });
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+
+    let error = grpc.merge_add(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert!(error.message().contains("not authorized for this worktree"));
+    assert!(r.api.calls().is_empty(), "rejection must not reach the API");
+}
+
+#[tokio::test]
+async fn sse_observer_starts_with_the_same_mandatory_hello_as_other_transports() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/events/sse?kinds=activity")
+        .header("authorization", format!("Bearer {read}"))
+        .body(Body::empty())
+        .unwrap();
+    let mut response = router(r.state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        response.body_mut().frame(),
+    )
+    .await
+    .expect("SSE hello deadline")
+    .expect("SSE body open")
+    .expect("SSE body frame");
+    let data = frame.into_data().expect("SSE data frame");
+    let text = String::from_utf8(data.to_vec()).unwrap();
+    assert!(
+        text.contains("event:hello") || text.contains("event: hello"),
+        "{text:?}"
+    );
+    assert!(text.contains(r#""kind":"hello""#), "{text:?}");
+}
+
+#[tokio::test]
+async fn sse_rejects_attach_only_filters_as_bad_requests() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    for path in [
+        "/v1/events/sse?kinds=snapshot",
+        "/v1/events/sse?kinds=delta",
+    ] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("authorization", format!("Bearer {read}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router(r.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let error: super::ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, super::ControlErrorCode::BadRequest);
+        assert!(error.error.contains("supported observer kinds:"));
+    }
 }
 
 #[tokio::test]

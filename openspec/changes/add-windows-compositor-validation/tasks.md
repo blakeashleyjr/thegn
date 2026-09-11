@@ -39,5 +39,5 @@
 
 ## 3. CI
 
-- [ ] 3.1 One `[ci-windows]` dispatch green with the phase-4 tree
-      (workspace check + ipc + platform kernel tests).
+- [ ] 3.1 One `ci.yml` dispatch with `extras: true` green with the phase-4
+      tree (workspace check + ipc + platform kernel tests).
