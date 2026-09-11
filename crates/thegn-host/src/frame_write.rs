@@ -198,6 +198,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingTerminal {
         calls: Vec<&'static str>,
+        fail_enter: bool,
+        fail_flush: bool,
     }
 
     impl Terminal for RecordingTerminal {
@@ -209,6 +211,9 @@ mod tests {
         }
         fn enter_alternate_screen(&mut self) -> termwiz::Result<()> {
             self.calls.push("enter");
+            if self.fail_enter {
+                return Err(std::io::Error::other("enter failed").into());
+            }
             Ok(())
         }
         fn exit_alternate_screen(&mut self) -> termwiz::Result<()> {
@@ -225,6 +230,9 @@ mod tests {
         }
         fn flush(&mut self) -> termwiz::Result<()> {
             self.calls.push("flush");
+            if self.fail_flush {
+                return Err(std::io::Error::other("flush failed").into());
+            }
             Ok(())
         }
         fn poll_input(
@@ -245,6 +253,28 @@ mod tests {
         // leave the whole session on the primary screen.
         let mut term = RecordingTerminal::default();
         enter_alt_screen(&mut term).unwrap();
+        assert_eq!(term.calls, ["enter", "flush"]);
+    }
+
+    #[test]
+    fn enter_alt_screen_stops_when_enter_fails() {
+        let mut term = RecordingTerminal {
+            fail_enter: true,
+            ..Default::default()
+        };
+        let error = enter_alt_screen(&mut term).unwrap_err();
+        assert!(error.to_string().contains("enter failed"));
+        assert_eq!(term.calls, ["enter"]);
+    }
+
+    #[test]
+    fn enter_alt_screen_propagates_flush_failure() {
+        let mut term = RecordingTerminal {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let error = enter_alt_screen(&mut term).unwrap_err();
+        assert!(error.to_string().contains("flush failed"));
         assert_eq!(term.calls, ["enter", "flush"]);
     }
 
