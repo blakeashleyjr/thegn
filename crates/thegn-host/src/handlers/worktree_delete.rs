@@ -427,7 +427,9 @@ pub(crate) fn remove_group(
             panes.table.remove(&id);
         }
     }
-    let was_active = gi == session.active;
+    // Rendering and Landing::plan use active_group(), which clamps stale
+    // indices to the last group. Compare against that same effective index.
+    let was_active = gi == session.active.min(session.worktrees.len() - 1);
     let prior = session.active_group().map(|g| g.name.clone());
     session.switch_to(gi);
     session.close_active_group();
