@@ -7,7 +7,8 @@
 //!
 //! - `keyring:<account>` — the OS keyring (Secret Service / macOS Keychain /
 //!   Windows Credential Manager), via the pure-Rust `keyring` crate. On a headless
-//!   box with no Secret Service this fails softly and the caller falls back.
+//!   box with no Secret Service explicit reads report unavailable; broker writes
+//!   may choose the owner-only file backend instead.
 //! - `env:VAR` / `file:PATH` — delegated to
 //!   [`thegn_core::config::expand_env_ref`] (unchanged behavior).
 //! - a bare string (`FLY_API_TOKEN`) — an **env var name**, matching the historic
@@ -59,9 +60,9 @@ pub fn resolve_ref_for(r: &SecretRef, consumer: &str) -> Option<String> {
     }
     let (value, outcome) = match r {
         SecretRef::Keyring { account } => match keyring_get(account) {
-            Some(v) => (Some(v), SecretOutcome::Resolved),
-            None if keyring_available() => (None, SecretOutcome::Missing),
-            None => (None, SecretOutcome::Unavailable),
+            Ok(Some(v)) => (Some(v), SecretOutcome::Resolved),
+            Ok(None) if keyring_available() => (None, SecretOutcome::Missing),
+            Ok(None) | Err(_) => (None, SecretOutcome::Unavailable),
         },
         SecretRef::Env { var } => match std::env::var(var).ok().filter(|s| !s.trim().is_empty()) {
             Some(v) => (Some(v), SecretOutcome::Resolved),
@@ -175,12 +176,15 @@ pub fn forget(name: &str) {
     if let Ok(mut m) = presence_memo().lock() {
         m.clear();
     }
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, name) {
-        let _ = entry.delete_credential(); // best-effort: cleanup: the credential may already be absent
-    }
+    let _ = keyring_del(name); // best-effort: bounded cleanup; absence is success
     if let Ok(path) = secrets_file(name) {
         let _ = std::fs::remove_file(path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
+    // Do not derive and delete the pre-hash fallback filename. That historical
+    // sanitizer was not injective (`a/b` and `a_b` both became `a_b.token`), so
+    // automatic legacy cleanup could delete a different account's credential.
+    // Existing `file:` refs remain directly resolvable and can be removed by
+    // their explicit path during a user-directed migration.
 }
 
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
@@ -249,22 +253,7 @@ const KEYRING_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// exactly the hang this removes. Same trade as `sandbox::output_with_timeout`'s
 /// detached reap.
 fn probe_keyring_bounded() -> bool {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // best-effort: the receiver is gone if we already timed out.
-        let _ = tx.send(probe_keyring());
-    });
-    match rx.recv_timeout(KEYRING_PROBE_TIMEOUT) {
-        Ok(ok) => ok,
-        Err(_) => {
-            tracing::warn!(
-                target: "thegn::secret",
-                cap_ms = KEYRING_PROBE_TIMEOUT.as_millis() as u64,
-                "keyring probe timed out — treating the OS keyring as unavailable"
-            );
-            false
-        }
-    }
+    run_keyring_op_with_timeout("probe", KEYRING_PROBE_TIMEOUT, probe_keyring).unwrap_or(false)
 }
 
 /// The unbounded probe: a round-trip on a throwaway account is the only honest
@@ -287,19 +276,60 @@ fn probe_keyring() -> bool {
     }
 }
 
-fn keyring_get(account: &str) -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, account)
-        .ok()?
-        .get_password()
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+fn run_keyring_op_with_timeout<T: Send + 'static>(
+    operation: &'static str,
+    timeout: std::time::Duration,
+    op: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        // best-effort: the receiver is gone if the operation exceeded its cap.
+        let _ = tx.send(op());
+    });
+    rx.recv_timeout(timeout).map_err(|_| {
+        tracing::warn!(
+            target: "thegn::secret",
+            operation,
+            cap_ms = timeout.as_millis() as u64,
+            "keyring operation timed out — treating the OS keyring as unavailable"
+        );
+        anyhow::anyhow!(
+            "keyring {operation} timed out after {}ms",
+            timeout.as_millis()
+        )
+    })
+}
+
+fn keyring_get(account: &str) -> Result<Option<String>> {
+    let account = account.to_string();
+    run_keyring_op_with_timeout("get", KEYRING_PROBE_TIMEOUT, move || {
+        keyring::Entry::new(KEYRING_SERVICE, &account)
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+            .filter(|value| !value.trim().is_empty())
+    })
 }
 
 fn keyring_set(account: &str, token: &str) -> Result<()> {
-    keyring::Entry::new(KEYRING_SERVICE, account)
-        .context("keyring entry")?
-        .set_password(token)
-        .context("keyring set")
+    let account = account.to_string();
+    let token = token.to_string();
+    run_keyring_op_with_timeout("set", KEYRING_PROBE_TIMEOUT, move || {
+        keyring::Entry::new(KEYRING_SERVICE, &account)
+            .context("keyring entry")?
+            .set_password(&token)
+            .context("keyring set")
+    })?
+}
+
+fn keyring_del(account: &str) -> Result<()> {
+    let account = account.to_string();
+    run_keyring_op_with_timeout("delete", KEYRING_PROBE_TIMEOUT, move || {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).context("keyring entry")?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("keyring delete"),
+        }
+    })?
 }
 
 /// `$XDG_CONFIG_HOME/thegn/secrets/<name>.token` — alongside the config file,
@@ -311,9 +341,10 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
         .map(|p| p.join("secrets"))
         .context("config path has no parent")?;
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    // best-effort: owner-only secrets dir (0700 / owner DACL).
-    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
-    // Sanitize so a name never escapes the dir.
+    thegn_core::fsperm::restrict_dir_to_owner(&dir)
+        .with_context(|| format!("restrict {}", dir.display()))?;
+    // Sanitize for readability, then bind the filename to the exact name so
+    // aliases such as `a/b` and `a_b` cannot share or delete one another's token.
     let safe: String = name
         .chars()
         .map(|c| {
@@ -323,17 +354,16 @@ fn secrets_file(name: &str) -> Result<PathBuf> {
                 '_'
             }
         })
+        .take(48)
         .collect();
-    Ok(dir.join(format!("{safe}.token")))
+    let safe = if safe.is_empty() { "secret" } else { &safe };
+    let identity = thegn_core::util::short_hash(name, 16);
+    Ok(dir.join(format!("{safe}-{identity}.token")))
 }
 
 fn write_private(path: &std::path::Path, token: &str) -> Result<()> {
-    std::fs::write(path, token.trim().as_bytes())
-        .with_context(|| format!("write {}", path.display()))?;
-    // best-effort: the keyring is the primary store; the file fallback is
-    // tightened to owner-only (0600 / owner DACL) where the platform allows.
-    let _ = thegn_core::fsperm::restrict_to_owner(path);
-    Ok(())
+    thegn_core::fsperm::write_owner_only_atomic(path, token.trim().as_bytes())
+        .with_context(|| format!("write owner-only secret {}", path.display()))
 }
 
 // --- the SecretStore seam, backed by the functions above --------------------
@@ -354,7 +384,7 @@ impl Probe for KeyringStore {
         } else {
             Availability::Unavailable(
                 "no usable OS credential store (headless / locked / absent); \
-                 `keyring:` refs fall back to file/env"
+                 explicit `keyring:` refs are unavailable; broker writes may use an owner-only file"
                     .into(),
             )
         };
@@ -373,18 +403,16 @@ impl SecretStore for KeyringStore {
     }
     fn get(&self, account: &str) -> Result<String, SecretError> {
         match keyring_get(account) {
-            Some(v) => Ok(v),
-            None if keyring_available() => Err(SecretError::not_found(account.to_string())),
-            None => Err(SecretError::unavailable("no usable OS credential store")),
+            Ok(Some(v)) => Ok(v),
+            Ok(None) if keyring_available() => Err(SecretError::not_found(account.to_string())),
+            Ok(None) | Err(_) => Err(SecretError::unavailable("no usable OS credential store")),
         }
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
         keyring_set(account, value).map_err(|e| SecretError::denied(e.to_string()))
     }
     fn del(&self, account: &str) -> Result<(), SecretError> {
-        keyring::Entry::new(KEYRING_SERVICE, account)
-            .and_then(|e| e.delete_credential())
-            .map_err(|e| SecretError::denied(e.to_string()))
+        keyring_del(account).map_err(|e| SecretError::denied(e.to_string()))
     }
 }
 
@@ -412,11 +440,23 @@ impl SecretStore for FileStore {
     fn get(&self, account: &str) -> Result<String, SecretError> {
         // A bare account name resolves to the config-adjacent secrets file.
         let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
-        std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SecretError::not_found(account.to_string()))
+        match std::fs::read_to_string(&path) {
+            Ok(value) => {
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    Err(SecretError::not_found(account.to_string()))
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(SecretError::not_found(account.to_string()))
+            }
+            Err(error) => Err(SecretError::denied(format!(
+                "read {}: {error}",
+                path.display()
+            ))),
+        }
     }
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
         let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
@@ -424,9 +464,14 @@ impl SecretStore for FileStore {
     }
     fn del(&self, account: &str) -> Result<(), SecretError> {
         let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
-        // best-effort: a missing file is already "deleted".
-        let _ = std::fs::remove_file(path);
-        Ok(())
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SecretError::denied(format!(
+                "remove {}: {error}",
+                path.display()
+            ))),
+        }
     }
     fn list(&self) -> Result<Vec<String>, SecretError> {
         let path =
@@ -499,22 +544,18 @@ pub fn probes() -> Vec<ProbeReport> {
 /// `keyring:` routes through the shared keyring service; a missing entry (or an
 /// unavailable keyring) is a clear, actionable error, never a plaintext
 /// fallback or a hang. Bare strings are LITERAL values.
-pub fn resolve_mcp_env(value: &str) -> Result<String, String> {
-    match SecretRef::parse(value, BareAs::Literal) {
-        SecretRef::Keyring { account } => KeyringStore.get(&account).map_err(|_| {
-            format!(
-                "keyring entry `{account}` is not set — add it with \
-                 `thegn mcp secret set {account} <value>` (agents never see the value)"
-            )
-        }),
-        SecretRef::Env { var } => std::env::var(&var)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| format!("env var `{var}` is unset or empty")),
-        SecretRef::File { path } => thegn_core::config::expand_env_ref(&format!("file:{path}"))
-            .ok_or_else(|| format!("file `{path}` is unreadable or empty")),
-        SecretRef::Literal(s) => Ok(s.expose().to_string()),
-    }
+pub fn resolve_mcp_env(value: &str, consumer: &str) -> Result<String, String> {
+    let reference = SecretRef::parse(value, BareAs::Literal);
+    resolve_ref_for(&reference, consumer).ok_or_else(|| match &reference {
+        SecretRef::Keyring { account } => format!(
+            "keyring entry `{account}` is not set — add it with \
+             `thegn mcp secret set {account} <value>` (agents never see the value)"
+        ),
+        _ => format!(
+            "secret ref `{}` is unreadable, unset, or empty",
+            reference.audit_name()
+        ),
+    })
 }
 
 /// `thegn mcp secret set` — store under the shared keyring service and record
@@ -530,7 +571,9 @@ pub fn mcp_secret_set(account: &str, value: &str) -> Result<(), String> {
 
 /// `thegn mcp secret rm` — remove from the keyring and the index.
 pub fn mcp_secret_rm(account: &str) -> Result<(), String> {
-    let _ = KeyringStore.del(account);
+    KeyringStore
+        .del(account)
+        .map_err(|error| error.message().to_string())?;
     index_remove(account);
     Ok(())
 }
@@ -624,5 +667,24 @@ mod tests {
         // An account we never set resolves to None (never panics, even with no
         // Secret Service available).
         assert_eq!(resolve("keyring:__tg_never_set_account__"), None);
+    }
+
+    #[test]
+    fn bounded_operation_returns_without_waiting_for_worker() {
+        let started = std::time::Instant::now();
+        let result =
+            run_keyring_op_with_timeout("test", std::time::Duration::from_millis(10), || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                true
+            });
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn fallback_names_do_not_alias_after_sanitization() {
+        let slash = secrets_file("a/b").unwrap();
+        let underscore = secrets_file("a_b").unwrap();
+        assert_ne!(slash, underscore);
     }
 }

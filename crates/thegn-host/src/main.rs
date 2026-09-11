@@ -117,6 +117,7 @@ mod logotype;
 mod loop_policy;
 mod lsp;
 mod machine0_bridge;
+mod managed_ssh_rotation;
 mod managed_tool;
 mod mascot;
 mod masthead;
@@ -190,6 +191,7 @@ mod push_notify;
 mod queries;
 mod rasterize;
 mod recorder;
+mod remote_enqueue_auth;
 mod remote_poll;
 mod remote_sync;
 mod render_plan;
@@ -691,6 +693,15 @@ pub enum Command {
     SpriteProxy {
         /// Worktree path (defaults to the current dir) — selects the env/sandbox.
         worktree: Option<String>,
+        /// Rotation-only custody proof: expected provider kind.
+        #[arg(long, hide = true)]
+        expected_provider: Option<String>,
+        /// Rotation-only custody proof: expected value-free account namespace.
+        #[arg(long, hide = true)]
+        expected_account: Option<String>,
+        /// Rotation-only custody proof: expected sandbox id.
+        #[arg(long, hide = true)]
+        expected_instance: Option<String>,
     },
     /// Hidden: the VPS exec bridge (`vps-ssh <name> -- cmd…`) — the CLI prefix a
     /// VPS provider env's panes and control-plane reads run through. Resolves
@@ -1159,9 +1170,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         thegn_core::config::config_warn(&w);
     }
     crate::forge_handle::install(&cfg);
-    // Tracker tokens resolve through the same broker as provider tokens, so a
-    // `keyring:` ref works for [issues] too (svc cannot link the keyring itself).
-    thegn_svc::issue::secret::install_keyring_resolver(|r| crate::secret::resolve_for(r, "issue"));
+    crate::provider_factory::install_managed_key_scope(cfg.credentials.ssh.managed_key_scope);
+    // Service-layer issue, CI, VPN, and snapshot consumers resolve typed refs
+    // through the same host broker as provider tokens. Svc cannot link the OS
+    // keyring itself, so install the process's single value-fetch chokepoint.
+    thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
@@ -1329,18 +1342,42 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             })?;
             Ok(())
         }
-        Command::SpriteProxy { worktree } => {
+        Command::SpriteProxy {
+            worktree,
+            expected_provider,
+            expected_account,
+            expected_instance,
+        } => {
             // ssh ProxyCommand: relay the in-sandbox sshd (127.0.0.1:22) over the
             // provider's TCP-over-WebSocket proxy on stdin/stdout.
             let wt = worktree
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
                 .ok_or_else(|| anyhow::anyhow!("sprite-proxy: no worktree"))?;
-            let (provider, id, _workdir) =
+            let (provider, id, _workdir, provider_kind, custody_account) =
                 agent::provider_proxy_target(&cfg, &wt).ok_or_else(|| {
                     anyhow::anyhow!(
                         "sprite-proxy: {wt} is not a provider env (or its API token is unset)"
                     )
                 })?;
+            if let Some(expected) = expected_provider
+                && !provider_kind.eq_ignore_ascii_case(&expected)
+            {
+                anyhow::bail!(
+                    "sprite-proxy: resolved provider {provider_kind:?}, expected {expected:?}"
+                );
+            }
+            if let Some(expected) = expected_account
+                && custody_account != expected
+            {
+                anyhow::bail!(
+                    "sprite-proxy: resolved custody account {custody_account:?}, expected {expected:?}"
+                );
+            }
+            if let Some(expected) = expected_instance
+                && id != expected
+            {
+                anyhow::bail!("sprite-proxy: resolved instance {id:?}, expected {expected:?}");
+            }
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(sprite_proxy_relay(provider, id))
         }

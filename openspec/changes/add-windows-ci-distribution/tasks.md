@@ -2,17 +2,21 @@
 
 ## 1. CI
 
-- [x] 1.1 `windows` job promoted from opt-in to routine (push/PR/dispatch):
-      workspace msvc check + ipc + platform kernel tests.
-- [x] 1.2 Release `thegn.exe` built and uploaded as the
-      `thegn-x86_64-pc-windows-msvc` artifact (30-day retention) on every run.
+- [ ] 1.1 Promote `windows` from opt-in to routine only after a recorded green
+      run: workspace msvc check + ipc + platform kernel tests.
+- [x] 1.2 Opt-in Windows runs build and upload `thegn.exe` as the canonical
+      `thegn-x86_64-pc-windows-msvc` artifact (30-day retention).
 - [x] 1.3 ci.yml header documents the job alongside the macos/e2e notes.
+- [x] 1.4 A dependent Windows job downloads the canonical artifact and smokes
+      `thegn.exe --version` and `thegn.exe --help` outside the build tree.
 
 ## 2. Distribution docs
 
-- [x] 2.1 README "Install" gains the native-Windows path (rustup + VS Build
-      Tools, `cargo install --path crates/thegn-host`, CI artifact, Windows
-      Terminal requirement, Job-Object scoping note).
+- [x] 2.1 README "Install" documents the current native-Windows source path
+      (rustup + VS Build Tools, `cargo install --path crates/thegn-host`,
+      Windows Terminal requirement, Job-Object scoping note) and names the
+      configured CI artifact without presenting it as available before a green
+      run.
 - [x] 2.2 CONTRIBUTING "Windows (native) notes" (landed in phase 4) is the
       referenced dev loop.
 
@@ -31,5 +35,5 @@
       touched crate; workspace windows-gnu cross-check green + warning-free.
 - [x] 4.2 Core coverage gate (`just coverage`, 95% lines) green with the new
       core modules (shellinv, fsperm, termcaps/basename additions).
-- [ ] 4.3 First routine `windows` CI run green on GitHub (happens when the
-      merge queue lands this branch; dispatch manually to run it earlier).
+- [ ] 4.3 First opt-in `windows` plus `windows-artifact-smoke` CI run green on
+      GitHub; then remove the opt-in gates and record the first routine run.

@@ -158,6 +158,42 @@ Run the drain **where the target repo lives**. If you invoke it from a
 machine other than the target's host, thegn tells you which host to run
 it on — the fold, gate, and ref-advance must be co-located with `main`.
 
+`[merge_queue] remote_mode` chooses how an off-host worktree gets into that
+target:
+
+- **`route_to_host`** (the default) keeps the target host authoritative. A
+  provider-provisioned environment or user-managed SSH worktree receives the
+  host-canonical worktree id, a reachable control URL, and a dedicated
+  `merge_add` token. That token can enqueue only its registered worktree; it
+  cannot list worktrees or queues, stage/commit, type into a terminal, or clear
+  the queue. The host re-reads the registered repo, branch, and remote location
+  and uses that location to ingest the tip; it never treats the remote absolute
+  path as a host-local path.
+- **`push`** folds and gates in the provider clone, advances its local target,
+  and pushes that target to `origin`. It needs no inbound host control endpoint,
+  but origin—not the host queue—is the convergence authority.
+
+Route credentials live in opaque per-worktree, owner-only runtime files. A
+provider receives its file after reusable-image checkpointing through the
+provider's secret exec environment. A user-managed SSH target receives the same
+two data lines over SSH stdin; the token never enters ssh argv, logs, transcript
+text, or an artifact. SSH ownership includes account, host, connection identity,
+and worktree, so worktrees sharing one remote `$HOME` cannot replace or revoke
+each other. Reattach reuses a still-valid installed credential so an existing
+pane keeps working; endpoint changes, expiry, or a binding mismatch rotate it
+atomically. Recycling/destruction and SSH worktree deletion revoke the token
+before owner metadata disappears. The host persists only the token hash.
+
+Route mode requires a live `thegn serve` TCP registration and a declared
+confidential topology: `[serve] topology = "tls-terminated"` behind a loopback
+TLS proxy, or `"tunnel"` for a trusted encrypted tunnel, with a reachable
+`advertise_host`/`advertise_port`. Plaintext direct exposure is not eligible.
+After changing the endpoint, reprovision or reattach/open the environment to
+rotate the credential. A missing endpoint/token, invalid scope, unknown
+worktree, stale registered location/branch, or failed remote branch lookup is
+an explicit error and never creates a remote-local fallback row. If inbound
+secure serving is unavailable, select `remote_mode = "push"` deliberately.
+
 ## The fixing agent
 
 Point the handoff at an agent either by naming one of your `[[agents]]`

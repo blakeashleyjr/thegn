@@ -665,7 +665,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Same install as `main.rs`'s subcommand path — the interactive launch does
     // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
     // is exactly where a `keyring:` issue token has to resolve (THE-72).
-    thegn_svc::issue::secret::install_keyring_resolver(|r| crate::secret::resolve_for(r, "issue"));
+    thegn_svc::secret::install_resolver(crate::secret::resolve_ref_for);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph

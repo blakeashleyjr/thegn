@@ -88,6 +88,10 @@ pub(crate) fn install_pane_services(
     panes: &mut crate::panes::Panes,
     cfg: &thegn_core::config::Config,
 ) {
+    // Provider factories are intentionally EnvProviderConfig-shaped. Republish
+    // the top-level custody policy here as well as at initial CLI startup so a
+    // live config reload cannot keep using the previous key scope.
+    crate::provider_factory::install_managed_key_scope(cfg.credentials.ssh.managed_key_scope);
     panes.set_replay_config(cfg.replay.clone());
     let mut daemon = cfg.daemon.clone();
     daemon.enabled = daemon_active(cfg);

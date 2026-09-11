@@ -19,6 +19,7 @@ use thegn_core::ci::{
 };
 use thegn_core::config::{CiConfig, CiProviderKind};
 use thegn_core::remote::GitLoc;
+use thegn_core::secretref::BareAs;
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -84,14 +85,21 @@ pub trait CiProvider: thegn_core::seam::Probe + Send + Sync {
 /// constructs a client.
 pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
     let system = resolve_system(loc, cfg)?;
-    client_for_system(system)
+    client_for_system_with_config(system, cfg)
 }
 
 /// The system → client factory (pure; `provider_for` adds remote/file sniffing).
 pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
+    client_for_system_with_config(system, &CiConfig::default())
+}
+
+/// System → client factory carrying provider configuration and resolving any
+/// configured token once, at construction. The value is injected into the
+/// child environment (never argv) for every `glab` call.
+fn client_for_system_with_config(system: CiSystem, cfg: &CiConfig) -> Option<CiClient> {
     match system {
         CiSystem::GithubActions => Some(Box::new(GithubCi)),
-        CiSystem::GitlabCi => Some(Box::new(GitlabCi)),
+        CiSystem::GitlabCi => Some(Box::new(GitlabCi::from_config(cfg))),
         CiSystem::Drone | CiSystem::Woodpecker | CiSystem::Jenkins | CiSystem::Argo => None,
     }
 }
@@ -508,9 +516,15 @@ pub fn parse_gh_workflows(json: &str) -> Vec<CiWorkflow> {
 
 // === GitLab CI (glab + GitLab API) ========================================
 
-/// GitLab CI via `glab api` (reuses `glab`'s configured auth). Pipelines→jobs;
-/// GitLab has no per-job "steps", so [`CiJob::steps`] stays empty.
-pub struct GitlabCi;
+/// GitLab CI via `glab api`. A configured token is resolved by the injected
+/// broker and supplied only through `GITLAB_TOKEN`; when absent, `glab` may use
+/// its own credential store. GitLab has no per-job "steps", so
+/// [`CiJob::steps`] stays empty.
+#[derive(Default)]
+pub struct GitlabCi {
+    token: Option<String>,
+    host: Option<String>,
+}
 
 impl thegn_core::seam::Probe for GitlabCi {
     fn probe(&self) -> thegn_core::seam::ProbeReport {
@@ -525,6 +539,27 @@ impl thegn_core::seam::Probe for GitlabCi {
 }
 
 impl GitlabCi {
+    fn from_config(cfg: &CiConfig) -> Self {
+        Self {
+            token: crate::secret::resolve(&cfg.gitlab.token, BareAs::Literal, "ci:gitlab"),
+            host: (!cfg.gitlab.host.trim().is_empty()).then(|| cfg.gitlab.host.trim().to_string()),
+        }
+    }
+
+    /// Construct a `glab` command with credentials in the child environment,
+    /// never in argv. Keeping this at one chokepoint prevents a new operation
+    /// from accidentally falling back to an unaudited/config-ignored path.
+    fn command(&self, loc: &GitLoc, args: &[&str]) -> Command {
+        let mut cmd = loc.cli_command("glab", args);
+        if let Some(token) = &self.token {
+            cmd.env("GITLAB_TOKEN", token);
+        }
+        if let Some(host) = &self.host {
+            cmd.env("GITLAB_HOST", host);
+        }
+        cmd
+    }
+
     /// URL-encode the project path (`group/sub/repo` → `group%2Fsub%2Frepo`) for
     /// the `projects/:id` API segment. Only `/` needs encoding in project paths.
     fn project_seg(loc: &GitLoc) -> Option<String> {
@@ -549,19 +584,19 @@ impl CiProvider for GitlabCi {
         if let Some(b) = branch {
             endpoint.push_str(&format!("&ref={b}"));
         }
-        let json = run_cli(&mut loc.cli_command("glab", &["api", &endpoint]))?;
+        let json = run_cli(&mut self.command(loc, &["api", &endpoint]))?;
         Ok(parse_gitlab_pipelines(&json))
     }
 
     fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         // Pipeline header + its jobs (two calls; the jobs carry the states).
-        let pipe_json = run_cli(&mut loc.cli_command(
-            "glab",
+        let pipe_json = run_cli(&mut self.command(
+            loc,
             &["api", &format!("projects/{proj}/pipelines/{run_id}")],
         ))?;
-        let jobs_json = run_cli(&mut loc.cli_command(
-            "glab",
+        let jobs_json = run_cli(&mut self.command(
+            loc,
             &["api", &format!("projects/{proj}/pipelines/{run_id}/jobs")],
         ))?;
         let mut run = parse_gitlab_pipeline_detail(&pipe_json).ok_or(CiError::NotFound)?;
@@ -571,8 +606,8 @@ impl CiProvider for GitlabCi {
 
     fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
-        run_bounded_log(&mut loc.cli_command(
-            "glab",
+        run_bounded_log(&mut self.command(
+            loc,
             &["api", &format!("projects/{proj}/jobs/{job_id}/trace")],
         ))
     }
@@ -597,7 +632,7 @@ impl CiProvider for GitlabCi {
             args.push(format!("{k}={v}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_cli(&mut loc.cli_command("glab", &argv)).map(|_| ())
+        run_cli(&mut self.command(loc, &argv)).map(|_| ())
     }
 
     fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
@@ -605,13 +640,13 @@ impl CiProvider for GitlabCi {
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
         let endpoint = format!("projects/{proj}/pipelines/{run_id}/retry");
-        run_cli(&mut loc.cli_command("glab", &["api", "-X", "POST", &endpoint])).map(|_| ())
+        run_cli(&mut self.command(loc, &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
     fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         let endpoint = format!("projects/{proj}/pipelines/{run_id}/cancel");
-        run_cli(&mut loc.cli_command("glab", &["api", "-X", "POST", &endpoint])).map(|_| ())
+        run_cli(&mut self.command(loc, &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
     fn caps(&self) -> CiCaps {
@@ -737,6 +772,38 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_config_token_is_in_child_environment_never_argv() {
+        let mut cfg = CiConfig::default();
+        cfg.gitlab.token = "fixture-secret-token".into();
+        cfg.gitlab.host = "gitlab.example.test".into();
+        let client = GitlabCi::from_config(&cfg);
+        let loc = GitLoc::for_worktree(std::path::Path::new("."));
+        let command = client.command(&loc, &["api", "projects/g%2Fr/pipelines"]);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg.contains("fixture-secret-token")));
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get("GITLAB_TOKEN").and_then(Option::as_deref),
+            Some("fixture-secret-token")
+        );
+        assert_eq!(
+            env.get("GITLAB_HOST").and_then(Option::as_deref),
+            Some("gitlab.example.test")
+        );
+    }
+
+    #[test]
     fn parse_gh_run_list() {
         let json = r#"[
           {"databaseId":123,"name":"CI","workflowName":"CI","displayTitle":"fix: thing",
@@ -849,13 +916,13 @@ mod tests {
     #[test]
     fn caps_are_set() {
         assert!(GithubCi.caps().steps);
-        assert!(!GitlabCi.caps().steps);
+        assert!(!GitlabCi::default().caps().steps);
         assert!(GithubCi.caps().trigger);
-        assert!(GitlabCi.caps().cancel);
+        assert!(GitlabCi::default().caps().cancel);
         // GitLab's pipeline `retry` can't scope to failed jobs; offering the
         // distinction anyway would silently retry everything.
         assert!(GithubCi.caps().rerun_failed);
-        assert!(!GitlabCi.caps().rerun_failed);
+        assert!(!GitlabCi::default().caps().rerun_failed);
     }
 }
 

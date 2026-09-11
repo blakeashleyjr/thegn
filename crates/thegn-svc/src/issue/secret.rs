@@ -3,76 +3,21 @@
 //! Parses the config string once into a typed [`SecretRef`] (with
 //! [`BareAs::Literal`] — the historic issue/CI-token meaning,
 //! `thegn_core::secretref`) and resolves it. `keyring:` needs OS
-//! credential-store access, which svc cannot link, so the host installs a
-//! resolver at startup ([`install_keyring_resolver`]); without one a `keyring:`
-//! ref resolves to `None` with an actionable warning rather than being sent to
-//! the tracker as a literal API key.
+//! credential-store access, which svc cannot link, so the host installs the
+//! shared typed resolver at startup (`crate::secret::install_resolver`);
+//! without one a `keyring:` ref fails closed rather than being sent to the
+//! tracker as a literal API key.
 //!
 //! Never logs a value: every diagnostic names the ref via
 //! [`SecretRef::audit_name`], which is value-free by construction.
 
-use std::sync::OnceLock;
-
 use thegn_core::secretref::{BareAs, SecretRef};
-
-/// The process's `keyring:` resolver, installed by the host at startup.
-///
-/// A plain `fn` pointer (not a boxed closure) keeps this `Send + Sync` with no
-/// allocation, exactly like `thegn-host`'s `forge_handle` process-global.
-static KEYRING: OnceLock<fn(&str) -> Option<String>> = OnceLock::new();
-
-/// Install the process's `keyring:` resolver. Idempotent — the first call wins.
-///
-/// The resolver is handed the **canonical ref string** (`"keyring:<account>"`),
-/// not a bare account name, so the host can pass it straight to its
-/// string-taking broker (`thegn-host`'s `secret::resolve_for`) — which parses a
-/// bare string as an env-var *name* and would otherwise read the wrong thing
-/// entirely.
-///
-/// A process that never installs (any unit test, any svc-only consumer)
-/// degrades to env/file/literal resolution only, which is today's behaviour
-/// minus the bogus literal.
-pub fn install_keyring_resolver(f: fn(&str) -> Option<String>) {
-    // `get_or_init` rather than `set(..)`: a second install is a no-op by
-    // design (the first wins), and this says so without an ignored `Result`
-    // (the ignored-result ratchet, `test/ignored-result-ratchet.txt`).
-    KEYRING.get_or_init(|| f);
-}
 
 /// Resolve one `[[issue_accounts]]`/`[issues.*]` token to its value. `None`
 /// when the ref is empty, names nothing, or cannot be resolved here.
 pub(crate) fn resolve_account_token(raw: &str, provider: &str) -> Option<String> {
     let r = SecretRef::parse(raw, BareAs::Literal);
-    if !r.is_configured() {
-        return None;
-    }
-    match &r {
-        SecretRef::Env { var } => std::env::var(var).ok().filter(|s| !s.trim().is_empty()),
-        SecretRef::File { path } => {
-            let p = thegn_core::util::expand_tilde(path);
-            std::fs::read_to_string(&p)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        }
-        SecretRef::Literal(v) => Some(v.expose().to_string()).filter(|s| !s.is_empty()),
-        SecretRef::Keyring { .. } => match KEYRING.get() {
-            // `audit_name()` of a keyring ref IS its canonical config string
-            // (`keyring:<account>`) and carries no secret — see the install
-            // contract above for why the hook gets the whole ref, not the
-            // account alone.
-            Some(f) => f(&r.audit_name()),
-            None => {
-                tracing::warn!(
-                    target: "thegn::secret",
-                    provider,
-                    secret_ref = %r.audit_name(),
-                    "keyring: tracker token cannot be resolved here — install the host resolver, or use file:/env:"
-                );
-                None
-            }
-        },
-    }
+    crate::secret::resolve_ref(&r, &format!("issues:{provider}"))
 }
 
 #[cfg(test)]
@@ -136,21 +81,5 @@ mod tests {
         let got = resolve_account_token("keyring:__tg_issue_never_set__", "linear");
         assert_ne!(got.as_deref(), Some("keyring:__tg_issue_never_set__"));
         assert_eq!(got, None);
-    }
-
-    /// This is the only test that installs the process-global resolver, so its
-    /// hook is always the one in effect afterwards.
-    #[test]
-    fn installed_hook_resolves_keyring() {
-        // The hook sees the canonical ref string, not a bare account name.
-        fn hook(secret_ref: &str) -> Option<String> {
-            (secret_ref == "keyring:work-linear").then(|| "lin_from_keyring".to_string())
-        }
-        install_keyring_resolver(hook);
-        assert_eq!(
-            resolve_account_token("keyring:work-linear", "linear").as_deref(),
-            Some("lin_from_keyring")
-        );
-        assert_eq!(resolve_account_token("keyring:other", "linear"), None);
     }
 }
