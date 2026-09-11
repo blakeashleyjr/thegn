@@ -722,7 +722,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [x] 185. Declarative config (KDL/TOML)
 - [x] 186. Project-level in-repo config
 - [x] 187. Live reload
-- [x] 188. Validation + error surfacing
+- [x] 188. Validation + error surfacing _(advisory severity repair: THE-569, `openspec/changes/preserve-config-validation-severity/`)_
 - [x] 189. Config layering — global→profile→workspace→project
 - [~] 190. Secrets references (not inline)
 - [ ] 191. Migration on version bump
