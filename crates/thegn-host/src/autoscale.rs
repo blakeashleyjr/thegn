@@ -98,7 +98,7 @@ pub(crate) fn provision_managed(
     // Register: a DB host def (merged into the config catalog on next load;
     // `db_host_binding` synthesizes a binding for THIS process) + the
     // authoritative capacity spec from the template.
-    let hc = engine_host_config(&ip);
+    let hc = engine_host_config(&name, &ip)?;
     db.put_host_def(&name, &hc, unix_now())
         .context("persist engine host def")?;
     db.capacity_put(&HostCapacityRow {
@@ -159,11 +159,19 @@ pub(crate) fn provision_managed(
 /// The `[host.*]`-shaped def for an engine-created box: ssh as root with the
 /// managed keypair, host key accepted on first connect (a fresh VM's key is
 /// unknown by definition), runtime install pre-consented (thegn owns it).
-fn engine_host_config(ip: &str) -> HostConfig {
-    let identity = crate::agent::sprite_ssh_keypair()
-        .map(|(path, _)| path.to_string_lossy().into_owned())
+fn engine_host_config(name: &str, ip: &str) -> Result<HostConfig> {
+    let identity = thegn_core::managed_ssh::list()?
+        .into_iter()
+        .find(|record| record.instance == name)
+        .map(|record| record.key_path)
+        .or_else(|| {
+            crate::agent::sprite_ssh_keypair()
+                .ok()
+                .map(|(path, _)| path)
+        })
+        .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
-    HostConfig {
+    Ok(HostConfig {
         reach: HostReach::Ssh,
         install_runtime: InstallConsent::Auto,
         ssh: EnvSshConfig {
@@ -180,7 +188,7 @@ fn engine_host_config(ip: &str) -> HostConfig {
             ..EnvSshConfig::default()
         },
         ..HostConfig::default()
-    }
+    })
 }
 
 /// Binding for an engine host def persisted this session (the loaded Config
@@ -442,7 +450,7 @@ mod tests {
 
     #[test]
     fn engine_host_config_shape() {
-        let hc = engine_host_config("203.0.113.7");
+        let hc = engine_host_config("missing-test-instance", "203.0.113.7").unwrap();
         assert_eq!(hc.reach, HostReach::Ssh);
         assert_eq!(hc.install_runtime, InstallConsent::Auto);
         assert_eq!(hc.ssh.host, "root@203.0.113.7");

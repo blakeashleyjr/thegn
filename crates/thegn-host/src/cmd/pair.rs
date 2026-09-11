@@ -15,7 +15,7 @@ pub enum PairAction {
     /// Mint a single-use pairing code and print its pairing URL. The code is
     /// shown ONCE (only its hash is stored).
     New {
-        /// Scopes the redeemed token will hold (csv of read,write,git,exec,admin).
+        /// Scopes the redeemed token will hold (csv of read,write,git,merge_add,exec,admin).
         #[arg(long, default_value = "read")]
         scope: String,
         /// Human label shown in `pair list` and approval prompts.
@@ -78,7 +78,7 @@ pub fn run(cfg: &Config, action: PairAction) -> Result<()> {
             let scopes = ScopeSet::parse(&scope);
             if scopes.is_empty() {
                 anyhow::bail!(
-                    "no valid scopes in {scope:?} (use csv of read,write,git,exec,admin)"
+                    "no valid scopes in {scope:?} (use csv of read,write,git,merge_add,exec,admin)"
                 );
             }
             let now = now_ms();

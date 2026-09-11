@@ -290,7 +290,11 @@ fn reset_terminal() {
 pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     let (ip, user, transport) = resolve(cfg, name, interactive)?;
-    let (key, _pubkey) = crate::agent::sprite_ssh_keypair()?;
+    let key = thegn_core::managed_ssh::read_unique_instance("machine0", name)?
+        .map(|record| record.key_path)
+        .filter(|path| path.exists())
+        .map(Ok)
+        .unwrap_or_else(|| crate::agent::sprite_ssh_keypair().map(|pair| pair.0))?;
     let shim = ssh_shim::SshShim {
         name: name.to_string(),
         ip,

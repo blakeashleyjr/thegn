@@ -8329,6 +8329,7 @@ dependencies = [
  "unic-langid",
  "unicode-width 0.2.2",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -78,7 +78,11 @@ impl SshShim {
     /// per-instance host key, quiet. Pure over `self` (unit-tested).
     pub fn base_argv(&self) -> Vec<String> {
         let kh = registry::known_hosts_path(&self.name);
-        let control = control_socket_path();
+        // The identity is part of the multiplexing namespace. This is
+        // load-bearing for managed-key rotation: a connection made with the
+        // old key must never satisfy the replacement-key connectivity proof by
+        // reusing the old key's already-authenticated ControlMaster.
+        let control = control_socket_path_for(&self.key_path);
         let mut v: Vec<String> = vec![
             "ssh".into(),
             // Hermetic: a thegn-managed remote pins its own identity, known_hosts,
@@ -247,6 +251,14 @@ impl SshShim {
 /// so location is irrelevant beyond length + privacy. The `tg-ssh` dir is created
 /// 0700 best-effort.
 pub fn control_socket_path() -> PathBuf {
+    control_socket_path_for(PathBuf::from("managed").as_path())
+}
+
+/// Control socket template scoped to one SSH identity. OpenSSH's `%C` expands
+/// from local-host/remote-host/port/user, but deliberately does not include the
+/// identity file; without this suffix, key rotation could appear verified by
+/// riding an old key's existing master connection.
+pub fn control_socket_path_for(key_path: &std::path::Path) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -259,7 +271,8 @@ pub fn control_socket_path() -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)); // best-effort: 0700 on the socket dir; failure leaves the pre-existing perms
     }
-    base.join("cm-%C")
+    let identity = thegn_core::util::short_hash(&key_path.to_string_lossy(), 12);
+    base.join(format!("cm-{identity}-%C"))
 }
 
 /// Parse `find -printf '%y\t%s\t%f\n'` output into entries. Pure (unit-tested).
@@ -352,6 +365,18 @@ mod tests {
             "per-instance known_hosts pinned: {expected:?}"
         );
         assert_eq!(argv.last().unwrap(), "root@203.0.113.7");
+    }
+
+    #[test]
+    fn control_master_namespace_includes_the_identity_path() {
+        let old = control_socket_path_for(std::path::Path::new("/state/ssh/key"));
+        let replacement = control_socket_path_for(std::path::Path::new("/state/ssh/key.next-123"));
+        assert_ne!(old, replacement);
+        assert_eq!(
+            old,
+            control_socket_path_for(std::path::Path::new("/state/ssh/key"))
+        );
+        assert!(old.to_string_lossy().ends_with("-%C"));
     }
 
     #[test]

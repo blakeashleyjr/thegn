@@ -457,4 +457,13 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["mine"]);
     }
+
+    #[test]
+    fn sshd_init_fails_closed_on_key_custody_setup_errors() {
+        assert!(SSHD_INIT.starts_with("set -e;"));
+        assert!(SSHD_INIT.contains("chmod 700 /root/.ssh"));
+        assert!(SSHD_INIT.contains("chmod 600 /root/.ssh/authorized_keys"));
+        assert!(!SSHD_INIT.contains("chmod 700 /root/.ssh || true"));
+        assert!(!SSHD_INIT.contains("chmod 600 /root/.ssh/authorized_keys || true"));
+    }
 }

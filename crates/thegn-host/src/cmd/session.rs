@@ -10,7 +10,7 @@ use std::path::Path;
 use thegn_core::agent_task::template_vars;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
-use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
+use thegn_core::issue::{AgentDispatchStatus, DispatchRunPublishOutcome, NewDispatch};
 use thegn_core::outln;
 use thegn_core::pipeline_resume;
 use thegn_core::pipeline_run;
@@ -124,14 +124,17 @@ pub enum SessionAction {
         /// `dispatch put --chunk … --force`.
         #[arg(long, requires = "stage", conflicts_with = "resume_work")]
         chunk: Option<String>,
-        /// Resume a failed (or otherwise unfinished) pipeline roster row
-        /// (THE-86): the row is looked up offline, its stage's prompt
-        /// template is re-rendered against the row's own bindings, and a
-        /// fresh headless dispatch is opened whose prompt asks the worker to
-        /// FINISH the stage — write and commit the handoff artifact —
-        /// rather than restart the task. The row is the record: its stage,
-        /// issue, worktree and agent are reused, the new row is parented on
-        /// it, and any failure after the insert marks the new row `failed`.
+        /// Resume an eligible unfinished pipeline roster row (THE-86): an
+        /// unstamped spawning/running row is refused because its worker may
+        /// still be live; otherwise the source is reconciled and the fresh
+        /// finisher atomically claims the stage's duplicate/capacity gate.
+        /// Its stage prompt is rendered against the new finisher row's exact
+        /// id/artifact bindings and asks the worker to FINISH the stage —
+        /// write and commit that handoff artifact — rather than restart it.
+        /// The source row is the record: its
+        /// stage, issue, worktree and agent are reused, the new row is
+        /// parented on it, and any failure after the insert marks the new row
+        /// `failed`.
         /// Conflicts with every flag that would contradict the row
         /// (`--bind`/`--adopt`/`--json` still shape the new session).
         #[arg(
@@ -1045,9 +1048,10 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     .await;
     match opened {
         Ok(info) => {
-            // 12. Stamp the row with its session + artifact, then `running`.
-            db.stamp_dispatch_run(row_id, &info.id, &artifact)?;
-            db.update_dispatch_status(row_id, AgentDispatchStatus::Running)?;
+            // 12. Publish session + artifact + `running` in one DB write. If
+            // that fails after the daemon opened the process, compensate by
+            // killing the process and closing the visible row as failed.
+            publish_opened_dispatch(&db, client, row_id, &info.id, &artifact).await?;
             // 13. Print.
             if d.json {
                 outln!(
@@ -1083,6 +1087,77 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     }
 }
 
+/// Publish an already-opened daemon session on its roster row. The daemon and
+/// SQLite cannot share one transaction, so every missing/stale/error outcome is
+/// compensated immediately by killing the new session. A concurrent roster
+/// verdict is preserved; an otherwise-owned queued/spawning row is failed
+/// best-effort. Cleanup failures are included in the returned error.
+async fn publish_opened_dispatch(
+    db: &Db,
+    client: &ControlClient,
+    row_id: i64,
+    session_id: &str,
+    artifact: &str,
+) -> Result<()> {
+    let (publish_detail, reconcile_owned_row) =
+        match db.publish_dispatch_run(row_id, session_id, artifact) {
+            Ok(DispatchRunPublishOutcome::Published) => return Ok(()),
+            Ok(DispatchRunPublishOutcome::Missing) => {
+                ("the reserved roster row disappeared".to_string(), false)
+            }
+            Ok(DispatchRunPublishOutcome::StateChanged { status }) => (
+                format!(
+                    "the roster row moved to {} while the session was opening",
+                    status.as_str()
+                ),
+                false,
+            ),
+            Err(error) => (format!("the roster publication failed: {error:#}"), true),
+        };
+    let kill = client.kill(session_id).await;
+    let row_detail = if reconcile_owned_row {
+        let note = if kill.is_ok() {
+            "session opened but its roster identity could not be published; launch was torn down"
+        } else {
+            "session opened but its roster identity could not be published; launch teardown failed"
+        };
+        let mut result: Result<bool> = Ok(false);
+        for expected in [AgentDispatchStatus::Queued, AgentDispatchStatus::Spawning] {
+            match db.compare_and_set_dispatch_status(
+                row_id,
+                expected,
+                AgentDispatchStatus::Failed,
+                Some(note),
+            ) {
+                Ok(true) => {
+                    result = Ok(true);
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        match result {
+            Ok(true) => "reserved row marked failed".to_string(),
+            Ok(false) => "reserved row changed concurrently and was preserved".to_string(),
+            Err(error) => format!("row reconciliation failed: {error:#}"),
+        }
+    } else {
+        "newer roster state preserved".to_string()
+    };
+    let kill_detail = match kill {
+        Ok(()) => "session teardown succeeded".to_string(),
+        Err(error) => format!("session teardown failed: {error:#}"),
+    };
+    anyhow::bail!(
+        "dispatch {row_id} opened session {session_id} but could not publish its roster identity: \
+         {publish_detail}; {kill_detail}; {row_detail}"
+    )
+}
+
 /// The row checks `--resume-work` answers offline, before any daemon contact
 /// (the smoke suite checks them daemon-free): the row must exist — same
 /// wording `dispatch set-status` uses — and must be a pipeline row, because a
@@ -1094,8 +1169,8 @@ fn resume_row_checks(row_id: i64, row: Option<&thegn_core::issue::AgentDispatch>
     // A finished or retired verdict is not a resume point: the Lead already
     // closed the stage (done/merged) or walked away from it (abandoned), and
     // re-driving it would spawn a second worker over closed work. `failed` —
-    // the resume feature's whole point — and the active/parked states stay
-    // resumable.
+    // the resume feature's whole point — and eligible parked/exited states
+    // stay resumable after their source row is reconciled deliberately.
     if matches!(
         row.status,
         AgentDispatchStatus::Done | AgentDispatchStatus::Merged | AgentDispatchStatus::Abandoned
@@ -1104,6 +1179,23 @@ fn resume_row_checks(row_id: i64, row: Option<&thegn_core::issue::AgentDispatch>
             "dispatch {row_id} is {} — a finished or retired verdict is not a resume \
              point; --resume-work re-drives a failed or parked row",
             row.status.as_str()
+        );
+    }
+    if matches!(
+        row.status,
+        AgentDispatchStatus::Spawning | AgentDispatchStatus::Running
+    ) && row.exit_code.is_none()
+        && row.exited_at_ms.is_none()
+    {
+        anyhow::bail!(
+            "dispatch {row_id} is {} with no exit stamp — its worker may still be live; wait for \
+             its exit or close it deliberately before --resume-work",
+            row.status.as_str()
+        );
+    }
+    if row.status == AgentDispatchStatus::Unknown {
+        anyhow::bail!(
+            "dispatch {row_id} has an unknown status — reconcile the roster row before --resume-work"
         );
     }
     row.stage
@@ -1129,6 +1221,40 @@ fn resume_preflight(cfg: &Config, db: &Db, row_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Reconcile one eligible source row and atomically admit its finisher. Kept
+/// separate from the daemon open so capacity/de-dup behavior is testable with
+/// an in-memory roster and no process.
+fn claim_resume_dispatch(
+    db: &Db,
+    row: &thegn_core::issue::AgentDispatch,
+    stage: &thegn_core::config_pipeline::PipelineStage,
+    worktree: &str,
+    agent_name: &str,
+) -> Result<i64> {
+    match db.claim_resume_dispatch(
+        row.id,
+        row.status,
+        NewDispatch {
+            issue_id: &row.issue_id,
+            worktree_path: worktree,
+            agent_name,
+            stage: row.stage.as_deref(),
+            parent_id: Some(row.id),
+            session_id: None,
+            artifact_path: None,
+            chunk_path: row.chunk_path.as_deref(),
+        },
+        stage.concurrency,
+    )? {
+        Ok(id) => Ok(id),
+        Err(decision) => anyhow::bail!(
+            "resume dispatch refused; row {} was left unchanged: {}",
+            row.id,
+            decision.reason()
+        ),
+    }
+}
+
 /// The previous session's final screen as non-blank lines. Best-effort by
 /// design: ANY failure — the row never opened a session, the daemon's
 /// tombstone was reaped, the daemon cannot answer — degrades to an empty
@@ -1148,13 +1274,60 @@ async fn screen_tail_of(client: &ControlClient, session_id: Option<&str>) -> Vec
     }
 }
 
-/// The `--resume-work` composition (THE-86): turn a failed (or otherwise
-/// unfinished) pipeline row into a fresh finisher dispatch. Any non-terminal
-/// row is resumable — including one whose session exited 0, because an exit-0
-/// with no committed artifact is precisely the "session exit ≠ done" failure
-/// the done gate catches, and the finisher is its recovery. A row the Lead
-/// already closed (`done` / `merged` / `abandoned`) is refused — a finished
-/// or retired verdict is not a resume point (`resume_row_checks`).
+/// All inputs needed to render a resume worker's final prompt. Keeping the
+/// binding assembly here makes the identity invariant testable: `{artifact}`
+/// and `{row}` always name the new finisher row, while the source
+/// attempt's artifact is recovery context and the new row's parent artifact.
+struct ResumePromptInput<'a> {
+    stage: &'a thegn_core::config_pipeline::PipelineStage,
+    facts: &'a IssueFacts,
+    branch: &'a str,
+    worktree: &'a str,
+    target_artifact: &'a str,
+    source_artifact: &'a str,
+    row_id: i64,
+    source_artifact_exists: bool,
+    source_artifact_tracked: bool,
+    git_status: &'a str,
+    diff_stat: &'a str,
+    screen_tail: &'a [String],
+}
+
+fn render_resume_prompt(input: &ResumePromptInput<'_>) -> Result<String> {
+    let vars = stage_task_vars(
+        input.facts,
+        input.branch,
+        input.worktree,
+        &input.stage.name,
+        input.target_artifact,
+        input.source_artifact,
+        input.row_id,
+    );
+    let stage_prompt =
+        crate::stage_prompt::render_stage(&input.stage.name, &input.stage.prompt, &vars)?;
+    Ok(pipeline_resume::finisher_prompt(
+        &pipeline_resume::FinisherInput {
+            stage_name: &input.stage.name,
+            stage_prompt: &stage_prompt,
+            artifact: input.source_artifact,
+            target_artifact: input.target_artifact,
+            artifact_exists: input.source_artifact_exists,
+            artifact_tracked: input.source_artifact_tracked,
+            git_status: input.git_status,
+            diff_stat: input.diff_stat,
+            screen_tail: input.screen_tail,
+        },
+    ))
+}
+
+/// The `--resume-work` composition (THE-86): turn an eligible failed, parked,
+/// queued, or positively exited pipeline row into a fresh finisher dispatch.
+/// An unstamped `spawning`/`running` row is refused because its worker may
+/// still be live. An exit-0 row with no committed artifact remains eligible:
+/// that is precisely the "session exit ≠ done" failure the done gate catches.
+/// A row the Lead already closed (`done` / `merged` / `abandoned`) is refused
+/// because a finished or retired verdict is not a resume point
+/// (`resume_row_checks`).
 ///
 /// The row is the record: its stage, issue, worktree and agent are reused
 /// verbatim (which harness a retry should run on is config's business, or a
@@ -1188,69 +1361,52 @@ async fn resume_work(
         .to_string_lossy()
         .into_owned();
     let branch = resolve_branch(&db, &wt);
-    // 4. The stage template re-render, bound to the ROW's own facts: the
-    //    {artifact} binding is the row's artifact path (the one the previous
-    //    worker was told to write), and {parent_artifact} comes from the
-    //    parent row when there is one. An empty render is refused with the
-    //    same message a fresh dispatch uses.
-    let artifact_old = row.artifact_path.clone().unwrap_or_default();
-    let parent_row = match row.parent_id {
-        Some(pid) => db.get_dispatch(pid)?,
-        None => None,
-    };
-    let parent_artifact = parent_row
-        .as_ref()
-        .and_then(|r| r.artifact_path.clone())
-        .unwrap_or_default();
+    // 4. Gather everything that belongs to the source attempt before claiming
+    //    the finisher: its artifact state and final screen are recovery
+    //    context, never the new row's completion target.
     let facts = gather_issue_facts(client, stage, &row.issue_id).await?;
-    let vars = stage_task_vars(
-        &facts,
-        &branch,
-        &wt,
-        &stage.name,
-        &artifact_old,
-        &parent_artifact,
-        row.id,
-    );
-    // The shared render step (render + invalid-template wrap + empty-prompt
-    // refusal), so the finisher's re-render and a fresh dispatch's render
-    // refuse identically — one helper, three callers (open_stage, resume,
-    // the daemon's relaunch).
-    let stage_prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
-    // 5. Finisher facts: the row's artifact state (the same filesystem/git
+    // 5. Finisher facts: the source row's artifact state (the same filesystem/git
     //    read the done gate applies), the worktree's git state, and the
     //    previous session's final screen.
-    let vf = crate::cmd::dispatch::verify_facts(&row);
+    let source_vf = crate::cmd::dispatch::verify_facts(&row);
     let git_status = git_out(Path::new(&wt), &["status", "--porcelain"]).unwrap_or_default();
     let diff_stat = git_out(Path::new(&wt), &["diff", "--stat"]).unwrap_or_default();
     let screen_tail = screen_tail_of(client, row.session_id.as_deref()).await;
-    let prompt = pipeline_resume::finisher_prompt(&pipeline_resume::FinisherInput {
-        stage_name: &stage.name,
-        stage_prompt: &stage_prompt,
-        artifact: vf.artifact.as_deref().unwrap_or(""),
-        artifact_exists: vf.exists,
-        artifact_tracked: vf.tracked,
+    // 6. Reconcile the source before competing for a fresh slot. Failed rows
+    //    are already terminal/free; queued, parked, and positively exited rows
+    //    are deliberately closed as superseded. A compare-and-set preserves a
+    //    newer supervisor verdict that lands between preflight and this point.
+    // The finisher is a new dispatch, so it must use the same atomic admission
+    // policy as `session open --stage`: capacity and equivalent active work are
+    // checked inside BEGIN IMMEDIATE with the insert. If another monitor takes
+    // the freed slot first, this attempt is safely refused rather than
+    // oversubscribing the stage.
+    let new_row = claim_resume_dispatch(&db, &row, stage, &wt, &agent_name)?;
+    let artifact = pipeline_run::artifact_path(&row.issue_id, &stage.name, new_row);
+    // 6b. Only now is the finisher's row-derived identity known. Render its
+    // stage prompt with the NEW row id/artifact and the source artifact as its
+    // parent handoff. If rendering fails, close the reservation rather than
+    // leaving a queued row which a monitor would try forever.
+    let prompt = match render_resume_prompt(&ResumePromptInput {
+        stage,
+        facts: &facts,
+        branch: &branch,
+        worktree: &wt,
+        target_artifact: &artifact,
+        source_artifact: source_vf.artifact.as_deref().unwrap_or(""),
+        row_id: new_row,
+        source_artifact_exists: source_vf.exists,
+        source_artifact_tracked: source_vf.tracked,
         git_status: &git_status,
         diff_stat: &diff_stat,
         screen_tail: &screen_tail,
-    });
-    // 6. Row before open (D5) — parented on the row being resumed. The new
-    //    row's artifact path is keyed to the NEW row id (D6), so parallel
-    //    coders stay collide-free.
-    let new_row = db.put_agent_dispatch(NewDispatch {
-        issue_id: &row.issue_id,
-        worktree_path: &wt,
-        agent_name: &agent_name,
-        stage: row.stage.as_deref(),
-        parent_id: Some(row.id),
-        session_id: None,
-        artifact_path: None,
-        // The finisher finishes THE SAME chunk the failed row ran under, so
-        // the retry row carries its chunk_path too — the scope picture (and
-        // the gate's sibling set) survives the resume (THE-86 chunk 3).
-        chunk_path: row.chunk_path.as_deref(),
-    })?;
-    let artifact = pipeline_run::artifact_path(&row.issue_id, &stage.name, new_row);
+    }) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            let _ = db.update_dispatch_status(new_row, AgentDispatchStatus::Failed);
+            return Err(error).with_context(|| format!("dispatch {new_row} failed"));
+        }
+    };
     // 7. Open — the same headless, stage-layered launch a fresh dispatch
     //    builds, seeded with the finisher prompt instead of the bare task.
     let opened = async {
@@ -1289,8 +1445,7 @@ async fn resume_work(
     .await;
     match opened {
         Ok(info) => {
-            db.stamp_dispatch_run(new_row, &info.id, &artifact)?;
-            db.update_dispatch_status(new_row, AgentDispatchStatus::Running)?;
+            publish_opened_dispatch(&db, client, new_row, &info.id, &artifact).await?;
             if json {
                 outln!(
                     "{}",
@@ -1525,8 +1680,14 @@ mod open_stage_tests {
 
 #[cfg(test)]
 mod resume_work_tests {
-    use super::resume_row_checks;
+    use super::{
+        IssueFacts, ResumePromptInput, claim_resume_dispatch, render_resume_prompt,
+        resume_row_checks,
+    };
+    use thegn_core::config_pipeline::PipelineStage;
+    use thegn_core::db::Db;
     use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
+    use thegn_core::store::NotificationStore;
 
     fn row(stage: Option<&str>) -> AgentDispatch {
         AgentDispatch {
@@ -1606,7 +1767,6 @@ mod resume_work_tests {
         for status in [
             AgentDispatchStatus::Failed,
             AgentDispatchStatus::WaitingHuman,
-            AgentDispatchStatus::Running,
         ] {
             let mut r = row(Some("code"));
             r.status = status;
@@ -1617,6 +1777,168 @@ mod resume_work_tests {
                 status.as_str()
             );
         }
+    }
+
+    #[test]
+    fn an_unstamped_spawning_or_running_row_cannot_spawn_a_second_worker() {
+        for status in [AgentDispatchStatus::Spawning, AgentDispatchStatus::Running] {
+            let mut r = row(Some("code"));
+            r.status = status;
+            let msg = resume_row_checks(7, Some(&r)).unwrap_err().to_string();
+            assert!(msg.contains("may still be live"), "{msg}");
+            assert!(msg.contains("no exit stamp"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_positively_exited_running_row_is_eligible_for_a_finisher() {
+        let mut r = row(Some("code"));
+        r.status = AgentDispatchStatus::Running;
+        r.exited_at_ms = Some(123);
+        assert_eq!(resume_row_checks(7, Some(&r)).unwrap(), "code");
+    }
+
+    #[test]
+    fn a_finisher_prompt_targets_its_new_row_not_the_source_attempt() {
+        let stage = PipelineStage {
+            name: "code".into(),
+            prompt: "write {artifact}; report {row}; previous {parent_artifact}".into(),
+            ..Default::default()
+        };
+        let facts = IssueFacts {
+            number: "THE-121".into(),
+            title: String::new(),
+            body: String::new(),
+            url: String::new(),
+        };
+        let prompt = render_resume_prompt(&ResumePromptInput {
+            stage: &stage,
+            facts: &facts,
+            branch: "tg/the-121",
+            worktree: "/wt/121",
+            target_artifact: ".thegn/pipeline/THE-121/code/9.md",
+            source_artifact: ".thegn/pipeline/THE-121/code/7.md",
+            row_id: 9,
+            source_artifact_exists: true,
+            source_artifact_tracked: true,
+            git_status: "",
+            diff_stat: "",
+            screen_tail: &[],
+        })
+        .unwrap();
+        assert!(prompt.contains(
+            "write .thegn/pipeline/THE-121/code/9.md; report 9; previous .thegn/pipeline/THE-121/code/7.md"
+        ));
+        assert!(prompt.contains(
+            "This finisher's required handoff artifact is `.thegn/pipeline/THE-121/code/9.md`"
+        ));
+        assert!(prompt.contains(
+            "Leave the handoff artifact at `.thegn/pipeline/THE-121/code/9.md` committed"
+        ));
+        assert!(!prompt.contains(
+            "Leave the handoff artifact at `.thegn/pipeline/THE-121/code/7.md` committed"
+        ));
+    }
+
+    #[test]
+    fn a_parked_source_is_reconciled_before_its_finisher_claims_the_slot() {
+        let db = Db::open_memory().unwrap();
+        let source = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                chunk_path: Some("chunk-1.md"),
+                ..thegn_core::issue::NewDispatch::new("linear:THE-121", "/wt/121", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::WaitingHuman)
+            .unwrap();
+        let source_row = db.get_dispatch(source).unwrap().unwrap();
+        let stage = PipelineStage {
+            name: "code".into(),
+            concurrency: 1,
+            ..Default::default()
+        };
+
+        let finisher = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude")
+            .expect("reconciled source frees its slot");
+        let source_after = db.get_dispatch(source).unwrap().unwrap();
+        let finisher = db.get_dispatch(finisher).unwrap().unwrap();
+        assert_eq!(source_after.status, AgentDispatchStatus::Failed);
+        assert_eq!(finisher.status, AgentDispatchStatus::Queued);
+        assert_eq!(finisher.parent_id, Some(source));
+        assert_eq!(finisher.chunk_path.as_deref(), Some("chunk-1.md"));
+    }
+
+    #[test]
+    fn a_capacity_refusal_rolls_back_source_reconciliation() {
+        let db = Db::open_memory().unwrap();
+        let source = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                ..thegn_core::issue::NewDispatch::new("linear:THE-121", "/wt/121", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::WaitingHuman)
+            .unwrap();
+        db.put_agent_dispatch(thegn_core::issue::NewDispatch {
+            stage: Some("code"),
+            artifact_path: Some("other.md"),
+            ..thegn_core::issue::NewDispatch::new("linear:OTHER", "/wt/other", "claude")
+        })
+        .unwrap();
+        let source_row = db.get_dispatch(source).unwrap().unwrap();
+        let stage = PipelineStage {
+            name: "code".into(),
+            concurrency: 1,
+            ..Default::default()
+        };
+
+        let error = claim_resume_dispatch(&db, &source_row, &stage, "/wt/121", "claude")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at capacity"), "{error}");
+        assert!(error.contains("left unchanged"), "{error}");
+        assert_eq!(db.list_dispatches().unwrap().len(), 2);
+        assert_eq!(
+            db.get_dispatch(source).unwrap().unwrap().status,
+            AgentDispatchStatus::WaitingHuman
+        );
+        assert!(db.dispatch_notes(source, None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_concurrent_source_verdict_is_preserved_without_a_finisher() {
+        let db = Db::open_memory().unwrap();
+        let source = db
+            .put_agent_dispatch(thegn_core::issue::NewDispatch {
+                stage: Some("code"),
+                ..thegn_core::issue::NewDispatch::new("linear:THE-121", "/wt/121", "claude")
+            })
+            .unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::WaitingHuman)
+            .unwrap();
+        let stale_source = db.get_dispatch(source).unwrap().unwrap();
+        db.update_dispatch_status(source, AgentDispatchStatus::Done)
+            .unwrap();
+        let stage = PipelineStage {
+            name: "code".into(),
+            concurrency: 2,
+            ..Default::default()
+        };
+
+        let error = claim_resume_dispatch(&db, &stale_source, &stage, "/wt/121", "claude")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed from waiting_human to done"),
+            "{error}"
+        );
+        assert!(error.contains("newer verdict was preserved"), "{error}");
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+        assert_eq!(
+            db.get_dispatch(source).unwrap().unwrap().status,
+            AgentDispatchStatus::Done
+        );
     }
 }
 

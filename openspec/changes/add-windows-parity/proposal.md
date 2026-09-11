@@ -14,10 +14,10 @@ a Linux thegn:
   /proc reader).
 - **Secret-file permissions**: new `thegn_core::fsperm`
   (`restrict_to_owner` / `restrict_dir_to_owner`) — `chmod 0600/0700` on
-  unix, owner-only DACL via `icacls /inheritance:r /grant:r <user>:F` on
-  Windows (subprocess over a page of unsafe `SetNamedSecurityInfoW`,
-  matching the repo's subprocess-fallback philosophy; these are best-effort
-  fallback files — keyring/Credential Manager is the primary store). Rewires
+  unix, owner-only protected DACL via a fixed PowerShell ACL script on Windows
+  (the DACL is rebuilt so inherited and pre-existing explicit grants cannot
+  survive; subprocess over a page of unsafe `SetNamedSecurityInfoW`, matching
+  the repo's subprocess-fallback philosophy). Rewires
   the token file+dir (host `secret.rs`), share credentials, and VPN keys.
 - **Sandbox backend policy on Windows**: `pick_backend` declines OCI
   runtimes on native Windows _even when Docker/Podman Desktop is installed_ —

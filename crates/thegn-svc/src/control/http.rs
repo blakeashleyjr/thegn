@@ -303,6 +303,16 @@ pub(super) fn authed_target(
         audit(&ctx, verb, target, AuditOutcome::NoScope);
         return Err(e.into_response());
     }
+    if matches!(verb, Verb::MergeAdd)
+        && !thegn_core::control::route_to_host_token_allows_worktree(ctx.scopes, &ctx.label, target)
+    {
+        audit(&ctx, verb, target, AuditOutcome::NoScope);
+        return Err(error_json(
+            StatusCode::FORBIDDEN,
+            ControlErrorCode::NoScope,
+            "route-to-host token is not authorized for this worktree",
+        ));
+    }
     // A mutating call that authorized: record its attribution. (The action's
     // own errors surface in the handler's response; this record proves who was
     // allowed to invoke what, against which resource.)
@@ -1579,6 +1589,7 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
         thegn_core::control::Scope::Read,
         thegn_core::control::Scope::Write,
         thegn_core::control::Scope::Git,
+        thegn_core::control::Scope::MergeAdd,
         thegn_core::control::Scope::Exec,
         thegn_core::control::Scope::Admin,
     ] {
@@ -1597,7 +1608,7 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
 /// [`EventFrame`]. Read scope.
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct EventsQuery {
-    /// Comma-separated [`thegn_core::control_wire::FEED_KINDS`].
+    /// Comma-separated [`thegn_core::control_wire::OBSERVER_KINDS`].
     kinds: Option<String>,
     session: Option<String>,
     /// `1`, `true`, `0`, or `false`; omitted means false.
@@ -1644,6 +1655,11 @@ pub(super) async fn events_ws(
 }
 
 async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, filter: FeedFilter) {
+    // Register before the awaited hello write. Otherwise a slow/buffering
+    // client can observe its hello yet lose an arbitrary interval of events
+    // before the receiver exists. Hello still goes out first; any intervening
+    // broadcast frames remain queued behind it.
+    let mut rx = state.api.subscribe();
     let hello = hello_frame(&state, &ctx);
     if socket
         .send(Message::Binary(hello.encode().into()))
@@ -1652,7 +1668,6 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx, f
     {
         return;
     }
-    let mut rx = state.api.subscribe();
     loop {
         match rx.recv().await {
             Ok(frame) => {
@@ -1691,9 +1706,10 @@ pub(super) async fn events_sse(
     headers: HeaderMap,
     Query(q): Query<EventsQuery>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::Events) {
-        return r;
-    }
+    let ctx = match authed(&state, &headers, Verb::Events) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     let filter = match q.into_filter() {
         Ok(filter) => filter,
         Err(message) => {
@@ -1704,8 +1720,16 @@ pub(super) async fn events_sse(
             );
         }
     };
+    let hello = hello_frame(&state, &ctx);
+    let initial = futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(
+            sse::Event::default()
+                .event(hello.kind())
+                .data(frame_json(&hello).to_string()),
+        )
+    });
     let rx = state.api.subscribe();
-    let stream = futures_util::stream::unfold((rx, filter), |(mut rx, filter)| async move {
+    let events = futures_util::stream::unfold((rx, filter), |(mut rx, filter)| async move {
         loop {
             match rx.recv().await {
                 Ok(frame) => {
@@ -1730,7 +1754,7 @@ pub(super) async fn events_sse(
             }
         }
     });
-    sse::Sse::new(stream).into_response()
+    sse::Sse::new(initial.chain(events)).into_response()
 }
 
 /// The JSON envelope of an [`EventFrame`] for SSE / `--json` consumers.
@@ -1845,7 +1869,19 @@ mod control_events {
         }
         .into_filter()
         .unwrap_err();
-        assert!(typo.contains("unknown event kind"));
+        assert!(typo.contains("unknown observer event kind"));
+        assert!(typo.contains("supported observer kinds:"));
+
+        for attach_only in ["snapshot", "delta"] {
+            let error = EventsQuery {
+                kinds: Some(attach_only.into()),
+                ..Default::default()
+            }
+            .into_filter()
+            .unwrap_err();
+            assert!(error.contains("unknown observer event kind"));
+            assert!(error.contains("supported observer kinds:"));
+        }
 
         let bad_lag = EventsQuery {
             signal_lag: Some("sometimes".into()),
@@ -1854,6 +1890,19 @@ mod control_events {
         .into_filter()
         .unwrap_err();
         assert!(bad_lag.contains("invalid signal_lag"));
+    }
+
+    #[test]
+    fn websocket_and_sse_share_the_complete_observer_vocabulary() {
+        for kind in thegn_core::control_wire::OBSERVER_KINDS {
+            let filter = EventsQuery {
+                kinds: Some((*kind).into()),
+                ..Default::default()
+            }
+            .into_filter()
+            .unwrap();
+            assert_eq!(filter.kinds, Some(vec![(*kind).to_string()]));
+        }
     }
 
     #[test]

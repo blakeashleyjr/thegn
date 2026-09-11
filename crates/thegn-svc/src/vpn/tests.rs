@@ -114,6 +114,18 @@ fn tailscale_missing_auth_key_errors() {
 }
 
 #[test]
+fn sidecar_argv_uses_owner_only_env_file_not_secret_values() {
+    let plan = for_provider(&spec(ts_cfg()))
+        .sidecar_plan("tg-secret-argv")
+        .unwrap();
+    let env_path = std::path::Path::new("/state/thegn/vpn/tg-secret-argv/environment");
+    let args = sidecar_run_args(&plan, &[], Some(env_path));
+    assert_eq!(flag_val(&args, "--env-file"), env_path.to_str());
+    assert!(!args.iter().any(|arg| arg.contains("tskey-abc123")));
+    assert!(!args.iter().any(|arg| arg == "-e"));
+}
+
+#[test]
 fn wireguard_plan_mounts_conf_and_adds_tun() {
     let mut c = VpnConfig {
         provider: VpnProviderKind::Wireguard,
@@ -249,7 +261,6 @@ fn zerotier_plan_requires_network_and_joins_it() {
     );
     c.zerotier = ZerotierConfig {
         network_id: "8056c2e21c000001".into(),
-        ..ZerotierConfig::default()
     };
     let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert_eq!(

@@ -12,8 +12,9 @@ and `HOSTNAME`/`COMPUTERNAME` fallbacks in
 `:963-990`. The daemon consumes that shared helper
 (`crates/thegn-host/src/daemon/mod.rs:252-260,337-349`). The only account-name
 uses are `USER` for the bare-host remote default
-(`crates/thegn-core/src/remote.rs:147-164`) and `USERNAME` for the Windows
-`icacls` grant target (`crates/thegn-core/src/fsperm.rs:43-68`).
+(`crates/thegn-core/src/remote.rs:147-164`). Windows owner-only DACL setup now
+asks `WindowsIdentity` for the current SID inside a fixed PowerShell ACL script;
+it does not consume account-name metadata.
 
 There is no `whoami` direct dependency in the workspace dependency declarations
 (`Cargo.toml:35-220`) or package entries in `Cargo.lock`.
@@ -29,9 +30,10 @@ the existing degradation behavior and adds no unsafe surface.
 
 Linux and musl keep their current procfs/fallback hostname path and do not
 gain an identity lookup. macOS continues to use the non-Linux `sysinfo`
-hostname fallback, while mingw/Windows retains `USERNAME` for the existing
-`icacls` seam. A new direct crate would add build and binary cost across those
-target graphs without replacing a current dependency or a user-visible need.
+hostname fallback, while mingw/Windows uses the platform PowerShell security
+API for the existing ACL seam. A new direct crate would add build and binary
+cost across those target graphs without replacing a current dependency or a
+user-visible need.
 
 ## Reopen condition
 

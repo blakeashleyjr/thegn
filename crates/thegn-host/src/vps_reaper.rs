@@ -123,6 +123,15 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
                 age / 60
             ));
             if let Some(p) = crate::provider_factory::vps_provider_for(pc, &inst.name) {
+                if let Err(error) =
+                    crate::remote_enqueue_auth::revoke_for_sandbox(pc, &inst.name, None)
+                {
+                    thegn_core::msg::warn(&format!(
+                        "vps reaper: refusing to destroy {} because route-to-host credential revocation failed: {error:#}",
+                        inst.name
+                    ));
+                    continue;
+                }
                 use thegn_svc::provider::RemoteProvider;
                 match crate::agent::block_on_provider(|| async { p.destroy(&inst.name).await }) {
                     // destroy() clears the ledger + known_hosts; also drop any

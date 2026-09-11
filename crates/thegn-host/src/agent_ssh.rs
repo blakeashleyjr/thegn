@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use thegn_core::config::Config;
+use thegn_core::config::{Config, ManagedKeyScope};
 use thegn_core::db::Db;
 use thegn_core::remote::GitLoc;
 use thegn_core::repo;
@@ -24,27 +24,83 @@ pub const SPRITE_SSHD_PORT: u16 = 2222;
 // off-loop: ssh-keygen runs once, on the provisioning path (spawn_blocking /
 // pool thread / CLI); loop-side callers (sprite_ssh_connect) find the key
 // already cached and skip the subprocess.
-#[expect(clippy::disallowed_methods)]
 pub fn sprite_ssh_keypair() -> anyhow::Result<(PathBuf, String)> {
+    managed_ssh_keypair(ManagedKeyScope::Shared, "sprites", "shared")
+}
+
+/// The managed keypair for one configured custody scope. Per-account key names
+/// are deterministic from the provider plus its non-secret credential-ref name;
+/// shared mode preserves the historic `sprite_ed25519` path.
+pub fn managed_ssh_keypair(
+    scope: ManagedKeyScope,
+    provider: &str,
+    account: &str,
+) -> anyhow::Result<(PathBuf, String)> {
     let dir = thegn_core::util::thegn_dir().join("ssh");
     std::fs::create_dir_all(&dir)?;
-    let key = dir.join("sprite_ed25519");
-    let pubp = dir.join("sprite_ed25519.pub");
-    if !pubp.exists() {
-        let out = std::process::Command::new("ssh-keygen")
-            .args(["-t", "ed25519", "-N", "", "-C", "thegn-sprite", "-q", "-f"])
-            .arg(&key)
-            .output()
-            .map_err(|e| anyhow::anyhow!("ssh-keygen: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "ssh-keygen failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
+    thegn_core::fsperm::restrict_dir_to_owner(&dir)?;
+    let basename = scope.managed_key_basename(provider, account);
+    let key = dir.join(basename);
+    generate_managed_keypair_at(&key, &format!("thegn-{provider}-{account}"))?;
+    thegn_core::fsperm::restrict_to_owner(&key)?;
+    let pubp = PathBuf::from(format!("{}.pub", key.display()));
     let pubkey = std::fs::read_to_string(&pubp)?.trim().to_string();
     Ok((key, pubkey))
+}
+
+/// Load an already-authorized managed keypair without ever generating a new
+/// key at the recorded path. Custody records describe remote authorization, so
+/// a missing local half must fail closed rather than silently creating a key
+/// the remote has never seen.
+pub fn existing_managed_ssh_keypair(key: &Path) -> anyhow::Result<(PathBuf, String)> {
+    let public = PathBuf::from(format!("{}.pub", key.display()));
+    if !key.is_file() || !public.is_file() {
+        anyhow::bail!(
+            "recorded managed SSH keypair is unavailable at {}",
+            key.display()
+        );
+    }
+    thegn_core::fsperm::restrict_to_owner(key)?;
+    let public_key = std::fs::read_to_string(&public)?.trim().to_string();
+    if public_key.is_empty() {
+        anyhow::bail!(
+            "recorded managed SSH public key is empty at {}",
+            public.display()
+        );
+    }
+    Ok((key.to_path_buf(), public_key))
+}
+
+/// Generate a no-passphrase ed25519 pair at an exact path. Existing complete
+/// pairs are reused; a half-pair is rejected instead of silently overwriting
+/// custody material. Used by initial provisioning and rotation staging.
+#[expect(clippy::disallowed_methods)]
+pub fn generate_managed_keypair_at(key: &Path, comment: &str) -> anyhow::Result<()> {
+    let public = PathBuf::from(format!("{}.pub", key.display()));
+    match (key.exists(), public.exists()) {
+        (true, true) => return Ok(()),
+        (true, false) | (false, true) => anyhow::bail!(
+            "managed SSH keypair is incomplete at {} (refusing to overwrite)",
+            key.display()
+        ),
+        (false, false) => {}
+    }
+    if let Some(parent) = key.parent() {
+        std::fs::create_dir_all(parent)?;
+        thegn_core::fsperm::restrict_dir_to_owner(parent)?;
+    }
+    let out = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", comment, "-q", "-f"])
+        .arg(key)
+        .output()
+        .map_err(|error| anyhow::anyhow!("ssh-keygen: {error}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
 }
 
 /// Idempotent in-sandbox setup for the SSH-over-WSS transport (run during
@@ -56,12 +112,12 @@ pub fn sprite_sshd_setup_script(pubkey: &str) -> String {
     format!(
         "command -v sshd >/dev/null 2>&1 || nix profile install nixpkgs#openssh 2>/dev/null || \
            (export DEBIAN_FRONTEND=noninteractive; sudo apt-get update -y && sudo apt-get install -y openssh-server) 2>/dev/null || true; \
-         mkdir -p \"$HOME/.ssh\"; chmod 700 \"$HOME/.ssh\"; \
-         touch \"$HOME/.ssh/authorized_keys\"; chmod 600 \"$HOME/.ssh/authorized_keys\"; \
-         grep -qF {pk} \"$HOME/.ssh/authorized_keys\" 2>/dev/null || printf '%s\\n' {pk} >> \"$HOME/.ssh/authorized_keys\"; \
-         [ -f \"$HOME/.ssh/sprite_host_ed25519\" ] || ssh-keygen -t ed25519 -N '' -q -f \"$HOME/.ssh/sprite_host_ed25519\"; \
-         printf 'Port {port}\\nListenAddress 127.0.0.1\\nHostKey %s/.ssh/sprite_host_ed25519\\nAuthorizedKeysFile %s/.ssh/authorized_keys\\nPasswordAuthentication no\\nPidFile %s/.ssh/sprite_sshd.pid\\nPrintMotd no\\n' \"$HOME\" \"$HOME\" \"$HOME\" > \"$HOME/.ssh/sprite_sshd_config\"; \
-         true",
+         command -v sshd >/dev/null 2>&1 || exit 73; \
+         mkdir -p \"$HOME/.ssh\" || exit 73; chmod 700 \"$HOME/.ssh\" || exit 73; \
+         touch \"$HOME/.ssh/authorized_keys\" || exit 73; chmod 600 \"$HOME/.ssh/authorized_keys\" || exit 73; \
+         grep -qF {pk} \"$HOME/.ssh/authorized_keys\" 2>/dev/null || printf '%s\\n' {pk} >> \"$HOME/.ssh/authorized_keys\" || exit 73; \
+         [ -f \"$HOME/.ssh/sprite_host_ed25519\" ] || ssh-keygen -t ed25519 -N '' -q -f \"$HOME/.ssh/sprite_host_ed25519\" || exit 73; \
+         printf 'Port {port}\\nListenAddress 127.0.0.1\\nHostKey %s/.ssh/sprite_host_ed25519\\nAuthorizedKeysFile %s/.ssh/authorized_keys\\nPasswordAuthentication no\\nPidFile %s/.ssh/sprite_sshd.pid\\nPrintMotd no\\n' \"$HOME\" \"$HOME\" \"$HOME\" > \"$HOME/.ssh/sprite_sshd_config\" || exit 73",
         port = SPRITE_SSHD_PORT,
     )
 }
@@ -127,7 +183,39 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
     if pc.connect != ProviderConnect::Ssh {
         return None;
     }
-    let (key, _pubkey) = match sprite_ssh_keypair() {
+    let sandbox_id =
+        crate::provider_factory::provider_sandbox_name(cfg, worktree, &environment.name)
+            .filter(|id| !id.is_empty());
+    let recorded = match sandbox_id
+        .as_deref()
+        .map(|id| crate::provider_factory::managed_custody_record(pc, id))
+        .transpose()
+    {
+        Ok(record) => record.flatten(),
+        Err(error) => {
+            thegn_core::msg::warn(&format!("connect=ssh: {error}"));
+            return None;
+        }
+    };
+    let account = crate::provider_factory::managed_key_account(pc);
+    let keypair = if let Some(record) = recorded {
+        existing_managed_ssh_keypair(&record.key_path)
+    } else if sandbox_id
+        .as_deref()
+        .is_some_and(crate::provider_workdir::is_provisioned_locally)
+    {
+        // A pre-custody-ledger Sprite was provisioned with the historical
+        // shared key. Preserve that identity until an explicit reprovision;
+        // there is no record tying that old authorization to this worktree.
+        sprite_ssh_keypair()
+    } else {
+        managed_ssh_keypair(
+            cfg.credentials.ssh.managed_key_scope,
+            &pc.provider,
+            &account,
+        )
+    };
+    let (key, _pubkey) = match keypair {
         Ok(k) => k,
         Err(e) => {
             thegn_core::msg::warn(&format!(
@@ -140,8 +228,7 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
     // can only authenticate as itself), so ssh logs in as that user. The workdir
     // resolves against the sandbox's cached `$HOME` (workspace lives under the
     // login user's home), falling back to the bare default when uncached.
-    let workdir = crate::provider_factory::provider_sandbox_name(cfg, worktree, &environment.name)
-        .filter(|s| !s.is_empty())
+    let workdir = sandbox_id
         .map(|id| crate::provider_workdir::resolve(pc, &id))
         .unwrap_or_else(|| pc.sync_workdir());
     Some((key, "sprite".to_string(), workdir))
@@ -157,11 +244,58 @@ pub fn sprite_ssh_argv(
     user: &str,
     workdir: &str,
 ) -> Vec<String> {
-    let proxy = format!(
+    sprite_ssh_argv_inner(thegn_exe, worktree, key, user, workdir, None)
+}
+
+/// Rotation proof variant: the proxy subprocess must resolve back to the exact
+/// custody tuple whose replacement key is being tested. A moved worktree or a
+/// same-named Sprite in another account therefore fails closed before opening
+/// the WSS transport.
+pub(crate) struct SpriteSshCustody<'a> {
+    pub provider: &'a str,
+    pub account: &'a str,
+    pub instance: &'a str,
+}
+
+pub(crate) fn sprite_ssh_argv_for_custody(
+    thegn_exe: &str,
+    worktree: &str,
+    key: &Path,
+    user: &str,
+    workdir: &str,
+    custody: SpriteSshCustody<'_>,
+) -> Vec<String> {
+    sprite_ssh_argv_inner(
+        thegn_exe,
+        worktree,
+        key,
+        user,
+        workdir,
+        Some((custody.provider, custody.account, custody.instance)),
+    )
+}
+
+fn sprite_ssh_argv_inner(
+    thegn_exe: &str,
+    worktree: &str,
+    key: &Path,
+    user: &str,
+    workdir: &str,
+    custody: Option<(&str, &str, &str)>,
+) -> Vec<String> {
+    let mut proxy = format!(
         "{} sprite-proxy {}",
         thegn_core::util::sh_quote(thegn_exe),
         thegn_core::util::sh_quote(worktree),
     );
+    if let Some((provider, account, instance)) = custody {
+        proxy.push_str(&format!(
+            " --expected-provider {} --expected-account {} --expected-instance {}",
+            thegn_core::util::sh_quote(provider),
+            thegn_core::util::sh_quote(account),
+            thegn_core::util::sh_quote(instance),
+        ));
+    }
     // Run the user's login shell, not the sprite's default `$SHELL` (which is
     // bash → no zsh / no host-parity prompt). The same runtime probe chain the
     // native pane uses (`command -v zsh && exec zsh -l; …`) so the uploaded
@@ -178,6 +312,21 @@ pub fn sprite_ssh_argv(
     let mut v: Vec<String> = vec![
         "ssh".into(),
         "-tt".into(),
+        // Hermetic managed identity. In particular, disabling multiplexing is
+        // load-bearing for rotation: a staged-key proof must not reuse an
+        // already-authenticated connection made with the retiring key.
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ControlPath=none".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
         "-o".into(),
         format!("ProxyCommand={proxy}"),
     ];

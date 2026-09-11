@@ -79,6 +79,7 @@ pub(crate) fn snapshot(
                 hostname: row.hostname,
                 endpoint: row.endpoint,
                 tcp_addr: row.tcp_addr.unwrap_or_default(),
+                control_origin: row.control_origin.unwrap_or_default(),
                 started_at_ms: row.started_at,
                 heartbeat_at: row.heartbeat_at,
                 daemon_id: row.daemon_id,
@@ -96,6 +97,7 @@ pub(crate) fn snapshot(
         hostname: row.hostname,
         endpoint: row.endpoint,
         tcp_addr: row.tcp_addr.unwrap_or_default(),
+        control_origin: row.control_origin.unwrap_or_default(),
         started_at_ms: row.started_at,
         heartbeat_at: row.heartbeat_at,
         daemon_id: row.daemon_id,
@@ -159,6 +161,29 @@ pub(crate) fn probe_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::db::Db;
+    use thegn_core::store::{ControlStore, DaemonRow};
+
+    #[test]
+    fn snapshot_keeps_listener_and_public_origin_distinct() {
+        let db = Db::open_memory().unwrap();
+        db.put_daemon(&DaemonRow {
+            daemon_id: "serve".into(),
+            pid: 1,
+            scope: "/state".into(),
+            endpoint: "/run/thegn.sock".into(),
+            tcp_addr: Some("127.0.0.1:5380".into()),
+            control_origin: Some("https://thegn.example".into()),
+            hostname: "host".into(),
+            version: "test".into(),
+            started_at: 1_000,
+            heartbeat_at: 2_000,
+        })
+        .unwrap();
+        let status = snapshot(&db, "/state", 2_001).unwrap();
+        assert_eq!(status.tcp_addr, "127.0.0.1:5380");
+        assert_eq!(status.control_origin, "https://thegn.example");
+    }
 
     #[test]
     fn chip_state_precedence() {

@@ -371,21 +371,19 @@ fn control_endpoint_from_env() -> Option<(String, String)> {
 /// local row.
 fn add_via_host(url: &str, token: &str, worktrees: Vec<String>) -> Result<()> {
     use thegn_svc::control::client::{ControlAddr, ControlClient};
-    let targets: Vec<String> = if worktrees.is_empty() {
-        vec![
-            std::env::var("THEGN_WORKTREE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .context(
-                    "route_to_host: $THEGN_WORKTREE is unset, so this worktree can't be \
-                     identified to the host",
-                )?,
-        ]
-    } else {
-        worktrees
-    };
-    let client = ControlClient::new(ControlAddr::Tcp {
-        addr: url.to_string(),
+    let host_worktree = std::env::var("THEGN_WORKTREE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context(
+            "route_to_host: $THEGN_WORKTREE is unset, so this worktree can't be identified to the host",
+        )?;
+    anyhow::ensure!(
+        worktrees.is_empty() || (worktrees.len() == 1 && worktrees.first() == Some(&host_worktree)),
+        "route_to_host accepts only this provisioned worktree ({host_worktree}); omit the path argument"
+    );
+    let targets = [host_worktree];
+    let client = ControlClient::new(ControlAddr::HttpOrigin {
+        origin: url.to_string(),
         token: token.to_string(),
     });
     let rt = tokio::runtime::Runtime::new().context("tokio runtime for route-to-host enqueue")?;
@@ -401,6 +399,30 @@ fn add_via_host(url: &str, token: &str, worktrees: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Select the authority model from the repo-resolved config whenever the
+/// in-sandbox clone can identify its repository. Provisioning uses that same
+/// layer; consulting only the raw global table here would invert a trusted
+/// `[workspace.<slug>.merge_queue] remote_mode` override. If the current
+/// directory no longer resolves but a provisioned return credential exists,
+/// the credential is the fail-closed evidence that provisioning selected the
+/// host authority model.
+fn effective_remote_mode(
+    cfg: &Config,
+    current_repo: Option<&Path>,
+    has_return_credential: bool,
+) -> thegn_core::config::MergeRemoteMode {
+    current_repo.map_or_else(
+        || {
+            if has_return_credential {
+                thegn_core::config::MergeRemoteMode::RouteToHost
+            } else {
+                cfg.merge_queue.remote_mode
+            }
+        },
+        |root| cfg.repo_merge_queue(root).remote_mode,
+    )
+}
+
 fn add(cfg: &Config, worktrees: Vec<String>, all: bool) -> Result<()> {
     add_quiet(cfg, worktrees, all, false)
 }
@@ -411,14 +433,22 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
     // route_to_host: a provisioned sprite (host control endpoint + token in its
     // env) sends the enqueue to the host's daemon so the host's queue owns the
     // row. `--all` enumerates local branches, so it stays on the local path.
-    if !all
-        // Global table on purpose: this branch runs BEFORE a repo root is known
-        // (the enqueue is being forwarded to another host), so there is nothing
-        // to resolve against yet.
-        && cfg.merge_queue.remote_mode == thegn_core::config::MergeRemoteMode::RouteToHost
-        && let Some((url, token)) = control_endpoint_from_env()
-    {
-        return add_via_host(&url, &token, worktrees);
+    if !all {
+        let endpoint = control_endpoint_from_env();
+        let current_repo = repo_root().ok();
+        let mode = effective_remote_mode(cfg, current_repo.as_deref(), endpoint.is_some());
+        if mode == thegn_core::config::MergeRemoteMode::RouteToHost
+            && let Some((url, token)) = endpoint
+        {
+            return add_via_host(&url, &token, worktrees);
+        }
+        if mode == thegn_core::config::MergeRemoteMode::RouteToHost
+            && std::env::var("THEGN_REMOTE_ENV").as_deref() == Ok("1")
+        {
+            anyhow::bail!(
+                "route_to_host credential is missing: reprovision this environment after starting the secure host control endpoint; no local queue row was created"
+            );
+        }
     }
     let db = Db::open()?;
 
@@ -823,6 +853,63 @@ mod conflict_tests {
                 PathBuf::from("quote\"name.rs"),
                 PathBuf::from("line\nbreak.rs"),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn provisioned_remote_without_return_credential_fails_before_local_db() {
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("THEGN_REMOTE_ENV", "1"),
+            ("THEGN_CONTROL_URL", ""),
+            ("THEGN_CONTROL_TOKEN", ""),
+        ]);
+        let error = add_quiet(&Config::default(), Vec::new(), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("route_to_host credential is missing"));
+        assert!(error.contains("no local queue row was created"));
+    }
+
+    #[test]
+    fn trusted_repo_remote_mode_override_matches_provisioning_authority() {
+        let root = std::path::Path::new("/repos/acme");
+        let mut cfg = Config::default();
+        cfg.merge_queue.remote_mode = thegn_core::config::MergeRemoteMode::Push;
+        cfg.workspace.insert(
+            thegn_core::config::workspace_slug(root),
+            thegn_core::config::WorkspaceConfig {
+                merge_queue: thegn_core::config::MergeQueueOverlay {
+                    remote_mode: Some(thegn_core::config::MergeRemoteMode::RouteToHost),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            effective_remote_mode(&cfg, Some(root), false),
+            thegn_core::config::MergeRemoteMode::RouteToHost
+        );
+
+        cfg.merge_queue.remote_mode = thegn_core::config::MergeRemoteMode::RouteToHost;
+        cfg.workspace
+            .get_mut(&thegn_core::config::workspace_slug(root))
+            .unwrap()
+            .merge_queue
+            .remote_mode = Some(thegn_core::config::MergeRemoteMode::Push);
+        assert_eq!(
+            effective_remote_mode(&cfg, Some(root), true),
+            thegn_core::config::MergeRemoteMode::Push,
+            "repo-resolved push must ignore a stale return credential"
+        );
+        assert_eq!(
+            effective_remote_mode(&cfg, None, true),
+            thegn_core::config::MergeRemoteMode::RouteToHost,
+            "credential is the authority hint only when no repo can be resolved"
         );
     }
 }
