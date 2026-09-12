@@ -390,6 +390,13 @@
       "changes": [
         "pane-zoom-stack"
       ]
+    },
+    {
+      "issue": "THE-586",
+      "project": "Spec & Tracker Reconciliation",
+      "changes": [
+        "preserve-config-validation-severity"
+      ]
     }
   ]
 }
