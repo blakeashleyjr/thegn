@@ -446,6 +446,21 @@
       "issue": "THE-600",
       "project": "Runtime Security & Host Architecture",
       "changes": ["safe-merged-worktree-cleanup"]
+    },
+    {
+      "issue": "THE-606",
+      "project": "Runtime Security & Host Architecture",
+      "changes": ["require-canonical-merge-history"]
+    },
+    {
+      "issue": "THE-608",
+      "project": "Runtime Security & Host Architecture",
+      "changes": ["preserve-merge-drain-diagnostics"]
+    },
+    {
+      "issue": "THE-610",
+      "project": "Runtime Security & Host Architecture",
+      "changes": ["preserve-merge-drain-diagnostics"]
     }
   ]
 }

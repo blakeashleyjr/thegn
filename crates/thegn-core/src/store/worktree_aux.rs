@@ -6,6 +6,15 @@ use crate::db::{ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use anyhow::Result;
 
+/// Exact replacement of a queue transition's nullable metadata. `None` clears
+/// the column; these values confer no ownership or concurrency authority.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MergeStatusFields {
+    pub result_oid: Option<String>,
+    pub conflict_paths: Option<String>,
+    pub error_detail: Option<String>,
+}
+
 /// Settled fold outcomes only. This vocabulary is not evidence that Git advanced;
 /// the caller must establish advancement before selecting `Landed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +162,16 @@ pub trait WorktreeAuxStore {
         result_oid: Option<&str>,
         conflict_paths: Option<&str>,
         error_detail: Option<&str>,
+    ) -> Result<()>;
+
+    /// Replace all transition metadata on exactly one existing row. Missing
+    /// rows are errors. Preserve routing, nomination time and attempt budget.
+    /// This is not a claim/CAS: concurrent reassignment needs a separate guard.
+    fn replace_merge_status(
+        &self,
+        worktree: &str,
+        status: &str,
+        fields: &MergeStatusFields,
     ) -> Result<()>;
 
     /// Re-stamp a queued row's target branch to the one a run is actually

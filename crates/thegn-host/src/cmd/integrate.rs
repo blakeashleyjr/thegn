@@ -131,11 +131,10 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         );
         return Ok(());
     }
-    // Landing is effectively irreversible from the user's seat: `on_landed`
-    // defaults to removing the worktree and deleting the branch, which takes
-    // gitignored local state with it. So an interactive run confirms, and a
-    // non-interactive one must say `--yes` rather than have the prompt silently
-    // auto-answer itself.
+    // Advancing the target and committing selected dirty snapshots are writes
+    // that require confirmation. Cleanup is a separate explicit action; this
+    // command does not expire historical worktrees or delete their branches.
+    // Non-interactive callers must say `--yes` rather than silently confirming.
     if !args.yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {

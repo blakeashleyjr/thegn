@@ -56,13 +56,14 @@ pub fn target_host_label(loc: &GitLoc) -> Option<String> {
 /// Guard for the in-process drain/land/integrate paths: when the target repo
 /// lives on another host, the fold/gate/CAS can't run here (the object store is
 /// remote). Returns a ready-to-print message telling the user to run the drain
-/// co-located with the target repo — where Milestone A bundle-fetches any
-/// off-host branch tips in. `None` when the target is local (proceed normally).
+/// co-located with the target repo. Automatic remote/provider source fetching
+/// is currently unsupported by canonical-history admission; source work must
+/// be committed and integrated locally. `None` when the target is local.
 ///
 /// (The convenience path — the local UI auto-dispatching to a merge-drain daemon
 /// on the target host over ssh/iroh — needs remote-daemon reach that isn't wired
-/// yet; see tasks.md J128/129. Running the drain on the target host is the
-/// supported workflow until then.)
+/// yet; see tasks.md J128/129. Target-host execution is necessary but does not
+/// admit an off-host source.)
 pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Result<Option<String>> {
     let loc = target_loc(db, repo_root)?;
     let Some(host) = target_host_label(&loc) else {
@@ -71,8 +72,9 @@ pub fn remote_target_guard(db: &Db, repo_root: &Path) -> Result<Option<String>> 
     Ok(Some(format!(
         "This repo's target branch lives on another host ({host}). \
          The merge queue folds in the target's object store, so the drain must \
-         run there — open a shell on {host} and run `thegn merge drain` (branches \
-         queued from other hosts are fetched in automatically)."
+         run there. Commit and integrate source work locally on that host before \
+         running `thegn merge drain`: automatic remote/provider source fetching \
+         is currently unsupported by canonical-history admission."
     )))
 }
 
@@ -362,8 +364,61 @@ mod tests {
     }
 
     #[test]
-    fn route_to_host_uses_registered_remote_metadata_and_drains_distinct_store() {
-        let temp = tempfile::tempdir().unwrap();
+    fn route_to_host_enqueues_registered_metadata_but_holds_unverified_provider_source() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct RepoSnapshot {
+            refs: Vec<u8>,
+            index: Vec<u8>,
+            config: Vec<u8>,
+            base: Vec<u8>,
+            remote: Option<Vec<u8>>,
+        }
+
+        #[expect(clippy::disallowed_methods)] // private read-only Git snapshot
+        fn snapshot(path: &Path) -> RepoSnapshot {
+            let output = util::git_cmd(path).arg("show-ref").output().unwrap();
+            assert!(output.status.success());
+            let remote = match std::fs::read(path.join("remote.txt")) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("private tracked file snapshot failed: {error}"),
+            };
+            RepoSnapshot {
+                refs: output.stdout,
+                index: std::fs::read(path.join(".git/index")).unwrap(),
+                config: std::fs::read(path.join(".git/config")).unwrap(),
+                base: std::fs::read(path.join("base.txt")).unwrap(),
+                remote,
+            }
+        }
+
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-remote-queue-history-")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap();
+        let state = temp.path().join("state");
+        let config_root = temp.path().join("config");
+        let local = temp.path().join("local");
+        let global = temp.path().join("gitconfig");
+        let template = temp.path().join("template");
+        std::fs::write(&global, "").unwrap();
+        std::fs::create_dir(&template).unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", config_root.to_str().unwrap()),
+            ("APPDATA", config_root.to_str().unwrap()),
+            ("LOCALAPPDATA", local.to_str().unwrap()),
+            ("THEGN_DIR", temp.path().to_str().unwrap()),
+            ("THEGN_PROFILE", ""),
+            ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
+            ("GIT_TEMPLATE_DIR", template.to_str().unwrap()),
+        ]);
+        // CanonicalHistory opens its own registry: isolate and initialize it
+        // before any fixture Git or provider work, not just the two queue DBs.
+        let _private_registry = Db::open().unwrap();
         let host_repo = temp.path().join("host-repo");
         let remote_repo = temp.path().join("remote-repo");
         init_repo(&host_repo);
@@ -393,7 +448,45 @@ mod tests {
         let host_canonical_id = temp.path().join("absent-host-path");
         assert!(!host_canonical_id.exists());
         let host_id = host_canonical_id.to_string_lossy().into_owned();
-        let location = GitLoc::provider_db_string(&["env".into()], &remote_repo.to_string_lossy());
+        let provider_marker = temp.path().join("provider-must-not-run");
+        let provider_armed = temp.path().join("provider-armed");
+        let provider_audit = temp.path().join("provider-lookups");
+        assert_eq!(
+            util::git_out(&remote_repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "feat/remote"
+        );
+        let expected_query = util::sh_join(&[
+            "git".into(),
+            "-C".into(),
+            remote_repo.to_str().unwrap().into(),
+            "rev-parse".into(),
+            "--abbrev-ref".into(),
+            "HEAD".into(),
+        ]);
+        // Stub only the exact enqueue lookup; never evaluate a provider script
+        // or source login profiles. The repositories and queue writes are real.
+        let location = GitLoc::provider_db_string(
+            &[
+                "sh".into(),
+                "-c".into(),
+                concat!(
+                    "if [ -e \"$1\" ]; then printf invoked > \"$2\"; exit 97; fi; ",
+                    "if [ \"$#\" -ne 7 ] || [ \"$5\" != /bin/sh ] || ",
+                    "[ \"$6\" != -lc ] || [ \"$7\" != \"$4\" ]; then ",
+                    "printf unexpected > \"$2\"; exit 96; fi; ",
+                    "printf 'lookup\\n' >> \"$3\"; printf 'feat/remote\\n'"
+                )
+                .into(),
+                "private-provider-canary".into(),
+                provider_armed.to_str().unwrap().into(),
+                provider_marker.to_str().unwrap().into(),
+                provider_audit.to_str().unwrap().into(),
+                expected_query,
+            ],
+            &remote_repo.to_string_lossy(),
+        );
         let db = Db::open_at(&temp.path().join("host.db")).unwrap();
         db.put_worktree(
             "repo/feat-remote",
@@ -422,7 +515,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].worktree, host_id);
         assert_eq!(rows[0].location, location);
+        assert_eq!(rows[0].status, "queued");
+        assert_eq!(rows[0].agent_attempts, 0);
         assert!(remote_db.list_merge_queue().unwrap().is_empty());
+        assert_eq!(std::fs::read(&provider_audit).unwrap(), b"lookup\n");
+        assert!(!provider_marker.exists());
+        std::fs::write(&provider_armed, "drain must not invoke provider").unwrap();
+        let host_before = snapshot(&host_repo);
+        let source_before = snapshot(&remote_repo);
+        let mut progress = Vec::new();
 
         let item = crate::merge_driver::QueueItem {
             worktree: rows[0].worktree.clone(),
@@ -436,14 +537,44 @@ mod tests {
             &host_repo,
             &db,
             vec![item],
-            |_| {},
+            |step| progress.push(step.status.to_owned()),
         );
-        assert_eq!(outcome.landed, vec!["feat/remote"]);
-        assert_eq!(
-            std::fs::read_to_string(host_repo.join("remote.txt")).unwrap(),
-            "remote\n"
-        );
-        assert_eq!(db.list_merge_queue().unwrap()[0].status, "landed");
+        assert_eq!(outcome.gate_error, ["feat/remote"]);
+        assert!(outcome.landed.is_empty());
+        assert!(outcome.ready.is_empty());
+        assert!(outcome.deferred.is_empty());
+        assert!(outcome.needs_human.is_empty());
+        assert!(outcome.resyncs.is_empty());
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(progress, ["folding", "gate_error"]);
+        let after_rows = db.list_merge_queue().unwrap();
+        assert_eq!(after_rows.len(), 1);
+        let held = &after_rows[0];
+        assert_eq!(held.status, "gate_error");
+        assert_eq!(held.worktree, rows[0].worktree);
+        assert_eq!(held.branch, rows[0].branch);
+        assert_eq!(held.target_branch, rows[0].target_branch);
+        assert_eq!(held.location, rows[0].location);
+        assert_eq!(held.queued_at, rows[0].queued_at);
+        assert_eq!(held.agent_attempts, rows[0].agent_attempts);
+        assert!(held.result_oid.is_none());
+        assert!(held.conflict_paths.is_none());
+        let detail = held.error_detail.as_deref().unwrap();
+        if thegn_core::sandbox_backend::host_os() == thegn_core::sandbox_backend::HostOs::Windows {
+            assert!(detail.contains("verified local gate state is unsupported on this platform"));
+            assert!(!detail.contains("unsupported for remote/provider"));
+        } else {
+            assert!(
+                detail.contains(
+                    "canonical history is unsupported for remote/provider merge operations"
+                )
+            );
+        }
+        assert!(!provider_marker.exists());
+        assert_eq!(std::fs::read(&provider_audit).unwrap(), b"lookup\n");
+        assert_eq!(snapshot(&host_repo), host_before);
+        assert_eq!(snapshot(&remote_repo), source_before);
+        assert!(remote_db.list_merge_queue().unwrap().is_empty());
     }
 
     #[test]

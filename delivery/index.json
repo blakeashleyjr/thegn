@@ -716,6 +716,25 @@
       "summary": "THE-569 runtime severity repair landed; THE-586 reconciles its missing reciprocal delivery inventory."
     },
     {
+      "change": "preserve-merge-drain-diagnostics",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {"issue": "THE-608", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-610", "project": "Runtime Security & Host Architecture"}
+      ],
+      "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
+    },
+    {
+      "change": "require-canonical-merge-history",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {"issue": "THE-606", "project": "Runtime Security & Host Architecture"}
+      ],
+      "summary": "Require verified local canonical history across fold evidence and automatic cleanup; source review and focused/native gates remain pending."
+    },
+    {
       "change": "resurrect-model-proxy",
       "lifecycle": "active",
       "disposition": "residual-split",
