@@ -27,6 +27,8 @@ use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 
+#[path = "integrate_candidates.rs"]
+mod candidates;
 #[path = "integrate_persistence.rs"]
 mod persistence;
 pub(crate) use persistence::run_selected_fold;
@@ -517,6 +519,10 @@ pub struct Candidates {
     pub skipped_dirty: Vec<String>,
     /// branch name → its worktree path (the DB is keyed by worktree).
     pub worktrees: HashMap<String, String>,
+    /// Local Git identities captured during read-only discovery, never DB-routed.
+    pub(crate) identities: HashMap<String, candidates::LocalIdentity>,
+    /// Dirty candidates whose snapshot is pending explicit fold admission.
+    pub(crate) pending_snapshots: HashSet<String>,
 }
 
 /// The main checkout (first `git worktree list` entry) reachable from any path
@@ -539,7 +545,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     let mq = &cfg.repo_merge_queue(&repo_root);
     let target = resolve_target(mq, &repo_root);
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
-    let mut cands = candidate_branches(mq, &repo_root, &target, override_gpg)?;
+    let mut cands = candidate_branches(mq, &repo_root, &target)?;
     // The in-app `integrate` action reaches this too, so the opt-in guard lives
     // here rather than in the CLI: one keypress must not be able to land a branch
     // nobody nominated. A DB that won't open means we cannot prove anything was
@@ -550,7 +556,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
             .unwrap_or_default();
         hold_unenqueued(&mut cands, &enqueued);
     }
-    run_selected_fold(mq, &repo_root, &cands)
+    run_selected_fold(mq, &repo_root, &cands, override_gpg)
 }
 
 /// Hold back every candidate that was not explicitly enqueued, returning the
@@ -593,8 +599,8 @@ pub fn enqueued_worktrees(db: &Db, target_branch: &str) -> HashSet<String> {
 }
 
 /// Collect a repo's foldable worktree branches: every linked worktree (not the
-/// main checkout, not the target branch itself). Dirty worktrees are snapshotted
-/// into a commit when `snapshot_dirty`, else skipped.
+/// main checkout, not the target branch itself). This discovery never snapshots.
+/// Dirty worktrees are included for later admission when `snapshot_dirty`, else skipped.
 ///
 /// NOTE: "eligible" here means only *foldable* — clean, and not already the
 /// target. It carries no notion of whether the branch was meant to land. Callers
@@ -604,7 +610,6 @@ pub fn candidate_branches(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     target_branch: &str,
-    override_gpg: bool,
 ) -> Result<Candidates> {
     let porc = util::git_out(repo_root, &["worktree", "list", "--porcelain"])
         .context("git worktree list")?;
@@ -612,6 +617,8 @@ pub fn candidate_branches(
     let mut branches = Vec::new();
     let mut skipped_dirty = Vec::new();
     let mut worktrees = HashMap::new();
+    let mut identities = HashMap::new();
+    let mut pending_snapshots = HashSet::new();
     let mut wt_path = String::new();
     for line in porc.lines().chain(std::iter::once("")) {
         if let Some(p) = line.strip_prefix("worktree ") {
@@ -619,17 +626,26 @@ pub fn candidate_branches(
         } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
             let branch = b.to_string();
             if wt_path != main && branch != target_branch {
-                let loc = GitLoc::for_worktree(Path::new(&wt_path));
-                let tip = if cfg.snapshot_dirty {
-                    let msg = format!("snapshot: {branch} (fold-actor)");
-                    match CliGit.snapshot_worktree(&loc, &msg, override_gpg)? {
-                        Some(new_tip) => new_tip,
-                        None => CliGit.rev_parse(&loc, "HEAD")?,
-                    }
-                } else if CliGit.is_dirty(&loc).unwrap_or(false) {
+                let loc = GitLoc::Local(PathBuf::from(&wt_path));
+                let dirty = CliGit
+                    .is_dirty(&loc)
+                    .context("candidate dirty-state lookup failed")?;
+                if dirty && !cfg.snapshot_dirty {
                     skipped_dirty.push(branch.clone());
                     continue;
+                }
+                if dirty {
+                    pending_snapshots.insert(branch.clone());
+                }
+                let tip = if cfg.snapshot_dirty {
+                    let identity =
+                        candidates::LocalIdentity::read(repo_root, Path::new(&wt_path), &branch)?;
+                    let tip = identity.tip.clone();
+                    identities.insert(branch.clone(), identity);
+                    tip
                 } else {
+                    // Existing snapshot-disabled discovery stays a read-only
+                    // local tip lookup; it never needs snapshot-only authority.
                     CliGit.rev_parse(&loc, "HEAD")?
                 };
                 worktrees.insert(branch.clone(), wt_path.clone());
@@ -641,6 +657,8 @@ pub fn candidate_branches(
         branches,
         skipped_dirty,
         worktrees,
+        identities,
+        pending_snapshots,
     })
 }
 
@@ -1547,6 +1565,8 @@ mod enqueue_guard_tests {
                 })
                 .collect(),
             skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
             worktrees: pairs
                 .iter()
                 .map(|(b, w)| ((*b).to_string(), (*w).to_string()))
@@ -2166,6 +2186,8 @@ mod tests {
         let candidates = Candidates {
             branches,
             skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
             worktrees,
         };
         let observations = observe_outcomes(&db, &candidates).unwrap();
@@ -2516,6 +2538,8 @@ mod tests {
         let candidates = Candidates {
             branches: repo.branch_set(),
             skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
             worktrees: HashMap::from([("b1".into(), worktree.to_string_lossy().into_owned())]),
         };
         config.organize_folders = false;

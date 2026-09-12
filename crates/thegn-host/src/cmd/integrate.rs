@@ -64,7 +64,7 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     let target = integrate::resolve_target(mq, &repo_root);
 
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
-    let mut cands = integrate::candidate_branches(mq, &repo_root, &target, override_gpg)?;
+    let mut cands = integrate::candidate_branches(mq, &repo_root, &target)?;
     for s in &cands.skipped_dirty {
         outln!("  • skipped {s} (dirty — set [merge_queue] snapshot_dirty = true to fold it)");
     }
@@ -115,10 +115,20 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         }
     );
     for b in &cands.branches {
-        outln!("    {}", b.name);
+        outln!(
+            "    {}{}",
+            b.name,
+            if cands.pending_snapshots.contains(&b.name) {
+                " (dirty; snapshot only after confirmation)"
+            } else {
+                ""
+            }
+        );
     }
     if args.dry_run {
-        outln!("Dry run — nothing folded, nothing queued, no worktree touched.");
+        outln!(
+            "Dry run — no candidate snapshots, folds or queue changes. State initialization may occur."
+        );
         return Ok(());
     }
     // Landing is effectively irreversible from the user's seat: `on_landed`
@@ -129,9 +139,9 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     if !args.yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
-            outln!("Refusing to fold non-interactively without `--yes`.");
-            outln!("  Re-run with `--dry-run` to preview, or `--yes` to proceed.");
-            return Ok(());
+            anyhow::bail!(
+                "Refusing to fold non-interactively without `--yes`; use `--dry-run` to preview or `--yes` to proceed."
+            );
         }
         if !super::confirm(&format!(
             "Fold {} branch(es) into {target}?",
@@ -142,7 +152,7 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         }
     }
 
-    let report = integrate::run_selected_fold(mq, &repo_root, &cands)?;
+    let report = integrate::run_selected_fold(mq, &repo_root, &cands, override_gpg)?;
     // Explicit integration authorizes the listed candidates, not expiry of
     // unrelated historical worktrees. Cleanup remains an explicit sweep action.
 

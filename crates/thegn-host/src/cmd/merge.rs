@@ -460,8 +460,7 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
         let root = repo_root()?;
         let mq = &cfg.repo_merge_queue(&root);
         let target = integrate::resolve_target(mq, &root);
-        let override_gpg = cfg.repo_git(&root).override_gpg;
-        let cands = integrate::candidate_branches(mq, &root, &target, override_gpg)?;
+        let cands = integrate::candidate_branches(mq, &root, &target)?;
         for s in &cands.skipped_dirty {
             if !quiet {
                 outln!(
