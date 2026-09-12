@@ -729,7 +729,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets
+test: contract-ratchets test-live
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1072,11 +1072,10 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
 # THE CAP IS THE POINT. Verbose logging goes to the rotating file sink, which is
 # hard-bounded at `size_mb x (max_files + 1)` — 120 MB by default here. Raise the
 # verbosity and the cap SHRINKS your history, it never grows the footprint:
-#   just live level=trace        # firehose, same 120 MB ceiling
-#   just live size_mb=5 files=2  # 15 MB ceiling, for a nearly-full disk
-# The host role writes NOTHING to stderr (only `Role::Cli` does), so `stderr.log`
-# collects panics and the odd early-startup line — kilobytes, not a firehose.
-# It is truncated on each launch rather than appended, so it cannot creep either.
+#   just live trace             # firehose, same 120 MB ceiling
+#   just live debug 5 2         # 15 MB ceiling, for a nearly-full disk
+# Startup stderr is retained in each private recovery directory. It is separate
+# from the rotating application-log allowance, as are backups and build artifacts.
 #
 # For the compositor `THEGN_LOG` being set IS the request for logs, so the file
 # sink is forced on regardless of `[log] file` (a `Role::Host` has no stderr
@@ -1084,34 +1083,21 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
 # What the host did NOT honour until now was the rotation/dir knobs: it passed
 # hardcoded defaults, pinning the ceiling at 5 MB x 5 whatever you configured.
 #
-# THIS REPLACES YOUR RUNNING INSTANCE. Two hosts cannot share one state root
-# (one SQLite cache, one daemon socket, one set of pane sessions), so the
-# existing host + daemon + detached pane shells are rotated first — same reason
-# `start-term-release` does it. Panes come back on reattach; unsaved work in a
-# pane does not.
+# Linux/default profile: stage a build, then confirm backup/install/launch.
+# Close existing controllers and daemons yourself when prompted. Never kills
+# processes or overrides database migration authority. See docs/live-upgrades.md.
+[positional-arguments]
 live level="debug" size_mb="20" files="5":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    just release-profiling
-    state="${XDG_STATE_HOME:-$HOME/.local/state}"; logs="$state/thegn/logs"
-    mkdir -p "$logs"
-    echo "state:  $state/thegn (YOUR REAL db + session)" >&2
-    echo "logs:   $logs/thegn.log — capped at $(( {{size_mb}} * ({{files}} + 1) )) MB total ({{size_mb}} MB x {{files}} rotations + active)" >&2
-    echo "stderr: $logs/thegn-stderr.log (panics + backtrace; truncated per launch)" >&2
-    echo "perf:   THEGN_PERF=1 rollup; 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/" >&2
-    # Rotate the old instance: a stale daemon otherwise reattaches pane sessions
-    # from the PREVIOUS binary, so a rebuild silently never takes effect.
-    pkill -f "release/thegn[ ]daemon" 2>/dev/null || true
-    pkill -f "[t]hegn daemon --socket" 2>/dev/null || true
-    sleep 0.3
-    exec env \
-      "RUST_BACKTRACE=full" \
-      "THEGN_LOG={{level}},thegn={{level}},thegn_core={{level}},thegn_svc={{level}}" \
-      "THEGN_LOG_ROTATION_SIZE_MB={{size_mb}}" \
-      "THEGN_LOG_MAX_FILES={{files}}" \
-      "THEGN_PERF=1" \
-      "THEGN_DATABASE_MIGRATION_EXECUTABLE=$PWD/target/release/thegn" \
-      target/release/thegn 2>"$logs/thegn-stderr.log"
+    python3 -B scripts/live.py --level "$1" --size-mb "$2" --files "$3"
+
+# Read-only upgrade paths, source selection and constraints (no build/launch).
+[positional-arguments]
+live-plan level="debug" size_mb="20" files="5":
+    python3 -B scripts/live.py --plan --level "$1" --size-mb "$2" --files "$3"
+
+# Private launcher regression tests; no Cargo or live-state mutation.
+test-live:
+    python3 -B test/live_test.py
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,

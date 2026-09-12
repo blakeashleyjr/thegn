@@ -390,6 +390,13 @@
       "changes": [
         "pane-zoom-stack"
       ]
+    },
+    {
+      "issue": "THE-613",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "harden-live-upgrades"
+      ]
     }
   ]
 }
