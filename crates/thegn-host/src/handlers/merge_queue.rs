@@ -267,6 +267,19 @@ pub(crate) fn dispatch_drain(
 // Loop-side channel drains
 // ---------------------------------------------------------------------------
 
+fn fold_summary(landed: usize, deferred: usize, complete: bool) -> String {
+    let prefix = if complete {
+        "Integrated"
+    } else {
+        "Integration incomplete"
+    };
+    if deferred == 0 {
+        format!("{prefix}: {landed} landed")
+    } else {
+        format!("{prefix}: {landed} landed, {deferred} deferred")
+    }
+}
+
 /// Drain batch-fold results: report what landed/deferred and re-hydrate so the
 /// advanced target tip and cleared activity dots show immediately.
 pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
@@ -276,17 +289,18 @@ pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
         let now = std::time::Instant::now();
         match result {
             Ok(r) => {
-                let msg = if r.deferred.is_empty() {
-                    format!("Integrated: {} landed", r.landed.len())
+                let completion = r.request_result();
+                let msg = fold_summary(r.landed.len(), r.deferred.len(), completion.is_ok());
+                let landed = r.advanced && !r.landed.is_empty();
+                if let Err(error) = completion {
+                    ctx.toasts.info_ttl(
+                        format!("{msg}; {error}"),
+                        now,
+                        std::time::Duration::from_secs(6),
+                    );
                 } else {
-                    format!(
-                        "Integrated: {} landed, {} deferred",
-                        r.landed.len(),
-                        r.deferred.len()
-                    )
-                };
-                let landed = !r.landed.is_empty();
-                ctx.toasts.success(msg, now);
+                    ctx.toasts.success(msg, now);
+                }
                 *ctx.want_model_refresh = true;
                 // A batch fold's `persist` may have removed landed worktrees.
                 if landed {
@@ -1072,6 +1086,19 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_fold_summary_never_claims_integration_completed() {
+        assert_eq!(
+            fold_summary(0, 0, false),
+            "Integration incomplete: 0 landed"
+        );
+        assert_eq!(
+            fold_summary(1, 2, false),
+            "Integration incomplete: 1 landed, 2 deferred"
+        );
+        assert_eq!(fold_summary(1, 0, true), "Integrated: 1 landed");
+    }
 
     fn row(worktree: &str, status: &str) -> thegn_core::db::MergeQueueRow {
         thegn_core::db::MergeQueueRow {

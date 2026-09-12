@@ -8361,6 +8361,7 @@ dependencies = [
  "pprof",
  "regex",
  "reqwest 0.12.28",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

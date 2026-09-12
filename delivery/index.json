@@ -477,6 +477,18 @@
       "summary": "Zone policy and config shipped; sidebar, palette, and detail discoverability remain."
     },
     {
+      "change": "atomic-fold-outcomes",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-591",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Publish observed final queue outcomes atomically without transient runnable state or stale-owner lifecycle."
+    },
+    {
       "change": "audit-remote-surface-map",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -523,6 +535,18 @@
         }
       ],
       "summary": "Implementation is accepted but its remaining scoped host verification must be reconciled before archive."
+    },
+    {
+      "change": "confirm-fold-before-land",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-589",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Only successful target CAS authorizes landed persistence and lifecycle; failed folds retain bounded diagnostics."
     },
     {
       "change": "decide-plugin-ui-extension-surfaces",
@@ -678,6 +702,18 @@
         }
       ],
       "summary": "Queue review repairs cover visibility, original-stack keyboard focus, narrow geometry and duplicate layout work; focused, integrated, full-gate and visual verification remain before delivery."
+    },
+    {
+      "change": "preserve-config-validation-severity",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-586",
+          "project": "Spec & Tracker Reconciliation"
+        }
+      ],
+      "summary": "THE-569 runtime severity repair landed; THE-586 reconciles its missing reciprocal delivery inventory."
     },
     {
       "change": "resurrect-model-proxy",

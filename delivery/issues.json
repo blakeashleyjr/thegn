@@ -390,6 +390,27 @@
       "changes": [
         "pane-zoom-stack"
       ]
+    },
+    {
+      "issue": "THE-586",
+      "project": "Spec & Tracker Reconciliation",
+      "changes": [
+        "preserve-config-validation-severity"
+      ]
+    },
+    {
+      "issue": "THE-589",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "confirm-fold-before-land"
+      ]
+    },
+    {
+      "issue": "THE-591",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "atomic-fold-outcomes"
+      ]
     }
   ]
 }

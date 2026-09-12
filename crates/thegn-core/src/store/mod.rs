@@ -82,5 +82,8 @@ pub use session_migration::SessionMigrationStore;
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use usage::{UsageSample, UsageStore};
 pub use workspace::WorkspaceStore;
-pub use worktree_aux::WorktreeAuxStore;
+pub use worktree_aux::{
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
+    MergeRegistryIdentity, WorktreeAuxStore,
+};
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

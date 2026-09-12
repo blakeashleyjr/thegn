@@ -6,6 +6,75 @@ use crate::db::{ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use anyhow::Result;
 
+/// Settled fold outcomes only. This vocabulary is not evidence that Git advanced;
+/// the caller must establish advancement before selecting `Landed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeFinalStatus {
+    Landed,
+    Deferred,
+    GateFailed,
+    GateError,
+}
+
+impl MergeFinalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::Deferred => "deferred",
+            Self::GateFailed => "gate_failed",
+            Self::GateError => "gate_error",
+        }
+    }
+}
+
+/// Complete replacement of the outcome columns. `None` means SQL NULL, unlike
+/// `update_merge_status`. Finalization preserves an existing row's nomination
+/// time and attempt budget; it is not an enqueue/retry gesture.
+pub struct MergeFinalOutcome<'a> {
+    pub worktree: &'a str,
+    pub branch: &'a str,
+    pub repo_root: &'a str,
+    /// The target actually requested for this fold, including explicit overrides.
+    pub target_branch: &'a str,
+    /// Expected execution location. Empty and `local` denote local placement;
+    /// remote descriptors must match exactly, never by filesystem path alone.
+    pub location: &'a str,
+    pub status: MergeFinalStatus,
+    pub result_oid: Option<&'a str>,
+    pub conflict_paths: Option<&'a str>,
+    pub error_detail: Option<&'a str>,
+}
+
+/// Registry facts relevant to outcome routing. NULL is retained, not fabricated
+/// into a repository/branch identity. These strings are cache metadata, not Git
+/// or filesystem identity proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeRegistryIdentity {
+    pub branch: Option<String>,
+    pub repo_path: Option<String>,
+    pub location: Option<String>,
+}
+
+/// One consistent pre-fold snapshot. Fields cannot be constructed by consumers;
+/// obtain it through `observe_merge_outcome`, before external work starts.
+/// Equality detects current-state changes, NOT same-value ABA or durable leases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcomeObservation {
+    pub(crate) worktree: String,
+    pub(crate) registry: Option<MergeRegistryIdentity>,
+    pub(crate) queue: Option<MergeQueueRow>,
+    // MergeQueueRow presents SQL NULL as empty. Retain the raw value too so a
+    // writer changing that representation is still visible to the comparison.
+    pub(crate) queue_location: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcomeWrite {
+    Written,
+    RegistryChanged,
+    QueueChanged,
+}
+
 /// Object-safe (`&self` + concrete args), so `&dyn WorktreeAuxStore` works for
 /// backend-agnostic consumers. [`crate::db::Db`] is the embedded-SQLite impl.
 pub trait WorktreeAuxStore {
@@ -51,6 +120,20 @@ pub trait WorktreeAuxStore {
     /// resets the row to `queued` and clears any prior result/conflict/error, so
     /// a branch that was deferred and then rebased starts fresh.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()>;
+
+    /// Read registry and queue state consistently BEFORE starting a fold. No
+    /// reservation is created and no lock may be retained across external work.
+    fn observe_merge_outcome(&self, worktree: &str) -> Result<MergeOutcomeObservation>;
+
+    /// Commit a final status directly, only while the pre-fold observation still
+    /// matches. Refusal/error changes nothing. A caller may apply lifecycle only
+    /// after `Written`; that subsequent filesystem work is not part of this
+    /// transaction. Implementations must never publish an intermediate `queued`.
+    fn persist_merge_outcome(
+        &self,
+        observed: &MergeOutcomeObservation,
+        outcome: &MergeFinalOutcome<'_>,
+    ) -> Result<MergeOutcomeWrite>;
 
     /// Update a queued worktree's status and (optionally) its result oid,
     /// conflicted paths (newline-joined), and error detail. Passing `None` leaves
