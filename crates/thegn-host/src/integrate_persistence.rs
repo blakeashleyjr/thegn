@@ -220,11 +220,26 @@ pub(super) fn persist(
         // Only the committed final state authorizes this lifecycle event. No
         // transient Enqueued event is emitted. A later filesystem/DB reassignment
         // still needs the independent lifecycle ownership checks (THE-588).
-        let event = match row.status {
-            MergeFinalStatus::Landed => LifecycleEvent::Landed,
-            _ => LifecycleEvent::Failed,
-        };
-        crate::merge_lifecycle::apply(config, db, repo_root, &row.worktree, &row.branch, event);
+        match row.status {
+            MergeFinalStatus::Landed => crate::merge_lifecycle::apply_landed(
+                config,
+                db,
+                repo_root,
+                &row.worktree,
+                &row.branch,
+                row.result_oid
+                    .as_deref()
+                    .context("committed landed outcome has no result commit")?,
+            ),
+            _ => crate::merge_lifecycle::apply(
+                config,
+                db,
+                repo_root,
+                &row.worktree,
+                &row.branch,
+                LifecycleEvent::Failed,
+            ),
+        }
     }
     Ok(())
 }
