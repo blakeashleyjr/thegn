@@ -597,6 +597,18 @@
       "summary": "Complete runtime TUI localization and define plugin-visible string participation."
     },
     {
+      "change": "harden-live-upgrades",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-613",
+          "project": "Distribution & Release Readiness"
+        }
+      ],
+      "summary": "Stage and back up confirmed live upgrades; real controller migration verification remains operator-controlled."
+    },
+    {
       "change": "make-sidebar-mode-visible",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
