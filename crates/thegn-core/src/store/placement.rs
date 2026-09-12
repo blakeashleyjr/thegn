@@ -179,6 +179,10 @@ pub trait PlacementStore {
     /// sandbox, same host, amounts unchanged (never a release+re-reserve).
     fn tenancy_rebind(&self, sandbox: &str, worktree: &str) -> Result<()>;
     fn tenancy_for(&self, sandbox: &str) -> Result<Option<TenancyRow>>;
+
+    /// Conservative cleanup guard: any raw tenancy association (sandbox key or
+    /// worktree path) holds, including released or malformed historical rows.
+    fn has_cleanup_tenancy(&self, worktree: &str) -> Result<bool>;
     /// Live (reserved|active) tenants of a host.
     fn tenants_of(&self, host: &HostId) -> Result<Vec<TenancyRow>>;
     /// Σ floors of a host's live tenants.

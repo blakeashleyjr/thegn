@@ -747,7 +747,8 @@
         {"issue": "THE-588", "project": "Runtime Security & Host Architecture"},
         {"issue": "THE-593", "project": "Runtime Security & Host Architecture"},
         {"issue": "THE-594", "project": "Runtime Security & Host Architecture"},
-        {"issue": "THE-596", "project": "Runtime Security & Host Architecture"}
+        {"issue": "THE-596", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-600", "project": "Runtime Security & Host Architecture"}
       ],
       "summary": "Verify automatic collection ownership, preserve uncertain user work and retry records, and report only actual removal; focused and native gates remain pending."
     },

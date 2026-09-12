@@ -369,6 +369,16 @@ impl PlacementStore for Db {
         }))
     }
 
+    fn has_cleanup_tenancy(&self, worktree: &str) -> Result<bool> {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM host_tenancy WHERE sandbox=?1 OR worktree=?1)",
+                [worktree],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     fn tenants_of(&self, host: &HostId) -> Result<Vec<TenancyRow>> {
         let mut stmt = self.conn().prepare(&format!(
             "SELECT {TEN_COLS} FROM host_tenancy

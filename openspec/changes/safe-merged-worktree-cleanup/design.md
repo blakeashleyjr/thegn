@@ -4,6 +4,15 @@ Queue rows select candidates, never grant filesystem authority. Resolve the
 selected repository's actual common Git directory and configured target; reject
 foreign, main, detached, locked, remote, unregistered, noncanonical and mismatched
 paths before hooks or runtime teardown. Cache repository identity must agree.
+Automatic cleanup uses `WorkspaceStore::worktree_record` for each exact registry
+observation (THE-600). Missing rows remain distinct from malformed fields or
+query failures, which refuse cleanup. The existing display list deliberately
+retains its tolerant behavior and is not an admission source.
+Cleanup also queries raw tenancy existence by both sandbox key and associated
+worktree, retaining even released/malformed historical records. Dispatch guards
+hold unknown/nonterminal states and pending worktree reassignment; only known
+terminal rows without a matching pending reassignment permit cleanup. Errors
+propagate, while ordinary placement/display status readers remain unchanged.
 Pin open identity handles for the root, common directory, worktree, linked
 metadata and `.git` file. Require the current branch tip and recorded landed
 commit to remain ancestors of the current target.
