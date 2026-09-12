@@ -428,6 +428,11 @@
       "changes": ["safe-merged-worktree-cleanup"]
     },
     {
+      "issue": "THE-595",
+      "project": "Runtime Security & Host Architecture",
+      "changes": ["select-before-snapshot"]
+    },
+    {
       "issue": "THE-596",
       "project": "Runtime Security & Host Architecture",
       "changes": ["safe-merged-worktree-cleanup"]

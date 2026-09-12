@@ -23,6 +23,26 @@ fn registered(db: &Db) {
         .unwrap();
 }
 
+#[test]
+fn registry_identity_accessor_borrows_the_captured_observation() {
+    let db = Db::open_memory().unwrap();
+    let absent = db.observe_merge_outcome(WORKTREE).unwrap();
+    assert!(absent.registry_identity().is_none());
+    registered(&db);
+    let observed = db.observe_merge_outcome(WORKTREE).unwrap();
+    let identity = observed.registry_identity().unwrap();
+    assert_eq!(identity.branch.as_deref(), Some("feature"));
+    assert_eq!(identity.repo_path.as_deref(), Some(REPO));
+    db.set_worktree_location(WORKTREE, "changed").unwrap();
+    assert_eq!(observed.registry_identity(), Some(identity));
+    assert_ne!(
+        db.observe_merge_outcome(WORKTREE)
+            .unwrap()
+            .registry_identity(),
+        Some(identity)
+    );
+}
+
 fn row(db: &Db) -> MergeQueueRow {
     let rows = db.list_merge_queue().unwrap();
     assert_eq!(rows.len(), 1);

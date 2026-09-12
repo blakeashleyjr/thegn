@@ -17,6 +17,19 @@ use thegn_core::store::{
 
 pub(super) struct OutcomeObservations(HashMap<String, MergeOutcomeObservation>);
 
+impl OutcomeObservations {
+    pub(super) fn registry_identity(
+        &self,
+        worktree: &str,
+    ) -> Result<Option<&thegn_core::store::MergeRegistryIdentity>> {
+        Ok(self
+            .0
+            .get(worktree)
+            .context("missing pre-fold snapshot observation")?
+            .registry_identity())
+    }
+}
+
 pub(super) fn observe_outcomes(db: &Db, candidates: &Candidates) -> Result<OutcomeObservations> {
     let mut observed = HashMap::new();
     for candidate in &candidates.branches {
@@ -39,9 +52,17 @@ pub(crate) fn run_selected_fold(
     config: &MergeQueueConfig,
     repo_root: &Path,
     candidates: &Candidates,
+    override_gpg: bool,
 ) -> Result<FoldReport> {
-    run_observed_fold(Db::open(), config, repo_root, candidates, || {
-        run_fold(config, repo_root, candidates.branches.clone())
+    run_observed_fold(Db::open(), config, repo_root, candidates, |observations| {
+        let tips = super::candidates::selected_snapshot_tips(
+            config,
+            repo_root,
+            candidates,
+            observations,
+            override_gpg,
+        )?;
+        run_fold(config, repo_root, tips)
     })
 }
 
@@ -50,13 +71,18 @@ fn run_observed_fold(
     config: &MergeQueueConfig,
     repo_root: &Path,
     candidates: &Candidates,
-    fold: impl FnOnce() -> Result<FoldReport>,
+    fold: impl FnOnce(Option<&OutcomeObservations>) -> Result<FoldReport>,
 ) -> Result<FoldReport> {
     let bookkeeping = database.and_then(|db| {
         let observations = observe_outcomes(&db, candidates)?;
         Ok((db, observations))
     });
-    let mut report = fold()?;
+    let mut report = fold(
+        bookkeeping
+            .as_ref()
+            .ok()
+            .map(|(_, observations)| observations),
+    )?;
     let persisted = bookkeeping.and_then(|(db, observations)| {
         persist(config, repo_root, &db, candidates, &report, &observations)
     });
@@ -310,6 +336,8 @@ mod tests {
                     tip: "candidate-tip".into(),
                 }],
                 skipped_dirty: Vec::new(),
+                identities: HashMap::new(),
+                pending_snapshots: HashSet::new(),
                 worktrees: HashMap::from([("b1".into(), worktree.clone())]),
             };
             let config = MergeQueueConfig {
@@ -551,7 +579,7 @@ mod tests {
             &fixture.config,
             &fixture.repo,
             &fixture.candidates,
-            || {
+            |_| {
                 fixture
                     .db
                     .enqueue_merge(&fixture.worktree, "replacement", "other-target")?;
@@ -589,7 +617,7 @@ mod tests {
             &fixture.config,
             &fixture.repo,
             &fixture.candidates,
-            || Ok(fixture.report(MergeFinalStatus::Landed)),
+            |_| Ok(fixture.report(MergeFinalStatus::Landed)),
         )
         .unwrap();
         assert!(report.advanced);

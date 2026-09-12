@@ -68,6 +68,14 @@ pub struct MergeOutcomeObservation {
     pub(crate) queue_location: Option<String>,
 }
 
+impl MergeOutcomeObservation {
+    /// Borrow the exact captured routing facts without fabricating a fresh guard.
+    /// This is metadata, not a lease or authority to access a remote filesystem.
+    pub fn registry_identity(&self) -> Option<&MergeRegistryIdentity> {
+        self.registry.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcomeWrite {
     Written,

@@ -752,6 +752,18 @@
       "summary": "Verify automatic collection ownership, preserve uncertain user work and retry records, and report only actual removal; focused and native gates remain pending."
     },
     {
+      "change": "select-before-snapshot",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-595",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
+    },
+    {
       "change": "verify-sandbox-mounts",
       "lifecycle": "active",
       "disposition": "residual-split",
