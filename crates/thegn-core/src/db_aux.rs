@@ -122,6 +122,10 @@ fn validate_merge_outcome(
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "db_cleanup_hold_tests.rs"]
+mod cleanup_hold_tests;
+
 impl Db {
     /// Enqueue a remotely prepared worktree only while every registry fact
     /// verified before the provider/SSH round trip is still authoritative.
@@ -445,6 +449,23 @@ impl WorktreeAuxStore for Db {
             params![worktree],
         )?;
         Ok(())
+    }
+
+    fn hold_merge_cleanup(&self, row: &MergeQueueRow) -> Result<bool> {
+        use crate::merge_sweep::CleanupHold;
+        if row.status != "landed"
+            || row.result_oid.as_deref().is_none_or(str::is_empty)
+            || CleanupHold::from_detail(row.error_detail.as_deref()).is_some()
+        {
+            return Ok(false);
+        }
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET error_detail=?12 WHERE worktree=?1 AND branch=?2 AND target_branch=?3 AND status=?4 AND queued_at=?5 AND updated_at=?6 AND result_oid IS ?7 AND conflict_paths IS ?8 AND error_detail IS ?9 AND COALESCE(location,'')=?10 AND COALESCE(agent_attempts,0)=?11",
+            params![row.worktree, row.branch, row.target_branch, row.status, row.queued_at, row.updated_at,
+                row.result_oid, row.conflict_paths, row.error_detail, row.location, row.agent_attempts,
+                CleanupHold::BranchRetained.marker()],
+        )?;
+        Ok(changed == 1)
     }
 
     /// The whole queue, oldest-queued first (the fold order + UI feed).

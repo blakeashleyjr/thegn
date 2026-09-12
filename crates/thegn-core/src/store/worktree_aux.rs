@@ -172,6 +172,11 @@ pub trait WorktreeAuxStore {
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()>;
 
+    /// Install only the fixed branch-retained cleanup marker if every decoded
+    /// field still matches this landed observation. Preserve timestamps and
+    /// raw nullable location/attempt aliases; false means revoked/already held.
+    fn hold_merge_cleanup(&self, expected: &MergeQueueRow) -> Result<bool>;
+
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>>;
 

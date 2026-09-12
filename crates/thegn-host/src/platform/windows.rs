@@ -212,6 +212,25 @@ pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Purpose-scoped directory identity open. BACKUP_SEMANTICS enables directory
+/// handles only here; ordinary file opens keep their existing security flags.
+/// Refuse all final-component reparse points, including directory junctions.
+pub fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("not a plain directory identity"));
+    }
+    Ok(file)
+}
+
 #[cfg(test)]
 pub fn symlink_file_for_test(
     original: &std::path::Path,

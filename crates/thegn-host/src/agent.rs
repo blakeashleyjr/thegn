@@ -978,6 +978,21 @@ fn register_projection(worktree: &str, spec: thegn_core::projection::ProjectionS
     }
 }
 
+/// Automatic collection cannot tear down remote projections/sync from a path.
+/// A poisoned registry is unknown ownership, never proof of no resources.
+pub(crate) fn automatic_cleanup_resources_absent(path: &str) -> Result<(), String> {
+    let projection = projection_registry()
+        .lock()
+        .map_err(|_| "projection registry unavailable")?;
+    let sync = provider_sync_registry()
+        .lock()
+        .map_err(|_| "provider sync registry unavailable")?;
+    if projection.contains_key(path) || sync.contains_key(path) {
+        return Err("projection/provider sync requires explicit owned cleanup".into());
+    }
+    Ok(())
+}
+
 /// Tear down a worktree's projection (unmount sshfs / final sync) on close.
 /// A no-op when nothing was projected. Called from the worktree-close teardown
 /// thread alongside [`deregister_vpn`].

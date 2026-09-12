@@ -736,10 +736,58 @@ pub(crate) fn destroy_one(
     mode: HookExecutionMode,
     db: Option<&Db>,
 ) -> (bool, String) {
+    destroy_one_checked(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        keep_files,
+        delete_branch,
+        mode,
+        db,
+        &|| Ok(()),
+        None,
+        None,
+    )
+}
+
+/// Automatic collectors supply a fail-closed identity/cleanliness guard and
+/// no-force remover. Explicit user deletion retains its original behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn destroy_one_checked(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    keep_files: bool,
+    delete_branch: bool,
+    mode: HookExecutionMode,
+    db: Option<&Db>,
+    guard: &dyn Fn() -> Result<(), String>,
+    remove: Option<&dyn Fn() -> Result<(), String>>,
+    automatic_teardown: Option<&dyn Fn() -> Result<(), String>>,
+) -> (bool, String) {
+    // This function runs only on workers/CLI paths. Physical-path resolution
+    // must not be moved into the loop-side lexical scheduling claim.
+    let Some(_physical_claim) = try_physical_destroy_path(worktree) else {
+        return (
+            false,
+            "physical worktree cleanup is already in progress".into(),
+        );
+    };
+    if let Err(error) = guard() {
+        return (false, error);
+    }
     // The session boundary is live while `worktree` is still a valid cwd. It
     // must precede both the vetoing pre-hook and all teardown that can remove
     // the directory. The latch makes this once-only and warn-only.
     end_session_before_destroy(cfg, repo_root, worktree, branch, workspace, db);
+
+    if let Err(error) = guard() {
+        return (false, error);
+    }
 
     let pre = run_event_with_db(
         cfg,
@@ -755,11 +803,28 @@ pub(crate) fn destroy_one(
         return (false, pre.message());
     }
 
-    if let Err(error) = teardown_runtime(cfg, repo_root, worktree, db) {
+    if let Err(error) = guard() {
         return (false, error);
     }
 
-    let removed = if keep_files {
+    let teardown = match automatic_teardown {
+        Some(teardown) => teardown(),
+        None => teardown_runtime(cfg, repo_root, worktree, db),
+    };
+    if let Err(error) = teardown {
+        return (false, error);
+    }
+
+    if let Err(error) = guard() {
+        return (false, error);
+    }
+
+    let removed = if let Some(remove) = remove {
+        match remove() {
+            Ok(()) => true,
+            Err(error) => return (false, error),
+        }
+    } else if keep_files {
         let marker = worktree.join(".git");
         match std::fs::remove_file(&marker) {
             Ok(()) => thegn_core::util::git_ok(repo_root, &["worktree", "prune"]),
@@ -1067,6 +1132,32 @@ impl Drop for SessionEndGuard {
 
 static SESSION_RUNTIME: OnceLock<Mutex<SessionRuntime>> = OnceLock::new();
 static DESTROY_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static PHYSICAL_DESTROY_CLAIMS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+struct PhysicalDestroyClaim(PathBuf);
+
+impl Drop for PhysicalDestroyClaim {
+    fn drop(&mut self) {
+        // Identity is captured before deletion; never canonicalize a deleted
+        // or replaced alias during release.
+        PHYSICAL_DESTROY_CLAIMS
+            .get()
+            .expect("physical claims initialized")
+            .lock()
+            .expect("physical claim mutex poisoned")
+            .remove(&self.0);
+    }
+}
+
+fn try_physical_destroy_path(path: &Path) -> Option<PhysicalDestroyClaim> {
+    let key = destroy_key(path);
+    PHYSICAL_DESTROY_CLAIMS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("physical claim mutex poisoned")
+        .insert(key.clone())
+        .then(|| PhysicalDestroyClaim(key))
+}
 
 /// Process-local ownership for a synchronous destroy transaction. Async UI
 /// workers keep their manual claim until the compositor consumes completion;
@@ -1100,6 +1191,21 @@ pub(crate) fn try_claim_destroy_path(path: &Path) -> bool {
 /// Claim a physical path for the duration of a synchronous destroy operation.
 pub(crate) fn try_scoped_destroy_path(path: &Path) -> Option<ScopedDestroyClaim> {
     try_claim_destroy_path(path).then(|| ScopedDestroyClaim(path.to_path_buf()))
+}
+
+fn destroy_key(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    // Removal may already have deleted the final component. Resolve its parent
+    // so a claim made via a symlink alias can still be released afterwards.
+    match (
+        path.parent().and_then(|p| p.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn release_destroy_path(path: &Path) {
@@ -1210,6 +1316,18 @@ fn claim_session_end(key: &SessionKey) -> Option<SessionEndGuard> {
         key: key.clone(),
         in_flight,
     })
+}
+
+/// Automatic collection must not take over an active/in-flight session hook.
+pub(crate) fn automatic_cleanup_session_absent(worktree: &Path) -> Result<(), String> {
+    let key = session_key(worktree);
+    let runtime = session_runtime()
+        .lock()
+        .map_err(|_| "session registry unavailable")?;
+    if runtime.latches.contains(&key) || runtime.ending.contains_key(&key) {
+        return Err("active session requires explicit cleanup".into());
+    }
+    Ok(())
 }
 
 fn end_session_before_destroy(
@@ -1361,6 +1479,57 @@ fn report_log_failure(context: &HookContext, result: &crate::hook_run::HookRunRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_claims_cover_aliases_and_release_captured_deleted_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worktree");
+        std::fs::create_dir(&path).unwrap();
+        let claim = try_physical_destroy_path(&path).unwrap();
+        assert!(try_physical_destroy_path(&path).is_none());
+        assert!(
+            try_physical_destroy_path(&path).is_none(),
+            "failed acquisition must not release owner"
+        );
+        if crate::platform::test_symlink_supported() {
+            let alias = dir.path().join("alias");
+            crate::platform::test_symlink(&path, &alias).unwrap();
+            assert!(try_physical_destroy_path(&alias).is_none());
+        }
+        std::fs::remove_dir(&path).unwrap();
+        drop(claim);
+        let missing = try_physical_destroy_path(&path).unwrap();
+        drop(missing);
+        std::fs::create_dir(&path).unwrap();
+        assert!(try_physical_destroy_path(&path).is_some());
+    }
+
+    #[test]
+    fn physical_claim_release_survives_alias_replacement_without_loop_io() {
+        if !crate::platform::test_symlink_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        crate::platform::test_symlink(&first, &alias).unwrap();
+        let claim = try_physical_destroy_path(&alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        crate::platform::test_symlink(&second, &alias).unwrap();
+        drop(claim);
+        assert!(try_physical_destroy_path(&first).is_some());
+        assert!(try_physical_destroy_path(&alias).is_some());
+        // Lexical reservations deliberately do not resolve aliases on the loop.
+        let lexical = try_scoped_destroy_path(&first).unwrap();
+        assert!(
+            try_physical_destroy_path(&first).is_some(),
+            "separate claim domains cannot self-deadlock"
+        );
+        drop(lexical);
+    }
 
     #[expect(clippy::disallowed_methods)]
     fn git(dir: &Path, args: &[&str]) {
