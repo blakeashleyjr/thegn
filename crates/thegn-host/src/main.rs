@@ -24,6 +24,7 @@ mod autoscale;
 mod bar_nav;
 mod blast_radius;
 mod borders;
+mod bounded_git_probe;
 mod branch_cache;
 mod bridge_sup;
 mod build_cache;
