@@ -765,6 +765,18 @@
       "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
     },
     {
+      "change": "verify-gate-workspace",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-597",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Fail closed on gate lock or linked-checkout identity failure; never purge unknown reused gate paths."
+    },
+    {
       "change": "verify-sandbox-mounts",
       "lifecycle": "active",
       "disposition": "residual-split",
