@@ -13,6 +13,15 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 impl WorkspaceStore for Db {
+    fn has_persisted_worktree_session(&self, worktree: &str) -> Result<bool> {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tab_groups WHERE worktree=?1)",
+                [worktree],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
     // --- repo history (launcher recents) -----------------------------------
     fn touch_repo(&self, path: &str, name: &str) -> Result<()> {
         let now = util::now();
@@ -358,8 +367,13 @@ impl WorkspaceStore for Db {
         // worktree remove` in a shell left the MQ badge counting a branch
         // that no longer exists, and a worktree recreated at the same path
         // inherited the old one's CI failure (an instant ✋) and stale glyphs.
-        self.conn()
-            .execute("DELETE FROM merge_queue WHERE worktree=?1", params![wt])?;
+        // A recognized cleanup hold is independent retained branch history,
+        // not a live-worktree cache. Generic hydration/reaping must not erase
+        // it; explicit queue dismissal still uses remove_merge_entry.
+        self.conn().execute(
+            "DELETE FROM merge_queue WHERE worktree=?1 AND NOT(status='landed' AND error_detail IS ?2)",
+            params![wt, crate::merge_sweep::CleanupHold::BranchRetained.marker()],
+        )?;
         self.conn()
             .execute("DELETE FROM pr_cache WHERE worktree=?1", params![wt])?;
         self.conn()
@@ -1419,6 +1433,33 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_worktree_session_guard_preserves_unknown_query_failure() {
+        use crate::store::WorkspaceStore;
+        let db = crate::db::Db::open_memory().unwrap();
+        let store: &dyn WorkspaceStore = &db;
+        assert!(!store.has_persisted_worktree_session("private/wt").unwrap());
+        store
+            .put_tab_group(
+                "private",
+                &crate::models::TabGroupRow {
+                    name: "private/branch".into(),
+                    kind: "branch".into(),
+                    worktree: "private/wt".into(),
+                    ordinal: 0,
+                    active_tab: 0,
+                },
+            )
+            .unwrap();
+        assert!(store.has_persisted_worktree_session("private/wt").unwrap());
+        assert!(
+            !store
+                .has_persisted_worktree_session("private/other")
+                .unwrap()
+        );
+        db.conn().execute_batch("DROP TABLE tab_groups").unwrap();
+        assert!(store.has_persisted_worktree_session("private/wt").is_err());
+    }
     use crate::db::Db;
     use crate::store::WorkspaceStore;
 

@@ -248,6 +248,11 @@ pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Directory-identity opening for automatic cleanup; callers verify type.
+pub fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_nofollow(path)
+}
+
 #[cfg(test)]
 pub fn symlink_file_for_test(
     original: &std::path::Path,

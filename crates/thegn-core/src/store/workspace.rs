@@ -264,6 +264,10 @@ pub trait WorkspaceStore {
     /// Insert or replace a worktree group's persisted row.
     fn put_tab_group(&self, session: &str, row: &crate::models::TabGroupRow) -> Result<()>;
 
+    /// Conservative cleanup guard: persisted sessions can retain runtime
+    /// ownership even before local session registries have been hydrated.
+    fn has_persisted_worktree_session(&self, worktree: &str) -> Result<bool>;
+
     /// Insert or replace one tab inside a worktree group.
     fn put_group_tab(&self, session: &str, row: &crate::models::GroupTabRow) -> Result<()>;
 

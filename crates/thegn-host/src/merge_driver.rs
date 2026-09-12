@@ -199,7 +199,14 @@ pub(crate) fn drive_queue(
                     // live checkout of the target left stale by the ref move.
                     out.resyncs.extend(resyncs);
                     set(db, "landed", Some(&commit), None);
-                    lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
+                    crate::merge_lifecycle::apply_landed(
+                        cfg,
+                        db,
+                        repo_root,
+                        &item.worktree,
+                        &item.branch,
+                        &commit,
+                    );
                     progress(&DriveStep {
                         worktree: &item.worktree,
                         branch: &item.branch,

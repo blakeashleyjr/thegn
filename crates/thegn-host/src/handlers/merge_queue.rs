@@ -698,19 +698,19 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             });
         }
         MqAction::ClearLanded => {
-            let landed: Vec<String> = ctx
+            let landed: Vec<_> = ctx
                 .model
                 .panel
                 .merge_queue
                 .iter()
                 .filter(|r| r.status == "landed")
-                .map(|r| r.worktree.clone())
+                .cloned()
                 .collect();
             if landed.is_empty() {
                 ctx.model.status = "Merge queue: nothing landed to clear".into();
                 return true;
             }
-            ctx.model.panel.merge_queue.retain(|r| r.status != "landed");
+            // Do not optimistically erase retry rows before collection succeeds.
             // Under `expire` a landed row IS the grace-period clock, so dropping
             // it alone would strand its worktree in `merged_folder` with nothing
             // left to sweep it. Clearing therefore means "collect them now" —
@@ -720,29 +720,53 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             let sweep_root = ctx.active_wt.clone();
             tokio::task::spawn_blocking(move || {
                 let n = landed.len();
-                let swept = crate::integrate::main_checkout(&sweep_root)
-                    .map(|root| crate::merge_sweep::sweep(&sweep_cfg, &root, true))
-                    .unwrap_or_default();
-                let ok = Db::open().map(|db| {
-                    landed
+                let Some(root) = crate::integrate::main_checkout(&sweep_root) else {
+                    note.send(
+                        "Clear refused: repository identity unavailable; retry records retained"
+                            .into(),
+                    );
+                    return;
+                };
+                let swept = crate::merge_sweep::sweep(&sweep_cfg, &root, true);
+                let expire = sweep_cfg.repo_merge_queue(&root).on_landed
+                    == thegn_core::config::OnLanded::Expire;
+                let ok = if expire {
+                    // Only successful collector writes are ours to report;
+                    // a concurrently revoked/missing row is not a deletion.
+                    Ok(swept
+                        .cleared_rows
                         .iter()
-                        .filter(|wt| db.remove_merge_entry(wt).is_ok())
-                        .count()
-                });
+                        .filter(|path| landed.iter().any(|row| &row.worktree == *path))
+                        .count())
+                } else {
+                    Db::open()
+                        .and_then(|db| crate::merge_sweep::clear_selected_landed(&db, &landed))
+                };
                 let tail = if swept.collected.is_empty() {
                     String::new()
                 } else {
                     format!(", removed {} worktree(s)", swept.collected.len())
                 };
-                let kept = if swept.kept_dirty.is_empty() {
+                let kept = if swept.kept_dirty.is_empty()
+                    && swept.kept.is_empty()
+                    && swept.bookkeeping_errors.is_empty()
+                {
                     String::new()
                 } else {
-                    format!("; kept {} with uncommitted changes", swept.kept_dirty.len())
+                    format!(
+                        "; retained {} dirty, {} refused; {} bookkeeping error(s)",
+                        swept.kept_dirty.len(),
+                        swept.kept.len(),
+                        swept.bookkeeping_errors.len()
+                    )
                 };
                 note.send(match ok {
                     Ok(k) if k == n => format!("Cleared {n} landed row(s){tail}{kept}"),
                     Ok(k) => format!("Cleared {k}/{n} landed row(s){tail}{kept}"),
-                    Err(e) => format!("Clear failed: {e}"),
+                    Err(e) => format!(
+                        "Clear failed: {}",
+                        crate::merge_sweep::safe_display(&e.to_string())
+                    ),
                 });
             });
         }
@@ -1020,7 +1044,16 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 }
             }
             record("landed", Some(&commit), None);
-            lifecycle(LifecycleEvent::Landed, &branch);
+            if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
+                crate::merge_lifecycle::apply_landed(
+                    &cfg.repo_merge_queue(&root),
+                    db,
+                    &root,
+                    wt,
+                    &branch,
+                    &commit,
+                );
+            }
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
                 ..DriveOutcome::default()
