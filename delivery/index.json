@@ -680,6 +680,18 @@
       "summary": "Queue review repairs cover visibility, original-stack keyboard focus, narrow geometry and duplicate layout work; focused, integrated, full-gate and visual verification remain before delivery."
     },
     {
+      "change": "preserve-config-validation-severity",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-586",
+          "project": "Spec & Tracker Reconciliation"
+        }
+      ],
+      "summary": "THE-569 runtime severity repair landed; THE-586 reconciles its missing reciprocal delivery inventory."
+    },
+    {
       "change": "resurrect-model-proxy",
       "lifecycle": "active",
       "disposition": "residual-split",
