@@ -368,6 +368,7 @@ fn registrations(root: &Path) -> Result<Vec<Registration>, Refusal> {
 
 /// A private snapshot held only across the synchronous, claimed transaction.
 pub(crate) struct Verified {
+    history: crate::canonical_history::CanonicalHistory,
     root: PathBuf,
     path: PathBuf,
     common: PathBuf,
@@ -388,6 +389,8 @@ impl Verified {
         landed: Option<&str>,
     ) -> Result<Self, Refusal> {
         let root = canonical(root)?;
+        let history = crate::canonical_history::CanonicalHistory::capture(&root)
+            .map_err(|error| unsafe_reason(error.to_string()))?;
         let path = canonical(Path::new(worktree))?;
         if path != Path::new(worktree) || path == root {
             return Err(unsafe_reason(
@@ -402,9 +405,6 @@ impl Verified {
             return Err(unsafe_reason(
                 "Git working directory is redirected or not a root",
             ));
-        }
-        if common_dir.join("info/grafts").exists() {
-            return Err(unsafe_reason("legacy Git grafts make ancestry unverified"));
         }
         let branch_ref = format!("refs/heads/{branch}");
         let target_ref = format!("refs/heads/{target}");
@@ -473,7 +473,11 @@ impl Verified {
         .into_iter()
         .map(|(path, kind)| identity(path, kind))
         .collect::<Result<Vec<_>, _>>()?;
+        history
+            .revalidate()
+            .map_err(|error| unsafe_reason(error.to_string()))?;
         Ok(Self {
+            history,
             root,
             path,
             common: common_dir,
@@ -487,6 +491,9 @@ impl Verified {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), Refusal> {
+        self.history
+            .revalidate()
+            .map_err(|error| unsafe_reason(error.to_string()))?;
         let now = Self::probe(
             &self.root,
             self.path
@@ -557,6 +564,9 @@ impl Verified {
     }
 
     fn verify_repository(&self) -> Result<(), Refusal> {
+        self.history
+            .revalidate()
+            .map_err(|error| unsafe_reason(error.to_string()))?;
         let root = identity(&self.root, IdentityKind::Directory)?;
         let common_handle = identity(&self.common, IdentityKind::Directory)?;
         if root != self.identities[4]

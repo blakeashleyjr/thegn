@@ -131,7 +131,9 @@ pub(super) fn selected_snapshot_tips(
     candidates: &Candidates,
     observations: Option<&super::persistence::OutcomeObservations>,
     override_gpg: bool,
+    history: &crate::canonical_history::CanonicalHistory,
 ) -> Result<Vec<Branch>> {
+    history.revalidate()?;
     if !config.snapshot_dirty || candidates.branches.is_empty() {
         return Ok(candidates.branches.clone());
     }
@@ -170,17 +172,21 @@ pub(super) fn selected_snapshot_tips(
             );
         }
         identity.revalidate()?;
+        let source = history.local_child(&identity.loc())?;
         CliGit
             .is_dirty(&identity.loc())
             .context("selected dirty-state lookup failed")?;
-        selected.push(identity);
+        selected.push((identity, source));
     }
     let mut tips = Vec::with_capacity(selected.len());
     let mut completed = 0usize;
-    for identity in selected {
+    for (identity, source) in selected {
         let snapshot = (|| {
+            history.revalidate()?;
             identity.revalidate()?;
-            CliGit.snapshot_worktree(&identity.loc(), &format!("snapshot: {} (fold-actor)", identity.branch), override_gpg)
+            let result = source.checked(|| CliGit.snapshot_worktree(&identity.loc(), &format!("snapshot: {} (fold-actor)", identity.branch), override_gpg));
+            history.revalidate()?;
+            result
         })().with_context(|| format!(
             "snapshot of selected branch {} failed; {completed} earlier authorized snapshots may remain; this worktree may be staged; no rollback was attempted",
             identity.branch.chars().filter(|c| !c.is_control() && super::diagnostic_char(*c)).take(160).collect::<String>()

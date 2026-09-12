@@ -3,10 +3,11 @@
 //! Observations are snapshots, not durable ABA generations. Each queue row is
 //! atomic; Git, SQLite and subsequent filesystem lifecycle are not one transaction.
 
-use super::{Candidates, FoldReport, run_fold};
+use super::{Candidates, FoldReport, run_fold_observed};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::LifecycleEvent;
@@ -54,16 +55,27 @@ pub(crate) fn run_selected_fold(
     candidates: &Candidates,
     override_gpg: bool,
 ) -> Result<FoldReport> {
-    run_observed_fold(Db::open(), config, repo_root, candidates, |observations| {
-        let tips = super::candidates::selected_snapshot_tips(
-            config,
-            repo_root,
-            candidates,
-            observations,
-            override_gpg,
-        )?;
-        run_fold(config, repo_root, tips)
-    })
+    run_observed_fold(
+        Db::open(),
+        config,
+        repo_root,
+        candidates,
+        |observations, db| {
+            let db = db.context("canonical history requires an available registry")?;
+            let history =
+                crate::canonical_history::CanonicalHistory::registered(Rc::clone(db), repo_root)?;
+            let tips = super::candidates::selected_snapshot_tips(
+                config,
+                repo_root,
+                candidates,
+                observations,
+                override_gpg,
+                &history,
+            )?;
+            history.revalidate()?;
+            run_fold_observed(config, repo_root, tips, history)
+        },
+    )
 }
 
 fn run_observed_fold(
@@ -71,17 +83,18 @@ fn run_observed_fold(
     config: &MergeQueueConfig,
     repo_root: &Path,
     candidates: &Candidates,
-    fold: impl FnOnce(Option<&OutcomeObservations>) -> Result<FoldReport>,
+    fold: impl FnOnce(Option<&OutcomeObservations>, Option<&Rc<Db>>) -> Result<FoldReport>,
 ) -> Result<FoldReport> {
     let bookkeeping = database.and_then(|db| {
         let observations = observe_outcomes(&db, candidates)?;
-        Ok((db, observations))
+        Ok((Rc::new(db), observations))
     });
     let mut report = fold(
         bookkeeping
             .as_ref()
             .ok()
             .map(|(_, observations)| observations),
+        bookkeeping.as_ref().ok().map(|(db, _)| db),
     )?;
     let persisted = bookkeeping.and_then(|(db, observations)| {
         persist(config, repo_root, &db, candidates, &report, &observations)
@@ -579,7 +592,7 @@ mod tests {
             &fixture.config,
             &fixture.repo,
             &fixture.candidates,
-            |_| {
+            |_, _| {
                 fixture
                     .db
                     .enqueue_merge(&fixture.worktree, "replacement", "other-target")?;
@@ -617,7 +630,7 @@ mod tests {
             &fixture.config,
             &fixture.repo,
             &fixture.candidates,
-            |_| Ok(fixture.report(MergeFinalStatus::Landed)),
+            |_, _| Ok(fixture.report(MergeFinalStatus::Landed)),
         )
         .unwrap();
         assert!(report.advanced);

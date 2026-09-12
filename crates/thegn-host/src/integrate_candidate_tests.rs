@@ -29,7 +29,7 @@ fn git(path: &Path, args: &[&str]) -> String {
 impl Fixture {
     // Positive strict-snapshot steps are Unix-only. Windows runs an actual
     // unsupported-admission/no-mutation assertion instead of ignoring the test.
-    // The separate snapshot-disabled test exercises portable compatibility.
+    // Snapshot-disabled automatic folds require the same canonical history proof.
     fn supported_or_refused(&self) -> bool {
         if thegn_core::sandbox_backend::host_os() != thegn_core::sandbox_backend::HostOs::Windows {
             return true;
@@ -39,14 +39,17 @@ impl Fixture {
         let error = candidate_branches(&self.config.merge_queue, &self.repo, "main")
             .err()
             .expect("Windows strict snapshot must refuse");
-        assert!(error.to_string().contains("unsupported on Windows"));
+        assert!(format!("{error:#}").contains("unsupported"));
         assert_eq!(Self::snapshot(&self.queued), queued);
         assert_eq!(Self::snapshot(&self.unqueued), unqueued);
         false
     }
 
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("thegn-candidate-")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap();
         let state = root.path().join("state");
         let config_home = root.path().join("config");
         let template = root.path().join("template");
@@ -148,6 +151,7 @@ impl Fixture {
             candidates,
             Some(&observations),
             true,
+            &crate::canonical_history::CanonicalHistory::capture(&self.repo)?,
         )
     }
 }
@@ -258,7 +262,15 @@ fn missing_observation_prevents_snapshots() {
     }
     let before = Fixture::snapshot(&f.queued);
     assert!(
-        selected_snapshot_tips(&f.config.merge_queue, &f.repo, &f.selected(), None, true).is_err()
+        selected_snapshot_tips(
+            &f.config.merge_queue,
+            &f.repo,
+            &f.selected(),
+            None,
+            true,
+            &crate::canonical_history::CanonicalHistory::capture(&f.repo).unwrap()
+        )
+        .is_err()
     );
     assert_eq!(Fixture::snapshot(&f.queued), before);
 }
@@ -266,6 +278,9 @@ fn missing_observation_prevents_snapshots() {
 #[test]
 fn snapshot_disabled_keeps_pinned_tips_without_mutating_dirty_work() {
     let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
     let selected = Candidates {
         branches: vec![Branch {
             name: "queued".into(),
@@ -282,7 +297,15 @@ fn snapshot_disabled_keeps_pinned_tips_without_mutating_dirty_work() {
     let before = Fixture::snapshot(&f.queued);
     let mut config = f.config.merge_queue.clone();
     config.snapshot_dirty = false;
-    let tips = selected_snapshot_tips(&config, &f.repo, &selected, None, true).unwrap();
+    let tips = selected_snapshot_tips(
+        &config,
+        &f.repo,
+        &selected,
+        None,
+        true,
+        &crate::canonical_history::CanonicalHistory::capture(&f.repo).unwrap(),
+    )
+    .unwrap();
     assert_eq!(tips[0].tip, selected.branches[0].tip);
     assert_eq!(Fixture::snapshot(&f.queued), before);
     let found = candidate_branches(&config, &f.repo, "main").unwrap();
@@ -404,4 +427,60 @@ fn later_snapshot_failure_reports_partial_authorized_snapshots_without_rollback(
     assert_ne!(git(&f.queued, &["rev-parse", "HEAD"]), queued_head);
     assert_eq!(git(&f.unqueued, &["rev-parse", "HEAD"]), unqueued_head);
     assert!(lock.exists());
+}
+
+#[test]
+fn first_snapshot_hook_cannot_replace_later_git_identity_and_readmit_it() {
+    let f = Fixture::new();
+    if !f.supported_or_refused() {
+        return;
+    }
+    let mut selected = f.discovered();
+    selected.branches.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        selected
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        ["queued", "unqueued"]
+    );
+    let first_before = git(&f.queued, &["rev-parse", "HEAD"]);
+    let later_before = Fixture::snapshot(&f.unqueued);
+    let gitfile_before = std::fs::read(f.unqueued.join(".git")).unwrap();
+    let hooks = f._root.path().join("private-hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let marker = f._root.path().join("hook-ran");
+    let original = f.unqueued.join(".git");
+    let replacement = f.unqueued.join(".git.the606-replacement");
+    let script = format!(
+        "#!/bin/sh\nset -eu\ntest \"$PWD\" = {} || exit 0\ncp {} {}\nmv {} {}\nprintf ran > {}\n",
+        util::sh_quote(f.queued.to_str().unwrap()),
+        util::sh_quote(original.to_str().unwrap()),
+        util::sh_quote(replacement.to_str().unwrap()),
+        util::sh_quote(replacement.to_str().unwrap()),
+        util::sh_quote(original.to_str().unwrap()),
+        util::sh_quote(marker.to_str().unwrap())
+    );
+    crate::platform::publish_private_executable(
+        &hooks.join("post-commit.new"),
+        &hooks.join("post-commit"),
+        script.as_bytes(),
+    )
+    .unwrap();
+    git(
+        &f.repo,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let error = f.snapshot_selected(&selected).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("1 earlier authorized snapshots may remain")
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), b"ran");
+    assert_ne!(git(&f.queued, &["rev-parse", "HEAD"]), first_before);
+    assert_eq!(Fixture::snapshot(&f.unqueued), later_before);
+    assert_eq!(std::fs::read(original).unwrap(), gitfile_before);
+    assert!(!replacement.exists());
 }

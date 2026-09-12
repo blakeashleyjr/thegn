@@ -23,6 +23,31 @@ pub(crate) struct Regular {
 
 pub(crate) struct Lock(Regular);
 
+#[cfg(test)]
+pub(crate) fn history_test_symlink(_original: &Path, _link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(_original, _link)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn history_test_nonunicode() -> Option<std::ffi::OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::ffi::OsString::from_vec(vec![255]))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 fn refused(message: &'static str) -> io::Error {
     io::Error::other(message)
 }

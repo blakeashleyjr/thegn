@@ -8,7 +8,7 @@ use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::{
     MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeRegistryIdentity, WorktreeAuxStore,
+    MergeRegistryIdentity, MergeStatusFields, WorktreeAuxStore,
 };
 use crate::util;
 use anyhow::Result;
@@ -17,6 +17,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 #[cfg(test)]
 #[path = "db_merge_outcome_tests.rs"]
 mod merge_outcome_tests;
+
+#[cfg(test)]
+#[path = "db_merge_status_tests.rs"]
+mod merge_status_tests;
 
 fn merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueRow> {
     Ok(MergeQueueRow {
@@ -381,6 +385,33 @@ impl WorktreeAuxStore for Db {
         )?;
         tx.commit()?;
         Ok(MergeOutcomeWrite::Written)
+    }
+
+    /// Replace every nullable outcome field; `None` clears it to SQL NULL.
+    /// Missing rows fail rather than pretending the transition was persisted.
+    fn replace_merge_status(
+        &self,
+        worktree: &str,
+        status: &str,
+        fields: &MergeStatusFields,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET status=?2, updated_at=?3, result_oid=?4, \
+             conflict_paths=?5, error_detail=?6 WHERE worktree=?1",
+            params![
+                worktree,
+                status,
+                util::now(),
+                fields.result_oid,
+                fields.conflict_paths,
+                fields.error_detail
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "merge status replacement requires one existing row"
+        );
+        Ok(())
     }
 
     /// Update a queued worktree's status and (optionally) its result oid,

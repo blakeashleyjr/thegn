@@ -84,6 +84,6 @@ pub use usage::{UsageSample, UsageStore};
 pub use workspace::WorkspaceStore;
 pub use worktree_aux::{
     MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
-    MergeRegistryIdentity, WorktreeAuxStore,
+    MergeRegistryIdentity, MergeStatusFields, WorktreeAuxStore,
 };
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

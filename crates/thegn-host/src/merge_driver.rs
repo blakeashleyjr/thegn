@@ -18,12 +18,16 @@ use std::path::Path;
 
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
-use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+use thegn_core::store::{MergeStatusFields, WorkspaceStore, WorktreeAuxStore};
 // The real-git driver fixtures shell out to git and stamp queue rows.
 #[cfg(test)]
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};
+
+#[cfg(test)]
+#[path = "merge_driver_status_tests.rs"]
+mod status_tests;
 
 /// A worktree branch to drain, as read from the `merge_queue` cache.
 #[derive(Debug, Clone)]
@@ -42,13 +46,15 @@ pub(crate) struct QueueItem {
 }
 
 /// One status transition the driver made, handed to the caller's `progress`
-/// callback (the DB row is already written when this fires).
+/// callback. Metadata matches the attempted best-effort cache write; a failed
+/// write does not turn this notification into proof of durable state.
 pub(crate) struct DriveStep<'a> {
     /// The queue row's key — lets the host patch its panel row in place.
     pub worktree: &'a str,
     pub branch: &'a str,
     pub status: &'a str,
     pub detail: &'a str,
+    pub fields: &'a MergeStatusFields,
 }
 
 /// Summary of a full drain.
@@ -86,6 +92,25 @@ fn conflict_detail(
     conflicts: &[thegn_core::submodule::SubmoduleConflict],
 ) -> String {
     crate::integrate::conflict_details(paths, conflicts).join("\n")
+}
+
+fn conflict_fields(
+    paths: &[String],
+    conflicts: &[thegn_core::submodule::SubmoduleConflict],
+) -> MergeStatusFields {
+    let context = crate::integrate::conflict_details(&[], conflicts).join("\n");
+    MergeStatusFields {
+        result_oid: None,
+        conflict_paths: (!paths.is_empty()).then(|| paths.join("\n")),
+        error_detail: (!context.is_empty()).then_some(context),
+    }
+}
+
+fn replace_status(db: &Db, worktree: &str, status: &str, fields: &MergeStatusFields) {
+    // Best-effort cache update, not a claim/CAS or proof that persistence worked.
+    if let Err(error) = db.replace_merge_status(worktree, status, fields) {
+        tracing::warn!(target: "thegn::merge", "queue status cache write failed: {error}");
+    }
 }
 
 /// Queue rows belonging to `root`'s repo (the queue is global; a drain is
@@ -126,7 +151,50 @@ pub(crate) fn drive_queue(
     repo_root: &Path,
     db: &Db,
     items: Vec<QueueItem>,
+    progress: impl FnMut(&DriveStep),
+) -> DriveOutcome {
+    drive_queue_with(
+        cfg,
+        full,
+        repo_root,
+        db,
+        items,
+        progress,
+        DriveActions {
+            attempt: |branch: &str, location: &thegn_core::remote::GitLoc| {
+                integrate::attempt_land(cfg, repo_root, branch, location)
+            },
+            floor: |worktree: &str| {
+                crate::agent_run::agent_floor_gate(
+                    full,
+                    worktree,
+                    cfg.agent_sandbox,
+                    cfg.agent_isolation_floor,
+                    cfg.agent_on_floor_miss,
+                )
+            },
+        },
+    )
+}
+
+/// Private injection points exercise the actual loop without launching Git or
+/// an agent. Production supplies the same concrete operations as before.
+struct DriveActions<A, F> {
+    attempt: A,
+    floor: F,
+}
+
+fn drive_queue_with(
+    cfg: &MergeQueueConfig,
+    full: &Config,
+    repo_root: &Path,
+    db: &Db,
+    items: Vec<QueueItem>,
     mut progress: impl FnMut(&DriveStep),
+    mut actions: DriveActions<
+        impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
+        impl FnMut(&str) -> crate::agent_run::AgentDispatch,
+    >,
 ) -> DriveOutcome {
     let mut out = DriveOutcome::default();
     // Resolved once per drain, not per branch: `agent_command` verbatim, else a
@@ -149,7 +217,13 @@ pub(crate) fn drive_queue(
 
     for item in items {
         let set = |db: &Db, status: &str, oid: Option<&str>, detail: Option<&str>| {
-            let _ = db.update_merge_status(&item.worktree, status, oid, detail, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let fields = MergeStatusFields {
+                result_oid: oid.map(str::to_owned),
+                conflict_paths: None,
+                error_detail: detail.map(str::to_owned),
+            };
+            replace_status(db, &item.worktree, status, &fields);
+            fields
         };
         // Sidebar-folder lifecycle: move the worktree on a settled transition
         // (landed ⇒ Merged/cleanup, failure ⇒ the failed folder). No-op unless
@@ -157,8 +231,9 @@ pub(crate) fn drive_queue(
         let lifecycle = |db: &Db, event: thegn_core::merge_lifecycle::LifecycleEvent| {
             crate::merge_lifecycle::apply(cfg, db, repo_root, &item.worktree, &item.branch, event);
         };
-        set(db, "folding", None, None);
+        let fields = set(db, "folding", None, None);
         progress(&DriveStep {
+            fields: &fields,
             worktree: &item.worktree,
             branch: &item.branch,
             status: "folding",
@@ -176,13 +251,14 @@ pub(crate) fn drive_queue(
         // spent it. `merge retry` (or a re-enqueue) resets it to 0.
         let mut agent_runs = item.agent_attempts;
         loop {
-            let attempt = match integrate::attempt_land(cfg, repo_root, &item.branch, &branch_loc) {
+            let attempt = match (actions.attempt)(&item.branch, &branch_loc) {
                 Ok(a) => a,
                 Err(e) => {
                     let detail = format!("{e}");
-                    set(db, "needs_human", None, Some(&detail));
+                    let fields = set(db, "needs_human", None, Some(&detail));
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: "needs_human",
@@ -198,7 +274,7 @@ pub(crate) fn drive_queue(
                     // Carried out to the caller so the CLI can warn about any
                     // live checkout of the target left stale by the ref move.
                     out.resyncs.extend(resyncs);
-                    set(db, "landed", Some(&commit), None);
+                    let fields = set(db, "landed", Some(&commit), None);
                     crate::merge_lifecycle::apply_landed(
                         cfg,
                         db,
@@ -208,6 +284,7 @@ pub(crate) fn drive_queue(
                         &commit,
                     );
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: "landed",
@@ -217,9 +294,10 @@ pub(crate) fn drive_queue(
                     break;
                 }
                 AttemptOutcome::UpToDate => {
-                    set(db, "landed", None, Some("already merged"));
+                    let fields = set(db, "landed", None, Some("already merged"));
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Landed);
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: "landed",
@@ -229,8 +307,9 @@ pub(crate) fn drive_queue(
                     break;
                 }
                 AttemptOutcome::Ready { tip } => {
-                    set(db, "ready", Some(&tip), Some("gated green — awaiting land"));
+                    let fields = set(db, "ready", Some(&tip), Some("gated green — awaiting land"));
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: "ready",
@@ -243,9 +322,10 @@ pub(crate) fn drive_queue(
                     // Branch host unreachable / tip couldn't be fetched in. Hold
                     // (deferred) with the reason — a transient blip is retried on
                     // the next drain; never silently drop the row.
-                    set(db, "deferred", None, Some(&detail));
+                    let fields = set(db, "deferred", None, Some(&detail));
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: "deferred",
@@ -263,9 +343,10 @@ pub(crate) fn drive_queue(
                     // stop; the row is retried on the next drain, by which time
                     // the environment may be fixed.
                     let detail = detail_with_log(&reason, &log);
-                    set(db, "gate_error", None, Some(&detail));
+                    let fields = set(db, "gate_error", None, Some(&detail));
                     lifecycle(db, thegn_core::merge_lifecycle::LifecycleEvent::Failed);
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status: "gate_error",
@@ -290,18 +371,13 @@ pub(crate) fn drive_queue(
                 // Gate BEFORE consuming an attempt: a fail-closed miss, or an
                 // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
                 // failure — hold the entry and NEVER blame the branch.
-                let dispatch = crate::agent_run::agent_floor_gate(
-                    full,
-                    &item.worktree,
-                    cfg.agent_sandbox,
-                    cfg.agent_isolation_floor,
-                    cfg.agent_on_floor_miss,
-                );
+                let dispatch = (actions.floor)(&item.worktree);
                 let sandbox = match dispatch {
                     crate::agent_run::AgentDispatch::InfraHold(reason) => {
                         thegn_core::msg::warn(&reason);
-                        set(db, "agent_blocked", None, Some(&reason));
+                        let fields = set(db, "agent_blocked", None, Some(&reason));
                         progress(&DriveStep {
+                            fields: &fields,
                             worktree: &item.worktree,
                             branch: &item.branch,
                             status: "agent_blocked",
@@ -309,7 +385,7 @@ pub(crate) fn drive_queue(
                         });
                         // Held for a later drain; NOT a branch/gate failure.
                         out.deferred.push(item.branch.clone());
-                        continue;
+                        break;
                     }
                     crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
                         thegn_core::msg::warn(&warning);
@@ -320,8 +396,9 @@ pub(crate) fn drive_queue(
                 agent_runs += 1;
                 let _ = db.set_merge_agent_attempts(&item.worktree, agent_runs); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
-                set(db, "agent_running", None, Some(&note));
+                let fields = set(db, "agent_running", None, Some(&note));
                 progress(&DriveStep {
+                    fields: &fields,
                     worktree: &item.worktree,
                     branch: &item.branch,
                     status: "agent_running",
@@ -358,13 +435,10 @@ pub(crate) fn drive_queue(
                     } else {
                         "deferred"
                     };
-                    set(
-                        db,
-                        status,
-                        None,
-                        (!detail.is_empty()).then_some(&detail).map(|s| s.as_str()),
-                    );
+                    let fields = conflict_fields(&paths, &submodule_conflicts);
+                    replace_status(db, &item.worktree, status, &fields);
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status,
@@ -386,8 +460,9 @@ pub(crate) fn drive_queue(
                     // string: "breaks build" told the user nothing about WHY,
                     // and the log was otherwise discarded entirely.
                     let detail = detail_with_log("breaks build", &log);
-                    set(db, status, None, Some(&detail));
+                    let fields = set(db, status, None, Some(&detail));
                     progress(&DriveStep {
+                        fields: &fields,
                         worktree: &item.worktree,
                         branch: &item.branch,
                         status,
@@ -679,6 +754,78 @@ mod tests {
         use super::*;
         use std::path::{Path, PathBuf};
 
+        /// Own every fixture path and keep environment restoration alive until
+        /// synchronous driver/agent work completes, including assertion failure.
+        struct Fixture {
+            _env: crate::testenv::EnvVarGuard,
+            _root: tempfile::TempDir,
+        }
+
+        impl Fixture {
+            fn new(tag: &str) -> (Self, PathBuf, PathBuf) {
+                let private = tempfile::Builder::new()
+                    .prefix(&format!("tg-drive-{tag}-"))
+                    .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+                    .unwrap();
+                let base = private.path();
+                for name in [
+                    "config", "state", "cache", "thegn", "tmp", "appdata", "template", "repo",
+                ] {
+                    std::fs::create_dir(base.join(name)).unwrap();
+                }
+                let config = base.join("config");
+                let state = base.join("state");
+                let cache = base.join("cache");
+                let thegn = base.join("thegn");
+                let temporary = base.join("tmp");
+                let appdata = base.join("appdata");
+                let template = base.join("template");
+                let global = base.join("gitconfig");
+                std::fs::write(&global, "").unwrap();
+                // Keep the authored fixture scripts but do not source the user's
+                // login startup files. The product's shell dispatch is unchanged.
+                let shell = base.join("fixture-shell");
+                crate::platform::publish_private_executable(
+                    &base.join("fixture-shell.staged"),
+                    &shell,
+                    b"#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = -lc ] || exit 97\nexec /bin/sh -c \"$2\"\n",
+                ).unwrap();
+                let env = crate::testenv::EnvVarGuard::set(&[
+                    ("XDG_CONFIG_HOME", config.to_str().unwrap()),
+                    ("XDG_STATE_HOME", state.to_str().unwrap()),
+                    ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+                    ("THEGN_DIR", thegn.to_str().unwrap()),
+                    ("THEGN_PROFILE", ""),
+                    ("TMPDIR", temporary.to_str().unwrap()),
+                    ("TMP", temporary.to_str().unwrap()),
+                    ("TEMP", temporary.to_str().unwrap()),
+                    ("APPDATA", appdata.to_str().unwrap()),
+                    ("LOCALAPPDATA", appdata.to_str().unwrap()),
+                    ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+                    ("GIT_CONFIG_NOSYSTEM", "1"),
+                    ("GIT_CONFIG_COUNT", "0"),
+                    ("GIT_CONFIG_PARAMETERS", ""),
+                    ("GIT_TEMPLATE_DIR", template.to_str().unwrap()),
+                    ("SHELL", shell.to_str().unwrap()),
+                    ("ENV", ""),
+                    ("BASH_ENV", ""),
+                ]);
+                // CanonicalHistory uses its own on-disk connection, not the
+                // driver's in-memory queue cache. Bootstrap it in this fixture.
+                drop(Db::open().expect("initialize private canonical-history registry"));
+                let repo = base.join("repo");
+                let feature = base.join("feature");
+                (
+                    Self {
+                        _env: env,
+                        _root: private,
+                    },
+                    repo,
+                    feature,
+                )
+            }
+        }
+
         #[expect(clippy::disallowed_methods)]
         fn git(dir: &Path, args: &[&str]) {
             let ok = util::git_cmd(dir)
@@ -696,17 +843,9 @@ mod tests {
         }
 
         /// A repo on `main` with a linked worktree holding branch `feat` whose one
-        /// commit conflicts with `main` on `base.txt`. Returns (repo_root, feat_wt).
-        fn conflicting_repo(tag: &str) -> (PathBuf, PathBuf) {
-            let root = std::env::temp_dir().join(format!(
-                "tg-drive-{tag}-{}-{}",
-                std::process::id(),
-                util::now()
-            ));
-            let feat_wt = root.with_extension("feat");
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            std::fs::create_dir_all(&root).unwrap();
+        /// commit conflicts with `main` on `base.txt`. Retain the owner through use.
+        fn conflicting_repo(tag: &str) -> (Fixture, PathBuf, PathBuf) {
+            let (fixture, root, feat_wt) = Fixture::new(tag);
             git(&root, &["init", "-q", "-b", "main"]);
             git(&root, &["config", "user.name", "t"]);
             git(&root, &["config", "user.email", "t@e"]);
@@ -734,21 +873,13 @@ mod tests {
             std::fs::write(root.join("base.txt"), "mainline\n").unwrap();
             git(&root, &["add", "-A"]);
             git(&root, &["commit", "-q", "-m", "main edits base"]);
-            (root, feat_wt)
+            (fixture, root, feat_wt)
         }
 
         /// A cleanly foldable linked branch, used to reach commit signing
         /// without first taking the conflict/agent path.
-        fn clean_repo(tag: &str) -> (PathBuf, PathBuf) {
-            let root = std::env::temp_dir().join(format!(
-                "tg-drive-{tag}-{}-{}",
-                std::process::id(),
-                util::now()
-            ));
-            let feat_wt = root.with_extension("feat");
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
-            std::fs::create_dir_all(&root).unwrap();
+        fn clean_repo(tag: &str) -> (Fixture, PathBuf, PathBuf) {
+            let (fixture, root, feat_wt) = Fixture::new(tag);
             git(&root, &["init", "-q", "-b", "main"]);
             git(&root, &["config", "user.name", "t"]);
             git(&root, &["config", "user.email", "t@e"]);
@@ -771,15 +902,10 @@ mod tests {
             std::fs::write(feat_wt.join("feat.txt"), "feat\n").unwrap();
             git(&feat_wt, &["add", "-A"]);
             git(&feat_wt, &["commit", "-q", "-m", "feat"]);
-            (root, feat_wt)
+            (fixture, root, feat_wt)
         }
 
         fn cfg(agent_command: &str, max: u32) -> MergeQueueConfig {
-            // Hermetic shell for run_agent's `$SHELL -lc` wrapper (nextest isolates
-            // env per test process).
-            unsafe {
-                std::env::set_var("SHELL", "/bin/sh");
-            }
             MergeQueueConfig {
                 target_branch: "main".into(),
                 gate_on: false,
@@ -798,7 +924,7 @@ mod tests {
 
         #[test]
         fn agent_resolves_conflict_and_branch_lands() {
-            let (root, feat_wt) = conflicting_repo("resolve");
+            let (_fixture, root, feat_wt) = conflicting_repo("resolve");
             let before = out(&root, &["rev-parse", "main"]);
             // The "agent": rebase feat onto main as a disjoint change so it folds clean.
             let agent = "git reset --hard main -q && echo feat > feat.txt && \
@@ -824,13 +950,11 @@ mod tests {
             );
             assert!(out_.needs_human.is_empty());
             assert_ne!(out(&root, &["rev-parse", "main"]), before, "main advanced");
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
         fn agent_that_cannot_fix_marks_needs_human() {
-            let (root, feat_wt) = conflicting_repo("giveup");
+            let (_fixture, root, feat_wt) = conflicting_repo("giveup");
             let before = out(&root, &["rev-parse", "main"]);
             // A no-op "agent" never resolves the conflict.
             let db = Db::open_memory().unwrap();
@@ -850,13 +974,11 @@ mod tests {
             assert_eq!(out_.needs_human, ["feat"]);
             assert!(out_.landed.is_empty());
             assert_eq!(out(&root, &["rev-parse", "main"]), before, "main held");
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
         fn signing_infrastructure_failure_never_blames_branch_or_wakes_agent() {
-            let (root, feat_wt) = clean_repo("sign-infra");
+            let (_fixture, root, feat_wt) = clean_repo("sign-infra");
             let before_main = out(&root, &["rev-parse", "main"]);
             let before_feat = out(&root, &["rev-parse", "feat"]);
             git(&root, &["config", "gpg.program", "false"]);
@@ -885,8 +1007,6 @@ mod tests {
             assert!(!statuses.iter().any(|status| status == "needs_human"));
             assert_eq!(out(&root, &["rev-parse", "main"]), before_main);
             assert_eq!(out(&root, &["rev-parse", "feat"]), before_feat);
-            let _ = std::fs::remove_dir_all(&root);
-            let _ = std::fs::remove_dir_all(&feat_wt);
         }
 
         /// The fixing script, as a `sh` one-liner. Ends in `&& true` so the
@@ -906,7 +1026,7 @@ mod tests {
 
         #[test]
         fn a_named_agent_entry_is_dispatched_without_an_agent_command() {
-            let (root, feat_wt) = conflicting_repo("byname");
+            let (_fixture, root, feat_wt) = conflicting_repo("byname");
             let full = Config {
                 agents: vec![thegn_core::config::NamedCommand {
                     name: "fixer".into(),
@@ -929,20 +1049,21 @@ mod tests {
             mq.agent = "fixer".into();
 
             let db = Db::open_memory().unwrap();
-            let out_ = drive_queue(&mq, &full, &root, &db, vec![item(&feat_wt)], |_| {});
+            let mut steps = Vec::new();
+            let out_ = drive_queue(&mq, &full, &root, &db, vec![item(&feat_wt)], |step| {
+                steps.push((step.status.to_owned(), step.detail.to_owned()));
+            });
             assert_eq!(
                 out_.landed,
                 ["feat"],
-                "a named [[agents]] entry should have been dispatched"
+                "a named [[agents]] entry should have been dispatched: {out_:?}; steps={steps:?}"
             );
             assert!(out_.warnings.is_empty());
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
         fn a_named_agent_that_resolves_to_nothing_warns_instead_of_going_quiet() {
-            let (root, feat_wt) = conflicting_repo("noagent");
+            let (_fixture, root, feat_wt) = conflicting_repo("noagent");
             let mut mq = cfg("", 2);
             mq.agent = "not-configured".into();
 
@@ -961,13 +1082,11 @@ mod tests {
             // ...but the reason is reported rather than looking like a clean no-op.
             assert_eq!(out_.warnings.len(), 1, "{:?}", out_.warnings);
             assert!(out_.warnings[0].contains("not-configured"));
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
         fn a_custom_prompt_template_reaches_the_agent() {
-            let (root, feat_wt) = conflicting_repo("prompt");
+            let (_fixture, root, feat_wt) = conflicting_repo("prompt");
             // The "agent" only does its job if the sentinel from the configured
             // template is present in the prompt it was handed, so a landing is
             // proof the custom text (not the built-in) got through.
@@ -989,8 +1108,6 @@ mod tests {
                 ["feat"],
                 "the configured prompt template should have reached the agent"
             );
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
 
         #[test]
@@ -998,7 +1115,7 @@ mod tests {
             // The negative control for the test above: with no configured
             // template the same agent finds no sentinel and never fixes anything,
             // so `landed` there really was caused by the override.
-            let (root, feat_wt) = conflicting_repo("nosentinel");
+            let (_fixture, root, feat_wt) = conflicting_repo("nosentinel");
             let agent = "printf '%s' \"$THEGN_TASK_PROMPT\" | grep -q MAGIC-SENTINEL && ";
             let mq = cfg(&format!("{agent}{FIXER}"), 1);
 
@@ -1013,8 +1130,6 @@ mod tests {
             );
             assert_eq!(out_.needs_human, ["feat"]);
             assert!(out_.landed.is_empty());
-            let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            let _ = std::fs::remove_dir_all(&feat_wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
 }

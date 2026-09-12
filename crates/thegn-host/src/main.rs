@@ -29,6 +29,7 @@ mod branch_cache;
 mod bridge_sup;
 mod build_cache;
 mod calendar_docs;
+mod canonical_history;
 mod caps;
 mod caret;
 #[cfg(test)]
