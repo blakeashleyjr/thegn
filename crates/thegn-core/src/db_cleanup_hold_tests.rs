@@ -2,6 +2,83 @@ use super::*;
 use crate::merge_sweep::CleanupHold;
 use crate::store::WorkspaceStore;
 
+#[test]
+fn cleanup_tenancy_holds_raw_sandbox_and_worktree_associations() {
+    let db = Db::open_memory().unwrap();
+    let store: &dyn crate::store::PlacementStore = &db;
+    assert!(!store.has_cleanup_tenancy("private/wt").unwrap());
+    db.conn().execute(
+        "INSERT INTO host_tenancy(sandbox,host_id,worktree,cpu_floor_milli,mem_floor_mb,state,reserved_at) VALUES('private/wt','invalid-host-id','private/associated',0,0,'released',0)",
+        [],
+    ).unwrap();
+    assert!(store.has_cleanup_tenancy("private/wt").unwrap());
+    assert!(store.has_cleanup_tenancy("private/associated").unwrap());
+    assert!(
+        store.tenancy_for("private/wt").unwrap().is_none(),
+        "exercise lossy legacy decode"
+    );
+    assert!(!store.has_cleanup_tenancy("private/missing").unwrap());
+    db.conn().execute_batch("DROP TABLE host_tenancy").unwrap();
+    assert!(store.has_cleanup_tenancy("private/wt").is_err());
+}
+
+#[test]
+fn cleanup_dispatch_holds_unknown_nonterminal_and_pending_rows() {
+    let db = Db::open_memory().unwrap();
+    let store: &dyn crate::store::NotificationStore = &db;
+    assert!(!store.has_cleanup_dispatch("private/wt").unwrap());
+    db.conn().execute(
+        "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private','private/wt','private',0,'unknown-future-state')",
+        [],
+    ).unwrap();
+    assert!(store.has_cleanup_dispatch("private/wt").unwrap());
+    assert!(
+        db.worktrees_with_active_dispatch().unwrap().is_empty(),
+        "exercise inactive legacy unknown"
+    );
+    for status in [
+        "queued",
+        "spawning",
+        "running",
+        "waiting_human",
+        "pr_open",
+        "parked",
+    ] {
+        db.conn()
+            .execute("UPDATE agent_dispatches SET status=?1", [status])
+            .unwrap();
+        assert!(
+            store.has_cleanup_dispatch("private/wt").unwrap(),
+            "{status}"
+        );
+    }
+    for status in ["done", "failed", "merged", "abandoned"] {
+        db.conn()
+            .execute("UPDATE agent_dispatches SET status=?1", [status])
+            .unwrap();
+        assert!(
+            !store.has_cleanup_dispatch("private/wt").unwrap(),
+            "{status}"
+        );
+    }
+    db.conn()
+        .execute(
+            "UPDATE agent_dispatches SET pending_worktree_path='private/next'",
+            [],
+        )
+        .unwrap();
+    assert!(store.has_cleanup_dispatch("private/next").unwrap());
+    assert!(!store.has_cleanup_dispatch("private/wt").unwrap());
+    db.conn()
+        .execute("UPDATE agent_dispatches SET status=x'00'", [])
+        .unwrap();
+    assert!(store.has_cleanup_dispatch("private/wt").is_err());
+    db.conn()
+        .execute_batch("DROP TABLE agent_dispatches")
+        .unwrap();
+    assert!(store.has_cleanup_dispatch("private/wt").is_err());
+}
+
 fn fixture() -> (Db, MergeQueueRow) {
     let db = Db::open_memory().unwrap();
     db.enqueue_merge("private/wt", "feature", "main").unwrap();

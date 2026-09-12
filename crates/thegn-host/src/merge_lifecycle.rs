@@ -372,8 +372,8 @@ pub(crate) fn remove_landed_with_config(
             reason: "selected landed queue entry changed or was revoked".into(),
         };
     }
-    let cache_before = match db.worktrees() {
-        Ok(rows) => rows.into_iter().find(|r| r.worktree == worktree),
+    let cache_before = match db.worktree_record(worktree) {
+        Ok(row) => row,
         Err(error) => {
             return CleanupOutcome::Refused {
                 reason: format!("worktree cache identity unavailable: {error}"),
@@ -413,11 +413,7 @@ pub(crate) fn remove_landed_with_config(
         if current != queue_before {
             return Err("merge queue entry changed during cleanup".into());
         }
-        let cache_now = db
-            .worktrees()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|r| r.worktree == worktree);
+        let cache_now = db.worktree_record(worktree).map_err(|e| e.to_string())?;
         if cache_now
             .as_ref()
             .map(|r| (&r.repo_root, &r.branch, &r.location, &r.env_name))
@@ -476,7 +472,7 @@ pub(crate) fn remove_landed_with_config(
     // removal, report partial bookkeeping failure rather than claiming tidy DB.
     let queue_removed = match db.transaction(|db| {
         unchanged_queue().map_err(anyhow::Error::msg)?;
-        let cache_now = db.worktrees()?.into_iter().find(|r| r.worktree == worktree);
+        let cache_now = db.worktree_record(worktree)?;
         if cache_now
             .as_ref()
             .map(|r| (&r.repo_root, &r.branch, &r.location))

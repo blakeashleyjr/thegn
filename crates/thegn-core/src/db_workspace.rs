@@ -12,6 +12,28 @@ use crate::util;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
+const WORKTREE_RECORD_COLUMNS: &str = "worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, observed_backend, folder_id, env_name";
+
+fn decode_worktree_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRow> {
+    Ok(WorktreeRow {
+        worktree: r.get(0)?,
+        branch: r.get(1)?,
+        agent: r.get(2)?,
+        created_at: r.get(3)?,
+        repo_root: r.get(4)?,
+        tab_name: r.get(5)?,
+        session_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+        sandbox_backend: r.get(9)?,
+        observed_backend: r.get(10)?,
+        folder_id: r.get(11)?,
+        env_name: r
+            .get::<_, Option<String>>(12)?
+            .filter(|s| !s.trim().is_empty()),
+    })
+}
+
 impl WorkspaceStore for Db {
     fn has_persisted_worktree_session(&self, worktree: &str) -> Result<bool> {
         self.conn()
@@ -558,30 +580,22 @@ impl WorkspaceStore for Db {
         // the COALESCE, `r.get::<_, String/i64>` errors on those NULLs and the row
         // is silently dropped by `filter_map(|r| r.ok())` — losing the env pin and
         // any row `put_worktree` hasn't fully healed yet.
-        let mut stmt = self.conn().prepare(
-            "SELECT worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, observed_backend, folder_id, env_name
-             FROM worktrees ORDER BY position, created_at, worktree",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(WorktreeRow {
-                worktree: r.get(0)?,
-                branch: r.get(1)?,
-                agent: r.get(2)?,
-                created_at: r.get(3)?,
-                repo_root: r.get(4)?,
-                tab_name: r.get(5)?,
-                session_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                sandbox_backend: r.get(9)?,
-                observed_backend: r.get(10)?,
-                folder_id: r.get(11)?,
-                env_name: r
-                    .get::<_, Option<String>>(12)?
-                    .filter(|s| !s.trim().is_empty()),
-            })
-        })?;
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT {WORKTREE_RECORD_COLUMNS} FROM worktrees ORDER BY position, created_at, worktree"
+        ))?;
+        let rows = stmt.query_map([], decode_worktree_record)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    fn worktree_record(&self, worktree: &str) -> Result<Option<WorktreeRow>> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {WORKTREE_RECORD_COLUMNS} FROM worktrees WHERE worktree=?1"),
+                [worktree],
+                decode_worktree_record,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Swap the persisted sort positions of two worktrees (by path). Used by
@@ -1433,6 +1447,45 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worktree_record_preserves_absence_nullable_fields_and_decode_errors() {
+        let db = Db::open_memory().unwrap();
+        let store: &dyn WorkspaceStore = &db;
+        assert!(store.worktree_record("private/missing").unwrap().is_none());
+        db.conn()
+            .execute(
+                "INSERT INTO worktrees(worktree, location, env_name) VALUES(?1, ?2, ?3)",
+                ["private/remote", "remote-placement", "  "],
+            )
+            .unwrap();
+        let row = store.worktree_record("private/remote").unwrap().unwrap();
+        assert_eq!(row.worktree, "private/remote");
+        assert_eq!(row.location, "remote-placement");
+        assert_eq!(row.position, 0);
+        assert!(row.branch.is_empty() && row.repo_root.is_empty());
+        assert!(row.env_name.is_none());
+        db.conn()
+            .execute(
+                "UPDATE worktrees SET position='malformed' WHERE worktree=?1",
+                ["private/remote"],
+            )
+            .unwrap();
+        assert!(store.worktree_record("private/remote").is_err());
+        assert!(store.worktree_record("private/missing").unwrap().is_none());
+        assert!(
+            store.worktrees().unwrap().is_empty(),
+            "legacy list remains lossy"
+        );
+    }
+
+    #[test]
+    fn worktree_record_query_failure_is_not_absence() {
+        let db = Db::open_memory().unwrap();
+        let store: &dyn WorkspaceStore = &db;
+        db.conn().execute_batch("DROP TABLE worktrees").unwrap();
+        assert!(store.worktree_record("private/missing").is_err());
+    }
+
     #[test]
     fn persisted_worktree_session_guard_preserves_unknown_query_failure() {
         use crate::store::WorkspaceStore;

@@ -85,19 +85,15 @@ impl LocalResources {
         root: &Path,
         path: &str,
     ) -> Result<(), String> {
-        use thegn_core::store::{PlacementStore, WorkspaceStore};
+        use thegn_core::store::{NotificationStore, PlacementStore, WorkspaceStore};
         if Self::selection(db, root, path)? != self.selected {
             return Err("selected worktree/workspace environment changed during cleanup".into());
         }
-        if db.tenancy_for(path).map_err(|e| e.to_string())?.is_some()
+        if db.has_cleanup_tenancy(path).map_err(|e| e.to_string())?
             || db
                 .has_persisted_worktree_session(path)
                 .map_err(|e| e.to_string())?
-            || db
-                .worktrees_with_active_dispatch()
-                .map_err(|e| e.to_string())?
-                .iter()
-                .any(|wt| wt == path)
+            || db.has_cleanup_dispatch(path).map_err(|e| e.to_string())?
         {
             return Err("runtime/session/dispatch ownership requires explicit cleanup".into());
         }

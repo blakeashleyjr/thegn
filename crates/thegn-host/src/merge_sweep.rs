@@ -493,6 +493,245 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn malformed_remote_cache_refuses_before_hooks_and_preserves_worktree_refs_queue() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, wt) = fixture(&parent, "malformed", &db, &isolation);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE worktrees SET location='remote-placement', position='malformed' WHERE worktree=?1",
+                [wt.to_str().unwrap()],
+            )
+            .unwrap();
+        assert!(
+            db.worktrees().unwrap().is_empty(),
+            "exercise hidden legacy row"
+        );
+        assert!(db.worktree_record(wt.to_str().unwrap()).is_err());
+        let refs = || {
+            let output = isolation
+                .git(&root)
+                .args([
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before_refs = refs();
+        let before_queue = db.list_merge_queue().unwrap();
+        let before_contents = std::fs::read(wt.join("tracked")).unwrap();
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.hooks.pre_destroy = vec![thegn_core::hooks::HookEntry::Command(
+            "printf ran > cleanup-hook".into(),
+        )];
+        let report = sweep_with_db(&cfg, &root, true, &db);
+        assert!(report.collected.is_empty() && report.cleared_rows.is_empty());
+        assert_eq!(report.kept.len(), 1);
+        assert!(
+            report.kept[0]
+                .1
+                .contains("worktree cache identity unavailable")
+        );
+        assert_eq!(refs(), before_refs);
+        assert_eq!(db.list_merge_queue().unwrap(), before_queue);
+        assert_eq!(std::fs::read(wt.join("tracked")).unwrap(), before_contents);
+        assert!(!wt.join("cleanup-hook").exists());
+        assert!(!root.join("cleanup-hook").exists());
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn unknown_resource_metadata_refuses_before_hooks_and_preserves_worktree_refs_queue() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        for kind in [
+            "tenancy-key",
+            "tenancy-association",
+            "dispatch",
+            "pending-dispatch",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let db_path = parent.join("private.db");
+            let db = Db::open_at(&db_path).unwrap();
+            let (root, wt) = fixture(&parent, kind, &db, &isolation);
+            let fixture_conn = rusqlite::Connection::open(&db_path).unwrap();
+            let path = wt.to_str().unwrap();
+            match kind {
+                "tenancy-key" | "tenancy-association" => {
+                    let (sandbox, association) = if kind == "tenancy-key" {
+                        (path, "")
+                    } else {
+                        ("private-reservation", path)
+                    };
+                    fixture_conn.execute(
+                        "INSERT INTO host_tenancy(sandbox,host_id,worktree,cpu_floor_milli,mem_floor_mb,reserved_at) VALUES(?1,'invalid-host-id',?2,0,0,0)",
+                        [sandbox, association],
+                    ).unwrap();
+                }
+                _ => {
+                    let (active, pending, status) = if kind == "dispatch" {
+                        (path, "", "unknown-future-state")
+                    } else {
+                        ("private-other", path, "done")
+                    };
+                    fixture_conn.execute(
+                        "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status,pending_worktree_path) VALUES('private',?1,'private',0,?2,?3)",
+                        [active, status, pending],
+                    ).unwrap();
+                }
+            }
+            let refs = || {
+                let output = isolation
+                    .git(&root)
+                    .args([
+                        "for-each-ref",
+                        "--format=%(refname) %(objectname)",
+                        "refs/heads",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                output.stdout
+            };
+            let before_refs = refs();
+            let before_queue = db.list_merge_queue().unwrap();
+            let mut cfg = local_config();
+            cfg.merge_queue.on_landed = OnLanded::Expire;
+            cfg.merge_queue.target_branch = "main".into();
+            cfg.hooks.pre_destroy = vec![thegn_core::hooks::HookEntry::Command(
+                "printf ran > cleanup-hook".into(),
+            )];
+            let report = sweep_with_db(&cfg, &root, true, &db);
+            assert!(
+                report.collected.is_empty() && report.cleared_rows.is_empty(),
+                "{kind}"
+            );
+            assert_eq!(report.kept.len(), 1, "{kind}");
+            assert!(
+                report.kept[0]
+                    .1
+                    .contains("runtime/session/dispatch ownership"),
+                "{kind}: {report:?}"
+            );
+            assert_eq!(refs(), before_refs, "{kind}");
+            assert_eq!(db.list_merge_queue().unwrap(), before_queue, "{kind}");
+            assert_eq!(
+                std::fs::read(wt.join("tracked")).unwrap(),
+                b"keep\n",
+                "{kind}"
+            );
+            assert!(!wt.join("cleanup-hook").exists(), "{kind}");
+            assert!(!root.join("cleanup-hook").exists(), "{kind}");
+        }
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn post_admission_unknown_dispatch_stops_removal_after_the_pre_destroy_hook() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, wt) = fixture(&parent, "late-resource", &db, &isolation);
+        let before_queue = db.list_merge_queue().unwrap();
+        let refs = || {
+            let output = isolation
+                .git(&root)
+                .args([
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before_refs = refs();
+        let started = parent.join("hook-started");
+        let release = parent.join("hook-release");
+        let mut cfg = local_config();
+        cfg.merge_queue.on_landed = OnLanded::Expire;
+        cfg.merge_queue.target_branch = "main".into();
+        cfg.hooks.pre_destroy = vec![thegn_core::hooks::HookEntry::Spec(
+            thegn_core::hooks::HookEntrySpec {
+                command: format!(
+                    "printf started > {}; while [ ! -e {} ]; do sleep 0.01; done",
+                    util::sh_quote(&started.to_string_lossy()),
+                    util::sh_quote(&release.to_string_lossy()),
+                ),
+                wait: Some(true),
+                timeout_secs: Some(10),
+                on_failure: Some(thegn_core::hooks::HookFailure::Warn),
+            },
+        )];
+        let writer_started = started.clone();
+        let writer_release = release.clone();
+        let writer_path = wt.to_str().unwrap().to_owned();
+        // Scoped ownership joins the writer even if the sweep/assertion panics.
+        let report = std::thread::scope(|scope| {
+            let writer = std::thread::Builder::new().name("private-late-resource".into())
+                .spawn_scoped(scope, move || -> anyhow::Result<()> {
+                    struct Release(std::path::PathBuf);
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            if let Err(error) = std::fs::write(&self.0, "release") {
+                                eprintln!("private hook release failed: {error}");
+                            }
+                        }
+                    }
+                    let _release = Release(writer_release);
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !writer_started.exists() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    anyhow::ensure!(writer_started.exists(), "pre-destroy rendezvous did not start");
+                    let writer_conn = rusqlite::Connection::open(&db_path)?;
+                    writer_conn.execute(
+                        "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private',?1,'private',0,'unknown-after-admission')",
+                        [writer_path],
+                    )?;
+                    Ok(())
+                }).unwrap();
+            let report = sweep_with_db(&cfg, &root, true, &db);
+            writer.join().unwrap().unwrap();
+            report
+        });
+        assert!(
+            started.exists() && release.exists(),
+            "the earlier hook really ran"
+        );
+        assert!(report.collected.is_empty() && report.cleared_rows.is_empty());
+        assert_eq!(report.kept.len(), 1);
+        assert!(
+            report.kept[0]
+                .1
+                .contains("runtime/session/dispatch ownership"),
+            "{report:?}"
+        );
+        assert_eq!(refs(), before_refs);
+        assert_eq!(db.list_merge_queue().unwrap(), before_queue);
+        assert_eq!(std::fs::read(wt.join("tracked")).unwrap(), b"keep\n");
+        assert!(
+            thegn_core::store::NotificationStore::has_cleanup_dispatch(&db, wt.to_str().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn diagnostics_never_emit_terminal_controls_and_are_bounded() {
         assert_eq!(safe_display("α\u{061c}\u{200e}\u{200f}β"), "α���β");
         assert_eq!(safe_display("a\x1b[31m\n\u{202e}b"), "a�[31m��b");
