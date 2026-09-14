@@ -4,6 +4,22 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+// Run the vendored dependency's real PTY regressions in the normal host test
+// target too: Cargo cannot select a patched non-workspace dependency's tests.
+#[cfg(test)]
+mod termwiz_regression {
+    use std::os::fd::AsRawFd;
+    use termwiz::caps::{Capabilities, ProbeHints};
+    use termwiz::terminal::{Terminal, UnixTerminal};
+
+    mod drop_tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/termwiz/src/terminal/unix_drop_tests.rs"
+        ));
+    }
+}
+
 /// Restores the original stderr fd on drop (see [`super::redirect_stderr_to_logfile`]).
 ///
 /// Holds an `OwnedFd` rather than a `RawFd`: nix 0.31 moved the fd API to

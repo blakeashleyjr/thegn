@@ -19,6 +19,11 @@ members = [
 # this workspace when a command runs from an arbitrary cwd.
 exclude = ["apps", "vendor"]
 
+[patch.crates-io]
+# THE-618: preserve cleanup after PTY hangup without a panic in Drop.
+# Exact 0.23.3 release + destructor-only fix; provenance in vendor/termwiz/PATCH.md.
+termwiz = { path = "vendor/termwiz" }
+
 [workspace.package]
 version = "0.1.0-alpha.2"
 edition = "2024"

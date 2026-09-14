@@ -221,6 +221,34 @@ fn claim_history(once: &HistoryOnce) -> bool {
     !once.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A cancelled/failed first attach did not deliver history. Release its claim
+/// so the next real attach still restores this pane's empty emulator.
+struct HistoryClaim {
+    once: HistoryOnce,
+    include: bool,
+    delivered: bool,
+}
+
+impl HistoryClaim {
+    fn new(once: &HistoryOnce) -> Self {
+        // Production constructs one source per pane and its one relay awaits
+        // attach serially. This claim is not a multi-consumer history lock.
+        Self {
+            once: once.clone(),
+            include: claim_history(once),
+            delivered: false,
+        }
+    }
+}
+
+impl Drop for HistoryClaim {
+    fn drop(&mut self) {
+        if self.include && !self.delivered {
+            self.once.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl DaemonSource {
     async fn open_and_attach(&self, spec: &ExecSpec) -> Result<ExecSession> {
         let info: SessionInfo = self
@@ -241,9 +269,12 @@ impl DaemonSource {
             .await?;
         // A just-opened session has no history yet; claim the cell so a later
         // reconnect on this pane counts as a re-attach.
-        claim_history(&self.attached_once);
-        self.attach_session(&info.id, spec.cols, spec.rows, true)
-            .await
+        let session = self
+            .attach_session(&info.id, spec.cols, spec.rows, true)
+            .await?;
+        self.attached_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(session)
     }
 
     async fn attach_session(
@@ -286,8 +317,12 @@ impl ExecSource for DaemonSource {
         Box::pin(async move {
             // First attach on this pane (resurrect warm attach) restores the
             // scrollback context; its reconnects repaint without it.
-            let history = claim_history(&self.attached_once);
-            self.attach_session(session, cols, rows, history).await
+            let mut history = HistoryClaim::new(&self.attached_once);
+            let result = self
+                .attach_session(session, cols, rows, history.include)
+                .await?;
+            history.delivered = true;
+            Ok(result)
         })
     }
 
@@ -393,11 +428,27 @@ pub(crate) struct LazyDaemonSource {
     /// This pane's history-tail cell — see [`HistoryOnce`]. One source is built
     /// per pane, so `Default` (unclaimed) is right for every new pane.
     pub attached_once: HistoryOnce,
+    /// The endpoint pinned by this pane's first open/attach. An
+    /// absence check must not discover/start a different daemon with an empty
+    /// roster and mistake that for proof that the original shell disappeared.
+    pub last_client: std::sync::Mutex<Option<ControlClient>>,
 }
 
 impl LazyDaemonSource {
     async fn source(&self) -> Result<DaemonSource> {
+        let recorded = self
+            .last_client
+            .lock()
+            .map_err(|_| anyhow!("daemon client lock poisoned"))?
+            .is_some();
+        if recorded {
+            return self.recorded_source();
+        }
         let client = ensure_daemon(&self.cfg).await?;
+        *self
+            .last_client
+            .lock()
+            .map_err(|_| anyhow!("daemon client lock poisoned"))? = Some(client.clone());
         Ok(DaemonSource {
             client,
             worktree: self.worktree.clone(),
@@ -405,6 +456,20 @@ impl LazyDaemonSource {
             // per-`DaemonSource` cell would read as "first attach" every time
             // and replay the tail on every reconnect.
             attached_once: std::sync::Arc::clone(&self.attached_once),
+        })
+    }
+
+    fn recorded_source(&self) -> Result<DaemonSource> {
+        let client = self
+            .last_client
+            .lock()
+            .map_err(|_| anyhow!("daemon client lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow!("no recorded daemon session endpoint"))?;
+        Ok(DaemonSource {
+            client,
+            worktree: self.worktree.clone(),
+            attached_once: self.attached_once.clone(),
         })
     }
 }
@@ -422,19 +487,20 @@ impl ExecSource for LazyDaemonSource {
     ) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(async move {
             let source = self.source().await?;
-            // Same first-attach/reconnect split as `DaemonSource::attach`, on
-            // the cell `source()` just cloned from this (per-pane) source.
-            let history = claim_history(&source.attached_once);
-            source.attach_session(session, cols, rows, history).await
+            source.attach(session, cols, rows).await
         })
     }
 
     fn kill_session<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { self.source().await?.client.kill(session).await })
+        Box::pin(async move { self.recorded_source()?.client.kill(session).await })
+    }
+
+    fn session_absent<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move { self.recorded_source()?.session_absent(session).await })
     }
 
     fn session_pid<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Option<u32>> {
-        Box::pin(async move { self.source().await.ok()?.lookup_pid(session).await })
+        Box::pin(async move { self.recorded_source().ok()?.lookup_pid(session).await })
     }
 }
 
@@ -495,5 +561,65 @@ mod tests {
         let per_call = std::sync::Arc::clone(&pane);
         assert!(claim_history(&per_call));
         assert!(!claim_history(&pane), "the clone consumed the claim");
+    }
+
+    #[test]
+    fn failed_or_cancelled_attach_releases_its_history_claim() {
+        let pane = HistoryOnce::default();
+        drop(HistoryClaim::new(&pane));
+        let mut next = HistoryClaim::new(&pane);
+        assert!(next.include);
+        next.delivered = true;
+        drop(next);
+        assert!(!HistoryClaim::new(&pane).include);
+    }
+
+    #[tokio::test]
+    async fn lazy_absence_queries_only_the_last_attach_endpoint_and_decodes_strictly() {
+        use axum::{Json, Router, routing::get};
+        use serde_json::json;
+        for (body, expected) in [
+            (json!({"sessions": []}), Some(true)),
+            (
+                json!({"sessions": [SessionInfo { id: "live".into(), ..Default::default() }]}),
+                Some(false),
+            ),
+            (json!({}), None),
+            (json!({"sessions": null}), None),
+            (json!({"sessions": [SessionInfo::default()]}), None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new().route("/v1/sessions", get(move || async move { Json(body) })),
+                )
+                .await
+                .unwrap();
+            });
+            let source = LazyDaemonSource {
+                cfg: DaemonConfig::default(),
+                worktree: None,
+                attached_once: Default::default(),
+                last_client: std::sync::Mutex::new(Some(ControlClient::new(
+                    ControlAddr::HttpOrigin {
+                        origin: format!("http://{address}"),
+                        token: "fixture".into(),
+                    },
+                ))),
+            };
+            // No health endpoint exists. This must use the recorded client,
+            // never discovery/ensure_daemon (or the user's configured socket).
+            assert_eq!(source.session_absent("live").await.ok(), expected);
+            server.abort();
+        }
+        let source = LazyDaemonSource {
+            cfg: DaemonConfig::default(),
+            worktree: None,
+            attached_once: Default::default(),
+            last_client: Default::default(),
+        };
+        assert!(source.session_absent("live").await.is_err());
     }
 }
