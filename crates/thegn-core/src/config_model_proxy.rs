@@ -205,7 +205,7 @@ impl Default for BudgetConfig {
 impl BudgetConfig {
     /// The rolling-window length in millis (0 = cumulative).
     pub fn window_len_ms(&self) -> i64 {
-        (self.window_secs as i64).saturating_mul(1000)
+        crate::time_policy::duration_millis(self.window_secs)
     }
 }
 
@@ -357,6 +357,29 @@ mod tests {
             api_key: key.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn huge_budget_windows_remain_enabled_and_preserve_accumulated_spend() {
+        let db = crate::db::Db::open_memory().unwrap();
+        for seconds in [i64::MAX as u64 - 1, i64::MAX as u64 + 1, u64::MAX] {
+            let cfg = BudgetConfig {
+                window_secs: seconds,
+                ..Default::default()
+            };
+            let window = cfg.window_len_ms();
+            assert_eq!(window, i64::MAX);
+            let scope = format!("fixture:{seconds}");
+            db.add_model_proxy_spend(&scope, 10, 1.0, 1000, window)
+                .unwrap();
+            let row = db
+                .add_model_proxy_spend(&scope, 5, 0.5, 2000, window)
+                .unwrap();
+            assert_eq!(row.spent_tokens, 15);
+            assert_eq!(row.window_start_ms, 1000);
+            assert!(!crate::budget_alert::window_lapsed(window, 1000, 2000));
+        }
+        assert_eq!(BudgetConfig::default().window_len_ms(), 0);
     }
 
     #[test]

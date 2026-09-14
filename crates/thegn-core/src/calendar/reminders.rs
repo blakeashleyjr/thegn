@@ -59,7 +59,7 @@ pub fn due(
     // A backwards or absurd window (a suspend/resume, a wall-clock jump) would
     // otherwise replay hours of reminders at once. Clamp to one hour of
     // catch-up: anything older has stopped being worth raising.
-    let since = last_checked_ms.clamp(now_ms - 3_600_000, now_ms);
+    let since = last_checked_ms.clamp(now_ms.saturating_sub(3_600_000), now_ms);
     let mut out = Vec::new();
     for e in events {
         // A cancelled meeting should not nag.
@@ -76,7 +76,7 @@ pub fn due(
             &e.reminders[..]
         };
         for r in reminders {
-            let trigger = start_ms - (r.minutes_before as i64) * 60_000;
+            let trigger = start_ms.saturating_sub(i64::from(r.minutes_before) * 60_000);
             if trigger > since && trigger <= now_ms {
                 out.push(DueReminder {
                     event_id: e.id().0,

@@ -56,7 +56,7 @@ impl HealSchedule {
     /// made) due, given the unix time of the last attempt (or of the failure,
     /// for attempt 0) and now?
     pub fn due(&self, attempt: u32, last_attempt: i64, now: i64) -> bool {
-        now.saturating_sub(last_attempt) >= self.wait_secs(attempt) as i64
+        crate::time_policy::elapsed_at_least(now, last_attempt, self.wait_secs(attempt))
     }
 }
 

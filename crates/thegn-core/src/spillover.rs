@@ -91,7 +91,7 @@ pub fn spill_cooldown_ms(kind: SpillKind, consecutive: u32, retry_after_secs: Op
         SpillKind::Quota => ExhaustionKind::RateLimit,
         SpillKind::CreateFailure => ExhaustionKind::ServerError,
     };
-    calculate_backoff(k, consecutive).as_millis() as i64
+    crate::time_policy::saturating_i64(calculate_backoff(k, consecutive).as_millis())
 }
 
 /// A provider's current marker as the picker sees it.

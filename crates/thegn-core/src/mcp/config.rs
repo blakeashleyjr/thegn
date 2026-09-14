@@ -95,7 +95,7 @@ impl McpProxyConfig {
     pub fn breaker_config(&self) -> crate::mcp::proxy::breaker::BreakerConfig {
         crate::mcp::proxy::breaker::BreakerConfig {
             failure_threshold: self.failure_threshold.max(1),
-            cooldown_ms: (self.cooldown_secs as i64).saturating_mul(1000),
+            cooldown_ms: crate::time_policy::duration_millis(self.cooldown_secs),
         }
     }
 }
@@ -228,6 +228,28 @@ mod tests {
             command: cmd.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn huge_cooldown_does_not_accidentally_reopen_a_failed_upstream() {
+        use crate::mcp::proxy::breaker::{Breaker, BreakerState};
+        let cfg = McpProxyConfig {
+            cooldown_secs: u64::MAX,
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let mut breaker = Breaker::new(cfg.breaker_config());
+        breaker.on_failure(1000);
+        assert_eq!(breaker.state(2000), BreakerState::Open);
+        assert!(!breaker.allow(2000));
+        let zero = McpProxyConfig {
+            cooldown_secs: 0,
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let mut breaker = Breaker::new(zero.breaker_config());
+        breaker.on_failure(1000);
+        assert!(breaker.allow(1000));
     }
 
     #[test]

@@ -433,6 +433,26 @@ impl FlyProvider {
     /// Delete the Fly app without retiring local ownership records. Reapers use
     /// this boundary so a later route-token revocation failure leaves enough
     /// durable state to retry the complete lifecycle safely.
+    /// Read-only age reconciliation for the exact persisted managed machine.
+    /// A failed read keeps the ledger intact so the next pass can retry.
+    pub async fn reaper_creation_time(&self, name: &str, machine_id: &str) -> Result<i64> {
+        anyhow::ensure!(
+            !machine_id.is_empty(),
+            "fly: pending create has no authoritative machine identity"
+        );
+        let account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+        thegn_core::managed_ssh::read("fly", &account, name)
+            .context("fly: validate persisted managed ownership before age reconciliation")?;
+        let inventory = self
+            .get_json(&machines::machines_url(
+                &self.spec.api_base(),
+                &app_name(name),
+            ))
+            .await?;
+        machines::reaper_creation_time(&inventory, name, machine_id, &host_label())
+            .map_err(anyhow::Error::msg)
+    }
+
     pub async fn destroy_remote_only(&self, id: &str) -> Result<()> {
         let custody_account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
         thegn_core::managed_ssh::read("fly", &custody_account, id)

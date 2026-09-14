@@ -300,7 +300,7 @@ fn retry_at(error: &ForgeError, attempts: u32, now_ms: i64) -> Option<i64> {
         | ForgeError::NotInstalled
         | ForgeError::NoPr => return None,
     };
-    Some(now_ms.saturating_add((seconds as i64).saturating_mul(1_000)))
+    Some(now_ms.saturating_add(thegn_core::time_policy::duration_millis(seconds)))
 }
 
 fn park_after_forge_error(

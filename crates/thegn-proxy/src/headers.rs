@@ -38,7 +38,7 @@ pub fn retry_after_ms(headers: &HeaderMap, now_ms: i64) -> Option<i64> {
     let v = headers.get("retry-after")?.to_str().ok()?.trim();
     if let Ok(secs) = v.parse::<f64>() {
         if secs > 0.0 {
-            return Some(now_ms + (secs * 1000.0) as i64);
+            return thegn_core::time_policy::deadline_millis_from_seconds(now_ms, secs);
         }
         return None;
     }
@@ -56,6 +56,14 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(name, HeaderValue::from_str(value).unwrap());
         h
+    }
+
+    #[test]
+    fn hostile_retry_after_is_unknown_and_never_wraps_to_past() {
+        for raw in ["inf", "NaN", "18446744073709551615", "315360001"] {
+            assert_eq!(retry_after_ms(&hm("retry-after", raw), 1000), None);
+        }
+        assert_eq!(retry_after_ms(&hm("retry-after", "1"), i64::MAX), None);
     }
 
     #[test]

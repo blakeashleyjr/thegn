@@ -666,7 +666,7 @@ pub(crate) fn spawn_refresh_ticker(
             |sampler: &mut thegn_metrics::StatsSampler| -> Option<crate::chrome::DaemonStatus> {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
+                    .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
                     .unwrap_or(0);
                 let status = thegn_core::db::Db::open()
                     .and_then(|db| crate::handlers::status::snapshot(&db, &daemon_scope, now_ms));

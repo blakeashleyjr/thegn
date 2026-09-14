@@ -25,8 +25,8 @@ use thegn_svc::vps::{self, registry};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(300);
 /// Mirrors the warm-pool stale-provisioning threshold (`reconcile_pool`).
-const ORPHAN_AGE_SECS: i64 = 20 * 60;
-const CREATING_STALE_SECS: i64 = 10 * 60;
+const ORPHAN_AGE_SECS: u64 = 20 * 60;
+const CREATING_STALE_SECS: u64 = 10 * 60;
 
 /// Throttled entry: schedule one reconcile pass when due. Cheap when not due
 /// or when no VPS env is configured; network work runs on its own thread.
@@ -106,21 +106,33 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
         {
             live_anywhere.insert(inst.name.clone());
             let record = records.iter().find(|r| r.name == inst.name);
-            let age = inst.created.map(|c| now - c).unwrap_or(0);
-            let over_lifetime = pc.max_lifetime_secs > 0 && age >= pc.max_lifetime_secs as i64;
-            let orphaned = record.is_none() && age >= ORPHAN_AGE_SECS;
-            if !(orphaned || over_lifetime) {
+            if record.is_some_and(|record| {
+                record.provider != kind
+                    || (!record.instance_id.is_empty() && record.instance_id != inst.id)
+            }) {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: quarantined {}: inventory identity differs from the ledger; reconcile ownership; no deletion attempted",
+                    inst.name
+                ));
                 continue;
             }
-            let why = if orphaned {
-                "not in the local ledger (crashed create?)"
-            } else {
-                "past max_lifetime_secs"
-            };
+            let decision = thegn_core::time_policy::resource_expiry(
+                now,
+                inst.created,
+                pc.max_lifetime_secs,
+                record.is_none().then_some(ORPHAN_AGE_SECS),
+            );
+            if !admit_reap(decision, |reason| {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: quarantined {}: {reason}; no deletion attempted; next pass will retry",
+                    inst.name
+                ));
+            }) {
+                continue;
+            }
             thegn_core::msg::warn(&format!(
-                "vps reaper: destroying {} ({why}, age {}m) — a VPS bills until destroyed",
-                inst.name,
-                age / 60
+                "vps reaper: destroying {} (verified provider age exceeds lifetime/orphan policy)",
+                inst.name
             ));
             if let Some(p) = crate::provider_factory::vps_provider_for(pc, &inst.name) {
                 if let Err(error) =
@@ -167,6 +179,21 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
     cleanup_ledger(&records, &live_anywhere);
 }
 
+/// The sole time-policy admission gate before any VPS lifecycle action.
+fn admit_reap(
+    decision: thegn_core::time_policy::ResourceExpiry,
+    report: impl FnOnce(&str),
+) -> bool {
+    match decision {
+        thegn_core::time_policy::ResourceExpiry::Expired => true,
+        thegn_core::time_policy::ResourceExpiry::Keep => false,
+        thegn_core::time_policy::ResourceExpiry::Quarantine(reason) => {
+            report(reason);
+            false
+        }
+    }
+}
+
 /// Pure decision: should this ledger record be dropped, given the union of
 /// names seen live across ALL accounts we reconciled this pass? A record with a
 /// live instance anywhere is kept (its VPS may belong to a sibling account of
@@ -179,7 +206,9 @@ fn should_drop_record(
     if live.contains(&rec.name) {
         return false;
     }
-    let stale_creating = rec.state == "creating" && now - rec.created_at >= CREATING_STALE_SECS;
+    let stale_creating = rec.state == "creating"
+        && thegn_core::time_policy::age_seconds(now, rec.created_at)
+            .is_some_and(|age| age >= CREATING_STALE_SECS);
     let gone_ready = rec.state == "ready";
     stale_creating || gone_ready
 }
@@ -190,6 +219,14 @@ fn should_drop_record(
 fn cleanup_ledger(records: &[registry::VpsRecord], live: &std::collections::HashSet<String>) {
     let now = thegn_core::util::now();
     for rec in records {
+        if rec.state == "creating"
+            && thegn_core::time_policy::age_seconds(now, rec.created_at).is_none()
+        {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: quarantined ledger {}: invalid/future intent time; reconcile inventory; record retained",
+                rec.name
+            ));
+        }
         if !should_drop_record(rec, live, now) {
             continue;
         }
@@ -209,6 +246,26 @@ fn cleanup_ledger(records: &[registry::VpsRecord], live: &std::collections::Hash
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_or_hostile_time_is_observable_and_never_admitted() {
+        for (created, lifetime) in [
+            (None, 60),
+            (Some(0), 60),
+            (Some(i64::MIN), 60),
+            (Some(101), 1),
+            (Some(1), u64::MAX),
+        ] {
+            let mut notices = 0;
+            let mut destroys = 0;
+            let decision =
+                thegn_core::time_policy::resource_expiry(100, created, lifetime, Some(60));
+            if admit_reap(decision, |_| notices += 1) {
+                destroys += 1;
+            }
+            assert_eq!((notices, destroys), (1, 0));
+        }
+    }
 
     fn rec(name: &str, state: &str, created_at: i64) -> registry::VpsRecord {
         registry::VpsRecord {
@@ -248,7 +305,7 @@ mod tests {
         ));
         // creating older than the stale threshold ⇒ drop.
         assert!(should_drop_record(
-            &rec("stuck", "creating", now - CREATING_STALE_SECS - 1),
+            &rec("stuck", "creating", now - CREATING_STALE_SECS as i64 - 1),
             &live,
             now
         ));

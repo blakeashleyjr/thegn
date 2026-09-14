@@ -76,8 +76,7 @@ pub fn priority(t: &ScanTarget, now: i64, ttl_secs: u64) -> Option<ScanPriority>
         Some(at) => {
             // A stamp in the future (clock skew, a restored DB) counts as fresh
             // rather than wrapping negative and re-measuring forever.
-            let age = now.saturating_sub(at);
-            if ttl_secs > 0 && age < ttl_secs as i64 {
+            if crate::time_policy::is_fresh(now, Some(at), ttl_secs) {
                 return None;
             }
             Some(if t.active {

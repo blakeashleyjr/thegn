@@ -186,7 +186,8 @@ impl ModelProxyStore for Db {
             .optional()?;
         let (window_start, base_tokens, base_cost, killed) = match existing {
             Some(r) => {
-                let lapsed = window_len_ms > 0 && now_ms - r.window_start_ms >= window_len_ms;
+                let lapsed =
+                    crate::budget_alert::window_lapsed(window_len_ms, r.window_start_ms, now_ms);
                 if lapsed {
                     (now_ms, 0, 0.0, r.killed)
                 } else {

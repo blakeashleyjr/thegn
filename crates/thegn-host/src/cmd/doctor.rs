@@ -1317,7 +1317,7 @@ fn daemon_health() -> (&'static str, Option<String>) {
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0);
     let ttl = thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
     let scope = thegn_core::util::xdg_state_home()
@@ -2047,7 +2047,7 @@ fn hosts_report(cfg: &Config) {
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(u128::from(d.as_secs())))
         .unwrap_or(0);
     for (name, hc) in &cfg.host {
         let state = cfg

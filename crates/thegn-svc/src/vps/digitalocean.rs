@@ -253,6 +253,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_and_future_provider_creation_times_never_authorize_reaping() {
+        for timestamp in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!("bad"),
+            serde_json::json!("1960-01-01T00:00:00Z"),
+            serde_json::json!("2099-01-01T00:00:00Z"),
+        ] {
+            let mut row = serde_json::json!({"id":42,"name":"fixture"});
+            row["created_at"] = timestamp;
+            let instance = parse_droplet(&row).unwrap();
+            let decision = thegn_core::time_policy::resource_expiry(
+                1_800_000_000,
+                instance.created,
+                60,
+                Some(1200),
+            );
+            assert!(matches!(
+                decision,
+                thegn_core::time_policy::ResourceExpiry::Quarantine(_)
+            ));
+        }
+    }
+
+    #[test]
     fn urls_are_versioned_and_tag_filtered() {
         assert_eq!(
             droplets_url("https://api.digitalocean.com/v2/"),
