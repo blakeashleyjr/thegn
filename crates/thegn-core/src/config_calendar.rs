@@ -469,7 +469,7 @@ pub fn display_warnings(cfg: &CalendarConfig) -> Vec<String> {
             crate::calendar::display::Field::ClockLabel,
         )
         .as_str()
-            != c.label.trim()
+            != c.label
         {
             out.push(format!("calendar.clocks[{i}].label: display text contains controls or exceeds the 64 scalar/cell budget; it will be sanitized"));
         }
@@ -480,7 +480,7 @@ pub fn display_warnings(cfg: &CalendarConfig) -> Vec<String> {
             crate::calendar::display::Field::Calendar,
         )
         .as_str()
-            != a.name.trim()
+            != a.name
         {
             out.push(format!("calendar.accounts[{i}].name: display text contains controls or exceeds the 64 scalar/cell budget; it will be sanitized"));
         }
