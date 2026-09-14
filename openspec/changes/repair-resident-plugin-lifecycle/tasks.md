@@ -24,5 +24,6 @@
 - [x] Add explicit READY, finite fixture lifetime, assertion-unwind cleanup and shell-independent lifecycle/failure coverage.
 - [x] Select native lifecycle and exact Windows cancellation-race regressions in the existing opt-in CI job; preserve macOS pipeline.
 - [x] Execute eight new native Linux regressions plus all 48 existing plugin tests; exclude one ignored helper from the count (two platform ratchets also passed).
-- [ ] Check the new foreign-target test source separately; native Windows/macOS execution still requires their kernels.
+- [x] Pass the full Windows service library/test crosscheck with the new fixture source; this is not native execution.
+- [ ] Check the new Darwin fixture graph; the historical unix.rs-only harness does not cover it. Native Windows/macOS execution still requires their kernels.
 - [ ] Complete independent adversarial review, scoped checks and local landing of the follow-up.

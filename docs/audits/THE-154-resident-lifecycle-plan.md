@@ -244,13 +244,14 @@ latch and ReadFile must be repeated until the actual thread finishes.
 The opt-in Windows CI job runs both selections. Its opt-in policy, macOS full
 build/test job, production platform code and plugin availability are unchanged.
 No CI dispatch, push or native Windows/macOS execution is performed by this
-change. Linux execution passed at the assembled follow-up checkpoint; foreign-
-target compilation of this new source remains a separate pending gate.
+change. Linux execution passed at the assembled follow-up checkpoint. The full
+Windows service library/test graph, including the new fixture source, also passed
+cross-compilation; the new Darwin fixture graph remains unverified.
 
 | Gate                              | Evidence before this follow-up                                                           | Remaining evidence                                                                                     |
 | --------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | Native Linux lifecycle            | Eight new and 48 existing plugin regressions passed; two ratchets passed; helper ignored | Final follow-up integration/source checks                                                              |
-| Windows library/tests compilation | Full service `x86_64-pc-windows-gnu --tests` crosscheck passed                           | Recheck added test source; this cannot prove Windows runtime behavior                                  |
+| Windows library/tests compilation | Full service `x86_64-pc-windows-gnu --tests` crosscheck passed                           | New fixture source passed full Windows --tests crosscheck; native execution still required                                  |
 | Native Windows lifecycle          | No recorded resident fixture execution                                                   | Run the explicit native CI selections on Windows, including CancelSynchronousIo race and failure paths |
 | Darwin source compilation         | Isolated actual-source platform/tests crosscheck passed                                  | Added portable fixture source is not covered by that historical check                                  |
 | Native macOS lifecycle            | No recorded resident fixture execution                                                   | Execute resident tests on macOS to exercise SIGCHLD/WNOWAIT and native pipes                           |
@@ -273,3 +274,12 @@ The native follow-up receipt is `/tmp/thegn-rolling-plugin-20260914.log` with
 regressions and two ratchets). Independent reviewer verified that the eight new
 tests passed and excluded the helper from the regression count. These are Linux
 results, not execution evidence for Windows cancellation or macOS SIGCHLD.
+
+The new Windows source gate passed `cargo check --offline --locked -p thegn-svc
+--target x86_64-pc-windows-gnu --tests`, recorded in
+`/tmp/thegn-rolling-windows-check-20260914.log`. Its three warnings are preexisting
+and outside the new fixture source. This is typechecking, not native execution.
+The older isolated Darwin harness covers only platform/unix.rs and does not cover
+the new native_tests/session/provider fixture graph. A stubbed replacement would
+not establish that graph's behavior, so Darwin source and native macOS execution
+remain explicitly pending.
