@@ -679,7 +679,7 @@
     },
     {
       "change": "harden-live-diagnostics-and-forge",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -711,7 +711,8 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads."
+      "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "harden-live-upgrades",
