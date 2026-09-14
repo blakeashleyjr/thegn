@@ -3816,3 +3816,7 @@ fn sandbox_candidates(
 #[cfg(test)]
 #[path = "agent_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agent_cleanup_fixture.rs"]
+pub(crate) mod cleanup_fixture;

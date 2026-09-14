@@ -82,6 +82,13 @@ old selection. Duplicate selections cannot inflate cleared counts. Actual land
 callers carry the commit through `apply_landed`; generic Landed/UpToDate events
 without a matching recorded result cannot trigger destructive cleanup.
 
+This is comparison of the full observed row values, not a durable generation.
+A same-value ABA (another writer changes a row and then restores every observed
+value, including timestamps, before revalidation) is not excluded. Detecting that
+history requires a separately implemented durable generation; these guards make
+no such claim. Changed result OIDs revoke eligibility even when every other row
+value is unchanged, for both physical cleanup and asynchronous panel clearing.
+
 THE-594 settles the environment once and uses a dedicated conservative local
 callback, never the ambient-reloading explicit teardown routine. Worktree and
 workspace selections are checked with error-preserving DB reads. Active
@@ -104,3 +111,7 @@ commands. OCI discovery receives a private test search directory; dedicated
 cases verify conservative detection without executing any candidate. This
 exercises actual production argv and removal without touching
 live sessions/configuration. Tests and native delivery gates remain pending.
+
+## THE-594 acceptance fixtures
+
+Private tests insert owned data-only entries into the real agent projection/provider-sync registries and invoke `remove_landed_with_config`. A path-scoped thread-local observer refuses the explicit `teardown_runtime` entry before ambient lookups if automatic cleanup accidentally reaches it. This counts entry into the current synchronous teardown boundary, not individual provider commands or future foreign threads. Actual pre/post hook marker commands prove resource refusal occurs before hooks and that the same landed selection succeeds after fixture custody is released. Registry RAII restores previous entries on assertion unwind. All helpers compile only under cfg(test); runtime cleanup policy and scheduling remain unchanged.
