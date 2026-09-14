@@ -112,6 +112,7 @@ pub struct PtyPane {
     /// Bytes of the in-progress line not yet terminated by '\n'. Flushed into
     /// `history` on newline or when it exceeds 4096 bytes.
     history_partial: Vec<u8>,
+    pub(crate) clipboard: crate::queries::clipboard::Clipboard,
     /// Stateful ANSI stripper carried across PTY read chunks so sequences that
     /// arrive split at a chunk boundary are handled correctly.
     history_stripper: AnsiStripper,
@@ -386,6 +387,7 @@ impl PtyPane {
             program: program_name(argv),
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
+            clipboard: crate::queries::clipboard::Clipboard::default(),
             history_stripper: AnsiStripper::default(),
             pid: pty.pid,
             child_reaped: Some(pty.reaped),
@@ -469,6 +471,7 @@ impl PtyPane {
             program,
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
+            clipboard: crate::queries::clipboard::Clipboard::default(),
             history_stripper: AnsiStripper::default(),
             pid: None,
             child_reaped: None,
@@ -880,6 +883,7 @@ impl PtyPane {
             program: "shell".into(),
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
+            clipboard: crate::queries::clipboard::Clipboard::default(),
             history_stripper: AnsiStripper::default(),
             pid: None,
             child_reaped: None,

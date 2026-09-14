@@ -227,3 +227,14 @@ multiplexer would; `THEGN_NO_DAEMON=1` does it for a single run.
 
 See also [[configuration]] for where these keys live, and
 [[workspaces-and-worktrees]] for how sessions map onto worktrees.
+
+Pane applications may set the outer clipboard with OSC 52, but cannot read it.
+Thegn accepts one selector (`c`, `p`, `q`, `s`, or `0`–`7`) and canonical
+nonempty base64 data up to 64 KiB decoded. BEL and ST terminators are supported
+across PTY reads. Queries, empty/default or multiple selectors, empty/clear
+forms and malformed data are refused; this deliberately narrows the broader
+[xterm OSC 52 grammar](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
+
+A refused set remains pending for that pane, and a newer validated set replaces
+it. Reattach, fallback and exit discard unadmitted partial/pending clipboard
+state. Already accepted writes remain in writer FIFO order.
