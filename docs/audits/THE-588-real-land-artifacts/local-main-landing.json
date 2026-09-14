@@ -1,0 +1,14 @@
+{
+  "landed_head": "bb8ff6d77ba85ec292494957653b6c9d9047b8ed",
+  "fixture_code": "b21cb20d",
+  "native_passed": 38,
+  "strict_host_all_targets_clippy": true,
+  "source_ratchets": true,
+  "strict_change_validation": true,
+  "treefmt_log_sha256": "f80fb844460067e7434696ee85ebfb04a1df2bbc73f82b11f9e0eebe5028b358",
+  "preserved_untracked_files": 143,
+  "justfile_sha256": "75a61923b8db84f1115dd291159c65a63712eab27cbe3f3230b9b87129caf9b2",
+  "live_cleanup": false,
+  "live_restart": false,
+  "push": false
+}

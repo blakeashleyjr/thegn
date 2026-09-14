@@ -24,6 +24,9 @@ negative coverage. Earlier full-workspace receipts establish the unchanged
 provenance. Evidence is under `THE-588-real-land-artifacts/`.
 
 Strict host/all-target Clippy, source ratchets and strict change validation now
-pass. Local-main landing remains pending at this checkpoint. This does not establish native non-Unix cleanup behavior, stronger
+pass. Canonical local main advanced to
+`bb8ff6d77ba85ec292494957653b6c9d9047b8ed` with the reviewed fixture and all
+prior strict-origin fixes. The user justfile and 143 pre-existing untracked files
+were rehashed unchanged after landing. This does not establish native non-Unix cleanup behavior, stronger
 post-observation atomic file protection (THE-370), or restored automatic branch
 deletion (THE-596). Those broader obligations remain separate and open.
