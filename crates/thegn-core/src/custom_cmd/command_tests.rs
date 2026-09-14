@@ -48,9 +48,13 @@ const PATHS: &[&str] = &[
     "SelectedCommit.Subject",
     "SelectedCommit.Author",
     "SelectedLocalCommit.Subject",
+    "SelectedLocalCommit.Sha",
+    "SelectedLocalCommit.Short",
+    "SelectedLocalCommit.Author",
     "SelectedBranch.Name",
     "SelectedBranch.Upstream",
     "SelectedLocalBranch.Name",
+    "SelectedLocalBranch.Upstream",
     "CheckedOutBranch.Name",
     "CheckedOutBranch.Upstream",
     "SelectedFile",
@@ -61,6 +65,40 @@ const PATHS: &[&str] = &[
     "Form.Answer",
     "Prompts.Answer",
 ];
+
+#[test]
+fn alias_and_missing_selection_coverage_uses_the_real_compiler() {
+    let mut cmd = config("");
+    cmd.template_policy = None;
+    for path in PATHS {
+        cmd.argv = vec!["printf".into(), format!("{{{{.{path}}}}}")];
+        assert_eq!(
+            compile(&cmd, &context("answer")).unwrap().terminal_argv()[1],
+            "answer"
+        );
+        assert!(compile(&cmd, &TemplateCtx::default()).is_err(), "{path}");
+    }
+    for path in ["SelectedStash.Index", "SelectedStashEntry.Index"] {
+        cmd.argv = vec!["printf".into(), format!("{{{{.{path}}}}}")];
+        assert_eq!(
+            compile(&cmd, &context("answer")).unwrap().terminal_argv()[1],
+            "2"
+        );
+        assert!(compile(&cmd, &TemplateCtx::default()).is_err());
+    }
+}
+
+#[test]
+fn cumulative_and_quote_amplification_budgets_fail_during_construction() {
+    let mut cmd = config("");
+    cmd.template_policy = None;
+    cmd.argv = std::iter::once("printf".into())
+        .chain(std::iter::repeat_n("{{.SelectedFile}}".into(), 255))
+        .collect();
+    assert!(compile(&cmd, &context(&"x".repeat(1024 * 1024))).is_err());
+    let cmd = config("printf '%s' {{.SelectedFile}}");
+    assert!(compile(&cmd, &context(&"'".repeat(300_000))).is_err());
+}
 
 #[test]
 fn every_data_family_is_inert_across_modes_and_transport_projections() {

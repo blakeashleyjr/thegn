@@ -115,10 +115,42 @@ fn placeholder(body: &str, mode: Mode) -> Result<(&str, bool), TemplateError> {
     }
 }
 
+fn append(out: &mut String, value: &str, budget: usize) -> Result<(), TemplateError> {
+    if value.len() > budget.saturating_sub(out.len()) {
+        return Err(err("expanded command exceeds its size limit"));
+    }
+    out.push_str(value);
+    Ok(())
+}
+
+// Mirrors sh_quote's representation length without constructing it. Check
+// expansion amplification before allocating the quoted representation.
+fn quoted_len(value: &str) -> usize {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b))
+    {
+        value.len()
+    } else {
+        value
+            .len()
+            .saturating_add(
+                value
+                    .bytes()
+                    .filter(|&b| b == b'\'')
+                    .count()
+                    .saturating_mul(3),
+            )
+            .saturating_add(2)
+    }
+}
+
 fn substitute(
     template: &str,
     mode: Mode,
     ctx: Option<&TemplateCtx>,
+    budget: usize,
 ) -> Result<String, TemplateError> {
     if template.len() > MAX_TEMPLATE || template.contains('\0') {
         return Err(err("template is oversized or contains NUL"));
@@ -129,7 +161,7 @@ fn substitute(
     let mut out = String::new();
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
+        append(&mut out, &rest[..start], budget)?;
         let after = &rest[start + 2..];
         let end = after
             .find("}}")
@@ -142,20 +174,17 @@ fn substitute(
                 return Err(err("placeholder value is oversized or contains NUL"));
             }
             if mode == Mode::Argv || raw {
-                out.push_str(&value);
+                append(&mut out, &value, budget)?;
             } else {
-                out.push_str(&crate::util::sh_quote(&value));
+                if quoted_len(&value) > budget.saturating_sub(out.len()) {
+                    return Err(err("quoted command exceeds its size limit"));
+                }
+                append(&mut out, &crate::util::sh_quote(&value), budget)?;
             }
         }
         rest = &after[end + 2..];
-        if out.len() > MAX_EXPANDED {
-            return Err(err("expanded command exceeds its size limit"));
-        }
     }
-    out.push_str(rest);
-    if out.len() > MAX_EXPANDED {
-        return Err(err("expanded command exceeds its size limit"));
-    }
+    append(&mut out, rest, budget)?;
     Ok(out)
 }
 
@@ -260,7 +289,7 @@ fn validate(cmd: &GitCommand) -> Result<Mode, TemplateError> {
         return Err(err("templates exceed their combined size limit"));
     }
     for template in templates {
-        substitute(template, mode, None)?;
+        substitute(template, mode, None, MAX_EXPANDED)?;
     }
     Ok(mode)
 }
@@ -280,17 +309,22 @@ pub fn validate_commands(commands: &[GitCommand]) -> Vec<String> {
 pub fn compile(cmd: &GitCommand, ctx: &TemplateCtx) -> Result<ExpandedCommand, TemplateError> {
     let mode = validate(cmd)?;
     let program = if mode == Mode::Argv {
-        let args = cmd
-            .argv
-            .iter()
-            .map(|arg| substitute(arg, mode, Some(ctx)))
-            .collect::<Result<Vec<_>, _>>()?;
-        if args.iter().map(String::len).sum::<usize>() > MAX_EXPANDED {
-            return Err(err("expanded argv exceeds its combined size limit"));
+        let mut args = Vec::with_capacity(cmd.argv.len());
+        let mut remaining = MAX_EXPANDED;
+        let mut wire_remaining = MAX_EXPANDED;
+        for template in &cmd.argv {
+            let arg = substitute(template, mode, Some(ctx), remaining)?;
+            let wire_len = quoted_len(&arg).saturating_add(usize::from(!args.is_empty()));
+            if wire_len > wire_remaining {
+                return Err(err("quoted argv exceeds its combined size limit"));
+            }
+            remaining -= arg.len();
+            wire_remaining -= wire_len;
+            args.push(arg);
         }
         Program::Argv(args)
     } else {
-        Program::Shell(substitute(&cmd.command, mode, Some(ctx))?)
+        Program::Shell(substitute(&cmd.command, mode, Some(ctx), MAX_EXPANDED)?)
     };
     Ok(ExpandedCommand(program))
 }
