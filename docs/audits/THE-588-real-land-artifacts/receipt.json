@@ -60,7 +60,25 @@
       "path": "thegn-THE588-independent-acceptance-evidence-20260914.json",
       "sha256": "e4d040d4fa138692d8d2207308a5d245e713a4c8dc738d42d6942e993c8fbaa1",
       "bytes": 6828
+    },
+    {
+      "path": "thegn-THE588-clippy-20260914.log",
+      "sha256": "69c612c42558921b3d975f6ff2648c22e78b512002990b6423b68e4edb65d8d5",
+      "bytes": 9138
+    },
+    {
+      "path": "thegn-THE588-ratchets-20260914.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "bytes": 4797
+    },
+    {
+      "path": "thegn-THE588-openspec-20260914.log",
+      "sha256": "5b9906df211b377ebfe0cd6eca1fc87805e9e4d7c2f2f345fff79c16d9731d26",
+      "bytes": 47
     }
   ],
-  "scope": "Targeted actual-land/lifecycle/cleanup/failed-fold acceptance; no new full-workspace or non-Unix claim"
+  "scope": "Targeted actual-land/lifecycle/cleanup/failed-fold acceptance; no new full-workspace or non-Unix claim",
+  "strict_host_all_targets_clippy_exit_code": 0,
+  "source_ratchets_exit_code": 0,
+  "strict_change_validation_exit_code": 0
 }

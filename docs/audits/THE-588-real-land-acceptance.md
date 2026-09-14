@@ -23,7 +23,7 @@ negative coverage. Earlier full-workspace receipts establish the unchanged
 32-test scoped cleanup/sweep acceptance set; they retain their original source
 provenance. Evidence is under `THE-588-real-land-artifacts/`.
 
-Strict lint, source gates and local-main landing remain pending at this
-checkpoint. This does not establish native non-Unix cleanup behavior, stronger
+Strict host/all-target Clippy, source ratchets and strict change validation now
+pass. Local-main landing remains pending at this checkpoint. This does not establish native non-Unix cleanup behavior, stronger
 post-observation atomic file protection (THE-370), or restored automatic branch
 deletion (THE-596). Those broader obligations remain separate and open.
