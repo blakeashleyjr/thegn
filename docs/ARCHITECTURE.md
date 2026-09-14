@@ -200,6 +200,15 @@ the plugin runtime (`openspec/specs/plugin-runtime`): loader (`[[plugins]]`
   joins every `IssueRouter` beside configured accounts. Nothing plugin-side
   ever touches the idle loop (channel + waker, like every producer).
 
+Resident process ownership lives in `thegn-svc::plugin::session`; platform I/O
+and child identity operations are confined to `plugin/platform/`. That narrow
+service-owned seam is excluded from the platform-cfg ratchet because the host
+already depends on svc, so using host process ownership here would create a
+cycle. Arbitrary platform cfg growth elsewhere remains prohibited. The host
+retains one supervisor across reloads and awaits its receipts outside the UI
+loop. Receipts separate leader reaping and pipe settlement from the currently
+unproven guarantee of complete descendant containment (THE-154 remains open).
+
 **Gate:** catalog tests (`every_verb_has_exactly_one_row`, admin never on
 MCP/plugin), per-surface `coverage_problems` tests (HTTP, gRPC, CLI, MCP,
 plugin), `api_calls_mirror_routes`, `tests/plugin_api_wire.rs` +

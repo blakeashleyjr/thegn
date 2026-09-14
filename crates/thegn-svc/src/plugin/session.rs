@@ -1,310 +1,498 @@
-//! A resident plugin session: one long-lived child spoken to over NDJSON.
-//!
-//! [`spawn_ndjson`](super::proc::spawn_ndjson) runs a plugin to completion;
-//! this keeps one alive for the whole thegn session. Reads happen on a
-//! dedicated thread that hands every parsed line to a callback (the host
-//! tags it with the plugin id, queues it on the loop channel and pulses the
-//! waker); writes go through a cloneable [`SessionWriter`] so replies can be
-//! sent from any thread (the host.call dispatcher answers directly, never
-//! touching the event loop).
-
+//! Bounded resident admission. Callers never own pipes or wait for children.
+use super::proc::PluginError;
+use futures_util::FutureExt;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use thegn_core::plugin_api::{RpcMessage, RpcResponse};
+use tokio::time::Instant;
 
-use thegn_core::plugin_api::{PluginCallback, RpcMessage, RpcResponse};
+pub(super) mod admission;
+mod owner;
+pub use admission::SessionWriter;
+use admission::Shared;
 
-use super::proc::{MAX_LINE_BYTES, PluginError};
+pub const MAX_RESIDENT_SESSIONS: usize = 32;
+pub const MAX_QUEUED_FRAMES: usize = 32;
+pub const MAX_QUEUED_BYTES: usize = 2 * super::proc::MAX_LINE_BYTES;
+pub const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
-/// One parsed line (or lifecycle event) from a resident plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFailure {
+    Full,
+    TooLarge,
+    Closed,
+}
+impl std::fmt::Display for SessionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Full => "resident admission is full",
+            Self::TooLarge => "resident frame exceeds limits",
+            Self::Closed => "resident session is closed",
+        })
+    }
+}
+impl std::error::Error for SessionFailure {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    WriterClosed,
+    Requested,
+    StdoutClosed,
+    ProcessExit,
+    Protocol,
+    WriteFailed,
+    WriteTimeout,
+    CallbackPanic,
+    OwnerPanic,
+    Shutdown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeGuarantee {
+    Unproven,
+}
+
+/// Independent facts: leader reaping never certifies descendant containment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOutcome {
+    pub reason: CloseReason,
+    pub leader_reaped: bool,
+    pub code: Option<i32>,
+    pub pipes_settled: bool,
+    pub tree: TreeGuarantee,
+    pub termination_requested: bool,
+    pub errors: Vec<String>,
+}
+impl SessionOutcome {
+    pub fn settled(&self) -> bool {
+        self.leader_reaped && self.pipes_settled
+    }
+}
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    /// A verb or notification from the plugin.
     Message(RpcMessage),
-    /// The plugin's reply to a host-initiated request.
     Response(RpcResponse),
-    /// A line that was not valid JSON — kept for diagnostics (`println!`
-    /// debugging is the most common plugin-author mistake).
     Junk(String),
-    /// The process exited; the session is dead. Sent exactly once, last.
-    Exit { code: Option<i32> },
+    /// Last callback. The completion receipt carries reaping/pipe facts.
+    Exit {
+        code: Option<i32>,
+    },
 }
-
-/// Cloneable stdin handle: `None` after the session dies or is killed.
+struct Entry {
+    shared: Arc<Shared>,
+    task: Arc<tokio::sync::Mutex<TaskState>>,
+    // Custody survives a completed task when termination or pipe settlement failed.
+    held: Arc<Mutex<Option<super::platform::Process>>>,
+}
+struct TaskState {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    joined: Option<Result<(), String>>,
+    failures: Vec<String>,
+}
+struct Registry {
+    closed: bool,
+    entries: BTreeMap<String, Entry>,
+}
+struct SupervisorInner {
+    #[cfg(test)]
+    after_spawn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    runtime: tokio::runtime::Handle,
+    registry: Mutex<Registry>,
+}
+/// One application-wide registry retained across plugin reloads.
 #[derive(Clone)]
-pub struct SessionWriter(Arc<Mutex<Option<ChildStdin>>>);
-
-impl SessionWriter {
-    fn write_line(&self, line: &str) -> Result<(), PluginError> {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(stdin) = guard.as_mut() else {
-            return Err(PluginError::Protocol("session is closed".into()));
+pub struct ResidentSupervisor(Arc<SupervisorInner>);
+#[derive(Debug)]
+pub struct ShutdownReport {
+    pub outcomes: Vec<(String, SessionOutcome)>,
+    pub unresolved: Vec<String>,
+}
+impl ShutdownReport {
+    pub fn is_settled(&self) -> bool {
+        self.unresolved.is_empty() && self.outcomes.iter().all(|(_, outcome)| outcome.settled())
+    }
+}
+impl ResidentSupervisor {
+    pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self(Arc::new(SupervisorInner {
+            #[cfg(test)]
+            after_spawn: Mutex::new(None),
+            runtime,
+            registry: Mutex::new(Registry {
+                closed: false,
+                entries: BTreeMap::new(),
+            }),
+        }))
+    }
+    /// Background setup/restart lane only. Wait for the old closing identity
+    /// before replacement; Held resources continue to block the same key.
+    pub fn wait_for_release(&self, key: &str) -> Result<(), PluginError> {
+        let entry = {
+            let registry = self.0.registry.lock().unwrap_or_else(|e| e.into_inner());
+            if registry.closed {
+                return Err(PluginError::Spawn("resident supervisor closing".into()));
+            }
+            registry
+                .entries
+                .get(key)
+                .map(|entry| (entry.shared.clone(), entry.task.clone()))
         };
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush())
-            .map_err(|e| PluginError::Protocol(format!("write failed: {e}")))
+        let Some((shared, task)) = entry else {
+            return Ok(());
+        };
+        let Some((_, deadline)) = shared.closing() else {
+            return Err(PluginError::Spawn(
+                "resident identity already running".into(),
+            ));
+        };
+        self.0.runtime.block_on(async {
+            let mut outcome = shared.outcome.subscribe();
+            while outcome.borrow().is_none() {
+                if !matches!(
+                    tokio::time::timeout_at(deadline, outcome.changed()).await,
+                    Ok(Ok(()))
+                ) {
+                    return Err(PluginError::Spawn(
+                        "old resident cleanup remains outstanding".into(),
+                    ));
+                }
+            }
+            if !outcome
+                .borrow()
+                .as_ref()
+                .is_some_and(SessionOutcome::settled)
+            {
+                return Err(PluginError::Spawn(
+                    "old resident retains unsettled resources".into(),
+                ));
+            }
+            let mut task = tokio::time::timeout_at(deadline, task.lock())
+                .await
+                .map_err(|_| PluginError::Spawn("old resident join outstanding".into()))?;
+            if let Some(handle) = task.handle.as_mut() {
+                let result = tokio::time::timeout_at(deadline, handle)
+                    .await
+                    .map_err(|_| PluginError::Spawn("old resident join outstanding".into()))?;
+                task.joined = Some(result.map_err(|error| error.to_string()));
+                task.handle = None;
+            }
+            if matches!(task.joined, Some(Ok(()))) {
+                Ok(())
+            } else {
+                Err(PluginError::Spawn("old resident owner failed".into()))
+            }
+        })
     }
-
-    /// Send a host→plugin callback notification (`activate`, `render`,
-    /// `on_event`, `deactivate`).
-    pub fn notify(
-        &self,
-        callback: PluginCallback,
-        params: serde_json::Value,
-    ) -> Result<(), PluginError> {
-        let msg = RpcMessage::notification(callback, params);
-        self.write_line(&serde_json::to_string(&msg).unwrap_or_default())
+    pub fn request_shutdown(&self, deadline: Instant) {
+        let entries = {
+            let mut registry = self.0.registry.lock().unwrap_or_else(|e| e.into_inner());
+            registry.closed = true;
+            registry
+                .entries
+                .values()
+                .map(|entry| entry.shared.clone())
+                .collect::<Vec<_>>()
+        };
+        for shared in entries {
+            shared.close(CloseReason::Shutdown, deadline);
+        }
     }
-
-    /// Write one raw NDJSON line (the provider bridge's `provider.call`
-    /// requests, which carry their own correlation ids).
-    pub fn send_raw(&self, line: &str) -> Result<(), PluginError> {
-        self.write_line(line)
-    }
-
-    /// Answer one of the plugin's `id`-bearing requests.
-    pub fn respond(&self, resp: &RpcResponse) -> Result<(), PluginError> {
-        self.write_line(&serde_json::to_string(resp).unwrap_or_default())
-    }
-
-    /// Drop the stdin handle (EOF to the plugin) — the polite half of
-    /// shutdown; `ResidentSession::kill` is the impolite half.
-    pub fn close(&self) {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = None;
+    /// Request all sessions first, then wait concurrently against ONE deadline.
+    pub async fn shutdown_until(&self, deadline: Instant) -> ShutdownReport {
+        self.request_shutdown(deadline);
+        let entries = {
+            let registry = self.0.registry.lock().unwrap_or_else(|e| e.into_inner());
+            registry
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        entry.shared.outcome.subscribe(),
+                        entry.task.clone(),
+                        entry.shared.clone(),
+                        entry.held.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let results = futures_util::future::join_all(entries.into_iter().map(
+            |(key, mut outcome, task, shared, held)| async move {
+                while outcome.borrow().is_none() {
+                    if !matches!(
+                        tokio::time::timeout_at(deadline, outcome.changed()).await,
+                        Ok(Ok(()))
+                    ) {
+                        break;
+                    }
+                }
+                // The handle stays inside registry-owned state even if this waiter
+                // is cancelled. Concurrent shutdown callers observe the same join.
+                let joined = match tokio::time::timeout_at(deadline, task.lock()).await {
+                    Ok(mut task) => {
+                        if let Some(handle) = task.handle.as_mut() {
+                            if let Ok(result) = tokio::time::timeout_at(deadline, handle).await {
+                                let result = result.map_err(|error| error.to_string());
+                                if let Err(error) = &result {
+                                    task.failures.push(error.clone());
+                                }
+                                task.joined = Some(result);
+                                task.handle = None;
+                            }
+                        }
+                        if task.handle.is_none() && Instant::now() < deadline {
+                            let process = held
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take();
+                            if let Some(process) = process {
+                                let custody =
+                                    owner::Custody::new(process, shared.clone(), held.clone());
+                                shared.outcome.send_replace(None);
+                                task.handle =
+                                    Some(self.0.runtime.spawn(owner::retry(custody, deadline)));
+                                task.joined = None;
+                                if let Ok(result) = tokio::time::timeout_at(
+                                    deadline,
+                                    task.handle.as_mut().expect("retry owner"),
+                                )
+                                .await
+                                {
+                                    let result = result.map_err(|error| error.to_string());
+                                    if let Err(error) = &result {
+                                        task.failures.push(error.clone());
+                                    }
+                                    task.joined = Some(result);
+                                    task.handle = None;
+                                }
+                            }
+                        }
+                        if task.failures.is_empty() {
+                            task.joined.clone()
+                        } else {
+                            Some(Err(task.failures.join("; ")))
+                        }
+                    }
+                    Err(_) => None,
+                };
+                let result = outcome.borrow().clone();
+                (key, result, joined)
+            },
+        ))
+        .await;
+        let mut report = ShutdownReport {
+            outcomes: Vec::new(),
+            unresolved: Vec::new(),
+        };
+        for (key, result, joined) in results {
+            if !matches!(joined, Some(Ok(()))) {
+                report
+                    .unresolved
+                    .push(format!("{key}: owner join {joined:?}"));
+            }
+            match result {
+                Some(outcome) => report.outcomes.push((key, outcome)),
+                None => report
+                    .unresolved
+                    .push(format!("{key}: no terminal receipt")),
+            }
+        }
+        report
     }
 }
-
-/// A live resident plugin process.
+impl Drop for SupervisorInner {
+    fn drop(&mut self) {
+        let registry = self.registry.get_mut().unwrap_or_else(|e| e.into_inner());
+        for (key, entry) in &registry.entries {
+            entry.shared.close(CloseReason::Shutdown, Instant::now());
+            if entry
+                .shared
+                .outcome
+                .borrow()
+                .as_ref()
+                .is_none_or(|outcome| !outcome.settled())
+            {
+                let held = entry
+                    .held
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                tracing::error!(target: "thegn::plugin", plugin = %key, held, "final supervisor release with unresolved resources; custody cannot survive application exit");
+            }
+        }
+    }
+}
 pub struct ResidentSession {
-    child: Arc<Mutex<Child>>,
-    writer: SessionWriter,
+    shared: Arc<Shared>,
 }
-
 impl ResidentSession {
-    /// Spawn `argv` and start the reader thread. Every stdout line (and the
-    /// final exit) is delivered to `on_event`; stderr is drained and logged.
-    /// The environment is scrubbed of inherited git state exactly like
-    /// [`spawn_ndjson`](super::proc::spawn_ndjson).
     pub fn spawn(
+        supervisor: &ResidentSupervisor,
+        key: &str,
         argv: &[String],
         env: &BTreeMap<String, String>,
         cwd: Option<&Path>,
-        on_event: impl Fn(SessionEvent) + Send + 'static,
+        on_event: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> Result<Self, PluginError> {
         let Some((program, args)) = argv.split_first() else {
             return Err(PluginError::Spawn("empty command".into()));
         };
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        if key.len() > 256 {
+            return Err(PluginError::Spawn("resident identity exceeds limit".into()));
+        }
+        let shared = Shared::new();
+        let held = Arc::new(Mutex::new(None));
+        let task_state = Arc::new(tokio::sync::Mutex::new(TaskState {
+            handle: None,
+            joined: None,
+            failures: Vec::new(),
+        }));
+        // Acquire registration ownership BEFORE exposing the reservation.
+        // Concurrent shutdown waits on this guard under its own deadline.
+        let mut registration = task_state
+            .clone()
+            .try_lock_owned()
+            .expect("new private task state");
+        {
+            let mut registry = supervisor
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            registry.entries.retain(|_, entry| {
+                if !entry
+                    .shared
+                    .outcome
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(SessionOutcome::settled)
+                {
+                    return true;
+                }
+                if let Ok(mut task) = entry.task.try_lock() {
+                    if let Some(handle) = task.handle.as_mut()
+                        && handle.is_finished()
+                    {
+                        if let Some(result) = handle.now_or_never() {
+                            task.joined = Some(result.map_err(|error| error.to_string()));
+                            task.handle = None;
+                        }
+                    }
+                    return !matches!(task.joined, Some(Ok(())));
+                }
+                true
+            });
+            if registry.closed
+                || registry.entries.contains_key(key)
+                || registry.entries.len() >= MAX_RESIDENT_SESSIONS
+            {
+                return Err(PluginError::Spawn(
+                    "resident supervisor closed, full, or identity still owned".into(),
+                ));
+            }
+            registry.entries.insert(
+                key.to_string(),
+                Entry {
+                    shared: shared.clone(),
+                    task: task_state.clone(),
+                    held: held.clone(),
+                },
+            );
+        }
+        let mut command = Command::new(program);
+        command
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in env {
-            cmd.env(k, v);
+            .stderr(Stdio::piped())
+            .envs(env);
+        if let Some(path) = cwd.filter(|path| path.is_dir()) {
+            command.current_dir(path);
         }
-        if let Some(d) = cwd.filter(|d| d.is_dir()) {
-            cmd.current_dir(d);
-        }
-        for var in [
+        for name in [
             "GIT_DIR",
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
             "GIT_OBJECT_DIRECTORY",
         ] {
-            cmd.env_remove(var);
+            command.env_remove(name);
         }
-        super::proc::set_process_group(&mut cmd);
-
-        let mut child = cmd.spawn().map_err(|e| PluginError::Spawn(e.to_string()))?;
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let writer = SessionWriter(Arc::new(Mutex::new(stdin)));
-        let child = Arc::new(Mutex::new(child));
-
-        if let Some(err) = stderr {
-            std::thread::spawn(move || {
-                let buf = BufReader::new(err);
-                for line in buf.lines().map_while(Result::ok) {
-                    tracing::debug!(target: "thegn::plugin", "stderr: {line}");
-                }
-            });
-        }
-
-        let reap = Arc::clone(&child);
-        let reader_writer = writer.clone();
-        std::thread::spawn(move || {
-            if let Some(out) = stdout {
-                let mut buf = BufReader::new(out);
-                let mut line = Vec::new();
-                loop {
-                    line.clear();
-                    let n = match buf
-                        .by_ref()
-                        .take(MAX_LINE_BYTES as u64)
-                        .read_until(b'\n', &mut line)
-                    {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    let text = String::from_utf8_lossy(&line[..n]).trim().to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    on_event(parse_line(&text));
-                }
+        let entered = supervisor.0.runtime.enter();
+        let spawned = super::platform::Prepared::new().and_then(|prepared| {
+            if shared.closing().is_some() {
+                return Err(std::io::Error::other("supervisor closing"));
             }
-            // EOF: close our stdin handle (unblocks a child stuck on read),
-            // reap, and deliver the exit exactly once.
-            reader_writer.close();
-            let code = {
-                let mut guard = reap.lock().unwrap_or_else(|e| e.into_inner());
-                guard.wait().ok().and_then(|s| s.code())
-            };
-            on_event(SessionEvent::Exit { code });
+            prepared.spawn(command)
         });
-
-        Ok(Self { child, writer })
+        drop(entered);
+        let process = match spawned {
+            Ok(process) => process,
+            Err(error) => {
+                supervisor
+                    .0
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entries
+                    .remove(key);
+                return Err(PluginError::Spawn(error.to_string()));
+            }
+        };
+        let custody = owner::Custody::new(process, shared.clone(), held);
+        #[cfg(test)]
+        if let Some(hook) = supervisor.0.after_spawn.lock().unwrap().take() {
+            hook();
+        }
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let task = supervisor.0.runtime.spawn(async move {
+            if ready.await.is_ok() {
+                owner::run(custody, on_event).await;
+            }
+        });
+        registration.handle = Some(task);
+        drop(registration);
+        start.send(()).map_err(|()| {
+            PluginError::Spawn("lifecycle owner stopped before registration".into())
+        })?;
+        Ok(Self { shared })
     }
-
-    /// The cloneable write half.
     pub fn writer(&self) -> SessionWriter {
-        self.writer.clone()
+        SessionWriter(self.shared.clone())
     }
-
-    /// Hard-stop the process (the reader thread then reaps it and delivers
-    /// `Exit`). Used on shutdown after a best-effort `deactivate`.
+    pub fn request_close(&self, reason: CloseReason, deadline: Instant) {
+        self.shared.close(reason, deadline);
+    }
     pub fn kill(&self) {
-        self.writer.close();
-        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        // best-effort: the process may already have exited.
-        let _ = guard.kill(); // best-effort: the process may already have exited (see above)
+        self.request_close(CloseReason::Requested, Instant::now() + CLOSE_BUDGET);
+    }
+    pub fn completion(&self) -> tokio::sync::watch::Receiver<Option<SessionOutcome>> {
+        self.shared.outcome.subscribe()
+    }
+}
+impl Drop for ResidentSession {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
-/// Classify one NDJSON line.
+/// Classify one complete NDJSON line. Junk remains diagnostic, not executable.
 fn parse_line(text: &str) -> SessionEvent {
-    // A response has an `id` and result/error but no `method`; try the
-    // message shape first because it is the common case.
     match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(v) if v.get("method").is_some() => match serde_json::from_value::<RpcMessage>(v) {
-            Ok(m) => SessionEvent::Message(m),
-            Err(_) => SessionEvent::Junk(text.to_string()),
-        },
-        Ok(v) if v.get("id").is_some() => match serde_json::from_value::<RpcResponse>(v) {
-            Ok(r) => SessionEvent::Response(r),
-            Err(_) => SessionEvent::Junk(text.to_string()),
-        },
+        Ok(value) if value.get("method").is_some() => {
+            match serde_json::from_value::<RpcMessage>(value) {
+                Ok(message) => SessionEvent::Message(message),
+                Err(_) => SessionEvent::Junk(text.to_string()),
+            }
+        }
+        Ok(value) if value.get("id").is_some() => {
+            match serde_json::from_value::<RpcResponse>(value) {
+                Ok(response) => SessionEvent::Response(response),
+                Err(_) => SessionEvent::Junk(text.to_string()),
+            }
+        }
         _ => SessionEvent::Junk(text.to_string()),
     }
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    fn sh(script: &str) -> Vec<String> {
-        vec!["sh".into(), "-c".into(), script.into()]
-    }
-
-    fn collect(rx: &mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
-        let mut out = Vec::new();
-        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(10)) {
-            let done = matches!(ev, SessionEvent::Exit { .. });
-            out.push(ev);
-            if done {
-                break;
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn round_trips_a_callback_and_classifies_lines() {
-        let (tx, rx) = mpsc::channel();
-        // The child echoes an update verb for every line it reads, plus one
-        // junk line, then exits when stdin closes.
-        let session = ResidentSession::spawn(
-            &sh(r#"echo not-json; while read -r _; do echo '{"method":"update","params":{"surface":"s"}}'; break; done"#),
-            &BTreeMap::new(),
-            None,
-            move |ev| {
-                let _ = tx.send(ev); // best-effort: test receiver may be gone
-            },
-        )
-        .unwrap();
-        session
-            .writer()
-            .notify(PluginCallback::Render, serde_json::json!({}))
-            .unwrap();
-        session.writer().close();
-        let events = collect(&rx);
-        assert!(
-            matches!(events.first(), Some(SessionEvent::Junk(j)) if j == "not-json"),
-            "{events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, SessionEvent::Message(m) if m.method.as_str() == "update")),
-            "{events:?}"
-        );
-        assert!(
-            matches!(events.last(), Some(SessionEvent::Exit { code: Some(0) })),
-            "{events:?}"
-        );
-    }
-
-    #[test]
-    fn responses_are_classified_and_kill_delivers_exit() {
-        let (tx, rx) = mpsc::channel();
-        let session = ResidentSession::spawn(
-            &sh(r#"echo '{"id":7,"result":{"ok":true}}'; sleep 30"#),
-            &BTreeMap::new(),
-            None,
-            move |ev| {
-                let _ = tx.send(ev); // best-effort: test receiver may be gone
-            },
-        )
-        .unwrap();
-        let first = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(
-            matches!(&first, SessionEvent::Response(r) if r.id == 7),
-            "{first:?}"
-        );
-        session.kill();
-        let events = collect(&rx);
-        assert!(
-            matches!(events.last(), Some(SessionEvent::Exit { .. })),
-            "{events:?}"
-        );
-    }
-
-    #[test]
-    fn writes_to_a_dead_session_error() {
-        let (tx, rx) = mpsc::channel();
-        let session = ResidentSession::spawn(&sh("exit 3"), &BTreeMap::new(), None, move |ev| {
-            let _ = tx.send(ev); // best-effort: test receiver may be gone (dead-session case)
-        })
-        .unwrap();
-        let events = collect(&rx);
-        assert!(
-            matches!(events.last(), Some(SessionEvent::Exit { code: Some(3) })),
-            "{events:?}"
-        );
-        // The reader closed the writer on EOF; a late notify errors cleanly.
-        assert!(
-            session
-                .writer()
-                .notify(PluginCallback::Render, serde_json::json!({}))
-                .is_err()
-        );
-    }
-}
+pub(crate) mod tests;

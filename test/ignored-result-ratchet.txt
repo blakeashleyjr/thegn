@@ -335,7 +335,6 @@ crates/thegn-svc/src/lsp/mod.rs
 crates/thegn-svc/src/machine0/mcp.rs
 crates/thegn-svc/src/machine0/mod.rs
 crates/thegn-svc/src/plugin/proc.rs
-crates/thegn-svc/src/plugin/session.rs
 crates/thegn-svc/src/projection/mod.rs
 crates/thegn-svc/src/provider.rs
 crates/thegn-svc/src/revtunnel/mod.rs
