@@ -221,6 +221,10 @@ pub enum GitOp {
         command: String,
         capture: bool,
     },
+    CustomTemplate {
+        command: thegn_core::custom_cmd::ExpandedCommand,
+        capture: bool,
+    },
 }
 
 impl GitOp {
@@ -290,7 +294,7 @@ impl GitOp {
             GitOp::UndoPlan { redo: false } => "planning undo",
             GitOp::UndoPlan { .. } => "planning redo",
             GitOp::UndoApply { .. } => "undoing",
-            GitOp::Custom { .. } => "running command",
+            GitOp::Custom { .. } | GitOp::CustomTemplate { .. } => "running command",
         }
     }
 
@@ -637,6 +641,11 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
             Err(e) => GitOpResult::Err(first_line(&e)),
         },
         GitOp::Custom { command, capture } => match g.run_custom(loc, &command) {
+            Ok(out) if capture => GitOpResult::Output(out),
+            Ok(_) => GitOpResult::Ok(None),
+            Err(e) => GitOpResult::Err(first_line(&e)),
+        },
+        GitOp::CustomTemplate { command, capture } => match g.run_custom_template(loc, &command) {
             Ok(out) if capture => GitOpResult::Output(out),
             Ok(_) => GitOpResult::Ok(None),
             Err(e) => GitOpResult::Err(first_line(&e)),

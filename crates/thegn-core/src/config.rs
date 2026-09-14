@@ -2035,8 +2035,17 @@ pub struct GitCommand {
     /// or `global` (every git view).
     #[serde(default = "default_git_context")]
     pub context: String,
-    /// Shell command template, run via `sh -c` after expansion.
+    /// Trusted shell template. Placeholders require explicit template_policy.
+    /// Mutually exclusive with argv.
+    #[serde(default)]
     pub command: String,
+    /// Argument templates; each element stays one argument after expansion.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Required migration acknowledgement for shell placeholders: safe, or
+    /// dangerously_allow_raw for explicit dangerously_unquoted_shell filters.
+    #[serde(default)]
+    pub template_policy: Option<String>,
     /// Menu label (defaults to the command text).
     #[serde(default)]
     pub description: Option<String>,
@@ -6169,6 +6178,9 @@ impl Config {
             ];
         }
 
+        for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
+            crate::msg::warn(&diagnostic);
+        }
         for p in &mut self.pins {
             if let Some(cwd) = &p.cwd {
                 p.cwd = Some(util::expand_tilde(cwd));
