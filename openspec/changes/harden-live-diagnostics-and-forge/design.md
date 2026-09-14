@@ -44,3 +44,12 @@ continues returning complete diagnostics independently of the runtime warning ca
 Tests use isolated tracing subprocesses, an in-process tower HTTP service, and
 synthetic credential helpers. They never consult actual GitHub accounts or
 live configuration/state. User-provided logging directives remain authoritative.
+
+## Plain structured fields (THE-635)
+
+Brand's prefix color flag did not control the outer tracing layer's field writer.
+Plain sinks could therefore emit styled field names even with an unstyled prefix.
+The formatter must explicitly disable field-writer styling for plain output,
+without stripping payload text or changing selected terminal color/JSON policy.
+Regression fixtures force an ANSI-capable outer layer so ambient NO_COLOR cannot
+silently mask this behavior.

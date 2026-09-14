@@ -14,3 +14,9 @@
 - [x] Complete final rustfmt, taplo, and diff whitespace checks.
 - [ ] Complete independent adversarial review and address findings.
 - [ ] Root review, delivery registry reconciliation, and permitted landing.
+
+## THE-635: plain field color policy
+
+- [x] Reproduce plain structured-field ANSI leakage with NO_COLOR absent and identify production file/stderr sink impact.
+- [ ] Apply selected color policy at the actual field writer and review adversarially.
+- [ ] Pass explicit color-capable-layer plain/TTY/JSON fixtures, isolated production sinks and final workspace gate.

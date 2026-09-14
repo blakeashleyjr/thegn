@@ -704,6 +704,10 @@
         {
           "issue": "THE-624",
           "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-635",
+          "project": "Workspace Product & Observability"
         }
       ],
       "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads."
