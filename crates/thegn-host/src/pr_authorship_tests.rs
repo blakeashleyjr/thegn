@@ -12,6 +12,7 @@ use thegn_core::forge::{
 pub(crate) struct Fixture {
     pub dir: tempfile::TempDir,
     pub loc: GitLoc,
+    pub db: thegn_core::db::Db,
     pub pr: PrStatus,
     pub proof: PrAuthorship,
 }
@@ -78,7 +79,9 @@ impl Fixture {
             author: author.clone(),
             viewer: author,
         };
+        let db = thegn_core::db::Db::open_at(&dir.path().join("fixture.db")).unwrap();
         Self {
+            db,
             dir,
             loc,
             pr,
@@ -147,16 +150,49 @@ impl Forge for FakeForge {
 fn fresh_organization_authorship_is_admitted_and_disabled_policy_needs_no_proof() {
     let fixture = Fixture::new();
     let forge = fixture.forge(vec![fixture.proof.clone()]);
-    let permit = acquire(true, &forge, &fixture.loc, "github", &fixture.pr).unwrap();
-    revalidate(permit.as_ref(), &forge, &fixture.loc, &fixture.pr, false).unwrap();
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    revalidate(
+        permit.as_ref(),
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        &fixture.pr,
+        false,
+    )
+    .unwrap();
     assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 2);
     let unavailable = GitLoc::Local("/does-not-exist".into());
     assert!(
-        acquire(false, &forge, &unavailable, "gitlab", &PrStatus::default())
-            .unwrap()
-            .is_none()
+        acquire(
+            false,
+            &fixture.db,
+            &forge,
+            &unavailable,
+            "gitlab",
+            7,
+            &PrStatus::default()
+        )
+        .unwrap()
+        .is_none()
     );
-    revalidate(None, &forge, &unavailable, &PrStatus::default(), false).unwrap();
+    revalidate(
+        None,
+        &fixture.db,
+        &forge,
+        &unavailable,
+        &PrStatus::default(),
+        false,
+    )
+    .unwrap();
     assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 2);
 }
 
@@ -166,10 +202,38 @@ fn account_change_and_origin_change_after_preparation_hold() {
     let mut foreign = fixture.proof.clone();
     foreign.viewer.id = "U_someone_else".into();
     let forge = fixture.forge(vec![fixture.proof.clone(), foreign]);
-    let permit = acquire(true, &forge, &fixture.loc, "github", &fixture.pr).unwrap();
-    assert!(revalidate(permit.as_ref(), &forge, &fixture.loc, &fixture.pr, false).is_err());
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    assert!(
+        revalidate(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            &fixture.pr,
+            false
+        )
+        .is_err()
+    );
     let forge = fixture.forge(vec![fixture.proof.clone()]);
-    let permit = acquire(true, &forge, &fixture.loc, "github", &fixture.pr).unwrap();
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
     assert!(
         fixture
             .loc
@@ -183,7 +247,17 @@ fn account_change_and_origin_change_after_preparation_hold() {
             .unwrap()
             .success()
     );
-    assert!(revalidate(permit.as_ref(), &forge, &fixture.loc, &fixture.pr, false).is_err());
+    assert!(
+        revalidate(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            &fixture.pr,
+            false
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -192,21 +266,41 @@ fn unknown_cached_author_local_head_and_selected_provider_are_not_authority() {
     let forge = fixture.forge(vec![fixture.proof.clone()]);
     let mut stale = fixture.pr.clone();
     stale.author = None;
-    assert!(acquire(true, &forge, &fixture.loc, "github", &stale).is_err());
-    assert!(acquire(true, &forge, &fixture.loc, "ghe", &fixture.pr).is_err());
+    assert!(acquire(true, &fixture.db, &forge, &fixture.loc, "github", 7, &stale).is_err());
+    assert!(
+        acquire(
+            true,
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            "ghe",
+            7,
+            &fixture.pr
+        )
+        .is_err()
+    );
     let mut moved = fixture.pr.clone();
     moved.head_ref_oid = "f".repeat(40);
     let mut proof = fixture.proof.clone();
     proof.head = moved.head_ref_oid.clone();
     let forge = fixture.forge(vec![proof]);
-    assert!(acquire(true, &forge, &fixture.loc, "github", &moved).is_err());
+    assert!(acquire(true, &fixture.db, &forge, &fixture.loc, "github", 7, &moved).is_err());
 }
 
 #[test]
 fn only_verified_review_completion_can_advance_the_permitted_head() {
     let fixture = Fixture::new();
     let forge = fixture.forge(vec![fixture.proof.clone()]);
-    let permit = acquire(true, &forge, &fixture.loc, "github", &fixture.pr).unwrap();
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
     assert!(
         fixture
             .loc
@@ -232,6 +326,127 @@ fn only_verified_review_completion_can_advance_the_permitted_head() {
     let mut proof = fixture.proof.clone();
     proof.head = after.head_ref_oid.clone();
     let forge = fixture.forge(vec![proof]);
-    assert!(revalidate(permit.as_ref(), &forge, &fixture.loc, &after, false).is_err());
-    assert!(revalidate(permit.as_ref(), &forge, &fixture.loc, &after, true).is_ok());
+    assert!(
+        revalidate(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            &after,
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        revalidate(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            &after,
+            true
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn persisted_remote_malformed_and_changed_execution_locations_hold_before_proof() {
+    let fixture = Fixture::new();
+    let path = fixture.dir.path().to_str().unwrap();
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let permit = acquire(
+        true,
+        &fixture.db,
+        &forge,
+        &fixture.loc,
+        "github",
+        7,
+        &fixture.pr,
+    )
+    .unwrap();
+    fixture
+        .db
+        .put_worktree("fixture", path, path, "fixture", Some("local"), None)
+        .unwrap();
+    for location in [
+        r#"{"host":"fixture.invalid","port":22,"path":"/remote"}"#,
+        r#"{"control_prefix":["fixture-provider"],"path":"/remote"}"#,
+        "broken metadata",
+    ] {
+        fixture.db.set_worktree_location(path, location).unwrap();
+        let before = forge.proof_calls.load(Ordering::SeqCst);
+        assert!(
+            acquire(
+                true,
+                &fixture.db,
+                &forge,
+                &fixture.loc,
+                "github",
+                7,
+                &fixture.pr
+            )
+            .is_err()
+        );
+        assert!(
+            revalidate(
+                permit.as_ref(),
+                &fixture.db,
+                &forge,
+                &fixture.loc,
+                &fixture.pr,
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(forge.proof_calls.load(Ordering::SeqCst), before);
+    }
+    fixture.db.set_worktree_location(path, "local").unwrap();
+    assert!(
+        revalidate(
+            permit.as_ref(),
+            &fixture.db,
+            &forge,
+            &fixture.loc,
+            &fixture.pr,
+            false
+        )
+        .is_ok()
+    );
+    // A different checkout with identical repository/head evidence is still a
+    // different selected execution location.
+    let other = Fixture::new();
+    assert!(
+        other
+            .loc
+            .git_command(&["fetch", "--quiet", path, &fixture.pr.head_ref_oid])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        other
+            .loc
+            .git_command(&["checkout", "--quiet", "--detach", "FETCH_HEAD"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        other.loc.git_out(&["rev-parse", "HEAD"]),
+        Some(fixture.pr.head_ref_oid.clone())
+    );
+    assert!(
+        revalidate(
+            permit.as_ref(),
+            &other.db,
+            &forge,
+            &other.loc,
+            &fixture.pr,
+            false
+        )
+        .is_err()
+    );
 }
