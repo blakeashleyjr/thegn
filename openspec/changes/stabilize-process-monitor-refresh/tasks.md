@@ -7,6 +7,6 @@
 - [x] Preserve sampled selection and bind pending confirmation/escalation identity.
 - [x] Add deterministic sampler/view and monitor regression fixtures.
 - [x] Run actual-source sampler/view harness; demonstrate old tie comparators fail.
-- [ ] Run combined host monitor and model equality tests in coordinated build graph.
-- [ ] Complete primary code review and independent adversarial review/revisions.
+- [x] Run combined host monitor and model equality tests in coordinated build graph.
+- [x] Complete primary code review and independent adversarial review/revisions.
 - [ ] Complete combined source/spec/format gates and reviewed local-main landing.

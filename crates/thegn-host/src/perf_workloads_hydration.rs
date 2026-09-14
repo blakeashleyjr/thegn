@@ -7,7 +7,11 @@ use std::time::Instant;
 use thegn_core::store::WorkspaceStore;
 
 fn git(executable: &Path, cwd: &Path, args: &[&str]) {
-    let output = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    for variable in thegn_core::util::GIT_ENV_VARS {
+        command.env_remove(variable);
+    }
+    let output = command
         .current_dir(cwd)
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -94,7 +98,9 @@ fn controlled_full_hydration_workload() {
             "fixture",
         ],
     );
+    assert!(thegn_core::util::xdg_state_home().starts_with(root));
     let db = thegn_core::db::Db::open().unwrap();
+    assert!(state.join("thegn/thegn.db").is_file());
     db.put_workspace(repo.to_str().unwrap(), "fixture", "local")
         .unwrap();
     let mut session = crate::session::Session::default();
@@ -118,11 +124,16 @@ fn controlled_full_hydration_workload() {
         };
         std::fs::write(wt.join("file-0.txt"), "fixture changed\n").unwrap();
         let name = format!("fixture/{n}");
+        let branch = if n == 0 {
+            "main".into()
+        } else {
+            format!("fixture-{n}")
+        };
         db.put_worktree(
             &name,
             repo.to_str().unwrap(),
             wt.to_str().unwrap(),
-            if n == 0 { "main" } else { "fixture" },
+            &branch,
             None,
             None,
         )
@@ -143,7 +154,7 @@ fn controlled_full_hydration_workload() {
         }
         let mut samples = Vec::new();
         for sample in 0..9 {
-            let _ = crate::perf::CPU.take();
+            std::hint::black_box(crate::perf::CPU.take());
             let start = Instant::now();
             let model =
                 crate::hydrate::build_model(&session, &db, crate::hydrate::HydrateHints::default());

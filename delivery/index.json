@@ -477,6 +477,18 @@
       "summary": "Zone policy and config shipped; sidebar, palette, and detail discoverability remain."
     },
     {
+      "change": "admit-set-only-pane-clipboard",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-343",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Admit only bounded complete clipboard sets with generation-fenced pending ownership."
+    },
+    {
       "change": "atomic-fold-outcomes",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -523,6 +535,18 @@
         }
       ],
       "summary": "Identity signing schema exists, but pane injection, enable semantics, precedence evidence, and dedicated help remain."
+    },
+    {
+      "change": "bound-shared-framed-protocols",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-310",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Bound and amortize shared framed decoding and close failed transports coherently."
     },
     {
       "change": "complete-devcontainer-support",
@@ -776,6 +800,18 @@
       "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
     },
     {
+      "change": "repair-kitty-stream-parser",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-286",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Bound Kitty APC parsing and emit text without repeated retained-prefix copies."
+    },
+    {
       "change": "repair-performance-evidence-and-log-tail",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -894,6 +930,30 @@
         }
       ],
       "summary": "Verify automatic collection ownership, preserve uncertain user work and retry records, and report only actual removal; focused and native gates remain pending."
+    },
+    {
+      "change": "sanitize-calendar-display-text",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-471",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Project bounded calendar text consistently at display and measurement sinks."
+    },
+    {
+      "change": "secure-custom-command-templates",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-377",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Compile repository data into bounded inert argv or explicitly admitted shell templates."
     },
     {
       "change": "select-before-snapshot",
