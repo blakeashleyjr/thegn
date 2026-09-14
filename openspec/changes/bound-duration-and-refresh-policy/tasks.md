@@ -10,8 +10,9 @@
 - [x] Complete independent model/PR scheduler regression; nine actual-source cadence/schedule/panic fixtures pass in debug and optimized builds.
 - [x] Run updated core32 and existing config293 tests, and measure full-load overhead (+0.21% median, within noise).
 - [ ] Complete final primary/adversarial approval and combined host checks for THE-483.
-- [ ] Replace remaining signed duration/epoch policy casts and classify all remaining casts.
-- [ ] Implement and test visible fail-closed provider time quarantine and any trustworthy generation-bound fallback.
-- [ ] Verify daemon lease, MCP breaker, model budget, usage reset, and reaper action-count boundaries.
-- [ ] Complete combined host/service checks, formatting/spec/delivery gates, and independent adversarial review.
+- [x] Replace remaining signed duration/epoch policy casts and classify all remaining cast files in the THE-484 audit.
+- [x] Implement and test visible provider-time quarantine with exact Fly custody/inventory evidence; never invent local generation/time provenance.
+- [x] Verify daemon lease, MCP breaker, model budget and usage reset boundaries: core118 + extra26, svc28, proxy/media26 pass; actual-source shared reaper admission action-count fixture passes.
+- [x] Complete primary and independent source review at 2dbe30aa after custody, ambiguous environment policy and empty VPS ID revisions; focused service checks, formatting, idle guard, ignored-result ratchet and strict OpenSpec pass.
+- [ ] Complete final combined host checks and delivery gates; broad/native provider lifecycle gates remain separately required.
 - [ ] Land reviewed changes on canonical local main when Git metadata is writable.
