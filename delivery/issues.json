@@ -656,6 +656,13 @@
       "changes": [
         "stabilize-process-monitor-refresh"
       ]
+    },
+    {
+      "issue": "THE-634",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "authenticate-pr-agent-authorship"
+      ]
     }
   ]
 }
