@@ -412,7 +412,10 @@ impl AuditFixture {
                 .next()
                 .unwrap()
                 .expect("each progress follows a real SQL update");
-            assert_eq!(row.get::<_, usize>(0).unwrap(), index + 1);
+            assert_eq!(
+                row.get::<_, i64>(0).unwrap(),
+                i64::try_from(index + 1).unwrap()
+            );
             assert_eq!(row.get::<_, String>(1).unwrap(), saved.worktree);
             let old = &previous[&saved.worktree];
             assert_eq!(row.get::<_, String>(2).unwrap(), old.status);
