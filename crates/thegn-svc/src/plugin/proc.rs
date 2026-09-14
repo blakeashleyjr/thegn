@@ -211,6 +211,13 @@ pub(crate) fn set_process_group(cmd: &mut Command) {
 #[cfg(not(unix))]
 pub(crate) fn set_process_group(_cmd: &mut Command) {}
 
+/// Whether this platform has direct group termination without launching an
+/// unbounded helper. Callers promising a deadline must refuse before spawn
+/// when this is false; the legacy taskkill path does not provide that contract.
+pub(crate) const fn bounded_group_termination_supported() -> bool {
+    cfg!(unix)
+}
+
 #[cfg(unix)]
 pub(crate) fn kill_group(pid: u32) {
     // Negative pid targets the whole group.

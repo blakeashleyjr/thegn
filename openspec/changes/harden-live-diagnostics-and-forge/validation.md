@@ -42,3 +42,5 @@ numeric group signalling; and unsanitized Git calls in new test fixtures.
 Independent adversarial review and final combined-candidate validation remain
 required before acceptance. No live process, configuration, credentials,
 canonical checkout, or external repository/account was changed.
+
+Independent review found that non-Unix taskkill has no deadline. The candidate now refuses credential-helper spawn when direct bounded group termination is unsupported; explicit environment tokens remain supported. Native Windows helper execution is not claimed.
