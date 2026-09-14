@@ -163,6 +163,9 @@ mod panel_util;
 mod panes;
 mod parity;
 mod perf;
+mod perf_timing;
+#[cfg(test)]
+mod perf_workloads;
 mod pins;
 mod pipeline_board;
 mod placement_flow;

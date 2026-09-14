@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,45 +42,26 @@ fn tail_file(
     tx: tokio::sync::mpsc::UnboundedSender<Vec<ParsedLog>>,
     waker: Arc<dyn Fn() + Send + Sync>,
 ) {
-    let Ok(file) = File::open(path) else {
-        return;
-    };
-    let mut reader = BufReader::new(file);
-    // Seek to end: we tail live appends, not the whole (potentially many-MB)
-    // historical log. Backfill would parse the entire file into batches on an
-    // unbounded channel whether or not the log view is ever opened.
-    let _ = reader.seek(SeekFrom::End(0)); // best-effort: a failed seek only risks a one-time backfill
-
-    let mut line = String::new();
-    let mut batch = Vec::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                // At EOF. Flush any pending batch, then either exit (consumer
-                // gone) or sleep before polling for new appends.
-                if !batch.is_empty() {
-                    if tx.send(std::mem::take(&mut batch)).is_err() {
-                        return; // consumer dropped — stop the task, don't leak it
-                    }
-                    waker();
+    let mut follower = super::tail::FileFollower::new(path.to_path_buf());
+    while !tx.is_closed() {
+        let mut batch = Vec::new();
+        for line in follower.poll() {
+            batch.push(thegn_core::log::parser::parse_log(&line));
+            if batch.len() == 100 {
+                if tx.send(std::mem::take(&mut batch)).is_err() {
+                    return;
                 }
-                if tx.is_closed() {
-                    return; // consumer dropped — don't spin forever
-                }
-                std::thread::sleep(IDLE_POLL);
+                waker();
             }
-            Ok(_) => {
-                batch.push(thegn_core::log::parser::parse_log(line.trim_end()));
-                if batch.len() >= 100 {
-                    // Batch limit — flush eagerly.
-                    if tx.send(std::mem::take(&mut batch)).is_err() {
-                        return;
-                    }
-                    waker();
-                }
+        }
+        if !batch.is_empty() {
+            if tx.send(batch).is_err() {
+                return;
             }
-            Err(_) => return,
+            waker();
+        }
+        if !follower.has_more() {
+            std::thread::sleep(IDLE_POLL);
         }
     }
 }

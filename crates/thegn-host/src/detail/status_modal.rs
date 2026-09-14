@@ -492,8 +492,34 @@ fn loop_cells(p: &crate::perf::PerfSnapshot) -> Vec<(String, String, Tok)> {
             pair(p.render_p50_us, p.render_p99_us),
             if over { Tok::Hue(Hue::Red) } else { dim },
         ),
-        ("input".into(), pair(p.input_p50_us, p.input_p99_us), dim),
-        ("flush".into(), pair(p.flush_p50_us, p.flush_p99_us), dim),
+        (
+            "input→submit".into(),
+            pair(p.input_p50_us, p.input_p99_us),
+            dim,
+        ),
+        (
+            "encode/submit".into(),
+            pair(p.flush_p50_us, p.flush_p99_us),
+            dim,
+        ),
+        (
+            "sink write p99".into(),
+            if p.writer_frames == 0 {
+                "no samples".into()
+            } else {
+                fmt_us(p.writer_write_p99_us)
+            },
+            dim,
+        ),
+        (
+            "input→sink p99".into(),
+            if p.writer_input_samples == 0 {
+                "no samples".into()
+            } else {
+                fmt_us(p.writer_input_p99_us)
+            },
+            dim,
+        ),
         ("drain".into(), pair(p.drain_p50_us, p.drain_p99_us), dim),
         ("switch".into(), pair(p.switch_p50_us, p.switch_p99_us), dim),
         (
@@ -519,7 +545,7 @@ fn loop_cells(p: &crate::perf::PerfSnapshot) -> Vec<(String, String, Tok)> {
             dim,
         ),
         (
-            "idle".into(),
+            "loop idle".into(),
             format!("{:.1}%", p.idle_ratio * 100.0),
             idle_tone,
         ),
