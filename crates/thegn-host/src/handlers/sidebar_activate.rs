@@ -17,6 +17,28 @@ fn resident_terminal_index(session: &crate::session::Session, name: &str) -> Opt
         .position(|w| w.name == name && w.kind == crate::session::GroupKind::Terminal)
 }
 
+/// The switch histogram a row activation lands in. A Workspace row that targets
+/// the already-active workspace (or the resident-terminal sentinel) still lands
+/// as a worktree hop, so it is stamped `Worktree`.
+///
+/// Every activation site must stamp `switch_at` with this: the stamp doubles as
+/// the render plan's `switch` damage bit, and an in-workspace hop is a pure
+/// focus move that dirties nothing else — without it the sidebar highlight
+/// moves while the center keeps painting the previous worktree's panes.
+pub(crate) fn switch_kind(
+    target: &crate::sidebar::RowTarget,
+    active_session: &str,
+) -> crate::perf::SwitchKind {
+    match target {
+        crate::sidebar::RowTarget::Workspace { repo_path, .. }
+            if repo_path.as_str() != "terminal" && repo_path != active_session =>
+        {
+            crate::perf::SwitchKind::Workspace
+        }
+        _ => crate::perf::SwitchKind::Worktree,
+    }
+}
+
 /// Activate a sidebar row target: focus a live `(group, tab)` in the session,
 /// or switch to another workspace (landing on its named worktree group when
 /// that group exists in the target's persisted layout).
@@ -229,5 +251,22 @@ mod tests {
             active: 0,
         };
         assert_eq!(resident_terminal_index(&session, "prod"), Some(1));
+    }
+
+    #[test]
+    fn switch_kind_only_counts_a_different_project_as_a_workspace_switch() {
+        use crate::perf::SwitchKind;
+        use crate::sidebar::RowTarget;
+        let ws = |repo: &str| RowTarget::Workspace {
+            repo_path: repo.into(),
+            group: Some("feat".into()),
+        };
+        assert_eq!(
+            switch_kind(&RowTarget::Tab(1, 0), "/repo"),
+            SwitchKind::Worktree
+        );
+        assert_eq!(switch_kind(&ws("/repo"), "/repo"), SwitchKind::Worktree);
+        assert_eq!(switch_kind(&ws("terminal"), "/repo"), SwitchKind::Worktree);
+        assert_eq!(switch_kind(&ws("/other"), "/repo"), SwitchKind::Workspace);
     }
 }

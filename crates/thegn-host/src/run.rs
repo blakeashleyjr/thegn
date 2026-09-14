@@ -7435,17 +7435,7 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 SidebarOutcome::Activate(target) => {
-                    // A Workspace row that targets the already-active workspace
-                    // still lands as a worktree hop, but stamping it Workspace
-                    // is fine: the histogram measures what the user asked for.
-                    let kind = match &target {
-                        crate::sidebar::RowTarget::Workspace { repo_path, .. }
-                            if repo_path.as_str() != "terminal" && *repo_path != session.id =>
-                        {
-                            crate::perf::SwitchKind::Workspace
-                        }
-                        _ => crate::perf::SwitchKind::Worktree,
-                    };
+                    let kind = crate::handlers::sidebar_activate::switch_kind(&target, &session.id);
                     switch_at = Some((std::time::Instant::now(), kind));
                     if activate_row!(target) {
                         kick_model_hydration!();
@@ -14409,6 +14399,20 @@ async fn event_loop<T: Terminal>(
                                 target,
                                 force_center,
                             } => {
+                                // Stamp the switch like the keyboard `Activate`
+                                // arm: it is the render plan's `switch` damage
+                                // bit. An in-workspace hop is a pure focus move
+                                // that dirties nothing else, so without it this
+                                // arm's sidebar-only damage repainted the
+                                // highlight but left the center on the previous
+                                // worktree's panes.
+                                switch_at = Some((
+                                    std::time::Instant::now(),
+                                    crate::handlers::sidebar_activate::switch_kind(
+                                        &target,
+                                        &session.id,
+                                    ),
+                                ));
                                 let hydrate = activate_row!(target);
                                 // A switch from the sidebar keeps the user in
                                 // the center terminal if that's where they were
