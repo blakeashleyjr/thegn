@@ -35,3 +35,21 @@ preserved. The original patch is retained in the audit artifact directory.
 
 Evidence: `remediation-2026-09-13-artifacts/native-unblocked-validation.tar.gz`,
 its per-suite JSON results, independent triage receipt and Git landing log.
+
+## Linear acceptance review after landing
+
+Seven of the ten selected issues are Done: THE-628, THE-286, THE-310, THE-471,
+THE-343, THE-377 and THE-484. Primary and independent review found their scoped
+acceptance satisfied. Three remain In Progress despite landed improvements:
+
+- THE-483: add the original acceptance regression exercising the running shared
+  ticker with adversarial values, or rejecting startup before ticker spawn.
+  Primitive, pure scheduling and configuration tests do not replace that test.
+- THE-545: bind actual dispatch to the authorized credential/account generation;
+  stable identity rechecks do not freeze subsequent account changes. This
+  remaining obligation is related to THE-541. Existing author-gate tests pass.
+- THE-154: native platform runtime evidence and full escaped-descendant
+  containment remain unproved as documented above.
+
+These obligations do not reverse the scoped landing approval. They prevent
+claiming the entire ten-issue batch is complete.
