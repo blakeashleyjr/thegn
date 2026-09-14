@@ -42,3 +42,27 @@ Final full-gate, scoped clippy and local landing receipts will be recorded here.
 
 No live restart, external push, live queue cleanup or provider dispatch is part
 of this fixture validation. Main's existing user justfile comments are preserved.
+
+## Full workspace findings and revisions
+
+The first full workspace run selected 8,354 tests and 26 configured skips. It
+stopped fail-fast after 2,291 passes and one failure, leaving 6,062 tests unrun.
+The failure exposed THE-635: plain log prefixes did not disable the outer field
+writer's ANSI styling. Restoring NO_COLOR merely masked the defect. The fix at
+`4e212d09` applies the selected policy to the actual field writer and tests plain
+file/redirected stderr, terminal color and JSON with an explicitly color-capable
+outer layer. Independent review approved the fix. The final workspace rerun
+uses the same selection with `--no-fail-fast`.
+
+Runner review also found HOME-dependent fixture gaps. Twelve reviewed read-only
+path/planning fixtures preserve inherited HOME unchanged. One old cache test
+could create real home directories or return without assertions; `b88ff9b6`
+replaces that with the shared production helper operating on an owned temporary
+home path. Its assertions cover cold directory creation, writable child mounts,
+and no changes without a read-only parent. Independent review caught and fixed
+a Windows separator comparison. No HOME environment value is repurposed.
+
+The newly assembled cleanup subset passed all 50 tests in
+`/tmp/thegn-rolling-cleanup-20260914-results.json`, including the actual late-hook
+registry mutation, result-only refinalization, attached projection/sync refusal,
+and the same-selection positive cleanup control after resource custody release.

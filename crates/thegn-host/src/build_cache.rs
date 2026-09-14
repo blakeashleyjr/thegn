@@ -498,6 +498,14 @@ pub(crate) fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, Str
     out
 }
 
+// Convenience for existing path-planning tests; shipping overmount code
+// supplies its already-resolved inherited home directly.
+#[cfg(test)]
+fn sandbox_cache_mounts(cfg: &Config, repo_root: &Path) -> Vec<Mount> {
+    let inherited_home = std::env::var("HOME").ok();
+    sandbox_cache_mounts_at_home(cfg, repo_root, inherited_home.as_deref())
+}
+
 /// Read-write cache directories the in-sandbox pre-commit toolchain needs under
 /// a read-only `$HOME`: the hook FRAMEWORK caches (`prek`, and legacy
 /// `pre-commit`) — without which `git commit` hooks can't write their hook
@@ -506,11 +514,6 @@ pub(crate) fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, Str
 /// read-write [`Mount`]; the caller creates the source dir and filters with
 /// `keep_cfg_mount`. An in-tree `CARGO_TARGET_DIR` is already writable (it lives
 /// under the read-write worktree bind), so it's skipped.
-pub(crate) fn sandbox_cache_mounts(cfg: &Config, repo_root: &Path) -> Vec<Mount> {
-    let inherited_home = std::env::var("HOME").ok();
-    sandbox_cache_mounts_at_home(cfg, repo_root, inherited_home.as_deref())
-}
-
 fn sandbox_cache_mounts_at_home(
     cfg: &Config,
     repo_root: &Path,
