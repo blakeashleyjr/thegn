@@ -997,7 +997,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Verify automatic collection ownership, preserve uncertain user work and retry records, and report only actual removal; focused and native gates remain pending."
+      "summary": "Verified automatic collection ownership and actual removal; THE-588 actual-land acceptance is on local main. THE-596 direct-ref restoration remains separately open."
     },
     {
       "change": "sanitize-calendar-display-text",

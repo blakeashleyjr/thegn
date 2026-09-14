@@ -24,7 +24,7 @@ The reviewed scoped changes are delivered to local main. No live cleanup or runt
 - [x] Obtain primary and independent approval of a single-environment-lock, two-repository actual fold/persist/cleanup fixture.
 - [x] Execute the real target CAS followed by production persistence and configured removal; verify foreign state and retained branch/queue hold.
 - [x] Pass all 38 selected native lifecycle/cleanup and failed-fold tests at `b21cb20d`.
-- [ ] Pass strict host lint and source gates; land the reviewed fixture on local main before closing THE-588.
+- [x] Pass strict host lint and source gates; land the reviewed fixture on local main before closing THE-588 (`bb8ff6d7`).
 
 ## THE-594 actual resource-admission regression follow-up
 
