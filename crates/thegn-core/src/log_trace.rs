@@ -586,7 +586,16 @@ where
             }
         }
 
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        // The outer layer can enable ANSI independently of Brand (including
+        // through its NO_COLOR default). Plain sinks must keep structured
+        // fields plain as well as the prefix. Writer::new is non-ANSI and
+        // forwards directly into the existing writer without buffering.
+        let fields_writer = if self.ansi {
+            writer.by_ref()
+        } else {
+            Writer::new(&mut writer)
+        };
+        ctx.field_format().format_fields(fields_writer, event)?;
         writeln!(writer)
     }
 }
@@ -974,25 +983,38 @@ mod tests {
 
     #[test]
     fn text_formatter_covers_plain_timestamped_and_ansi_worktree_forms() {
-        let plain = Arc::new(Mutex::new(Vec::new()));
-        let plain_layer = tracing_subscriber::fmt::layer()
-            .with_writer(BufWriter(plain.clone()))
-            .event_format(Brand {
-                ansi: false,
-                timestamp: true,
-                json: false,
-            });
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(plain_layer), || {
-            tracing::info!(target: "thegn::plain", count = 2, "plain message");
-        });
-        let plain = String::from_utf8(plain.lock().unwrap().clone()).unwrap();
-        assert!(plain.contains("INFO  thegn::plain"), "{plain:?}");
-        assert!(plain.contains("proc=cli run="), "{plain:?}");
-        assert!(plain.contains("plain message"), "{plain:?}");
-        assert!(!plain.contains("\u{1b}["), "{plain:?}");
+        for timestamp in [false, true] {
+            let plain = Arc::new(Mutex::new(Vec::new()));
+            let plain_layer = tracing_subscriber::fmt::layer()
+                // Deliberately disagree with Brand, independently of NO_COLOR:
+                // cover both redirected CLI stderr and timestamped file output.
+                .with_ansi(true)
+                .with_writer(BufWriter(plain.clone()))
+                .event_format(Brand {
+                    ansi: false,
+                    timestamp,
+                    json: false,
+                });
+            tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(plain_layer),
+                || {
+                    tracing::info!(target: "thegn::plain", count = 2, healthy = true, "plain message");
+                },
+            );
+            let plain = String::from_utf8(plain.lock().unwrap().clone()).unwrap();
+            assert!(plain.contains("INFO  thegn::plain"), "{plain:?}");
+            assert!(plain.contains("proc=cli run="), "{plain:?}");
+            assert!(
+                plain.contains("plain message count=2 healthy=true"),
+                "{plain:?}"
+            );
+            assert!(!plain.contains("\u{1b}["), "{plain:?}");
+            assert_eq!(plain.starts_with("INFO"), !timestamp, "{plain:?}");
+        }
 
         let ansi = Arc::new(Mutex::new(Vec::new()));
         let ansi_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(true)
             .with_writer(BufWriter(ansi.clone()))
             .event_format(Brand {
                 ansi: true,
@@ -1008,6 +1030,7 @@ mod tests {
         assert!(ansi.contains("\u{1b}[38;2;"), "{ansi:?}");
         assert!(ansi.contains("wt=feature-a"), "{ansi:?}");
         assert!(ansi.contains("ansi message"), "{ansi:?}");
+        assert!(ansi.contains("\x1b[3mreason\x1b[0m"), "{ansi:?}");
     }
 
     #[test]
@@ -1023,6 +1046,7 @@ mod tests {
     fn json_formatter_without_worktree_escapes_structured_fields() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(true)
             .with_writer(BufWriter(buf.clone()))
             .event_format(Brand {
                 ansi: false,
@@ -1043,6 +1067,7 @@ mod tests {
         assert!(value.get("wt").is_none());
         assert!(value["msg"].as_str().unwrap().contains("quoted"));
         assert!(value["msg"].as_str().unwrap().contains("line one"));
+        assert!(!value["msg"].as_str().unwrap().contains('\u{1b}'));
     }
 
     #[test]
@@ -1084,6 +1109,7 @@ mod tests {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("LOCALAPPDATA", dir.join("state"))
             .env("USERPROFILE", dir.join("home"))
+            .env_remove("NO_COLOR")
             .env_remove("THEGN_LOG")
             .env_remove("THEGN_LOG_LEVEL");
         if case == "cli" {
@@ -1122,14 +1148,18 @@ mod tests {
                 let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
                 assert!(log.contains("installed host text"), "{log}");
                 assert!(log.contains("proc=host"), "{log}");
+                assert!(log.contains("count=2 healthy=true"), "{log:?}");
+                assert!(!log.contains('\u{1b}'), "{log:?}");
             } else if case == "host-json" {
                 let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
                 let value: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
-                assert_eq!(value["msg"], "installed host json");
+                assert_eq!(value["msg"], "installed host json count=4");
                 assert_eq!(value["proc"], "host");
             } else if case == "cli" {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(stderr.contains("installed cli stderr"), "{stderr}");
+                assert!(stderr.contains("count=3 healthy=false"), "{stderr:?}");
+                assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
             } else if case == "bad-file" {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(stderr.contains("could not open log file"), "{stderr}");
@@ -1169,7 +1199,7 @@ mod tests {
                 };
                 install(Role::Host, &cfg);
                 assert!(ready());
-                tracing::warn!(target: "thegn::install-test", "installed host text");
+                tracing::warn!(target: "thegn::install-test", count = 2, healthy = true, "installed host text");
                 reload_level(LogLevel::Trace);
                 tracing::trace!(target: "thegn::install-test", "reloaded trace");
                 // A second install exercises the idempotent try-init failure path.
@@ -1234,12 +1264,12 @@ mod tests {
                 };
                 install(Role::Host, &cfg);
                 assert!(ready());
-                tracing::error!(target: "thegn::install-test", "installed host json");
+                tracing::error!(target: "thegn::install-test", count = 4, "installed host json");
             }
             "cli" => {
                 install(Role::Cli, &LogConfig::default());
                 assert!(ready());
-                tracing::warn!(target: "thegn::install-test", "installed cli stderr");
+                tracing::warn!(target: "thegn::install-test", count = 3, healthy = false, "installed cli stderr");
             }
             "bad-file" => {
                 let invalid_dir = dir.join("not-a-directory");

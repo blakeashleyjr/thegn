@@ -663,6 +663,13 @@
       "changes": [
         "authenticate-pr-agent-authorship"
       ]
+    },
+    {
+      "issue": "THE-635",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
     }
   ]
 }
