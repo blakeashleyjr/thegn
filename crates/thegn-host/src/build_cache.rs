@@ -507,8 +507,17 @@ pub(crate) fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, Str
 /// `keep_cfg_mount`. An in-tree `CARGO_TARGET_DIR` is already writable (it lives
 /// under the read-write worktree bind), so it's skipped.
 pub(crate) fn sandbox_cache_mounts(cfg: &Config, repo_root: &Path) -> Vec<Mount> {
+    let inherited_home = std::env::var("HOME").ok();
+    sandbox_cache_mounts_at_home(cfg, repo_root, inherited_home.as_deref())
+}
+
+fn sandbox_cache_mounts_at_home(
+    cfg: &Config,
+    repo_root: &Path,
+    inherited_home: Option<&str>,
+) -> Vec<Mount> {
     let mut dirs: Vec<String> = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = inherited_home {
         dirs.push(format!("{home}/.cache/prek"));
         dirs.push(format!("{home}/.cache/pre-commit"));
     }
@@ -541,12 +550,24 @@ pub(crate) fn inject_cache_mounts(spec: &mut SandboxSpec, cfg: &Config, repo_roo
 /// without a full `SandboxSpec`. No-op unless the list already binds `$HOME`
 /// read-only.
 fn overmount_caches(mounts: &mut Vec<Mount>, cfg: &Config, repo_root: &Path) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let home_ro = !home.is_empty() && mounts.iter().any(|m| m.host == home && m.ro);
+    let inherited_home = std::env::var("HOME").unwrap_or_default();
+    overmount_caches_at_home(mounts, cfg, repo_root, &inherited_home);
+}
+
+// The live wrapper supplies its unchanged inherited home. Keeping this owned
+// path explicit lets the cold-cache regression use a private temporary tree.
+fn overmount_caches_at_home(
+    mounts: &mut Vec<Mount>,
+    cfg: &Config,
+    repo_root: &Path,
+    inherited_home: &str,
+) {
+    let home_ro =
+        !inherited_home.is_empty() && mounts.iter().any(|m| m.host == inherited_home && m.ro);
     if !home_ro {
         return;
     }
-    for m in sandbox_cache_mounts(cfg, repo_root) {
+    for m in sandbox_cache_mounts_at_home(cfg, repo_root, Some(inherited_home)) {
         // best-effort: bwrap needs the bind source to exist; create a cold cache
         // dir before overmounting it (keep_cfg_mount also requires it to be a
         // real directory to overmount the read-only parent).
@@ -661,22 +682,47 @@ mod tests {
 
     #[test]
     fn overmount_caches_overmounts_under_readonly_home() {
-        let Ok(home) = std::env::var("HOME") else {
-            return;
-        };
-        // Hardened substrate: a read-only $HOME bind the caches must overmount.
-        let mut mounts = vec![Mount {
-            host: home.clone(),
-            dest: home.clone(),
-            ro: true,
+        let fixture = tempfile::tempdir().unwrap();
+        let private_home = fixture.path().join("home");
+        std::fs::create_dir(&private_home).unwrap();
+        let home = private_home.to_str().unwrap();
+        let config = Config::default();
+        let cache_paths = ["prek", "pre-commit"].map(|name| private_home.join(".cache").join(name));
+        let home_mount = |ro| Mount {
+            host: home.into(),
+            dest: home.into(),
+            ro,
             cache: false,
-        }];
-        overmount_caches(&mut mounts, &Config::default(), Path::new("/repo"));
-        let prek = format!("{home}/.cache/prek");
-        assert!(
-            mounts.iter().any(|m| m.host == prek && !m.ro),
-            "prek cache should be overmounted read-write under a read-only $HOME"
-        );
+        };
+
+        // No read-only parent means no directory creation or extra mounts,
+        // including an explicitly writable home bind.
+        for mut mounts in [Vec::new(), vec![home_mount(false)]] {
+            let count = mounts.len();
+            overmount_caches_at_home(&mut mounts, &config, fixture.path(), home);
+            assert_eq!(mounts.len(), count);
+            assert!(cache_paths.iter().all(|path| !path.exists()));
+        }
+
+        let mut mounts = vec![home_mount(true)];
+        overmount_caches_at_home(&mut mounts, &config, fixture.path(), home);
+        assert_eq!(mounts.len(), 3);
+        assert!(mounts[0].ro, "the parent remains read-only");
+        for path in cache_paths {
+            assert!(
+                path.is_dir(),
+                "cold cache must be created inside the fixture"
+            );
+            assert!(
+                mounts.iter().any(|mount| {
+                    Path::new(&mount.host) == path.as_path()
+                        && mount.dest == mount.host
+                        && !mount.ro
+                        && mount.cache
+                }),
+                "private cache needs a path-preserving writable overmount"
+            );
+        }
     }
 
     #[test]
