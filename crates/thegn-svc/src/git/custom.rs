@@ -1,5 +1,5 @@
 //! User-defined git commands (`[[git_commands]]`): the host collects prompt
-//! responses, thegn-core's `custom_cmd::expand` renders the template
+//! responses, thegn-core's `custom_cmd::compile` admits the template
 //! against the current selection, and this runs the result in the worktree.
 //! `terminal` output mode is executed by the host's floating-pane machinery
 //! instead — this seam only covers capture (`popup`) and fire-and-forget.
