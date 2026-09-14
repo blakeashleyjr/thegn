@@ -123,7 +123,6 @@ crates/thegn-host/src/cmd/diff.rs
 crates/thegn-host/src/cmd/disk.rs
 crates/thegn-host/src/cmd/doctor.rs
 crates/thegn-host/src/cmd/host.rs
-crates/thegn-host/src/cmd/integrate.rs
 crates/thegn-host/src/cmd/merge.rs
 crates/thegn-host/src/cmd/mod.rs
 crates/thegn-host/src/cmd/open.rs

@@ -477,6 +477,18 @@
       "summary": "Zone policy and config shipped; sidebar, palette, and detail discoverability remain."
     },
     {
+      "change": "atomic-fold-outcomes",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-591",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Publish observed final queue outcomes atomically without transient runnable state or stale-owner lifecycle."
+    },
+    {
       "change": "audit-remote-surface-map",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
@@ -523,6 +535,18 @@
         }
       ],
       "summary": "Implementation is accepted but its remaining scoped host verification must be reconciled before archive."
+    },
+    {
+      "change": "confirm-fold-before-land",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-589",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Only successful target CAS authorizes landed persistence and lifecycle; failed folds retain bounded diagnostics."
     },
     {
       "change": "decide-plugin-ui-extension-surfaces",
@@ -680,6 +704,37 @@
       "summary": "Queue review repairs cover visibility, original-stack keyboard focus, narrow geometry and duplicate layout work; focused, integrated, full-gate and visual verification remain before delivery."
     },
     {
+      "change": "preserve-config-validation-severity",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-586",
+          "project": "Spec & Tracker Reconciliation"
+        }
+      ],
+      "summary": "THE-569 runtime severity repair landed; THE-586 reconciles its missing reciprocal delivery inventory."
+    },
+    {
+      "change": "preserve-merge-drain-diagnostics",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {"issue": "THE-608", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-610", "project": "Runtime Security & Host Architecture"}
+      ],
+      "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
+    },
+    {
+      "change": "require-canonical-merge-history",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {"issue": "THE-606", "project": "Runtime Security & Host Architecture"}
+      ],
+      "summary": "Require verified local canonical history across fold evidence and automatic cleanup; source review and focused/native gates remain pending."
+    },
+    {
       "change": "resurrect-model-proxy",
       "lifecycle": "active",
       "disposition": "residual-split",
@@ -702,6 +757,43 @@
         }
       ],
       "summary": "The live completion engine shipped; packaging verification and cleanup remain."
+    },
+    {
+      "change": "safe-merged-worktree-cleanup",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {"issue": "THE-588", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-593", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-594", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-596", "project": "Runtime Security & Host Architecture"},
+        {"issue": "THE-600", "project": "Runtime Security & Host Architecture"}
+      ],
+      "summary": "Verify automatic collection ownership, preserve uncertain user work and retry records, and report only actual removal; focused and native gates remain pending."
+    },
+    {
+      "change": "select-before-snapshot",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-595",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
+    },
+    {
+      "change": "verify-gate-workspace",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-597",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Fail closed on gate lock or linked-checkout identity failure; never purge unknown reused gate paths."
     },
     {
       "change": "verify-sandbox-mounts",

@@ -6,10 +6,129 @@
 
 use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
-use crate::store::WorktreeAuxStore;
+use crate::store::{
+    MergeFinalOutcome, MergeFinalStatus, MergeOutcomeObservation, MergeOutcomeWrite,
+    MergeRegistryIdentity, MergeStatusFields, WorktreeAuxStore,
+};
 use crate::util;
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+#[cfg(test)]
+#[path = "db_merge_outcome_tests.rs"]
+mod merge_outcome_tests;
+
+#[cfg(test)]
+#[path = "db_merge_status_tests.rs"]
+mod merge_status_tests;
+
+fn merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeQueueRow> {
+    Ok(MergeQueueRow {
+        worktree: row.get(0)?,
+        branch: row.get(1)?,
+        target_branch: row.get(2)?,
+        status: row.get(3)?,
+        queued_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        result_oid: row.get(6)?,
+        conflict_paths: row.get(7)?,
+        error_detail: row.get(8)?,
+        // NULL (pre-v44 / unregistered worktree) = local / same store.
+        location: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        agent_attempts: row.get::<_, Option<u32>>(10)?.unwrap_or_default(),
+    })
+}
+
+// Caller holds a read snapshot or a write transaction for both SELECTs.
+fn merge_outcome_observation(conn: &Connection, worktree: &str) -> Result<MergeOutcomeObservation> {
+    let registry = conn
+        .query_row(
+            "SELECT branch,repo_path,location FROM worktrees WHERE worktree=?1",
+            [worktree],
+            |row| {
+                Ok(MergeRegistryIdentity {
+                    branch: row.get(0)?,
+                    repo_path: row.get(1)?,
+                    location: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    let queue = conn
+        .query_row(
+            "SELECT worktree,branch,target_branch,status,queued_at,updated_at,\
+                    result_oid,conflict_paths,error_detail,location,agent_attempts \
+             FROM merge_queue WHERE worktree=?1",
+            [worktree],
+            |row| Ok((merge_queue_row(row)?, row.get::<_, Option<String>>(9)?)),
+        )
+        .optional()?;
+    let (queue, queue_location) = match queue {
+        Some((row, location)) => (Some(row), location),
+        None => (None, None),
+    };
+    Ok(MergeOutcomeObservation {
+        worktree: worktree.to_owned(),
+        registry,
+        queue,
+        queue_location,
+    })
+}
+
+fn merge_location(location: Option<&str>) -> &str {
+    match location {
+        None | Some("" | "local") => "",
+        Some(other) => other,
+    }
+}
+
+fn validate_merge_outcome(
+    observed: &MergeOutcomeObservation,
+    outcome: &MergeFinalOutcome<'_>,
+) -> Result<()> {
+    anyhow::ensure!(
+        observed.worktree == outcome.worktree
+            && !outcome.worktree.is_empty()
+            && !outcome.branch.is_empty()
+            && !outcome.repo_root.is_empty()
+            && !outcome.target_branch.is_empty(),
+        "merge outcome does not match its observed worktree/context"
+    );
+    if let Some(registry) = &observed.registry {
+        anyhow::ensure!(
+            registry.branch.as_deref() == Some(outcome.branch)
+                && registry.repo_path.as_deref() == Some(outcome.repo_root)
+                && merge_location(registry.location.as_deref())
+                    == merge_location(Some(outcome.location)),
+            "merge outcome does not match its observed registry context"
+        );
+    }
+    if let Some(queue) = &observed.queue {
+        anyhow::ensure!(
+            queue.branch == outcome.branch
+                && merge_location(Some(&queue.location)) == merge_location(Some(outcome.location)),
+            "merge outcome does not match its observed queue branch/location"
+        );
+    }
+    anyhow::ensure!(
+        observed.registry.is_some()
+            || observed.queue.is_some()
+            || merge_location(Some(outcome.location)).is_empty(),
+        "unregistered merge outcome has no observed remote location"
+    );
+    anyhow::ensure!(
+        match outcome.status {
+            MergeFinalStatus::Landed => outcome.result_oid.is_some_and(|oid| !oid.is_empty()),
+            _ => outcome.result_oid.is_none(),
+        },
+        "merge outcome result OID is inconsistent with final status"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "db_cleanup_hold_tests.rs"]
+mod cleanup_hold_tests;
 
 impl Db {
     /// Enqueue a remotely prepared worktree only while every registry fact
@@ -214,6 +333,87 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    fn observe_merge_outcome(&self, worktree: &str) -> Result<MergeOutcomeObservation> {
+        let tx = self.conn().unchecked_transaction()?;
+        let observed = merge_outcome_observation(&tx, worktree)?;
+        tx.commit()?;
+        Ok(observed)
+    }
+
+    fn persist_merge_outcome(
+        &self,
+        observed: &MergeOutcomeObservation,
+        outcome: &MergeFinalOutcome<'_>,
+    ) -> Result<MergeOutcomeWrite> {
+        validate_merge_outcome(observed, outcome)?;
+        let tx = Transaction::new_unchecked(self.conn(), TransactionBehavior::Immediate)?;
+        let current = merge_outcome_observation(&tx, outcome.worktree)?;
+        if current.registry != observed.registry {
+            return Ok(MergeOutcomeWrite::RegistryChanged);
+        }
+        if current.queue != observed.queue || current.queue_location != observed.queue_location {
+            return Ok(MergeOutcomeWrite::QueueChanged);
+        }
+        // Mirror the observed registry's exact location representation, or the
+        // observed queue's when unregistered. Never canonicalize a remote descriptor.
+        let location = observed
+            .registry
+            .as_ref()
+            .map(|registry| registry.location.as_deref())
+            .unwrap_or(observed.queue_location.as_deref());
+        tx.execute(
+            "INSERT INTO merge_queue \
+                (worktree,branch,target_branch,status,queued_at,updated_at,\
+                 result_oid,conflict_paths,error_detail,location,agent_attempts) \
+             VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,0) \
+             ON CONFLICT(worktree) DO UPDATE SET \
+                branch=excluded.branch,target_branch=excluded.target_branch,\
+                status=excluded.status,updated_at=excluded.updated_at,\
+                result_oid=excluded.result_oid,conflict_paths=excluded.conflict_paths,\
+                error_detail=excluded.error_detail,location=excluded.location",
+            params![
+                outcome.worktree,
+                outcome.branch,
+                outcome.target_branch,
+                outcome.status.as_str(),
+                util::now(),
+                outcome.result_oid,
+                outcome.conflict_paths,
+                outcome.error_detail,
+                location,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(MergeOutcomeWrite::Written)
+    }
+
+    /// Replace every nullable outcome field; `None` clears it to SQL NULL.
+    /// Missing rows fail rather than pretending the transition was persisted.
+    fn replace_merge_status(
+        &self,
+        worktree: &str,
+        status: &str,
+        fields: &MergeStatusFields,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET status=?2, updated_at=?3, result_oid=?4, \
+             conflict_paths=?5, error_detail=?6 WHERE worktree=?1",
+            params![
+                worktree,
+                status,
+                util::now(),
+                fields.result_oid,
+                fields.conflict_paths,
+                fields.error_detail
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "merge status replacement requires one existing row"
+        );
+        Ok(())
+    }
+
     /// Update a queued worktree's status and (optionally) its result oid,
     /// conflicted paths (newline-joined), and error detail. Passing `None` leaves
     /// the corresponding column unchanged.
@@ -282,6 +482,23 @@ impl WorktreeAuxStore for Db {
         Ok(())
     }
 
+    fn hold_merge_cleanup(&self, row: &MergeQueueRow) -> Result<bool> {
+        use crate::merge_sweep::CleanupHold;
+        if row.status != "landed"
+            || row.result_oid.as_deref().is_none_or(str::is_empty)
+            || CleanupHold::from_detail(row.error_detail.as_deref()).is_some()
+        {
+            return Ok(false);
+        }
+        let changed = self.conn().execute(
+            "UPDATE merge_queue SET error_detail=?12 WHERE worktree=?1 AND branch=?2 AND target_branch=?3 AND status=?4 AND queued_at=?5 AND updated_at=?6 AND result_oid IS ?7 AND conflict_paths IS ?8 AND error_detail IS ?9 AND COALESCE(location,'')=?10 AND COALESCE(agent_attempts,0)=?11",
+            params![row.worktree, row.branch, row.target_branch, row.status, row.queued_at, row.updated_at,
+                row.result_oid, row.conflict_paths, row.error_detail, row.location, row.agent_attempts,
+                CleanupHold::BranchRetained.marker()],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>> {
         let mut stmt = self.conn().prepare(
@@ -289,22 +506,7 @@ impl WorktreeAuxStore for Db {
                       result_oid,conflict_paths,error_detail,location,agent_attempts
                FROM merge_queue ORDER BY queued_at"#,
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(MergeQueueRow {
-                worktree: r.get(0)?,
-                branch: r.get(1)?,
-                target_branch: r.get(2)?,
-                status: r.get(3)?,
-                queued_at: r.get(4)?,
-                updated_at: r.get(5)?,
-                result_oid: r.get(6)?,
-                conflict_paths: r.get(7)?,
-                error_detail: r.get(8)?,
-                // NULL (pre-v44 / unregistered worktree) = local / same store.
-                location: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                agent_attempts: r.get::<_, Option<u32>>(10)?.unwrap_or_default(),
-            })
-        })?;
+        let rows = stmt.query_map([], merge_queue_row)?;
         let mut v = Vec::new();
         for row in rows {
             v.push(row?);

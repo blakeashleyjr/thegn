@@ -171,6 +171,21 @@ pub fn disconnect_path(host_path: &str) {
     }
 }
 
+/// Read-only automatic-collection guard; never reconnect or drop a bridge.
+pub(crate) fn automatic_cleanup_resources_absent(path: &str) -> Result<(), String> {
+    if let Some(global) = GLOBAL.get() {
+        let paths = global
+            .inner
+            .paths
+            .lock()
+            .map_err(|_| "bridge registry unavailable")?;
+        if paths.contains_key(path) {
+            return Err("attached bridge requires explicit owned cleanup".into());
+        }
+    }
+    Ok(())
+}
+
 /// Default in-env path the static-musl `thegn` is pushed to (8-B.3). The push
 /// (`agent::ensure_remote_bridge`) installs the binary here before connect; if no
 /// local binary is configured the connect spawn-fails gracefully (per-op fallback).

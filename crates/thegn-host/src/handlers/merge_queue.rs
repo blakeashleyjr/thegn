@@ -23,7 +23,7 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::LifecycleEvent;
 use thegn_core::notification::NotificationKind;
-use thegn_core::store::WorktreeAuxStore;
+use thegn_core::store::{MergeStatusFields, WorktreeAuxStore};
 use thegn_core::util;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -39,13 +39,14 @@ pub(crate) type FoldRx = tokio_mpsc::UnboundedReceiver<anyhow::Result<FoldReport
 
 /// What the off-loop drive (or a one-shot queue mutation) reports back.
 pub(crate) enum DriveMsg {
-    /// One driver status transition (the DB row is already written when this
-    /// fires) — the loop patches the panel row in place for a live repaint.
+    /// One attempted driver transition. The cache write is best-effort; these
+    /// exact fields permit a live projection, not a durability/ownership claim.
     Step {
         worktree: String,
         branch: String,
         status: String,
         detail: String,
+        fields: MergeStatusFields,
     },
     /// The drain finished; clears the inflight flag and toasts the summary.
     Done(DriveOutcome),
@@ -168,6 +169,7 @@ pub(crate) fn spawn_drive(
                 branch: s.branch.to_string(),
                 status: s.status.to_string(),
                 detail: s.detail.to_string(),
+                fields: s.fields.clone(),
             });
         });
         send(DriveMsg::Done(out));
@@ -267,6 +269,19 @@ pub(crate) fn dispatch_drain(
 // Loop-side channel drains
 // ---------------------------------------------------------------------------
 
+fn fold_summary(landed: usize, deferred: usize, complete: bool) -> String {
+    let prefix = if complete {
+        "Integrated"
+    } else {
+        "Integration incomplete"
+    };
+    if deferred == 0 {
+        format!("{prefix}: {landed} landed")
+    } else {
+        format!("{prefix}: {landed} landed, {deferred} deferred")
+    }
+}
+
 /// Drain batch-fold results: report what landed/deferred and re-hydrate so the
 /// advanced target tip and cleared activity dots show immediately.
 pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
@@ -276,17 +291,18 @@ pub(crate) fn drain_fold_results(rx: &mut FoldRx, ctx: &mut DrainCtx) {
         let now = std::time::Instant::now();
         match result {
             Ok(r) => {
-                let msg = if r.deferred.is_empty() {
-                    format!("Integrated: {} landed", r.landed.len())
+                let completion = r.request_result();
+                let msg = fold_summary(r.landed.len(), r.deferred.len(), completion.is_ok());
+                let landed = r.advanced && !r.landed.is_empty();
+                if let Err(error) = completion {
+                    ctx.toasts.info_ttl(
+                        format!("{msg}; {error}"),
+                        now,
+                        std::time::Duration::from_secs(6),
+                    );
                 } else {
-                    format!(
-                        "Integrated: {} landed, {} deferred",
-                        r.landed.len(),
-                        r.deferred.len()
-                    )
-                };
-                let landed = !r.landed.is_empty();
-                ctx.toasts.success(msg, now);
+                    ctx.toasts.success(msg, now);
+                }
                 *ctx.want_model_refresh = true;
                 // A batch fold's `persist` may have removed landed worktrees.
                 if landed {
@@ -318,8 +334,9 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                 branch,
                 status,
                 detail,
+                fields,
             } => {
-                apply_step(&mut ctx.model.panel, &worktree, &branch, &status, &detail);
+                apply_step(&mut ctx.model.panel, &worktree, &branch, &status, &fields);
                 match status.as_str() {
                     "landed" => {
                         ctx.toasts.success(format!("Landed {branch}"), now);
@@ -358,7 +375,9 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                         );
                         *ctx.want_model_refresh = true;
                     }
-                    "deferred" | "gate_failed" => *ctx.want_model_refresh = true,
+                    "deferred" | "gate_failed" | "gate_error" | "agent_blocked" => {
+                        *ctx.want_model_refresh = true;
+                    }
                     _ => {}
                 }
             }
@@ -370,20 +389,8 @@ pub(crate) fn drain_drive_msgs(rx: &mut DriveRx, ctx: &mut DrainCtx) {
                     ctx.toasts
                         .info_ttl(w.clone(), now, std::time::Duration::from_secs(8));
                 }
-                let total =
-                    out.landed.len() + out.ready.len() + out.deferred.len() + out.needs_human.len();
-                let msg = if total == 0 {
-                    "Merge queue: nothing to drain".to_string()
-                } else {
-                    format!(
-                        "Drained: {} landed, {} ready, {} deferred, {} need a human",
-                        out.landed.len(),
-                        out.ready.len(),
-                        out.deferred.len(),
-                        out.needs_human.len()
-                    )
-                };
-                if out.deferred.is_empty() && out.needs_human.is_empty() {
+                let (msg, success) = drive_summary(&out);
+                if success {
                     ctx.toasts.success(msg, now);
                 } else {
                     ctx.toasts
@@ -421,7 +428,7 @@ pub(crate) fn apply_step(
     worktree: &str,
     branch: &str,
     status: &str,
-    detail: &str,
+    fields: &MergeStatusFields,
 ) {
     let now = util::now();
     let row = match panel
@@ -451,23 +458,33 @@ pub(crate) fn apply_step(
     };
     row.status = status.to_string();
     row.updated_at = now;
-    match status {
-        "landed" | "ready" => {
-            if !detail.is_empty() {
-                row.result_oid = Some(detail.to_string());
-            }
-            row.conflict_paths = None;
-            row.error_detail = None;
-        }
-        "deferred" => {
-            row.conflict_paths = (!detail.is_empty()).then(|| detail.to_string());
-            row.error_detail = None;
-        }
-        "gate_failed" | "needs_human" | "agent_running" => {
-            row.error_detail = (!detail.is_empty()).then(|| detail.to_string());
-        }
-        _ => {}
-    }
+    row.result_oid.clone_from(&fields.result_oid);
+    row.conflict_paths.clone_from(&fields.conflict_paths);
+    row.error_detail.clone_from(&fields.error_detail);
+}
+
+fn drive_summary(out: &DriveOutcome) -> (String, bool) {
+    let total = out.landed.len()
+        + out.ready.len()
+        + out.deferred.len()
+        + out.needs_human.len()
+        + out.gate_error.len();
+    let message = if total == 0 {
+        "Merge queue: nothing to drain".to_owned()
+    } else {
+        format!(
+            "Drained: {} landed, {} ready, {} deferred, {} need a human, {} gate errors",
+            out.landed.len(),
+            out.ready.len(),
+            out.deferred.len(),
+            out.needs_human.len(),
+            out.gate_error.len(),
+        )
+    };
+    (
+        message,
+        out.deferred.is_empty() && out.needs_human.is_empty() && out.gate_error.is_empty(),
+    )
 }
 
 /// Route a settled queue transition to the notification machinery: rules/DND
@@ -673,7 +690,13 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
                 return true;
             };
             // Optimistic: back to queued (the enqueue upsert does exactly this).
-            apply_step(&mut ctx.model.panel, &wt, &branch, "queued", "");
+            apply_step(
+                &mut ctx.model.panel,
+                &wt,
+                &branch,
+                "queued",
+                &MergeStatusFields::default(),
+            );
             tokio::task::spawn_blocking(move || {
                 note.send(
                     match Db::open().and_then(|db| db.enqueue_merge(&wt, &branch, &target)) {
@@ -684,19 +707,19 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             });
         }
         MqAction::ClearLanded => {
-            let landed: Vec<String> = ctx
+            let landed: Vec<_> = ctx
                 .model
                 .panel
                 .merge_queue
                 .iter()
                 .filter(|r| r.status == "landed")
-                .map(|r| r.worktree.clone())
+                .cloned()
                 .collect();
             if landed.is_empty() {
                 ctx.model.status = "Merge queue: nothing landed to clear".into();
                 return true;
             }
-            ctx.model.panel.merge_queue.retain(|r| r.status != "landed");
+            // Do not optimistically erase retry rows before collection succeeds.
             // Under `expire` a landed row IS the grace-period clock, so dropping
             // it alone would strand its worktree in `merged_folder` with nothing
             // left to sweep it. Clearing therefore means "collect them now" —
@@ -706,29 +729,53 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
             let sweep_root = ctx.active_wt.clone();
             tokio::task::spawn_blocking(move || {
                 let n = landed.len();
-                let swept = crate::integrate::main_checkout(&sweep_root)
-                    .map(|root| crate::merge_sweep::sweep(&sweep_cfg, &root, true))
-                    .unwrap_or_default();
-                let ok = Db::open().map(|db| {
-                    landed
+                let Some(root) = crate::integrate::main_checkout(&sweep_root) else {
+                    note.send(
+                        "Clear refused: repository identity unavailable; retry records retained"
+                            .into(),
+                    );
+                    return;
+                };
+                let swept = crate::merge_sweep::sweep(&sweep_cfg, &root, true);
+                let expire = sweep_cfg.repo_merge_queue(&root).on_landed
+                    == thegn_core::config::OnLanded::Expire;
+                let ok = if expire {
+                    // Only successful collector writes are ours to report;
+                    // a concurrently revoked/missing row is not a deletion.
+                    Ok(swept
+                        .cleared_rows
                         .iter()
-                        .filter(|wt| db.remove_merge_entry(wt).is_ok())
-                        .count()
-                });
+                        .filter(|path| landed.iter().any(|row| &row.worktree == *path))
+                        .count())
+                } else {
+                    Db::open()
+                        .and_then(|db| crate::merge_sweep::clear_selected_landed(&db, &landed))
+                };
                 let tail = if swept.collected.is_empty() {
                     String::new()
                 } else {
                     format!(", removed {} worktree(s)", swept.collected.len())
                 };
-                let kept = if swept.kept_dirty.is_empty() {
+                let kept = if swept.kept_dirty.is_empty()
+                    && swept.kept.is_empty()
+                    && swept.bookkeeping_errors.is_empty()
+                {
                     String::new()
                 } else {
-                    format!("; kept {} with uncommitted changes", swept.kept_dirty.len())
+                    format!(
+                        "; retained {} dirty, {} refused; {} bookkeeping error(s)",
+                        swept.kept_dirty.len(),
+                        swept.kept.len(),
+                        swept.bookkeeping_errors.len()
+                    )
                 };
                 note.send(match ok {
                     Ok(k) if k == n => format!("Cleared {n} landed row(s){tail}{kept}"),
                     Ok(k) => format!("Cleared {k}/{n} landed row(s){tail}{kept}"),
-                    Err(e) => format!("Clear failed: {e}"),
+                    Err(e) => format!(
+                        "Clear failed: {}",
+                        crate::merge_sweep::safe_display(&e.to_string())
+                    ),
                 });
             });
         }
@@ -934,8 +981,7 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
     };
     let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
-    let override_gpg = cfg.repo_git(&root).override_gpg;
-    let cands = match integrate::candidate_branches(mq, &root, &target, override_gpg) {
+    let cands = match integrate::candidate_branches(mq, &root, &target) {
         Ok(c) => c,
         Err(e) => return format!("Add failed: {e}"),
     };
@@ -1006,7 +1052,16 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
                 }
             }
             record("landed", Some(&commit), None);
-            lifecycle(LifecycleEvent::Landed, &branch);
+            if let (Some(db), Some(root)) = (&db, integrate::main_checkout(Path::new(wt))) {
+                crate::merge_lifecycle::apply_landed(
+                    &cfg.repo_merge_queue(&root),
+                    db,
+                    &root,
+                    wt,
+                    &branch,
+                    &commit,
+                );
+            }
             DriveMsg::Done(DriveOutcome {
                 landed: vec![branch],
                 ..DriveOutcome::default()
@@ -1073,6 +1128,19 @@ fn land_ready(cfg: &thegn_core::config::Config, wt: &str) -> DriveMsg {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_fold_summary_never_claims_integration_completed() {
+        assert_eq!(
+            fold_summary(0, 0, false),
+            "Integration incomplete: 0 landed"
+        );
+        assert_eq!(
+            fold_summary(1, 2, false),
+            "Integration incomplete: 1 landed, 2 deferred"
+        );
+        assert_eq!(fold_summary(1, 0, true), "Integrated: 1 landed");
+    }
+
     fn row(worktree: &str, status: &str) -> thegn_core::db::MergeQueueRow {
         thegn_core::db::MergeQueueRow {
             worktree: worktree.into(),
@@ -1123,7 +1191,13 @@ mod tests {
         let mut panel = crate::panel::PanelData::default();
         panel.merge_queue.push(row("/wt/a", "queued"));
 
-        apply_step(&mut panel, "/wt/a", "b-queued", "folding", "");
+        apply_step(
+            &mut panel,
+            "/wt/a",
+            "b-queued",
+            "folding",
+            &MergeStatusFields::default(),
+        );
         assert_eq!(panel.merge_queue[0].status, "folding");
 
         apply_step(
@@ -1131,7 +1205,10 @@ mod tests {
             "/wt/a",
             "b-queued",
             "deferred",
-            "src/a.rs\nsrc/b.rs",
+            &MergeStatusFields {
+                conflict_paths: Some("src/a.rs\nsrc/b.rs".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(panel.merge_queue[0].status, "deferred");
         assert_eq!(
@@ -1139,12 +1216,74 @@ mod tests {
             Some("src/a.rs\nsrc/b.rs")
         );
 
-        apply_step(&mut panel, "/wt/a", "b-queued", "landed", "abc123");
+        apply_step(
+            &mut panel,
+            "/wt/a",
+            "b-queued",
+            "landed",
+            &MergeStatusFields {
+                result_oid: Some("abc123".into()),
+                ..Default::default()
+            },
+        );
         assert_eq!(panel.merge_queue[0].status, "landed");
         assert_eq!(panel.merge_queue[0].result_oid.as_deref(), Some("abc123"));
         // Landing clears the failure details.
         assert!(panel.merge_queue[0].conflict_paths.is_none());
         assert!(panel.merge_queue[0].error_detail.is_none());
+    }
+
+    #[test]
+    fn held_steps_replace_stale_result_conflict_and_error_independently() {
+        let mut panel = crate::panel::PanelData::default();
+        panel.merge_queue.push(row("/wt/a", "deferred"));
+        for status in ["gate_error", "agent_blocked", "deferred", "needs_human"] {
+            panel.merge_queue[0].result_oid = Some("stale-result".into());
+            panel.merge_queue[0].conflict_paths = Some("stale-conflict".into());
+            panel.merge_queue[0].error_detail = Some("stale-error".into());
+            let fields = MergeStatusFields {
+                error_detail: Some("current infrastructure reason".into()),
+                ..Default::default()
+            };
+            apply_step(&mut panel, "/wt/a", "feature", status, &fields);
+            let row = &panel.merge_queue[0];
+            assert_eq!(row.status, status);
+            assert!(row.result_oid.is_none() && row.conflict_paths.is_none());
+            assert_eq!(row.error_detail, fields.error_detail);
+        }
+    }
+
+    #[test]
+    fn gate_error_only_and_mixed_drains_are_not_successful_or_empty() {
+        let mut out = DriveOutcome {
+            gate_error: vec!["held".into()],
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let (message, success) = drive_summary(&out);
+            assert!(!success);
+            assert!(message.contains("1 gate errors"));
+            assert!(!message.contains("nothing to drain"));
+            out.landed.push("landed".into());
+        }
+        assert_eq!(
+            drive_summary(&DriveOutcome::default()),
+            ("Merge queue: nothing to drain".into(), true)
+        );
+        assert!(
+            drive_summary(&DriveOutcome {
+                landed: vec!["ok".into()],
+                ..Default::default()
+            })
+            .1
+        );
+        assert!(
+            !drive_summary(&DriveOutcome {
+                deferred: vec!["agent-blocked".into()],
+                ..Default::default()
+            })
+            .1
+        );
     }
 
     #[test]
@@ -1155,7 +1294,10 @@ mod tests {
             "/wt/new",
             "feat",
             "agent_running",
-            "agent fixing (1/2)",
+            &MergeStatusFields {
+                error_detail: Some("agent fixing (1/2)".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(panel.merge_queue.len(), 1);
         let r = &panel.merge_queue[0];

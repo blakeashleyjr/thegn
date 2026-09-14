@@ -2057,15 +2057,16 @@ mod tests {
     /// A real route-to-host request crosses the TCP HTTP client, router, and
     /// daemon-service boundary used by a provisioned environment.
     /// The caller's checkout and DB remain distinct: only the host DB owns the
-    /// queue row, while the eventual host drain ingests the remote branch tip.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn route_to_host_client_enqueues_and_drains_on_the_authoritative_host() {
+    /// queue row. Automatic drain holds the unverified provider source before
+    /// executing it; successful transport is not canonical-history admission.
+    #[test]
+    fn route_to_host_client_enqueues_but_holds_unverified_provider_source() {
         use thegn_core::remote::GitLoc;
         use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
         use thegn_svc::control::client::{ControlAddr, ControlClient};
 
         #[expect(clippy::disallowed_methods)] // deterministic real-Git fixture, test only
-        fn git(dir: &std::path::Path, args: &[&str]) {
+        fn git(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
             let output = thegn_core::util::git_cmd(dir).args(args).output().unwrap();
             assert!(
                 output.status.success(),
@@ -2073,6 +2074,31 @@ mod tests {
                 args.join(" "),
                 String::from_utf8_lossy(&output.stderr)
             );
+            output.stdout
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct RepoSnapshot {
+            refs: Vec<u8>,
+            index: Vec<u8>,
+            config: Vec<u8>,
+            base: Vec<u8>,
+            remote: Option<Vec<u8>>,
+        }
+
+        fn snapshot(path: &std::path::Path) -> RepoSnapshot {
+            let remote = match std::fs::read(path.join("remote.txt")) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("private tracked file snapshot failed: {error}"),
+            };
+            RepoSnapshot {
+                refs: git(path, &["show-ref"]),
+                index: std::fs::read(path.join(".git/index")).unwrap(),
+                config: std::fs::read(path.join(".git/config")).unwrap(),
+                base: std::fs::read(path.join("base.txt")).unwrap(),
+                remote,
+            }
         }
 
         fn init_repo(path: &std::path::Path) {
@@ -2086,127 +2112,233 @@ mod tests {
             git(path, &["commit", "-q", "-m", "base"]);
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let host_repo = temp.path().join("host-repo");
-        let remote_repo = temp.path().join("remote-repo");
-        init_repo(&host_repo);
-        git(
-            temp.path(),
-            &[
-                "clone",
-                "-q",
-                &host_repo.to_string_lossy(),
-                &remote_repo.to_string_lossy(),
-            ],
-        );
-        git(&remote_repo, &["config", "user.name", "Thegn Test"]);
-        git(
-            &remote_repo,
-            &["config", "user.email", "thegn@example.invalid"],
-        );
-        git(&remote_repo, &["config", "commit.gpgsign", "false"]);
-        git(&remote_repo, &["checkout", "-q", "-b", "feat/transport"]);
-        std::fs::write(remote_repo.join("remote.txt"), "through transport\n").unwrap();
-        git(&remote_repo, &["add", "-A"]);
-        git(&remote_repo, &["commit", "-q", "-m", "remote"]);
-
-        let remote_id = temp
-            .path()
-            .join("opaque-host-id")
-            .to_string_lossy()
-            .into_owned();
-        assert!(!std::path::Path::new(&remote_id).exists());
-        let remote_db = Db::open_at(&temp.path().join("remote.db")).unwrap();
-        let location = GitLoc::provider_db_string(&["env".into()], &remote_repo.to_string_lossy());
-        let mut config = thegn_core::config::Config::default();
-        config.merge_queue.organize_folders = false;
-        config.merge_queue.gate_command.clear();
-        let (svc, _events) = service_with_config(0, config.clone());
-        svc.db
-            .lock()
-            .unwrap()
-            .put_worktree(
-                "repo/feat-transport",
-                &host_repo.to_string_lossy(),
-                &remote_id,
-                "feat/transport",
-                Some(&location),
-                None,
-            )
+        let temp = tempfile::Builder::new()
+            .prefix("thegn-provider-history-")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
             .unwrap();
+        let state = temp.path().join("state");
+        let config_root = temp.path().join("config");
+        let local = temp.path().join("local");
+        let global = temp.path().join("gitconfig");
+        let template = temp.path().join("template");
+        std::fs::write(&global, "").unwrap();
+        std::fs::create_dir(&template).unwrap();
+        // Set and retain isolation before constructing any runtime or Git
+        // worker. The implicit canonical-history Db::open is private too.
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", config_root.to_str().unwrap()),
+            ("APPDATA", config_root.to_str().unwrap()),
+            ("LOCALAPPDATA", local.to_str().unwrap()),
+            ("THEGN_DIR", temp.path().to_str().unwrap()),
+            ("THEGN_PROFILE", ""),
+            ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
+            ("GIT_TEMPLATE_DIR", template.to_str().unwrap()),
+        ]);
+        let _private_registry = Db::open().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let host_repo = temp.path().join("host-repo");
+            let remote_repo = temp.path().join("remote-repo");
+            init_repo(&host_repo);
+            git(
+                temp.path(),
+                &[
+                    "clone",
+                    "-q",
+                    &host_repo.to_string_lossy(),
+                    &remote_repo.to_string_lossy(),
+                ],
+            );
+            git(&remote_repo, &["config", "user.name", "Thegn Test"]);
+            git(
+                &remote_repo,
+                &["config", "user.email", "thegn@example.invalid"],
+            );
+            git(&remote_repo, &["config", "commit.gpgsign", "false"]);
+            git(&remote_repo, &["checkout", "-q", "-b", "feat/transport"]);
+            std::fs::write(remote_repo.join("remote.txt"), "through transport\n").unwrap();
+            git(&remote_repo, &["add", "-A"]);
+            git(&remote_repo, &["commit", "-q", "-m", "remote"]);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let control_addr = listener.local_addr().unwrap();
-        let svc = Arc::new(svc);
-        let now = thegn_core::util::now().saturating_mul(1_000);
-        let minted = thegn_svc::control::auth::mint(
-            thegn_core::control::TokenKind::Control,
-            thegn_core::control::ScopeSet::of(&[thegn_core::control::Scope::MergeAdd]),
-            &thegn_core::control::RouteToHostTokenBinding {
-                owner: "integration-test".into(),
-                worktree: remote_id.clone(),
+            let remote_id = temp
+                .path()
+                .join("opaque-host-id")
+                .to_string_lossy()
+                .into_owned();
+            assert!(!std::path::Path::new(&remote_id).exists());
+            let remote_db = Db::open_at(&temp.path().join("remote.db")).unwrap();
+            let provider_marker = temp.path().join("provider-must-not-run");
+            let provider_armed = temp.path().join("provider-armed");
+            let provider_audit = temp.path().join("provider-lookups");
+            assert_eq!(
+                String::from_utf8(git(&remote_repo, &["rev-parse", "--abbrev-ref", "HEAD"]))
+                    .unwrap()
+                    .trim(),
+                "feat/transport"
+            );
+            let expected_query = thegn_core::util::sh_join(&[
+                "git".into(),
+                "-C".into(),
+                remote_repo.to_str().unwrap().into(),
+                "rev-parse".into(),
+                "--abbrev-ref".into(),
+                "HEAD".into(),
+            ]);
+            // Fixture provider: acknowledge only this exact branch lookup,
+            // without evaluating the appended script or starting a login shell.
+            // The HTTP/auth/registry flow is real; provider lookup is stubbed.
+            let location = GitLoc::provider_db_string(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    concat!(
+                        "if [ -e \"$1\" ]; then printf invoked > \"$2\"; exit 97; fi; ",
+                        "if [ \"$#\" -ne 7 ] || [ \"$5\" != /bin/sh ] || ",
+                        "[ \"$6\" != -lc ] || [ \"$7\" != \"$4\" ]; then ",
+                        "printf unexpected > \"$2\"; exit 96; fi; ",
+                        "printf 'lookup\\n' >> \"$3\"; printf 'feat/transport\\n'"
+                    )
+                    .into(),
+                    "private-provider-canary".into(),
+                    provider_armed.to_str().unwrap().into(),
+                    provider_marker.to_str().unwrap().into(),
+                    provider_audit.to_str().unwrap().into(),
+                    expected_query,
+                ],
+                &remote_repo.to_string_lossy(),
+            );
+            let mut config = thegn_core::config::Config::default();
+            config.merge_queue.organize_folders = false;
+            config.merge_queue.gate_command.clear();
+            let (svc, _events) = service_with_config(0, config.clone());
+            svc.db
+                .lock()
+                .unwrap()
+                .put_worktree(
+                    "repo/feat-transport",
+                    &host_repo.to_string_lossy(),
+                    &remote_id,
+                    "feat/transport",
+                    Some(&location),
+                    None,
+                )
+                .unwrap();
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let control_addr = listener.local_addr().unwrap();
+            let svc = Arc::new(svc);
+            let now = thegn_core::util::now().saturating_mul(1_000);
+            let minted = thegn_svc::control::auth::mint(
+                thegn_core::control::TokenKind::Control,
+                thegn_core::control::ScopeSet::of(&[thegn_core::control::Scope::MergeAdd]),
+                &thegn_core::control::RouteToHostTokenBinding {
+                    owner: "integration-test".into(),
+                    worktree: remote_id.clone(),
+                }
+                .label(),
+                None,
+                Some(now + 60_000),
+                now,
+            );
+            svc.db.lock().unwrap().put_pairing(&minted.row).unwrap();
+            let state = thegn_svc::control::http::ControlState {
+                api: svc.clone(),
+                store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
+                local_admin: false,
+                daemon_euid: None,
+                require_approval: false,
+                server_label: "test thegn".into(),
+                cors_origins: Vec::new(),
+            };
+            let app = thegn_svc::control::http::router(state);
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+            let reply = ControlClient::new(ControlAddr::HttpOrigin {
+                origin: format!("http://{control_addr}"),
+                token: minted.token,
+            })
+            .merge_add(&remote_id)
+            .await
+            .expect("remote client enqueue through the real handler");
+            assert_eq!(reply["queued"], true);
+            assert_eq!(reply["message"], "queued feat/transport");
+            let rows = svc.db.lock().unwrap().list_merge_queue().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].worktree, remote_id);
+            assert_eq!(rows[0].location, location);
+            assert_eq!(rows[0].status, "queued");
+            assert_eq!(rows[0].agent_attempts, 0);
+            assert!(remote_db.list_merge_queue().unwrap().is_empty());
+            assert_eq!(std::fs::read(&provider_audit).unwrap(), b"lookup\n");
+            assert!(!provider_marker.exists());
+            std::fs::write(&provider_armed, "drain must not invoke provider").unwrap();
+            let host_before = snapshot(&host_repo);
+            let source_before = snapshot(&remote_repo);
+            let mut progress = Vec::new();
+
+            let item = crate::merge_driver::QueueItem {
+                worktree: rows[0].worktree.clone(),
+                branch: rows[0].branch.clone(),
+                location: rows[0].location.clone(),
+                agent_attempts: rows[0].agent_attempts,
+            };
+            let outcome = crate::merge_driver::drive_queue(
+                &config.merge_queue,
+                &config,
+                &host_repo,
+                &svc.db.lock().unwrap(),
+                vec![item],
+                |step| progress.push(step.status.to_owned()),
+            );
+            assert_eq!(outcome.gate_error, ["feat/transport"]);
+            assert!(outcome.landed.is_empty());
+            assert!(outcome.ready.is_empty());
+            assert!(outcome.deferred.is_empty());
+            assert!(outcome.needs_human.is_empty());
+            assert!(outcome.resyncs.is_empty());
+            assert!(outcome.warnings.is_empty());
+            assert_eq!(progress, ["folding", "gate_error"]);
+            let after_rows = svc.db.lock().unwrap().list_merge_queue().unwrap();
+            assert_eq!(after_rows.len(), 1);
+            let held = &after_rows[0];
+            assert_eq!(held.status, "gate_error");
+            assert_eq!(held.worktree, rows[0].worktree);
+            assert_eq!(held.branch, rows[0].branch);
+            assert_eq!(held.target_branch, rows[0].target_branch);
+            assert_eq!(held.location, rows[0].location);
+            assert_eq!(held.queued_at, rows[0].queued_at);
+            assert_eq!(held.agent_attempts, rows[0].agent_attempts);
+            assert!(held.result_oid.is_none());
+            assert!(held.conflict_paths.is_none());
+            let detail = held.error_detail.as_deref().unwrap();
+            if thegn_core::sandbox_backend::host_os()
+                == thegn_core::sandbox_backend::HostOs::Windows
+            {
+                assert!(
+                    detail.contains("verified local gate state is unsupported on this platform")
+                );
+                assert!(!detail.contains("unsupported for remote/provider"));
+            } else {
+                assert!(detail.contains(
+                    "canonical history is unsupported for remote/provider merge operations"
+                ));
             }
-            .label(),
-            None,
-            Some(now + 60_000),
-            now,
-        );
-        svc.db.lock().unwrap().put_pairing(&minted.row).unwrap();
-        let state = thegn_svc::control::http::ControlState {
-            api: svc.clone(),
-            store: svc.db.clone() as Arc<Mutex<dyn ControlStore + Send>>,
-            local_admin: false,
-            daemon_euid: None,
-            require_approval: false,
-            server_label: "test thegn".into(),
-            cors_origins: Vec::new(),
-        };
-        let app = thegn_svc::control::http::router(state);
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            assert!(!provider_marker.exists());
+            assert_eq!(std::fs::read(&provider_audit).unwrap(), b"lookup\n");
+            assert_eq!(snapshot(&host_repo), host_before);
+            assert_eq!(snapshot(&remote_repo), source_before);
+            assert!(remote_db.list_merge_queue().unwrap().is_empty());
+
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
         });
-
-        let reply = ControlClient::new(ControlAddr::HttpOrigin {
-            origin: format!("http://{control_addr}"),
-            token: minted.token,
-        })
-        .merge_add(&remote_id)
-        .await
-        .expect("remote client enqueue through the real handler");
-        assert_eq!(reply["queued"], true);
-        assert_eq!(reply["message"], "queued feat/transport");
-        let rows = svc.db.lock().unwrap().list_merge_queue().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].worktree, remote_id);
-        assert_eq!(rows[0].location, location);
-        assert!(remote_db.list_merge_queue().unwrap().is_empty());
-
-        let item = crate::merge_driver::QueueItem {
-            worktree: rows[0].worktree.clone(),
-            branch: rows[0].branch.clone(),
-            location: rows[0].location.clone(),
-            agent_attempts: rows[0].agent_attempts,
-        };
-        let outcome = crate::merge_driver::drive_queue(
-            &config.merge_queue,
-            &config,
-            &host_repo,
-            &svc.db.lock().unwrap(),
-            vec![item],
-            |_| {},
-        );
-        assert_eq!(outcome.landed, vec!["feat/transport"]);
-        assert_eq!(
-            std::fs::read_to_string(host_repo.join("remote.txt")).unwrap(),
-            "through transport\n"
-        );
-        assert_eq!(
-            svc.db.lock().unwrap().list_merge_queue().unwrap()[0].status,
-            "landed"
-        );
-        assert!(remote_db.list_merge_queue().unwrap().is_empty());
-
-        server.abort();
     }
 
     fn leases(svc: &DaemonService) -> Vec<LeaseRow> {
