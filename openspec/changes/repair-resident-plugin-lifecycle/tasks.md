@@ -23,5 +23,6 @@
 - [x] Primary approval for portable test-only reexec fixtures and explicit native Windows CI selection; no containment implementation.
 - [x] Add explicit READY, finite fixture lifetime, assertion-unwind cleanup and shell-independent lifecycle/failure coverage.
 - [x] Select native lifecycle and exact Windows cancellation-race regressions in the existing opt-in CI job; preserve macOS pipeline.
-- [ ] Execute new native Linux regressions and foreign-target source checks, recording their different proof limits.
+- [x] Execute eight new native Linux regressions plus all 48 existing plugin tests; exclude one ignored helper from the count (two platform ratchets also passed).
+- [ ] Check the new foreign-target test source separately; native Windows/macOS execution still requires their kernels.
 - [ ] Complete independent adversarial review, scoped checks and local landing of the follow-up.
