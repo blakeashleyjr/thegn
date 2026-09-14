@@ -80,6 +80,14 @@ pub fn deadline_seconds(now: i64, delay_secs: u64) -> Option<i64> {
     now.checked_add(i64::try_from(delay_secs).ok()?)
 }
 
+/// Fractional provider delays use ceiling seconds, never an earlier reset.
+pub fn deadline_seconds_from_float(now: i64, seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || !(0.0..=MAX_DURATION_SECS as f64).contains(&seconds) {
+        return None;
+    }
+    deadline_seconds(now, seconds.ceil() as u64)
+}
+
 /// Checked relative delay in milliseconds. Absolute epochs use the full signed
 /// range; only the relative delay is subject to the operational duration bound.
 pub fn deadline_millis(now_ms: i64, delay_ms: u64) -> Option<i64> {

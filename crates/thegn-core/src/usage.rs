@@ -389,7 +389,7 @@ pub fn forecast_exhaustion(
         return None;
     }
     let rate = (last.1 - first.1) / span as f32; // percent per second
-    if rate <= 0.0 {
+    if !rate.is_finite() || rate <= 0.0 {
         return None;
     }
     let remaining = (100.0 - last.1).max(0.0);
@@ -813,7 +813,7 @@ impl CodexWindow {
     fn reset_at(&self, now: i64) -> Option<i64> {
         self.resets_at.or_else(|| {
             self.resets_in_seconds
-                .and_then(|s| crate::time_policy::deadline_seconds(now, s))
+                .and_then(|s| crate::time_policy::deadline_seconds_from_float(now, s))
         })
     }
 }
@@ -1243,7 +1243,7 @@ pub fn parse_antigravity_quota(bytes: &[u8], now: i64) -> Option<AccountUsage> {
         let label = safe_field(w.label.clone()).unwrap_or_else(|| format!("window {}", i + 1));
         let resets_at = w.resets_at.or_else(|| {
             w.resets_in_seconds
-                .and_then(|s| crate::time_policy::deadline_seconds(now, s))
+                .and_then(|s| crate::time_policy::deadline_seconds_from_float(now, s))
         });
         windows.push(UsageWindow::new(
             &label,

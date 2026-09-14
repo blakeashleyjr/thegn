@@ -56,11 +56,17 @@ pub fn tick(cfg: &Config) {
     std::thread::spawn(move || reap(&envs));
 }
 
-/// One reconcile pass over the Fly ledger records. The env's `max_lifetime_secs`
-/// ceiling is taken from the first fly env (mirrors the VPS reaper's per-provider
-/// treatment; a Fly record doesn't record which env minted it).
+/// The ledger lacks an environment/account binding. Refuse ambiguous policies
+/// before provider construction, inventory access or local ledger retirement.
 fn reap(envs: &[EnvProviderConfig]) {
-    let Some(pc) = envs.first() else { return };
+    if let Err(reason) = crate::reaper_policy::with_unambiguous(envs, reap_unambiguous) {
+        thegn_core::msg::warn(&format!(
+            "fly reaper: quarantined provider kind: {reason}; no provider or ledger actions attempted"
+        ));
+    }
+}
+
+fn reap_unambiguous(pc: &EnvProviderConfig) {
     let now = thegn_core::util::now();
     for rec in registry::list().into_iter().filter(|r| r.provider == "fly") {
         // Legacy created_at is local intent/finalization time, not provider

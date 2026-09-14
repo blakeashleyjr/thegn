@@ -17,7 +17,7 @@ semantics remain explicit. Remaining cast classifications are below.
 VPS inventory supplies authoritative creation timestamps. Unknown, nonpositive,
 future or unsupported lifetime input becomes an observable quarantine warning
 and cannot authorize expiry or orphan deletion. A ledger record with a different
-provider/instance ID also quarantines. Invalid local provisioning/hibernation
+provider/instance ID, or an empty recorded instance ID, also quarantines. Invalid local provisioning/hibernation
 ages cannot trigger destructive recovery. An absent live VPS may still retire
 an existing ready ledger row because that decision does not depend on age.
 
@@ -28,9 +28,21 @@ must match, and inventory must contain exactly one well-formed machine. Empty,
 multiple, malformed or changed inventories quarantine. Provider created_at uses
 the documented API timestamp. The app name is derived separately from sandbox
 name and is not compared with Machine name. The existing managed SSH custody
-record must be readable before age reconciliation. A failed read retains the
+record must exist and match provider, account, instance, key path and key fingerprint before any inventory read. A failed read retains the
 ledger for retry; a staged record without exact machine identity quarantines.
 No local timestamp provenance is invented. [Fly Machines API response fields](https://fly.io/docs/machines/api/machines-resource/)
+
+Primary review caught an absent-custody `Ok(None)` admission; the new injected
+inventory seam rejects absent or mismatched custody without reading the provider.
+Independent review caught per-environment lifetime/account ambiguity: the legacy
+ledger does not identify its environment. Both reapers now quarantine an entire
+provider kind before provider construction, inventory or ledger cleanup whenever
+its configured endpoint, credential reference or lifetime differs across envs.
+This includes a 60-second policy beside disabled expiry. Exact duplicate policies
+still reconcile once. Credential/endpoint spellings are compared conservatively;
+aliases that might refer to one account can quarantine rather than merge uncertain
+authority. Staged VPS intent without a nonempty observed ID cannot authorize
+resource deletion; cleanup after confirmed absence remains a separate decision.
 
 The last inventory read and provider deletion remain separate operations; this
 change does not eliminate a resource-identity race between them or repair the
@@ -98,7 +110,7 @@ Repository-wide source scan includes tests and non-time fields. This table class
 | `crates/thegn-core/src/scan_sched.rs` | 186, 187, 215, 217 | Remaining casts occur in fixed/default-bound test fixtures; production duration conversions were replaced. |
 | `crates/thegn-core/src/spillover.rs` | 87 | Retry-After is capped at3600 seconds before multiplying by1000 (maximum3600000ms). |
 | `crates/thegn-core/src/time_policy.rs` | 155, 307 | Runtime narrowing is explicitly capped at i64::MAX; remaining uses are fixed-bound assertions. |
-| `crates/thegn-core/src/usage.rs` | 396 | Non-time IDs/counts/bytes/capacities/booleans/token fields, plus any test fixtures. Outside duration/epoch policy scope. |
+| `crates/thegn-core/src/usage.rs` | 396 | Comment describing the removed truncating cast; no remaining cast expression. |
 | `crates/thegn-core/src/weather.rs` | 387, 396 | Non-time display/control quantity (weather, volume or CPU percentage), using float-to-integer saturation. |
 | `crates/thegn-core/tests/sandbox_audit.rs` | 17 | Non-time IDs/counts/bytes/capacities/booleans/token fields, plus any test fixtures. Outside duration/epoch policy scope. |
 | `crates/thegn-host/src/attention_status.rs` | 140, 290, 294, 298 | Activity timestamps are floating-point display/scoring projections (Rust saturating float cast, no modular unsigned wrap); other cast is a row ordinal. |
