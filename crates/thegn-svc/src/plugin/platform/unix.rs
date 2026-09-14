@@ -109,6 +109,8 @@ impl Prepared {
                 status: None,
                 #[cfg(test)]
                 signal_override: None,
+                #[cfg(test)]
+                wait_calls: 0,
             },
             stdin,
             stdout,
@@ -194,6 +196,8 @@ pub(crate) struct Leader {
     status: Option<ExitStatus>,
     #[cfg(test)]
     signal_override: Option<Box<dyn FnMut(libc::pid_t) -> io::Result<()> + Send>>,
+    #[cfg(test)]
+    wait_calls: usize,
 }
 
 impl Leader {
@@ -202,12 +206,21 @@ impl Leader {
     }
 
     fn exited_without_reaping(&mut self) -> io::Result<bool> {
+        if self.identity_lost {
+            return Err(io::Error::other(
+                "leader identity was lost; observation forbidden",
+            ));
+        }
         let Some(child) = self.child.as_ref() else {
             return Ok(true);
         };
         // SAFETY: zeroed siginfo is a valid output buffer; WNOHANG avoids a
         // blocking wait and WNOWAIT retains identity until group signaling ends.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        #[cfg(test)]
+        {
+            self.wait_calls += 1;
+        }
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
@@ -256,20 +269,36 @@ impl Leader {
             .as_ref()
             .ok_or_else(|| io::Error::other("leader already reaped"))?;
         let group = -(child.id() as libc::pid_t);
+        let group_result = self.signal_group(group);
+        // Group success does not prove the leader still belonged to that
+        // group. Ensure this exclusively owned, unreaped child terminates too;
+        // never discover or signal its potentially changed process group.
+        let leader_result = self
+            .child
+            .as_mut()
+            .expect("unreaped child ownership")
+            .kill();
+        match (group_result, leader_result) {
+            (Ok(()), leader) => leader,
+            (Err(group), leader) if group.raw_os_error() == Some(libc::ESRCH) => leader,
+            (Err(group), Ok(())) => Err(group),
+            (Err(group), Err(leader)) => Err(io::Error::other(format!(
+                "group termination: {group}; leader termination: {leader}"
+            ))),
+        }
+    }
+
+    fn signal_group(&mut self, group: libc::pid_t) -> io::Result<()> {
         #[cfg(test)]
         if let Some(signal) = self.signal_override.as_mut() {
             return signal(group);
         }
-        // SAFETY: this owner has never reaped the child, pinning its identity.
-        // The process group is created before exec. No post-reap PID fallback.
+        // SAFETY: terminate checked still-owned/unreaped identity. The initial
+        // group was created before exec; no post-reap numeric fallback exists.
         if unsafe { libc::kill(group, libc::SIGKILL) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
             Ok(())
         } else {
-            Err(error)
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -284,6 +313,15 @@ impl Leader {
     }
 
     fn consume_ready(&mut self) -> io::Result<ExitStatus> {
+        if self.identity_lost {
+            return Err(io::Error::other(
+                "leader identity was lost; consuming wait forbidden",
+            ));
+        }
+        #[cfg(test)]
+        {
+            self.wait_calls += 1;
+        }
         let status = match self
             .child
             .as_mut()
@@ -341,6 +379,14 @@ mod tests {
         assert_eq!(
             process.leader.consume_ready().unwrap_err().raw_os_error(),
             Some(libc::ECHILD)
+        );
+        let waits = process.leader.wait_calls;
+        assert!(process.leader.exited_without_reaping().is_err());
+        assert!(process.leader.consume_ready().is_err());
+        assert!(process.leader.reap().is_err());
+        assert_eq!(
+            process.leader.wait_calls, waits,
+            "lost identity reached another numeric wait syscall"
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
@@ -456,5 +502,50 @@ mod tests {
         );
         assert_eq!(process.leader.reap().unwrap().code(), Some(7));
         runtime.block_on(process.settle_pipes(tokio::time::Instant::now()));
+    }
+    #[test]
+    fn resident_unix_group_result_always_terminates_exact_owned_leader() {
+        for group_exists in [false, true] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let entered = runtime.enter();
+            let mut command = Command::new("sh");
+            // Shell builtin only: no descendant or unrelated group is created.
+            command
+                .args(["-c", "read -r fixture"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut process = Prepared::new().unwrap().spawn(command).unwrap();
+            drop(entered);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            process.leader.signal_override = Some(Box::new(move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                if group_exists {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                }
+            }));
+            process.leader.terminate().unwrap();
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), process.leader.wait_ready())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+            assert!(process.leader.reaped_status().is_none());
+            assert!(!process.leader.reap().unwrap().success());
+            assert!(process.leader.terminate().is_err());
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                1,
+                "reaped identity reached signaling again"
+            );
+            assert!(runtime.block_on(process.settle_pipes(Instant::now())));
+        }
     }
 }
