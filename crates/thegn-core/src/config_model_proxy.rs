@@ -184,6 +184,7 @@ pub struct BudgetConfig {
     /// What a breach does: warn (default, never blocks) | refuse | downgrade.
     pub on_breach: BudgetBreach,
     /// Rolling-window length in seconds (0 = cumulative, never rolls over).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub window_secs: u64,
     /// Per-scope ceilings, keyed by scope (`global`, `agent:<n>`,
     /// `worktree:<path>`, `workspace:<repo>`, `zone:<n>`).
@@ -223,10 +224,13 @@ pub struct ModelProxyConfig {
     /// Enable the cross-route last-resort tier globally.
     pub last_resort: bool,
     /// Streaming first-byte (peek/commit) budget, seconds.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub first_byte_timeout_secs: u64,
     /// Committed-stream idle watchdog, seconds.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub idle_timeout_secs: u64,
     /// Streaming keep-alive cadence, seconds.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub heartbeat_secs: u64,
     /// The provider registry.
     pub providers: Vec<ProviderEntry>,

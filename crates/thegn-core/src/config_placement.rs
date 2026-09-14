@@ -322,9 +322,11 @@ pub struct AutoscaleConfig {
     /// Floor kept alive by scale-down (warm capacity).
     pub min_hosts: u32,
     /// A Managed host with zero tenants for longer than this is destroyed.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub scale_down_idle_secs: u64,
     /// Base cooldown after a lane's create failure (escalates per consecutive
     /// failure, capped).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub cooldown_secs: u64,
     /// Ordered failover lanes.
     pub managed: Vec<ManagedTemplate>,
@@ -384,6 +386,7 @@ pub struct PlacementConfig {
     pub independent_safety_pct: u32,
     /// Max age of a host's measured headroom sample before a placement
     /// decision refreshes it (lazily — never the idle ticker).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub headroom_ttl_secs: u64,
     /// Ordered SPILLOVER lane: `[env.<name>]` entries with a provider
     /// placement, tried (health- and budget-gated) when the owned pool and

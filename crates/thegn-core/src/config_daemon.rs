@@ -121,10 +121,12 @@ pub struct DaemonConfig {
     /// Exit after this long with no live sessions; `0` = never. Ignored by
     /// `thegn serve` — a serving daemon keeps its TCP listener up for thin
     /// clients that haven't connected yet, so it never idle-exits.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub idle_exit_secs: u64,
     /// Keep a detached session's PTY warm this long (the relay lease grace);
     /// `0` = never reap — a detached session lives until explicitly killed
     /// (or the machine restarts).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub lease_grace_secs: u64,
 }
 

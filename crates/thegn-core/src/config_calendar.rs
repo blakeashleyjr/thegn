@@ -48,16 +48,20 @@ pub struct CalendarConfig {
     /// Mark days that have events with a dot in the grid.
     pub show_event_markers: bool,
     /// Cache lifetime (seconds) before a background re-fetch is worthwhile.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub ttl_secs: u64,
     /// Default seconds between syncs, for accounts that don't set their own.
     /// Floored at [`MIN_REFRESH_SECS`].
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
     /// Cap on cached events per account, so one enormous calendar can't
     /// dominate the DB or the expansion pass.
     pub max_events: usize,
     /// How far back to fetch and keep events.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub horizon_past_days: u32,
     /// How far ahead to fetch events.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub horizon_future_days: u32,
     /// Raise notifications ahead of events that carry reminders.
     pub reminders_enabled: bool,
@@ -256,6 +260,7 @@ pub struct CalendarAccount {
     pub read_only: bool,
     /// Seconds between syncs; `0` inherits `[calendar] refresh_interval_secs`.
     /// Always floored at [`MIN_REFRESH_SECS`].
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
 
     /// `ics`: path to a `.ics` file, or to a directory of them (which is the
@@ -282,6 +287,7 @@ pub struct CalendarAccount {
     /// `"run:khal"`). A plugin requesting more than this is denied and audited.
     pub capabilities: Vec<String>,
     /// Seconds before a fetch is abandoned and the child's process group killed.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_secs: u64,
 }
 

@@ -252,6 +252,7 @@ pub struct EnvProviderConfig {
     /// VPS providers only: ceiling on any instance's lifetime in seconds; the
     /// reaper destroys older ones (a VPS bills until destroyed — there is no
     /// free suspended state). `0` ⇒ no ceiling.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub max_lifetime_secs: u64,
     /// Hibernation (snapshot-then-destroy on idle) for this env's claimed
     /// sandboxes: `auto` (default — on for commodity VPS, off for
@@ -260,6 +261,7 @@ pub struct EnvProviderConfig {
     pub hibernate: HibernateMode,
     /// Per-env idle-seconds override before hibernation. `0` ⇒ the global
     /// `[lifecycle] hibernate_after_secs`.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub hibernate_idle_secs: u64,
 }
 
@@ -488,9 +490,11 @@ pub fn provider_self_suspends(name: &str) -> bool {
 pub struct MetricsConfig {
     /// Scrape interval in seconds.
     #[serde(alias = "interval-secs")]
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub interval_secs: f64,
     /// Request timeout in milliseconds.
     #[serde(alias = "timeout-ms")]
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub timeout_ms: u64,
     /// Max response body size in bytes (prevent runaway).
     #[serde(alias = "max-body-bytes")]
@@ -622,6 +626,7 @@ pub struct LifecycleConfig {
     /// keeps; active/busy/pane-held worktrees are always kept).
     pub max_warm: usize,
     /// Idle seconds before a non-essential warm sandbox may suspend.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub idle_ttl_secs: u64,
     /// How far ahead of focus to eagerly provision (hide the provisioning cost).
     pub eager: EagerScope,
@@ -644,6 +649,7 @@ pub struct LifecycleConfig {
     /// whose `hibernate` mode resolves on (default: commodity VPS). `0` ⇒ off
     /// globally. Deliberately much longer than `idle_ttl_secs`: suspend is
     /// instant to undo, hibernate costs a re-provision on next open.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub hibernate_after_secs: u64,
     /// `[lifecycle.snapshot]` — where hibernation snapshots live.
     pub snapshot: SnapshotStoreConfig,
@@ -751,6 +757,7 @@ pub struct PoolConfig {
     /// pool member idle longer than this (seconds). Ignored for scale-to-zero
     /// providers, whose idle spares self-suspend for free and are parked, not
     /// aged out (they still rotate on flake.lock drift).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub max_idle_secs: u64,
     /// Recycle checkpointed spares by restoring them IN PLACE (seconds) instead
     /// of destroy+rebuild (minutes) when they go stale or their worktree is

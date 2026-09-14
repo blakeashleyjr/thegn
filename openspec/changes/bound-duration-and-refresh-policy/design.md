@@ -1,0 +1,52 @@
+# Design
+
+Use `time_policy` for nonzero cadence slots, unsigned age/freshness, checked
+provider deadlines, and wide-domain duration-to-millisecond conversion. Convert
+through u128 and use ceiling division so a scheduler cannot wrap to zero or fire
+before a nonintegral slot boundary. Every runtime entry remains safe when a
+programmatic configuration bypasses strict validation.
+
+Operational strict maxima are 31 days for periodic cadences and ten 365-day
+years for other durations. Schema fields express maxima in their own units:
+seconds, milliseconds, or days. Existing defaults and lower floors remain;
+feature disable/inheritance semantics stay explicit (None or the field's
+established zero convention). Epoch fields are never capped as durations.
+The complete field-family inventory is in
+`docs/audits/time-policy-duration-inventory.md`.
+
+A blanket new serde rejection is unsafe here: `Config::load_layered` falls back
+to the entire default configuration on deserialization errors. A new duration
+error must not discard unrelated sandbox isolation settings. Therefore schema
+numeric maxima drive duration-only strict validation, explicit overlay admission,
+and pre-write validation. The permissive base-file path retains parsed settings
+and warns. Runtime periodic conversion caps unsupported cadence values; invalid
+destructive duration remains raw until the reaper quarantines it. This is targeted
+duration recovery and does not fix the general loader-admission issue THE-505.
+An explicit overlay with a newly invalid duration is rejected atomically; an
+unrelated repair remains possible when a base already contains diagnosed errors.
+
+The shared ticker gets an unwind-only notification guard: exactly one error
+and existing terminal wake on panic, no heartbeat poll or extra timer. Ordinary
+channel shutdown remains silent. This reports worker loss rather than implying
+that a background thread's death is healthy idle state.
+
+THE-484 work must distinguish trustworthy provider creation time from unknown,
+malformed, future, or overflowing data. Unknown inventory is visibly quarantined
+with a reconciliation instruction; it never authorizes deletion. Existing ledger
+created_at values conflate provider time and fallback local now, so they cannot
+be retroactively promoted to generation-bound creation evidence. A local fallback
+is only valid when genuine create-intent evidence is tied to the exact current
+provider resource generation; otherwise quarantine remains necessary. No live
+provider call is used during this work.
+
+Repeated hydration must not serialize an entire Config merely to validate an
+unchanged environment. Base duration diagnostics use a bounded32-entry source
+fingerprint cache (diagnostics only, never runtime authorization). The environment
+DTO checks its ten duration fields directly, with parity fixtures against full
+schema validation. CLI/profile changes validate a small explicit patch. Schema
+and full-config walks remain at strict admission boundaries or changed base source.
+
+Model and PR due decisions are independent. A due PR subsumes a coincident model
+refresh; hostile model intervals cannot starve an ordinary PR schedule. Nine
+actual-source standalone cadence/schedule/panic fixtures pass in both debug and
+optimized builds; final updated core admission tests and combined host remain pending.

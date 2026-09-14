@@ -412,7 +412,10 @@ const WEATHER_FIRST_SLOT: u64 = 10;
 /// is the same belt-and-braces as [`spawn_refresh_ticker`]'s calendar slot, so
 /// the one place that loops cannot be made to spin from config.
 fn weather_every_slots(poll_secs: Option<u64>) -> Option<u64> {
-    poll_secs.map(|s| (s.max(thegn_core::config_weather::MIN_REFRESH_SECS) * 1000) / 500)
+    poll_secs.map(|s| {
+        thegn_core::time_policy::cadence_slots(s, thegn_core::config_weather::MIN_REFRESH_SECS, 500)
+            .get()
+    })
 }
 
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
@@ -575,23 +578,40 @@ pub(crate) fn spawn_refresh_ticker(
 ) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
+        let _failure = crate::worker_failure::PanicNotify::new(|| {
+            tracing::error!(target: "thegn::hydrate", "shared refresh ticker terminated by panic; periodic refresh is unavailable");
+            let _ = waker.wake(); // best-effort: surface failure on an existing terminal wake
+        });
         // The 500ms refresh ticker: it only decides when to *ask* for work, and
         // every consumer is off the render path.
         crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         let tick = Duration::from_millis(500);
-        let model_every = (model_refresh_interval().as_millis() as u64 / 500).max(1);
-        let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let model_every = thegn_core::time_policy::cadence_millis_slots(
+            model_refresh_interval().as_millis(),
+            500,
+        );
+        let pr_every =
+            thegn_core::time_policy::cadence_millis_slots(PR_REFRESH_INTERVAL.as_millis(), 500);
         let ci_every = crate::ci_refresh::ci_every_slots(ci_poll_secs);
         let fetch_every = auto_fetch_secs.and_then(crate::remote_poll::fetch_every_slots);
-        let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let issue_every =
+            thegn_core::time_policy::cadence_millis_slots(ISSUE_REFRESH_INTERVAL.as_millis(), 500)
+                .get();
         // Floored the same way `[pr_queue] poll_secs` is, so a misconfigured 0
         // can't spin the ticker against the forge's rate limit.
-        let prq_every = prq_poll_secs.map(|s| (s.max(15) * 1000) / 500);
+        let prq_every =
+            prq_poll_secs.map(|s| thegn_core::time_policy::cadence_slots(s, 15, 500).get());
         // Floored the same way, so a misconfigured 0 can't spin against a
         // provider's rate limit. (`CalendarAccount::refresh_secs` already
         // clamps; this is belt-and-braces at the one place that loops.)
-        let calendar_every = calendar_poll_secs
-            .map(|s| (s.max(thegn_core::config_calendar::MIN_REFRESH_SECS) * 1000) / 500);
+        let calendar_every = calendar_poll_secs.map(|s| {
+            thegn_core::time_policy::cadence_slots(
+                s,
+                thegn_core::config_calendar::MIN_REFRESH_SECS,
+                500,
+            )
+            .get()
+        });
         // Reminders are checked on a coarse fixed cadence: worst-case 30s
         // lateness is irrelevant for a "10 minutes before" alert, and the check
         // is pure, so this is far cheaper than a per-reminder timer.
@@ -599,14 +619,21 @@ pub(crate) fn spawn_refresh_ticker(
         // `UsageConfig::effective_poll_secs` already floors this at 60; the
         // `.max(60)` here is the same belt-and-braces as the calendar slot, so
         // the one place that loops can't be made to spin from config.
-        let usage_every = usage_poll_secs.map(|s| (s.max(60) * 1000) / 500);
+        let usage_every =
+            usage_poll_secs.map(|s| thegn_core::time_policy::cadence_slots(s, 60, 500).get());
         let weather_every = weather_every_slots(weather_poll_secs);
-        let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let container_every = thegn_core::time_policy::cadence_millis_slots(
+            CONTAINER_REFRESH_INTERVAL.as_millis(),
+            500,
+        )
+        .get();
         let disk_every =
             thegn_core::scan_sched::pump_slots(disk_ttl_secs, DISK_PUMP_FLOOR_SECS, 500);
         let loc_every =
             loc_ttl_secs.map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
-        let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let daemon_every =
+            thegn_core::time_policy::cadence_millis_slots(DAEMON_REFRESH_INTERVAL.as_millis(), 500)
+                .get();
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
@@ -619,7 +646,11 @@ pub(crate) fn spawn_refresh_ticker(
         // is what emits the first ClockTick — the initial frame already renders
         // the current time.
         let mut last_clock_unit = {
-            let period = clock_period_secs.load(Ordering::Relaxed).max(1) as i64;
+            let period = thegn_core::time_policy::saturating_i64(u128::from(
+                clock_period_secs
+                    .load(Ordering::Relaxed)
+                    .clamp(1, thegn_core::time_policy::MAX_CADENCE_SECS),
+            ));
             chrono::Local::now().timestamp().div_euclid(period)
         };
         // Daemon/status: a read-only DB handle + this state dir's scope, read on
@@ -656,13 +687,12 @@ pub(crate) fn spawn_refresh_ticker(
         }
         loop {
             std::thread::sleep(tick);
-            ticks += 1;
+            ticks = ticks.wrapping_add(1);
             let mut wake = false;
-            if ticks.is_multiple_of(model_every) {
-                let kind = if ticks.is_multiple_of(pr_every) {
-                    RefreshKind::Pr
-                } else {
-                    RefreshKind::Model
+            if let Some(work) = crate::refresh_schedule::model_or_pr(ticks, model_every, pr_every) {
+                let kind = match work {
+                    crate::refresh_schedule::ModelRefresh::Pr => RefreshKind::Pr,
+                    crate::refresh_schedule::ModelRefresh::Model => RefreshKind::Model,
                 };
                 if tx.send(kind).is_err() {
                     break; // loop gone
@@ -781,7 +811,7 @@ pub(crate) fn spawn_refresh_ticker(
             // `packed-refs` rewrite, the watcher-retarget window, a network mount)
             // is caught here within the PR cadence. The heal itself is a cheap
             // guarded no-op when the checkout is already coherent (the common case).
-            if ticks.is_multiple_of(pr_every) && tx.send(RefreshKind::MainRefMoved).is_err() {
+            if ticks.is_multiple_of(pr_every.get()) && tx.send(RefreshKind::MainRefMoved).is_err() {
                 break;
             }
             if let Some(n) = calendar_every
@@ -807,7 +837,11 @@ pub(crate) fn spawn_refresh_ticker(
             // across suspend/resume or a wall-clock jump, because it compares
             // absolute units rather than counting elapsed ticks.
             {
-                let period = clock_period_secs.load(Ordering::Relaxed).max(1) as i64;
+                let period = thegn_core::time_policy::saturating_i64(u128::from(
+                    clock_period_secs
+                        .load(Ordering::Relaxed)
+                        .clamp(1, thegn_core::time_policy::MAX_CADENCE_SECS),
+                ));
                 let unit = chrono::Local::now().timestamp().div_euclid(period);
                 if unit != last_clock_unit {
                     last_clock_unit = unit;

@@ -127,9 +127,7 @@ pub fn plan(targets: &[ScanTarget], now: i64, ttl_secs: u64, budget: usize) -> V
 /// Floored at `floor_secs` so a misconfigured `0` can never spin the scanner,
 /// and clamped to at least one slot.
 pub fn pump_slots(ttl_secs: u64, floor_secs: u64, slot_ms: u64) -> u64 {
-    let slot_ms = slot_ms.max(1);
-    let secs = (ttl_secs / 4).max(floor_secs);
-    ((secs * 1000) / slot_ms).max(1)
+    crate::time_policy::cadence_slots(ttl_secs / 4, floor_secs, slot_ms).get()
 }
 
 /// Cache rows whose path has left the live set — the shared shape of both orphan
