@@ -945,6 +945,91 @@ fn prepare_sandbox_none_backend_falls_to_host() {
 }
 
 #[test]
+fn final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate() {
+    with_temp_state("floor-auto-host", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        // No candidate reaches the pre-ensure floor check. The candidate builder
+        // still appends host: this used to bypass fail-closed admission entirely.
+        cfg.sandbox.backend_chain.clear();
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let error = prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("isolation floor"), "{error}");
+        assert!(error.to_string().contains("host-process"), "{error}");
+    });
+}
+
+#[test]
+fn explicit_host_does_not_override_fail_closed_floor() {
+    with_temp_state("floor-explicit-host", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Bwrap;
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let error = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            Some("host"),
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("isolation floor"), "{error}");
+    });
+}
+
+#[test]
+fn final_host_floor_degrade_reports_the_missed_boundary() {
+    with_temp_state("floor-degraded-host", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Degrade;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let outcome =
+            prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None)
+                .unwrap();
+        assert!(outcome.spec.is_none());
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("isolation floor") && w.contains("host-process"))
+        );
+    });
+}
+
+#[test]
+fn bare_remote_ssh_honors_fail_closed_floor() {
+    with_temp_state("floor-remote-host", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+        cfg.sandbox.isolation_floor = thegn_core::config::IsolationFloor::SharedKernel;
+        cfg.sandbox.on_floor_miss = thegn_core::config::OnFloorMiss::Fail;
+        let target = SshTarget::plain("example.invalid".into(), 22, false);
+        let location = GitLoc::remote_db_string_for(&target, "/remote/worktree");
+        let loc = GitLoc::from_db("/host/worktree", Some(&location));
+        let error = prepare_sandbox_env(
+            &cfg,
+            Path::new("/repo"),
+            "/host/worktree",
+            &loc,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("isolation floor"), "{error}");
+    });
+}
+
+#[test]
 fn prepare_remote_ssh_carries_exact_target_for_route_credential() {
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;

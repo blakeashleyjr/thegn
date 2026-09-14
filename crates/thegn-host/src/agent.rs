@@ -143,7 +143,7 @@ pub struct SandboxHalt {
     /// `failover = "ask"`: the modal offers a "run on host" choice beside retry.
     pub ask: bool,
     /// Set when the reason we cannot contain this pane is a runtime that is
-    /// installed but **not running**. The modal then offers to start it, which
+    /// installed but failed its availability probe. The modal offers to start it, which
     /// is a fix the user can take without leaving thegn. `None` for every other
     /// halt (a missing token, an unreachable host — nothing to start).
     pub dormant: Option<thegn_core::sandbox_dormant::DormantRuntime>,
@@ -582,6 +582,12 @@ pub fn prepare_sandbox_env(
                 if spec.placement.is_local() {
                     break;
                 }
+                crate::sandbox_admission::admit(
+                    &sb,
+                    spec.capabilities().isolation,
+                    worktree,
+                    &mut warnings,
+                )?;
                 ssh_none_guard(
                     &spec,
                     sb.backend,
@@ -761,9 +767,9 @@ pub fn prepare_sandbox_env(
         }
         .into());
     }
-    // A runtime that is installed but merely STOPPED is one command from
-    // working, and until now the chain folded it into "absent" and opened a host
-    // shell without a word. Offer it instead — start it, run on the host, or
+    // An installed runtime failed its availability probe. A stopped service is
+    // one possible cause; access or runtime failure can look the same. Offer
+    // the configured recovery choices — start it, run on the host, or
     // cancel — per `[sandbox] on_dormant`. Only when this launch actually asked
     // for containment: an `auto`/`host` launch landing on the host is the
     // configured outcome, not a degradation, and must never nag.
@@ -822,7 +828,7 @@ pub fn prepare_sandbox_env(
                 return Err(SandboxHalt {
                     env_name: rt.name.clone(),
                     placement: "local".into(),
-                    reason: format!("{} is installed but not running — {}", rt.name, rt.remedy),
+                    reason: format!("{} is installed but unavailable — inspect runtime health and access with `thegn doctor`", rt.name),
                     ask,
                     dormant: Some(rt),
                 }
@@ -830,6 +836,14 @@ pub fn prepare_sandbox_env(
             }
         }
     }
+    // No runnable candidate remains. Admission must compare the actual host
+    // fallback even when no earlier candidate reached the floor check at all.
+    crate::sandbox_admission::admit(
+        &sb,
+        thegn_core::capabilities::IsolationClass::HostProcess,
+        worktree,
+        &mut warnings,
+    )?;
     // Every candidate is spent and we are opening a bare host shell. Say it once
     // here — under `Fallthrough::Exact` the resolver deliberately stays quiet,
     // because only this loop knows which candidate was the last one.

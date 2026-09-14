@@ -37,6 +37,9 @@ pub(crate) fn provider_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+#[path = "provider_sessions.rs"]
+mod sessions;
+
 /// Per-request deadline for the small JSON **control-plane** calls (create,
 /// list, destroy, fs read/list, network policy, checkpoint metadata). The shared
 /// client (above) bounds only *connection* setup so genuinely long transfers
@@ -1305,7 +1308,7 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(&self.api_base, id, session, cols, rows)?;
-        self.start_session(url, true).await
+        self.connect_exec(url, true, false).await
     }
 
     /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
@@ -1347,6 +1350,12 @@ impl SpritesProvider {
     /// Run the WSS handshake (bearer auth) and spawn the bridge task. `tty`
     /// selects the wire framing: raw (PTY) vs 1-byte stream-id prefixes (non-PTY).
     async fn start_session(&self, url: String, tty: bool) -> Result<ExecSession> {
+        self.connect_exec(url, tty, true).await
+    }
+
+    // Fresh exec can wait for cold boot. Reattach is already retried by the
+    // session relay and must not multiply its budget by an inner 90s loop.
+    async fn connect_exec(&self, url: String, tty: bool, cold_open: bool) -> Result<ExecSession> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let auth: tokio_tungstenite::tungstenite::http::HeaderValue =
             format!("Bearer {}", self.token)
@@ -1372,12 +1381,15 @@ impl SpritesProvider {
             {
                 Ok(Ok((ws, _resp))) => break ws,
                 res => {
-                    if start.elapsed() >= CONNECT_BUDGET {
+                    let permanent = matches!(&res, Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
+                        if response.status().is_client_error()
+                            && !matches!(response.status().as_u16(), 408 | 429));
+                    if !cold_open || permanent || start.elapsed() >= CONNECT_BUDGET {
                         return match res {
                             Ok(Err(e)) => Err(e).context("sprites: exec ws connect"),
                             _ => Err(anyhow!(
-                                "sprites: exec ws connect timed out after {}s (sandbox never became ready)",
-                                CONNECT_BUDGET.as_secs()
+                                "sprites: exec ws connect timed out after {}s",
+                                start.elapsed().as_secs()
                             )),
                         };
                     }
