@@ -11,6 +11,7 @@
 - [ ] THE-596 follow-up: prove atomic direct-ref-type admission before restoring automatic branch deletion.
 - [x] Run focused private tests (16 core, 78 host) and source/architecture ratchets.
 - [x] THE-600: verify strict registry/resource observations reject malformed remote, tenancy and dispatch rows before hooks and after admission (18 core, 81 host focused tests passed).
+- [ ] THE-600 September 14 follow-up: execute the real post-hook registry-decoder corruption regression and independently review it before closure.
 - [ ] Independent review and repair all findings.
 - [ ] Integrate with THE-589 and pass the normal native delivery gate.
 

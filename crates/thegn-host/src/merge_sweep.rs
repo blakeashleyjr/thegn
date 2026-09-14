@@ -654,14 +654,30 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods)]
     fn post_admission_unknown_dispatch_stops_removal_after_the_pre_destroy_hook() {
+        assert_post_admission_mutation_stops_removal(LateCleanupMutation::UnknownDispatch);
+    }
+
+    #[test]
+    fn post_admission_malformed_registry_stops_removal_after_the_pre_destroy_hook() {
+        assert_post_admission_mutation_stops_removal(LateCleanupMutation::MalformedRegistry);
+    }
+
+    #[derive(Clone, Copy)]
+    enum LateCleanupMutation {
+        UnknownDispatch,
+        MalformedRegistry,
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    fn assert_post_admission_mutation_stops_removal(mutation: LateCleanupMutation) {
         let isolation = crate::merge_lifecycle::TestIsolation::new();
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().canonicalize().unwrap();
         let db_path = parent.join("private.db");
         let db = Db::open_at(&db_path).unwrap();
         let (root, wt) = fixture(&parent, "late-resource", &db, &isolation);
+        assert!(db.worktree_record(wt.to_str().unwrap()).unwrap().is_some());
         let before_queue = db.list_merge_queue().unwrap();
         let refs = || {
             let output = isolation
@@ -717,10 +733,19 @@ mod tests {
                     }
                     anyhow::ensure!(writer_started.exists(), "pre-destroy rendezvous did not start");
                     let writer_conn = rusqlite::Connection::open(&db_path)?;
-                    writer_conn.execute(
-                        "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private',?1,'private',0,'unknown-after-admission')",
-                        [writer_path],
-                    )?;
+                    let changed = match mutation {
+                        LateCleanupMutation::UnknownDispatch => writer_conn.execute(
+                            "INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status) VALUES('private',?1,'private',0,'unknown-after-admission')",
+                            [writer_path],
+                        )?,
+                        // Change only an unrelated decoder field AFTER the real
+                        // hook starts. Initial registry admission was valid.
+                        LateCleanupMutation::MalformedRegistry => writer_conn.execute(
+                            "UPDATE worktrees SET position='malformed-after-admission' WHERE worktree=?1",
+                            [writer_path],
+                        )?,
+                    };
+                    anyhow::ensure!(changed == 1, "private mutation did not reach its row");
                     Ok(())
                 }).unwrap();
             let report = sweep_with_db(&cfg, &root, true, &db);
@@ -733,19 +758,40 @@ mod tests {
         );
         assert!(report.collected.is_empty() && report.cleared_rows.is_empty());
         assert_eq!(report.kept.len(), 1);
-        assert!(
-            report.kept[0]
-                .1
-                .contains("runtime/session/dispatch ownership"),
-            "{report:?}"
-        );
+        match mutation {
+            LateCleanupMutation::UnknownDispatch => {
+                assert!(
+                    report.kept[0]
+                        .1
+                        .contains("runtime/session/dispatch ownership"),
+                    "{report:?}"
+                );
+                assert!(
+                    thegn_core::store::NotificationStore::has_cleanup_dispatch(
+                        &db,
+                        wt.to_str().unwrap()
+                    )
+                    .unwrap()
+                );
+            }
+            LateCleanupMutation::MalformedRegistry => {
+                let decode_error = db.worktree_record(wt.to_str().unwrap()).unwrap_err();
+                assert!(
+                    report.kept[0].1.contains(&decode_error.to_string()),
+                    "{report:?}"
+                );
+                assert!(
+                    !thegn_core::store::NotificationStore::has_cleanup_dispatch(
+                        &db,
+                        wt.to_str().unwrap()
+                    )
+                    .unwrap()
+                );
+            }
+        }
         assert_eq!(refs(), before_refs);
         assert_eq!(db.list_merge_queue().unwrap(), before_queue);
         assert_eq!(std::fs::read(wt.join("tracked")).unwrap(), b"keep\n");
-        assert!(
-            thegn_core::store::NotificationStore::has_cleanup_dispatch(&db, wt.to_str().unwrap())
-                .unwrap()
-        );
     }
 
     #[test]
