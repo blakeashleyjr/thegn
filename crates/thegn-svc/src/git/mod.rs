@@ -2081,9 +2081,9 @@ mod tests {
     }
 
     /// Run `git` in `dir`, panicking on failure (test setup helper).
-    /// `-c` overrides every fixture git call needs, because these helpers
-    /// deliberately inherit the developer's GLOBAL config (for
-    /// `init.defaultBranch`) and therefore inherit its tooling too.
+    /// `-c` overrides fixture git calls need when inherited global config
+    /// enables developer tooling. Fixtures set their required branch names
+    /// explicitly rather than relying on `init.defaultBranch`.
     ///
     /// - **Signing off.** A developer with `commit.gpgsign = true` otherwise
     ///   gets a *hang* on every commit: gpg waits on a pinentry a test runner
@@ -2116,9 +2116,8 @@ mod tests {
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         // `git -C dir` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed (see git_cmd
         // above) so the suite can't leak into the outer repo's shared config.
-        // NB: this helper intentionally inherits the user's GLOBAL git config
-        // (unlike git_cmd above) — these tests rely on init.defaultBranch=main
-        // when seeding bare remotes, so do NOT add GIT_CONFIG_GLOBAL=/dev/null.
+        // Global git config can still be inherited; fixture branch names and
+        // commit identities are explicit so neither requires developer setup.
         //
         // Because the global config IS inherited, signing must be turned off
         // explicitly: a developer with `commit.gpgsign = true` in ~/.gitconfig
@@ -2293,9 +2292,11 @@ mod tests {
 
     #[test]
     fn merge_state_detects_a_live_merge_and_clears_after_abort() {
-        let base = std::env::temp_dir().join(format!("tg-merge-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
-        std::fs::create_dir_all(&base).unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("tg-merge-")
+            .tempdir()
+            .unwrap();
+        let base = fixture.path().to_path_buf();
         git_in(&base, &["init", "-q", "-b", "main"]);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
         git_in(&base, &["add", "f.txt"]);
@@ -2313,10 +2314,22 @@ mod tests {
         // A conflicting merge leaves MERGE_HEAD behind (merge itself fails).
         // Via the scrubbed core `git_cmd` so an inherited GIT_DIR can't make
         // this hit the outer repo's shared config (the core.worktree bug).
-        let _ = thegn_core::util::git_cmd(&base) // best-effort: conflicting merge fails by design; state asserted below
+        let merge = thegn_core::util::git_cmd(&base)
             .args(GIT_FIXTURE_OVERRIDES)
             .args(["merge", "feat"])
-            .output();
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge.status.code(),
+            Some(1),
+            "expected a merge conflict, stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr),
+        );
         let st = CliGit.merge_state(&loc).unwrap().expect("merge detected");
         assert_eq!(st.kind, MergeKind::Merge);
         assert_eq!(st.kind.label(), "MERGING");
@@ -2327,7 +2340,6 @@ mod tests {
 
         git_in(&base, &["merge", "--abort"]);
         assert!(CliGit.merge_state(&loc).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -2444,15 +2456,24 @@ mod tests {
 
     #[test]
     fn ahead_behind_counts_divergence_and_is_none_without_upstream() {
-        let base = std::env::temp_dir().join(format!("tg-ab-{}-{:p}", std::process::id(), &0u8));
-        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
+        let fixture = tempfile::Builder::new().prefix("tg-ab-").tempdir().unwrap();
+        let base = fixture.path().to_path_buf();
         let remote = base.join("remote.git");
         let clone = base.join("clone");
-        std::fs::create_dir_all(&base).unwrap();
 
         // A bare "remote" with one commit, cloned locally so the clone's branch
         // has a tracking upstream.
-        git_in(&base, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git_in(
+            &base,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        );
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
         git_in(&seed, &["init", "-q", "-b", "main"]);
@@ -2501,8 +2522,6 @@ mod tests {
         let solo_loc = GitLoc::for_worktree(&solo);
         assert_eq!(gix.ahead_behind(&solo_loc).unwrap(), None);
         assert_eq!(cli.ahead_behind(&solo_loc).unwrap(), None);
-
-        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 }
 
