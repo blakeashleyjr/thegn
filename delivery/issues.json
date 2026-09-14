@@ -586,6 +586,13 @@
       "changes": [
         "repair-performance-evidence-and-log-tail"
       ]
+    },
+    {
+      "issue": "THE-628",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "stabilize-process-monitor-refresh"
+      ]
     }
   ]
 }

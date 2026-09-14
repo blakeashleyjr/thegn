@@ -908,6 +908,18 @@
       "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
     },
     {
+      "change": "stabilize-process-monitor-refresh",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-628",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Preserve process snapshots, deterministic row order and sampled selection identity across refreshes."
+    },
+    {
       "change": "verify-gate-workspace",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
