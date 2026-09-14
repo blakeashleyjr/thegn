@@ -5,16 +5,25 @@ mod unix {
     use super::super::*;
 
     fn fixture_tool(name: &str) -> PathBuf {
-        let discovered = thegn_core::util::which_path(name).unwrap_or_else(|| {
+        let discovered = PathBuf::from(thegn_core::util::which_path(name).unwrap_or_else(|| {
             panic!("required private fixture tool missing from initial PATH: {name}")
-        });
-        let absolute = std::fs::canonicalize(discovered).unwrap_or_else(|error| {
+        }));
+        let absolute = if discovered.is_absolute() {
+            discovered
+        } else {
+            std::env::current_dir()
+                .expect("private fixture discovery cwd must be available")
+                .join(discovered)
+        };
+        let resolved = std::fs::canonicalize(&absolute).unwrap_or_else(|error| {
             panic!("required fixture tool identity unavailable: {name}: {error}")
         });
         assert!(
-            absolute.is_absolute() && absolute.is_file(),
+            absolute.is_absolute() && resolved.is_file(),
             "fixture tool must resolve to an absolute regular file: {name}"
         );
+        // Preserve argv[0]'s lexical basename: Nix sleep may resolve to the
+        // multicall coreutils binary, whose behavior depends on that basename.
         absolute
     }
 
