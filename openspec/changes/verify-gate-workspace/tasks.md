@@ -23,3 +23,18 @@ production setters. Build took 4m18s; tests took 34.268s. Source9 hashes remaine
 unchanged through the run, and source ratchets passed. This Linux scoped result
 does not replace the full combined gate, native CLI proof or THE-606 history
 admission prerequisite. No live queue result is claimed.
+
+## Native acceptance — 2026-09-14
+
+The final compiled host fixtures passed all 26 gate-runner cases and the four
+previously environment-blocked gate-path cases in
+`/tmp/thegn-native-unblocked-host-results.json`, including concurrent distinct
+OIDs, replaced lock identity, foreign/symlink/special paths, checkout failure
+preservation, infrastructure classification and no speculative landing. The
+prior combined host receipt also records successful lock-open failure coverage.
+The target-inclusive private CLI regression passed all 106 commands against
+normal CLI source `1ef8228f`; its complete evidence is at
+`/tmp/thegn-integrate-native-tw5m0z40/evidence`. Independent acceptance review
+approved THE-597's repair scope. Native success on unsupported non-Unix gate
+backends, the full combined gate and THE-601's separate cancellation scope are
+not established by these Linux results.
