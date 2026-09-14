@@ -23,4 +23,4 @@ No live cleanup, runtime mutation, or successful delivery is claimed here.
 - [x] Obtain primary approval for private registry custody and a path-scoped explicit-teardown entry observer, all cfg(test).
 - [x] Add actual automatic-cleanup cases for projection, provider sync and both; retain exact queue/cache/refs/content and refuse before hooks.
 - [x] Add same-selection positive cleanup after registry release, custody unwind restoration, and worktree-selection change alongside workspace-selection coverage.
-- [ ] Run focused actual host tests and independent review; record exact results before closure.
+- [x] Run focused actual host tests (cleanup50/50 including both new runtime fixtures) and independent source review; exact results recorded in the dated THE-594 audit.
