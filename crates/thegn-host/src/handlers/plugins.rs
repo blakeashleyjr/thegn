@@ -410,16 +410,10 @@ pub(crate) fn drain(
             PluginMsg::Event { plugin, event } => match event {
                 SessionEvent::Message(m) => repaint |= apply_message(state, &plugin, m),
                 SessionEvent::Response(r) => {
-                    // Provider bridge replies resolve their waiting seam
-                    // call; anything else is a stray.
-                    let routed = state
-                        .plugins
-                        .get(&plugin)
-                        .and_then(|e| e.bridge.as_ref())
-                        .is_some_and(|b| b.resolve(r.clone()));
-                    if !routed {
-                        tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "response from plugin (no host request pending)");
-                    }
+                    // Provider replies are resolved by the owning session before
+                    // enqueueing host events. Never route an old session's id
+                    // against a replacement bridge with the same plugin name.
+                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "unroutable response from originating plugin session");
                 }
                 SessionEvent::Junk(line) => {
                     tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");

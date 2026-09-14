@@ -78,7 +78,15 @@ mod tests {
 
     fn fake_session() -> (thegn_svc::plugin::SessionWriter, ()) {
         // Spawn a trivial child purely to obtain a writer; close it at once.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let supervisor = thegn_svc::plugin::ResidentSupervisor::new(runtime.handle().clone());
         let s = thegn_svc::plugin::ResidentSession::spawn(
+            &supervisor,
+            "fixture",
             &["sh".into(), "-c".into(), "cat >/dev/null".into()],
             &Default::default(),
             None,
@@ -87,6 +95,13 @@ mod tests {
         .unwrap();
         let w = s.writer();
         s.kill();
+        assert!(
+            runtime
+                .block_on(supervisor.shutdown_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3)
+                ))
+                .is_settled()
+        );
         (w, ())
     }
 }

@@ -10,9 +10,9 @@ fn platform_cfgs_are_pinned() {
     file_ratchet(
         env!("CARGO_MANIFEST_DIR"),
         "platform-cfg-svc-ratchet.txt",
-        &[],
+        &["plugin/platform/"],
         |_, body| has_platform_cfg(body),
-        "Per-OS code in thegn-svc belongs in ipc.rs (the transport seam) or behind \
+        "Per-OS code in thegn-svc belongs in ipc.rs (the transport seam) or plugin/platform (owned resident lifecycle) or behind \
          a thegn-host platform function. Keep service logic platform-free.",
     );
 }

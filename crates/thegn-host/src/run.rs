@@ -1137,7 +1137,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         );
     }
 
+    let resident_supervisor =
+        thegn_svc::plugin::ResidentSupervisor::new(tokio::runtime::Handle::current());
     let result = event_loop(
+        resident_supervisor.clone(),
         &mut buf,
         session,
         seeded,
@@ -1178,6 +1181,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         host_cache_port,
     )
     .await;
+    // Outside the UI loop, including every early/error return. All sessions
+    // close together under one application deadline; reloads share this owner.
+    let resident_report = resident_supervisor
+        .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(3))
+        .await;
+    for (plugin, outcome) in &resident_report.outcomes {
+        tracing::debug!(target: "thegn::plugin", plugin = %plugin, ?outcome, "resident lifecycle receipt; descendant containment remains unproven");
+    }
+    let result = if resident_report.is_settled() {
+        result
+    } else {
+        tracing::error!(target: "thegn::plugin", ?resident_report, "application exiting with unresolved owned resident resources");
+        result.and(Err(anyhow::anyhow!(
+            "resident cleanup left unresolved owned resources"
+        )))
+    };
 
     {
         use std::io::Write as _;
@@ -5949,6 +5968,7 @@ use crate::media_ctl::{
 
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
+    resident_supervisor: thegn_svc::plugin::ResidentSupervisor,
     buf: &mut BufferedTerminal<T>,
     mut session: crate::session::Session,
     seeded: bool,
@@ -11300,6 +11320,7 @@ async fn event_loop<T: Terminal>(
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_default();
                     plugins_host = Some(crate::plugins::spawn_plugins_host(
+                        resident_supervisor.clone(),
                         current_config.plugins.clone(),
                         plugin_config_dir,
                         plugin_tx.clone(),
@@ -13472,6 +13493,7 @@ async fn event_loop<T: Terminal>(
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_default();
                     plugins_host = Some(crate::plugins::spawn_plugins_host(
+                        resident_supervisor.clone(),
                         current_config.plugins.clone(),
                         config_dir,
                         plugin_tx.clone(),

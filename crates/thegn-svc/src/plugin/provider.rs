@@ -20,14 +20,19 @@ use thegn_core::plugin_api::{
     PROVIDER_CALL_METHOD, RpcError, RpcErrorCode, RpcMessage, RpcResponse,
 };
 
-use super::session::SessionWriter;
+use super::session::{MAX_QUEUED_FRAMES, SessionFailure, SessionWriter};
 
 /// The correlation half: pending requests waiting for their `RpcResponse`.
 pub struct ProviderBridge {
     writer: SessionWriter,
     timeout: Duration,
     next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, mpsc::Sender<RpcResponse>>>,
+    pending: Mutex<Pending>,
+}
+
+struct Pending {
+    closed: Option<SessionFailure>,
+    calls: HashMap<u64, mpsc::Sender<Result<RpcResponse, SessionFailure>>>,
 }
 
 /// A failed bridge call, classified like any seam error.
@@ -58,15 +63,46 @@ impl BridgeError {
 
 impl ProviderBridge {
     pub fn new(writer: SessionWriter, timeout: Duration) -> Arc<Self> {
-        Arc::new(Self {
+        let bridge = Arc::new(Self {
             writer,
             timeout,
             // Provider request ids share the wire with host.call replies (the
             // plugin allocates its own request ids); start high so the two
             // streams cannot collide in logs.
             next_id: AtomicU64::new(1_000_000),
-            pending: Mutex::new(HashMap::new()),
-        })
+            pending: Mutex::new(Pending {
+                closed: None,
+                calls: HashMap::new(),
+            }),
+        });
+        let closing = Arc::downgrade(&bridge);
+        let routing = Arc::downgrade(&bridge);
+        if let Err(error) = bridge.writer.bind_provider(
+            Box::new(move |error| {
+                if let Some(bridge) = closing.upgrade() {
+                    bridge.close(error);
+                }
+            }),
+            Arc::new(move |response| {
+                routing
+                    .upgrade()
+                    .is_some_and(|bridge| bridge.resolve(response))
+            }),
+        ) {
+            bridge.close(error);
+        }
+        bridge
+    }
+
+    fn close(&self, error: SessionFailure) {
+        let pending = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.closed = Some(error);
+            std::mem::take(&mut pending.calls)
+        };
+        for (_, sender) in pending {
+            drop(sender.send(Err(error)));
+        }
     }
 
     /// Route a response from the session reader to its waiting call.
@@ -75,11 +111,11 @@ impl ProviderBridge {
     pub fn resolve(&self, resp: RpcResponse) -> bool {
         let tx = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&resp.id)
+            pending.calls.remove(&resp.id)
         };
         match tx {
             // best-effort: the caller may have timed out and gone.
-            Some(tx) => tx.send(resp).is_ok(),
+            Some(tx) => tx.send(Ok(resp)).is_ok(),
             None => false,
         }
     }
@@ -96,30 +132,38 @@ impl ProviderBridge {
         let (tx, rx) = mpsc::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.insert(id, tx);
+            if let Some(error) = pending.closed {
+                return Err(BridgeError::Transport(error.to_string()));
+            }
+            if self.writer.is_closed() {
+                return Err(BridgeError::Transport(SessionFailure::Closed.to_string()));
+            }
+            if pending.calls.len() >= MAX_QUEUED_FRAMES {
+                return Err(BridgeError::Transport(SessionFailure::Full.to_string()));
+            }
+            pending.calls.insert(id, tx);
         }
         let msg = RpcMessage {
             id: Some(id),
             method: PROVIDER_CALL_METHOD.to_string(),
             params: serde_json::json!({ "seam": seam, "op": op, "args": args }),
         };
-        let sent = self
-            .writer
-            .send_raw(&serde_json::to_string(&msg).unwrap_or_default());
+        let sent = self.writer.send_json(&msg);
         if let Err(e) = sent {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&id);
+            pending.calls.remove(&id);
             return Err(BridgeError::Transport(e.to_string()));
         }
         let out = rx.recv_timeout(self.timeout);
         // Timed out or hung up: forget the id so a late reply is dropped.
         if out.is_err() {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.remove(&id);
+            pending.calls.remove(&id);
         }
         match out {
-            Ok(RpcResponse { error: Some(e), .. }) => Err(BridgeError::Rpc(e)),
-            Ok(resp) => Ok(resp.result.unwrap_or(serde_json::Value::Null)),
+            Ok(Ok(RpcResponse { error: Some(e), .. })) => Err(BridgeError::Rpc(e)),
+            Ok(Ok(resp)) => Ok(resp.result.unwrap_or(serde_json::Value::Null)),
+            Ok(Err(error)) => Err(BridgeError::Transport(error.to_string())),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(BridgeError::Transport(format!(
                 "no reply to {seam}.{op} within {:?}",
                 self.timeout
@@ -294,6 +338,7 @@ impl IssueBackend for PluginIssueBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::session::tests::FixtureSupervisor;
     use crate::plugin::session::{ResidentSession, SessionEvent};
     use std::collections::BTreeMap;
 
@@ -318,25 +363,27 @@ while read -r line; do
 done
 "#;
 
-    fn live_bridge() -> (ResidentSession, Arc<ProviderBridge>) {
+    fn live_bridge() -> (FixtureSupervisor, ResidentSession, Arc<ProviderBridge>) {
         let bridge_slot: Arc<Mutex<Option<Arc<ProviderBridge>>>> = Arc::new(Mutex::new(None));
         let route = bridge_slot.clone();
-        let session = ResidentSession::spawn(&sh(FAKE), &BTreeMap::new(), None, move |ev| {
-            if let SessionEvent::Response(resp) = ev
-                && let Some(b) = route.lock().unwrap().as_ref()
-            {
-                b.resolve(resp);
-            }
-        })
-        .unwrap();
+        let fixture = FixtureSupervisor::new();
+        let session = fixture
+            .spawn(&sh(FAKE), &BTreeMap::new(), None, move |ev| {
+                if let SessionEvent::Response(resp) = ev
+                    && let Some(b) = route.lock().unwrap().as_ref()
+                {
+                    b.resolve(resp);
+                }
+            })
+            .unwrap();
         let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(10));
         *bridge_slot.lock().unwrap() = Some(bridge.clone());
-        (session, bridge)
+        (fixture, session, bridge)
     }
 
     #[test]
     fn issue_ops_round_trip_through_a_scripted_plugin() {
-        let (_session, bridge) = live_bridge();
+        let (_fixture, _session, bridge) = live_bridge();
         let backend = PluginIssueBackend::new(
             bridge.clone(),
             "demo",
@@ -374,7 +421,7 @@ done
 
     #[test]
     fn omitted_caps_refuse_optional_ops_without_a_bridge_round_trip() {
-        let (_session, bridge) = live_bridge();
+        let (_fixture, _session, bridge) = live_bridge();
         let backend = PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default());
         let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -395,13 +442,15 @@ done
     #[test]
     fn timeout_and_dead_session_degrade_to_errors() {
         // A plugin that never answers: the call times out.
-        let session = ResidentSession::spawn(
-            &sh("while read -r _; do :; done"),
-            &BTreeMap::new(),
-            None,
-            |_| {},
-        )
-        .unwrap();
+        let fixture = FixtureSupervisor::new();
+        let session = fixture
+            .spawn(
+                &sh("while read -r _; do :; done"),
+                &BTreeMap::new(),
+                None,
+                |_| {},
+            )
+            .unwrap();
         let bridge = ProviderBridge::new(session.writer(), Duration::from_millis(200));
         let err = bridge
             .call("issues", "list_issues", serde_json::json!({}))
@@ -418,7 +467,83 @@ done
 
     #[test]
     fn late_and_unknown_responses_are_reported_unroutable() {
-        let (_session, bridge) = live_bridge();
+        let (_fixture, _session, bridge) = live_bridge();
         assert!(!bridge.resolve(RpcResponse::ok(424242, serde_json::Value::Null)));
+    }
+    #[test]
+    fn resident_final_reply_before_exit_is_delivered_and_late_call_is_closed() {
+        let fixture = FixtureSupervisor::new();
+        let session = fixture
+            .spawn(
+                &sh(r#"read -r _; echo '{"id":1000000,"result":{"final":true}}'"#),
+                &BTreeMap::new(),
+                None,
+                |_| {},
+            )
+            .unwrap();
+        let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(10));
+        assert_eq!(
+            bridge
+                .call("fixture", "last", serde_json::Value::Null)
+                .unwrap(),
+            serde_json::json!({"final":true})
+        );
+        let report = fixture.shutdown();
+        assert!(report.is_settled(), "{report:?}");
+        let start = std::time::Instant::now();
+        assert!(
+            bridge
+                .call("fixture", "late", serde_json::Value::Null)
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn resident_eof_fails_pending_calls_without_waiting_for_rpc_deadline() {
+        let fixture = FixtureSupervisor::new();
+        let session = fixture
+            .spawn(
+                &sh("read -r _; exec 1>&-; sleep 30"),
+                &BTreeMap::new(),
+                None,
+                |_| {},
+            )
+            .unwrap();
+        let bridge = ProviderBridge::new(session.writer(), Duration::from_secs(30));
+        let start = std::time::Instant::now();
+        assert!(
+            bridge
+                .call("fixture", "eof", serde_json::Value::Null)
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(bridge.pending.lock().unwrap().calls.is_empty());
+    }
+    #[test]
+    fn resident_old_session_cannot_route_into_replacement_bridge() {
+        let old = super::super::session::admission::Shared::new();
+        let old_writer = SessionWriter(old.clone());
+        let old_bridge = ProviderBridge::new(old_writer, Duration::from_secs(1));
+        drop(old_bridge);
+        let replacement = super::super::session::admission::Shared::new();
+        let new_bridge =
+            ProviderBridge::new(SessionWriter(replacement.clone()), Duration::from_secs(1));
+        let (sender, receiver) = mpsc::channel();
+        new_bridge
+            .pending
+            .lock()
+            .unwrap()
+            .calls
+            .insert(1_000_000, sender);
+        assert!(!old.route_response(&RpcResponse::ok(1_000_000, serde_json::json!("stale"))));
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            replacement.route_response(&RpcResponse::ok(1_000_000, serde_json::json!("current")))
+        );
+        assert_eq!(
+            receiver.recv().unwrap().unwrap().result,
+            Some(serde_json::json!("current"))
+        );
     }
 }
