@@ -401,7 +401,9 @@
     {
       "issue": "THE-588",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["safe-merged-worktree-cleanup"]
+      "changes": [
+        "safe-merged-worktree-cleanup"
+      ]
     },
     {
       "issue": "THE-589",
@@ -420,47 +422,65 @@
     {
       "issue": "THE-593",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["safe-merged-worktree-cleanup"]
+      "changes": [
+        "safe-merged-worktree-cleanup"
+      ]
     },
     {
       "issue": "THE-594",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["safe-merged-worktree-cleanup"]
+      "changes": [
+        "safe-merged-worktree-cleanup"
+      ]
     },
     {
       "issue": "THE-595",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["select-before-snapshot"]
+      "changes": [
+        "select-before-snapshot"
+      ]
     },
     {
       "issue": "THE-596",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["safe-merged-worktree-cleanup"]
+      "changes": [
+        "safe-merged-worktree-cleanup"
+      ]
     },
     {
       "issue": "THE-597",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["verify-gate-workspace"]
+      "changes": [
+        "verify-gate-workspace"
+      ]
     },
     {
       "issue": "THE-600",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["safe-merged-worktree-cleanup"]
+      "changes": [
+        "safe-merged-worktree-cleanup"
+      ]
     },
     {
       "issue": "THE-606",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["require-canonical-merge-history"]
+      "changes": [
+        "require-canonical-merge-history"
+      ]
     },
     {
       "issue": "THE-608",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["preserve-merge-drain-diagnostics"]
+      "changes": [
+        "preserve-merge-drain-diagnostics"
+      ]
     },
     {
       "issue": "THE-610",
       "project": "Runtime Security & Host Architecture",
-      "changes": ["preserve-merge-drain-diagnostics"]
+      "changes": [
+        "preserve-merge-drain-diagnostics"
+      ]
     }
   ]
 }
