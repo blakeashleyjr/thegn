@@ -392,6 +392,20 @@
       ]
     },
     {
+      "issue": "THE-483",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "bound-duration-and-refresh-policy"
+      ]
+    },
+    {
+      "issue": "THE-484",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "bound-duration-and-refresh-policy"
+      ]
+    },
+    {
       "issue": "THE-559",
       "project": "Workspace Product & Observability",
       "changes": [
