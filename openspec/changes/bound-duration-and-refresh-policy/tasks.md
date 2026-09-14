@@ -8,7 +8,8 @@
 - [x] Replace shared cadence conversion and add unwind-only worker failure notification.
 - [x] Run first focused core gate: 28 tests pass; primitive debug/optimized and worker-failure harnesses pass.
 - [x] Complete independent model/PR scheduler regression; nine actual-source cadence/schedule/panic fixtures pass in debug and optimized builds.
-- [ ] Run updated config hot-path parity/cache tests, measure full-load overhead, and complete primary/adversarial review of THE-483.
+- [x] Run updated core32 and existing config293 tests, and measure full-load overhead (+0.21% median, within noise).
+- [ ] Complete final primary/adversarial approval and combined host checks for THE-483.
 - [ ] Replace remaining signed duration/epoch policy casts and classify all remaining casts.
 - [ ] Implement and test visible fail-closed provider time quarantine and any trustworthy generation-bound fallback.
 - [ ] Verify daemon lease, MCP breaker, model budget, usage reset, and reaper action-count boundaries.

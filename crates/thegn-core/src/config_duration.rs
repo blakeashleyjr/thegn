@@ -67,83 +67,91 @@ pub(crate) fn validate_override(key: &str, value: &serde_json::Value) -> Result<
 
 /// Environment DTO duration checks are direct arithmetic. The usual hydration
 /// load adds no Config clone, JSON serialization, or schema walk for this layer.
-pub(crate) fn errors_for_env_overlay(overlay: &crate::config::ConfigOverlay) -> Vec<String> {
+pub(crate) fn retain_valid_env_durations(
+    overlay: &mut crate::config::ConfigOverlay,
+) -> Vec<String> {
     let mut errors = Vec::new();
-    if let Some(value) = overlay.pr_ttl_secs
-        && u128::from(value) > u128::from(crate::time_policy::MAX_DURATION_SECS)
-    {
-        errors.push(format!(
-            "environment.pr_ttl_secs: duration exceeds supported range (got {value})"
-        ));
+    macro_rules! integer {
+        ($field:expr, $name:literal, $max:expr) => {
+            if let Some(value) = $field
+                && u128::from(value) > u128::from($max)
+            {
+                errors.push(format!(
+                    "environment.{}: duration exceeds supported range (got {value}); override ignored",
+                    $name
+                ));
+                $field = None;
+            }
+        };
     }
-    if let Some(value) = overlay.watch_pr_interval_secs
-        && u128::from(value) > u128::from(crate::time_policy::MAX_CADENCE_SECS)
-    {
-        errors.push(format!(
-            "environment.watch_pr_interval_secs: duration exceeds supported range (got {value})"
-        ));
+    macro_rules! floating {
+        ($field:expr, $name:literal, $max:expr) => {
+            if let Some(value) = $field
+                && (!value.is_finite() || value < 0.0 || value > $max as f64)
+            {
+                errors.push(format!(
+                    "environment.{}: duration exceeds supported range (got {value}); override ignored",
+                    $name
+                ));
+                $field = None;
+            }
+        };
     }
-    if let Some(value) = overlay.metrics_interval_secs
-        && (!value.is_finite()
-            || value < 0.0
-            || value > crate::time_policy::MAX_CADENCE_SECS as f64)
-    {
-        errors.push(format!(
-            "environment.metrics_interval_secs: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.metrics_timeout_ms
-        && u128::from(value) > u128::from(crate::time_policy::MAX_DURATION_MILLIS)
-    {
-        errors.push(format!(
-            "environment.metrics_timeout_ms: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.activity_runaway_secs
-        && (!value.is_finite()
-            || value < 0.0
-            || value > crate::time_policy::MAX_DURATION_SECS as f64)
-    {
-        errors.push(format!(
-            "environment.activity_runaway_secs: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.disk_scan_interval_secs
-        && u128::from(value) > u128::from(crate::time_policy::MAX_CADENCE_SECS)
-    {
-        errors.push(format!(
-            "environment.disk_scan_interval_secs: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.disk_idle_clean_days
-        && u128::from(value) > u128::from(crate::time_policy::MAX_DURATION_DAYS)
-    {
-        errors.push(format!(
-            "environment.disk_idle_clean_days: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.loc_scan_interval_secs
-        && u128::from(value) > u128::from(crate::time_policy::MAX_CADENCE_SECS)
-    {
-        errors.push(format!(
-            "environment.loc_scan_interval_secs: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.loc_watch_invalidate_secs
-        && u128::from(value) > u128::from(crate::time_policy::MAX_DURATION_SECS)
-    {
-        errors.push(format!(
-            "environment.loc_watch_invalidate_secs: duration exceeds supported range (got {value})"
-        ));
-    }
-    if let Some(value) = overlay.preview.fetch_timeout_ms
-        && u128::from(value) > u128::from(crate::time_policy::MAX_DURATION_MILLIS)
-    {
-        errors.push(format!(
-            "environment.preview.fetch_timeout_ms: duration exceeds supported range (got {value})"
-        ));
-    }
+    use crate::time_policy::{
+        MAX_CADENCE_SECS, MAX_DURATION_DAYS, MAX_DURATION_MILLIS, MAX_DURATION_SECS,
+    };
+    integer!(overlay.pr_ttl_secs, "pr_ttl_secs", MAX_DURATION_SECS);
+    integer!(
+        overlay.watch_pr_interval_secs,
+        "watch_pr_interval_secs",
+        MAX_CADENCE_SECS
+    );
+    floating!(
+        overlay.metrics_interval_secs,
+        "metrics_interval_secs",
+        MAX_CADENCE_SECS
+    );
+    integer!(
+        overlay.metrics_timeout_ms,
+        "metrics_timeout_ms",
+        MAX_DURATION_MILLIS
+    );
+    floating!(
+        overlay.activity_runaway_secs,
+        "activity_runaway_secs",
+        MAX_DURATION_SECS
+    );
+    integer!(
+        overlay.disk_scan_interval_secs,
+        "disk_scan_interval_secs",
+        MAX_CADENCE_SECS
+    );
+    integer!(
+        overlay.disk_idle_clean_days,
+        "disk_idle_clean_days",
+        MAX_DURATION_DAYS
+    );
+    integer!(
+        overlay.loc_scan_interval_secs,
+        "loc_scan_interval_secs",
+        MAX_CADENCE_SECS
+    );
+    integer!(
+        overlay.loc_watch_invalidate_secs,
+        "loc_watch_invalidate_secs",
+        MAX_DURATION_SECS
+    );
+    integer!(
+        overlay.preview.fetch_timeout_ms,
+        "preview.fetch_timeout_ms",
+        MAX_DURATION_MILLIS
+    );
     errors
+}
+
+#[cfg(test)]
+fn errors_for_env_overlay(overlay: &crate::config::ConfigOverlay) -> Vec<String> {
+    retain_valid_env_durations(&mut overlay.clone())
 }
 
 /// Strict raw-document boundary, used before any config write becomes visible.
@@ -206,6 +214,18 @@ pub(crate) fn check_number(
     }
 }
 
+// These are the two serde field aliases on numeric durations. Keep raw strict
+// admission aligned without deserializing a whole permissive Config (which
+// could fail for an unrelated legacy setting). Diagnostic paths retain input
+// spelling; canonical schema and runtime serialization use underscores.
+fn duration_property_key<'a>(path: &str, key: &'a str) -> &'a str {
+    match (path, key) {
+        ("metrics", "interval-secs") => "interval_secs",
+        ("metrics", "timeout-ms") => "timeout_ms",
+        _ => key,
+    }
+}
+
 fn walk_schema(
     schema: &Schema,
     root: &RootSchema,
@@ -253,7 +273,7 @@ fn walk(
                 for (key, child) in fields {
                     if let Some(property) = schema
                         .properties
-                        .get(key)
+                        .get(duration_property_key(path, key))
                         .or(schema.additional_properties.as_deref())
                     {
                         let next = if path.is_empty() {
@@ -284,6 +304,34 @@ mod tests {
     use super::*;
     use crate::config::{Config, MapEnv};
     use crate::time_policy::{MAX_CADENCE_SECS, MAX_DURATION_SECS};
+
+    #[test]
+    fn strict_duration_aliases_cannot_bypass_numeric_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let original = "[sandbox]\nisolation_floor='shared-kernel'\n";
+        std::fs::write(&path, original).unwrap();
+        for (alias, max) in [
+            ("interval-secs", MAX_CADENCE_SECS),
+            ("timeout-ms", crate::time_policy::MAX_DURATION_MILLIS),
+        ] {
+            let good = format!("[metrics]\n{alias}={max}\n");
+            let bad = format!("[metrics]\n{alias}={}\n", max + 1);
+            assert!(errors_for_str(&good).is_empty());
+            assert!(!errors_for_str(&bad).is_empty());
+            assert!(
+                crate::config_write::set_key(
+                    &path,
+                    &format!("metrics.{alias}"),
+                    &(max + 1).to_string()
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            let mut cfg = Config::default();
+            assert!(Config::apply_toml_overlay(&mut cfg, &bad).is_err());
+        }
+    }
 
     #[test]
     fn cached_base_diagnostics_follow_source_changes() {
@@ -485,6 +533,28 @@ mod tests {
             cfg.sandbox.isolation_floor,
             crate::config::IsolationFloor::SharedKernel
         );
+    }
+
+    #[test]
+    fn invalid_env_duration_retains_valid_explicit_security_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[pr]\nttl_secs=33\n").unwrap();
+        let env = MapEnv(std::collections::BTreeMap::from([
+            ("THEGN_PR_TTL".into(), u64::MAX.to_string()),
+            (
+                "THEGN_SANDBOX_ISOLATION_FLOOR".into(),
+                "shared-kernel".into(),
+            ),
+            ("THEGN_SANDBOX_NETWORK".into(), "none".into()),
+        ]));
+        let cfg = Config::load_layered(&env, &[], Some(path));
+        assert_eq!(cfg.pr.ttl_secs, 33);
+        assert_eq!(
+            cfg.sandbox.isolation_floor,
+            crate::config::IsolationFloor::SharedKernel
+        );
+        assert_eq!(cfg.sandbox.network, crate::config::Network::None);
     }
 
     #[test]
