@@ -195,7 +195,10 @@ pub fn backoff_ramp(cfg: BackoffConfig, consecutive_failures: u32) -> Duration {
             break;
         }
     }
-    Duration::from_nanos(nanos as u64)
+    if !nanos.is_finite() || nanos < 0.0 {
+        return cfg.ceiling;
+    }
+    duration_from_nanos_wide((nanos as u128).min(cfg.ceiling.as_nanos()))
 }
 
 /// Applies Go-style symmetric jitter to a backoff: jitter spans
@@ -203,7 +206,7 @@ pub fn backoff_ramp(cfg: BackoffConfig, consecutive_failures: u32) -> Duration {
 /// (so a 30s backoff at factor 0.2 spreads by up to ±6s), never dropping below
 /// 1s. A `factor` of 0 is a no-op.
 fn apply_jitter(backoff: Duration, factor: f64, jitter_ns: i64) -> Duration {
-    if factor <= 0.0 {
+    if !factor.is_finite() || factor <= 0.0 {
         return backoff;
     }
     // `jitter_max` is in NANOSECONDS — everything below (`j`, `backoff.as_nanos`,
@@ -211,27 +214,55 @@ fn apply_jitter(backoff: Duration, factor: f64, jitter_ns: i64) -> Duration {
     // `time.Duration(backoff.Seconds()*factor) * time.Second` is likewise a
     // nanosecond count. Computing it in seconds made jitter a ±few-nanosecond
     // no-op on multi-second backoffs, defeating anti-stampede spreading.
-    let jitter_max = (backoff.as_secs_f64() * factor * 1e9) as i64;
+    let jitter_max = (backoff.as_nanos() as f64 * factor.min(1.0)) as i128;
     if jitter_max <= 0 {
         return backoff;
     }
     let span = jitter_max * 2;
-    let j = jitter_ns.rem_euclid(span) - jitter_max;
-    let nanos = (backoff.as_nanos() as i64 + j).max(SECOND.as_nanos() as i64);
-    Duration::from_nanos(nanos as u64)
+    let j = i128::from(jitter_ns).rem_euclid(span) - jitter_max;
+    // Duration::MAX nanoseconds fits i128; jitter is capped to the documented
+    // 0..1 factor, so the symmetric span and addition also fit.
+    let nanos = (backoff.as_nanos() as i128 + j).max(SECOND.as_nanos() as i128);
+    duration_from_nanos_wide(nanos as u128)
+}
+
+fn duration_from_nanos_wide(nanos: u128) -> Duration {
+    let nanos = nanos.min(Duration::MAX.as_nanos());
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
 }
 
 fn wall_clock_jitter_ns() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
+        .map(|d| (d.as_nanos() % (i64::MAX as u128 + 1)) as i64)
         .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_backoff_jitter_never_wraps_or_panics() {
+        for duration in [Duration::from_secs(10 * 365 * 86400), Duration::MAX] {
+            for jitter in [i64::MIN, -1, 0, i64::MAX] {
+                let got = apply_jitter(duration, 1.0, jitter);
+                assert!(got >= SECOND);
+                assert!(got <= Duration::MAX);
+            }
+            let cfg = BackoffConfig {
+                initial: duration,
+                multiplier: 2.0,
+                ceiling: duration,
+                jitter: 0.2,
+            };
+            assert!(backoff_from_config_jittered(cfg, 1, 0) >= SECOND);
+        }
+    }
 
     #[test]
     fn classify_from_reason_string() {

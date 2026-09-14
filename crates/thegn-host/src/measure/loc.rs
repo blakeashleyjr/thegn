@@ -115,7 +115,7 @@ fn expire_watched(targets: &mut [thegn_core::scan_sched::ScanTarget], now: i64, 
     }
     for t in targets.iter_mut().filter(|t| t.active) {
         if t.measured_at
-            .is_some_and(|at| now.saturating_sub(at) >= window_secs as i64)
+            .is_some_and(|at| !thegn_core::time_policy::is_fresh(now, Some(at), window_secs))
         {
             t.measured_at = None;
         }

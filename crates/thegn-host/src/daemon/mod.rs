@@ -53,7 +53,7 @@ const HEARTBEAT_SECS: u64 = 15;
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0)
 }
 
@@ -331,7 +331,7 @@ async fn run(
         )),
         events: events.clone(),
         db: db.clone(),
-        grace_ms: (cfg.daemon.lease_grace_secs as i64).saturating_mul(1000),
+        grace_ms: thegn_core::time_policy::duration_millis(cfg.daemon.lease_grace_secs),
         idle_tx,
         shutdown: shutdown.clone(),
         config: std::sync::Arc::new(cfg.clone()),
@@ -492,7 +492,7 @@ async fn run(
                 thegn_core::control::ScopeSet::parse("read"),
                 "serve startup",
                 None,
-                Some(now + 15 * 60_000),
+                Some(now.saturating_add(15 * 60_000)),
                 now,
             );
             {

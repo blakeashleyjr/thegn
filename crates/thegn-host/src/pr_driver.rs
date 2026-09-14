@@ -141,7 +141,7 @@ fn record_failure(key: &str, now: i64, poll_secs: u64) -> u64 {
     let e = m.entry(key.to_string()).or_insert((0, 0));
     e.0 = e.0.saturating_add(1);
     let wait = crate::ci_refresh::backoff_secs(e.0, poll_secs);
-    e.1 = now + wait as i64;
+    e.1 = thegn_core::time_policy::deadline_seconds(now, wait).unwrap_or(i64::MAX);
     wait
 }
 

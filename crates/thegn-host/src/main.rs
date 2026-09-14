@@ -197,6 +197,7 @@ mod pty_drain;
 mod push_notify;
 mod queries;
 mod rasterize;
+mod reaper_policy;
 mod recorder;
 mod refresh_schedule;
 mod remote_enqueue_auth;

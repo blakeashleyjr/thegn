@@ -436,7 +436,7 @@ impl Config {
             probe_ttl_secs: if hc.probe_ttl_secs == 0 {
                 DEFAULT_PROBE_TTL_SECS
             } else {
-                hc.probe_ttl_secs as i64
+                crate::time_policy::saturating_i64(u128::from(hc.probe_ttl_secs))
             },
             declared_spec: parse_capacity(name, &hc.capacity),
         })

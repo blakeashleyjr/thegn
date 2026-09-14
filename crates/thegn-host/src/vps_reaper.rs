@@ -25,8 +25,8 @@ use thegn_svc::vps::{self, registry};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(300);
 /// Mirrors the warm-pool stale-provisioning threshold (`reconcile_pool`).
-const ORPHAN_AGE_SECS: i64 = 20 * 60;
-const CREATING_STALE_SECS: i64 = 10 * 60;
+const ORPHAN_AGE_SECS: u64 = 20 * 60;
+const CREATING_STALE_SECS: u64 = 10 * 60;
 
 /// Throttled entry: schedule one reconcile pass when due. Cheap when not due
 /// or when no VPS env is configured; network work runs on its own thread.
@@ -55,116 +55,126 @@ pub fn tick(cfg: &Config) {
     std::thread::spawn(move || reap(&envs));
 }
 
-/// One reconcile pass over the configured VPS envs. Envs sharing an account
-/// (same kind + api base) are deduped so the account is listed once.
+/// Reconcile each provider kind only when its environment account references
+/// and lifetime policy agree. The ledger cannot resolve which env minted it.
 fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
-    let ours = vps::host_label();
-    let mut seen_accounts: Vec<String> = Vec::new();
-    // Names of every instance seen live across ALL accounts this pass. The
-    // ledger `ready`-drop must run against this UNION, not one account's list:
-    // a `VpsRecord` carries no api_base, so a `ready` record minted by a SECOND
-    // account of the same provider kind is absent from any OTHER account's list
-    // and would otherwise be dropped while its VPS is still live/billing.
-    let mut live_anywhere: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Provider kinds for which EVERY account listed cleanly this pass. Only
-    // these are eligible for `ready`-record cleanup: if any account of a kind
-    // failed to list (token gone / API error), we can't tell a genuinely-gone
-    // record from one whose live instance we simply couldn't see, so we leave
-    // that kind's records alone until a clean pass.
-    let mut listed_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut failed_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (env_name, pc) in envs {
-        let kind = pc.provider.trim().to_string();
-        let account = format!("{}|{}", kind, pc.api_base.trim());
-        if seen_accounts.contains(&account) {
-            continue;
-        }
-        seen_accounts.push(account);
-        // Token unset ⇒ nothing reachable to reap (and nothing could have been
-        // created); skip quietly, same as the launch path.
-        let Some(probe) = crate::provider_factory::vps_provider_for(pc, "reaper-probe") else {
-            failed_kinds.insert(kind.clone());
-            continue;
-        };
-        let instances = match crate::agent::block_on_provider(|| async {
-            probe.list_detailed().await
-        }) {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::debug!(target: "thegn::lifecycle", error = %e, "vps reap: list failed");
-                failed_kinds.insert(kind.clone());
-                continue;
-            }
-        };
-        listed_kinds.insert(kind.clone());
-        let records = registry::list();
-        let now = thegn_core::util::now();
-
-        for inst in instances
-            .iter()
-            .filter(|i| i.labels.get("tg-host").map(String::as_str) == Some(ours.as_str()))
-        {
-            live_anywhere.insert(inst.name.clone());
-            let record = records.iter().find(|r| r.name == inst.name);
-            let age = inst.created.map(|c| now - c).unwrap_or(0);
-            let over_lifetime = pc.max_lifetime_secs > 0 && age >= pc.max_lifetime_secs as i64;
-            let orphaned = record.is_none() && age >= ORPHAN_AGE_SECS;
-            if !(orphaned || over_lifetime) {
-                continue;
-            }
-            let why = if orphaned {
-                "not in the local ledger (crashed create?)"
-            } else {
-                "past max_lifetime_secs"
-            };
+    let kinds: std::collections::BTreeSet<&str> =
+        envs.iter().map(|(_, pc)| pc.provider.trim()).collect();
+    for kind in kinds {
+        if let Err(reason) = crate::reaper_policy::with_unambiguous(
+            envs.iter()
+                .filter(|(_, pc)| pc.provider.trim() == kind)
+                .map(|(_, pc)| pc),
+            reap_unambiguous,
+        ) {
             thegn_core::msg::warn(&format!(
-                "vps reaper: destroying {} ({why}, age {}m) — a VPS bills until destroyed",
-                inst.name,
-                age / 60
+                "vps reaper: quarantined {kind}: {reason}; no provider or ledger actions attempted"
             ));
-            if let Some(p) = crate::provider_factory::vps_provider_for(pc, &inst.name) {
-                if let Err(error) =
-                    crate::remote_enqueue_auth::revoke_for_sandbox(pc, &inst.name, None)
-                {
-                    thegn_core::msg::warn(&format!(
-                        "vps reaper: refusing to destroy {} because route-to-host credential revocation failed: {error:#}",
-                        inst.name
-                    ));
-                    continue;
-                }
-                use thegn_svc::provider::RemoteProvider;
-                match crate::agent::block_on_provider(|| async { p.destroy(&inst.name).await }) {
-                    // destroy() clears the ledger + known_hosts; also drop any
-                    // pool row so the warm pool refills. best-effort: the DB is
-                    // a cache and the next reconcile re-observes.
-                    Ok(()) => {
-                        live_anywhere.remove(&inst.name);
-                        if let Ok(db) = thegn_core::db::Db::open() {
-                            let _ = db.delete_pool_spare(&inst.name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-                        }
+        }
+    }
+}
+
+fn reap_unambiguous(pc: &thegn_core::config::EnvProviderConfig) {
+    let ours = vps::host_label();
+    let kind = pc.provider.trim();
+    // The outer gate permits exactly one account/policy per provider kind.
+    // Failed or unavailable inventory must preserve all ownership records.
+    let Some(probe) = crate::provider_factory::vps_provider_for(pc, "reaper-probe") else {
+        return;
+    };
+    let instances = match crate::agent::block_on_provider(|| async { probe.list_detailed().await })
+    {
+        Ok(list) => list,
+        Err(error) => {
+            tracing::debug!(target: "thegn::lifecycle", %error, "vps reap: list failed");
+            return;
+        }
+    };
+    let records = registry::list();
+    let now = thegn_core::util::now();
+    let mut live_anywhere = std::collections::HashSet::new();
+    for inst in instances
+        .iter()
+        .filter(|i| i.labels.get("tg-host").map(String::as_str) == Some(ours.as_str()))
+    {
+        live_anywhere.insert(inst.name.clone());
+        let record = records.iter().find(|r| r.name == inst.name);
+        if record.is_some_and(|record| !recorded_identity_matches(record, kind, &inst.id)) {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: quarantined {}: inventory identity differs from the ledger; reconcile ownership; no deletion attempted",
+                inst.name
+            ));
+            continue;
+        }
+        let decision = thegn_core::time_policy::resource_expiry(
+            now,
+            inst.created,
+            pc.max_lifetime_secs,
+            record.is_none().then_some(ORPHAN_AGE_SECS),
+        );
+        if !admit_reap(decision, |reason| {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: quarantined {}: {reason}; no deletion attempted; next pass will retry",
+                inst.name
+            ));
+        }) {
+            continue;
+        }
+        thegn_core::msg::warn(&format!(
+            "vps reaper: destroying {} (verified provider age exceeds lifetime/orphan policy)",
+            inst.name
+        ));
+        if let Some(p) = crate::provider_factory::vps_provider_for(pc, &inst.name) {
+            if let Err(error) = crate::remote_enqueue_auth::revoke_for_sandbox(pc, &inst.name, None)
+            {
+                thegn_core::msg::warn(&format!(
+                    "vps reaper: refusing to destroy {} because route-to-host credential revocation failed: {error:#}",
+                    inst.name
+                ));
+                continue;
+            }
+            use thegn_svc::provider::RemoteProvider;
+            match crate::agent::block_on_provider(|| async { p.destroy(&inst.name).await }) {
+                // destroy() clears the ledger + known_hosts; also drop any
+                // pool row so the warm pool refills. best-effort: the DB is
+                // a cache and the next reconcile re-observes.
+                Ok(()) => {
+                    live_anywhere.remove(&inst.name);
+                    if let Ok(db) = thegn_core::db::Db::open() {
+                        let _ = db.delete_pool_spare(&inst.name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     }
-                    Err(e) => thegn_core::msg::warn(&format!(
-                        "vps reaper: destroy {} failed: {e}; will retry next pass",
-                        inst.name
-                    )),
                 }
+                Err(e) => thegn_core::msg::warn(&format!(
+                    "vps reaper: destroy {} failed: {e}; will retry next pass",
+                    inst.name
+                )),
             }
         }
-        let _ = env_name; // env identity only matters for per-env lifetime caps above
     }
-
-    // Ledger cleanup runs ONCE, after every account is listed, against the
-    // union of live names — so a record whose live instance lives under a
-    // sibling account (same kind, different api_base) is never dropped. Only
-    // kinds where every account listed cleanly are eligible.
-    for k in &failed_kinds {
-        listed_kinds.remove(k);
-    }
-    let records: Vec<registry::VpsRecord> = registry::list()
-        .into_iter()
-        .filter(|r| listed_kinds.contains(&r.provider))
-        .collect();
+    // Only this successfully reconciled kind can retire absent ledger rows.
+    let records: Vec<_> = records.into_iter().filter(|r| r.provider == kind).collect();
     cleanup_ledger(&records, &live_anywhere);
+}
+
+/// A staged intent is not an observed provider identity. It may participate in
+/// no-live-instance cleanup, but cannot authorize deletion of a named resource.
+fn recorded_identity_matches(record: &registry::VpsRecord, kind: &str, id: &str) -> bool {
+    record.provider == kind && !record.instance_id.is_empty() && record.instance_id == id
+}
+
+/// The sole time-policy admission gate before any VPS lifecycle action.
+fn admit_reap(
+    decision: thegn_core::time_policy::ResourceExpiry,
+    report: impl FnOnce(&str),
+) -> bool {
+    match decision {
+        thegn_core::time_policy::ResourceExpiry::Expired => true,
+        thegn_core::time_policy::ResourceExpiry::Keep => false,
+        thegn_core::time_policy::ResourceExpiry::Quarantine(reason) => {
+            report(reason);
+            false
+        }
+    }
 }
 
 /// Pure decision: should this ledger record be dropped, given the union of
@@ -179,7 +189,9 @@ fn should_drop_record(
     if live.contains(&rec.name) {
         return false;
     }
-    let stale_creating = rec.state == "creating" && now - rec.created_at >= CREATING_STALE_SECS;
+    let stale_creating = rec.state == "creating"
+        && thegn_core::time_policy::age_seconds(now, rec.created_at)
+            .is_some_and(|age| age >= CREATING_STALE_SECS);
     let gone_ready = rec.state == "ready";
     stale_creating || gone_ready
 }
@@ -190,6 +202,14 @@ fn should_drop_record(
 fn cleanup_ledger(records: &[registry::VpsRecord], live: &std::collections::HashSet<String>) {
     let now = thegn_core::util::now();
     for rec in records {
+        if rec.state == "creating"
+            && thegn_core::time_policy::age_seconds(now, rec.created_at).is_none()
+        {
+            thegn_core::msg::warn(&format!(
+                "vps reaper: quarantined ledger {}: invalid/future intent time; reconcile inventory; record retained",
+                rec.name
+            ));
+        }
         if !should_drop_record(rec, live, now) {
             continue;
         }
@@ -209,6 +229,47 @@ fn cleanup_ledger(records: &[registry::VpsRecord], live: &std::collections::Hash
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_or_mismatched_record_never_admits_resource_deletion() {
+        let mut record = rec("sandbox", "creating", 1);
+        for (provider, id) in [
+            ("hetzner", ""),
+            ("hetzner", "other"),
+            ("digitalocean", "id"),
+        ] {
+            record.provider = provider.into();
+            record.instance_id = id.into();
+            let mut deletes = 0;
+            if recorded_identity_matches(&record, "hetzner", "id") {
+                deletes += 1;
+            }
+            assert_eq!(deletes, 0);
+        }
+        record.provider = "hetzner".into();
+        record.instance_id = "id".into();
+        assert!(recorded_identity_matches(&record, "hetzner", "id"));
+    }
+
+    #[test]
+    fn unknown_or_hostile_time_is_observable_and_never_admitted() {
+        for (created, lifetime) in [
+            (None, 60),
+            (Some(0), 60),
+            (Some(i64::MIN), 60),
+            (Some(101), 1),
+            (Some(1), u64::MAX),
+        ] {
+            let mut notices = 0;
+            let mut destroys = 0;
+            let decision =
+                thegn_core::time_policy::resource_expiry(100, created, lifetime, Some(60));
+            if admit_reap(decision, |_| notices += 1) {
+                destroys += 1;
+            }
+            assert_eq!((notices, destroys), (1, 0));
+        }
+    }
 
     fn rec(name: &str, state: &str, created_at: i64) -> registry::VpsRecord {
         registry::VpsRecord {
@@ -248,7 +309,7 @@ mod tests {
         ));
         // creating older than the stale threshold ⇒ drop.
         assert!(should_drop_record(
-            &rec("stuck", "creating", now - CREATING_STALE_SECS - 1),
+            &rec("stuck", "creating", now - CREATING_STALE_SECS as i64 - 1),
             &live,
             now
         ));

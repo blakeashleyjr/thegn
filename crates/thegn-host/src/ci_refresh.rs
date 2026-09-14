@@ -26,10 +26,7 @@ pub(crate) fn ci_every_slots(poll_interval_secs: u64) -> u64 {
 /// younger than `[ci] ttl_secs`. Forced refreshes (the `g` key, post-mutation)
 /// bypass it. `ttl_secs == 0` disables the guard. Pure, so it's unit-tested.
 pub(crate) fn ci_cache_is_fresh(fetched_at: Option<i64>, now: i64, ttl_secs: u64) -> bool {
-    match fetched_at {
-        Some(t) => ttl_secs > 0 && now.saturating_sub(t) < ttl_secs as i64,
-        None => false,
-    }
+    thegn_core::time_policy::is_fresh(now, fetched_at, ttl_secs)
 }
 
 // --- fetch health: the panel note + failure backoff ------------------------
@@ -75,9 +72,10 @@ pub(crate) fn backoff_secs(failures: u32, poll_secs: u64) -> u64 {
 fn record_failure(worktree: &str, message: &str, now: i64, poll_secs: u64) {
     if let Ok(mut map) = health().lock() {
         let h = map.entry(worktree.to_string()).or_default();
-        h.failures += 1;
+        h.failures = h.failures.saturating_add(1);
         let backoff = backoff_secs(h.failures, poll_secs);
-        h.backoff_until = now + backoff as i64;
+        h.backoff_until =
+            thegn_core::time_policy::deadline_seconds(now, backoff).unwrap_or(i64::MAX);
         h.note = Some(if h.failures > 1 {
             format!("{message} — retrying in {backoff}s")
         } else {
@@ -349,6 +347,15 @@ fn ingest_failed_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enormous_ttl_and_clock_rollback_keep_cached_ci_quiet() {
+        for ttl in [i64::MAX as u64 - 1, i64::MAX as u64 + 1, u64::MAX] {
+            assert!(ci_cache_is_fresh(Some(1), 1000, ttl));
+        }
+        assert!(ci_cache_is_fresh(Some(i64::MAX), i64::MIN, 1));
+        assert!(!ci_cache_is_fresh(Some(i64::MIN), i64::MAX, 1));
+    }
 
     #[test]
     fn ci_cadence_honors_config_and_clamps() {

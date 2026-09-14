@@ -2,7 +2,7 @@
 //! operations (the `pairings` table): they work with or without a running
 //! daemon, so issuing/revoking access is never blocked on one.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use thegn_core::config::Config;
 use thegn_core::control::{PairingUrl, ScopeSet, TokenKind};
 use thegn_core::db::Db;
@@ -48,7 +48,7 @@ pub enum PairAction {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0)
 }
 
@@ -82,12 +82,18 @@ pub fn run(cfg: &Config, action: PairAction) -> Result<()> {
                 );
             }
             let now = now_ms();
+            let delay_ms = u64::try_from(ttl_mins.max(1))
+                .ok()
+                .and_then(|minutes| minutes.checked_mul(60_000));
+            let expires = delay_ms
+                .and_then(|delay| thegn_core::time_policy::deadline_millis(now, delay))
+                .context("pairing lifetime exceeds the supported duration or epoch range")?;
             let minted = auth::mint(
                 TokenKind::PairingCode,
                 scopes,
                 &label,
                 None,
-                Some(now + ttl_mins.max(1) * 60_000),
+                Some(expires),
                 now,
             );
             db.put_pairing(&minted.row)?;

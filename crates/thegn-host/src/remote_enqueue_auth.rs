@@ -20,7 +20,7 @@ const TOKEN_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .map(|duration| thegn_core::time_policy::saturating_i64(duration.as_millis()))
         .unwrap_or(0)
 }
 

@@ -321,7 +321,8 @@ async fn try_chain(
                 state.health.record_success(&ident, &backend.model);
                 state.metrics.inc_backend_attempt(&ident, "ok");
                 state.metrics.inc_request(&route.name, &ident, "ok");
-                let duration_ms = started.elapsed().as_millis() as i64;
+                let duration_ms =
+                    thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
                 state.metrics.observe_duration(duration_ms);
                 finalize_success(
                     state,
@@ -483,7 +484,9 @@ async fn try_stream_chain(
                     match kind {
                         FailKind::Serve => {
                             state.health.record_success(&ident, &backend.model);
-                            let duration_ms = started.elapsed().as_millis() as i64;
+                            let duration_ms = thegn_core::time_policy::saturating_i64(
+                                started.elapsed().as_millis(),
+                            );
                             state.metrics.observe_duration(duration_ms);
                             finalize_success(
                                 state,
@@ -693,10 +696,10 @@ fn finalize_closure(
     let bname = backend.name.clone();
     let bmodel = backend.model.clone();
     let ident = ident.to_string();
-    let ttfb_ms = started.elapsed().as_millis() as i64;
+    let ttfb_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
     move |stats: RelayStats| {
         let usage = stats.usage;
-        let duration_ms = started.elapsed().as_millis() as i64;
+        let duration_ms = thegn_core::time_policy::saturating_i64(started.elapsed().as_millis());
         let (cost, source) = cost_usd(
             &state.config.price_table,
             &bname,
@@ -888,7 +891,7 @@ fn audit_failure(
         backend: "none".to_string(),
         outcome: "all_failed".to_string(),
         error_code: Some("503".to_string()),
-        duration_ms: started.elapsed().as_millis() as i64,
+        duration_ms: thegn_core::time_policy::saturating_i64(started.elapsed().as_millis()),
         ..Default::default()
     };
     put_audit_row(state, &row);

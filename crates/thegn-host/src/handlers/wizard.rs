@@ -145,7 +145,7 @@ pub(crate) fn add_host_from_input(
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(u128::from(d.as_secs())))
         .unwrap_or(0);
     let db = thegn_core::db::Db::open().map_err(|e| format!("state db: {e}"))?;
     db.put_host_def(&name, &hc, now)

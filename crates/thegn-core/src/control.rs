@@ -974,6 +974,17 @@ mod tests {
     }
 
     #[test]
+    fn huge_unsigned_lease_grace_stays_timed_and_never_wraps() {
+        for seconds in [i64::MAX as u64 - 1, i64::MAX as u64 + 1, u64::MAX] {
+            let grace = crate::time_policy::duration_millis(seconds);
+            assert!(grace > 0);
+            assert_eq!(relay_expiry(1000, grace), i64::MAX);
+        }
+        assert_eq!(crate::time_policy::duration_millis(0), 0);
+        assert_eq!(relay_expiry(i64::MAX, 1), i64::MAX);
+    }
+
+    #[test]
     fn scope_set_parse_csv_round_trip() {
         for csv in [
             "read",
