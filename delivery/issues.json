@@ -390,6 +390,20 @@
       "changes": [
         "pane-zoom-stack"
       ]
+    },
+    {
+      "issue": "THE-575",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "resolve-build-git-identity"
+      ]
+    },
+    {
+      "issue": "THE-613",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "harden-live-upgrades"
+      ]
     }
   ]
 }
