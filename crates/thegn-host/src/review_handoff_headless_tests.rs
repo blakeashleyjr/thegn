@@ -134,6 +134,45 @@ fn selected_url_cannot_normalize_a_foreign_authority_into_the_proof() {
 }
 
 #[test]
+fn non_utf8_worktree_cannot_authorize_its_lossy_sibling() {
+    let Some(name) = crate::platform::gate_path::history_test_nonunicode() else {
+        // The existing platform fixture seam currently supplies Unix bytes.
+        return;
+    };
+    let fixture = Fixture::new();
+    let original = fixture.dir.path().join(name);
+    let sibling = fixture.dir.path().join("\u{fffd}");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    assert_ne!(original, sibling);
+    assert_eq!(
+        GitLoc::worktree_cache_key(&original),
+        GitLoc::worktree_cache_key(&sibling)
+    );
+    let forge = fixture.forge(vec![fixture.proof.clone()]);
+    let mut request = request(&fixture);
+    request.worktree = original;
+    request.snapshot.worktree_key = GitLoc::worktree_cache_key(&sibling);
+    let result = execute(
+        &queue(),
+        &request,
+        Some((&fixture.db, &forge)),
+        forbid_prepare,
+        forbid_launch,
+    );
+    assert!(result.unwrap_err().contains("lossless UTF-8"));
+    assert_eq!(forge.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 0);
+    // The outer production worker rejects before opening its ambient DB or
+    // resolving a forge; it never reaches the configured command.
+    assert!(
+        run(&Config::default(), &queue(), &request)
+            .unwrap_err()
+            .contains("lossless UTF-8")
+    );
+}
+
+#[test]
 fn persisted_remote_malformed_and_failed_db_never_query_a_provider() {
     let fixture = Fixture::new();
     let request = request(&fixture);
