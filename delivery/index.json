@@ -860,6 +860,18 @@
       "summary": "Correct performance measurement and log following; controlled hydration attribution remains open."
     },
     {
+      "change": "repair-resident-plugin-lifecycle",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-154",
+          "project": "Plugin UI Platform"
+        }
+      ],
+      "summary": "Bound resident I/O and retain lifecycle custody; native platform and full descendant-containment acceptance remain open."
+    },
+    {
       "change": "repair-session-recovery-and-terminal-teardown",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

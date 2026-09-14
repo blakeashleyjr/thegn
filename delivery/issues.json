@@ -357,6 +357,13 @@
       ]
     },
     {
+      "issue": "THE-154",
+      "project": "Plugin UI Platform",
+      "changes": [
+        "repair-resident-plugin-lifecycle"
+      ]
+    },
+    {
       "issue": "THE-286",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
