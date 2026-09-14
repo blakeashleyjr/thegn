@@ -1,0 +1,12 @@
+# Tasks
+
+- [x] Investigate hydration publication, process sampling, bounded admission, and monitor selection.
+- [x] Obtain primary reviewer approval of the bounded fix and regression plan.
+- [x] Preserve sampler-owned process state at authoritative hydration swap.
+- [x] Stabilize top-N admission and flat/tree tie ordering.
+- [x] Preserve sampled selection and bind pending confirmation/escalation identity.
+- [x] Add deterministic sampler/view and monitor regression fixtures.
+- [x] Run actual-source sampler/view harness; demonstrate old tie comparators fail.
+- [ ] Run combined host monitor and model equality tests in coordinated build graph.
+- [ ] Complete primary code review and independent adversarial review/revisions.
+- [ ] Complete combined source/spec/format gates and reviewed local-main landing.

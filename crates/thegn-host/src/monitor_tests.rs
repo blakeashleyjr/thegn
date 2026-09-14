@@ -716,6 +716,7 @@ fn proc(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, rss: u64) -> thegn_me
         cpu_pct: cpu,
         rss_bytes: rss,
         run_secs: 0,
+        start_time: 100,
         owner: thegn_metrics::ProcOwner::Other,
     }
 }
@@ -1445,4 +1446,184 @@ fn has_graphs_matches_what_the_builders_emit() {
             usize::from(plots)
         );
     }
+}
+
+// THE-628: a process snapshot belongs to its sampler, not model hydration.
+#[test]
+fn process_table_survives_interleaved_hydration_and_samples() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(40);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.nav(20);
+    ov.sync(&m, &h, screen);
+    let selected = ov.proc_rows[ov.sel].pid;
+    let scroll = ov.scroll();
+    for pass in 0..4 {
+        let mut hydrated = model_with(full_snap());
+        assert!(hydrated.procs.procs.is_empty());
+        hydrated.carry_live_processes_from(&mut m);
+        m = hydrated;
+        ov.refresh(&m, &ctx_at(&h, screen));
+        assert_eq!(ov.proc_rows.len(), 40);
+        assert_eq!(ov.proc_rows[ov.sel].pid, selected);
+        assert_eq!(ov.scroll(), scroll);
+        assert!(cursor_on_screen(&ov));
+        assert!(!headings(&ov).iter().any(|(title, _)| title == "sampling…"));
+        m.procs.procs[0].rss_bytes += pass;
+        ov.refresh(&m, &ctx_at(&h, screen));
+    }
+}
+
+#[test]
+fn passive_process_refresh_follows_identity_after_rank_changes() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(40);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.nav(20);
+    ov.sync(&m, &h, screen);
+    let identity = (ov.proc_rows[ov.sel].pid, ov.proc_rows[ov.sel].start_time);
+    m.procs.procs[20].cpu_pct = 1000.0;
+    ov.refresh(&m, &ctx_at(&h, screen));
+    assert_eq!(ov.sel, 0);
+    assert_eq!(
+        (ov.proc_rows[ov.sel].pid, ov.proc_rows[ov.sel].start_time),
+        identity
+    );
+    assert!(cursor_on_screen(&ov));
+    ov.begin_signal();
+    match &ov.confirm {
+        Some(super::Confirm::Signal {
+            pid, start_time, ..
+        }) => assert_eq!((*pid, *start_time), identity),
+        _ => panic!("expected confirmation for selected identity"),
+    }
+}
+
+#[test]
+fn process_refresh_does_not_yank_a_manually_scrolled_viewport() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(40);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.wheel(15);
+    let scroll = ov.scroll();
+    m.procs.procs[0].cpu_pct = -1.0;
+    ov.refresh(&m, &ctx_at(&h, screen));
+    assert_eq!(ov.sel, 39);
+    assert_eq!(ov.scroll(), scroll);
+    assert!(!ov.follow);
+}
+
+#[test]
+fn process_confirmation_refuses_a_reused_or_disappeared_sampled_identity() {
+    for reused in [false, true] {
+        let h = TelemetryHistory::default();
+        let screen = Rect::full(100, 24);
+        let mut m = model_with_n_procs(3);
+        // PID 0 is rejected before any OS signal on every supported platform,
+        // keeping this fixture safe even if the identity guard regresses.
+        m.procs.procs[0].pid = 0;
+        let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+        ov.begin_signal();
+        if reused {
+            m.procs.procs[0].start_time += 1;
+        } else {
+            m.procs.procs.remove(0);
+        }
+        ov.refresh(&m, &ctx_at(&h, screen));
+        // This must be the identity refusal, not the platform invalid-PID error.
+        ov.confirm_key(&KeyCode::Char('y'));
+        assert!(ov.confirm.is_none());
+        assert!(
+            ov.status
+                .as_deref()
+                .unwrap()
+                .contains("process changed or left")
+        );
+        assert!(ov.last_termed.is_none());
+    }
+}
+
+#[test]
+fn reused_process_does_not_inherit_selection_or_signal_escalation() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(3);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.last_termed = Some((1000, 100));
+    m.procs.procs[0].start_time = 200;
+    m.procs.procs[0].cpu_pct = -1.0;
+    ov.refresh(&m, &ctx_at(&h, screen));
+    assert_eq!(
+        ov.proc_rows[ov.sel].pid, 1001,
+        "fallback stays at old index rather than following reused PID"
+    );
+    ov.nav(2);
+    ov.begin_signal();
+    assert!(matches!(
+        ov.confirm,
+        Some(super::Confirm::Signal {
+            pid: 1000,
+            stage: crate::platform::ProcSignal::Terminate,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn process_exit_clamps_and_explicit_sort_still_resets_selection() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(40);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.nav(39);
+    ov.sync(&m, &h, screen);
+    m.procs.procs.truncate(2);
+    ov.refresh(&m, &ctx_at(&h, screen));
+    assert_eq!(ov.sel, 1);
+    assert!(cursor_on_screen(&ov));
+    ov.proc_key('m');
+    ov.sync(&m, &h, screen);
+    assert_eq!(ov.sel, 0);
+    m.procs.procs.clear();
+    ov.refresh(&m, &ctx_at(&h, screen));
+    assert_eq!(ov.sel, 0);
+    assert_eq!(ov.scroll(), 0);
+}
+
+#[test]
+fn paused_process_refresh_does_not_change_the_displayed_snapshot() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(3);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.paused = true;
+    let before = ov.proc_rows.clone();
+    m.procs.procs.reverse();
+    m.procs.procs[0].cpu_pct = 1000.0;
+    assert!(!ov.refresh(&m, &ctx_at(&h, screen)));
+    assert_eq!(ov.proc_rows, before);
+}
+
+#[test]
+fn process_confirmation_keeps_its_identity_while_ranks_change() {
+    let h = TelemetryHistory::default();
+    let screen = Rect::full(100, 24);
+    let mut m = model_with_n_procs(3);
+    let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
+    ov.begin_signal();
+    m.procs.procs[0].cpu_pct = -1.0;
+    ov.refresh(&m, &ctx_at(&h, screen));
+    assert_eq!(ov.sel, 2);
+    assert!(matches!(
+        ov.confirm,
+        Some(super::Confirm::Signal {
+            pid: 1000,
+            start_time: 100,
+            ..
+        })
+    ));
+    // Do not confirm: the fixture validates the target, never sends a signal.
 }

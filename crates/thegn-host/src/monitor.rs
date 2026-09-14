@@ -62,6 +62,7 @@ enum Confirm {
     /// Deliver `stage` to a process.
     Signal {
         pid: u32,
+        start_time: u64,
         label: String,
         stage: crate::platform::ProcSignal,
     },
@@ -429,7 +430,7 @@ pub struct MonitorOverlay {
     confirm: Option<Confirm>,
     /// The pid we last SIGTERM'd, so a second signal on the same process offers
     /// SIGKILL as a distinct escalation.
-    last_termed: Option<u32>,
+    last_termed: Option<(u32, u64)>,
     /// A transient footer note (signal outcome, filter echo).
     status: Option<String>,
     /// Owned + foreign container rows behind the Containers tab, cached at
@@ -515,7 +516,7 @@ impl MonitorOverlay {
             rows,
             body_rows: rows.saturating_sub(CHROME_ROWS),
         };
-        ov.rebuild(model, ctx);
+        ov.rebuild(model, ctx, false);
         ov
     }
 
@@ -595,7 +596,7 @@ impl MonitorOverlay {
     }
 
     /// Rebuild the active tab's body from current data.
-    fn rebuild(&mut self, model: &FrameModel, ctx: &StatusCtx) {
+    fn rebuild(&mut self, model: &FrameModel, ctx: &StatusCtx, preserve_process: bool) {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
@@ -603,7 +604,18 @@ impl MonitorOverlay {
         // — so `sel`, the signal action, the clean action and the container row
         // actions all index exactly what the renderer draws. Rows first, then
         // one clamp for the active tab, then the build.
+        let selected = preserve_process
+            .then(|| self.proc_rows.get(self.sel).map(|r| (r.pid, r.start_time)))
+            .flatten();
         self.proc_rows = procs_view::rows(&model.procs, self.proc_view());
+        if let Some(identity) = selected
+            && let Some(index) = self
+                .proc_rows
+                .iter()
+                .position(|r| (r.pid, r.start_time) == identity)
+        {
+            self.sel = index;
+        }
         self.disk_rows = build::worktree_disk_rows(model, now / 1000);
         // Container row identities for the key handler (the same order the
         // builder renders `model.containers` in), so a key resolves `sel`
@@ -721,7 +733,7 @@ impl MonitorOverlay {
     /// was paused at.
     pub fn rebuild_after_key(&mut self, model: &FrameModel, ctx: &StatusCtx) {
         self.resize(ctx.screen);
-        self.rebuild(model, ctx);
+        self.rebuild(model, ctx, false);
     }
 
     /// Rebuild in place from fresh data. Returns `true` when it repainted.
@@ -746,7 +758,7 @@ impl MonitorOverlay {
             // removed). Fall back rather than render an empty tab.
             self.tab = self.tabs.first().copied().unwrap_or(MonitorTab::Cpu);
         }
-        self.rebuild(model, ctx);
+        self.rebuild(model, ctx, self.tab == MonitorTab::Procs);
         true
     }
 
@@ -1170,8 +1182,25 @@ impl MonitorOverlay {
     fn confirm_key(&mut self, key: &KeyCode) -> MonitorOutcome {
         if matches!(key, KeyCode::Char('y' | 'Y')) {
             match self.confirm.take() {
-                Some(Confirm::Signal { pid, label, stage }) => {
-                    self.perform_signal(pid, &label, stage)
+                Some(Confirm::Signal {
+                    pid,
+                    start_time,
+                    label,
+                    stage,
+                }) => {
+                    // A refresh may reorder or replace a PID while the prompt is
+                    // open. A vanished sampled identity needs a new confirmation.
+                    if self
+                        .proc_rows
+                        .iter()
+                        .any(|r| (r.pid, r.start_time) == (pid, start_time))
+                    {
+                        self.perform_signal(pid, start_time, &label, stage);
+                    } else {
+                        self.status = Some(format!(
+                            "{label}: process changed or left the sampled list; select it again"
+                        ));
+                    }
                 }
                 Some(Confirm::Clean { path, label }) => {
                     self.pending_action = Some(MonitorAction::CleanWorktree(path));
@@ -1193,14 +1222,14 @@ impl MonitorOverlay {
     fn begin_signal(&mut self) -> MonitorOutcome {
         // Copy out of the row first so the immutable borrow of `self.proc_rows`
         // ends before `self.confirm`/`self.status` are written.
-        let Some((pid, name, owner)) = self
+        let Some((pid, start_time, name, owner)) = self
             .proc_rows
             .get(self.sel)
-            .map(|r| (r.pid, r.name.clone(), r.owner))
+            .map(|r| (r.pid, r.start_time, r.name.clone(), r.owner))
         else {
             return MonitorOutcome::Pending;
         };
-        let stage = if self.last_termed == Some(pid) {
+        let stage = if self.last_termed == Some((pid, start_time)) {
             crate::platform::ProcSignal::Kill
         } else {
             crate::platform::ProcSignal::Terminate
@@ -1212,13 +1241,24 @@ impl MonitorOverlay {
             format!(" ({owner})")
         };
         let label = format!("pid {pid} {name}{owner}");
-        self.confirm = Some(Confirm::Signal { pid, label, stage });
+        self.confirm = Some(Confirm::Signal {
+            pid,
+            start_time,
+            label,
+            stage,
+        });
         self.status = None;
         MonitorOutcome::Pending
     }
 
     /// Deliver the confirmed signal, surfacing the outcome — never swallowed.
-    fn perform_signal(&mut self, pid: u32, label: &str, stage: crate::platform::ProcSignal) {
+    fn perform_signal(
+        &mut self,
+        pid: u32,
+        start_time: u64,
+        label: &str,
+        stage: crate::platform::ProcSignal,
+    ) {
         let name = match stage {
             crate::platform::ProcSignal::Terminate => "SIGTERM",
             crate::platform::ProcSignal::Kill => "SIGKILL",
@@ -1227,7 +1267,7 @@ impl MonitorOverlay {
             Ok(()) => {
                 self.status = Some(format!("sent {name} to {label}"));
                 if stage == crate::platform::ProcSignal::Terminate {
-                    self.last_termed = Some(pid);
+                    self.last_termed = Some((pid, start_time));
                 }
             }
             Err(e) => self.status = Some(format!("{label}: {e}")),
