@@ -97,7 +97,9 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
 /// today). Loop-persistent: leftovers carry to the next iteration.
 #[derive(Default)]
 pub(crate) struct PtyBacklog {
-    per_pane: HashMap<u32, VecDeque<Vec<u8>>>,
+    per_pane: HashMap<u32, VecDeque<(u64, Vec<u8>)>>,
+    generations: HashMap<u32, u64>,
+    clipboard_ready: VecDeque<u32>,
     /// Round-robin cursor order over panes with backlog.
     rr: VecDeque<u32>,
     /// Total stashed bytes (the high-water gauge).
@@ -115,7 +117,7 @@ impl PtyBacklog {
         if q.is_empty() && !self.rr.contains(&id) {
             self.rr.push_back(id);
         }
-        q.push_back(chunk);
+        q.push_back((*self.generations.get(&id).unwrap_or(&0), chunk));
     }
 
     /// Coalesce this pane's queued chunks into one buffer of at most `max`
@@ -125,20 +127,24 @@ impl PtyBacklog {
     /// identical to the arbitrary chunking the PTY read already imposes — and
     /// it's what gives the drain deadline its granularity (an unsplittable
     /// 64KB chunk would pin one slice at ~16ms of feed).
-    fn take_slice(&mut self, id: u32, max: usize) -> Vec<u8> {
+    fn take_tagged_slice(&mut self, id: u32, max: usize) -> (u64, Vec<u8>) {
         let Some(q) = self.per_pane.get_mut(&id) else {
-            return Vec::new();
+            return (0, Vec::new());
         };
+        let generation = q.front().map(|(generation, _)| *generation).unwrap_or(0);
         let max = max.max(1);
         let mut out = Vec::new();
         while out.len() < max {
-            let Some(mut chunk) = q.pop_front() else {
+            if q.front().is_some_and(|(next, _)| *next != generation) {
+                break;
+            }
+            let Some((_, mut chunk)) = q.pop_front() else {
                 break;
             };
             let room = max - out.len();
             if chunk.len() > room {
                 let rest = chunk.split_off(room);
-                q.push_front(rest);
+                q.push_front((generation, rest));
             }
             self.total -= chunk.len();
             if out.is_empty() {
@@ -150,17 +156,37 @@ impl PtyBacklog {
         if q.is_empty() {
             self.per_pane.remove(&id);
         }
-        out
+        (generation, out)
+    }
+
+    #[cfg(test)]
+    fn take_slice(&mut self, id: u32, max: usize) -> Vec<u8> {
+        self.take_tagged_slice(id, max).1
+    }
+
+    fn barrier(&mut self, id: u32) {
+        let generation = self.generations.entry(id).or_default();
+        *generation = generation
+            .checked_add(1)
+            .expect("pane generation exhausted");
+        self.clipboard_ready.retain(|&p| p != id);
+    }
+
+    fn clipboard_pending(&mut self, id: u32) {
+        if !self.clipboard_ready.contains(&id) {
+            self.clipboard_ready.push_back(id);
+        }
     }
 
     /// Everything stashed for `id` (the pre-Exit flush). Removes the pane.
+    #[cfg(test)]
     fn drain_pane(&mut self, id: u32) -> Vec<u8> {
         let Some(q) = self.per_pane.remove(&id) else {
             return Vec::new();
         };
         self.rr.retain(|&p| p != id);
         let mut out = Vec::new();
-        for chunk in q {
+        for (_, chunk) in q {
             self.total -= chunk.len();
             out.extend_from_slice(&chunk);
         }
@@ -292,8 +318,20 @@ pub(crate) fn drain<T: Terminal>(
                 backlog.push(id, chunk);
             }
             Ok(PaneEvent::Exit(id, code)) => exits.push((id, code)),
-            Ok(PaneEvent::SessionFallback(id)) => fallbacks.push(id),
-            Ok(PaneEvent::Reattached(id)) => reattached.push(id),
+            Ok(PaneEvent::SessionFallback(id)) => {
+                backlog.barrier(id);
+                if let Some(p) = ctx.panes.table.get_mut(&id) {
+                    p.clipboard.reset();
+                }
+                fallbacks.push(id);
+            }
+            Ok(PaneEvent::Reattached(id)) => {
+                backlog.barrier(id);
+                if let Some(p) = ctx.panes.table.get_mut(&id) {
+                    p.clipboard.reset();
+                }
+                reattached.push(id);
+            }
             Err(tokio_mpsc::error::TryRecvError::Empty) => break,
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
                 summary.disconnected = true;
@@ -324,10 +362,22 @@ pub(crate) fn drain<T: Terminal>(
     // its final output reaches scrollback before the pane leaves the table.
     summary.exited = exits.iter().map(|(id, _)| *id).collect();
     for (id, code) in exits {
-        let tail = backlog.drain_pane(id);
-        if !tail.is_empty() {
-            handle_output(ctx, id, &tail);
+        loop {
+            let (generation, tail) = backlog.take_tagged_slice(id, crate::loop_policy::MAX_SLICE);
+            if tail.is_empty() {
+                break;
+            }
+            let current = *backlog.generations.get(&id).unwrap_or(&0);
+            handle_output(ctx, id, &tail, generation == current);
         }
+        if let Some(p) = ctx.panes.table.get_mut(&id) {
+            p.clipboard
+                .submit(|bytes| ctx.writer.try_submit_clipboard(bytes, || {}));
+            p.clipboard.reset();
+        }
+        backlog.clipboard_ready.retain(|&p| p != id);
+        backlog.generations.remove(&id);
+        backlog.rr.retain(|&p| p != id);
         if ctx.preview.pane_exit(id) {
             *ctx.dirty = true;
         }
@@ -347,12 +397,21 @@ pub(crate) fn drain<T: Terminal>(
         let slice =
             crate::loop_policy::pane_slice(budget.max_bytes - spent, backlog.panes_with_backlog());
         let Some(id) = backlog.next_pane() else { break };
-        let merged = backlog.take_slice(id, slice);
+        let (generation, merged) = backlog.take_tagged_slice(id, slice);
         if merged.is_empty() {
             continue;
         }
         spent += merged.len();
-        handle_output(ctx, id, &merged);
+        let current = *backlog.generations.get(&id).unwrap_or(&0);
+        handle_output(ctx, id, &merged, generation == current);
+        if ctx
+            .panes
+            .table
+            .get(&id)
+            .is_some_and(|p| p.clipboard.has_pending())
+        {
+            backlog.clipboard_pending(id);
+        }
 
         // Input preemption: a keystroke found here aborts the drain — its
         // dispatch (and the frame showing its effect) must not wait out the
@@ -368,6 +427,25 @@ pub(crate) fn drain<T: Terminal>(
                 crate::perf_timing::observe_input(input_at, Instant::now());
                 summary.preempted = true;
                 break;
+            }
+        }
+    }
+
+    // Retry a bounded round-robin pass. Writer capacity release supplies the
+    // next wake; no timer runs merely because the clipboard is idle.
+    let attempts = backlog.clipboard_ready.len().min(64);
+    for _ in 0..attempts {
+        let Some(id) = backlog.clipboard_ready.pop_front() else {
+            break;
+        };
+        if let Some(p) = ctx.panes.table.get_mut(&id) {
+            p.clipboard.submit(|bytes| {
+                ctx.writer.try_submit_clipboard(bytes, || {
+                    let _ = ctx.waker.wake(); // best-effort: retry work may outlive the terminal
+                })
+            });
+            if p.clipboard.has_pending() {
+                backlog.clipboard_ready.push_back(id);
             }
         }
     }
@@ -415,7 +493,7 @@ pub(crate) fn prune_output_degraded(
 /// terminal queries, forward OSC passthrough, route the drawer control
 /// channel, and mark pane damage. Moved verbatim from the run.rs drain
 /// (adapted to `ctx` borrows; per-chunk work now runs once per merged buffer).
-fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
+fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8], admit_clipboard: bool) {
     // Associate output with the session tree before borrowing the pane mutably.
     // Parsing this bounded tail is pure CPU; a full chrome repaint is raised
     // only when discovery/status changes, never for unrelated PTY bytes.
@@ -435,6 +513,9 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
         *ctx.dirty = true;
     }
     if let Some(p) = ctx.panes.table.get_mut(&id) {
+        if admit_clipboard {
+            p.clipboard.feed(b);
+        }
         // First real output ⇒ this worktree's shell is live; drop its loading
         // splash (by owner, so a background worktree that finished while away
         // shows no stale splash on return). Held while provisioning is still
@@ -536,10 +617,6 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                         );
                     }
                 }
-                let fwd = crate::queries::osc_passthrough(&emu_text);
-                if !fwd.is_empty() {
-                    ctx.writer.submit_oob(fwd);
-                }
             }
             // Corner is in `visible`; mark it dirty so the render block runs
             // and flushes `corner_gfx`.
@@ -560,13 +637,6 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
             };
             if !resp.is_empty() {
                 let _ = p.write_reply(&resp); // best-effort: reply: the pane may be gone; the reply is dropped
-            }
-            // Clipboard sets (OSC 52) from inner apps go VERBATIM to the outer
-            // terminal — vim's "+y inside a pane reaches the system clipboard
-            // like in a plain terminal.
-            let fwd = crate::queries::osc_passthrough(b);
-            if !fwd.is_empty() {
-                ctx.writer.submit_oob(fwd);
             }
             if ctx.visible.contains(&id) {
                 // Pane-content-only damage: recompose just this pane, not the
@@ -1555,5 +1625,48 @@ mod tests {
         assert_eq!(tail.len(), 200);
         assert_eq!(b.total, 100, "other panes' backlog is untouched");
         assert!(b.drain_pane(3).is_empty());
+    }
+    #[test]
+    fn backlog_generation_barriers_preserve_bytes_without_crossing_clipboard_state() {
+        let mut backlog = PtyBacklog::default();
+        let mut clipboard = crate::queries::clipboard::Clipboard::default();
+        clipboard.feed(b"\x1b]52;c;eA==\x07\x1b]52;c;");
+        clipboard.submit(Err);
+        backlog.push(1, b"eQ==\x07".to_vec()); // old suffix waiting before fallback
+        backlog.barrier(1);
+        clipboard.reset(); // receipt barrier, never grouped lifecycle callback
+        backlog.push(1, b"\x1b]52;c;eg==\x07".to_vec());
+        let (old, first) = backlog.take_tagged_slice(1, usize::MAX);
+        let (new, second) = backlog.take_tagged_slice(1, usize::MAX);
+        assert_eq!(first, b"eQ==\x07");
+        assert_eq!(old, 0);
+        assert_eq!(new, 1);
+        let current = backlog.generations[&1];
+        if old == current {
+            clipboard.feed(&first);
+        }
+        if new == current {
+            clipboard.feed(&second);
+        }
+        let mut admitted = Vec::new();
+        clipboard.submit(|bytes| {
+            admitted = bytes;
+            Ok(())
+        });
+        assert_eq!(admitted, b"\x1b]52;c;eg==\x07");
+        assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn backlog_clipboard_retry_order_is_unique_and_barriers_retire_old_work() {
+        let mut backlog = PtyBacklog::default();
+        for id in [3, 1, 2, 3, 2] {
+            backlog.clipboard_pending(id);
+        }
+        assert_eq!(backlog.clipboard_ready, [3, 1, 2]);
+        backlog.barrier(1);
+        assert_eq!(backlog.clipboard_ready, [3, 2]);
+        backlog.clipboard_pending(1);
+        assert_eq!(backlog.clipboard_ready, [3, 2, 1]);
     }
 }
