@@ -93,6 +93,7 @@ impl Fixture {
             pr: self.pr.clone(),
             proofs: Mutex::new(proofs.into()),
             proof_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
             reruns: AtomicUsize::new(0),
         }
     }
@@ -102,6 +103,7 @@ pub(crate) struct FakeForge {
     pub pr: PrStatus,
     proofs: Mutex<VecDeque<PrAuthorship>>,
     pub proof_calls: AtomicUsize,
+    pub status_calls: AtomicUsize,
     pub reruns: AtomicUsize,
 }
 impl thegn_core::seam::Probe for FakeForge {
@@ -124,6 +126,7 @@ impl Forge for FakeForge {
         None
     }
     fn pr_status(&self, _: &GitLoc, _: PrRef) -> Result<PrStatus, ForgeError> {
+        self.status_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.pr.clone())
     }
     fn pr_list(&self, _: &GitLoc, _: usize) -> Result<Vec<PrHeader>, ForgeError> {

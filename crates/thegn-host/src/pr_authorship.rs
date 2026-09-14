@@ -1,4 +1,4 @@
-//! One admission path for PR queue, CI autofix and durable review handoff.
+//! One admission path for PR queue, CI autofix and review handoffs.
 //! Evidence is fresh, location-bound and rechecked after preparation, before
 //! consuming an attempt/claim. This is not a global credential freeze: an
 //! external account change after the last check remains THE-541 territory.
@@ -20,6 +20,13 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
+    /// Match a selected view against the structured repository authenticated by
+    /// this proof. Comparing the canonical full URL rejects foreign authorities,
+    /// userinfo, extra path segments, query strings and fragments.
+    pub(crate) fn matches_pr_url(&self, url: &str, number: u64) -> bool {
+        self.proof.number == number && self.proof.repository.matches_pr_url(url, number)
+    }
+
     pub(crate) fn matches_review(&self, repository: &str, number: u64) -> bool {
         self.proof.number == number
             && format!(
@@ -75,7 +82,10 @@ pub(crate) fn acquire(
 /// location. Until that execution authority is verified, own-only automation
 /// must not authorize against a remote/provider proof or silently read a local
 /// checkout with the same path. Database failures and malformed metadata hold.
-fn local_execution_location(db: &Db, loc: &GitLoc) -> Result<std::path::PathBuf, &'static str> {
+pub(crate) fn local_execution_location(
+    db: &Db,
+    loc: &GitLoc,
+) -> Result<std::path::PathBuf, &'static str> {
     const LOCATION_HELD: &str = "own-PR automation held: local agent execution authority must be verified; remote/provider handoff needs an explicit verified route";
     let GitLoc::Local(path) = loc else {
         return Err(LOCATION_HELD);
