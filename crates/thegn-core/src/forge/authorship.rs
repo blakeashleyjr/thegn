@@ -25,10 +25,9 @@ impl GithubRepository {
             rest.split_once('/')?
         } else if let Some(rest) = origin.strip_prefix("ssh://git@") {
             rest.split_once('/')?
-        } else if let Some(rest) = origin.strip_prefix("git@") {
-            rest.split_once(':')?
         } else {
-            return None;
+            let rest = origin.strip_prefix("git@")?;
+            rest.split_once(':')?
         };
         if host.is_empty()
             || !host.split('.').all(|part| {

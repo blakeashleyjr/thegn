@@ -75,7 +75,7 @@ impl Clipboard {
                     // Vec's geometric capacity must obey the wire allocation
                     // cap as well as its length (MAX_WIRE is not a power of 2).
                     if self.partial.len() == self.partial.capacity() {
-                        let capacity = (self.partial.capacity() * 2).max(8).min(MAX_WIRE);
+                        let capacity = (self.partial.capacity() * 2).clamp(8, MAX_WIRE);
                         self.partial.reserve_exact(capacity - self.partial.len());
                     }
                     self.partial.push(byte);

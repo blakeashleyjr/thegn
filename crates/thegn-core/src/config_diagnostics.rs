@@ -50,10 +50,10 @@ impl Recent {
             *previous = content;
             self.diagnostics.retain(|(source, _)| *source != identity);
         } else {
-            if self.sources.len() == MAX_DIAGNOSTICS {
-                if let Some((expired, _)) = self.sources.pop_front() {
-                    self.diagnostics.retain(|(source, _)| *source != expired);
-                }
+            if self.sources.len() == MAX_DIAGNOSTICS
+                && let Some((expired, _)) = self.sources.pop_front()
+            {
+                self.diagnostics.retain(|(source, _)| *source != expired);
             }
             self.sources.push_back((identity, content));
         }

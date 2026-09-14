@@ -32,8 +32,7 @@ impl Lines {
                     .partial
                     .capacity()
                     .saturating_mul(2)
-                    .max(128)
-                    .min(MAX_LINE_BYTES);
+                    .clamp(128, MAX_LINE_BYTES);
                 self.partial.reserve_exact(capacity - self.partial.len());
             }
             self.partial.push(byte);
