@@ -21,6 +21,9 @@ For own-only policy, the worker opens one workspace DB and checks persisted loca
 execution before resolving/querying a forge. Missing location is the existing
 supported local case; lookup errors, malformed metadata and remote/provider
 placements hold. The selected snapshot's key uses `GitLoc::worktree_cache_key`.
+Own-only admission also requires a lossless UTF-8 worktree path before opening
+the DB or resolving a forge: the historical runner accepts a string cwd, so an
+invalid OS path must not authenticate one checkout and launch its lossy sibling.
 The fresh PR number, head and branch must match the selected snapshot. Shared
 authorship admission binds the proof to the checkout's origin and current HEAD;
 the selected view URL must match that proof's structured repository and exact PR
@@ -36,7 +39,7 @@ has no new DB/provider prerequisite.
 
 ## Regression and review gates
 
-Seven new tests invoke the production blocking admission helper and its actual
+Eight new tests invoke the production blocking admission helper and its actual
 launch callback boundary with synthetic local Git/DB fixtures and a recording
 forge. They cover an owned organization PR reaching one launch callback; foreign
 and unknown author, mixed PR number, stale head/branch/worktree; hostile selected
@@ -47,6 +50,14 @@ broader policy without DB or proof. These tests do not execute a coding agent,
 contact a provider, resolve real credentials or demonstrate actual credential
 isolation. Preparation and launch counters assert the ordering in production
 control flow, including proof before sandbox preparation.
+
+Independent review found that an invalid UTF-8 OS path could authenticate the
+original checkout while the string-only runner used its replacement-character
+sibling. The revision rejects that path before outer-worker DB/forge access and
+again at the injectable admission seam. A two-directory fixture proves the
+cache-key collision and zero provider/preparation/launch calls. It reuses the
+existing platform non-Unicode fixture helper, whose byte-path case runs on Unix;
+the unsupported platform branch returns without claiming native path coverage.
 
 At the initial review checkpoint, rustfmt and diff checks pass. Production host
 compilation, focused regression execution and independent source review are

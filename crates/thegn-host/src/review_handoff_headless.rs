@@ -28,10 +28,22 @@ pub(super) struct Request {
     pub feedback: String,
 }
 
+fn selected_worktree_key(request: &Request, own_only: bool) -> Result<String, &'static str> {
+    // AgentTaskRun still accepts a string cwd. Never authenticate the original
+    // OS path and then launch a different checkout through lossy conversion.
+    if own_only && request.worktree.to_str().is_none() {
+        return Err(
+            "review handoff held: own-only execution requires a lossless UTF-8 worktree path",
+        );
+    }
+    Ok(GitLoc::worktree_cache_key(&request.worktree))
+}
+
 pub(super) fn run(cfg: &Config, queue: &PrQueueConfig, request: &Request) -> Result<(), String> {
+    let worktree = selected_worktree_key(request, queue.own_prs_only)?;
     let prepare = || match crate::agent_run::agent_floor_gate(
         cfg,
-        &GitLoc::worktree_cache_key(&request.worktree),
+        &worktree,
         queue.agent_sandbox,
         queue.agent_isolation_floor,
         queue.agent_on_floor_miss,
@@ -73,7 +85,7 @@ fn execute(
     prepare: impl FnOnce() -> Result<Option<SandboxSpec>, String>,
     launch: impl FnOnce(&AgentTaskRun<'_>) -> bool,
 ) -> Result<(), String> {
-    let worktree = GitLoc::worktree_cache_key(&request.worktree);
+    let worktree = selected_worktree_key(request, queue.own_prs_only)?;
     let loc = GitLoc::Local(request.worktree.clone());
     let admitted = if queue.own_prs_only {
         let (db, forge) = authority.ok_or(pr_authorship::HELD)?;
