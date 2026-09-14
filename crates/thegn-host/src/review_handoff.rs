@@ -4,7 +4,7 @@
 //! pane search is deliberately scoped to the active worktree's own tabs and
 //! checks the actual foreground process rather than the focused pane.
 
-use thegn_core::agent_task::{TaskKind, TaskVars};
+use thegn_core::agent_task::TaskVars;
 use thegn_core::config::Config;
 use thegn_core::review::{PrReviewSnapshot, format_review_feedback};
 
@@ -14,6 +14,9 @@ use crate::hydrate::RefreshKind;
 use crate::panes::Panes;
 use crate::session::{Session, Tab};
 use tokio::sync::mpsc::UnboundedSender;
+
+#[path = "review_handoff_headless.rs"]
+mod headless;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewSelection {
@@ -173,50 +176,19 @@ pub(crate) fn dispatch(
             let refresh_tx = refresh_tx.clone();
             let waker = waker.clone();
             let queue = review_queue(session, cfg);
-            let worktree = crate::hydrate::active_tab_path(session)
-                .to_string_lossy()
-                .into_owned();
-            let sandbox = match crate::agent_run::agent_floor_gate(
-                cfg,
-                &worktree,
-                queue.agent_sandbox,
-                queue.agent_isolation_floor,
-                queue.agent_on_floor_miss,
-            ) {
-                crate::agent_run::AgentDispatch::Run(sandbox) => sandbox,
-                crate::agent_run::AgentDispatch::RunDegraded(sandbox, warning) => {
-                    thegn_core::msg::warn(&warning);
-                    sandbox
-                }
-                crate::agent_run::AgentDispatch::InfraHold(reason) => {
-                    model.status = format!("review handoff blocked: {reason}");
-                    return;
-                }
-            };
-            let vars = vars(&snapshot, base, title, url, &worktree, text);
-            let prompt = match thegn_core::agent_task::render_prompt(
-                queue.prompts.resolve(TaskKind::PrReview),
-                &vars,
-            ) {
-                Ok(prompt) => prompt,
-                Err(error) => {
-                    model.status = format!("review handoff template invalid: {error}");
-                    return;
-                }
+            let cfg = cfg.clone();
+            let request = headless::Request {
+                worktree: crate::hydrate::active_tab_path(session),
+                snapshot,
+                command,
+                title: title.into(),
+                url: url.into(),
+                base: base.into(),
+                feedback: text,
             };
             tokio::task::spawn_blocking(move || {
-                let ok = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
-                    kind: TaskKind::PrReview,
-                    worktree: &worktree,
-                    prompt: &prompt,
-                    command_template: &command,
-                    vars: &vars,
-                    timeout_secs: queue.agent_timeout_secs,
-                    sandbox,
-                    credential_free: false,
-                });
-                if !ok {
-                    thegn_core::msg::warn("PR review agent handoff failed");
+                if let Err(reason) = headless::run(&cfg, &queue, &request) {
+                    thegn_core::msg::warn(&reason);
                 }
                 if refresh_tx.send(RefreshKind::Pr).is_ok()
                     && let Err(error) = waker.wake()
@@ -224,7 +196,7 @@ pub(crate) fn dispatch(
                     tracing::debug!(%error, "review handoff refresh wake failed");
                 }
             });
-            model.status = "review feedback sent to headless agent".into();
+            model.status = "review handoff queued for verification".into();
         }
         PaneTarget::None => {
             model.status = "no live agent pane or configured headless agent".into();
