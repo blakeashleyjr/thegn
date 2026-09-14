@@ -1,5 +1,10 @@
 # September 13 audit remediation
 
+**September 14 update:** the reviewed candidate is now merged into local main.
+All 99 previously blocked tests pass. Earlier read-only/failed-validation holds
+below are historical; see [landing receipt](local-main-landing-2026-09-14.md).
+THE-154 native platform/containment follow-ups remain open.
+
 Tracking: [THE-614](https://linear.app/blakeashley/issue/THE-614). Baseline:
 `f4c1355bf2dce35b78502e1fe2023ab6054e19ac`. This is an implementation/review
 record, not a claim that the running build contains these changes.

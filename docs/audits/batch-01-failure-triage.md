@@ -1,5 +1,10 @@
 # Batch 01 combined test failure triage
 
+**September 14 update:** the reviewed candidate is now merged into local main.
+All 99 previously blocked tests pass. Earlier read-only/failed-validation holds
+below are historical; see [landing receipt](local-main-landing-2026-09-14.md).
+THE-154 native platform/containment follow-ups remain open.
+
 This is a source/log review, not a rerun or a waiver. Inputs are
 `/tmp/thegn-audit-combined-host-results.json` and
 `/tmp/thegn-audit-combined-svc-results.json`, plus their referenced per-test logs.

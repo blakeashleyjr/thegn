@@ -1,5 +1,10 @@
 # Maintenance batch 02 review checkpoint
 
+**September 14 update:** the reviewed candidate is now merged into local main.
+All 99 previously blocked tests pass. Earlier read-only/failed-validation holds
+below are historical; see [landing receipt](local-main-landing-2026-09-14.md).
+THE-154 native platform/containment follow-ups remain open.
+
 This is a private review candidate, **not a canonical-main landing**. The checkout's
 Git metadata remains read-only. Batch-01 native ownership/socket test failures
 remain outstanding and are not waived by this batch's focused passes.
