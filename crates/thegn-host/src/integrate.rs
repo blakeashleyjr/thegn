@@ -2208,6 +2208,195 @@ mod tests {
         assert!(report.diagnostics.contains("[base] failed"));
     }
 
+    #[test]
+    #[cfg(unix)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owned actual Git integration fixture"
+    )]
+    fn configured_cleanup_runs_only_after_real_target_advance_and_committed_outcome() {
+        // One environment lock for the entire fold/persist/cleanup chain. Repo::new
+        // also owns that non-reentrant lock, so it must not be nested here.
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let private = tempfile::tempdir().unwrap();
+        let base = private.path().canonicalize().unwrap();
+        let root = base.join("selected-repository");
+        let foreign = base.join("foreign-repository");
+        let checkout = base.join("selected-checkout");
+        let foreign_checkout = base.join("foreign-checkout");
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = isolation.git(cwd).args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "private git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end_matches('\n')
+                .to_owned()
+        };
+        for (repository, worktree, branch) in [
+            (&root, &checkout, "candidate"),
+            (&foreign, &foreign_checkout, "foreign-candidate"),
+        ] {
+            std::fs::create_dir(repository).unwrap();
+            git(repository, &["init", "-q", "-b", "main"]);
+            git(repository, &["config", "user.name", "private-fixture"]);
+            git(
+                repository,
+                &["config", "user.email", "private@example.invalid"],
+            );
+            git(repository, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+            git(repository, &["add", "base.txt"]);
+            git(repository, &["commit", "-q", "-m", "base"]);
+            git(
+                repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(worktree.join("owned.txt"), format!("{branch} payload\n")).unwrap();
+            git(worktree, &["add", "owned.txt"]);
+            git(worktree, &["commit", "-q", "-m", "distinct candidate"]);
+        }
+        // Implicit GitLoc registry reads and explicit persistence use this same
+        // fresh private state database. No final outcome is seeded for candidate.
+        let db = Db::open().unwrap();
+        let wt = checkout.to_str().unwrap();
+        let foreign_wt = foreign_checkout.to_str().unwrap();
+        db.enqueue_merge(wt, "candidate", "main").unwrap();
+        db.set_merge_agent_attempts(wt, 2).unwrap();
+        db.enqueue_merge(foreign_wt, "foreign-candidate", "main")
+            .unwrap();
+        let foreign_tip = git(&foreign, &["rev-parse", "foreign-candidate"]);
+        db.update_merge_status(
+            foreign_wt,
+            "landed",
+            Some(&foreign_tip),
+            None,
+            Some("foreign evidence"),
+        )
+        .unwrap();
+        let queued = db.list_merge_queue().unwrap();
+        let selected_before = queued
+            .iter()
+            .find(|row| row.worktree == wt)
+            .unwrap()
+            .clone();
+        let foreign_before = queued
+            .iter()
+            .find(|row| row.worktree == foreign_wt)
+            .unwrap()
+            .clone();
+        let foreign_refs = git(
+            &foreign,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        let foreign_registrations = git(&foreign, &["worktree", "list", "--porcelain"]);
+        let foreign_bytes = std::fs::read(foreign_checkout.join("owned.txt")).unwrap();
+        let target_before = git(&root, &["rev-parse", "main"]);
+        let source_tip = git(&root, &["rev-parse", "candidate"]);
+        assert_ne!(
+            target_before, source_tip,
+            "must land a distinct unmerged commit"
+        );
+        let candidates = Candidates {
+            branches: vec![Branch {
+                name: "candidate".into(),
+                tip: source_tip.clone(),
+            }],
+            skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
+            worktrees: HashMap::from([("candidate".into(), wt.into())]),
+        };
+        let observations = observe_outcomes(&db, &candidates).unwrap();
+        let mut config = cfg("printf 'private-positive-cleanup-gate\\n'");
+        config.land_strategy = thegn_core::config::LandStrategy::Merge;
+        config.organize_folders = true;
+        config.on_landed = thegn_core::config::OnLanded::Remove;
+        let report = run_fold(&config, &root, candidates.branches.clone()).unwrap();
+        assert!(report.advanced && report.gate == GateOutcome::Passed);
+        assert_eq!(report.landed.len(), 1);
+        assert_eq!(report.landed[0].branch, "candidate");
+        let landed = &report.landed[0].commit;
+        assert_ne!(landed, &target_before);
+        assert_eq!(git(&root, &["rev-parse", "main"]), *landed);
+        git(&root, &["merge-base", "--is-ancestor", &source_tip, "main"]);
+        assert!(
+            checkout.join("owned.txt").is_file(),
+            "fold alone must not perform lifecycle cleanup"
+        );
+        assert_eq!(
+            db.list_merge_queue()
+                .unwrap()
+                .iter()
+                .find(|row| row.worktree == wt)
+                .unwrap(),
+            &selected_before
+        );
+        assert!(report.request_result().is_ok());
+
+        // The actual production persistence function commits Landed before
+        // invoking apply_landed with the configured automatic Remove policy.
+        persist(&config, &root, &db, &candidates, &report, &observations).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&checkout).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let registrations = git(&root, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !registrations
+                .lines()
+                .any(|line| line == format!("worktree {wt}"))
+        );
+        assert_eq!(git(&root, &["rev-parse", "main"]), *landed);
+        assert_eq!(
+            git(&root, &["rev-parse", "candidate"]),
+            source_tip,
+            "THE596 keeps the branch ref"
+        );
+        let rows = db.list_merge_queue().unwrap();
+        let held = rows.iter().find(|row| row.worktree == wt).unwrap();
+        assert_eq!(held.status, "landed");
+        assert_eq!(held.result_oid.as_deref(), Some(landed.as_str()));
+        assert_eq!(
+            held.error_detail.as_deref(),
+            Some(thegn_core::merge_sweep::CleanupHold::BranchRetained.marker())
+        );
+        assert!(held.conflict_paths.is_none());
+        assert_eq!(held.agent_attempts, selected_before.agent_attempts);
+        assert_eq!(held.queued_at, selected_before.queued_at);
+        assert_eq!(
+            rows.iter().find(|row| row.worktree == foreign_wt).unwrap(),
+            &foreign_before
+        );
+        assert_eq!(
+            git(
+                &foreign,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            foreign_refs
+        );
+        assert_eq!(
+            git(&foreign, &["worktree", "list", "--porcelain"]),
+            foreign_registrations
+        );
+        assert_eq!(
+            std::fs::read(foreign_checkout.join("owned.txt")).unwrap(),
+            foreign_bytes
+        );
+        drop(db);
+        private.close().expect("private real-land fixture cleanup");
+    }
+
     /// Every failed case is exercised with a real linked worktree and a private
     /// DB. Destructive on-land policy is intentionally armed: speculative
     /// persistence must never reach it. Implicit state access is isolated by Repo.

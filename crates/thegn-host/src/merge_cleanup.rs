@@ -643,20 +643,31 @@ impl TestIsolation {
     pub(crate) fn new() -> Self {
         let state = tempfile::tempdir().unwrap();
         let path = state.path().to_str().unwrap();
-        let env = thegn_core::testenv::EnvGuard::set(&[
-            ("XDG_STATE_HOME", path),
-            ("XDG_CONFIG_HOME", path),
-            ("LOCALAPPDATA", path),
-            ("APPDATA", path),
-            ("THEGN_DIR", path),
-            ("TMPDIR", path),
-            ("TMP", path),
-            ("TEMP", path),
-            ("THEGN_SANDBOX_ENABLED", "false"),
-            ("THEGN_SANDBOX_BACKEND", "none"),
-            ("THEGN_PROFILE", ""),
-        ]);
         let config = state.path().join("absent.gitconfig");
+        let env = thegn_core::testenv::EnvGuard::mutate_pairs(&[
+            ("XDG_STATE_HOME", Some(path)),
+            ("XDG_CONFIG_HOME", Some(path)),
+            ("LOCALAPPDATA", Some(path)),
+            ("APPDATA", Some(path)),
+            ("THEGN_DIR", Some(path)),
+            ("TMPDIR", Some(path)),
+            ("TMP", Some(path)),
+            ("TEMP", Some(path)),
+            ("THEGN_SANDBOX_ENABLED", Some("false")),
+            ("THEGN_SANDBOX_BACKEND", Some("none")),
+            ("THEGN_PROFILE", Some("")),
+            ("GIT_CONFIG_GLOBAL", Some(config.to_str().unwrap())),
+            ("GIT_CONFIG_NOSYSTEM", Some("1")),
+            ("GIT_CONFIG_COUNT", None),
+            ("GIT_CONFIG_PARAMETERS", None),
+            ("GIT_TEMPLATE_DIR", None),
+            ("GIT_DIR", None),
+            ("GIT_COMMON_DIR", None),
+            ("GIT_WORK_TREE", None),
+            ("GIT_INDEX_FILE", None),
+            ("GIT_OBJECT_DIRECTORY", None),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", None),
+        ]);
         let previous = TEST_GIT_CONFIG.with(|slot| slot.replace(Some(config)));
         Self {
             previous,
