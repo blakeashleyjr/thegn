@@ -670,6 +670,20 @@
       "changes": [
         "harden-live-diagnostics-and-forge"
       ]
+    },
+    {
+      "issue": "THE-636",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "isolate-maintenance-regression-fixtures"
+      ]
+    },
+    {
+      "issue": "THE-637",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "isolate-maintenance-regression-fixtures"
+      ]
     }
   ]
 }
