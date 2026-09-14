@@ -135,7 +135,7 @@ pub fn classify_wake_storm(
     }
 }
 
-/// Per-frame compose+flush budget in microseconds. A rollup whose median frame
+/// Per-frame host composition/submission budget in microseconds. A rollup whose median frame
 /// exceeds this warns (the slow-frame guard), independent of wake count — the
 /// signal the old idle-ratio/wake-count storm warning could never see. Default
 /// 16ms (one 60Hz frame); override with `THEGN_FRAME_BUDGET_US`.
@@ -147,8 +147,8 @@ pub fn frame_budget_us() -> u64 {
         .unwrap_or(16_000)
 }
 
-/// Input→frame latency budget in microseconds — the user-facing "usable
-/// performance" number (keypress/click → the frame that shows its effect). A
+/// First-host-observation→submission budget in microseconds. This clock does
+/// not include terminal-reader delay or establish an application response. A
 /// rollup whose median input latency exceeds this warns (the slow-input guard),
 /// the signal that interactivity regressed regardless of render/idle proxies.
 /// Default 50ms; override with `THEGN_INPUT_BUDGET_US`.
@@ -252,10 +252,12 @@ pub enum Subsys {
     Rows,
     /// On-loop: the `need_relayout` block (pane geometry + PTY resizes).
     Relayout,
+    /// CPU on scoped hydration/panel fan-out threads, separate from the parent.
+    HydrateChild,
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 14] = [
+    pub const ALL: [Subsys; 15] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -270,6 +272,7 @@ impl Subsys {
         Subsys::Drawer,
         Subsys::Rows,
         Subsys::Relayout,
+        Subsys::HydrateChild,
     ];
     pub const N: usize = Self::ALL.len();
 
@@ -290,6 +293,7 @@ impl Subsys {
             Subsys::Drawer => "drawer",
             Subsys::Rows => "rows",
             Subsys::Relayout => "relayout",
+            Subsys::HydrateChild => "hydrate-child",
         }
     }
 }
@@ -370,8 +374,9 @@ impl Drop for CpuGuard {
 
 /// A tiny power-of-two bucket histogram: `bucket[k]` counts samples in
 /// `[2^k, 2^(k+1))` microseconds. O(1) record, no allocation, no sorting —
-/// good enough for p50/p99 of render latency. 32 buckets cover up to ~4s.
-#[derive(Clone)]
+/// good enough for p50/p99 of render latency. The final bucket starts at
+/// 2^31 microseconds; larger samples saturate into it.
+#[derive(Clone, Debug)]
 pub struct Histo {
     buckets: [u64; Self::N],
     count: u64,
@@ -403,6 +408,10 @@ impl Histo {
     #[allow(dead_code)] // histogram helper, used by the Telemetry overlay
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
     }
 
     /// Approximate percentile (0.0..=1.0) in microseconds. Returns the lower
@@ -563,9 +572,15 @@ pub struct LoopPerf {
     /// thousands of cheap pane frames.
     pub render_incr_us: Histo,
     pub render_full_us: Histo,
-    /// Input→frame latency samples: from an input event's dispatch to the frame
-    /// that renders its effect. The primary "usable performance" metric.
+    /// First observed pending input to next submission (coalesced cohort).
+    /// Does not establish a causal application response or physical display.
     pub input_us: Histo,
+    pub input_events: u64,
+    pub input_coalesced_events: u64,
+    pending_input_events: u64,
+    pub resync_us: Histo,
+    pub(crate) writer: crate::perf_timing::WriterMetrics,
+    pub writer_deferred: bool,
     /// Switch→frame latency samples: from a tab/worktree-switch action to the
     /// first frame that shows the destination — the perceived switch cost.
     pub switch_us: Histo,
@@ -575,9 +590,9 @@ pub struct LoopPerf {
     /// Under a multi-pane flood this is the loop-thread cost that competes
     /// directly with input handling.
     pub drain_us: Histo,
-    /// Time inside `emit_frame` (wire render + stdout write + flush) — the
-    /// slow-outer-terminal (SSH) backpressure signal, split out of `render_us`
-    /// so compose+diff vs flush attribute separately.
+    /// Legacy submission-path timing: wire encoding + writer enqueue normally;
+    /// synchronous rendering also includes the sink write. Writer completion
+    /// is accounted separately in `writer`.
     pub flush_us: Histo,
     /// PTY output bytes drained this interval (chunk counts hide chunk size).
     pub pty_bytes: u64,
@@ -585,7 +600,7 @@ pub struct LoopPerf {
     pub input_preempts: u64,
     /// Pane-only frames deferred by the pacing gate (`loop_policy::frame_gate`).
     pub frames_deferred: u64,
-    /// Wall-clock spent inside compose+flush this interval — the honest
+    /// Wall-clock spent inside host composition/submission this interval — the honest
     /// "rendering cost" the idle ratio hides (a frame can be 120ms yet the loop
     /// still reports 85% idle because it blocks between frames).
     pub render_busy: Duration,
@@ -615,6 +630,12 @@ impl LoopPerf {
             render_incr_us: Histo::new(),
             render_full_us: Histo::new(),
             input_us: Histo::new(),
+            input_events: 0,
+            input_coalesced_events: 0,
+            pending_input_events: 0,
+            resync_us: Histo::new(),
+            writer: crate::perf_timing::WriterMetrics::default(),
+            writer_deferred: false,
             switch_us: Histo::new(),
             switch_ws_us: Histo::new(),
             drain_us: Histo::new(),
@@ -672,6 +693,24 @@ impl LoopPerf {
         }
     }
 
+    /// Count dispatched events, not PTY preemption observations. A latency
+    /// sample covers a cohort of one or more events before the next submission.
+    pub fn input_event(&mut self) {
+        if enabled() {
+            self.input_events += 1;
+            if self.pending_input_events > 0 {
+                self.input_coalesced_events += 1;
+            }
+            self.pending_input_events += 1;
+        }
+    }
+
+    pub fn resync(&mut self, dt: Duration) {
+        if enabled() {
+            self.resync_us.record_us(dt.as_micros() as u64);
+        }
+    }
+
     /// One PTY drain pass completed in `dt` (wall time on the loop thread).
     #[inline]
     pub fn drain(&mut self, dt: Duration) {
@@ -680,7 +719,7 @@ impl LoopPerf {
         }
     }
 
-    /// One frame's `emit_frame` (wire + write + flush) took `dt`.
+    /// Legacy encoding/submission timing; sink I/O is included only in sync mode.
     #[inline]
     pub fn flush(&mut self, dt: Duration) {
         if enabled() {
@@ -704,15 +743,12 @@ impl LoopPerf {
         }
     }
 
-    /// A frame was composed + flushed in `dt`. `pane_only` is true when the
-    /// streaming fast path served it (recompose + bounded-diff only the damaged
-    /// panes); false for a full/chrome frame. `input_since` is the dispatch time
-    /// of the input event this frame responds to (if any); it's **taken** so the
-    /// dispatch→frame delta — the user-facing "usable performance" latency — is
-    /// recorded once and the stamp cleared (also unblocks the input-priority PTY
-    /// budget on the next iteration). `switch_since` is the same mechanism for a
-    /// switch action: taken here, so `switch_us`/`switch_ws_us` record exactly
-    /// the action→first-post-switch-frame latency, split by [`SwitchKind`].
+    /// Host frame work through submission took `dt`. `pane_only` identifies
+    /// incremental composition, even if a periodic resync re-emitted the full
+    /// surface. `input_since` is the earliest host observation in the pending
+    /// cohort, taken once on submission. No causal response/display guarantee
+    /// is implied. Clearing it also releases the input-priority PTY budget.
+    /// Switch stamps likewise measure action→next submission, split by kind.
     /// Both cleared even when accounting is off.
     #[inline]
     pub fn render(
@@ -723,6 +759,7 @@ impl LoopPerf {
         switch_since: &mut Option<(Instant, SwitchKind)>,
     ) {
         let input = input_since.take();
+        self.pending_input_events = 0;
         let switch = switch_since.take();
         if enabled() {
             self.renders += 1;
@@ -798,11 +835,6 @@ impl LoopPerf {
         self.drain_items[src as usize]
     }
 
-    /// Seconds since the last reset.
-    pub fn elapsed_secs(&self) -> f64 {
-        self.report_t0.elapsed().as_secs_f64().max(1e-9)
-    }
-
     /// Reset all counters and restart the interval clock.
     pub fn take(&mut self) {
         self.drain_items = [0; WakeSource::N];
@@ -815,6 +847,11 @@ impl LoopPerf {
         self.render_incr_us.reset();
         self.render_full_us.reset();
         self.input_us.reset();
+        self.input_events = 0;
+        self.input_coalesced_events = 0;
+        self.resync_us.reset();
+        self.writer = crate::perf_timing::WriterMetrics::default();
+        self.writer_deferred = false;
         self.switch_us.reset();
         self.switch_ws_us.reset();
         self.drain_us.reset();
@@ -841,6 +878,23 @@ impl Default for LoopPerf {
 /// and consumed by the live Telemetry overlay. All rates are per-second.
 #[derive(Clone, Debug, Default)]
 pub struct PerfSnapshot {
+    pub interval_seconds: f64,
+    pub frame_samples: u64,
+    pub input_samples: u64,
+    pub input_events: u64,
+    pub input_coalesced_events: u64,
+    pub resync_samples: u64,
+    pub resync_p99_us: u64,
+    pub writer_frames: u64,
+    pub writer_failed_frames: u64,
+    pub writer_deferred_rollups: u64,
+    pub writer_input_samples: u64,
+    pub writer_queue_p99_us: u64,
+    pub writer_write_p99_us: u64,
+    pub writer_completion_p99_us: u64,
+    pub writer_input_p99_us: u64,
+    pub hydrate_calls: u64,
+    pub hydrate_child_calls: u64,
     pub wakes_per_s: f64,
     pub renders_per_s: f64,
     pub pane_frames_per_s: f64,
@@ -855,7 +909,8 @@ pub struct PerfSnapshot {
     /// Pane-only fast-path frame cost percentiles.
     pub render_incr_p50_us: u64,
     pub render_incr_p99_us: u64,
-    /// Input→frame latency percentiles this interval (0 when no input landed).
+    /// Legacy first-observation→submission percentiles; consult input_samples
+    /// to distinguish no observations from the zero-microsecond bucket.
     pub input_p50_us: u64,
     pub input_p99_us: u64,
     /// Switch→first-frame latency percentiles (0 when no switch happened).
@@ -868,12 +923,12 @@ pub struct PerfSnapshot {
     /// PTY drain wall-time percentiles per loop iteration.
     pub drain_p50_us: u64,
     pub drain_p99_us: u64,
-    /// `emit_frame` (wire+write+flush) percentiles.
+    /// Legacy wire-encoding/submission percentiles (includes write in sync mode).
     pub flush_p50_us: u64,
     pub flush_p99_us: u64,
     pub pty_bytes_per_s: f64,
     pub idle_ratio: f64,
-    /// Fraction of wall-clock spent composing+flushing frames. Unlike
+    /// Fraction of wall-clock spent in host frame work through submission. Unlike
     /// `idle_ratio`, this exposes a slow-render cost even when the loop blocks
     /// most of the time between frames.
     pub render_busy_ratio: f64,
@@ -890,8 +945,11 @@ impl LoopPerf {
     /// warning if idle but pulsing), drain the CPU ledger, reset, and return a
     /// snapshot for the live overlay. Called by the loop when [`due`](Self::due)
     /// — never on its own timer (that would add a wake source).
-    pub fn rollup(&mut self) -> PerfSnapshot {
-        let secs = self.elapsed_secs();
+    pub fn rollup(&mut self, boundary: Instant) -> PerfSnapshot {
+        let secs = boundary
+            .saturating_duration_since(self.report_t0)
+            .as_secs_f64()
+            .max(1e-9);
         let cpu = CPU.take();
         let mut cpu_ms = [0.0f64; Subsys::N];
         for i in 0..Subsys::N {
@@ -901,6 +959,23 @@ impl LoopPerf {
         let hot_items = self.items(hot);
         let busy_ratio = (self.busy.as_secs_f64() / secs).clamp(0.0, 1.0);
         let snap = PerfSnapshot {
+            interval_seconds: secs,
+            frame_samples: self.render_us.count(),
+            input_samples: self.input_us.count(),
+            input_events: self.input_events,
+            input_coalesced_events: self.input_coalesced_events,
+            resync_samples: self.resync_us.count(),
+            resync_p99_us: self.resync_us.percentile_us(0.99),
+            writer_frames: self.writer.completion_us.count(),
+            writer_failed_frames: self.writer.failed_frames,
+            writer_deferred_rollups: self.writer.deferred_rollups,
+            writer_input_samples: self.writer.input_completion_us.count(),
+            writer_queue_p99_us: self.writer.queue_us.percentile_us(0.99),
+            writer_write_p99_us: self.writer.write_us.percentile_us(0.99),
+            writer_completion_p99_us: self.writer.completion_us.percentile_us(0.99),
+            writer_input_p99_us: self.writer.input_completion_us.percentile_us(0.99),
+            hydrate_calls: cpu[Subsys::Hydrate as usize].1,
+            hydrate_child_calls: cpu[Subsys::HydrateChild as usize].1,
             wakes_per_s: self.wakes as f64 / secs,
             renders_per_s: self.renders as f64 / secs,
             pane_frames_per_s: self.pane_frames as f64 / secs,
@@ -933,6 +1008,26 @@ impl LoopPerf {
 
         tracing::info!(
             target: "thegn::perf",
+            metric_version = 2,
+            interval_seconds = snap.interval_seconds,
+            frame_samples = snap.frame_samples,
+            input_samples = snap.input_samples,
+            input_events = snap.input_events,
+            input_coalesced_events = snap.input_coalesced_events,
+            resync_samples = snap.resync_samples,
+            resync_p99_us = snap.resync_p99_us,
+            writer_metrics_deferred = self.writer_deferred,
+            writer_frames = snap.writer_frames,
+            writer_failed_frames = snap.writer_failed_frames,
+            writer_deferred_rollups = snap.writer_deferred_rollups,
+            writer_input_samples = snap.writer_input_samples,
+            writer_queue_p99_us = snap.writer_queue_p99_us,
+            writer_write_p99_us = snap.writer_write_p99_us,
+            writer_completion_p99_us = snap.writer_completion_p99_us,
+            writer_input_p99_us = snap.writer_input_p99_us,
+            hydrate_calls = snap.hydrate_calls,
+            hydrate_child_calls = snap.hydrate_child_calls,
+            cpu_hydrate_child_ms = cpu_ms[Subsys::HydrateChild as usize],
             wakes_per_s = snap.wakes_per_s,
             renders_per_s = snap.renders_per_s,
             pane_frames_per_s = snap.pane_frames_per_s,
@@ -1019,11 +1114,11 @@ impl LoopPerf {
             WakeStorm::None => {}
         }
 
-        // Slow-frame guard: the median frame blew the compose+flush budget. Keys
+        // Slow-frame guard: the median frame blew the host submission-path budget. Keys
         // on cost-per-frame, NOT wake count or idle ratio — the condition the
         // storm warning above is structurally blind to (a 120ms frame fired a
         // few times a second still reads as "85% idle, 3 wakes/s"). This is the
-        // signal that the damage-compositor regressed back to full recomposes.
+        // is a budget observation; it does not diagnose a recomposition cause.
         if self.renders > 0 && snap.render_p50_us > frame_budget_us() {
             tracing::warn!(
                 target: "thegn::perf",
@@ -1032,7 +1127,7 @@ impl LoopPerf {
                 render_busy_ratio = snap.render_busy_ratio,
                 full_frames_per_s = snap.full_frames_per_s,
                 budget_us = frame_budget_us(),
-                "slow frames: p50 over budget — render path is recomposing too much"
+                "slow frames: submission-path p50 over budget"
             );
         }
 
@@ -1047,11 +1142,14 @@ impl LoopPerf {
                 input_p50_us = snap.input_p50_us,
                 input_p99_us = snap.input_p99_us,
                 budget_us = input_budget_us(),
-                "slow input: p50 over budget — input→frame latency regressed"
+                "slow input: observation-to-submission p50 over budget"
             );
         }
 
         self.take();
+        // Rollup/logging/publication work belongs to the NEXT interval, whose
+        // active clock uses this exact same boundary. Do not discard its cost.
+        self.report_t0 = boundary;
         snap
     }
 }
@@ -1160,6 +1258,45 @@ mod tests {
         // take() resets, so a second read is all zeros.
         let second = ledger.take();
         assert_eq!(second[Subsys::Hydrate as usize], (0, 0));
+    }
+
+    #[test]
+    fn zero_bucket_still_reports_its_sample_count() {
+        let mut histogram = Histo::new();
+        assert_eq!(histogram.count(), 0);
+        histogram.record_us(1);
+        assert_eq!(histogram.percentile_us(0.99), 0);
+        assert_eq!(histogram.count(), 1);
+    }
+
+    #[test]
+    fn rollup_counts_cohorts_and_uses_the_supplied_reset_boundary() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(true);
+        let mut lp = LoopPerf::new();
+        let start = lp.report_t0;
+        lp.input_event();
+        lp.input_event();
+        lp.render(Duration::from_millis(1), true, &mut Some(start), &mut None);
+        lp.resync(Duration::from_micros(200));
+        lp.add_busy(Duration::from_millis(3));
+        let boundary = start + Duration::from_millis(10);
+        let snapshot = lp.rollup(boundary);
+        assert_eq!(snapshot.frame_samples, 1);
+        assert_eq!(snapshot.input_samples, 1);
+        assert_eq!(snapshot.input_events, 2);
+        assert_eq!(snapshot.input_coalesced_events, 1);
+        assert_eq!(snapshot.resync_samples, 1);
+        assert_eq!(snapshot.interval_seconds, 0.01);
+        assert!((snapshot.idle_ratio - 0.7).abs() < 1e-9);
+        assert_eq!(lp.report_t0, boundary);
+        assert_eq!(lp.input_events, 0);
+        // Publication/dispatch after the boundary belongs to the new interval.
+        lp.add_busy(Duration::from_millis(4));
+        let next = lp.rollup(boundary + Duration::from_millis(10));
+        assert!((next.idle_ratio - 0.6).abs() < 1e-9);
+        assert_eq!(next.input_samples, 0);
+        set_enabled(false);
     }
 
     #[test]

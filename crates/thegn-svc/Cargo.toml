@@ -34,6 +34,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
+same-file.workspace = true
 # git reads go native via gix (Phase 2); GitHub via octocrab GraphQL (Phase 4).
 gix.workspace = true
 octocrab.workspace = true
