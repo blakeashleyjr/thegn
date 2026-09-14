@@ -720,8 +720,14 @@
       "lifecycle": "active",
       "disposition": "verification-gated",
       "owners": [
-        {"issue": "THE-608", "project": "Runtime Security & Host Architecture"},
-        {"issue": "THE-610", "project": "Runtime Security & Host Architecture"}
+        {
+          "issue": "THE-608",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-610",
+          "project": "Runtime Security & Host Architecture"
+        }
       ],
       "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
     },
@@ -730,7 +736,10 @@
       "lifecycle": "active",
       "disposition": "alpha-delivery",
       "owners": [
-        {"issue": "THE-606", "project": "Runtime Security & Host Architecture"}
+        {
+          "issue": "THE-606",
+          "project": "Runtime Security & Host Architecture"
+        }
       ],
       "summary": "Require verified local canonical history across fold evidence and automatic cleanup; source review and focused/native gates remain pending."
     },
@@ -763,11 +772,26 @@
       "lifecycle": "active",
       "disposition": "alpha-delivery",
       "owners": [
-        {"issue": "THE-588", "project": "Runtime Security & Host Architecture"},
-        {"issue": "THE-593", "project": "Runtime Security & Host Architecture"},
-        {"issue": "THE-594", "project": "Runtime Security & Host Architecture"},
-        {"issue": "THE-596", "project": "Runtime Security & Host Architecture"},
-        {"issue": "THE-600", "project": "Runtime Security & Host Architecture"}
+        {
+          "issue": "THE-588",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-593",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-594",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-596",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-600",
+          "project": "Runtime Security & Host Architecture"
+        }
       ],
       "summary": "Verify automatic collection ownership, preserve uncertain user work and retry records, and report only actual removal; focused and native gates remain pending."
     },
