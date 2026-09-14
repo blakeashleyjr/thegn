@@ -197,7 +197,11 @@ fn preferred_cols(docs: &CalendarDocs, weather_cols: usize) -> usize {
             } else {
                 c.label.clone()
             };
-            crate::seg::cells(&label)
+            thegn_core::calendar::display::DisplayText::new(
+                &label,
+                thegn_core::calendar::display::Field::ClockLabel,
+            )
+            .cells()
         })
         .max()
         .unwrap_or(6);
@@ -381,3 +385,6 @@ pub fn retick_open(
     c.st.weather = weather.cloned();
     changed
 }
+
+#[cfg(test)]
+mod display_tests;

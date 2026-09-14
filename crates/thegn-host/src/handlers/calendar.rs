@@ -7,6 +7,7 @@
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::calendar::DueReminder;
+use thegn_core::calendar::display::{DisplayText, Field};
 use thegn_core::db::Db;
 use thegn_core::notification::NotificationKind;
 use thegn_core::store::NotificationStore;
@@ -51,20 +52,23 @@ fn message_for(r: &DueReminder) -> String {
         m if m % 60 == 0 => format!("in {}h", m / 60),
         m => format!("in {}h{:02}", m / 60, m % 60),
     };
-    let mut msg = format!("{} {when}", r.title);
+    let mut msg = format!(
+        "{} {when}",
+        DisplayText::new(&r.title, Field::Title).as_str()
+    );
     // The most actionable detail available — a meeting URL beats a room name.
     let detail = if !r.url.trim().is_empty() {
-        r.url.trim()
+        DisplayText::new(&r.url, Field::Url).into_string()
     } else {
-        r.location.trim()
+        DisplayText::new(&r.location, Field::Location).into_string()
     };
     if !detail.is_empty() {
         msg.push(' ');
         msg.push_str(crate::caps::active_glyphs().emdash);
         msg.push(' ');
-        msg.push_str(detail);
+        msg.push_str(&detail);
     }
-    msg
+    DisplayText::new(&msg, Field::Reminder).into_string()
 }
 
 #[cfg(test)]
@@ -81,6 +85,19 @@ mod tests {
             trigger_mins: 10,
             starts_in_mins: starts_in,
         }
+    }
+
+    #[test]
+    fn hostile_reminders_are_bounded_single_row_and_keep_semantic_values() {
+        let raw = format!("\r\nATTACK\x1b\x07\t{}", "界\u{301}".repeat(4096));
+        let reminder = rem(&raw, 10, &raw, &raw);
+        let message = message_for(&reminder);
+        assert!(!message.chars().any(char::is_control));
+        assert!(crate::seg::cells(&message) <= 512);
+        assert!(message.chars().count() <= 512);
+        assert_eq!(reminder.title, raw);
+        assert_eq!(reminder.url, raw);
+        assert_eq!(message, message.trim());
     }
 
     #[test]

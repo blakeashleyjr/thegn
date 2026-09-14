@@ -32,7 +32,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::Instant;
 
@@ -55,14 +55,17 @@ pub(crate) enum WriterStatus {
 enum Msg {
     /// A composed frame (wire bytes + trailing graphics/bell).
     Frame(Vec<u8>, Option<FrameStamp>),
-    /// Order-preserving passthrough (OSC 52, kitty deletes, muse marker…).
+    /// Order-preserving passthrough (kitty deletes, muse marker…).
     Oob(Vec<u8>),
+    Clipboard(Vec<u8>),
 }
 
 struct Q {
     msgs: VecDeque<Msg>,
     /// How many `Msg::Frame`s are queued (the 2-deep bound).
     frames_queued: usize,
+    clipboard_queued: usize,
+    clipboard_bytes: usize,
     status: WriterStatus,
     consec_errs: u32,
     shutdown: bool,
@@ -73,6 +76,7 @@ struct Inner {
     q: Mutex<Q>,
     cv: Condvar,
     metrics_deferrals: AtomicU64,
+    clipboard_retry: AtomicBool,
 }
 
 pub(crate) struct FrameWriter {
@@ -94,6 +98,8 @@ impl FrameWriter {
             q: Mutex::new(Q {
                 msgs: VecDeque::new(),
                 frames_queued: 0,
+                clipboard_queued: 0,
+                clipboard_bytes: 0,
                 status: WriterStatus::Ok,
                 consec_errs: 0,
                 shutdown: false,
@@ -101,6 +107,7 @@ impl FrameWriter {
             }),
             cv: Condvar::new(),
             metrics_deferrals: AtomicU64::new(0),
+            clipboard_retry: AtomicBool::new(false),
         });
         let handle = (!sync).then(|| {
             let inner = Arc::clone(&inner);
@@ -154,7 +161,7 @@ impl FrameWriter {
     }
 
     /// Submit order-preserving passthrough bytes (never dropped, unbounded —
-    /// these are small: OSC sequences, kitty deletes, BEL, markers).
+    /// these are small: non-clipboard OSC, kitty deletes, BEL, markers).
     pub(crate) fn submit_oob(&self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
@@ -167,6 +174,47 @@ impl FrameWriter {
         q.msgs.push_back(Msg::Oob(bytes));
         drop(q);
         self.inner.cv.notify_one();
+    }
+
+    /// Only validated pane clipboard sets enter this bounded queue. One
+    /// in-flight write plus four queued sets bound writer-owned clipboard data;
+    /// refused ownership stays with the pane for latest-wins retry.
+    pub(crate) fn try_submit_clipboard(
+        &self,
+        bytes: Vec<u8>,
+        retry_wake: impl FnOnce(),
+    ) -> Result<(), Vec<u8>> {
+        if bytes.len() > crate::queries::clipboard::MAX_WIRE {
+            return Err(bytes);
+        }
+        if self.sync {
+            self.write_inline(&bytes, None);
+            return Ok(());
+        }
+        self.inner.clipboard_retry.store(true, Ordering::SeqCst);
+        let mut q = match self.inner.q.try_lock() {
+            Ok(q) => q,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                // A non-writer lock holder with an empty queue cannot provide
+                // a capacity wake. Pulse now so refused work never strands.
+                retry_wake();
+                return Err(bytes);
+            }
+        };
+        if q.shutdown
+            || matches!(q.status, WriterStatus::Fatal(_))
+            || q.clipboard_queued >= 4
+            || q.clipboard_bytes + bytes.len() > 4 * crate::queries::clipboard::MAX_WIRE
+        {
+            return Err(bytes);
+        }
+        q.clipboard_queued += 1;
+        q.clipboard_bytes += bytes.len();
+        q.msgs.push_back(Msg::Clipboard(bytes));
+        drop(q);
+        self.inner.cv.notify_one();
+        Ok(())
     }
 
     /// Take the current status (resetting Transient back to Ok; Fatal sticks).
@@ -240,15 +288,24 @@ impl Drop for FrameWriter {
     }
 }
 
+fn pop_message(q: &mut Q) -> Option<Msg> {
+    let message = q.msgs.pop_front()?;
+    if matches!(message, Msg::Frame(..)) {
+        q.frames_queued = q.frames_queued.saturating_sub(1);
+    }
+    if let Msg::Clipboard(bytes) = &message {
+        q.clipboard_queued -= 1;
+        q.clipboard_bytes -= bytes.len();
+    }
+    Some(message)
+}
+
 fn writer_main(inner: &Inner, waker: &TerminalWaker) {
     loop {
         let msg = {
             let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(m) = q.msgs.pop_front() {
-                    if matches!(m, Msg::Frame(..)) {
-                        q.frames_queued = q.frames_queued.saturating_sub(1);
-                    }
+                if let Some(m) = pop_message(&mut q) {
                     break Some(m);
                 }
                 if q.shutdown {
@@ -258,6 +315,9 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
             }
         };
         let Some(msg) = msg else { break };
+        if inner.clipboard_retry.swap(false, Ordering::SeqCst) {
+            let _ = waker.wake(); // best-effort: capacity release wakes pending clipboard admission
+        }
         let errored = write_message(inner, msg, write_and_flush);
         if errored {
             // The loop acts on the status (full repaint / teardown) — wake it.
@@ -274,7 +334,7 @@ fn write_message(
     write: impl FnOnce(&[u8]) -> std::io::Result<()>,
 ) -> bool {
     let bytes = match &msg {
-        Msg::Frame(b, _) | Msg::Oob(b) => b,
+        Msg::Frame(b, _) | Msg::Oob(b) | Msg::Clipboard(b) => b,
     };
     // After a Fatal, drop writes (the loop is tearing down); keep draining
     // so shutdown never deadlocks.
@@ -287,7 +347,7 @@ fn write_message(
     }
     let stamp = match &msg {
         Msg::Frame(_, stamp) => *stamp,
-        Msg::Oob(_) => None,
+        Msg::Oob(_) | Msg::Clipboard(_) => None,
     };
     let started = stamp.map(|_| Instant::now());
     let result = write(bytes);
@@ -347,6 +407,8 @@ mod tests {
         Q {
             msgs: VecDeque::new(),
             frames_queued: 0,
+            clipboard_queued: 0,
+            clipboard_bytes: 0,
             status: WriterStatus::Ok,
             consec_errs: 0,
             shutdown: false,
@@ -360,10 +422,66 @@ mod tests {
                 q: Mutex::new(q()),
                 cv: Condvar::new(),
                 metrics_deferrals: AtomicU64::new(0),
+                clipboard_retry: AtomicBool::new(false),
             }),
             handle: None,
             sync: false,
         }
+    }
+
+    #[test]
+    fn clipboard_admission_is_bounded_fifo_and_capacity_is_returned_on_pop() {
+        let writer = test_writer();
+        writer.submit_oob(vec![0]);
+        for byte in 1..=4 {
+            assert!(writer.try_submit_clipboard(vec![byte], || panic!()).is_ok());
+        }
+        assert_eq!(
+            writer.try_submit_clipboard(vec![5], || panic!()),
+            Err(vec![5])
+        );
+        let mut q = writer.inner.q.lock().unwrap();
+        assert_eq!(q.clipboard_queued, 4);
+        assert_eq!(q.clipboard_bytes, 4);
+        assert!(matches!(pop_message(&mut q), Some(Msg::Oob(ref b)) if b == &[0]));
+        for byte in 1..=4 {
+            assert!(matches!(pop_message(&mut q), Some(Msg::Clipboard(ref b)) if b == &[byte]));
+        }
+        assert_eq!(q.clipboard_queued, 0);
+        assert_eq!(q.clipboard_bytes, 0);
+        drop(q);
+        assert!(writer.try_submit_clipboard(vec![5], || panic!()).is_ok());
+        assert!(writer.inner.clipboard_retry.load(Ordering::SeqCst));
+        assert!(
+            writer
+                .try_submit_clipboard(
+                    vec![0; crate::queries::clipboard::MAX_WIRE + 1],
+                    || panic!()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn clipboard_lock_contention_with_empty_queue_pulses_retry_and_retains_bytes() {
+        let writer = test_writer();
+        let held = writer.inner.q.lock().unwrap();
+        let mut wakes = 0;
+        assert_eq!(
+            writer.try_submit_clipboard(vec![7], || wakes += 1),
+            Err(vec![7])
+        );
+        assert_eq!(wakes, 1);
+        assert!(held.msgs.is_empty());
+        drop(held);
+        assert!(writer.try_submit_clipboard(vec![7], || wakes += 1).is_ok());
+        assert_eq!(wakes, 1);
+        let msg = pop_message(&mut writer.inner.q.lock().unwrap()).unwrap();
+        assert!(!write_message(&writer.inner, msg, |b| {
+            assert_eq!(b, &[7]);
+            Ok(())
+        }));
+        assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 0);
     }
 
     #[test]

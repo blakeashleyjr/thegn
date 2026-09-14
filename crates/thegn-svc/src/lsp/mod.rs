@@ -22,10 +22,10 @@ pub mod registry;
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -627,6 +627,7 @@ pub struct LspClient {
     _proc: Option<thegn_core::proc_registry::ProcHandle>,
     next_id: AtomicI64,
     pending: Pending,
+    closed: Arc<AtomicBool>,
     root: PathBuf,
     /// The `languageId` sent in `didOpen` — carried from the resolved spec, so
     /// this connection speaks the wire protocol without any tree-sitter `Lang`.
@@ -732,11 +733,13 @@ impl LspClient {
     ) -> LspClient {
         let stdin: SharedWriter = Arc::new(Mutex::new(writer));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
         let reader_thread = {
             let pending = pending.clone();
             let stdin = stdin.clone();
             let root = root.to_path_buf();
-            thread::spawn(move || reader_loop(reader, pending, diag_tx, stdin, root))
+            let closed = closed.clone();
+            thread::spawn(move || reader_loop(reader, pending, diag_tx, stdin, root, closed))
         };
 
         LspClient {
@@ -744,6 +747,7 @@ impl LspClient {
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
             pending,
+            closed,
             root: root.to_path_buf(),
             language_id,
             caps: OnceLock::new(),
@@ -899,9 +903,16 @@ impl LspClient {
 
     /// Send a request and block (up to `timeout`) for its correlated response.
     fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.ensure_open()?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            // Reader closure uses this same lock to latch closed and drain.
+            // A late requester cannot insert after the terminal drain.
+            self.ensure_open()?;
+            pending.insert(id, tx);
+        }
 
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Err(e) = self.write(&body.to_string()) {
@@ -918,17 +929,28 @@ impl LspClient {
         }
     }
 
+    fn ensure_open(&self) -> Result<(), LspError> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err(LspError::Protocol("server stream closed".into()))
+        } else {
+            Ok(())
+        }
+    }
+
     fn notify(&self, method: &str, params: Value) -> Result<(), LspError> {
+        self.ensure_open()?;
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         self.write(&body.to_string())
     }
 
     fn write(&self, body: &str) -> Result<(), LspError> {
+        self.ensure_open()?;
         let framed = framing::encode(body);
         let mut stdin = self
             .stdin
             .lock()
             .map_err(|_| LspError::Protocol("stdin poisoned".into()))?;
+        self.ensure_open()?;
         stdin
             .write_all(&framed)
             .and_then(|_| stdin.flush())
@@ -958,24 +980,26 @@ fn reader_loop(
     diag_tx: Sender<PublishedDiagnostics>,
     stdin: SharedWriter,
     root: PathBuf,
+    closed: Arc<AtomicBool>,
 ) {
-    let mut decoder = framing::FrameDecoder::new();
-    let mut reader = BufReader::new(reader);
-    let mut chunk = [0u8; 8192];
+    let mut reader = framing::FramedReader::new(reader);
     loop {
-        let n = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        decoder.push(&chunk[..n]);
-        while let Some(body) = decoder.next_message() {
-            if let Ok(msg) = serde_json::from_str::<Value>(&body) {
-                dispatch(&msg, &pending, &diag_tx, &stdin, &root);
+        match reader.read_message() {
+            Ok(Some(body)) => {
+                if let Ok(msg) = serde_json::from_str::<Value>(&body) {
+                    dispatch(&msg, &pending, &diag_tx, &stdin, &root);
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(target: "thegn::lsp", %error, "closing invalid server stream");
+                break;
             }
         }
     }
     // Stream closed — unblock any waiters so they don't hang to the deadline.
     let mut map = pending.lock().unwrap();
+    closed.store(true, Ordering::SeqCst);
     for (_, tx) in map.drain() {
         let _ = tx.send(Err(LspError::Protocol("server stream closed".into()))); // best-effort: pending requesters may be gone
     }
@@ -1039,6 +1063,68 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_framing_rejects_late_concurrent_requests_without_writing() {
+        struct RejectWrites;
+        impl Write for RejectWrites {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("closed transport wrote bytes")
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("closed transport flushed")
+            }
+        }
+        let (diag_tx, diag_rx) = mpsc::channel();
+        let client = Arc::new(LspClient::from_io(
+            Box::new(std::io::Cursor::new(b"bad\r\n\r\n")),
+            Box::new(RejectWrites),
+            "fixture",
+            Path::new("/fixture"),
+            diag_tx,
+        ));
+        assert!(matches!(
+            diag_rx.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let client = client.clone();
+                scope.spawn(move || {
+                    assert!(matches!(client.request("late", Value::Null), Err(LspError::Protocol(ref e)) if e == "server stream closed"));
+                    assert!(client.notify("late", Value::Null).is_err());
+                });
+            }
+        });
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_framing_closes_lsp_and_fails_pending_without_dispatch() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::from([(7, request_tx)])));
+        let (diag_tx, diag_rx) = mpsc::channel();
+        let stdin: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let mut wire = b"Content-Length: 1\r\nContent-Length: 1\r\n\r\nX".to_vec();
+        wire.extend(framing::encode(r#"{"id":7,"result":"must not dispatch"}"#));
+        reader_loop(
+            Box::new(std::io::Cursor::new(wire)),
+            pending.clone(),
+            diag_tx,
+            stdin,
+            PathBuf::from("/fixture"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Err(LspError::Protocol(_)))
+        ));
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            diag_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn uri_round_trips_plain_path() {

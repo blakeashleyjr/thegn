@@ -444,3 +444,19 @@ fn an_entry_that_omits_enabled_still_counts() {
     assert_eq!(a.provider, CalendarProviderKind::Ics);
     assert_eq!(a.timeout_secs, 20);
 }
+
+#[test]
+fn calendar_display_labels_warn_without_rejecting_legacy_config() {
+    let body = "[[calendar.clocks]]\nzone = 'UTC'\nlabel = \"hostile\\nlabel\"\n";
+    let diagnostics = crate::config_validate::validate_diagnostics(body);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("calendar.clocks[0].label")
+                && d.severity == crate::config_validate::ValidationSeverity::Warning)
+    );
+    assert!(crate::config_validate::validate_str(body).is_empty());
+    let cfg: CalendarConfig =
+        toml::from_str("[[clocks]]\nzone = 'UTC'\nlabel = '👩‍💻 中文'\n").unwrap();
+    assert!(display_warnings(&cfg).is_empty());
+}
