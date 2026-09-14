@@ -1,10 +1,10 @@
 # Tasks and dependencies
 
 - [x] THE-595: read-only discovery and selected-only local snapshot admission.
-- [x] THE-595: implement nonzero missing-confirmation refusal and private native dry-run harness (native execution pending).
-- [x] THE-595: queued/unqueued dirty UI tests and private CLI harness cases (native execution pending).
+- [x] THE-595: implement nonzero missing-confirmation refusal and private native dry-run harness.
+- [x] THE-595: queued/unqueued dirty UI tests and private CLI harness cases.
 - [x] THE-595: fail-closed status, branch/HEAD/common-dir and registry tests.
-- [ ] Native fixed-binary proof of failed gate, atomic final status, no sweep and retained successful land.
+- [x] Native fixed-binary proof of failed gate, atomic final status, no sweep and retained successful land.
 - [x] Independent source review and scoped gates before component commit.
 - [ ] THE-588/THE-589/THE-591 combined integration and normal gate before THE-586 retry.
 
@@ -21,3 +21,16 @@ two Cargo jobs and two test threads with private XDG/TMP state.
 The native harness has passed syntax/source review only. It must run against the
 reviewed combined fixed binary before any native queue retry; no native result,
 full gate, main advancement or cleanup approval is implied by these scoped tests.
+
+## Native acceptance — 2026-09-14
+
+The reviewed normal CLI built from local main `1ef8228f` passed the private
+106-command regression in `test/integrate-outcome-native.py`. Evidence is retained
+at `/tmp/thegn-integrate-native-tw5m0z40/evidence`: the result, complete command
+journal, effective private configuration and pinned binary SHA-256 are recorded.
+The strengthened dirty preview and confirmation-refusal cases compare target and
+both source HEADs, indexes, content, all repository refs and logical DB contents.
+Actual selected-only snapshots, failed gates without speculative landed state,
+and successful retained folds also passed. Independent review accepted this
+THE-595 proof. The earlier syntax-only limitation above is superseded; the full
+combined gate and other issues' acceptance remain separate obligations.
