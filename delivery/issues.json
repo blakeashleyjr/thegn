@@ -406,6 +406,13 @@
       ]
     },
     {
+      "issue": "THE-545",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "authenticate-pr-agent-authorship"
+      ]
+    },
+    {
       "issue": "THE-559",
       "project": "Workspace Product & Observability",
       "changes": [

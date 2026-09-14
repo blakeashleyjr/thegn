@@ -525,6 +525,18 @@
       "summary": "The isolation matrix shipped; smolvm and WSL still need real-host verification."
     },
     {
+      "change": "authenticate-pr-agent-authorship",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-545",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Bind own-PR automation to fresh selected PR author, authenticated viewer, repository, head and verified local route."
+    },
+    {
       "change": "bind-identity-commit-signing",
       "lifecycle": "active",
       "disposition": "residual-split",
