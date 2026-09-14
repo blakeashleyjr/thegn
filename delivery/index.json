@@ -725,6 +725,22 @@
       "summary": "Stage and back up confirmed live upgrades; real controller migration verification remains operator-controlled."
     },
     {
+      "change": "isolate-maintenance-regression-fixtures",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-636",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-637",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Keep watchdog and Git regression work in owned private fixtures with explicit backend, branch and identity inputs."
+    },
+    {
       "change": "make-sidebar-mode-visible",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
