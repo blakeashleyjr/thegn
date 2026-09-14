@@ -349,6 +349,7 @@ impl ModelProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::ModelProxyStore;
 
     fn provider(name: &str, key: &str) -> ProviderEntry {
         ProviderEntry {
