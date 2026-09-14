@@ -83,6 +83,9 @@ impl FrameDecoder {
     }
 
     /// Reject the complete append before allocation; an error is terminal.
+    /// Drain complete messages before appending more reads. Near the allocation
+    /// cap, undrained messages may cause BufferTooLong even when total unread
+    /// bytes would fit, rather than trigger expensive tiny-prefix compaction.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
         if let Some(error) = self.error {
             return Err(error);
@@ -92,6 +95,13 @@ impl FrameDecoder {
             return self.fail(ProtocolError::BufferTooLong);
         }
         if bytes.len() > MAX_BUFFER_BYTES - self.buf.len() {
+            // A caller must drain queued messages before appending another
+            // read. Moving a near-full suffix after each tiny pop would make
+            // a sliding window quadratic. Only compact after enough consumed
+            // bytes pay for every moved byte; otherwise fail before copying.
+            if self.head < unread {
+                return self.fail(ProtocolError::BufferTooLong);
+            }
             self.compact();
         }
         let needed = self.buf.len() + bytes.len();
@@ -363,6 +373,27 @@ mod tests {
         }
         assert!(d.scanned <= bytes.len());
         assert!(d.moved <= bytes.len());
+    }
+
+    #[test]
+    fn hostile_full_buffer_sliding_window_cannot_force_repeated_suffix_moves() {
+        let frame = encode("");
+        let bytes = frame.repeat(MAX_BUFFER_BYTES / frame.len());
+        let mut d = FrameDecoder::new();
+        d.push(&bytes).unwrap();
+        for _ in 0..10 {
+            assert_eq!(pop(&mut d).as_deref(), Some(""));
+            match d.push(&frame) {
+                Ok(()) => {}
+                Err(ProtocolError::BufferTooLong) => {
+                    assert_eq!(d.moved, 0);
+                    assert_eq!(d.buf.capacity(), 0);
+                    return;
+                }
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("undrained near-cap sliding window must fail before compaction");
     }
 
     #[test]
