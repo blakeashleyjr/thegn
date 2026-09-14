@@ -71,3 +71,7 @@ usage and proxy reset delays, jitter and epoch narrowing, and MPRIS durations.
 Strict pairing-code relative durations reject before mint/persistence. Local
 provisioning/hibernation timestamps are checked before age-derived destructive
 recovery. Complete file/cast classification and evidence live in the THE-484 audit.
+
+## Running-worker acceptance follow-up
+
+The literal THE-483 survival criterion requires exercising thread startup and the common loop, beyond the existing pure conversion/scheduling tests. `hydrate_refresh_ticker` now owns the one production spawner and scheduler. A private generic adapter owns only clock, notification, sampler/registry/container I/O, and QoS boundaries. Live startup uses the existing 500ms sleep and work; tests replace these owned boundaries with finite channel permits and no provider or local-state effects. Static dispatch adds no timer or adapter allocation. The fixtures use real OS threads, one outstanding permit, bounded acknowledgements, output-channel observations, and retained handles closed on assertion unwind. The matrix preserves normal startup, priming, coalescing, and wake behavior while challenging each cadence family separately and together. Compilation and counterfactual evidence remain pending until the combined host gate.

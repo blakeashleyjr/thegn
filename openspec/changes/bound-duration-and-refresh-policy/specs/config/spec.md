@@ -39,3 +39,10 @@ existing terminal wake without introducing idle polling.
 - **WHEN** the worker panics
 - **THEN** it publishes one explicit failure diagnostic and pulses the existing waker
 - **AND** ordinary worker shutdown emits neither a failure diagnostic nor an extra wake
+
+#### Scenario: The running worker receives hostile enabled cadences
+
+- **WHEN** the production thread is started with each cadence family set to 2^61 or u64::MAX through normal config projections
+- **THEN** later Model, Pr, HostHeal, and MainRefMoved requests still arrive through its output channel
+- **AND** disabled optional schedules emit no requests
+- **AND** the integration fixture retains, closes, and joins its worker using bounded clock permits and completion receipts
