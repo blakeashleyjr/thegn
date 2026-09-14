@@ -65,13 +65,16 @@ pub struct McpProxyConfig {
     /// Seconds between upstream health checks (the daemon's reconcile/health
     /// tick cadence). `0` disables active health-checking (breakers still trip
     /// on real call failures).
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub health_interval_secs: u64,
     /// Consecutive failures/timeouts before an upstream's breaker opens.
     pub failure_threshold: u32,
     /// Seconds an open breaker waits before a half-open probe.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub cooldown_secs: u64,
     /// Per-request timeout (seconds) applied to an upstream call before it
     /// counts as a failure against the breaker.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub request_timeout_secs: u64,
 }
 

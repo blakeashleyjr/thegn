@@ -84,6 +84,7 @@ pub struct VpnConfig {
     pub sidecar_image: String,
     /// Seconds to wait for the tunnel's readiness probe before applying
     /// `on_error`.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub ready_timeout_secs: u64,
     pub on_error: VpnOnError,
     pub dns: VpnDnsMode,

@@ -1,0 +1,15 @@
+# THE-483 duration and cadence checkpoint
+
+The shared ticker used unchecked seconds-to-milliseconds conversion. A TOML-representable 2^61 interval or programmatic u64::MAX value could wrap to a zero/short divisor or panic. The model/PR nested due check could also starve normal PR refresh with a noncommensurate model interval.
+
+`time_policy` converts through a wide domain, caps unsupported runtime cadence, rounds up to nonzero slots, and keeps feature zero/None behavior with callers. A pure due decision makes PR cadence independent of model cadence and coalesces coincident work. An unwind-only guard reports ticker loss through one error and existing terminal wake, with no new timer.
+
+Strict field-family bounds are documented in `docs/duration-policy.md` and the full duration inventory. Schema attributes have no new serde rejection: a successfully parsed base preserves sandbox policy even when a duration is invalid. Strict writes validate before mutation; explicit CLI/profile patches reject invalid duration changes. Unchanged base diagnostics are cached by bounded source fingerprints; the hot environment path uses direct arithmetic and applies all valid overrides.
+
+Independent review by the authority agent found two gaps. Whole-environment rejection could discard a valid stronger isolation/network override alongside a bad TTL; the fix now removes only invalid numeric fields. Raw alias keys could bypass duration checks; the two existing metrics duration aliases now resolve to the canonical bounded schema fields. Regression fixtures cover both and assert no file mutation or policy downgrade.
+
+Validation: final focused core 32/32 pass (12 duration-admission, 6 primitive, 14 scan scheduler); existing config/load/write/validation 293/293 pass. Nine actual-source primitive/shared model-PR schedule/panic fixtures pass in both debug and optimized standalone builds. OpenSpec strict validation, idle-poll guard, ignored-result ratchet and diff checks pass. Combined host compilation/tests and final primary/independent approval remain separate integration gates.
+
+Complete `Config::load_layered` timing used the same standalone consumer against a pre-change canonical core rlib dated 2026-09-13 16:47:27 and the updated core rlib dated 21:53:44. Baseline artifact provenance is the pre-change local build, not a newly rebuilt exact parent commit. The representative source has CI/sandbox/calendar/PR/usage/weather/metrics sections. After 20 warmup loads, three interleaved rounds per variant measured nine samples of 100 full loads each. Median baseline 888.45µs/load; current 890.28µs/load (+0.21%, within run noise). This excludes changed-source cold schema construction and makes no end-to-end hydration or production workload claim. Raw samples: `/tmp/thegn-config-load-benchmark.json`; harness: `/tmp/thegn-config-load-bench.rs`; fixture: `/tmp/thegn-config-bench-fixture.toml`.
+
+THE-484 remains open: provider-age quarantine, resource-generation provenance and remaining signed duration/epoch consumers are not fixed by this checkpoint. Canonical local main cannot be updated while its Git metadata is read-only.

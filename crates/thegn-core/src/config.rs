@@ -805,6 +805,7 @@ pub struct MergeQueueConfig {
     /// Agent-dispatch → re-fold cycles per branch before it's `needs_human`.
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
     /// Opt in to running the fixing agent INSIDE the resolved sandbox (the
     /// default is host + the shared resource slice, unchanged — a sandboxed
@@ -858,6 +859,7 @@ pub struct MergeQueueConfig {
     /// land, and on demand via `thegn merge sweep` / the `sweep-merged` action; it
     /// never removes a worktree that has become dirty again, so resuming work in a
     /// merged worktree keeps it.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub merged_ttl_secs: u64,
     /// Folder for a landed branch under `on_landed = "move"`/`"expire"`.
     /// Empty ⇒ don't file.
@@ -1048,6 +1050,7 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_sandbox: Option<bool>,
@@ -1062,6 +1065,7 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_landed: Option<OnLanded>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub merged_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_folder: Option<String>,
@@ -1310,13 +1314,16 @@ pub struct ReplayConfig {
     /// byte range no longer exists) are evicted past this.
     pub max_bytes_per_pane: u64,
     /// Per-pane duration budget in seconds; events older than this are evicted.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub max_duration_secs: u64,
     /// Capture a keyframe marker after this many ms of activity …
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub keyframe_interval_ms: u64,
     /// … or after this many bytes, whichever comes first.
     pub keyframe_interval_bytes: u64,
     /// During playback, a gap larger than this (ms) between recorded events is
     /// collapsed to a short constant so idle stretches don't stall the scrub.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub idle_threshold_ms: u64,
     /// Mirror each pane's ring to `$XDG_STATE_HOME/thegn/replay/<session>/
     /// <pane>.tgr` on an off-loop writer thread, so scrubbing reaches into the
@@ -1523,9 +1530,11 @@ pub struct MediaConfig {
     /// Volume step (0.0..=1.0) applied by `media-volume-up`/`-down`.
     pub volume_step: f64,
     /// Seek step (seconds) applied by `media-seek-forward`/`-back` for audio.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub seek_step_secs: u64,
     /// Larger seek step (seconds) used when the loaded media is a video, where
     /// coarser skipping is the norm.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub seek_step_video_secs: u64,
     /// Render cover art in the docked Now-Playing panel when the backend + terminal
     /// support it (kitty/sixel graphics; falls back to blocks otherwise).
@@ -1535,6 +1544,7 @@ pub struct MediaConfig {
     /// Fallback poll cadence (seconds) for backends without a push-signal stream
     /// (mpv IPC / `playerctl`). The native MPRIS path uses D-Bus signals instead,
     /// so this never fires for it (preserving the ~0%-idle contract).
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_interval_secs: u64,
     pub mpv: MpvMediaConfig,
     pub mpd: MpdMediaConfig,
@@ -1601,9 +1611,11 @@ pub struct UsageConfig {
     pub token_rollups: bool,
     /// Days of usage history to keep for the sparkline and the reset forecast.
     /// `0` disables history (and the forecast with it).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub history_days: u32,
     /// Poll cadence in seconds. Floored at 60 no matter what is written here, so
     /// a stray `0` can't spin a poll loop against the provider's own rate limit.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_interval_secs: u64,
     /// Which harnesses to track (`"codex"`, `"claude"`, `"antigravity"`). Order is
     /// the display order; an unknown id is ignored.
@@ -2089,11 +2101,13 @@ pub struct GitConfig {
     /// Background-fetch cadence in seconds. `0` disables the periodic poll while
     /// leaving the event-driven ones (startup, worktree switch) alive. Clamped to
     /// ≥ 30s — each poll is a network round trip per repo.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub auto_fetch_interval_secs: u64,
     /// Floor between two background fetches of the SAME repo, whatever triggered
     /// them (ticker, startup, switching to a worktree). Keeps rapid worktree
     /// switching from turning into a fetch storm — worktrees of one repo share
     /// an object store, so one fetch serves them all.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub auto_fetch_min_interval_secs: u64,
     /// Also raise an inbox notification when a background fetch finds new
     /// upstream commits on a worktree's branch. **Off by default**: the ambient
@@ -2152,8 +2166,10 @@ pub struct GitOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_fetch: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub auto_fetch_interval_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub auto_fetch_min_interval_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_fetch_notify: Option<bool>,
@@ -2827,6 +2843,7 @@ impl Default for MonitorConfig {
 #[serde(default)]
 pub struct StatsConfig {
     /// Polling interval in seconds.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_secs: f64,
     /// Icon for CPU stat.
     pub cpu_icon: String,
@@ -2894,8 +2911,10 @@ pub struct StatsAlertsConfig {
     /// during a build is not something to be told about twice.
     pub notify: bool,
     /// Seconds past a threshold before firing, so a one-sample spike is silent.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub sustain_secs: u32,
     /// Minimum seconds between repeats of the same metric at the same level.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub repeat_secs: u32,
     /// Fractional retreat past the threshold required before an alert clears,
     /// so a value hovering on the line cannot flap.
@@ -3140,11 +3159,13 @@ pub struct LimitsConfig {
     /// group is killed. Generous, since suites legitimately take a while; the
     /// point is that a wedged run (e.g. blocked on a build lock) can't hang the
     /// panel forever. 0 disables the deadline.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub test_timeout_secs: u64,
     /// Wall-clock ceiling (seconds) for test *discovery*. Discovery should be
     /// near-instant (we use no-compile listing where possible), so a short cap
     /// surfaces "another build holds the cargo lock" instead of spinning. 0
     /// disables the deadline.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub discover_timeout_secs: u64,
     /// Run thegn-spawned `cargo` (test + discovery) under a private
     /// `CARGO_TARGET_DIR` (`<worktree>/target/thegn`) so it never blocks on
@@ -3191,6 +3212,7 @@ pub struct DiskConfig {
     /// measured more recently, and pumps at a quarter of this so a
     /// budget-bounded round still sweeps everything inside one window. The scan
     /// runs off the event loop (never blocks it) and is cached in the DB.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub scan_interval_secs: u64,
     /// Worktrees `du`'d per background round; the active worktree and any
     /// never-measured one go first, so a freshly created worktree is never stuck
@@ -3212,6 +3234,7 @@ pub struct DiskConfig {
     /// with uncommitted changes, and any `target/` under
     /// [`crate::disk_reclaim::MIN_RECLAIM_BYTES`] are all exempt — because
     /// an unexpected cold rebuild costs an agent mid-task real wall-clock.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub idle_clean_days: u32,
     /// Under genuine disk pressure, evict least-recently-touched `target/` dirs
     /// until free space is back above `[stats] disk_free_warn`.
@@ -3268,6 +3291,7 @@ pub struct SessionConfig {
     /// activity dot whose last live signal is older than this at resurrection is
     /// downgraded to a settled state. Applied once at restore; the live activity
     /// FSM is untouched.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub restore_grace_secs: u64,
     /// Whether creating a worktree (Alt+w) jumps to its new tab vs. background.
     pub focus_on_create: bool,
@@ -3295,6 +3319,7 @@ impl Default for SessionConfig {
 #[serde(default)]
 pub struct PrConfig {
     /// Cache TTL (seconds) before a live `gh` re-fetch.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub ttl_secs: u64,
 }
 
@@ -3389,6 +3414,7 @@ impl AppsConfig {
 #[serde(default)]
 pub struct WatchConfig {
     /// Seconds between PR refreshes (back-off applies on rate limits).
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub pr_interval_secs: u64,
 }
 
@@ -3705,6 +3731,7 @@ pub struct ShareConfig {
     pub visibility: ShareVisibility,
     pub on_error: ShareOnError,
     /// Seconds to wait for the share's URL to appear before applying `on_error`.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub ready_timeout_secs: u64,
     /// Safety guard: when `false`, refuse any share reachable from the public
     /// internet (frp http(s), tailscale `funnel`). Private/team/peer shares are
@@ -3789,6 +3816,7 @@ pub struct ForwardConfig {
     pub bind: String,
     /// Detector poll cadence in seconds (how often the sandbox is scanned for
     /// newly-bound listening ports).
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_secs: u64,
     /// Browser command for the "open in browser" action. Empty ⇒ `$BROWSER`,
     /// then `xdg-open`/`open`.
@@ -5271,9 +5299,13 @@ pub struct ConfigOverlay {
     pub theme_color: Option<ColorMode>,
     pub theme_glyphs: Option<GlyphMode>,
     pub theme_agent_glyphs: Option<AgentGlyphs>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub pr_ttl_secs: Option<u64>,
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub watch_pr_interval_secs: Option<u64>,
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub metrics_interval_secs: Option<f64>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub metrics_timeout_ms: Option<u64>,
     pub metrics_max_body_bytes: Option<usize>,
     pub apps_default_tab: Option<String>,
@@ -5293,19 +5325,24 @@ pub struct ConfigOverlay {
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub activity_runaway_secs: Option<f64>,
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub disk_scan_interval_secs: Option<u64>,
     pub disk_max_scan_per_round: Option<u32>,
     pub disk_auto_clean_on_merge: Option<bool>,
     pub disk_clean_on_pr_closed: Option<bool>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_DAYS"))]
     pub disk_idle_clean_days: Option<u32>,
     pub disk_reclaim_on_low_disk: Option<bool>,
     pub disk_sccache: Option<bool>,
     pub disk_sccache_dir: Option<String>,
     pub disk_shared_target_dir: Option<String>,
     pub loc_enabled: Option<bool>,
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub loc_scan_interval_secs: Option<u64>,
     pub loc_max_scan_per_round: Option<u32>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
@@ -5863,6 +5900,16 @@ fn parse_bool(raw: &str, key: &str) -> Option<bool> {
     }
 }
 
+fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
+    let mut overlay = env_overlay(env);
+    for error in crate::config_duration::retain_valid_env_durations(&mut overlay) {
+        config_warn(&error);
+    }
+    // Invalid duration fields never discard unrelated explicit authority such
+    // as a stronger isolation floor, disabled network, or fail-closed behavior.
+    overlay.apply(cfg);
+}
+
 impl Config {
     /// The default config path (overridable with `--config`).
     pub fn path() -> PathBuf {
@@ -5892,6 +5939,11 @@ impl Config {
             config_warn(diagnostic);
         }
         let mut cfg: Config = toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
+        for diagnostic in crate::config_duration::errors_for_base(&cfg, &normalized.body) {
+            config_warn(&format!(
+                "{diagnostic}; retaining configuration; affected runtime policy will cap or quarantine this value"
+            ));
+        }
 
         // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
         // removed before the public alpha. A leftover section is harmless
@@ -5928,7 +5980,7 @@ impl Config {
             config_warn(&format!("profile config {}: {e}", pfile.display()));
         }
 
-        env_overlay(env).apply(&mut cfg);
+        apply_env_duration_checked(&mut cfg, env);
 
         // Apply dot-notation overrides
         for ov in cli_overrides {
@@ -5954,7 +6006,7 @@ impl Config {
             Err(e) => {
                 config_warn(&format!("parse error: {e}; using defaults"));
                 let mut cfg = Config::default();
-                env_overlay(env).apply(&mut cfg);
+                apply_env_duration_checked(&mut cfg, env);
                 for ov in cli_overrides {
                     if let Some((key, val)) = ov.split_once('=') {
                         let _ = Self::apply_override_str(&mut cfg, key, val); // best-effort: the parse-error path was already surfaced via config_warn; overrides still apply so env/THEGN_* win
@@ -5993,6 +6045,10 @@ impl Config {
         let overlay: serde_json::Value =
             toml::from_str(&normalized.body).map_err(|e| format!("{e}"))?;
         let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
+        crate::config_duration::introduced(
+            &[],
+            crate::config_duration::errors_for_value::<Config>(&overlay),
+        )?;
         deep_merge_json(&mut base, overlay);
         *cfg = serde_json::from_value(base).map_err(|e| format!("{e}"))?;
         Ok(())
@@ -6046,7 +6102,11 @@ impl Config {
                 if !current.is_object() {
                     return Err(format!("Invalid path: {}", key));
                 }
-                current[*part] = Self::coerce_override_value(val);
+                let value = Self::coerce_override_value(val);
+                if current.get(*part) != Some(&value) {
+                    crate::config_duration::validate_override(&key, &value)?;
+                }
+                current[*part] = value;
             } else {
                 if !current.is_object() {
                     return Err(format!("Invalid path: {}", key));

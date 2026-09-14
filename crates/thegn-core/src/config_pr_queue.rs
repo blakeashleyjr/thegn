@@ -72,6 +72,7 @@ pub struct PrQueueConfig {
     pub enabled: bool,
     /// How often a queued PR's remote state is refreshed, in seconds. Clamped to
     /// a floor at use so a typo can't hammer the forge's rate limit.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_interval_secs: u64,
     /// Whether opening a PR from a worktree queues it automatically.
     pub auto_enqueue: PrAutoEnqueue,
@@ -88,6 +89,7 @@ pub struct PrQueueConfig {
     /// Agent-dispatch cycles per PR before it is marked `needs_human`.
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
     /// Opt in to running the fixing agent INSIDE the resolved sandbox (default:
     /// host + the shared resource slice). See [`Self::agent_isolation_floor`].
@@ -224,6 +226,7 @@ pub struct PrQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_interval_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_enqueue: Option<PrAutoEnqueue>,
@@ -236,6 +239,7 @@ pub struct PrQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_sandbox: Option<bool>,

@@ -59,7 +59,8 @@ const KIND_UPSTREAM: &str = "upstream_behind";
 /// startup + on-switch triggers still fire). Clamped to ≥ 30s — every tick is a
 /// network round trip per repo. Pure, so it's unit-tested.
 pub(crate) fn fetch_every_slots(interval_secs: u64) -> Option<u64> {
-    (interval_secs > 0).then(|| (interval_secs.max(30) * 1000) / 500)
+    (interval_secs > 0)
+        .then(|| thegn_core::time_policy::cadence_slots(interval_secs, 30, 500).get())
 }
 
 /// Whether a repo is due for a background fetch: never fetched this session, or

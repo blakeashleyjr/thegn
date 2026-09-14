@@ -54,6 +54,7 @@ pub struct HostConfig {
     /// explicit `[]` ⇒ none. Unknown names warn.
     pub volumes: Option<Vec<String>>,
     /// Probe TTL in seconds (0 ⇒ [`DEFAULT_PROBE_TTL_SECS`]).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub probe_ttl_secs: u64,
     /// ATTESTATION (taken on faith, never verified): the owner asserts this
     /// machine enforces the egress/config posture a thegn-built image

@@ -66,20 +66,25 @@ pub(crate) fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
 pub struct RemoteConfig {
     /// ssh `ServerAliveInterval` for every control-plane connection (seconds;
     /// `0` disables keepalives).
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub keepalive_interval_secs: u32,
     /// ssh `ServerAliveCountMax` — unanswered probes before the link is dead.
     pub keepalive_count_max: u32,
     /// ssh `ConnectTimeout` (seconds).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub connect_timeout_secs: u32,
     /// ssh `ControlPersist` — idle ControlMaster lifetime (seconds).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub control_persist_secs: u32,
     /// Kernel-level `TCPKeepAlive` alongside the application probes.
     pub tcp_keepalive: bool,
     /// Transient-failure retries per bring-up step (connect/probe/resolve).
     pub retry_attempts: u32,
     /// First retry backoff (milliseconds); doubles per attempt.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub retry_base_delay_ms: u64,
     /// Backoff ceiling (milliseconds).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub retry_max_delay_ms: u64,
     /// Background re-probe cadence for a failed host (seconds; the last step
     /// repeats forever). Empty ⇒ the built-in `[15, 30, 60, 300]`.

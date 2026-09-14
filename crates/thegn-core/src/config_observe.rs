@@ -19,6 +19,7 @@ pub struct ObserveConfig {
     /// Show the "Observe" tab in the top-level app-tab strip. Off by default.
     pub enabled: bool,
     /// Panel auto-refresh cadence, in seconds.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
     /// Dashboard source: empty ⇒ the built-in host-metrics dashboard; otherwise a
     /// path to a dashboard TOML (tilde-expanded), loaded via `gtui_core::dashboard`.

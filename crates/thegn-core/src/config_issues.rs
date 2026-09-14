@@ -22,6 +22,7 @@ pub struct IssuesConfig {
     #[serde(default)]
     pub providers: Vec<IssueProviderKind>,
     /// Cache TTL (seconds) before a background re-fetch.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub ttl_secs: u64,
     /// Maximum issues to fetch and display.
     pub max_issues: usize,
