@@ -22,7 +22,7 @@ pub mod registry;
 pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -959,18 +959,18 @@ fn reader_loop(
     stdin: SharedWriter,
     root: PathBuf,
 ) {
-    let mut decoder = framing::FrameDecoder::new();
-    let mut reader = BufReader::new(reader);
-    let mut chunk = [0u8; 8192];
+    let mut reader = framing::FramedReader::new(reader);
     loop {
-        let n = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        decoder.push(&chunk[..n]);
-        while let Some(body) = decoder.next_message() {
-            if let Ok(msg) = serde_json::from_str::<Value>(&body) {
-                dispatch(&msg, &pending, &diag_tx, &stdin, &root);
+        match reader.read_message() {
+            Ok(Some(body)) => {
+                if let Ok(msg) = serde_json::from_str::<Value>(&body) {
+                    dispatch(&msg, &pending, &diag_tx, &stdin, &root);
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(target: "thegn::lsp", %error, "closing invalid server stream");
+                break;
             }
         }
     }
@@ -1039,6 +1039,32 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_framing_closes_lsp_and_fails_pending_without_dispatch() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::from([(7, request_tx)])));
+        let (diag_tx, diag_rx) = mpsc::channel();
+        let stdin: SharedWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let mut wire = b"Content-Length: 1\r\nContent-Length: 1\r\n\r\nX".to_vec();
+        wire.extend(framing::encode(r#"{"id":7,"result":"must not dispatch"}"#));
+        reader_loop(
+            Box::new(std::io::Cursor::new(wire)),
+            pending.clone(),
+            diag_tx,
+            stdin,
+            PathBuf::from("/fixture"),
+        );
+        assert!(matches!(
+            request_rx.try_recv(),
+            Ok(Err(LspError::Protocol(_)))
+        ));
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            diag_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn uri_round_trips_plain_path() {
