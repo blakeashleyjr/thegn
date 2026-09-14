@@ -365,7 +365,7 @@ pub(crate) fn drain<T: Terminal>(
             );
             pending_input.push_back(ev);
             if interactive {
-                *input_at = Some(Instant::now());
+                crate::perf_timing::observe_input(input_at, Instant::now());
                 summary.preempted = true;
                 break;
             }

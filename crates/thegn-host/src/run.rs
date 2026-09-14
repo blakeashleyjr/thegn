@@ -6618,9 +6618,6 @@ async fn event_loop<T: Terminal>(
     // is on. Emits a `thegn::perf` rollup every `report_interval()`.
     let mut loop_perf = crate::perf::LoopPerf::new();
     let perf_interval = crate::perf::report_interval();
-    // Stamped at each loop-top when perf is on; the span until the blocking
-    // poll is the loop's "busy" time (drives the idle ratio).
-    let mut iter_t0 = std::time::Instant::now();
     // Idle-memory bookkeeping: `last_activity` is bumped on every frame that
     // actually renders; once it ages past the idle threshold a wake hands freed
     // glibc arena pages back to the OS (throttled via `last_trim`). See `mem`.
@@ -7941,7 +7938,15 @@ async fn event_loop<T: Terminal>(
     // trigger rather than on every tick from then until the meeting starts.
     let mut last_reminder_check_ms = chrono::Utc::now().timestamp_millis();
 
+    loop_perf.take(); // loop metrics start here; startup has its own waterfall
+    let mut active_clock = crate::perf_timing::ActiveClock::default();
     loop {
+        // Charge the previous dispatch too, including early-continue handlers.
+        if crate::perf::enabled() {
+            loop_perf.add_busy(active_clock.checkpoint(std::time::Instant::now()));
+        } else {
+            active_clock.pause();
+        }
         // Perf self-profiler: count the wake, stamp busy-time start, and emit
         // the periodic rollup when due (piggy-backing on this wake — never a
         // dedicated timer thread). All no-ops unless perf accounting is on.
@@ -7949,7 +7954,6 @@ async fn event_loop<T: Terminal>(
         // Service a pending SIGUSR2 profiler toggle (no-op without the feature).
         crate::profile::poll();
         if crate::perf::enabled() {
-            iter_t0 = std::time::Instant::now();
             // Roll up faster (1s) while the Telemetry section is watching, else
             // at the configured cadence (default 10s).
             let interval = if telemetry_open {
@@ -7958,7 +7962,14 @@ async fn event_loop<T: Terminal>(
                 perf_interval
             };
             if loop_perf.due(interval) {
-                let snap = loop_perf.rollup();
+                if let Some(metrics) = writer.take_metrics() {
+                    loop_perf.writer = metrics;
+                } else {
+                    loop_perf.writer_deferred = true;
+                }
+                let boundary = std::time::Instant::now();
+                loop_perf.add_busy(active_clock.checkpoint(boundary));
+                let snap = loop_perf.rollup(boundary);
                 panel_ui.docs.loop_perf.push(&snap);
             }
         }
@@ -13157,6 +13168,7 @@ async fn event_loop<T: Terminal>(
             let resync_now = !full_repaint
                 && !resync_interval.is_zero()
                 && last_resync.elapsed() >= resync_interval;
+            let resync_t0 = (resync_now && crate::perf::enabled()).then(std::time::Instant::now);
             let mut wire: Vec<Change> = Vec::new();
             if full_repaint {
                 // Full heal: reset the baseline so no stale cell survives (the
@@ -13206,6 +13218,9 @@ async fn event_loop<T: Terminal>(
                 // Genuine Full frame: bounded-to-full diff against the live baseline.
                 front.diff_screens(&scratch)
             };
+            if let Some(started) = resync_t0 {
+                loop_perf.resync(started.elapsed());
+            }
             // Where the focused pane WOULD like the hardware cursor. Whether it
             // gets it is decided below by `caret::resolve_frame`, against what
             // this frame actually painted — not against a list of modals, which
@@ -13289,14 +13304,24 @@ async fn event_loop<T: Terminal>(
             // BufferedTerminal) with its inline retry handling.
             let flush_t0 = std::time::Instant::now();
             if use_termwiz_renderer {
-                match crate::frame_write::emit_frame(
+                let stamp = crate::perf_timing::FrameStamp::capture(input_at);
+                let frame_write = crate::frame_write::emit_frame(
                     true,
                     buf,
                     &mut wire_renderer,
                     &mut recorder,
                     &wire,
                     false,
-                ) {
+                );
+                if stamp.is_some() {
+                    writer.record_external_frame(
+                        stamp,
+                        flush_t0,
+                        std::time::Instant::now(),
+                        matches!(&frame_write, crate::frame_write::FrameWrite::Ok),
+                    );
+                }
+                match frame_write {
                     crate::frame_write::FrameWrite::Ok => frame_write_errs = 0,
                     crate::frame_write::FrameWrite::Transient
                         if frame_write_errs < crate::frame_write::RETRY_MAX =>
@@ -13328,7 +13353,10 @@ async fn event_loop<T: Terminal>(
                 if let Some(rec) = &mut recorder {
                     let _ = rec.write_frame(&cells); // best-effort: recorder write: recording is advisory; a lost frame degrades replay fidelity only
                 }
-                if !writer.submit_frame(cells.into_bytes()) {
+                if !writer.submit_frame(
+                    cells.into_bytes(),
+                    crate::perf_timing::FrameStamp::capture(input_at),
+                ) {
                     // Unreachable by construction; if it ever fires, resync
                     // with a full repaint rather than corrupt the diff chain.
                     full_repaint = true;
@@ -13408,14 +13436,14 @@ async fn event_loop<T: Terminal>(
                 render_ms = frame_t0.elapsed().as_millis() as u64,
                 drain_chunks = drain_summary.chunks,
                 kind = if incremental_frame { "incr" } else { "full" },
-                "frame flushed"
+                "frame submitted"
             );
             if !first_frame_logged {
                 first_frame_logged = true;
                 tracing::info!(
                     target: "thegn::startup",
                     since_start_ms = start.elapsed().as_millis() as u64,
-                    "first frame flushed"
+                    "first frame submitted"
                 );
                 // Benchmark hook (`just bench`): exit right after the first
                 // real frame so hyperfine measures launch → first paint.
@@ -13454,7 +13482,9 @@ async fn event_loop<T: Terminal>(
         }
 
         // Work for this wake is done; the poll below is idle (busy span → idle ratio).
-        loop_perf.add_busy(iter_t0.elapsed());
+        if crate::perf::enabled() {
+            loop_perf.add_busy(active_clock.checkpoint(std::time::Instant::now()));
+        }
 
         // 3. Block until a terminal event or `waker.wake()` (→ `InputEvent::Wake`);
         //    no timeout → zero idle CPU, wake only on work, render at once. A
@@ -13469,11 +13499,23 @@ async fn event_loop<T: Terminal>(
         );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
-            None => buf.terminal().poll_input(timeout),
+            None => {
+                if crate::perf::enabled() {
+                    loop_perf.add_busy(active_clock.checkpoint(std::time::Instant::now()));
+                }
+                let event = buf.terminal().poll_input(timeout);
+                // This boundary excludes only the terminal poll wait. Queued
+                // events and the following dispatch remain active wall time.
+                if crate::perf::enabled() {
+                    active_clock.resume(std::time::Instant::now());
+                }
+                event
+            }
         };
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
-                input_at = Some(std::time::Instant::now()); // input-latency stamp
+                crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
+                loop_perf.input_event();
                 use termwiz::input::MouseButtons;
                 // SGR mouse coordinates are 1-based.
                 let mx = (m.x as usize).saturating_sub(1);
@@ -14751,7 +14793,8 @@ async fn event_loop<T: Terminal>(
                 if residue.swallow(&k.key, k.modifiers) {
                     continue;
                 }
-                input_at = Some(std::time::Instant::now()); // input-latency stamp
+                crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
+                loop_perf.input_event();
                 let k = normalize_key(k);
                 // Escape cancels an active utterance before any modal or pane
                 // sees it. While idle it remains available to every existing
@@ -23158,7 +23201,8 @@ async fn event_loop<T: Terminal>(
                 }
             }
             Ok(Some(InputEvent::Paste(s))) => {
-                input_at = Some(std::time::Instant::now()); // input-latency stamp
+                crate::perf_timing::observe_input(&mut input_at, std::time::Instant::now());
+                loop_perf.input_event();
                 if let Some(builder) = theme_builder.as_mut() {
                     builder.handle_paste(&s);
                     dirty = true;
