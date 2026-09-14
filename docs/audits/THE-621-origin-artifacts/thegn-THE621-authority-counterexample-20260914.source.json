@@ -1,0 +1,16 @@
+{
+  "source": "7014a49696a8baa3d2ef36e4186e6bce853a9e4d",
+  "actual_functions": {
+    "crates/thegn-svc/src/forge/mod.rs": {
+      "function_sha256": "5c9db5f9ed224ba19634af07d14f01a52938d9a4535e30b6acc5605b4751e835"
+    },
+    "crates/thegn-svc/src/forge/native.rs": {
+      "function_sha256": "9f97ae22cf9af926ea2017dae8b124aeabb202f91e45f3f7e6d7917ebe54f9da"
+    },
+    "crates/thegn-core/src/forge/model.rs": {
+      "function_sha256": "5dc25977db908635f9dffe193c5f3f3b3df37d386e5c2cfa883069de1db0d932"
+    }
+  },
+  "harness": "/tmp/thegn-THE621-authority-counterexample-20260914.rs",
+  "scope": "Actual source function extraction; no copied algorithm, network, credentials, Git or provider action"
+}

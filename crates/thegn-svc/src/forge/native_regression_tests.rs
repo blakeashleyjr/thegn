@@ -168,6 +168,95 @@ fn public_host_validation_precedes_credentials() {
     );
 }
 
+#[test]
+fn strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        thegn_core::util::git_cmd(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let loc = GitLoc::Local(dir.path().into());
+    let native = GithubNative::new();
+    let set_origin = |origin: &str| {
+        assert!(
+            thegn_core::util::git_cmd(dir.path())
+                .args(["config", "remote.origin.url", origin])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    for origin in [
+        "https://evil.example/foo@github.com/bar",
+        "https://evil.example/org/repo?next=@github.com/a/b",
+        "https://evil.example/org/repo#@github.com/a/b",
+        "ssh://git@evil.example/foo@github.com/bar",
+        "https://github.com.evil.example/org/repo",
+        "https://github.com@evil.example/org/repo",
+        "https://github.com:443@evil.example/org/repo",
+        "https://user@github.com/org/repo",
+        "https://github.com:443/org/repo",
+        "ssh://git@github.com:22/org/repo",
+        "https://github.com/org/repo?query=value",
+        "https://github.com/org/repo#fragment",
+        "https://github.com/org/repo/extra",
+        "https://github.com//repo",
+        "https://github.com/../repo",
+        "https://github.com/org/%2e%2e",
+        "https://github.com/org/repo\nextra",
+        "/private/github.com/org/repo",
+    ] {
+        assert_eq!(parse_owner_repo(origin), None, "{origin:?}");
+        set_origin(origin);
+        let token_calls = std::cell::Cell::new(0);
+        let result = native.gate_with_token(&loc, || {
+            token_calls.set(token_calls.get() + 1);
+            Some("private-never-sent-token".into())
+        });
+        assert!(
+            matches!(
+                result,
+                Err(ForgeError::NotConfigured(
+                    "origin is not a public GitHub remote"
+                ))
+            ),
+            "{origin:?}: {result:?}"
+        );
+        assert_eq!(token_calls.get(), 0, "foreign origin reached credentials");
+    }
+    // A circuit-only refusal cannot satisfy these controls: valid origins must
+    // reach the injected token callback and preserve this same parsed identity.
+    for origin in [
+        "https://github.com/org/repo",
+        "https://GitHub.com/org/repo.git",
+        "ssh://git@github.com/org/repo.git",
+        "git@github.com:org/repo.git",
+    ] {
+        set_origin(origin);
+        let token_calls = std::cell::Cell::new(0);
+        let result = native
+            .gate_with_token(&loc, || {
+                token_calls.set(token_calls.get() + 1);
+                Some("private-never-sent-token".into())
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            (
+                "private-never-sent-token".into(),
+                "org".into(),
+                "repo".into()
+            )
+        );
+        assert_eq!(token_calls.get(), 1);
+    }
+    // No request method is called; the injected token only proves admission.
+    dir.close().expect("private origin fixture cleanup");
+}
+
 struct Layer {
     result: Result<Vec<PrHeader>, ForgeError>,
     calls: Arc<AtomicUsize>,

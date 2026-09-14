@@ -11,6 +11,12 @@ use a host-aware implementation rather than a same-name public repository.
 - **WHEN** an enterprise repository has the same owner/name as a public repository
 - **THEN** the native public GitHub layer does not query or return that repository
 
+#### Scenario: Foreign URL path resembles a GitHub authority
+
+- **WHEN** a foreign origin contains `@github.com` after its URL authority ends
+- **THEN** native admission rejects it before token lookup, using the same strict parse for authority and repository identity
+- **AND** supported HTTPS, SSH URL and SCP GitHub origins retain their exact owner and repository identity
+
 ### Requirement: SDK error types determine fallback and connectivity
 
 GraphQL error envelopes, including partial responses with errors, SHALL use the

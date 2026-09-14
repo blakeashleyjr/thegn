@@ -1,0 +1,12 @@
+{
+  "landed_head": "16288656262992c677e26ede4127a37bacb56fe1",
+  "tested_code": "5e2f5bf2bcb3b2473e48775850133983e1f7be31",
+  "canonical": "/home/blake/code/thegn",
+  "method": "normal git fetch from private checkout then git merge --ff-only",
+  "user_preservation_manifest": "/tmp/thegn-THE621-canonical-prelanding-preservation-20260914.json",
+  "preserved_untracked_files": 143,
+  "justfile_sha256": "75a61923b8db84f1115dd291159c65a63712eab27cbe3f3230b9b87129caf9b2",
+  "push": false,
+  "live_restart": false,
+  "linear_closure": "pending fresh post-landing gates/readback"
+}

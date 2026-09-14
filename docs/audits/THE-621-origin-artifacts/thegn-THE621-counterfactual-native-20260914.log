@@ -1,0 +1,33 @@
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the621/crates/thegn-svc)
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the621/crates/thegn-media)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the621/crates/thegn-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 45s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 3b47cfb2-bbeb-4705-b680-5bf582cfd6bd with nextest profile: counterfactual
+    Starting 1 test across 1 binary (693 tests skipped)
+        FAIL [   0.081s] (1/1) thegn-svc forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens
+  stdout ───
+
+    running 1 test
+    test forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens ... FAILED
+
+    failures:
+
+    failures:
+        forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 693 filtered out; finished in 0.01s
+
+  stderr ───
+
+    thread 'forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens' (2002677) panicked at crates/thegn-svc/src/forge/native_regression_tests.rs:212:9:
+    assertion `left == right` failed: "https://evil.example/foo@github.com/bar"
+      left: Some(("foo@github.com", "bar"))
+     right: None
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.083s] 1 test run: 0 passed, 1 failed, 693 skipped
+        FAIL [   0.081s] (1/1) thegn-svc forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens
+error: test run failed

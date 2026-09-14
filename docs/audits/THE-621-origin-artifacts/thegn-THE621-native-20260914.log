@@ -1,0 +1,36 @@
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-origin-20260914/crates/thegn-svc)
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-origin-20260914/crates/thegn-media)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-origin-20260914/crates/thegn-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 53s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 6ac15e6c-282f-409f-a631-4a78866f072f with nextest profile: default
+    Starting 26 tests across 1 binary (668 tests skipped)
+        PASS [   0.090s] ( 1/26) thegn-svc forge::native::regression_tests::reaper_spawn_failure_retains_child_and_capacity
+        PASS [   0.112s] ( 2/26) thegn-svc forge::native::regression_tests::helper_capacity_stays_reserved_until_ownership_is_released
+        PASS [   0.122s] ( 3/26) thegn-svc forge::native::regression_tests::public_host_validation_precedes_credentials
+        PASS [   0.095s] ( 4/26) thegn-svc forge::native::regression_tests::sdk_graphql_envelopes_fall_through_without_offline_evidence
+        PASS [   0.120s] ( 5/26) thegn-svc forge::native::regression_tests::sdk_error_classification_drives_the_real_ladder
+        PASS [   0.169s] ( 6/26) thegn-svc forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens
+        PASS [   0.299s] ( 7/26) thegn-svc forge::native::regression_tests::cancelling_token_future_terminates_owned_group
+        PASS [   0.109s] ( 8/26) thegn-svc forge::native::regression_tests::token_helper_success_failure_and_output_bound
+        PASS [   0.129s] ( 9/26) thegn-svc forge::native::regression_tests::timeout_and_transport_failure_feed_native_circuit
+        PASS [   0.098s] (10/26) thegn-svc forge::native::regression_tests::typed_http_answers_are_not_global_network_failures
+        PASS [   0.095s] (11/26) thegn-svc forge::native::tests::graphql_no_pr_node_maps_to_no_pr
+        PASS [   0.090s] (12/26) thegn-svc forge::native::tests::graphql_pr_list_parses_headers
+        PASS [   0.217s] (13/26) thegn-svc forge::native::regression_tests::unknown_wait_ownership_is_reaped_without_group_signal
+        PASS [   0.105s] (14/26) thegn-svc forge::native::tests::graphql_pr_maps_fields_and_rolls_up_checks
+        PASS [   0.138s] (15/26) thegn-svc forge::native::tests::native_branch_resolution_is_local_rev_parse
+        PASS [   0.119s] (16/26) thegn-svc forge::native::tests::owner_repo_parses_ssh_and_https_forms
+        PASS [   0.125s] (17/26) thegn-svc forge::native::tests::token_is_trimmed
+        PASS [   0.094s] (18/26) thegn-svc forge::native::tests::token_precedence_prefers_gh_token_then_github_token_then_cli
+        PASS [   0.090s] (19/26) thegn-svc forge::tests::authorship_falls_back_as_one_operation_and_auth_errors_remain_final
+        PASS [   0.097s] (20/26) thegn-svc forge::tests::auth_failure_is_final
+        PASS [   0.519s] (21/26) thegn-svc forge::native::regression_tests::token_timeout_kills_descendants_even_after_parent_exit
+        PASS [   0.103s] (22/26) thegn-svc forge::tests::forge_set_routes_by_host
+        PASS [   0.096s] (23/26) thegn-svc forge::tests::native_answer_wins
+        PASS [   0.102s] (24/26) thegn-svc forge::tests::github_ladder_is_native_over_cli_and_kinds_agree_with_reserved
+        PASS [   0.087s] (25/26) thegn-svc forge::tests::not_configured_falls_through_to_cli
+        PASS [   0.099s] (26/26) thegn-svc forge::tests::remote_host_parses_every_url_shape
+────────────
+     Summary [   0.923s] 26 tests run: 26 passed, 668 skipped
