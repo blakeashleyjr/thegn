@@ -23,6 +23,15 @@ hidden-index state SHALL prevent automatic removal.
 - **WHEN** a branch, repository identity or cleanliness check changes
 - **THEN** automatic cleanup refuses and retains its retry record.
 
+#### Scenario: Registry decoding fails after an authorized hook
+
+- **WHEN** the worktree registry initially decodes successfully but a second
+  connection corrupts a decoder field after the pre-destroy hook starts
+- **THEN** revalidation SHALL refuse physical removal and retain the queue,
+  worktree contents and branch refs
+- **AND** the already authorized hook effect remains observable; refusal does
+  not claim to undo a hook that has already run.
+
 ### Requirement: Automatic collection retains branches until ref-type proof exists
 
 Automatic collection SHALL NOT mutate source, target or other branch refs.
