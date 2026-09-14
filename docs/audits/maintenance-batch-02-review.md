@@ -5,7 +5,8 @@ Git metadata remains read-only. Batch-01 native ownership/socket test failures
 remain outstanding and are not waived by this batch's focused passes.
 
 Eight of the selected ten issues have implemented candidates with primary and
-independent source review. THE-484 and THE-154 remain under implementation.
+independent source review. THE-484 has a source checkpoint with requested
+authority revisions; THE-154 remains under implementation and adversarial review.
 
 | Issue | Implementation and revisions | Evidence so far |
 | --- | --- | --- |
@@ -46,3 +47,31 @@ Raw checkpoint results: `/tmp/thegn-audit-batch02-host-results.json`,
 `/tmp/thegn-audit-batch02-platform-ratchets-final.log`.
 Full batch-02 validation, the two remaining implementations, and landing must
 remain explicit unfinished gates until actually completed.
+
+## Combined checkpoint 2
+
+The host/core/service all-target test build at `244882ba` (plus the updated
+`lsp_client` integration smoke caller) completed in 3m36s. The shared decoder now
+returns fallible results; the smoke test checks successful admission and decode
+explicitly. All four actual fake-LSP integration tests passed.
+
+Copied binaries were run with a fresh private XDG environment per test. The host
+passed 207 selected tests plus seven disjoint cadence/panic/platform-ratchet
+tests (214 total). This includes all five PR-authorship fixtures, 20 PR-driver
+tests, five durable-review tests, the CI author hold, final OSC parser/backlog
+revisions, 79 monitor tests and three model-equality tests. These overlap the
+earlier 165-test checkpoint; they are not additive evidence.
+
+The core passed 566 configuration, duration and PR-proof tests. The service
+passed 39 forge-ladder and LSP tests. Separate custom-command compiler/transport
+checks are recorded with their own result files. This verifies the combined
+duration and command pre-write guards, including the conflict resolution.
+
+Review of THE-484 requested present Fly custody, unambiguous account/lifetime
+policy before inventory or cleanup, and exact nonempty recorded VPS identity.
+THE-154 review is challenging cancellation custody, final-response ordering,
+stale-generation routing, task registration during shutdown and lost Unix
+child identity. Neither draft is approved for final integration yet.
+
+Evidence is under `/tmp/thegn-batch02-{host-checkpoint2,host-extra2,core-checkpoint2,svc-checkpoint2,lsp-integration}-results.json`
+and corresponding logs. Batch-01 native socket/ownership failures remain open.
