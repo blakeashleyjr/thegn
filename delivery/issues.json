@@ -392,6 +392,13 @@
       ]
     },
     {
+      "issue": "THE-575",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "resolve-build-git-identity"
+      ]
+    },
+    {
       "issue": "THE-586",
       "project": "Spec & Tracker Reconciliation",
       "changes": [
@@ -480,6 +487,13 @@
       "project": "Runtime Security & Host Architecture",
       "changes": [
         "preserve-merge-drain-diagnostics"
+      ]
+    },
+    {
+      "issue": "THE-613",
+      "project": "Distribution & Release Readiness",
+      "changes": [
+        "harden-live-upgrades"
       ]
     }
   ]
