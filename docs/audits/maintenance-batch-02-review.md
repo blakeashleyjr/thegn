@@ -4,9 +4,9 @@ This is a private review candidate, **not a canonical-main landing**. The checko
 Git metadata remains read-only. Batch-01 native ownership/socket test failures
 remain outstanding and are not waived by this batch's focused passes.
 
-Eight of the selected ten issues have implemented candidates with primary and
-independent source review. THE-484 has a source checkpoint with requested
-authority revisions; THE-154 remains under implementation and adversarial review.
+Nine of the selected ten issues have implemented candidates with primary and
+independent source review. THE-484 includes the requested authority revisions;
+THE-154 remains under implementation and adversarial review.
 
 | Issue   | Implementation and revisions                                                                                                                | Evidence so far                                                                                                                                                                |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -75,3 +75,19 @@ child identity. Neither draft is approved for final integration yet.
 
 Evidence is under `/tmp/thegn-batch02-{host-checkpoint2,host-extra2,core-checkpoint2,svc-checkpoint2,lsp-integration}-results.json`
 and corresponding logs. Batch-01 native socket/ownership failures remain open.
+
+## Provider-expiry revision
+
+THE-484 source checkpoint `2dbe30aa` and evidence update `3f3d73c7` are now
+merged into the private review branch. Primary and independent source reviews
+approved present Fly custody, exact single-machine inventory proof, ambiguity
+quarantine before any provider access or ledger cleanup, and nonempty exact
+recorded VPS identity. The author passed 118 focused core tests, 26 additional
+core lease/heal/config tests, 28 service tests, 26 proxy/media tests and the
+actual-source ambiguity-action fixture. Shared primitive fixtures pass in debug
+and optimized builds. These scoped counts overlap some earlier selections.
+
+Final combined host compilation/testing is pending with THE-154. Provider
+inventory/read-to-delete generation races and unknown historical ownership
+remain explicit limitations; quarantine retains resources for reconciliation.
+No live provider action was executed.

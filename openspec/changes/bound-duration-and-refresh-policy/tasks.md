@@ -9,7 +9,7 @@
 - [x] Run first focused core gate: 28 tests pass; primitive debug/optimized and worker-failure harnesses pass.
 - [x] Complete independent model/PR scheduler regression; nine actual-source cadence/schedule/panic fixtures pass in debug and optimized builds.
 - [x] Run updated core32 and existing config293 tests, and measure full-load overhead (+0.21% median, within noise).
-- [ ] Complete final primary/adversarial approval and combined host checks for THE-483.
+- [x] Complete THE-483 primary/adversarial source approval and combined host cadence/panic fixtures at checkpoint 2; native batch-wide gates remain separate.
 - [x] Replace remaining signed duration/epoch policy casts and classify all remaining cast files in the THE-484 audit.
 - [x] Implement and test visible provider-time quarantine with exact Fly custody/inventory evidence; never invent local generation/time provenance.
 - [x] Verify daemon lease, MCP breaker, model budget and usage reset boundaries: core118 + extra26, svc28, proxy/media26 pass; actual-source shared reaper admission action-count fixture passes.
