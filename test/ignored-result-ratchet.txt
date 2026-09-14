@@ -331,7 +331,6 @@ crates/thegn-svc/src/host/retry.rs
 crates/thegn-svc/src/ipc.rs
 crates/thegn-svc/src/iroh_reach.rs
 crates/thegn-svc/src/log/provider.rs
-crates/thegn-svc/src/lsp/framing.rs
 crates/thegn-svc/src/lsp/mod.rs
 crates/thegn-svc/src/machine0/mcp.rs
 crates/thegn-svc/src/machine0/mod.rs

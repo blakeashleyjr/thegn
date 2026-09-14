@@ -357,6 +357,41 @@
       ]
     },
     {
+      "issue": "THE-286",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "repair-kitty-stream-parser"
+      ]
+    },
+    {
+      "issue": "THE-310",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "bound-shared-framed-protocols"
+      ]
+    },
+    {
+      "issue": "THE-343",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "admit-set-only-pane-clipboard"
+      ]
+    },
+    {
+      "issue": "THE-377",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "secure-custom-command-templates"
+      ]
+    },
+    {
+      "issue": "THE-471",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "sanitize-calendar-display-text"
+      ]
+    },
+    {
       "issue": "THE-559",
       "project": "Workspace Product & Observability",
       "changes": [

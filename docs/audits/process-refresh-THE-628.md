@@ -36,8 +36,8 @@ Logs: `/tmp/thegn-process-refresh-harness-tests.log` and
 Eight additional host monitor fixtures cover repeated hydration/sample
 interleaving, passive rank changes, manual scrolling, disappearance and PID
 reuse, signal prompt identity and escalation, explicit-sort reset, and paused
-refresh. They await the coordinated combined host test build; this harness is
-not a substitute for them. Rendering remains pure, the existing idle render
+refresh. They passed in the assembled host checkpoint: all 79 monitor tests and
+three model-equality tests passed on September 13. Rendering remains pure, the existing idle render
 gate is unchanged, and no new sampling wake/timer was introduced. No visual
 end-to-end run or live perceived-smoothness claim is made yet.
 
@@ -46,6 +46,6 @@ separating input redraw from collection. Adjacent follow-ups: hidden sampler
 half-tick thread wakes, rebuilding unrelated tab rows on every status refresh,
 and content-sized table column jitter. They are excluded from this focused fix.
 
-Primary code review, independent adversarial review, combined host/source gates,
-and landing are pending. Canonical Git metadata is read-only in this session;
+Primary source review, independent adversarial review and the focused host
+checks are complete. Combined final gates and canonical landing remain pending. Canonical Git metadata is read-only in this session;
 changes are isolated in the private remediation clone.
