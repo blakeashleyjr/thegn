@@ -123,6 +123,9 @@ impl KittyRelay {
                         self.state = ScanState::Apc { escape: false };
                     } else {
                         text.push(ESC);
+                        if text.len() == TEXT_PIECE_BYTES {
+                            emit(Piece::Emulator(std::mem::take(&mut text)));
+                        }
                         if byte == ESC {
                             self.state = ScanState::Escape;
                         } else {
@@ -360,6 +363,23 @@ mod tests {
         relay.feed_with(&vec![b'x'; MAX_APC_BYTES], |_| panic!());
         relay.reset();
         assert_eq!(relay.feed(b"new"), vec![Piece::Emulator(b"new".to_vec())]);
+    }
+
+    #[test]
+    fn escape_pair_at_text_boundary_does_not_grow_output_past_limit() {
+        let mut relay = KittyRelay::new();
+        let mut input = vec![b'x'; TEXT_PIECE_BYTES - 1];
+        input.extend_from_slice(b"\x1b[");
+        let mut output = Vec::new();
+        relay.feed_with(&input, |piece| {
+            let Piece::Emulator(bytes) = piece else {
+                panic!()
+            };
+            assert!(bytes.len() <= TEXT_PIECE_BYTES);
+            assert!(bytes.capacity() <= TEXT_PIECE_BYTES);
+            output.extend(bytes);
+        });
+        assert_eq!(output, input);
     }
 
     #[test]
