@@ -1,6 +1,6 @@
 # THE-154: resident plugin lifecycle investigation and proposed repair
 
-Status (September 14): the scoped lifecycle repair landed on local main. Its final assembled gate passed 48 plugin regressions, host integration, and scoped clippy; all 48 passed again during native Linux landing validation. Full THE-154 acceptance remains open. The native test/CI follow-up below is approved; its new execution evidence is still pending.
+Status (September 14): the scoped lifecycle repair landed on local main. Its final assembled gate passed 48 plugin regressions, host integration, and scoped clippy; all 48 passed again during native Linux landing validation. Full THE-154 acceptance remains open. The approved native test/CI follow-up passed all eight new Linux regressions alongside all 48 existing plugin tests; native Windows/macOS execution remains outstanding.
 This is an existing lifecycle defect, not a plugin feature expansion.
 
 ## Historical defects at the original audit baseline (repaired)
@@ -237,23 +237,24 @@ progress, the write deadline, stdout EOF while the leader lives, native pipe and
 protocol failures, callback panic, final reply and pending-RPC EOF, concurrent
 shutdown/kill, and spawn failure followed by replacement. All settlement claims
 remain `tree: Unproven`. The existing deterministic Windows cancellation test
-is selected separately by its exact full name; cancellation between the worker
+is selected separately through the Windows tests module (currently one test);
+cancellation between the worker
 latch and ReadFile must be repeated until the actual thread finishes.
 
 The opt-in Windows CI job runs both selections. Its opt-in policy, macOS full
 build/test job, production platform code and plugin availability are unchanged.
 No CI dispatch, push or native Windows/macOS execution is performed by this
-change. Linux execution and foreign-target compilation will be recorded after
-the coordinated validation slot becomes available.
+change. Linux execution passed at the assembled follow-up checkpoint; foreign-
+target compilation of this new source remains a separate pending gate.
 
-| Gate                              | Evidence before this follow-up                                 | Remaining evidence                                                                                     |
-| --------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Native Linux lifecycle            | Landed plugin subset 48/48, rerun during September 14 landing  | Execute the eight new portable regressions and existing subset                                         |
-| Windows library/tests compilation | Full service `x86_64-pc-windows-gnu --tests` crosscheck passed | Recheck added test source; this cannot prove Windows runtime behavior                                  |
-| Native Windows lifecycle          | No recorded resident fixture execution                         | Run the explicit native CI selections on Windows, including CancelSynchronousIo race and failure paths |
-| Darwin source compilation         | Isolated actual-source platform/tests crosscheck passed        | Added portable fixture source is not covered by that historical check                                  |
-| Native macOS lifecycle            | No recorded resident fixture execution                         | Execute resident tests on macOS to exercise SIGCHLD/WNOWAIT and native pipes                           |
-| Complete escaped-tree containment | No enforceable resident tree owner on any supported platform   | Architectural containment prerequisite and native descendant/accounting evidence                       |
+| Gate                              | Evidence before this follow-up                                                           | Remaining evidence                                                                                     |
+| --------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Native Linux lifecycle            | Eight new and 48 existing plugin regressions passed; two ratchets passed; helper ignored | Final follow-up integration/source checks                                                              |
+| Windows library/tests compilation | Full service `x86_64-pc-windows-gnu --tests` crosscheck passed                           | Recheck added test source; this cannot prove Windows runtime behavior                                  |
+| Native Windows lifecycle          | No recorded resident fixture execution                                                   | Run the explicit native CI selections on Windows, including CancelSynchronousIo race and failure paths |
+| Darwin source compilation         | Isolated actual-source platform/tests crosscheck passed                                  | Added portable fixture source is not covered by that historical check                                  |
+| Native macOS lifecycle            | No recorded resident fixture execution                                                   | Execute resident tests on macOS to exercise SIGCHLD/WNOWAIT and native pipes                           |
+| Complete escaped-tree containment | No enforceable resident tree owner on any supported platform                             | Architectural containment prerequisite and native descendant/accounting evidence                       |
 
 Complete-tree closure cannot be obtained by reusing the current host Windows
 helper: it assigns the Job Object after spawn and permits a direct-child fallback.
@@ -266,3 +267,9 @@ requires a separate availability and escape policy. There is no existing macOS
 complete-tree containment seam to extract. These are outstanding prerequisites,
 not claims that an unproven tree is a known living descendant or a reason to
 disable otherwise working plugins.
+
+The native follow-up receipt is `/tmp/thegn-rolling-plugin-20260914.log` with
+`/tmp/thegn-rolling-plugin-20260914-results.json`: 58 passed, one ignored (56 plugin
+regressions and two ratchets). Independent reviewer verified that the eight new
+tests passed and excluded the helper from the regression count. These are Linux
+results, not execution evidence for Windows cancellation or macOS SIGCHLD.
