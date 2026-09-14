@@ -306,6 +306,34 @@ pub fn validate_commands(commands: &[GitCommand]) -> Vec<String> {
         .collect()
 }
 
+/// Validate changed command definitions before a config write is visible.
+/// Unchanged legacy commands do not prevent an unrelated configuration repair.
+/// Parse errors and diagnostics never include configured command text or keys.
+pub fn validate_write(before: &str, after: &str) -> Result<(), String> {
+    let read = |body: &str| {
+        toml::from_str::<toml::Value>(body)
+            .map_err(|_| "git_commands: configuration could not be inspected".to_string())
+    };
+    let before = read(before)?;
+    let after = read(after)?;
+    if before.get("git_commands") == after.get("git_commands") {
+        return Ok(());
+    }
+    let Some(value) = after.get("git_commands") else {
+        return Ok(());
+    };
+    let commands: Vec<GitCommand> = value
+        .clone()
+        .try_into()
+        .map_err(|_| "git_commands: invalid command definitions".to_string())?;
+    let errors = validate_commands(&commands);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 pub fn compile(cmd: &GitCommand, ctx: &TemplateCtx) -> Result<ExpandedCommand, TemplateError> {
     let mode = validate(cmd)?;
     let program = if mode == Mode::Argv {

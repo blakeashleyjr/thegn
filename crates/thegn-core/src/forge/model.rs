@@ -105,7 +105,19 @@ pub struct IssueRow {
     pub labels: Vec<String>,
 }
 
-/// Deserialized from `gh pr view --json …`, plus a computed checks rollup.
+/// Provider-reported author identity; stable node ID is required for ownership.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrAuthor {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub login: String,
+    #[serde(default)]
+    pub is_bot: bool,
+}
+
+/// Cached author is descriptive data, never a dispatch authorization token.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrStatus {
@@ -113,6 +125,9 @@ pub struct PrStatus {
     pub title: String,
     pub state: String, // OPEN | CLOSED | MERGED
     pub url: String,
+    /// Old cache rows deserialize as unknown and cannot authorize own-PR work.
+    #[serde(default)]
+    pub author: Option<PrAuthor>,
     #[serde(default)]
     pub is_draft: bool,
     #[serde(default)]

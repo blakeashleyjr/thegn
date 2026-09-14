@@ -65,18 +65,20 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
                 .with_context(|| format!("read {} before validation", path.display()));
         }
     };
+    let next = doc.to_string();
     crate::config_duration::introduced(
         &crate::config_duration::errors_for_str(&prior),
-        crate::config_duration::errors_for_str(&doc.to_string()),
+        crate::config_duration::errors_for_str(&next),
     )
     .map_err(anyhow::Error::msg)?;
+    crate::custom_cmd::validate_write(&prior, &next).map_err(anyhow::Error::msg)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     // Write atomically (tmp + rename) so a crash/full-disk mid-write can't leave a
     // truncated, unparseable config that load_layered then discards.
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, next).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))
 }
 

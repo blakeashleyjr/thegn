@@ -288,3 +288,31 @@ fn strict_validation_rejects_only_the_command_not_config_deserialization() {
             .any(|e| e.contains("git_commands[0]") && e.contains("legacy"))
     );
 }
+
+#[test]
+fn changed_commands_are_rejected_before_write_and_unrelated_repairs_remain_possible() {
+    let legacy = "[[git_commands]]\nkey='x'\ncommand='echo {{.SelectedFile}}'\n";
+    let safe = "[[git_commands]]\nkey='x'\nargv=['printf', '%s', '{{.SelectedFile}}']\n";
+    assert!(validate_write("", legacy).is_err());
+    assert!(validate_write(legacy, safe).is_ok());
+    assert!(validate_write(legacy, &format!("[pr]\nttl_secs=33\n{legacy}")).is_ok());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    assert!(
+        crate::config_write::set_key(&path, "git_commands", "sensitive invalid definition")
+            .is_err()
+    );
+    assert!(!path.exists());
+    let original = format!("# retain policy\n[sandbox]\nnetwork='none'\n{legacy}");
+    std::fs::write(&path, &original).unwrap();
+    let error = crate::config_write::set_key(&path, "git_commands", "sensitive invalid definition")
+        .unwrap_err();
+    assert!(!error.to_string().contains("sensitive"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    crate::config_write::set_key(&path, "pr.ttl_secs", "33").unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    let cfg: crate::config::Config = toml::from_str(&body).unwrap();
+    assert_eq!(cfg.pr.ttl_secs, 33);
+    assert_eq!(cfg.sandbox.network, crate::config::Network::None);
+    assert!(compile(&cfg.git_commands[0], &context("secret")).is_err());
+}
