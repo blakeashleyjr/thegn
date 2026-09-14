@@ -179,6 +179,11 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
 /// Parse `owner/repo` from a git remote URL (ssh or https, with/without
 /// `.git`). One parser for the workspace: `thegn_core::forge::model`'s.
 pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
+    // This implementation uses api.github.com. A syntactically valid owner/repo
+    // on another forge is not permission to query the same name on GitHub.
+    if super::remote_host(url).as_deref() != Some("github.com") {
+        return None;
+    }
     nwo_from_remote_url(url).and_then(|nwo| {
         nwo.split_once('/')
             .map(|(o, r)| (o.to_string(), r.to_string()))
@@ -279,6 +284,14 @@ impl GithubNative {
     /// The gate every native op runs first: local loc, closed circuit, token,
     /// origin. Any miss is `NotConfigured` — the ladder falls through.
     fn gate(&self, loc: &GitLoc) -> Result<(String, String, String), ForgeError> {
+        self.gate_with_token(loc, resolve_token)
+    }
+
+    fn gate_with_token(
+        &self,
+        loc: &GitLoc,
+        token: impl FnOnce() -> Option<String>,
+    ) -> Result<(String, String, String), ForgeError> {
         if loc.is_remote() {
             return Err(ForgeError::NotConfigured("native layer is local-only"));
         }
@@ -287,11 +300,13 @@ impl GithubNative {
                 "circuit open after repeated failures",
             ));
         }
-        let Some(token) = resolve_token() else {
-            return Err(ForgeError::NotConfigured("no GitHub token"));
-        };
         let Some((owner, repo)) = self.owner_repo(loc) else {
-            return Err(ForgeError::NotConfigured("origin is not a GitHub remote"));
+            return Err(ForgeError::NotConfigured(
+                "origin is not a public GitHub remote",
+            ));
+        };
+        let Some(token) = token() else {
+            return Err(ForgeError::NotConfigured("no GitHub token"));
         };
         Ok((token, owner, repo))
     }
@@ -308,53 +323,69 @@ impl GithubNative {
             .personal_token(token)
             .build()
             .map_err(|_| ForgeError::NotConfigured("octocrab client build failed"))?;
-        let result = rt.block_on(async {
-            tokio::time::timeout(OCTOCRAB_REQUEST_TIMEOUT, client.graphql::<Value>(&body)).await
-        });
-        match result {
-            Ok(Ok(resp)) if resp.get("errors").is_none() => {
-                circuit().record_success();
-                Ok(resp)
-            }
-            Ok(Ok(resp)) => {
-                // GraphQL-level errors (not a network failure) — CLI fallback.
-                tracing::debug!(
-                    target: "thegn::forge",
-                    op = what,
-                    errors = ?resp.get("errors"),
-                    "octocrab GraphQL errors, falling back to cli"
-                );
-                Err(ForgeError::NotConfigured("GraphQL errors"))
-            }
-            Ok(Err(e)) => {
-                let text = e.to_string().to_lowercase();
-                let is_connect =
-                    text.contains("connect") || text.contains("dns") || text.contains("tls");
-                tracing::warn!(
-                    target: "thegn::forge",
-                    op = what,
-                    error = %e,
-                    is_connect,
-                    "octocrab request failed"
-                );
-                if is_connect {
-                    circuit().record_failure();
-                    Err(ForgeError::Offline)
-                } else {
-                    // An HTTP-level answer (401/403/5xx): final, not a fallthrough.
-                    Err(ForgeError::Other(e.to_string()))
+        rt.block_on(graphql_request(
+            &client,
+            &body,
+            what,
+            OCTOCRAB_REQUEST_TIMEOUT,
+            circuit(),
+        ))
+    }
+}
+
+/// Classify the SDK's typed error, never its Display text (which can contain
+/// arbitrary repository names such as `connectivity`). HTTP/GraphQL answers
+/// prove reachability even when authentication or the service itself failed.
+fn classify_error(error: &octocrab::Error) -> (ForgeError, bool) {
+    match error {
+        octocrab::Error::Graphql { .. } => (ForgeError::NotConfigured("GraphQL errors"), true),
+        octocrab::Error::GitHub { source, .. } => {
+            let code = source.status_code.as_u16();
+            let error = match code {
+                429 => ForgeError::RateLimited,
+                403 if source.message.to_ascii_lowercase().contains("rate limit") => {
+                    ForgeError::RateLimited
                 }
+                401 | 403 => ForgeError::NotAuthenticated,
+                _ => ForgeError::Other(format!("GitHub API HTTP {code}: {}", source.message)),
+            };
+            (error, true)
+        }
+        octocrab::Error::Service { .. } | octocrab::Error::Hyper { .. } => {
+            (ForgeError::Offline, false)
+        }
+        _ => (ForgeError::Other(error.to_string()), false),
+    }
+}
+
+async fn graphql_request(
+    client: &octocrab::Octocrab,
+    body: &Value,
+    what: &'static str,
+    timeout: std::time::Duration,
+    health: &GhCircuit,
+) -> Result<Value, ForgeError> {
+    match tokio::time::timeout(timeout, client.graphql::<Value>(body)).await {
+        Ok(Ok(data)) => {
+            health.record_success();
+            Ok(data)
+        }
+        Ok(Err(error)) => {
+            let (classified, reached_server) = classify_error(&error);
+            if reached_server {
+                health.record_success();
+            } else if classified == ForgeError::Offline {
+                health.record_failure();
             }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    target: "thegn::forge",
-                    op = what,
-                    timeout_secs = OCTOCRAB_REQUEST_TIMEOUT.as_secs(),
-                    "octocrab request timed out"
-                );
-                circuit().record_failure();
-                Err(ForgeError::Offline)
-            }
+            tracing::warn!(target: "thegn::forge", op = what, error = %classified,
+                "octocrab request failed");
+            Err(classified)
+        }
+        Err(_) => {
+            health.record_failure();
+            tracing::warn!(target: "thegn::forge", op = what, timeout_secs = timeout.as_secs(),
+                "octocrab request timed out");
+            Err(ForgeError::Offline)
         }
     }
 }
@@ -423,16 +454,215 @@ impl Forge for GithubNative {
     }
 }
 
+const TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_TOKEN_BYTES: u64 = 16 * 1024;
+
 fn gh_auth_token() -> Option<String> {
-    let out = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output()
+    let mut command = std::process::Command::new("gh");
+    command.args(["auth", "token", "--hostname", "github.com"]);
+    token_command(command, TOKEN_TIMEOUT)
+}
+
+const MAX_TOKEN_HELPERS: usize = 4;
+static TOKEN_HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct TokenPermit(&'static std::sync::atomic::AtomicUsize);
+impl TokenPermit {
+    fn acquire(budget: &'static std::sync::atomic::AtomicUsize) -> Option<Self> {
+        budget
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active < MAX_TOKEN_HELPERS).then_some(active + 1),
+            )
+            .ok()?;
+        Some(Self(budget))
+    }
+}
+impl Drop for TokenPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+struct ReapJob {
+    child: std::process::Child,
+    _permit: Option<TokenPermit>,
+}
+
+// Failed handoffs retain both child ownership and capacity. Since every job
+// holds one of four permits, this queue cannot grow with repeated refreshes.
+static PENDING_REAPS: std::sync::Mutex<Vec<ReapJob>> = std::sync::Mutex::new(Vec::new());
+
+fn defer_reap_with(
+    job: ReapJob,
+    pending: &'static std::sync::Mutex<Vec<ReapJob>>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    let job = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
+    let handoff = job.clone();
+    let task = Box::new(move || {
+        let Some(mut job) = handoff.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        if let Err(error) = job.child.wait() {
+            tracing::debug!(target: "thegn::forge", %error, "credential helper reap deferred");
+            // A wait error does not prove the child is reaped. Keep ownership
+            // and capacity rather than signalling a possibly recycled id.
+            pending.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+        }
+    });
+    if let Err(error) = spawn(task) {
+        tracing::debug!(target: "thegn::forge", %error, "credential reaper unavailable");
+        if let Some(job) = job.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            pending.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+        }
+    }
+}
+
+fn defer_reap(job: ReapJob) {
+    defer_reap_with(job, &PENDING_REAPS, |task| {
+        std::thread::Builder::new()
+            .name("forge-credential-reaper".into())
+            .spawn(task)
+            .map(drop)
+    });
+}
+
+fn retry_reapers() {
+    let pending = std::mem::take(&mut *PENDING_REAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    for job in pending {
+        defer_reap(job);
+    }
+}
+
+/// Own an unreaped child as the process-group identity anchor. No group signal
+/// is ever sent after reaping or after a wait error makes ownership uncertain.
+struct TokenProcess {
+    child: Option<std::process::Child>,
+    permit: Option<TokenPermit>,
+    can_signal: bool,
+}
+
+impl TokenProcess {
+    fn observe_exit(
+        &mut self,
+        result: std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match &result {
+            Ok(Some(_)) => {
+                self.child.take();
+            }
+            Err(_) => self.can_signal = false,
+            Ok(None) => {}
+        }
+        result
+    }
+
+    fn poll_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let result = self
+            .child
+            .as_mut()
+            .expect("owned unreaped helper")
+            .try_wait();
+        self.observe_exit(result)
+    }
+}
+
+impl Drop for TokenProcess {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if self.can_signal {
+            crate::plugin::proc::kill_group(child.id());
+            if let Err(error) = child.kill() {
+                tracing::debug!(target: "thegn::forge", %error, "credential helper termination failed");
+            }
+            // Bound cleanup on the caller. No further signal follows any wait
+            // outcome; delayed or uncertain ownership goes to the reaper only.
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if std::time::Instant::now() < until => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    _ => break,
+                }
+            }
+        }
+        defer_reap(ReapJob {
+            child,
+            _permit: self.permit.take(),
+        });
+    }
+}
+
+/// Bound both exit and stdout completion: a helper's descendant may retain the
+/// pipe after its parent exits. The unreaped leader pins ownership until EOF or
+/// cancellation, so timeout cleanup cannot target a recycled numeric group.
+fn token_command(command: std::process::Command, timeout: std::time::Duration) -> Option<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .ok()?;
-    if !out.status.success() {
+    runtime.block_on(token_command_async(command, timeout))
+}
+
+async fn token_command_async(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::plugin::proc::set_process_group(&mut command);
+    retry_reapers();
+    let permit = TokenPermit::acquire(&TOKEN_HELPERS)?;
+    let mut owned = TokenProcess {
+        child: Some(command.spawn().ok()?),
+        permit: Some(permit),
+        can_signal: true,
+    };
+    let stdout = owned.child.as_mut()?.stdout.take()?;
+    let stdout = tokio::process::ChildStdout::from_std(stdout).ok()?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    // No wait/try_wait before pipe completion: even an exited parent must stay
+    // unreaped while its descendants can still retain the credential pipe.
+    tokio::time::timeout_at(
+        deadline,
+        stdout.take(MAX_TOKEN_BYTES + 1).read_to_end(&mut bytes),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if bytes.len() as u64 > MAX_TOKEN_BYTES {
         return None;
     }
-    let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!tok.is_empty()).then_some(tok)
+    let status = loop {
+        match owned.poll_exit() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + std::time::Duration::from_millis(5)).min(deadline),
+        )
+        .await;
+    };
+    if !status.success() {
+        return None;
+    }
+    let token = String::from_utf8(bytes).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 #[cfg(test)]
@@ -600,3 +830,7 @@ mod tests {
         assert_eq!(panel.fetched_at, 7);
     }
 }
+
+#[cfg(test)]
+#[path = "native_regression_tests.rs"]
+mod regression_tests;

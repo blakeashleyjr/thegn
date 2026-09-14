@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use serde::de::Deserializer;
@@ -193,19 +192,10 @@ pub fn drawer_policy(cfg: &Config) -> DrawerPolicy {
     DrawerPolicy::from_config(cfg)
 }
 
-/// Emit each normal-loading registry warning once per process. Config is
-/// reloaded during hydration, so reporting the same malformed row on every
-/// reload would turn one typo into a warning storm.
+/// Runtime warnings share the bounded, source-aware config diagnostic cache.
 pub(crate) fn warn_policy_issues(cfg: &Config) {
-    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
-    let warned = WARNED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
-    let policy = drawer_policy(cfg);
-    for warning in policy.warnings() {
-        if let Ok(mut seen) = warned.lock()
-            && seen.insert(warning.clone())
-        {
-            config_warn(warning);
-        }
+    for warning in drawer_policy(cfg).warnings() {
+        config_warn(warning);
     }
 }
 

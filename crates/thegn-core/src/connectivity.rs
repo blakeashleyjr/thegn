@@ -77,6 +77,14 @@ impl ConnState {
         }
     }
 
+    /// Change policy without discarding observed connectivity or recovery history.
+    /// A changed failure threshold applies to the next failure; policy changes
+    /// alone are not evidence that the network went online or offline.
+    pub fn update_thresholds(&mut self, offline_after: u32, probe_every_ms: u64) {
+        self.offline_after = offline_after.max(1);
+        self.probe_every_ms = probe_every_ms.max(1);
+    }
+
     pub fn state(&self) -> Connectivity {
         self.state
     }
@@ -205,9 +213,8 @@ fn forced() -> bool {
     FORCED.load(Ordering::Relaxed) != FORCED_AUTO
 }
 
-fn apply_edge(edge: Option<Connectivity>) {
+fn apply_edge(previous: Connectivity, edge: Option<Connectivity>) {
     let Some(new) = edge else { return };
-    HOT.store(conn_to_hot(new), Ordering::Relaxed);
     // Under a forced mode the UI shows the pinned state, so suppress the
     // transition side-effects (message + waker) to avoid spurious "Back online"
     // chatter while the user has pinned offline/online.
@@ -218,6 +225,10 @@ fn apply_edge(edge: Option<Connectivity>) {
         Connectivity::Offline => tracing::warn!(
             target: "thegn::connectivity",
             "network offline — pausing remote refreshes"
+        ),
+        Connectivity::Online if previous == Connectivity::Unknown => tracing::info!(
+            target: "thegn::connectivity",
+            "network online"
         ),
         Connectivity::Online => tracing::info!(
             target: "thegn::connectivity",
@@ -230,18 +241,30 @@ fn apply_edge(edge: Option<Connectivity>) {
     }
 }
 
+/// Apply evidence and publish the hot state while holding the same lock, so
+/// concurrent reporters cannot publish an older state after a newer one.
+fn report(update: impl FnOnce(&mut ConnState, u64) -> Option<Connectivity>) {
+    let now = now_ms();
+    let transition = state().lock().ok().map(|mut s| {
+        let previous = s.state();
+        let edge = update(&mut s, now);
+        HOT.store(conn_to_hot(s.state()), Ordering::Relaxed);
+        (previous, edge)
+    });
+    if let Some((previous, edge)) = transition {
+        // Hooks can call readers; never invoke them with the state lock held.
+        apply_edge(previous, edge);
+    }
+}
+
 /// Report a transient network failure (offline evidence).
 pub fn report_failure() {
-    let now = now_ms();
-    let edge = state().lock().ok().and_then(|mut s| s.report_failure(now));
-    apply_edge(edge);
+    report(ConnState::report_failure);
 }
 
 /// Report a successful network op (online evidence).
 pub fn report_success() {
-    let now = now_ms();
-    let edge = state().lock().ok().and_then(|mut s| s.report_success(now));
-    apply_edge(edge);
+    report(ConnState::report_success);
 }
 
 /// Recovery gate for the ticker: `true` at most once per cadence while offline.
@@ -269,11 +292,10 @@ pub fn install_forced(forced: Option<Connectivity>) {
 }
 
 /// Install the failure threshold + recovery cadence from `[network]` config.
-/// First set wins for the machine (a mid-session reload keeps startup values,
-/// like the theme), but the thresholds themselves are re-applied.
+/// Reloads preserve evidence and recovery cadence; only policy values change.
 pub fn install_thresholds(offline_after: u32, probe_every_ms: u64) {
     if let Ok(mut s) = state().lock() {
-        *s = ConnState::with_thresholds(offline_after, probe_every_ms);
+        s.update_thresholds(offline_after, probe_every_ms);
     }
 }
 
@@ -286,6 +308,101 @@ pub fn set_on_transition(hook: fn(Connectivity)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_reload_global_state_is_consistent() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connectivity::tests::config_reload_child",
+                "--nocapture",
+            ])
+            .env("THEGN_CONNECTIVITY_RELOAD_TEST", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn config_reload_child() {
+        if std::env::var_os("THEGN_CONNECTIVITY_RELOAD_TEST").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[network]\nrecovery_probe_secs = 1\n").unwrap();
+        let load = || {
+            crate::config::Config::try_load_layered(
+                &crate::config::MapEnv(Default::default()),
+                &[],
+                Some(path.clone()),
+            )
+            .unwrap()
+        };
+        load();
+        for _ in 0..3 {
+            report_failure();
+        }
+        assert_eq!(current(), Connectivity::Offline);
+        load();
+        assert_eq!(current(), Connectivity::Offline);
+        assert_eq!(consecutive_failures(), 3);
+        assert!(
+            should_probe(),
+            "unchanged config must not disable offline recovery"
+        );
+        install_forced(Some(Connectivity::Online));
+        assert_eq!(current(), Connectivity::Online);
+        install_forced(None);
+        assert_eq!(current(), Connectivity::Offline);
+        report_success();
+        load();
+        assert_eq!(current(), Connectivity::Online);
+    }
+
+    #[test]
+    fn policy_reload_preserves_evidence_and_recovery() {
+        let mut s = ConnState::with_thresholds(3, 100);
+        s.report_success(0);
+        s.update_thresholds(3, 100);
+        assert_eq!(s.state(), Connectivity::Online);
+        assert_eq!(
+            s.report_success(1),
+            None,
+            "reload cannot create another online edge"
+        );
+        s.report_failure(2);
+        s.report_failure(3);
+        s.update_thresholds(3, 100);
+        assert_eq!(s.consecutive_failures(), 2);
+        assert_eq!(s.report_failure(4), Some(Connectivity::Offline));
+        assert!(s.should_probe(4));
+        s.update_thresholds(3, 100);
+        assert_eq!(s.state(), Connectivity::Offline);
+        assert_eq!(s.offline_since_ms, Some(4));
+        assert_eq!(s.consecutive_failures(), 3);
+        assert!(!s.should_probe(103));
+        assert!(s.should_probe(104));
+        s.update_thresholds(10, 200);
+        assert_eq!(s.state(), Connectivity::Offline);
+        assert!(!s.should_probe(303));
+        assert!(s.should_probe(304));
+        assert_eq!(s.report_success(305), Some(Connectivity::Online));
+    }
+
+    #[test]
+    fn changed_failure_policy_applies_to_next_evidence() {
+        let mut s = ConnState::with_thresholds(5, 100);
+        s.report_failure(0);
+        s.report_failure(1);
+        s.update_thresholds(2, 100);
+        assert_eq!(s.state(), Connectivity::Unknown);
+        assert_eq!(s.report_failure(2), Some(Connectivity::Offline));
+    }
 
     #[test]
     fn flips_offline_after_threshold() {
