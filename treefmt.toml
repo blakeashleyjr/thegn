@@ -4,7 +4,7 @@
 
 # Files/paths excluded from ALL formatters.
 excludes = [
-  "*.kdl",     # no kdl formatter; layouts are hand-maintained
+  "*.kdl",            # no kdl formatter; layouts are hand-maintained
   "*.lock",
   "LICENSE",
   "target/*",
