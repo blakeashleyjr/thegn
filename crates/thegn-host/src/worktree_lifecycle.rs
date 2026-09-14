@@ -881,6 +881,8 @@ fn teardown_runtime(
     worktree: &Path,
     db: Option<&Db>,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    teardown_fixture::refuse_observed_path(worktree)?;
     let selected = db
         .and_then(|db| db.effective_env(&worktree.to_string_lossy(), &repo_root.to_string_lossy()));
     let loc = thegn_core::remote::GitLoc::for_worktree(worktree);
@@ -2239,3 +2241,7 @@ mod landing_tests {
         assert_eq!(cursor_path(&model, &sb).as_deref(), Some("/tmp/app-zeta"));
     }
 }
+
+#[cfg(test)]
+#[path = "worktree_teardown_fixture.rs"]
+pub(crate) mod teardown_fixture;

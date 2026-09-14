@@ -28,6 +28,14 @@ fn local_runtime_admission_pins_workspace_selection_and_refuses_persisted_sessio
             .contains("environment changed")
     );
     db.set_workspace_env(root, "").unwrap();
+    db.set_worktree_env(path, "changed-worktree").unwrap();
+    assert!(
+        settled
+            .revalidate(&db, &fixture.root, path)
+            .unwrap_err()
+            .contains("environment changed")
+    );
+    db.set_worktree_env(path, "").unwrap();
     db.put_tab_group(
         "private-session",
         &thegn_core::models::TabGroupRow {
@@ -416,3 +424,6 @@ fn private_git_transaction_rejects_a_changed_target_oid() {
         verified.head
     );
 }
+
+#[path = "merge_cleanup_runtime_tests.rs"]
+mod runtime;
