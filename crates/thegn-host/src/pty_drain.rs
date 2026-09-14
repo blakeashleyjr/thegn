@@ -178,6 +178,35 @@ impl PtyBacklog {
         }
     }
 
+    /// `None` retires stale/nonpending entries without consuming admission
+    /// budget; `Some(true)` retains a refused set, `Some(false)` accepted it.
+    /// Return true only when unvisited work follows successful admissions (sync
+    /// mode has no writer-pop wake). Full queues provide their own capacity wake.
+    fn retry_clipboards(
+        &mut self,
+        budget: usize,
+        mut retry: impl FnMut(u32) -> Option<bool>,
+    ) -> bool {
+        let mut unvisited = self.clipboard_ready.len();
+        let mut attempts = 0;
+        let mut admitted = false;
+        while unvisited > 0 && attempts < budget {
+            unvisited -= 1;
+            let Some(id) = self.clipboard_ready.pop_front() else {
+                break;
+            };
+            if let Some(pending) = retry(id) {
+                attempts += 1;
+                if pending {
+                    self.clipboard_ready.push_back(id);
+                } else {
+                    admitted = true;
+                }
+            }
+        }
+        unvisited > 0 && admitted
+    }
+
     /// Everything stashed for `id` (the pre-Exit flush). Removes the pane.
     #[cfg(test)]
     fn drain_pane(&mut self, id: u32) -> Vec<u8> {
@@ -433,21 +462,20 @@ pub(crate) fn drain<T: Terminal>(
 
     // Retry a bounded round-robin pass. Writer capacity release supplies the
     // next wake; no timer runs merely because the clipboard is idle.
-    let attempts = backlog.clipboard_ready.len().min(64);
-    for _ in 0..attempts {
-        let Some(id) = backlog.clipboard_ready.pop_front() else {
-            break;
-        };
-        if let Some(p) = ctx.panes.table.get_mut(&id) {
-            p.clipboard.submit(|bytes| {
-                ctx.writer.try_submit_clipboard(bytes, || {
-                    let _ = ctx.waker.wake(); // best-effort: retry work may outlive the terminal
-                })
-            });
-            if p.clipboard.has_pending() {
-                backlog.clipboard_ready.push_back(id);
-            }
+    let more_ready = backlog.retry_clipboards(64, |id| {
+        let p = ctx.panes.table.get_mut(&id)?;
+        if !p.clipboard.has_pending() {
+            return None;
         }
+        p.clipboard.submit(|bytes| {
+            ctx.writer.try_submit_clipboard(bytes, || {
+                let _ = ctx.waker.wake(); // best-effort: retry work may outlive the terminal
+            })
+        });
+        Some(p.clipboard.has_pending())
+    });
+    if more_ready {
+        let _ = ctx.waker.wake(); // best-effort: unvisited admission work needs another bounded pass
     }
 
     // A degraded pane that printed anything is by definition not blank — its
@@ -1668,5 +1696,39 @@ mod tests {
         assert_eq!(backlog.clipboard_ready, [3, 2]);
         backlog.clipboard_pending(1);
         assert_eq!(backlog.clipboard_ready, [3, 2, 1]);
+    }
+    #[test]
+    fn backlog_retry_stale_prefix_cannot_strand_a_later_valid_set() {
+        let mut backlog = PtyBacklog::default();
+        for id in 1..=100 {
+            backlog.clipboard_pending(id);
+        }
+        let mut attempted = Vec::new();
+        let wake = backlog.retry_clipboards(64, |id| {
+            if id < 100 {
+                None
+            } else {
+                attempted.push(id);
+                Some(true)
+            }
+        });
+        assert_eq!(attempted, [100]);
+        assert_eq!(backlog.clipboard_ready, [100]);
+        assert!(
+            !wake,
+            "a refused live set gets the writer's capacity/lock wake"
+        );
+    }
+
+    #[test]
+    fn backlog_retry_successful_budget_yields_wake_for_unvisited_work() {
+        let mut backlog = PtyBacklog::default();
+        for id in 1..=100 {
+            backlog.clipboard_pending(id);
+        }
+        assert!(backlog.retry_clipboards(64, |_| Some(false)));
+        assert_eq!(backlog.clipboard_ready.len(), 36);
+        assert!(!backlog.retry_clipboards(64, |_| Some(false)));
+        assert!(backlog.clipboard_ready.is_empty());
     }
 }
