@@ -288,20 +288,27 @@ END;
             (path / "untracked").write_text("untracked private state\n")
         self.write_config(snapshot=True, retain=True)
         self.native(repo, "merge", "add", str(queued))
-        before = self.state([queued, unqueued])
+        # Dirty discovery must preserve the target as well as both source
+        # worktrees: a source-only comparison could miss a speculative main
+        # checkout, index rewrite or ref update during preview/confirmation.
+        dirty_paths = [repo, queued, unqueued]
+        before = self.state(dirty_paths)
+        dirty_refs_before = self.git_run(repo, "for-each-ref", "--format=%(refname) %(objectname)")
         database_before = self.logical_database()
         journal = (self.root / "gate-journal").read_bytes()
         preview = self.native(repo, "integrate", "--dry-run")
         assert "snapshot only after confirmation" in preview
-        assert self.state([queued, unqueued]) == before
+        assert self.state(dirty_paths) == before
+        assert self.git_run(repo, "for-each-ref", "--format=%(refname) %(objectname)") == dirty_refs_before
         assert self.logical_database() == database_before
         self.native(repo, "integrate", expected="nonzero")
-        assert self.state([queued, unqueued]) == before
+        assert self.state(dirty_paths) == before
+        assert self.git_run(repo, "for-each-ref", "--format=%(refname) %(objectname)") == dirty_refs_before
         assert self.logical_database() == database_before
         assert (self.root / "gate-journal").read_bytes() == journal
         self.native(repo, "integrate", "--yes")
-        assert self.state([unqueued])[0][0] == before[0][1]
-        assert self.git_run(queued, "rev-parse", "HEAD") != before[0][0][0]
+        assert self.state([unqueued])[0][0] == before[0][2]
+        assert self.git_run(queued, "rev-parse", "HEAD") != before[0][1][0]
         assert (repo / "tracked").read_text() == "unstaged\n"
         assert self.outcome_events(queued)[-1] == ("landed", self.git_run(repo, "rev-parse", "main"))
         assert self.state([historical, unrelated])[0] == untouched[0]
