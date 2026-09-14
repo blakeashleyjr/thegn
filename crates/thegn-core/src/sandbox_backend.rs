@@ -290,23 +290,22 @@ fn host_fallback_msg(cfg: &SandboxConfig, placement: &Placement, lead: &str) -> 
         .iter()
         .filter_map(|n| Backend::parse(n))
         .filter(|b| *b != Backend::None && backend_suitable(*b, placement))
-        // Installed, yet the probe says no ⇒ its daemon/service isn't answering.
+        // PATH presence is local evidence only. An unsuccessful runtime probe
+        // does not distinguish a stopped service from permissions or failure.
         .filter(|b| {
-            backend_installed_locally(*b) && available(placement, *b) != RuntimeProbe::Present
+            placement.is_local()
+                && backend_installed_locally(*b)
+                && available(placement, *b) != RuntimeProbe::Present
         })
         .map(|b| b.label())
         .collect();
     if down.is_empty() {
         return format!("{lead}; running on the host (no kernel boundary)");
     }
-    let (subject, verb) = if down.len() == 1 {
-        (down[0].to_string(), "start it")
-    } else {
-        (down.join(", "), "start one")
-    };
+    let subject = down.join(", ");
     format!(
         "{lead}; running on the host (no kernel boundary). {subject} installed but \
-         not running — {verb} for a real sandbox, or see `thegn doctor`"
+         unavailable — check runtime health and access with `thegn doctor`"
     )
 }
 

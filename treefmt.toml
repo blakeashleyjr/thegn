@@ -11,6 +11,7 @@ excludes = [
   "result",
   ".direnv/*",
   ".git/*",
+  "vendor/termwiz/*", # Preserve exact upstream source outside the documented teardown patch.
 ]
 
 [formatter.rustfmt]

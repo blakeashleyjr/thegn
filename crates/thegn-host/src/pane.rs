@@ -139,6 +139,8 @@ pub struct PtyPane {
     /// false — an explicit close must not leak a live process into a relay
     /// lease; quit marks its center-tree panes detached before returning.
     detach_on_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Dropping this sender wakes a blocked stream relay without polling.
+    _relay_lifetime: Option<tokio::sync::oneshot::Sender<()>>,
     /// For a `Stream` pane: the session's PTY child pid on the local host
     /// (the pane daemon's child; 0 = unknown), published by the relay task.
     /// Lets the cwd/foreground-command capture work for daemon
@@ -390,6 +392,7 @@ impl PtyPane {
             pending_relaunch: None,
             session_cell: None,
             detach_on_drop: None,
+            _relay_lifetime: None,
             pid_cell: None,
             fallback_restore: None,
             predictor: crate::predict::Predictor::new(),
@@ -439,7 +442,8 @@ impl PtyPane {
         }
         let detach_on_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pid_cell = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        rt.spawn(relay_exec(
+        let (lifetime, owner_gone) = tokio::sync::oneshot::channel();
+        rt.spawn(relay_exec_owned(
             id,
             source,
             provider_name.clone(),
@@ -451,6 +455,7 @@ impl PtyPane {
             session_cell.clone(),
             detach_on_drop.clone(),
             pid_cell.clone(),
+            Some(owner_gone),
         ));
         Self {
             io: PaneIo::Stream {
@@ -470,6 +475,7 @@ impl PtyPane {
             pending_relaunch: None,
             session_cell: Some(session_cell),
             detach_on_drop: Some(detach_on_drop),
+            _relay_lifetime: Some(lifetime),
             pid_cell: Some(pid_cell),
             fallback_restore: None,
             predictor: crate::predict::Predictor::new(),
@@ -880,6 +886,7 @@ impl PtyPane {
             pending_relaunch: None,
             session_cell: Some(Arc::new(Mutex::new(None))),
             detach_on_drop: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            _relay_lifetime: None,
             pid_cell: Some(Arc::new(std::sync::atomic::AtomicU32::new(0))),
             fallback_restore: None,
             predictor: crate::predict::Predictor::new(),
@@ -995,6 +1002,38 @@ fn reconnect_backoff_ms(dead: u32) -> u64 {
         .min(RECONNECT_BACKOFF_CAP_MS)
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn relay_exec(
+    id: u32,
+    source: Arc<dyn crate::pane_source::ExecSource>,
+    provider_name: String,
+    sandbox_id: String,
+    open: ExecOpen,
+    tx: tokio_mpsc::Sender<PaneEvent>,
+    waker: Option<TerminalWaker>,
+    ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
+    session_cell: Arc<Mutex<Option<String>>>,
+    detach_on_drop: Arc<std::sync::atomic::AtomicBool>,
+    pid_cell: Arc<std::sync::atomic::AtomicU32>,
+) {
+    relay_exec_owned(
+        id,
+        source,
+        provider_name,
+        sandbox_id,
+        open,
+        tx,
+        waker,
+        ctrl_rx,
+        session_cell,
+        detach_on_drop,
+        pid_cell,
+        None,
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     target = "thegn::frame",
@@ -1002,7 +1041,7 @@ fn reconnect_backoff_ms(dead: u32) -> u64 {
     skip_all,
     fields(pane = id, provider = %provider_name)
 )]
-async fn relay_exec(
+async fn relay_exec_owned(
     id: u32,
     source: Arc<dyn crate::pane_source::ExecSource>,
     provider_name: String,
@@ -1014,6 +1053,7 @@ async fn relay_exec(
     session_cell: Arc<Mutex<Option<String>>>,
     detach_on_drop: Arc<std::sync::atomic::AtomicBool>,
     pid_cell: Arc<std::sync::atomic::AtomicU32>,
+    mut owner_gone: Option<tokio::sync::oneshot::Receiver<()>>,
 ) {
     let wake = || {
         if let Some(w) = &waker {
@@ -1026,8 +1066,7 @@ async fn relay_exec(
     };
     // Keep the open spec so a permanently-dropped session can be RE-OPENED fresh
     // (not just reattached) — opening a new exec resumes a suspended/restarted
-    // sandbox and restores input. `None` for an Attach-only pane (restart
-    // reattach), which has no spec to reopen from.
+    // sandbox and restores input. Restored panes carry the same fallback spec.
     let reopen_spec = match &open {
         ExecOpen::Open(spec) => Some(spec.clone()),
         ExecOpen::Attach { fallback, .. } => Some(fallback.clone()),
@@ -1046,40 +1085,43 @@ async fn relay_exec(
             cols,
             rows,
             fallback,
-        } => match source.attach(&session, cols, rows).await {
-            Ok(s) => Ok(s),
-            // The persisted session is gone (lease expired / the daemon
-            // restarted — e.g. after a reboot). Degrade to a FRESH session
-            // instead of an error husk; `SessionFallback` tells the loop to
-            // repaint the persisted scrollback tail + arm the relaunch
-            // overlay. Only both failing surfaces the husk below.
-            Err(attach_err) => {
-                let absent = source.session_absent(&session).await.unwrap_or(false);
-                if !absent {
-                    tracing::warn!(
-                        target: "thegn::sandbox",
-                        pane = id, sandbox = %sandbox_id, session = %session, %attach_err,
-                        "reattach failed without authoritative session absence; refusing to open a duplicate shell"
-                    );
-                    Err(attach_err)
-                } else {
-                    // WARN, not debug: this is the moment a user's persisted shell
-                    // is replaced by an empty one ("my terminal started over"). It
-                    // must be visible in a default `THEGN_LOG=info` capture.
-                    tracing::warn!(
-                        target: "thegn::sandbox",
-                        pane = id, sandbox = %sandbox_id, session = %session, %attach_err,
-                        "reattach to the persisted session failed; opening a FRESH session \
-                         (the previous shell's state is gone)"
-                    );
-                    match source.open(&fallback).await {
-                        Ok(s) => {
-                            fell_back = true;
-                            Ok(s)
-                        }
-                        Err(open_err) => Err(open_err),
+        } => match crate::pane_recovery::recover(
+            source.as_ref(),
+            &session,
+            cols,
+            rows,
+            &ctrl_rx,
+            Default::default(),
+        )
+        .await
+        {
+            crate::pane_recovery::Recovery::Attached(session) => Ok(session),
+            crate::pane_recovery::Recovery::Absent => {
+                tracing::warn!(
+                    target: "thegn::sandbox", pane = id, sandbox = %sandbox_id, session = %session,
+                    "persisted session is authoritatively absent; opening a FRESH session (the previous shell's state is gone)"
+                );
+                match source.open(&fallback).await {
+                    Ok(session) => {
+                        fell_back = true;
+                        Ok(session)
                     }
+                    Err(error) => Err(error),
                 }
+            }
+            crate::pane_recovery::Recovery::Cancelled => {
+                crate::pane_recovery::close_owned(
+                    source.as_ref(),
+                    Some(session),
+                    detach_on_drop.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
+                return;
+            }
+            crate::pane_recovery::Recovery::Exhausted(error) => {
+                tracing::warn!(target: "thegn::sandbox", pane = id, session = %session, %error,
+                    "session recovery exhausted without authoritative absence; refusing to open a duplicate shell");
+                Err(error)
             }
         },
     };
@@ -1114,6 +1156,8 @@ async fn relay_exec(
     // Reconnect loop: a transient socket drop with a known session id reattaches
     // (replaying scrollback). Bounded so a permanently-dead session still exits.
     let mut dead = 0u32;
+    let mut pending_control = None;
+    let mut current_size = (cols, rows);
     loop {
         // Publish the (re)connected session's local child pid, when the source
         // knows it (the pane daemon) — persist-time cwd/cmd capture reads it.
@@ -1126,7 +1170,7 @@ async fn relay_exec(
         {
             pid_cell.store(pid, std::sync::atomic::Ordering::Relaxed);
         }
-        match relay_session(
+        match relay_session_pending(
             id,
             session,
             &tx,
@@ -1134,6 +1178,9 @@ async fn relay_exec(
             &mut ctrl_rx,
             &session_cell,
             std::time::Duration::from_millis(PROGRESS_GRACE_MS),
+            &mut pending_control,
+            &mut current_size,
+            &mut owner_gone,
         )
         .await
         {
@@ -1156,16 +1203,13 @@ async fn relay_exec(
                 // kill the server-side session so it can't leak a live
                 // process into a relay lease. Best-effort — the daemon also
                 // reaps on its own terms.
-                if !detach_on_drop.load(std::sync::atomic::Ordering::Relaxed)
-                    && let Some(sid) = session_cell.lock().ok().and_then(|c| c.clone())
-                    && let Err(e) = source.kill_session(&sid).await
-                {
-                    tracing::debug!(
-                        target: "thegn::daemon",
-                        pane = id, session = %sid,
-                        "close-time session kill failed: {e}"
-                    );
-                }
+                let sid = session_cell.lock().ok().and_then(|cell| cell.clone());
+                crate::pane_recovery::close_owned(
+                    source.as_ref(),
+                    sid,
+                    detach_on_drop.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
                 return;
             }
             SessionEnd::Dropped { progressed } => {
@@ -1182,23 +1226,55 @@ async fn relay_exec(
                     // with `dead`, capped. `dead == 0` (a genuinely progressing
                     // session that just blipped) waits the base interval.
                     let backoff = reconnect_backoff_ms(dead);
-                    if backoff > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    if !crate::pane_recovery::backoff(
+                        std::time::Duration::from_millis(backoff),
+                        &ctrl_rx,
+                    )
+                    .await
+                    {
+                        let sid = session_cell.lock().ok().and_then(|cell| cell.clone());
+                        crate::pane_recovery::close_owned(
+                            source.as_ref(),
+                            sid,
+                            detach_on_drop.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                        .await;
+                        return;
                     }
                     let sid = session_cell.lock().ok().and_then(|c| c.clone());
-                    // 1. Prefer reattaching the SAME session: a transient socket
-                    //    drop replays scrollback with the shell state preserved.
                     let may_reopen = if let Some(sid) = &sid {
-                        match source.attach(sid, cols, rows).await {
-                            Ok(s) => {
+                        match crate::pane_recovery::recover(
+                            source.as_ref(),
+                            sid,
+                            current_size.0,
+                            current_size.1,
+                            &ctrl_rx,
+                            Default::default(),
+                        )
+                        .await
+                        {
+                            crate::pane_recovery::Recovery::Attached(s) => {
                                 tracing::debug!(target: "thegn::sandbox", pane = id, "reattached exec session");
-                                // Tell the loop the replay burst that follows is not
-                                // agent work (see `PaneEvent::Reattached`).
-                                let _ = tx.send(PaneEvent::Reattached(id)).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                let _ = tx.send(PaneEvent::Reattached(id)).await; // best-effort: pane may be gone
+                                wake();
                                 session = s;
                                 continue;
                             }
-                            Err(_) => source.session_absent(sid).await.unwrap_or(false),
+                            crate::pane_recovery::Recovery::Absent => true,
+                            crate::pane_recovery::Recovery::Cancelled => {
+                                crate::pane_recovery::close_owned(
+                                    source.as_ref(),
+                                    Some(sid.clone()),
+                                    detach_on_drop.load(std::sync::atomic::Ordering::Relaxed),
+                                )
+                                .await;
+                                return;
+                            }
+                            crate::pane_recovery::Recovery::Exhausted(error) => {
+                                tracing::warn!(target: "thegn::sandbox", pane = id, %error,
+                                    "session reattachment retry budget exhausted");
+                                false
+                            }
                         }
                     } else {
                         false
@@ -1210,10 +1286,10 @@ async fn relay_exec(
                     //    "suspend-idle, recover-on-return" path so a backgrounded
                     //    remote pane never becomes a permanently dead shell.
                     if may_reopen && let Some(spec) = &reopen_spec {
-                        if let Ok(mut c) = session_cell.lock() {
-                            *c = None; // drop the stale id; the fresh session announces a new one
-                        }
-                        if let Ok(s) = source.open(spec).await {
+                        let mut spec = spec.clone();
+                        spec.cols = current_size.0;
+                        spec.rows = current_size.1;
+                        if let Ok(s) = source.open(&spec).await {
                             tracing::debug!(
                                 target: "thegn::sandbox",
                                 pane = id, sandbox = %sandbox_id,
@@ -1252,6 +1328,7 @@ async fn relay_exec(
 /// it exits/closes or the pane is dropped, returning *why* it ended (so the
 /// caller can reconnect on a transient drop). Split out from [`relay_exec`] so
 /// it's unit-testable with a hand-built session (no live socket).
+#[cfg(test)]
 async fn relay_session(
     id: u32,
     session: ExecSession,
@@ -1262,6 +1339,43 @@ async fn relay_session(
     // Output within this window of (re)attach is treated as the scrollback
     // replay burst and does NOT count as progress — see `PROGRESS_GRACE_MS`.
     progress_grace: std::time::Duration,
+) -> SessionEnd {
+    relay_session_pending(
+        id,
+        session,
+        tx,
+        waker,
+        ctrl_rx,
+        session_cell,
+        progress_grace,
+        &mut None,
+        &mut (0, 0),
+        &mut None,
+    )
+    .await
+}
+
+async fn pane_owner_gone(owner: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    match owner {
+        Some(receiver) => {
+            receiver.await.ok(); // best-effort: both an explicit signal and sender drop mean the pane owner is gone
+        }
+        None => std::future::pending().await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_session_pending(
+    id: u32,
+    session: ExecSession,
+    tx: &tokio_mpsc::Sender<PaneEvent>,
+    waker: &Option<TerminalWaker>,
+    ctrl_rx: &mut tokio_mpsc::Receiver<ExecControl>,
+    session_cell: &Arc<Mutex<Option<String>>>,
+    progress_grace: std::time::Duration,
+    pending_control: &mut Option<ExecControl>,
+    current_size: &mut (u16, u16),
+    owner_gone: &mut Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> SessionEnd {
     let wake = || {
         if let Some(w) = waker {
@@ -1290,11 +1404,18 @@ async fn relay_session(
     let started = std::time::Instant::now();
     let mut progressed = false;
     loop {
+        if ctrl_rx.is_closed() {
+            return SessionEnd::PaneGone;
+        }
         tokio::select! {
+            _ = pane_owner_gone(owner_gone) => return SessionEnd::PaneGone,
             frame = frames.recv() => match frame {
                 Some(ExecFrame::Stdout(b)) => {
-                    if tx.send(PaneEvent::Output(id, b)).await.is_err() {
-                        return SessionEnd::PaneGone;
+                    tokio::select! {
+                        _ = pane_owner_gone(owner_gone) => return SessionEnd::PaneGone,
+                        result = tx.send(PaneEvent::Output(id, b)) => {
+                            if result.is_err() { return SessionEnd::PaneGone; }
+                        }
                     }
                     // Only output past the replay window counts as progress, so
                     // a session that just replays scrollback and drops still
@@ -1307,13 +1428,22 @@ async fn relay_session(
                 Some(ExecFrame::Exit(code)) => return SessionEnd::Exited(code),
                 None => return SessionEnd::Dropped { progressed },
             },
-            ctrl = ctrl_rx.recv() => match ctrl {
+            ctrl = ctrl_rx.recv(), if pending_control.is_none() => match ctrl {
                 Some(c) => {
-                    if control.send(c).await.is_err() {
-                        return SessionEnd::Dropped { progressed }; // driver/socket gone
+                    if let ExecControl::Resize { cols, rows } = &c {
+                        *current_size = (*cols, *rows);
                     }
+                    *pending_control = Some(c);
                 }
                 None => return SessionEnd::PaneGone, // pane dropped
+            },
+            permit = control.reserve(), if pending_control.is_some() => match permit {
+                Ok(permit) => {
+                    if let Some(control) = pending_control.take() {
+                        permit.send(control);
+                    }
+                }
+                Err(_) => return SessionEnd::Dropped { progressed },
             },
             res = session_id.changed(), if !sid_done => {
                 match res {
@@ -1365,7 +1495,180 @@ pub fn drain_until_exit(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unsent_control_survives_stream_failure_and_is_delivered_once() {
+        let (events, _events_rx) = tokio_mpsc::channel(8);
+        let (input, mut inputs) = tokio_mpsc::channel(8);
+        let bytes = ExecControl::Stdin(b"retained-input".to_vec());
+        input.send(bytes.clone()).await.unwrap();
+        let (_frames_tx, frames) = tokio_mpsc::channel(8);
+        let (failed_control, failed_rx) = tokio_mpsc::channel(1);
+        drop(failed_rx);
+        let (_sid_tx, session_id) = tokio::sync::watch::channel(Some("same-id".to_string()));
+        let cell = Arc::new(Mutex::new(None));
+        let mut pending = None;
+        let mut current_size = (80, 24);
+        let mut owner_gone = None;
+        let ended = relay_session_pending(
+            1,
+            ExecSession {
+                frames,
+                control: failed_control,
+                session_id,
+            },
+            &events,
+            &None,
+            &mut inputs,
+            &cell,
+            Duration::ZERO,
+            &mut pending,
+            &mut current_size,
+            &mut owner_gone,
+        )
+        .await;
+        assert!(matches!(ended, SessionEnd::Dropped { .. }));
+        assert_eq!(pending, Some(bytes.clone()));
+
+        let (_frames_tx2, frames) = tokio_mpsc::channel(8);
+        let (control, mut received) = tokio_mpsc::channel(8);
+        let (_sid_tx2, session_id) = tokio::sync::watch::channel(Some("same-id".to_string()));
+        let (ended, delivered) = tokio::join!(
+            relay_session_pending(
+                1,
+                ExecSession {
+                    frames,
+                    control,
+                    session_id
+                },
+                &events,
+                &None,
+                &mut inputs,
+                &cell,
+                Duration::ZERO,
+                &mut pending,
+                &mut current_size,
+                &mut owner_gone,
+            ),
+            async {
+                let delivered = received.recv().await;
+                drop(input);
+                delivered
+            },
+        );
+        assert_eq!(delivered, Some(bytes));
+        assert!(matches!(ended, SessionEnd::PaneGone));
+        assert!(pending.is_none());
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_latest_resize_already_sent_to_previous_stream() {
+        struct ResizeSource {
+            initial: Mutex<Option<ExecSession>>,
+            next: Mutex<Option<ExecSession>>,
+            sizes: Mutex<Vec<(u16, u16)>>,
+            attached: tokio::sync::Notify,
+        }
+        impl crate::pane_source::ExecSource for ResizeSource {
+            fn open<'a>(
+                &'a self,
+                _: &'a thegn_svc::provider::ExecSpec,
+            ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+                Box::pin(async move {
+                    Ok(self
+                        .initial
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("only one initial open"))
+                })
+            }
+            fn attach<'a>(
+                &'a self,
+                id: &'a str,
+                cols: u16,
+                rows: u16,
+            ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+                Box::pin(async move {
+                    assert_eq!(id, "same");
+                    self.sizes.lock().unwrap().push((cols, rows));
+                    self.attached.notify_one();
+                    Ok(self.next.lock().unwrap().take().unwrap())
+                })
+            }
+        }
+        let (frames_tx, frames) = tokio_mpsc::channel(8);
+        let (control, mut initial_controls) = tokio_mpsc::channel(8);
+        let (_sid, session_id) = tokio::sync::watch::channel(Some("same".to_string()));
+        let initial = ExecSession {
+            frames,
+            control,
+            session_id,
+        };
+        let (next_frames, frames) = tokio_mpsc::channel(8);
+        let (control, mut next_controls) = tokio_mpsc::channel(8);
+        let (_next_sid, session_id) = tokio::sync::watch::channel(Some("same".to_string()));
+        let source = Arc::new(ResizeSource {
+            initial: Mutex::new(Some(initial)),
+            next: Mutex::new(Some(ExecSession {
+                frames,
+                control,
+                session_id,
+            })),
+            sizes: Mutex::new(Vec::new()),
+            attached: tokio::sync::Notify::new(),
+        });
+        let (events, _events_rx) = tokio_mpsc::channel(8);
+        let (input, controls) = tokio_mpsc::channel(8);
+        let spec = thegn_svc::provider::ExecSpec {
+            argv: vec!["sh".into()],
+            tty: true,
+            cols: 80,
+            rows: 24,
+            env: vec![],
+            cwd: None,
+        };
+        let task = tokio::spawn(relay_exec(
+            1,
+            source.clone(),
+            "test".into(),
+            "local".into(),
+            ExecOpen::Open(spec),
+            events,
+            None,
+            controls,
+            Arc::new(Mutex::new(None)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        input
+            .send(ExecControl::Resize {
+                cols: 120,
+                rows: 50,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_controls.recv().await,
+            Some(ExecControl::Resize {
+                cols: 120,
+                rows: 50
+            })
+        );
+        drop(frames_tx);
+        tokio::time::timeout(Duration::from_secs(2), source.attached.notified())
+            .await
+            .unwrap();
+        assert_eq!(*source.sizes.lock().unwrap(), vec![(120, 50)]);
+        assert!(
+            next_controls.try_recv().is_err(),
+            "already-sent controls must not replay"
+        );
+        next_frames.send(ExecFrame::Exit(0)).await.unwrap();
+        task.await.unwrap();
+    }
     use super::*;
+    use std::time::Duration;
 
     fn sh(script: &str) -> Vec<String> {
         vec!["/bin/sh".into(), "-c".into(), script.into()]
@@ -1823,6 +2126,79 @@ mod tests {
                 self.kills.lock().unwrap().push(session.to_string());
                 Ok(())
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_control_owner_close_kills_once_and_detach_preserves_session() {
+        for detached in [false, true] {
+            let (_frames_tx, frames) = tokio_mpsc::channel(1);
+            let (control, _downstream_rx) = tokio_mpsc::channel(1);
+            control
+                .try_send(ExecControl::Stdin(b"already committed".to_vec()))
+                .unwrap();
+            let (_sid_tx, session_id) = tokio::sync::watch::channel(Some("owned".to_string()));
+            let kills = Arc::new(Mutex::new(Vec::new()));
+            let source = Arc::new(TestSource {
+                session: Mutex::new(Some(ExecSession {
+                    frames,
+                    control,
+                    session_id,
+                })),
+                kills: kills.clone(),
+            });
+            let (input, controls) = tokio_mpsc::channel(1);
+            input
+                .try_send(ExecControl::Stdin(b"pending".to_vec()))
+                .unwrap();
+            let (lifetime, owner_gone) = tokio::sync::oneshot::channel();
+            let (events, _events_rx) = tokio_mpsc::channel(8);
+            let task = tokio::spawn(relay_exec_owned(
+                1,
+                source,
+                "test".into(),
+                "local".into(),
+                ExecOpen::Open(thegn_svc::provider::ExecSpec {
+                    argv: vec!["sh".into()],
+                    tty: true,
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                    cwd: None,
+                }),
+                events,
+                None,
+                controls,
+                Arc::new(Mutex::new(None)),
+                Arc::new(std::sync::atomic::AtomicBool::new(detached)),
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Some(owner_gone),
+            ));
+            // Capacity becomes free only after the relay takes our input. The
+            // downstream remains full, so that control is now held pending.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while input.capacity() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Match PtyPane field teardown: control sender first, lifetime
+            // signal next. Frames/watch and downstream receiver remain open.
+            drop(input);
+            drop(lifetime);
+            tokio::time::timeout(Duration::from_millis(200), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                *kills.lock().unwrap(),
+                if detached {
+                    vec![]
+                } else {
+                    vec!["owned".to_string()]
+                }
+            );
         }
     }
 
