@@ -57,7 +57,6 @@ invalid duration fields and apply every other explicit setting. A mixed security
 override regression covers this. Raw duration admission recognizes the two existing
 metrics duration aliases, so aliases cannot bypass write/profile range checks.
 
-
 THE-484 implements checked provider resource expiry with an explicit observable
 quarantine decision. Fly uses its existing authenticated read seam and requires
 one exact owned machine plus provider created_at; local ledger times are never
