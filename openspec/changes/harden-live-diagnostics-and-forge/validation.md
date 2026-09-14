@@ -1,0 +1,44 @@
+# Validation checkpoint
+
+All commands use isolated worktree/state. Cargo uses `RUSTC_WRAPPER=''`,
+`CARGO_BUILD_JOBS=2`, `CARGO_TARGET_DIR=/tmp/thegn-audit-build-cache-20260913`,
+`--offline`, and `--locked` after adding the existing tracing-subscriber
+host dev-dependency edge. No crate versions changed.
+
+- `cargo test -p thegn-core --lib connectivity::`: 13 passed.
+- `cargo test -p thegn-core --lib config_diagnostics::`: 3 passed initially.
+- `cargo test -p thegn-core --lib log_trace::`: 16 passed, including isolated
+  subprocess cases for unchanged/changed config warnings, ordinary startup
+  suppression, and explicit logging overrides.
+- Final `cargo test -p thegn-svc --lib forge::`: 24 passed, including actual
+  octocrab GraphQL envelopes over an in-process tower transport, ladder calls,
+  typed HTTP/transport errors, public-host gating, helper timeout/cancellation,
+  parent-exit with inherited pipe, capacity retention, injected thread-spawn
+  failure, and unknown-wait reaper-only cleanup. This compiled final core code.
+- `/tmp/thegn-audit-input-harness`: 13 passed against the actual `input.rs`
+  module, cached termwiz/tracing dependencies, and minimal enclosing host types.
+  Includes broad DEBUG/TRACE payload exclusion and a source guard over every
+  compositor tracing target (including dormant-frame wakeup).
+- `/tmp/thegn-audit-config-diagnostics-harness`: 4 passed against final actual
+  cache source, including fixing then reintroducing the same warning and bounded
+  source-revision storage. Only the warning sink is stubbed in this harness.
+- All 14 noncompiling commands from the `ratchets` recipe passed. Delivery
+  registration is managed by the root integration and was not claimed here.
+- Strict OpenSpec change validation, changed-file rustfmt, host-manifest taplo,
+  and `git diff --check` passed.
+
+The final source-revision refinement and named-profile attribution were made
+after the initial full core test binary run. The combined candidate should rerun
+the config/logging subprocess cases and the host input tests. No standalone full
+host build was run; root is consolidating that expensive compile after merging
+reviewed branches. The reviewed build.rs metadata fix is copied identically from
+the root worktree to keep the combined host test loop from rebuilding on each
+invocation.
+
+Root review identified and corrected: a second raw-key log under the frame
+target; reaping the credential parent before inherited stdout completed;
+thread creation panicking during Drop; uncertain wait ownership triggering
+numeric group signalling; and unsanitized Git calls in new test fixtures.
+Independent adversarial review and final combined-candidate validation remain
+required before acceptance. No live process, configuration, credentials,
+canonical checkout, or external repository/account was changed.
