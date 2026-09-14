@@ -59,7 +59,7 @@ pub fn run(
     repo_context: Option<PathBuf>,
 ) -> Result<()> {
     match action {
-        Action::Path => outln!("{}", path.display()),
+        Action::Path => print_path(&path),
         Action::Show { json } => show(cfg, json)?,
         Action::Get { key, json } => get(cfg, &key, json, &path)?,
         Action::Edit => edit(cfg, &path)?,
@@ -164,13 +164,21 @@ pub fn run(
             &path,
             repo.or_else(|| repo_context.as_deref().map(Path::to_path_buf)),
         )?,
-        Action::Schema => {
-            let schema = schemars::schema_for!(Config);
-            outln!("{}", serde_json::to_string_pretty(&schema).unwrap());
-        }
+        Action::Schema => print_schema(),
         Action::Explain { key, repo, json } => explain(cfg, &key, repo, json, path)?,
     }
     Ok(())
+}
+
+/// Format a path without opening, canonicalizing or loading its configuration.
+pub(crate) fn print_path(path: &Path) {
+    outln!("{}", path.display());
+}
+
+/// Generate the schema from the type, without constructing effective configuration.
+pub(crate) fn print_schema() {
+    let schema = schemars::schema_for!(Config);
+    outln!("{}", serde_json::to_string_pretty(&schema).unwrap());
 }
 
 fn explain(cfg: &Config, key: &str, repo: Option<String>, json: bool, path: PathBuf) -> Result<()> {

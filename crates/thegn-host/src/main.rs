@@ -41,6 +41,7 @@ mod ci_refresh;
 mod cli_help;
 mod clipboard;
 mod cmd;
+mod command_intent;
 mod compat;
 mod complete;
 mod completions_health;
@@ -889,6 +890,14 @@ fn main() -> anyhow::Result<()> {
         cli.overrides.push(format!("log.level={lvl}"));
     }
 
+    // Embedded output must precede both legacy migration and profile reroot.
+    // Other intent tags retain the configured path below; they grant no exemption.
+    if let command_intent::CommandIntent::Static(intent) =
+        command_intent::classify(cli.command.as_ref())
+    {
+        return command_intent::dispatch_static(intent, cli.config.as_deref());
+    }
+
     // One-time superzej → thegn state migration (renames the old state/config/
     // app-home roots). MUST run before profile::reroot (profile roots live
     // under the app home being moved) and before the first Db::open (the WAL
@@ -1281,35 +1290,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
         Command::Setup => Ok(()),
-        Command::Completions { shell, static_ } => {
-            let bin = std::env::args()
-                .next()
-                .and_then(|p| {
-                    std::path::Path::new(&p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "thegn".into());
-            // Buffer first, both paths: the generators panic on write errors,
-            // and a consumer like `… | head` closing the pipe early is normal
-            // CLI life.
-            let mut buf = Vec::new();
-            if static_ {
-                // The stable `aot` generator: a self-contained script over the
-                // same grouped tree the parser uses, named for the invoked alias
-                // (thegn / tg). Structure only — it cannot know your worktrees.
-                // Kept as the documented degradation path if the unstable
-                // dynamic API ever breaks, so it must stay working and tested.
-                let mut tree = cli_help::attach(<Cli as clap::CommandFactory>::command());
-                clap_complete::generate(shell, &mut tree, bin, &mut buf);
-            } else {
-                complete::write_registration(shell, &bin, &mut buf);
-            }
-            use std::io::Write;
-            // best-effort: a closed pipe just means the reader got enough.
-            let _ = std::io::stdout().write_all(&buf);
-            Ok(())
-        }
+        Command::Completions { shell, static_ } => complete::print_registration(shell, static_),
         Command::Serve {
             bind,
             no_pair_url,
