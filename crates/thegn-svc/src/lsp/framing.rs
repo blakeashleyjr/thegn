@@ -1,20 +1,33 @@
-//! Language Server Protocol base-protocol framing.
-//!
-//! LSP messages are JSON-RPC bodies prefixed with a `Content-Length` header and
-//! a blank line — `Content-Length: 42\r\n\r\n{json}`. This module is the pure,
-//! I/O-free codec: [`encode`] frames a body, and [`FrameDecoder`] turns an
-//! arbitrarily-chunked byte stream back into whole JSON bodies (handling partial
-//! reads and several messages arriving in one buffer). All of it is unit-tested;
-//! the actual stdio lives in [`super::LspClient`].
+//! Shared LSP/bridge framing. Both transports use identical limits and fail
+//! closed on malformed framing; neither searches attacker-controlled bodies for
+//! a new header after losing synchronization.
 
-/// Reject any `Content-Length` above this — a well-formed LSP body is a JSON-RPC
-/// message, never gigabytes. A larger value is corruption or a hostile stream
-/// (ssh transports interleave foreign bytes: shell rc/banner output on stdout is
-/// a known real-world occurrence), so we treat it as a malformed header and
-/// resync rather than buffer the stream unboundedly.
-const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+use std::io::{self, Read};
 
-/// Frame a JSON body with the LSP `Content-Length` header.
+/// Includes the CRLFCRLF delimiter.
+pub const MAX_HEADER_BYTES: usize = 8192;
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+pub const READ_BYTES: usize = 8192;
+pub const MAX_BUFFER_BYTES: usize = MAX_FRAME_LEN + MAX_HEADER_BYTES + READ_BYTES;
+pub const FRAMES_PER_TURN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolError {
+    HeaderTooLong,
+    BufferTooLong,
+    MalformedHeader,
+    BodyTooLong,
+    InvalidUtf8,
+    TruncatedFrame,
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid framed stream: {self:?}")
+    }
+}
+impl std::error::Error for ProtocolError {}
+
 pub fn encode(body: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 32);
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
@@ -22,185 +35,349 @@ pub fn encode(body: &str) -> Vec<u8> {
     out
 }
 
-/// Incremental decoder: feed it bytes, pull out complete JSON bodies.
+/// Scan and consume offsets avoid prefix rescanning and repeated whole-buffer
+/// shifts. Compaction only moves a suffix after at least as many bytes have been
+/// consumed (or when required by the hard allocation bound).
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    head: usize,
+    scan: usize,
+    body: Option<(usize, usize)>,
+    error: Option<ProtocolError>,
+    #[cfg(test)]
+    scanned: usize,
+    #[cfg(test)]
+    moved: usize,
 }
 
 impl FrameDecoder {
     pub fn new() -> Self {
-        FrameDecoder { buf: Vec::new() }
+        Self::default()
     }
 
-    /// Append freshly-read bytes to the internal buffer.
-    pub fn push(&mut self, bytes: &[u8]) {
+    fn fail<T>(&mut self, error: ProtocolError) -> Result<T, ProtocolError> {
+        self.buf = Vec::new();
+        self.head = 0;
+        self.scan = 0;
+        self.body = None;
+        self.error = Some(error);
+        Err(error)
+    }
+
+    fn compact(&mut self) {
+        if self.head == 0 {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.moved += self.buf.len() - self.head;
+        }
+        self.buf.copy_within(self.head.., 0);
+        self.buf.truncate(self.buf.len() - self.head);
+        self.scan -= self.head;
+        if let Some((start, _)) = self.body.as_mut() {
+            *start -= self.head;
+        }
+        self.head = 0;
+    }
+
+    /// Reject the complete append before allocation; an error is terminal.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let unread = self.buf.len() - self.head;
+        if bytes.len() > MAX_BUFFER_BYTES - unread {
+            return self.fail(ProtocolError::BufferTooLong);
+        }
+        if bytes.len() > MAX_BUFFER_BYTES - self.buf.len() {
+            self.compact();
+        }
+        let needed = self.buf.len() + bytes.len();
+        if needed > self.buf.capacity() {
+            let capacity = needed
+                .max(self.buf.capacity().saturating_mul(2))
+                .min(MAX_BUFFER_BYTES);
+            self.buf.reserve_exact(capacity - self.buf.len());
+        }
         self.buf.extend_from_slice(bytes);
+        Ok(())
     }
 
-    /// Pop the next complete message body, or `None` if one isn't buffered yet.
-    ///
-    /// Headers other than `Content-Length` (e.g. `Content-Type`) are tolerated
-    /// and ignored. A malformed header block (no parseable `Content-Length`) is
-    /// dropped up to and including its separator so the stream can resync.
-    pub fn next_message(&mut self) -> Option<String> {
-        loop {
-            // Find the header/body separator.
-            let sep = find_subslice(&self.buf, b"\r\n\r\n")?;
-            let header = &self.buf[..sep];
-            let len = parse_content_length(header);
-            let body_start = sep + 4;
-
-            let Some(len) = len else {
-                // Unparseable header block — discard it and resync.
-                self.buf.drain(..body_start);
-                continue;
-            };
-
-            // `len` is attacker/corruption-controlled: a near-`usize::MAX` value
-            // would wrap `body_start + len` (a debug panic; in release a wrapped
-            // slice end that panics on the range), and even a huge non-wrapping
-            // value would buffer the stream unboundedly. Treat an overflow or an
-            // over-cap length as a malformed header and resync past it.
-            let body_end = body_start.checked_add(len);
-            match body_end {
-                Some(end) if len <= MAX_FRAME_LEN => {
-                    if self.buf.len() < end {
-                        return None; // body not fully arrived yet
-                    }
-                    let body: Vec<u8> = self.buf[body_start..end].to_vec();
-                    self.buf.drain(..end);
-                    // Bodies are UTF-8 JSON; a non-UTF-8 body is protocol-broken.
-                    return Some(String::from_utf8_lossy(&body).into_owned());
+    pub fn next_message(&mut self) -> Result<Option<String>, ProtocolError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if self.body.is_none() {
+            while self.scan + 4 <= self.buf.len() {
+                #[cfg(test)]
+                {
+                    self.scanned += 1;
                 }
-                _ => {
-                    // Overflowing or over-cap length — drop this header and resync.
-                    self.buf.drain(..body_start);
-                    continue;
+                if self.scan + 4 - self.head > MAX_HEADER_BYTES {
+                    return self.fail(ProtocolError::HeaderTooLong);
+                }
+                if &self.buf[self.scan..self.scan + 4] == b"\r\n\r\n" {
+                    let len = match parse_content_length(&self.buf[self.head..self.scan]) {
+                        Ok(len) => len,
+                        Err(error) => return self.fail(error),
+                    };
+                    self.body = Some((self.scan + 4, len));
+                    break;
+                }
+                self.scan += 1;
+            }
+            if self.body.is_none() {
+                if self.buf.len() - self.head >= MAX_HEADER_BYTES {
+                    return self.fail(ProtocolError::HeaderTooLong);
+                }
+                return Ok(None);
+            }
+        }
+        let (start, len) = self.body.expect("parsed above");
+        if self.buf.len() - start < len {
+            return Ok(None);
+        }
+        let body = match std::str::from_utf8(&self.buf[start..start + len]) {
+            Ok(body) => body.to_owned(),
+            Err(_) => return self.fail(ProtocolError::InvalidUtf8),
+        };
+        self.head = start + len;
+        self.scan = self.head;
+        self.body = None;
+        if self.head == self.buf.len() {
+            self.buf.clear();
+            self.head = 0;
+            self.scan = 0;
+        } else if self.head >= READ_BYTES && self.head >= self.buf.len() / 2 {
+            self.compact();
+        }
+        Ok(Some(body))
+    }
+
+    pub fn finish(&mut self) -> Result<(), ProtocolError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if self.buf.len() != self.head {
+            return self.fail(ProtocolError::TruncatedFrame);
+        }
+        Ok(())
+    }
+}
+
+fn parse_content_length(header: &[u8]) -> Result<usize, ProtocolError> {
+    let text = std::str::from_utf8(header).map_err(|_| ProtocolError::MalformedHeader)?;
+    let mut length = None;
+    for line in text.split("\r\n") {
+        let (key, value) = line.split_once(':').ok_or(ProtocolError::MalformedHeader)?;
+        if key.is_empty()
+            || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || value.bytes().any(|b| b.is_ascii_control() && b != b'\t')
+        {
+            return Err(ProtocolError::MalformedHeader);
+        }
+        if key.eq_ignore_ascii_case("content-length") {
+            let value = value.trim_matches([' ', '\t']);
+            if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ProtocolError::MalformedHeader);
+            }
+            let len = value
+                .parse::<usize>()
+                .map_err(|_| ProtocolError::BodyTooLong)?;
+            if len > MAX_FRAME_LEN {
+                return Err(ProtocolError::BodyTooLong);
+            }
+            length = Some(len);
+        }
+    }
+    length.ok_or(ProtocolError::MalformedHeader)
+}
+
+/// Blocking reader for the existing dedicated LSP/bridge reader threads. Never
+/// use this on an async runtime worker. Each call dispatches at most one frame;
+/// after 64 consecutive buffered frames the thread yields before continuing.
+/// A yield never performs a read while complete messages remain buffered.
+pub struct FramedReader<R> {
+    reader: R,
+    decoder: FrameDecoder,
+    turn_frames: usize,
+}
+
+impl<R: Read> FramedReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            decoder: FrameDecoder::new(),
+            turn_frames: 0,
+        }
+    }
+
+    pub fn read_message(&mut self) -> io::Result<Option<String>> {
+        if self.turn_frames == FRAMES_PER_TURN {
+            std::thread::yield_now();
+            self.turn_frames = 0;
+        }
+        loop {
+            match self.decoder.next_message().map_err(io::Error::other)? {
+                Some(body) => {
+                    self.turn_frames += 1;
+                    return Ok(Some(body));
+                }
+                None => {
+                    let mut chunk = [0; READ_BYTES];
+                    let n = match self.reader.read(&mut chunk) {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        other => other?,
+                    };
+                    self.turn_frames = 0;
+                    if n == 0 {
+                        self.decoder.finish().map_err(io::Error::other)?;
+                        return Ok(None);
+                    }
+                    self.decoder.push(&chunk[..n]).map_err(io::Error::other)?;
                 }
             }
         }
     }
-}
-
-/// Locate the first occurrence of `needle` in `haystack`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Parse the `Content-Length` value out of a header block (case-insensitive key).
-fn parse_content_length(header: &[u8]) -> Option<usize> {
-    let text = std::str::from_utf8(header).ok()?;
-    for line in text.split("\r\n") {
-        let (key, value) = line.split_once(':')?;
-        if key.trim().eq_ignore_ascii_case("content-length") {
-            return value.trim().parse::<usize>().ok(); // best-effort: parse failure maps to None (absent header); no error ignored
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn encode_prefixes_content_length() {
-        let framed = encode("{\"a\":1}");
-        assert_eq!(framed, b"Content-Length: 7\r\n\r\n{\"a\":1}");
+    fn pop(d: &mut FrameDecoder) -> Option<String> {
+        d.next_message().unwrap()
     }
 
     #[test]
-    fn decodes_a_single_whole_message() {
-        let mut d = FrameDecoder::new();
-        d.push(&encode("{\"id\":1}"));
-        assert_eq!(d.next_message().as_deref(), Some("{\"id\":1}"));
-        assert_eq!(d.next_message(), None);
-    }
-
-    #[test]
-    fn decodes_multiple_messages_in_one_buffer() {
-        let mut d = FrameDecoder::new();
-        let mut bytes = encode("{\"id\":1}");
-        bytes.extend(encode("{\"id\":2}"));
-        d.push(&bytes);
-        assert_eq!(d.next_message().as_deref(), Some("{\"id\":1}"));
-        assert_eq!(d.next_message().as_deref(), Some("{\"id\":2}"));
-        assert_eq!(d.next_message(), None);
-    }
-
-    #[test]
-    fn reassembles_across_partial_reads() {
-        let mut d = FrameDecoder::new();
-        let framed = encode("{\"hello\":\"world\"}");
-        // Feed it one byte at a time; only the final byte completes the message.
-        for (i, b) in framed.iter().enumerate() {
-            d.push(&[*b]);
-            if i + 1 < framed.len() {
-                assert_eq!(d.next_message(), None, "completed early at byte {i}");
-            }
+    fn encode_and_arbitrary_splits() {
+        let body = "{\"s\":\"café→\"}";
+        let bytes = encode(body);
+        for split in 0..=bytes.len() {
+            let mut d = FrameDecoder::new();
+            d.push(&bytes[..split]).unwrap();
+            let first = pop(&mut d);
+            d.push(&bytes[split..]).unwrap();
+            assert_eq!(first.or_else(|| pop(&mut d)).as_deref(), Some(body));
+            assert_eq!(pop(&mut d), None);
+            d.finish().unwrap();
         }
-        assert_eq!(d.next_message().as_deref(), Some("{\"hello\":\"world\"}"));
     }
 
     #[test]
-    fn tolerates_extra_headers() {
+    fn bytewise_header_has_linear_work_and_exact_limit() {
+        let prefix = b"Content-Length: 0\r\nX-Pad: ";
+        let mut bytes = prefix.to_vec();
+        bytes.resize(MAX_HEADER_BYTES - 4, b'x');
+        bytes.extend_from_slice(b"\r\n\r\n");
         let mut d = FrameDecoder::new();
-        d.push(b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: 2\r\n\r\n{}");
-        assert_eq!(d.next_message().as_deref(), Some("{}"));
+        for (i, b) in bytes.iter().enumerate() {
+            d.push(&[*b]).unwrap();
+            assert_eq!(pop(&mut d), (i == bytes.len() - 1).then(String::new));
+        }
+        assert!(d.scanned <= bytes.len());
+        assert_eq!(d.moved, 0);
     }
 
     #[test]
-    fn resyncs_past_a_malformed_header_block() {
+    fn unterminated_header_fails_at_cap_and_releases_allocation() {
         let mut d = FrameDecoder::new();
-        d.push(b"garbage-without-length\r\n\r\n");
-        d.push(&encode("{\"ok\":true}"));
-        assert_eq!(d.next_message().as_deref(), Some("{\"ok\":true}"));
+        for _ in 0..MAX_HEADER_BYTES - 1 {
+            d.push(b"x").unwrap();
+            assert_eq!(pop(&mut d), None);
+        }
+        d.push(b"x").unwrap();
+        assert_eq!(d.next_message(), Err(ProtocolError::HeaderTooLong));
+        assert!(d.scanned <= MAX_HEADER_BYTES);
+        assert_eq!(d.buf.capacity(), 0);
+        assert_eq!(d.push(&encode("{}")), Err(ProtocolError::HeaderTooLong));
+        assert_eq!(d.finish(), Err(ProtocolError::HeaderTooLong));
     }
 
     #[test]
-    fn unicode_body_byte_length_not_char_length() {
-        let body = "{\"s\":\"café→\"}"; // multibyte chars
+    fn malformed_lengths_and_utf8_are_sticky() {
+        for header in [
+            "",
+            "Content-Length: -1",
+            "Content-Length: +1",
+            "Content-Length: 1\r\nContent-Length: 1",
+            "X: yes",
+            "bad",
+            "Content-Length: 1\nOther: 1",
+        ] {
+            let mut d = FrameDecoder::new();
+            d.push(format!("{header}\r\n\r\n").as_bytes()).unwrap();
+            assert!(d.next_message().is_err(), "{header:?}");
+            assert_eq!(d.buf.capacity(), 0);
+        }
         let mut d = FrameDecoder::new();
-        d.push(&encode(body));
-        assert_eq!(d.next_message().as_deref(), Some(body));
+        d.push(b"Content-Length: 1\r\n\r\n\xff").unwrap();
+        assert_eq!(d.next_message(), Err(ProtocolError::InvalidUtf8));
     }
 
     #[test]
-    fn overflowing_content_length_resyncs_instead_of_panicking() {
-        // A near-usize::MAX Content-Length would wrap `body_start + len`
-        // (debug panic; release: a wrapped slice range that panics). It must be
-        // treated as a malformed header: dropped, then the next real message
-        // decodes.
+    fn body_and_buffer_bounds_are_checked_before_append() {
+        for length in [MAX_FRAME_LEN + 1, usize::MAX] {
+            let mut d = FrameDecoder::new();
+            d.push(format!("Content-Length: {length}\r\n\r\n").as_bytes())
+                .unwrap();
+            assert_eq!(d.next_message(), Err(ProtocolError::BodyTooLong));
+        }
         let mut d = FrameDecoder::new();
-        d.push(format!("Content-Length: {}\r\n\r\n", usize::MAX).as_bytes());
-        // No panic, and no body yet (the hostile header was dropped).
-        assert_eq!(d.next_message(), None);
-        d.push(&encode("{\"ok\":true}"));
-        assert_eq!(d.next_message().as_deref(), Some("{\"ok\":true}"));
-    }
-
-    #[test]
-    fn over_cap_content_length_is_rejected_not_buffered() {
-        // A huge-but-not-overflowing length must not make the decoder buffer the
-        // stream unboundedly; it's dropped and the stream resyncs.
-        let mut d = FrameDecoder::new();
-        d.push(format!("Content-Length: {}\r\n\r\n", MAX_FRAME_LEN + 1).as_bytes());
-        assert_eq!(d.next_message(), None);
-        d.push(&encode("{\"ok\":true}"));
-        assert_eq!(d.next_message().as_deref(), Some("{\"ok\":true}"));
-    }
-
-    #[test]
-    fn at_cap_content_length_still_decodes() {
-        // The cap itself is a valid (if large) length — a body exactly at the
-        // cap boundary must still be accepted once it arrives.
+        d.push(&vec![b'x'; MAX_BUFFER_BYTES]).unwrap();
+        assert!(d.buf.capacity() <= MAX_BUFFER_BYTES);
+        assert_eq!(d.push(b"x"), Err(ProtocolError::BufferTooLong));
+        assert_eq!(d.buf.capacity(), 0);
         let body = "x".repeat(MAX_FRAME_LEN);
         let mut d = FrameDecoder::new();
-        d.push(&encode(&body));
-        assert_eq!(d.next_message().as_deref(), Some(body.as_str()));
+        d.push(&encode(&body)).unwrap();
+        assert_eq!(pop(&mut d).as_deref(), Some(body.as_str()));
+    }
+
+    #[test]
+    fn many_tiny_frames_have_linear_moves_and_no_read_after_budget_yield() {
+        struct OneRead(Option<Vec<u8>>);
+        impl Read for OneRead {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let bytes = self
+                    .0
+                    .take()
+                    .expect("buffered frames must precede another read");
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+        }
+        let bytes = encode("{}").repeat(200);
+        let mut reader = FramedReader::new(OneRead(Some(bytes.clone())));
+        for _ in 0..200 {
+            assert_eq!(reader.read_message().unwrap().as_deref(), Some("{}"));
+        }
+        assert!(reader.decoder.scanned <= bytes.len());
+        assert!(reader.decoder.moved <= bytes.len());
+        let mut d = FrameDecoder::new();
+        let bytes = encode("{}").repeat(10000);
+        d.push(&bytes).unwrap();
+        for _ in 0..10000 {
+            assert_eq!(pop(&mut d).as_deref(), Some("{}"));
+        }
+        assert!(d.scanned <= bytes.len());
+        assert!(d.moved <= bytes.len());
+    }
+
+    #[test]
+    fn reader_closes_on_invalid_or_truncated_stream_without_resync() {
+        for bytes in [
+            b"bad\r\n\r\n".to_vec(),
+            b"Content-Length: 2\r\n\r\n{".to_vec(),
+            vec![b'x'; MAX_HEADER_BYTES],
+        ] {
+            let mut reader = FramedReader::new(io::Cursor::new(bytes));
+            assert!(reader.read_message().is_err());
+            assert!(reader.read_message().is_err());
+        }
+        let mut reader = FramedReader::new(io::Cursor::new(encode("{}")));
+        assert_eq!(reader.read_message().unwrap().as_deref(), Some("{}"));
+        assert_eq!(reader.read_message().unwrap(), None);
     }
 }

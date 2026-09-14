@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
-use crate::lsp::framing::{self, FrameDecoder};
+use crate::lsp::framing::{self, FramedReader};
 use thegn_core::remote::GitLoc;
 
 /// Parameters for the `exec` method: run `argv` (optionally in `cwd`, with extra
@@ -552,21 +552,23 @@ pub fn for_loc(loc: &GitLoc) -> Option<Arc<BridgeClient>> {
 }
 
 fn reader_loop(
-    mut reader: impl Read,
+    reader: impl Read,
     pending: Pending,
     subs: Subs,
     procs: Procs,
     closed: Arc<AtomicBool>,
 ) {
-    let mut dec = FrameDecoder::new();
-    let mut buf = [0u8; 8192];
+    let mut reader = FramedReader::new(reader);
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        let body = match reader.read_message() {
+            Ok(Some(body)) => body,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(target: "thegn::bridge", %error, "closing invalid framed stream");
+                break;
+            }
         };
-        dec.push(&buf[..n]);
-        while let Some(body) = dec.next_message() {
+        {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
                 continue;
             };
@@ -692,21 +694,23 @@ struct ProcState {
 const STDIN_QUEUE_DEPTH: usize = 64;
 type ProcRegistry = Arc<Mutex<HashMap<u64, ProcState>>>;
 
-pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
+pub fn serve(reader: impl Read, writer: impl Write + Send + 'static) {
     let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
     // Live fs.watch watchers, kept alive for the connection's lifetime.
     let mut watchers: Vec<RecommendedWatcher> = Vec::new();
     // Live streaming processes (proc.spawn), keyed by channel id.
     let procs: ProcRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let mut dec = FrameDecoder::new();
-    let mut buf = [0u8; 8192];
+    let mut reader = FramedReader::new(reader);
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        let body = match reader.read_message() {
+            Ok(Some(body)) => body,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(target: "thegn::bridge", %error, "closing invalid framed stream");
+                break;
+            }
         };
-        dec.push(&buf[..n]);
-        while let Some(body) = dec.next_message() {
+        {
             let Ok(req) = serde_json::from_str::<Request>(&body) else {
                 continue;
             };
@@ -1171,6 +1175,60 @@ fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn invalid_framing_closes_bridge_and_releases_all_subscribers() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::from([(7, request_tx)])));
+        let (fs_tx, fs_rx) = std::sync::mpsc::channel();
+        let subs: Subs = Arc::new(Mutex::new(HashMap::from([(1, fs_tx)])));
+        let (proc_tx, proc_rx) = std::sync::mpsc::channel();
+        let procs: Procs = Arc::new(Mutex::new(HashMap::from([(1, proc_tx)])));
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut wire = vec![b'x'; framing::MAX_HEADER_BYTES];
+        wire.extend(framing::encode(r#"{"id":7,"ok":"must not dispatch"}"#));
+        reader_loop(
+            std::io::Cursor::new(wire),
+            pending.clone(),
+            subs.clone(),
+            procs.clone(),
+            closed.clone(),
+        );
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(matches!(request_rx.try_recv(), Ok(Err(_))));
+        assert!(matches!(
+            fs_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            proc_rx.try_recv(),
+            Ok(ProcEvent::Exit { code: -1 })
+        ));
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(subs.lock().unwrap().is_empty());
+        assert!(procs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_framing_stops_agent_before_following_request() {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = b"Content-Length: nope\r\n\r\n".to_vec();
+        wire.extend(framing::encode(
+            r#"{"id":7,"method":"unknown","params":{}}"#,
+        ));
+        serve(std::io::Cursor::new(wire), Capture(written.clone()));
+        assert!(written.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn env_timeout_uses_default_when_unset_or_invalid() {
