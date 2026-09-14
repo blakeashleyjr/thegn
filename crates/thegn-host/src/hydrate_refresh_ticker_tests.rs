@@ -206,10 +206,10 @@ impl Drop for Fixture {
         // Always close/join, but avoid a second panic during assertion unwinding.
         if std::thread::panicking() {
             drop(self.permits.take());
-            if let Some(worker) = self.worker.take() {
-                if self.finished.recv_timeout(LIMIT).is_ok() {
-                    drop(worker.join());
-                }
+            if let Some(worker) = self.worker.take()
+                && self.finished.recv_timeout(LIMIT).is_ok()
+            {
+                drop(worker.join());
             }
         } else {
             self.finish();

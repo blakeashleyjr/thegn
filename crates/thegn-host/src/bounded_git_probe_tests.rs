@@ -100,7 +100,12 @@ fn inherited_pipe_is_bounded_and_keeps_its_resource_budget() {
     impl Drop for Release {
         fn drop(&mut self) {
             if let Err(error) = std::fs::write(&self.0, "release") {
-                eprintln!("private pipe-canary release failed: {error}");
+                // Best-effort diagnostic: cleanup must not panic on stderr failure.
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("private pipe-canary release failed: {error}\n"),
+                )
+                .unwrap_or(());
             }
         } // best-effort: private canary cleanup even on assertion failure
     }

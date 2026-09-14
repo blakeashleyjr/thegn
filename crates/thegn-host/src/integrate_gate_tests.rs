@@ -740,7 +740,11 @@ fn concurrent_distinct_oid_gate_refuses_instead_of_rechecking_out_active_tree() 
     impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
             if let Err(error) = std::fs::write(&self.0, "release") {
-                eprintln!("private gate rendezvous release failed: {error}");
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("private gate rendezvous release failed: {error}\n"),
+                )
+                .unwrap_or(()); // Best-effort diagnostic during cleanup/unwind.
             }
         }
     }

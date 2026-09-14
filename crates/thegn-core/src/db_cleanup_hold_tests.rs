@@ -175,7 +175,10 @@ fn cleanup_hold_rollback_and_query_failure_are_not_success() {
         anyhow::bail!("injected post-hold bookkeeping failure")
     });
     assert!(rollback.is_err());
-    assert_eq!(db.list_merge_queue().unwrap(), [selected.clone()]);
+    assert_eq!(
+        db.list_merge_queue().unwrap(),
+        std::slice::from_ref(&selected)
+    );
     db.conn().execute_batch("DROP TABLE merge_queue").unwrap();
     assert!(db.hold_merge_cleanup(&selected).is_err());
 }
