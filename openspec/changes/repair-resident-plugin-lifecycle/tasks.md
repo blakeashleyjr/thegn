@@ -26,4 +26,4 @@
 - [x] Execute eight new native Linux regressions plus all 48 existing plugin tests; exclude one ignored helper from the count (two platform ratchets also passed).
 - [x] Pass the full Windows service library/test crosscheck with the new fixture source; this is not native execution.
 - [ ] Check the new Darwin fixture graph; the historical unix.rs-only harness does not cover it. Native Windows/macOS execution still requires their kernels.
-- [ ] Complete independent adversarial review, scoped checks and local landing of the follow-up.
+- [x] Complete independent adversarial review, scoped checks and local landing of the follow-up.

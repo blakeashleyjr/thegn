@@ -554,7 +554,7 @@
     },
     {
       "change": "bound-duration-and-refresh-policy",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -566,7 +566,8 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Bound duration and cadence conversion while retaining security policy and quarantining unknown destructive ages."
+      "summary": "Bound duration and cadence conversion while retaining security policy and quarantining unknown destructive ages.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "bound-shared-framed-protocols",
@@ -678,7 +679,7 @@
     },
     {
       "change": "harden-live-diagnostics-and-forge",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -710,7 +711,8 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads."
+      "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "harden-live-upgrades",
@@ -726,7 +728,7 @@
     },
     {
       "change": "isolate-maintenance-regression-fixtures",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -738,7 +740,8 @@
           "project": "Alpha Reliability & State Compatibility"
         }
       ],
-      "summary": "Keep watchdog and Git regression work in owned private fixtures with explicit backend, branch and identity inputs."
+      "summary": "Keep watchdog and Git regression work in owned private fixtures with explicit backend, branch and identity inputs.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "make-sidebar-mode-visible",
@@ -921,7 +924,7 @@
     },
     {
       "change": "require-canonical-merge-history",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -929,7 +932,8 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Require verified local canonical history across fold evidence and automatic cleanup; source review and focused/native gates remain pending."
+      "summary": "Require verified local canonical history across fold evidence and automatic cleanup; source review and focused/native gates remain pending.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "resolve-build-git-identity",

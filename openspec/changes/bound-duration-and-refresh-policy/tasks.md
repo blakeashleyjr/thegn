@@ -14,12 +14,12 @@
 - [x] Implement and test visible provider-time quarantine with exact Fly custody/inventory evidence; never invent local generation/time provenance.
 - [x] Verify daemon lease, MCP breaker, model budget and usage reset boundaries: core118 + extra26, svc28, proxy/media26 pass; actual-source shared reaper admission action-count fixture passes.
 - [x] Complete primary and independent source review at 2dbe30aa after custody, ambiguous environment policy and empty VPS ID revisions; focused service checks, formatting, idle guard, ignored-result ratchet and strict OpenSpec pass.
-- [ ] Complete final combined host checks and delivery gates; broad/native provider lifecycle gates remain separately required.
-- [ ] Land reviewed changes on canonical local main when Git metadata is writable.
+- [x] Complete final combined host checks and delivery gates; broad/native provider lifecycle gates remain separately required.
+- [x] Land reviewed changes on canonical local main; September 14 follow-up receipt supersedes the old Git-access hold.
 
 ## THE-483 running-worker acceptance follow-up
 
 - [x] Obtain primary approval for one shared production spawner/loop with statically dispatched owned I/O boundaries.
 - [x] Add bounded channel-clock fixtures for each hostile cadence family, disabled schedules, and ordinary startup/periodic coalescing.
 - [x] Run actual host worker fixtures (3/3 within combined299/299) and counterfactual unchecked-overflow debug failure; record exact evidence and optimized counterfactual limitation.
-- [ ] Complete primary and independent review and land the acceptance follow-up.
+- [x] Complete primary and independent review and land the acceptance follow-up.
