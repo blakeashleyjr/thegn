@@ -228,7 +228,7 @@ fn canonical(path: &Path) -> Result<PathBuf, Refusal> {
         .map_err(|e| unsafe_reason(format!("unreadable path {}: {e}", path.display())))
 }
 
-fn common(root: &Path) -> Result<PathBuf, Refusal> {
+pub(crate) fn common(root: &Path) -> Result<PathBuf, Refusal> {
     canonical(Path::new(&text(
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],

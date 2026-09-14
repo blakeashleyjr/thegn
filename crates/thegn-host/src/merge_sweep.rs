@@ -133,8 +133,25 @@ fn sweep_with_db(cfg: &Config, repo_root: &Path, force: bool, db: &Db) -> SweepR
             return report;
         }
     };
+    let identity = match crate::merge_lifecycle::repository_identity(repo_root) {
+        Ok(identity) => identity,
+        Err(error) => {
+            report
+                .bookkeeping_errors
+                .push(format!("sweep repository identity unavailable: {error}"));
+            return report;
+        }
+    };
     let entries: Vec<_> = rows
         .iter()
+        // A global queue may contain the same target name in unrelated repos.
+        // Exclude proven foreign Git identities before applying this repo's
+        // clock or reporting holds. Unknown/missing paths remain conservative
+        // candidates; the final cleanup admission still proves all ownership.
+        .filter(|row| {
+            crate::merge_lifecycle::repository_identity(Path::new(&row.worktree))
+                .map_or(true, |candidate| candidate == identity)
+        })
         .filter(|row| {
             if merge_sweep::CleanupHold::from_detail(row.error_detail.as_deref()).is_some() {
                 if force { report.kept.push((row.branch.clone(), "worktree previously collected; branch and queue evidence retained for explicit cleanup (THE-596)".into())); }
@@ -347,8 +364,8 @@ mod tests {
         assert_eq!(report.collected, ["feature"]);
         assert_eq!(
             report.kept.len(),
-            2,
-            "foreign and forged main are kept, never collected"
+            1,
+            "foreign is outside the sweep; forged main is refused"
         );
         assert_eq!(
             report.bookkeeping_errors.len(),
