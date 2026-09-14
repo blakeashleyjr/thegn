@@ -181,25 +181,18 @@ fn respond_apc(body: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Collect OSC sequences an inner app emits that must be forwarded VERBATIM
-/// to the outer terminal: OSC 52 (clipboard set — e.g. `vim "+y` inside a
-/// pane) — the host's emulator would otherwise swallow them.
-pub fn osc_passthrough(bytes: &[u8]) -> Vec<u8> {
+#[path = "osc_clipboard.rs"]
+pub(crate) mod clipboard;
+
+#[cfg(test)]
+fn osc_passthrough(bytes: &[u8]) -> Vec<u8> {
+    let mut parser = clipboard::Clipboard::default();
+    parser.feed(bytes);
     let mut out = Vec::new();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b']' {
-            let body = &bytes[i + 2..];
-            if let Some((seq, len)) = osc_seq(body) {
-                if seq.starts_with(b"52;") {
-                    out.extend_from_slice(&bytes[i..i + 2 + len]);
-                }
-                i += 2 + len;
-                continue;
-            }
-        }
-        i += 1;
-    }
+    parser.submit(|bytes| {
+        out = bytes;
+        Ok(())
+    });
     out
 }
 

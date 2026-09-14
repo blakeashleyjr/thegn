@@ -84,6 +84,16 @@ pub fn validate_diagnostics(body: &str) -> Vec<ValidationDiagnostic> {
                 message,
             }),
     );
+    if let Ok(cfg) = toml::from_str::<Config>(&normalized.body) {
+        diagnostics.extend(
+            crate::config_calendar::display_warnings(&cfg.calendar)
+                .into_iter()
+                .map(|message| ValidationDiagnostic {
+                    severity: ValidationSeverity::Warning,
+                    message,
+                }),
+        );
+    }
     diagnostics
 }
 

@@ -459,6 +459,35 @@ pub fn validate_calendar(cfg: &CalendarConfig) -> Vec<String> {
     out
 }
 
+/// Advisory display diagnostics. Raw account names remain semantic cache keys;
+/// legacy labels are accepted, and every draw still applies the safe projection.
+pub fn display_warnings(cfg: &CalendarConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, c) in cfg.clocks.iter().enumerate() {
+        if crate::calendar::display::DisplayText::new(
+            &c.label,
+            crate::calendar::display::Field::ClockLabel,
+        )
+        .as_str()
+            != c.label.trim()
+        {
+            out.push(format!("calendar.clocks[{i}].label: display text contains controls or exceeds the 64 scalar/cell budget; it will be sanitized"));
+        }
+    }
+    for (i, a) in cfg.accounts.iter().enumerate() {
+        if crate::calendar::display::DisplayText::new(
+            &a.name,
+            crate::calendar::display::Field::Calendar,
+        )
+        .as_str()
+            != a.name.trim()
+        {
+            out.push(format!("calendar.accounts[{i}].name: display text contains controls or exceeds the 64 scalar/cell budget; it will be sanitized"));
+        }
+    }
+    out
+}
+
 /// `, did you mean "America/New_York"?` — or nothing when we have no idea.
 fn did_you_mean(name: &str) -> String {
     match crate::calendar::tz::suggest_zones(name, 3).as_slice() {

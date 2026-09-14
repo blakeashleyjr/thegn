@@ -56,13 +56,33 @@ pub enum Piece {
     GfxAnswer(Vec<u8>),
 }
 
-/// Splits a corner pane's PTY stream into emulator text and kitty graphics
-/// commands, buffering APC sequences that straddle PTY reads.
+/// Hard limit on a complete APC, including introducer and ST. Oversize APCs
+/// are discarded through their terminator; their tail is never ordinary text.
+const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
+/// Text is emitted incrementally even when the caller supplies a huge slice.
+const TEXT_PIECE_BYTES: usize = 8192;
+
+#[derive(Debug, Default)]
+enum ScanState {
+    #[default]
+    Text,
+    Escape,
+    Apc {
+        escape: bool,
+    },
+    Discard {
+        escape: bool,
+    },
+}
+
+/// Streaming corner parser. Each input byte is examined once for framing;
+/// only completed APC control fields are parsed for classification.
 #[derive(Debug, Default)]
 pub struct KittyRelay {
-    /// An APC sequence (or a lone trailing `ESC`) not yet terminated; carried into
-    /// the next [`Self::feed`].
+    state: ScanState,
     partial: Vec<u8>,
+    #[cfg(test)]
+    scanned: usize,
 }
 
 impl KittyRelay {
@@ -70,77 +90,109 @@ impl KittyRelay {
         Self::default()
     }
 
-    /// Drop any buffered partial — call when (re)spawning the corner pane so a new
-    /// child never inherits a stale half-sequence.
+    /// A new pane must never inherit the previous pane's partial sequence.
     pub fn reset(&mut self) {
-        self.partial.clear();
+        self.state = ScanState::Text;
+        self.partial = Vec::new();
     }
 
-    /// Split `input` (prepended with any buffered partial) into ordered pieces. A
-    /// trailing incomplete APC (or lone `ESC`) is retained for the next call.
-    pub fn feed(&mut self, input: &[u8]) -> Vec<Piece> {
-        let mut buf = std::mem::take(&mut self.partial);
-        buf.extend_from_slice(input);
-        let mut out = Vec::new();
-        let mut i = 0;
-        let mut text_start = 0;
-        while i < buf.len() {
-            if buf[i] != ESC {
-                i += 1;
-                continue;
+    /// Emit pieces as they complete instead of accumulating an input-sized
+    /// output vector. At most one 4 MiB APC and one 8 KiB text slice are owned
+    /// by the parser; the consumer owns each emitted piece immediately.
+    pub fn feed_with(&mut self, input: &[u8], mut emit: impl FnMut(Piece)) {
+        let mut text = Vec::new();
+        for &byte in input {
+            #[cfg(test)]
+            {
+                self.scanned += 1;
             }
-            // A bare trailing ESC may begin an APC on the next read — buffer it.
-            if i + 1 >= buf.len() {
-                flush_text(&mut out, &buf[text_start..i]);
-                self.partial = buf[i..].to_vec();
-                return out;
-            }
-            // Only APC (`ESC _`) is special; CSI/OSC/etc. stay in the text stream.
-            if buf[i + 1] != b'_' {
-                i += 2;
-                continue;
-            }
-            match find_st(&buf, i + 2) {
-                Some(end) => {
-                    // `end` is the index just past the ST.
-                    flush_text(&mut out, &buf[text_start..i]);
-                    out.push(classify(&buf[i..end]));
-                    i = end;
-                    text_start = end;
+            match self.state {
+                ScanState::Text => {
+                    if byte == ESC {
+                        self.state = ScanState::Escape;
+                    } else {
+                        text.push(byte);
+                    }
                 }
-                None => {
-                    // Incomplete APC: emit text before it, buffer the rest.
-                    flush_text(&mut out, &buf[text_start..i]);
-                    self.partial = buf[i..].to_vec();
-                    return out;
+                ScanState::Escape => {
+                    if byte == b'_' {
+                        if !text.is_empty() {
+                            emit(Piece::Emulator(std::mem::take(&mut text)));
+                        }
+                        self.partial.extend_from_slice(b"\x1b_");
+                        self.state = ScanState::Apc { escape: false };
+                    } else {
+                        text.push(ESC);
+                        if text.len() == TEXT_PIECE_BYTES {
+                            emit(Piece::Emulator(std::mem::take(&mut text)));
+                        }
+                        if byte == ESC {
+                            self.state = ScanState::Escape;
+                        } else {
+                            text.push(byte);
+                            self.state = ScanState::Text;
+                        }
+                    }
                 }
+                ScanState::Apc { escape } => {
+                    let ended = escape && byte == b'\\';
+                    if self.partial.len() == MAX_APC_BYTES {
+                        // Release capacity too: a discarded oversized command
+                        // does not retain its 4 MiB allocation indefinitely.
+                        self.partial = Vec::new();
+                        self.state = if ended {
+                            ScanState::Text
+                        } else {
+                            ScanState::Discard {
+                                escape: byte == ESC,
+                            }
+                        };
+                    } else {
+                        self.partial.push(byte);
+                        if ended {
+                            let seq = std::mem::take(&mut self.partial);
+                            emit(classify(seq));
+                            self.state = ScanState::Text;
+                        } else {
+                            self.state = ScanState::Apc {
+                                escape: byte == ESC,
+                            };
+                        }
+                    }
+                }
+                ScanState::Discard { escape } => {
+                    self.state = if escape && byte == b'\\' {
+                        ScanState::Text
+                    } else {
+                        ScanState::Discard {
+                            escape: byte == ESC,
+                        }
+                    };
+                }
+            }
+            if text.len() >= TEXT_PIECE_BYTES {
+                emit(Piece::Emulator(std::mem::take(&mut text)));
             }
         }
-        flush_text(&mut out, &buf[text_start..]);
-        out
+        if !text.is_empty() {
+            emit(Piece::Emulator(text));
+        }
     }
-}
 
-fn flush_text(out: &mut Vec<Piece>, bytes: &[u8]) {
-    if !bytes.is_empty() {
-        out.push(Piece::Emulator(bytes.to_vec()));
+    #[cfg(test)]
+    fn feed(&mut self, input: &[u8]) -> Vec<Piece> {
+        let mut pieces = Vec::new();
+        self.feed_with(input, |piece| pieces.push(piece));
+        pieces
     }
-}
-
-/// Find the index just past the next String Terminator (`ESC \`) at or after `from`.
-fn find_st(buf: &[u8], from: usize) -> Option<usize> {
-    buf[from..]
-        .windows(2)
-        .position(|w| w == ST)
-        .map(|p| from + p + 2)
 }
 
 /// Classify a complete APC sequence (`ESC _ … ESC \`). Non-graphics APCs (not
 /// `ESC _ G`) pass through to the emulator verbatim.
-fn classify(seq: &[u8]) -> Piece {
+fn classify(seq: Vec<u8>) -> Piece {
     // seq = ESC _ <body> ESC \  → body is seq[2 .. len-2].
     if seq.len() < 4 || seq[2] != b'G' {
-        return Piece::Emulator(seq.to_vec());
+        return Piece::Emulator(seq);
     }
     let body = &seq[2..seq.len() - 2]; // starts with 'G'
     // Control keys are up to the first ';' (payload separator), after the leading 'G'.
@@ -149,8 +201,8 @@ fn classify(seq: &[u8]) -> Piece {
     let action = key_value(ctrl, b"a=");
     match action {
         Some(b"q") => Piece::GfxAnswer(answer_for(ctrl)),
-        Some(b"T") | Some(b"p") => Piece::GfxDisplay(seq.to_vec()),
-        _ => Piece::GfxOther(seq.to_vec()),
+        Some(b"T") | Some(b"p") => Piece::GfxDisplay(seq),
+        _ => Piece::GfxOther(seq),
     }
 }
 
@@ -239,6 +291,111 @@ mod tests {
         v.extend_from_slice(body.as_bytes());
         v.extend_from_slice(ST);
         v
+    }
+
+    #[test]
+    fn every_byte_split_preserves_st_and_non_graphics_text() {
+        let seq = b"hello\x1b_Ga=T;AAAA\x1b\\tail\x1b[31m";
+        for split in 0..=seq.len() {
+            let mut relay = KittyRelay::new();
+            let mut got = relay.feed(&seq[..split]);
+            got.extend(relay.feed(&seq[split..]));
+            let mut wire = Vec::new();
+            for piece in got {
+                match piece {
+                    Piece::Emulator(b) | Piece::GfxDisplay(b) => wire.extend(b),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(wire, seq, "split {split}");
+            assert_eq!(relay.scanned, seq.len());
+        }
+    }
+
+    #[test]
+    fn near_cap_bytewise_input_has_linear_scan_work_and_no_prefix_copy() {
+        let mut seq = b"\x1b_Ga=T;".to_vec();
+        seq.resize(MAX_APC_BYTES - 2, b'A');
+        seq.extend_from_slice(ST);
+        for chunk in [1, 17, 8192, MAX_APC_BYTES] {
+            let mut relay = KittyRelay::new();
+            let mut count = 0;
+            for bytes in seq.chunks(chunk) {
+                relay.feed_with(bytes, |piece| {
+                    assert!(matches!(piece, Piece::GfxDisplay(ref b) if b == &seq));
+                    count += 1;
+                });
+                assert!(relay.partial.len() <= MAX_APC_BYTES);
+                assert!(relay.partial.capacity() <= MAX_APC_BYTES);
+            }
+            assert_eq!(count, 1);
+            // Framing scans every byte once. Classification walks only the
+            // complete control prefix and never revisits partial input.
+            assert_eq!(relay.scanned, seq.len());
+        }
+    }
+
+    #[test]
+    fn oversized_apc_discards_through_split_st_then_recovers() {
+        for graphics in [true, false] {
+            let mut relay = KittyRelay::new();
+            relay.feed_with(if graphics { b"\x1b_G" } else { b"\x1b_X" }, |_| panic!());
+            for _ in 0..=MAX_APC_BYTES / 8192 {
+                relay.feed_with(&[b'x'; 8192], |_| panic!());
+            }
+            assert!(relay.partial.is_empty());
+            relay.feed_with(b"still discarded\x1b", |_| panic!());
+            assert_eq!(
+                relay.feed(b"\\safe"),
+                vec![Piece::Emulator(b"safe".to_vec())]
+            );
+            assert_eq!(relay.feed(&apc("Ga=d")), vec![Piece::GfxOther(apc("Ga=d"))]);
+        }
+    }
+
+    #[test]
+    fn reset_drops_partial_and_discard_state() {
+        let mut relay = KittyRelay::new();
+        assert!(relay.feed(b"\x1b_Ga=T;old").is_empty());
+        relay.reset();
+        assert_eq!(relay.feed(b"new"), vec![Piece::Emulator(b"new".to_vec())]);
+        relay.feed_with(b"\x1b_", |_| panic!());
+        relay.feed_with(&vec![b'x'; MAX_APC_BYTES], |_| panic!());
+        relay.reset();
+        assert_eq!(relay.feed(b"new"), vec![Piece::Emulator(b"new".to_vec())]);
+    }
+
+    #[test]
+    fn escape_pair_at_text_boundary_does_not_grow_output_past_limit() {
+        let mut relay = KittyRelay::new();
+        let mut input = vec![b'x'; TEXT_PIECE_BYTES - 1];
+        input.extend_from_slice(b"\x1b[");
+        let mut output = Vec::new();
+        relay.feed_with(&input, |piece| {
+            let Piece::Emulator(bytes) = piece else {
+                panic!()
+            };
+            assert!(bytes.len() <= TEXT_PIECE_BYTES);
+            assert!(bytes.capacity() <= TEXT_PIECE_BYTES);
+            output.extend(bytes);
+        });
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn huge_single_feed_emits_bounded_text_pieces_without_retained_output() {
+        let mut relay = KittyRelay::new();
+        let input = vec![b'x'; MAX_APC_BYTES * 2];
+        let mut total = 0;
+        relay.feed_with(&input, |piece| {
+            let Piece::Emulator(bytes) = piece else {
+                panic!()
+            };
+            assert!(bytes.len() <= TEXT_PIECE_BYTES);
+            total += bytes.len();
+        });
+        assert_eq!(total, input.len());
+        assert!(relay.partial.is_empty());
     }
 
     #[test]

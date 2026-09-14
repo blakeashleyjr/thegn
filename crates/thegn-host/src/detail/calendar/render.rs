@@ -7,6 +7,7 @@
 
 use chrono::{Datelike, NaiveDate, Timelike};
 use termwiz::surface::Surface;
+use thegn_core::calendar::display::{DisplayText, Field};
 
 use super::layout::{self, GRID_HEADER_ROWS};
 use super::{CalPane, CalState};
@@ -323,9 +324,12 @@ fn agenda_table(st: &CalState) -> super::super::Section {
             };
             vec![
                 Cell::Text(event_when(e, st), Tok::Slot(S::Dim)),
-                Cell::Text(e.title.clone(), title_tone),
                 Cell::Text(
-                    e.calendar.clone(),
+                    DisplayText::new(&e.title, Field::Title).into_string(),
+                    title_tone,
+                ),
+                Cell::Text(
+                    DisplayText::new(&e.calendar, Field::Calendar).into_string(),
                     e.color.map(Tok::Hue).unwrap_or(Tok::Slot(S::Ghost)),
                 ),
             ]
@@ -391,7 +395,7 @@ fn clocks_table(st: &CalState) -> super::super::Section {
             };
             vec![
                 Cell::Text(
-                    r.label.clone(),
+                    DisplayText::new(&r.label, Field::ClockLabel).into_string(),
                     if r.is_home {
                         Tok::Slot(S::Text)
                     } else {
@@ -400,7 +404,10 @@ fn clocks_table(st: &CalState) -> super::super::Section {
                 ),
                 Cell::Text(r.local.format("%a").to_string(), Tok::Slot(S::Faint)),
                 Cell::Text(time, Tok::Slot(S::Text)),
-                Cell::Text(r.abbrev.clone(), Tok::Slot(S::Faint)),
+                Cell::Text(
+                    DisplayText::new(&r.abbrev, Field::ClockLabel).into_string(),
+                    Tok::Slot(S::Faint),
+                ),
                 Cell::Text(
                     thegn_core::calendar::tz::fmt_delta(r.delta_from_home_mins),
                     Tok::Hue(thegn_core::theme::Hue::Blue),
