@@ -231,15 +231,15 @@ impl ResidentSupervisor {
                 // is cancelled. Concurrent shutdown callers observe the same join.
                 let joined = match tokio::time::timeout_at(deadline, task.lock()).await {
                     Ok(mut task) => {
-                        if let Some(handle) = task.handle.as_mut() {
-                            if let Ok(result) = tokio::time::timeout_at(deadline, handle).await {
-                                let result = result.map_err(|error| error.to_string());
-                                if let Err(error) = &result {
-                                    task.failures.push(error.clone());
-                                }
-                                task.joined = Some(result);
-                                task.handle = None;
+                        if let Some(handle) = task.handle.as_mut()
+                            && let Ok(result) = tokio::time::timeout_at(deadline, handle).await
+                        {
+                            let result = result.map_err(|error| error.to_string());
+                            if let Err(error) = &result {
+                                task.failures.push(error.clone());
                             }
+                            task.joined = Some(result);
+                            task.handle = None;
                         }
                         if task.handle.is_none() && Instant::now() < deadline {
                             let process = held
@@ -373,11 +373,10 @@ impl ResidentSession {
                 if let Ok(mut task) = entry.task.try_lock() {
                     if let Some(handle) = task.handle.as_mut()
                         && handle.is_finished()
+                        && let Some(result) = handle.now_or_never()
                     {
-                        if let Some(result) = handle.now_or_never() {
-                            task.joined = Some(result.map_err(|error| error.to_string()));
-                            task.handle = None;
-                        }
+                        task.joined = Some(result.map_err(|error| error.to_string()));
+                        task.handle = None;
                     }
                     return !matches!(task.joined, Some(Ok(())));
                 }

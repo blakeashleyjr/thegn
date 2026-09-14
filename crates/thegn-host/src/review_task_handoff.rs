@@ -126,16 +126,15 @@ fn handle_loaded(
         Ok(proof) => proof,
         Err(reason) => return reason.into(),
     };
-    if let Some(permit) = &authorship {
-        if !permit.matches_review(&context.repository, context.pr_number)
+    if let Some(permit) = &authorship
+        && (!permit.matches_review(&context.repository, context.pr_number)
             || task.issue_id
                 != format!(
                     "pr:{selected_forge}:{}#{}",
                     context.repository, context.pr_number
-                )
-        {
-            return crate::pr_authorship::HELD.into();
-        }
+                ))
+    {
+        return crate::pr_authorship::HELD.into();
     }
     let sandbox = match crate::agent_run::agent_floor_gate(
         cfg,

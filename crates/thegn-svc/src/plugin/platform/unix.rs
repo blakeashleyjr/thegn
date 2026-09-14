@@ -161,10 +161,10 @@ impl Drop for Process {
         self.stdin = None;
         self.stdout = None;
         self.stderr = None;
-        if matches!(self.leader.exited_without_reaping(), Ok(true)) {
-            if let Err(error) = self.leader.reap() {
-                tracing::error!(target: "thegn::plugin", %error, "final nonblocking reap failed");
-            }
+        if matches!(self.leader.exited_without_reaping(), Ok(true))
+            && let Err(error) = self.leader.reap()
+        {
+            tracing::error!(target: "thegn::plugin", %error, "final nonblocking reap failed");
         }
     }
 }

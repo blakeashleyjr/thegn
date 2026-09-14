@@ -64,7 +64,12 @@ fn reaper() -> Result<&'static mpsc::SyncSender<ReapJob>, ProbeError> {
                 .spawn(move || {
                     crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                     while let Ok((mut child, budget)) = rx.recv() {
-                        if child.wait().is_err() {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "blocking reap runs only on this dedicated background thread"
+                        )]
+                        let status = child.wait();
+                        if status.is_err() {
                             // Unknown ownership/reap state must not free capacity for
                             // an unbounded succession of unreaped children.
                             std::mem::forget((child, budget));
