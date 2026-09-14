@@ -317,6 +317,12 @@ mod tests {
         assert_eq!(deadline_seconds(-1, 0), None);
         assert_eq!(deadline_seconds(i64::MAX, 1), None);
         assert_eq!(deadline_seconds(100, u64::MAX), None);
+        assert_eq!(deadline_seconds_from_float(100, 0.1), Some(101));
+        assert_eq!(deadline_seconds_from_float(100, 1.5), Some(102));
+        assert_eq!(deadline_seconds_from_float(i64::MAX, 0.1), None);
+        for delay in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+            assert_eq!(deadline_seconds_from_float(100, delay), None);
+        }
     }
 
     #[test]
