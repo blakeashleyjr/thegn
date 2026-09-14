@@ -1,0 +1,106 @@
+{
+  "verdict": "Hold: actual configured post-land positive fixture missing; listed guarded-removal and negative fold evidence is valid",
+  "receipts": [
+    {
+      "receipt": "/tmp/thegn-batch03-final-native-20260914.receipt.json",
+      "receipt_sha256": "b73ad1031d8e44b14fedba6c709e7c34cbb92ba10d3c8da06541045d292df809",
+      "source": "41ae7c04e52a1ca159bdf08ea1b6967a24cc9fa8",
+      "passed": 8405,
+      "selected": 8405,
+      "log": "/tmp/thegn-batch03-final-native-20260914.log",
+      "log_sha256": "3bfc1ae5f5b7f6ff31c8b242afc7c106f4fba1f248d21638641704ee3e652f14"
+    },
+    {
+      "receipt": "/tmp/thegn-rolling-full-workspace3-results-20260914.json",
+      "receipt_sha256": "94595fda1fb547dd8e81e6163b7d35f9c072c60ef956b3fce3e357831e50059a",
+      "source": "5b698dc4",
+      "passed": 8354,
+      "selected": 8354,
+      "log": "/tmp/thegn-rolling-full-workspace3-20260914.log",
+      "log_sha256": "7166604b1d90122adf27a546457e289f17efec27cc82f7d80d40ba8d8ed78cfb"
+    }
+  ],
+  "exact_test_count": 32,
+  "exact_tests_present_in_both": [
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::rejects_foreign_main_target_mismatched_and_unregistered_paths",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::dirty_ignored_untracked_and_unknown_status_never_mean_clean",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::hidden_index_modifications_and_filters_refuse_without_running_driver",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::branch_advanced_after_landing_or_during_cleanup_is_preserved",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::final_validation_preserves_new_ignored_files_and_replaced_directory",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::locked_worktree_busy_repository_and_symlink_alias_are_refused",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::symlinked_mutation_lock_and_revoked_final_guard_preserve_files",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::actual_no_force_removal_preserves_source_and_target_refs",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::branch_recheckout_after_removal_is_kept",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::identity_open_rejects_wrong_types_and_symlinks",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::named_pipe_identity_open_is_nonblocking_and_refused",
+    "thegn-host::bin/thegn merge_sweep::tests::shared_database_collects_only_verified_repository_and_reports_actual_removal",
+    "thegn-host::bin/thegn merge_sweep::tests::dirty_conflicted_claim_and_wrong_target_rows_keep_retry_metadata",
+    "thegn-host::bin/thegn merge_sweep::tests::held_cleanup_survives_refresh_without_repeating_missing_worktree_errors_or_touching_refs",
+    "thegn-host::bin/thegn merge_sweep::tests::foreign_cached_repository_is_refused_before_teardown",
+    "thegn-host::bin/thegn merge_sweep::tests::malformed_remote_cache_refuses_before_hooks_and_preserves_worktree_refs_queue",
+    "thegn-host::bin/thegn merge_sweep::tests::unknown_resource_metadata_refuses_before_hooks_and_preserves_worktree_refs_queue",
+    "thegn-host::bin/thegn merge_sweep::tests::post_admission_unknown_dispatch_stops_removal_after_the_pre_destroy_hook",
+    "thegn-host::bin/thegn merge_sweep::tests::post_admission_malformed_registry_stops_removal_after_the_pre_destroy_hook",
+    "thegn-host::bin/thegn merge_sweep::tests::selected_landed_row_cannot_authorize_requeued_or_revoked_cleanup",
+    "thegn-host::bin/thegn merge_sweep::tests::refinalized_result_oid_revokes_selected_cleanup_before_hooks",
+    "thegn-host::bin/thegn merge_sweep::tests::manual_clear_only_deletes_exact_selected_landed_rows",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_does_not_overlap_an_existing_destroy",
+    "thegn-host::bin/thegn merge_lifecycle::tests::generic_landed_or_mismatched_commit_cannot_remove_a_worktree",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_keeps_git_unregistered_directory",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_keeps_branch_and_explicit_queue_hold",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_detach_removes_worktree_but_keeps_branch",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::runtime::active_projection_and_sync_refuse_before_hooks_or_explicit_runtime_teardown",
+    "thegn-host::bin/thegn canonical_history::tests::history_refusal_preserves_actual_cleanup_queue_and_worktree",
+    "thegn-host::bin/thegn canonical_history::tests::external_graft_environment_refuses_actual_cleanup_without_default_grafts",
+    "thegn-host::bin/thegn integrate::tests::failed_union_cannot_persist_a_land_or_run_landed_lifecycle",
+    "thegn-host::bin/thegn integrate::tests::green_gate_advances_red_gate_holds_back"
+  ],
+  "source_linkage": {
+    "crates/thegn-host/src/merge_cleanup.rs": {
+      "canonical7014_sha256": "694f540a53499295055492bd7bca088a8aaf22778d56f880d61b42e99414cb19",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/merge_cleanup_tests.rs": {
+      "canonical7014_sha256": "5e655224d0e96c2ad2119c93f32e5cc0eb3dd86beb4212614075757611b4cf16",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/merge_cleanup_runtime_tests.rs": {
+      "canonical7014_sha256": "7c873ba03322799262cac25291bb49659bf170430c807510817f932e3a9f91b1",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/merge_lifecycle.rs": {
+      "canonical7014_sha256": "cd7e3a63380e6d618639dd0bea3f9af658b3c997a8a62a936405fd2e29d6b003",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/merge_sweep.rs": {
+      "canonical7014_sha256": "a7f65fc7b831cb4528c21eb49dfde256ea6c59806dcb849f21a8e17a6e822fb4",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/canonical_history.rs": {
+      "canonical7014_sha256": "e3316b2714db3ba6a8550572a78f0606dd6253334366c4732c36f8e4c6537fd8",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/integrate_persistence.rs": {
+      "canonical7014_sha256": "fdbefbdafdd847ed0b07d7ef252b9c541158d88f4d0ac143ae8b141c5fc24f12",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/integrate.rs": {
+      "canonical7014_sha256": "1cda7dba15f59806f5957d438e6877345f3c5866184ffe460f3d621793c55f9e",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/cmd/integrate.rs": {
+      "canonical7014_sha256": "9671b054cf0f2ee60f766747b94543f9fef230d911c9d8e79b83831e30b8ad86",
+      "identical_at_41ae": true
+    },
+    "crates/thegn-host/src/worktree_lifecycle.rs": {
+      "canonical7014_sha256": "cd3a6be23c4fadb955f054dcc1d4aa91a003a8a4c86d59d55c0606846de84930",
+      "identical_at_41ae": true
+    }
+  },
+  "canonical_ancestry": {
+    "ea807922": true,
+    "407e7d77": true,
+    "db2dbb55": true,
+    "7ad070c6": true
+  }
+}

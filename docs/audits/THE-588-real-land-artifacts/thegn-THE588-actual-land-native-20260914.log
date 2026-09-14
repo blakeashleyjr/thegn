@@ -1,0 +1,235 @@
+   Compiling gtui-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/gtui-core)
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/thegn-media)
+   Compiling thegn-metrics v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/thegn-metrics)
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/thegn-svc)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/thegn-core)
+   Compiling gtui-query v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/gtui-query)
+   Compiling gtui-app v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/gtui-app)
+   Compiling gtui-render v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/gtui-render)
+   Compiling tg-kit v0.1.0 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/tg-kit)
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/thegn-host)
+   Compiling termwiz v0.23.3 (/tmp/thegn-maintenance-04-cleanup-20260914/vendor/termwiz)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/hyperlink.rs:247:18
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match> {
+    |                  ^^^^^            ^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                  |
+    |                  the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match<'_>> {
+    |                                                     ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/image.rs:567:17
+    |
+567 |     pub fn data(&self) -> MutexGuard<ImageDataType> {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+567 |     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
+    |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:12:12
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>>;
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>>;
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:22:9
+   |
+22 |         &self,
+   |         ^^^^^ the lifetime is elided here
+...
+27 |     ) -> Option<SearchResult>;
+   |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+27 |     ) -> Option<SearchResult<'_>>;
+   |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:88:12
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>> {
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>> {
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/lineedit/history.rs:109:9
+    |
+109 |         &self,
+    |         ^^^^^ the lifetime is elided here
+...
+114 |     ) -> Option<SearchResult> {
+    |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+114 |     ) -> Option<SearchResult<'_>> {
+    |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:511:25
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<Line>> {
+    |                         ^^^^^         ^^^^^^^^^ the same lifetime is hidden here
+    |                         |
+    |                         the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+    |                                           +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:526:24
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<[Change]>) {
+    |                        ^^^^^ the lifetime is elided here       ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+    |                                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/clusterline.rs:165:17
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter<'_> {
+    |                                              ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/line.rs:609:19
+    |
+609 |     pub fn as_str(&self) -> Cow<str> {
+    |                   ^^^^^     ^^^^^^^^ the same lifetime is hidden here
+    |                   |
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+609 |     pub fn as_str(&self) -> Cow<'_, str> {
+    |                                 +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> vendor/termwiz/src/surface/line/line.rs:1014:21
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef> {
+     |                     ^^^^^ the lifetime is elided here   ^^^^^^^ the same lifetime is hidden here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+     |                                                                ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/terminal/mod.rs:74:27
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+   |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                           |
+   |                           the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+   |                                                                 ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/terminal/unix.rs:389:27
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+    |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                           |
+    |                           the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+    |                                                                 ++++
+
+warning: `termwiz` (lib) generated 13 warnings (run `cargo fix --lib -p termwiz` to apply 13 suggestions)
+   Compiling gtui-embed v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-cleanup-20260914/crates/gtui-embed)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 11s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 84920d8c-a021-4542-9a61-2f270f0f30ac with nextest profile: default
+    Starting 38 tests across 1 binary (3280 tests skipped)
+        PASS [   0.895s] ( 1/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::branch_advanced_after_landing_or_during_cleanup_is_preserved
+        PASS [   0.920s] ( 2/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::actual_no_force_removal_preserves_source_and_target_refs
+        PASS [   0.985s] ( 3/38) thegn-host::bin/thegn integrate::tests::failed_union_cannot_persist_a_land_or_run_landed_lifecycle
+        PASS [   0.863s] ( 4/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::branch_recheckout_after_removal_is_kept
+        PASS [   1.139s] ( 5/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::dirty_ignored_untracked_and_unknown_status_never_mean_clean
+        PASS [   0.080s] ( 6/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::identity_open_rejects_wrong_types_and_symlinks
+        PASS [   1.242s] ( 7/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::final_validation_preserves_new_ignored_files_and_replaced_directory
+        PASS [   0.153s] ( 8/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::local_runtime_admission_pins_workspace_selection_and_refuses_persisted_session
+        PASS [   0.151s] ( 9/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::local_runtime_admission_refuses_auto_and_unknown_environment
+        PASS [   0.091s] (10/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::named_pipe_identity_open_is_nonblocking_and_refused
+        PASS [   0.081s] (11/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::oci_discovery_is_bounded_conservative_and_never_executes_candidates
+        PASS [   0.805s] (12/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::hidden_index_modifications_and_filters_refuse_without_running_driver
+        PASS [   0.598s] (13/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::locked_worktree_busy_repository_and_symlink_alias_are_refused
+        PASS [   3.148s] (14/38) thegn-host::bin/thegn integrate::tests::configured_cleanup_runs_only_after_real_target_advance_and_committed_outcome
+        PASS [   0.102s] (15/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::runtime::registry_fixture_restores_prior_custody_on_unwind
+        PASS [   0.824s] (16/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::rejects_foreign_main_target_mismatched_and_unregistered_paths
+        PASS [   0.878s] (17/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::private_git_transaction_rejects_a_changed_target_oid
+        PASS [   0.156s] (18/38) thegn-host::bin/thegn merge_lifecycle::tests::dequeue_leaves_user_filed_folder_alone
+        PASS [   0.209s] (19/38) thegn-host::bin/thegn merge_lifecycle::tests::checked_land_lifecycle_surfaces_an_unavailable_write
+        PASS [   0.152s] (20/38) thegn-host::bin/thegn merge_lifecycle::tests::dequeue_unfiles_from_lifecycle_folder
+        PASS [   0.155s] (21/38) thegn-host::bin/thegn merge_lifecycle::tests::enqueue_files_into_merging_folder
+        PASS [   0.153s] (22/38) thegn-host::bin/thegn merge_lifecycle::tests::enqueue_registers_unpersisted_worktree_and_files_it
+        PASS [   0.162s] (23/38) thegn-host::bin/thegn merge_lifecycle::tests::failure_files_into_needs_attention
+        PASS [   0.172s] (24/38) thegn-host::bin/thegn merge_lifecycle::tests::generic_landed_or_mismatched_commit_cannot_remove_a_worktree
+        PASS [   0.162s] (25/38) thegn-host::bin/thegn merge_lifecycle::tests::home_worktree_is_never_touched
+        PASS [   0.158s] (26/38) thegn-host::bin/thegn merge_lifecycle::tests::land_in_place_files_into_merged_and_keeps_worktree
+        PASS [   0.159s] (27/38) thegn-host::bin/thegn merge_lifecycle::tests::land_in_place_off_unfiles_lifecycle_but_not_user_folder
+        PASS [   1.132s] (28/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::symlinked_mutation_lock_and_revoked_final_guard_preserve_files
+        PASS [   0.156s] (29/38) thegn-host::bin/thegn merge_lifecycle::tests::landed_move_refiles_and_keeps_row
+        PASS [   0.210s] (30/38) thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_does_not_overlap_an_existing_destroy
+        PASS [   0.255s] (31/38) thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_keeps_git_unregistered_directory
+        PASS [   0.155s] (32/38) thegn-host::bin/thegn merge_lifecycle::tests::toggle_off_is_inert
+        PASS [   0.078s] (33/38) thegn-host::bin/thegn merge_lifecycle::tests::vanished_indices_use_only_worker_reported_paths
+        PASS [   0.128s] (34/38) thegn-host::bin/thegn merge_lifecycle::tests::workspace_repo_path_falls_back_when_no_workspace_row
+        PASS [   0.128s] (35/38) thegn-host::bin/thegn merge_lifecycle::tests::workspace_repo_path_prefers_registered_workspace_string
+        PASS [   2.385s] (36/38) thegn-host::bin/thegn merge_lifecycle::tests::landed_detach_removes_worktree_but_keeps_branch
+        PASS [   2.404s] (37/38) thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_keeps_branch_and_explicit_queue_hold
+        PASS [   8.212s] (38/38) thegn-host::bin/thegn merge_lifecycle::cleanup::tests::runtime::active_projection_and_sync_refuse_before_hooks_or_explicit_runtime_teardown
+────────────
+     Summary [  11.109s] 38 tests run: 38 passed, 3280 skipped

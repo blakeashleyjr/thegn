@@ -1,0 +1,66 @@
+{
+  "source": "b21cb20dc8148b8e8d0f01cb39d25e661b702d25",
+  "exit_code": 0,
+  "selected": 38,
+  "passed": 38,
+  "skipped_unselected": 3280,
+  "test_seconds": 11.109,
+  "passed_tests": [
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::branch_advanced_after_landing_or_during_cleanup_is_preserved",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::actual_no_force_removal_preserves_source_and_target_refs",
+    "thegn-host::bin/thegn integrate::tests::failed_union_cannot_persist_a_land_or_run_landed_lifecycle",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::branch_recheckout_after_removal_is_kept",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::dirty_ignored_untracked_and_unknown_status_never_mean_clean",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::identity_open_rejects_wrong_types_and_symlinks",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::final_validation_preserves_new_ignored_files_and_replaced_directory",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::local_runtime_admission_pins_workspace_selection_and_refuses_persisted_session",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::local_runtime_admission_refuses_auto_and_unknown_environment",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::named_pipe_identity_open_is_nonblocking_and_refused",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::oci_discovery_is_bounded_conservative_and_never_executes_candidates",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::hidden_index_modifications_and_filters_refuse_without_running_driver",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::locked_worktree_busy_repository_and_symlink_alias_are_refused",
+    "thegn-host::bin/thegn integrate::tests::configured_cleanup_runs_only_after_real_target_advance_and_committed_outcome",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::runtime::registry_fixture_restores_prior_custody_on_unwind",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::rejects_foreign_main_target_mismatched_and_unregistered_paths",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::private_git_transaction_rejects_a_changed_target_oid",
+    "thegn-host::bin/thegn merge_lifecycle::tests::dequeue_leaves_user_filed_folder_alone",
+    "thegn-host::bin/thegn merge_lifecycle::tests::checked_land_lifecycle_surfaces_an_unavailable_write",
+    "thegn-host::bin/thegn merge_lifecycle::tests::dequeue_unfiles_from_lifecycle_folder",
+    "thegn-host::bin/thegn merge_lifecycle::tests::enqueue_files_into_merging_folder",
+    "thegn-host::bin/thegn merge_lifecycle::tests::enqueue_registers_unpersisted_worktree_and_files_it",
+    "thegn-host::bin/thegn merge_lifecycle::tests::failure_files_into_needs_attention",
+    "thegn-host::bin/thegn merge_lifecycle::tests::generic_landed_or_mismatched_commit_cannot_remove_a_worktree",
+    "thegn-host::bin/thegn merge_lifecycle::tests::home_worktree_is_never_touched",
+    "thegn-host::bin/thegn merge_lifecycle::tests::land_in_place_files_into_merged_and_keeps_worktree",
+    "thegn-host::bin/thegn merge_lifecycle::tests::land_in_place_off_unfiles_lifecycle_but_not_user_folder",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::symlinked_mutation_lock_and_revoked_final_guard_preserve_files",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_move_refiles_and_keeps_row",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_does_not_overlap_an_existing_destroy",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_keeps_git_unregistered_directory",
+    "thegn-host::bin/thegn merge_lifecycle::tests::toggle_off_is_inert",
+    "thegn-host::bin/thegn merge_lifecycle::tests::vanished_indices_use_only_worker_reported_paths",
+    "thegn-host::bin/thegn merge_lifecycle::tests::workspace_repo_path_falls_back_when_no_workspace_row",
+    "thegn-host::bin/thegn merge_lifecycle::tests::workspace_repo_path_prefers_registered_workspace_string",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_detach_removes_worktree_but_keeps_branch",
+    "thegn-host::bin/thegn merge_lifecycle::tests::landed_remove_keeps_branch_and_explicit_queue_hold",
+    "thegn-host::bin/thegn merge_lifecycle::cleanup::tests::runtime::active_projection_and_sync_refuse_before_hooks_or_explicit_runtime_teardown"
+  ],
+  "artifacts": [
+    {
+      "path": "thegn-THE588-actual-land-native-20260914.log",
+      "sha256": "811a8fe43a1ecededc9b52b49d0ada331aa54ace2286ad35a5e35ae9c53c2a98",
+      "bytes": 14727
+    },
+    {
+      "path": "thegn-THE588-independent-acceptance-review-20260914.md",
+      "sha256": "a398bc1024be50818cb5da31b78690bba5277c37a9af7ed3f9f3c68cfede2bb5",
+      "bytes": 13207
+    },
+    {
+      "path": "thegn-THE588-independent-acceptance-evidence-20260914.json",
+      "sha256": "e4d040d4fa138692d8d2207308a5d245e713a4c8dc738d42d6942e993c8fbaa1",
+      "bytes": 6828
+    }
+  ],
+  "scope": "Targeted actual-land/lifecycle/cleanup/failed-fold acceptance; no new full-workspace or non-Unix claim"
+}
