@@ -206,6 +206,10 @@ pub trait NotificationStore {
     /// Find the dispatch id for a worktree path (most recent, if any).
     fn dispatch_for_worktree(&self, worktree_path: &str) -> Result<Option<i64>>;
 
+    /// Automatic cleanup holds unknown/nonterminal dispatches and any pending
+    /// reassignment to this path. Query/decode errors are never an inactive row.
+    fn has_cleanup_dispatch(&self, worktree_path: &str) -> Result<bool>;
+
     /// The dispatch timestamp (`dispatched_at_ms`) of a worktree's most recent
     /// agent dispatch, if any. Read at resurrection to age a persisted
     /// running/active agent signal through [`crate::activity::coerce_stale`], so a

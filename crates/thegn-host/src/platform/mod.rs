@@ -43,6 +43,9 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+/// Physical identity and nonblocking ownership checks for local gate state.
+pub(crate) mod gate_path;
+
 /// Platform-owned details for the daemon's local administrative endpoint.
 /// The doctor owns presentation; this seam owns the OS identity primitive and
 /// endpoint-hardening check that give those labels their meaning.

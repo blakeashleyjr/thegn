@@ -21,6 +21,24 @@ use thegn_core::db::Db;
 use thegn_core::merge_lifecycle::{LifecycleAction, LifecycleEvent, decide};
 use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 
+#[path = "merge_cleanup.rs"]
+mod cleanup;
+#[cfg(test)]
+pub(crate) use cleanup::TestIsolation;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CleanupOutcome {
+    Removed {
+        branch_deleted: bool,
+        queue_removed: bool,
+        bookkeeping_errors: Vec<String>,
+    },
+    KeptDirty,
+    Refused {
+        reason: String,
+    },
+}
+
 /// Paths identified by the off-loop vanished-tab probe. The compositor applies
 /// this result without re-checking disk or SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +58,38 @@ pub(crate) fn apply(
     branch: &str,
     event: LifecycleEvent,
 ) {
+    apply_inner(cfg, db, repo_root, worktree, branch, event, None);
+}
+
+/// An actual committed outcome, unlike an `UpToDate` or generic lifecycle event.
+pub(crate) fn apply_landed(
+    cfg: &MergeQueueConfig,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    commit: &str,
+) {
+    apply_inner(
+        cfg,
+        db,
+        repo_root,
+        worktree,
+        branch,
+        LifecycleEvent::Landed,
+        Some(commit),
+    );
+}
+
+fn apply_inner(
+    cfg: &MergeQueueConfig,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    event: LifecycleEvent,
+    commit: Option<&str>,
+) {
     // The home / main checkout is a fixed anchor — never file or remove it.
     if Path::new(worktree) == repo_root {
         return;
@@ -48,7 +98,40 @@ pub(crate) fn apply(
         LifecycleAction::Noop => Ok(()),
         LifecycleAction::FileInto(folder) => file_into(db, repo_root, worktree, branch, &folder),
         LifecycleAction::RemoveWorktree { delete_branch } => {
-            remove_landed(db, repo_root, worktree, branch, delete_branch);
+            let Some(commit) = commit else {
+                thegn_core::msg::warn(
+                    "merge cleanup: retained worktree; no committed outcome supplied",
+                );
+                return;
+            };
+            let target = crate::integrate::resolve_target(cfg, repo_root);
+            let outcome = remove_landed(
+                db,
+                repo_root,
+                worktree,
+                branch,
+                &target,
+                Some(commit),
+                delete_branch,
+            );
+            match outcome {
+                CleanupOutcome::Removed {
+                    bookkeeping_errors, ..
+                } => {
+                    for error in bookkeeping_errors {
+                        thegn_core::msg::warn(&crate::merge_sweep::safe_display(&error));
+                    }
+                }
+                CleanupOutcome::KeptDirty => thegn_core::msg::warn(&format!(
+                    "merge cleanup: kept {} — uncommitted, untracked or ignored work",
+                    crate::merge_sweep::safe_display(branch)
+                )),
+                CleanupOutcome::Refused { reason } => thegn_core::msg::warn(&format!(
+                    "merge cleanup: kept {} — {}",
+                    crate::merge_sweep::safe_display(branch),
+                    crate::merge_sweep::safe_display(&reason)
+                )),
+            }
             Ok(())
         }
         LifecycleAction::Unfile => unfile(cfg, db, repo_root, worktree),
@@ -183,35 +266,83 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
     Ok(())
 }
 
-/// Does this worktree have uncommitted work (staged, unstaged, or untracked)?
-/// Missing/unreadable is treated as NOT dirty so a stale path still gets cleaned
-/// up — `git worktree remove` is the one that decides, and it fails safely.
-pub(crate) fn worktree_is_dirty(worktree: &str) -> bool {
-    thegn_core::util::git_out(Path::new(worktree), &["status", "--porcelain"])
-        .is_some_and(|s| !s.trim().is_empty())
-}
-
-/// Remove a landed worktree (and its branch when `delete_branch`), then drop its
-/// cache rows. The branch name comes from the caller (the queue row), not live
-/// git — the fold may already have fast-forwarded the branch away.
+/// Remove a landed worktree, retaining requested branch cleanup as an explicit
+/// hold. Caller-provided names must match the registered checkout and current
+/// Git objects before lifecycle side effects or physical removal.
 pub(crate) fn remove_landed(
     db: &Db,
     repo_root: &Path,
     worktree: &str,
     branch: &str,
+    target: &str,
+    landed: Option<&str>,
     delete_branch: bool,
-) {
+) -> CleanupOutcome {
+    let selected = match db.list_merge_queue() {
+        Ok(rows) => rows.into_iter().find(|row| row.worktree == worktree),
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                reason: format!("queue identity unavailable: {error}"),
+            };
+        }
+    };
+    let Some(selected) = selected.filter(|row| {
+        row.status == "landed"
+            && row.branch == branch
+            && row.target_branch == target
+            && landed.is_some()
+            && row.result_oid.as_deref() == landed
+    }) else {
+        return CleanupOutcome::Refused {
+            reason: "committed outcome does not match a current landed queue row".into(),
+        };
+    };
+    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    remove_landed_with_config(
+        &cfg,
+        db,
+        repo_root,
+        worktree,
+        branch,
+        target,
+        landed,
+        &selected,
+        delete_branch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_landed_with_config(
+    cfg: &thegn_core::config::Config,
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    target: &str,
+    landed: Option<&str>,
+    expected_queue: &thegn_core::db::MergeQueueRow,
+    delete_branch: bool,
+) -> CleanupOutcome {
+    if expected_queue.status != "landed"
+        || expected_queue.worktree != worktree
+        || expected_queue.branch != branch
+        || expected_queue.target_branch != target
+        || landed.is_none_or(str::is_empty)
+        || expected_queue.result_oid.as_deref() != landed
+    {
+        return CleanupOutcome::Refused {
+            reason: "selected landed queue identity is invalid".into(),
+        };
+    }
     // Merge reclaim shares the same process as interactive deletion in the TUI.
     // Serialize it with sidebar/workspace destroy workers so hooks, provider
     // teardown, and git removal cannot run twice for one physical path.
     let Some(_destroy_claim) =
         crate::worktree_lifecycle::try_scoped_destroy_path(Path::new(worktree))
     else {
-        thegn_core::msg::warn(&format!(
-            "{branch} landed, but cleanup for {worktree} is already in progress"
-        ));
-        let _ = db.remove_merge_entry(worktree); // best-effort: landing still completes the queue transition
-        return;
+        return CleanupOutcome::Refused {
+            reason: "cleanup is already in progress".into(),
+        };
     };
     // `worktree::remove` escalates to `git worktree remove --force`, which
     // discards uncommitted work. That is fine for an explicit `wt rm`, but this
@@ -219,20 +350,87 @@ pub(crate) fn remove_landed(
     // worktree the user still has work in must be left alone. It keeps its
     // lifecycle folder and its branch; the next land (or a manual `wt rm`)
     // cleans it up once the work is committed or dropped.
-    if worktree_is_dirty(worktree) {
-        thegn_core::msg::warn(&format!(
-            "{branch} landed, but {worktree} has uncommitted changes — leaving the worktree and its branch in place"
-        ));
-        let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
-        return;
+    let verified = match cleanup::Verified::probe(repo_root, worktree, branch, target, landed) {
+        Ok(verified) => verified,
+        Err(cleanup::Refusal::Dirty) => return CleanupOutcome::KeptDirty,
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                reason: error.to_string(),
+            };
+        }
+    };
+    let queue_before = match db.list_merge_queue() {
+        Ok(rows) => rows.into_iter().find(|r| r.worktree == worktree),
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                reason: format!("queue identity unavailable: {error}"),
+            };
+        }
+    };
+    if queue_before.as_ref() != Some(expected_queue) {
+        return CleanupOutcome::Refused {
+            reason: "selected landed queue entry changed or was revoked".into(),
+        };
     }
+    let cache_before = match db.worktree_record(worktree) {
+        Ok(row) => row,
+        Err(error) => {
+            return CleanupOutcome::Refused {
+                reason: format!("worktree cache identity unavailable: {error}"),
+            };
+        }
+    };
+    if queue_before.as_ref().is_some_and(|r| {
+        r.branch != branch
+            || r.target_branch != target
+            || (!r.location.is_empty() && r.location != "local")
+    }) || cache_before
+        .as_ref()
+        .is_some_and(|r| r.branch != branch || (!r.location.is_empty() && r.location != "local"))
+    {
+        return CleanupOutcome::Refused {
+            reason: "cache identity is remote or disagrees with Git".into(),
+        };
+    }
+    if let Some(row) = &cache_before
+        && let Err(error) = verified.verify_cached_repository(Path::new(&row.repo_root))
+    {
+        return CleanupOutcome::Refused {
+            reason: error.to_string(),
+        };
+    }
+    let resources = match cleanup::LocalResources::settle(cfg, db, repo_root, worktree) {
+        Ok(resources) => resources,
+        Err(reason) => return CleanupOutcome::Refused { reason },
+    };
+    let unchanged_queue = || -> Result<(), String> {
+        resources.revalidate(db, repo_root, worktree)?;
+        let current = db
+            .list_merge_queue()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|r| r.worktree == worktree);
+        if current != queue_before {
+            return Err("merge queue entry changed during cleanup".into());
+        }
+        let cache_now = db.worktree_record(worktree).map_err(|e| e.to_string())?;
+        if cache_now
+            .as_ref()
+            .map(|r| (&r.repo_root, &r.branch, &r.location, &r.env_name))
+            != cache_before
+                .as_ref()
+                .map(|r| (&r.repo_root, &r.branch, &r.location, &r.env_name))
+        {
+            return Err("worktree cache identity changed during cleanup".into());
+        }
+        Ok(())
+    };
     // Automatic reclaim is unattended: the shared transaction runs the hook,
     // runtime teardown, removal, and post-hook in order, but a repository-
     // authored failure can never wedge the queue.
-    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-    let workspace = thegn_core::repo::repo_slug(repo_root);
-    let (removed, message) = crate::worktree_lifecycle::destroy_one(
-        &cfg,
+    let workspace = thegn_core::util::slugify(&thegn_core::repo::repo_name_from_path(repo_root));
+    let (removed, message) = crate::worktree_lifecycle::destroy_one_checked(
+        cfg,
         repo_root,
         Path::new(worktree),
         branch,
@@ -241,23 +439,74 @@ pub(crate) fn remove_landed(
         delete_branch,
         thegn_core::hooks::HookExecutionMode::Unattended,
         Some(db),
+        &|| {
+            unchanged_queue()?;
+            verified.revalidate().map_err(|e| e.to_string())
+        },
+        Some(&|| {
+            unchanged_queue()?;
+            verified
+                .remove_checked(&unchanged_queue)
+                .map_err(|e| e.to_string())
+        }),
+        Some(&|| resources.revalidate(db, repo_root, worktree)),
     );
     if !removed {
-        // Landing completes the queue transition even when physical cleanup
-        // fails; retain the worktree row so the sidebar can report/retry it.
-        let _ = db.remove_merge_entry(worktree); // best-effort: cache write
-        thegn_core::msg::warn(&format!("merge cleanup: {message}"));
-        return;
+        return CleanupOutcome::Refused { reason: message };
     }
-    // The branch landed, so it's no longer a queue entry regardless.
-    let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
-    // Only drop the worktree's cache row (its folder assignment) when the dir
-    // actually went away. If removal failed (a read-only sandbox mount, or
-    // uncommitted changes), keep the row so the sidebar still files it under its
-    // folder instead of orphaning it ungrouped under the repo root ("home").
-    // git is the source of truth; the row self-corrects once the dir is gone.
-    if removed {
-        let _ = db.del_worktree(worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    if let Err(error) = verified.verify_removed() {
+        return CleanupOutcome::Refused {
+            reason: error.to_string(),
+        };
+    }
+    let mut bookkeeping_errors = Vec::new();
+    // THE-596: no-deref/OID checks alone cannot atomically prove direct ref
+    // type. Automatic cleanup never mutates a source/victim/target ref.
+    let branch_deleted = false;
+    if delete_branch {
+        bookkeeping_errors.push(format!(
+            "{branch}: worktree removed; branch retained pending explicit cleanup (THE-596)"
+        ));
+    }
+    // No retry record is discarded for a refused physical cleanup. After real
+    // removal, report partial bookkeeping failure rather than claiming tidy DB.
+    let queue_removed = match db.transaction(|db| {
+        unchanged_queue().map_err(anyhow::Error::msg)?;
+        let cache_now = db.worktree_record(worktree)?;
+        if cache_now
+            .as_ref()
+            .map(|r| (&r.repo_root, &r.branch, &r.location))
+            != cache_before
+                .as_ref()
+                .map(|r| (&r.repo_root, &r.branch, &r.location))
+        {
+            anyhow::bail!("worktree cache identity changed during cleanup");
+        }
+        if delete_branch && !db.hold_merge_cleanup(expected_queue)? {
+            anyhow::bail!("cleanup hold observation changed; retained for manual reconciliation");
+        }
+        db.del_worktree(worktree)?;
+        if !delete_branch {
+            db.remove_merge_entry(worktree)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }) {
+        Ok(removed) => removed,
+        Err(error) => {
+            bookkeeping_errors.push(format!(
+                "{branch}: cleanup bookkeeping retained for retry: {error}"
+            ));
+            false
+        }
+    };
+    if message != "removed" {
+        bookkeeping_errors.push(message);
+    }
+    CleanupOutcome::Removed {
+        branch_deleted,
+        queue_removed,
+        bookkeeping_errors,
     }
 }
 
@@ -381,7 +630,7 @@ mod tests {
     // test code: fixture plumbing, never on the event loop.
     #[expect(clippy::disallowed_methods)]
     fn git(dir: &Path, args: &[&str]) {
-        let ok = util::git_cmd(dir)
+        let ok = cleanup::test_git(dir)
             .args(args)
             .output()
             .map(|o| o.status.success())
@@ -438,6 +687,20 @@ mod tests {
             failed_folder: "Needs attention".into(),
             ..MergeQueueConfig::default()
         }
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    fn record_private_land(db: &Db, root: &Path, worktree: &str, branch: &str) -> String {
+        let output = cleanup::test_git(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let commit = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        db.enqueue_merge(worktree, branch, "main").unwrap();
+        db.update_merge_status(worktree, "landed", Some(&commit), None, None)
+            .unwrap();
+        commit
     }
 
     /// The folder name a worktree is currently filed under, if any.
@@ -507,6 +770,7 @@ mod tests {
 
     #[test]
     fn enqueue_files_into_merging_folder() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "enq");
         let (root_s, feat_s) = (
@@ -528,6 +792,7 @@ mod tests {
 
     #[test]
     fn enqueue_registers_unpersisted_worktree_and_files_it() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "unpersist");
         let (root_s, feat_s) = (
@@ -565,6 +830,7 @@ mod tests {
 
     #[test]
     fn landed_move_refiles_and_keeps_row() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "move");
         let (root_s, feat_s) = (
@@ -593,53 +859,41 @@ mod tests {
     }
 
     #[test]
-    fn landed_remove_deletes_worktree_branch_and_row() {
+    fn landed_remove_keeps_branch_and_explicit_queue_hold() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "rm");
         let feat_s = feat.to_string_lossy().to_string();
-        db.enqueue_merge(&feat_s, "feat", "main").unwrap();
-        apply(
-            &cfg(OnLanded::Remove),
-            &db,
-            &root,
-            &feat_s,
-            "feat",
-            LifecycleEvent::Landed,
-        );
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
         assert!(!feat.is_dir(), "worktree dir removed");
         assert!(
-            !util::git_ok(
+            util::git_ok(
                 &root,
                 &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
             ),
-            "branch deleted"
+            "branch retained pending atomic type proof"
         );
-        assert!(
-            db.list_merge_queue()
-                .unwrap()
-                .iter()
-                .all(|r| r.worktree != feat_s)
-        );
+        assert!(db.list_merge_queue().unwrap().iter().any(|r| {
+            r.worktree == feat_s
+                && thegn_core::merge_sweep::CleanupHold::from_detail(r.error_detail.as_deref())
+                    .is_some()
+        }));
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
     fn landed_remove_does_not_overlap_an_existing_destroy() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "rm-claimed");
         let feat_s = feat.to_string_lossy().to_string();
         db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
         let claim = crate::worktree_lifecycle::try_scoped_destroy_path(&feat)
             .expect("test should own the first destroy claim");
 
-        apply(
-            &cfg(OnLanded::Remove),
-            &db,
-            &root,
-            &feat_s,
-            "feat",
-            LifecycleEvent::Landed,
-        );
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, &feat_s, "feat", &commit);
 
         assert!(feat.is_dir(), "overlapping cleanup must not remove files");
         assert!(
@@ -653,8 +907,8 @@ mod tests {
             db.list_merge_queue()
                 .unwrap()
                 .iter()
-                .all(|row| row.worktree != feat_s),
-            "landing still completes the queue transition"
+                .any(|row| row.worktree == feat_s),
+            "refused cleanup retains its retry record"
         );
 
         drop(claim);
@@ -662,10 +916,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
+    #[test]
+    fn generic_landed_or_mismatched_commit_cannot_remove_a_worktree() {
+        let _isolation = TestIsolation::new();
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "unproven");
+        let path = feat.to_str().unwrap();
+        let commit = record_private_land(&db, &root, path, "feat");
+        let before = db.list_merge_queue().unwrap();
+        apply(
+            &cfg(OnLanded::Remove),
+            &db,
+            &root,
+            path,
+            "feat",
+            LifecycleEvent::Landed,
+        );
+        assert!(feat.exists());
+        apply_landed(
+            &cfg(OnLanded::Remove),
+            &db,
+            &root,
+            path,
+            "feat",
+            "wrong-commit",
+        );
+        assert!(feat.exists());
+        assert_eq!(db.list_merge_queue().unwrap(), before);
+        db.remove_merge_entry(path).unwrap();
+        apply_landed(&cfg(OnLanded::Remove), &db, &root, path, "feat", &commit);
+        assert!(feat.exists());
+        std::fs::remove_dir_all(&feat).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Regression: unattended cleanup must not recursively delete a directory
     // once Git can no longer prove that it is the registered worktree.
     #[test]
     fn landed_remove_keeps_git_unregistered_directory() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, _feat) = repo_with_feat(&db, "rmfail");
         let root_s = root.to_string_lossy().to_string();
@@ -679,13 +968,14 @@ mod tests {
         db.put_worktree("bogus", &root_s, &bogus_s, "bogus", None, Some(fid))
             .unwrap();
         db.enqueue_merge(&bogus_s, "bogus", "main").unwrap();
-        apply(
+        let commit = record_private_land(&db, &root, &bogus_s, "bogus");
+        apply_landed(
             &cfg(OnLanded::Remove),
             &db,
             &root,
             &bogus_s,
             "bogus",
-            LifecycleEvent::Landed,
+            &commit,
         );
         assert!(bogus.exists(), "the unverified directory is retained");
         assert!(
@@ -699,8 +989,8 @@ mod tests {
             db.list_merge_queue()
                 .unwrap()
                 .iter()
-                .all(|r| r.worktree != bogus_s),
-            "queue entry still cleared"
+                .any(|r| r.worktree == bogus_s),
+            "unverified cleanup retains its retry record"
         );
         let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _ = std::fs::remove_dir_all(&bogus); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
@@ -708,17 +998,12 @@ mod tests {
 
     #[test]
     fn landed_detach_removes_worktree_but_keeps_branch() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "detach");
         let feat_s = feat.to_string_lossy().to_string();
-        apply(
-            &cfg(OnLanded::Detach),
-            &db,
-            &root,
-            &feat_s,
-            "feat",
-            LifecycleEvent::Landed,
-        );
+        let commit = record_private_land(&db, &root, &feat_s, "feat");
+        apply_landed(&cfg(OnLanded::Detach), &db, &root, &feat_s, "feat", &commit);
         assert!(!feat.is_dir(), "worktree dir removed");
         assert!(
             util::git_ok(
@@ -736,6 +1021,7 @@ mod tests {
     // land is typically scripted from inside the worktree it lands.
     #[test]
     fn land_in_place_files_into_merged_and_keeps_worktree() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "lip");
         let (root_s, feat_s) = (
@@ -766,6 +1052,7 @@ mod tests {
 
     #[test]
     fn checked_land_lifecycle_surfaces_an_unavailable_write() {
+        let _isolation = TestIsolation::new();
         let state = tempfile::tempdir().unwrap();
         let path = state.path().join("thegn.db");
         let db = Db::open_at(&path).unwrap();
@@ -793,6 +1080,7 @@ mod tests {
     // is left strictly alone (the same host-side guard the dequeue path uses).
     #[test]
     fn land_in_place_off_unfiles_lifecycle_but_not_user_folder() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "lipoff");
         let (root_s, feat_s) = (
@@ -839,6 +1127,7 @@ mod tests {
 
     #[test]
     fn failure_files_into_needs_attention() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "fail");
         let (root_s, feat_s) = (
@@ -866,6 +1155,7 @@ mod tests {
     // into — the fix for worktrees stranded in "Merging" after a fold-actor land.
     #[test]
     fn dequeue_unfiles_from_lifecycle_folder() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "deq");
         let (root_s, feat_s) = (
@@ -901,6 +1191,7 @@ mod tests {
     // user hand-filed the worktree into is left strictly alone.
     #[test]
     fn dequeue_leaves_user_filed_folder_alone() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "dequser");
         let (root_s, feat_s) = (
@@ -928,6 +1219,7 @@ mod tests {
 
     #[test]
     fn home_worktree_is_never_touched() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "home");
         let root_s = root.to_string_lossy().to_string();
@@ -947,6 +1239,7 @@ mod tests {
 
     #[test]
     fn toggle_off_is_inert() {
+        let _isolation = TestIsolation::new();
         let db = Db::open_memory().unwrap();
         let (root, feat) = repo_with_feat(&db, "off");
         let (root_s, feat_s) = (

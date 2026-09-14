@@ -6,6 +6,92 @@ use crate::db::{ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use anyhow::Result;
 
+/// Exact replacement of a queue transition's nullable metadata. `None` clears
+/// the column; these values confer no ownership or concurrency authority.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MergeStatusFields {
+    pub result_oid: Option<String>,
+    pub conflict_paths: Option<String>,
+    pub error_detail: Option<String>,
+}
+
+/// Settled fold outcomes only. This vocabulary is not evidence that Git advanced;
+/// the caller must establish advancement before selecting `Landed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeFinalStatus {
+    Landed,
+    Deferred,
+    GateFailed,
+    GateError,
+}
+
+impl MergeFinalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::Deferred => "deferred",
+            Self::GateFailed => "gate_failed",
+            Self::GateError => "gate_error",
+        }
+    }
+}
+
+/// Complete replacement of the outcome columns. `None` means SQL NULL, unlike
+/// `update_merge_status`. Finalization preserves an existing row's nomination
+/// time and attempt budget; it is not an enqueue/retry gesture.
+pub struct MergeFinalOutcome<'a> {
+    pub worktree: &'a str,
+    pub branch: &'a str,
+    pub repo_root: &'a str,
+    /// The target actually requested for this fold, including explicit overrides.
+    pub target_branch: &'a str,
+    /// Expected execution location. Empty and `local` denote local placement;
+    /// remote descriptors must match exactly, never by filesystem path alone.
+    pub location: &'a str,
+    pub status: MergeFinalStatus,
+    pub result_oid: Option<&'a str>,
+    pub conflict_paths: Option<&'a str>,
+    pub error_detail: Option<&'a str>,
+}
+
+/// Registry facts relevant to outcome routing. NULL is retained, not fabricated
+/// into a repository/branch identity. These strings are cache metadata, not Git
+/// or filesystem identity proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeRegistryIdentity {
+    pub branch: Option<String>,
+    pub repo_path: Option<String>,
+    pub location: Option<String>,
+}
+
+/// One consistent pre-fold snapshot. Fields cannot be constructed by consumers;
+/// obtain it through `observe_merge_outcome`, before external work starts.
+/// Equality detects current-state changes, NOT same-value ABA or durable leases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcomeObservation {
+    pub(crate) worktree: String,
+    pub(crate) registry: Option<MergeRegistryIdentity>,
+    pub(crate) queue: Option<MergeQueueRow>,
+    // MergeQueueRow presents SQL NULL as empty. Retain the raw value too so a
+    // writer changing that representation is still visible to the comparison.
+    pub(crate) queue_location: Option<String>,
+}
+
+impl MergeOutcomeObservation {
+    /// Borrow the exact captured routing facts without fabricating a fresh guard.
+    /// This is metadata, not a lease or authority to access a remote filesystem.
+    pub fn registry_identity(&self) -> Option<&MergeRegistryIdentity> {
+        self.registry.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcomeWrite {
+    Written,
+    RegistryChanged,
+    QueueChanged,
+}
+
 /// Object-safe (`&self` + concrete args), so `&dyn WorktreeAuxStore` works for
 /// backend-agnostic consumers. [`crate::db::Db`] is the embedded-SQLite impl.
 pub trait WorktreeAuxStore {
@@ -52,6 +138,20 @@ pub trait WorktreeAuxStore {
     /// a branch that was deferred and then rebased starts fresh.
     fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()>;
 
+    /// Read registry and queue state consistently BEFORE starting a fold. No
+    /// reservation is created and no lock may be retained across external work.
+    fn observe_merge_outcome(&self, worktree: &str) -> Result<MergeOutcomeObservation>;
+
+    /// Commit a final status directly, only while the pre-fold observation still
+    /// matches. Refusal/error changes nothing. A caller may apply lifecycle only
+    /// after `Written`; that subsequent filesystem work is not part of this
+    /// transaction. Implementations must never publish an intermediate `queued`.
+    fn persist_merge_outcome(
+        &self,
+        observed: &MergeOutcomeObservation,
+        outcome: &MergeFinalOutcome<'_>,
+    ) -> Result<MergeOutcomeWrite>;
+
     /// Update a queued worktree's status and (optionally) its result oid,
     /// conflicted paths (newline-joined), and error detail. Passing `None` leaves
     /// the corresponding column unchanged.
@@ -62,6 +162,16 @@ pub trait WorktreeAuxStore {
         result_oid: Option<&str>,
         conflict_paths: Option<&str>,
         error_detail: Option<&str>,
+    ) -> Result<()>;
+
+    /// Replace all transition metadata on exactly one existing row. Missing
+    /// rows are errors. Preserve routing, nomination time and attempt budget.
+    /// This is not a claim/CAS: concurrent reassignment needs a separate guard.
+    fn replace_merge_status(
+        &self,
+        worktree: &str,
+        status: &str,
+        fields: &MergeStatusFields,
     ) -> Result<()>;
 
     /// Re-stamp a queued row's target branch to the one a run is actually
@@ -88,6 +198,11 @@ pub trait WorktreeAuxStore {
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     fn remove_merge_entry(&self, worktree: &str) -> Result<()>;
+
+    /// Install only the fixed branch-retained cleanup marker if every decoded
+    /// field still matches this landed observation. Preserve timestamps and
+    /// raw nullable location/attempt aliases; false means revoked/already held.
+    fn hold_merge_cleanup(&self, expected: &MergeQueueRow) -> Result<bool>;
 
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>>;

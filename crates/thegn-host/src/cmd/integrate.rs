@@ -64,7 +64,7 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     let target = integrate::resolve_target(mq, &repo_root);
 
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
-    let mut cands = integrate::candidate_branches(mq, &repo_root, &target, override_gpg)?;
+    let mut cands = integrate::candidate_branches(mq, &repo_root, &target)?;
     for s in &cands.skipped_dirty {
         outln!("  • skipped {s} (dirty — set [merge_queue] snapshot_dirty = true to fold it)");
     }
@@ -115,23 +115,32 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         }
     );
     for b in &cands.branches {
-        outln!("    {}", b.name);
+        outln!(
+            "    {}{}",
+            b.name,
+            if cands.pending_snapshots.contains(&b.name) {
+                " (dirty; snapshot only after confirmation)"
+            } else {
+                ""
+            }
+        );
     }
     if args.dry_run {
-        outln!("Dry run — nothing folded, nothing queued, no worktree touched.");
+        outln!(
+            "Dry run — no candidate snapshots, folds or queue changes. State initialization may occur."
+        );
         return Ok(());
     }
-    // Landing is effectively irreversible from the user's seat: `on_landed`
-    // defaults to removing the worktree and deleting the branch, which takes
-    // gitignored local state with it. So an interactive run confirms, and a
-    // non-interactive one must say `--yes` rather than have the prompt silently
-    // auto-answer itself.
+    // Advancing the target and committing selected dirty snapshots are writes
+    // that require confirmation. Cleanup is a separate explicit action; this
+    // command does not expire historical worktrees or delete their branches.
+    // Non-interactive callers must say `--yes` rather than silently confirming.
     if !args.yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
-            outln!("Refusing to fold non-interactively without `--yes`.");
-            outln!("  Re-run with `--dry-run` to preview, or `--yes` to proceed.");
-            return Ok(());
+            anyhow::bail!(
+                "Refusing to fold non-interactively without `--yes`; use `--dry-run` to preview or `--yes` to proceed."
+            );
         }
         if !super::confirm(&format!(
             "Fold {} branch(es) into {target}?",
@@ -142,19 +151,18 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         }
     }
 
-    let report = integrate::run_fold(mq, &repo_root, cands.branches.clone())?;
-    if let Ok(db) = Db::open() {
-        let _ = integrate::persist(mq, &repo_root, &db, &cands, &report); // best-effort: cache write: the fold already happened; persist only feeds the UI queue/report
-    }
-    // A land is the one moment new entries enter the grace period, so it is also
-    // the natural moment to collect the ones whose period already ended.
-    let swept = crate::merge_sweep::sweep(cfg, &repo_root, false);
-    for b in &swept.collected {
-        outln!("  ⌫ swept {b} (merged, past its grace period)");
-    }
+    let report = integrate::run_selected_fold(mq, &repo_root, &cands, override_gpg)?;
+    // Explicit integration authorizes the listed candidates, not expiry of
+    // unrelated historical worktrees. Cleanup remains an explicit sweep action.
 
     for l in &report.landed {
         outln!("  ✓ landed {} → {}", l.branch, short(&l.commit));
+    }
+    for prepared in &report.prepared {
+        outln!("  • held {} (prepared only; not landed)", prepared.branch);
+    }
+    for branch in &report.unprepared {
+        outln!("  • held {branch} (fold preparation unavailable; not landed)");
     }
     for d in &report.deferred {
         if d.gate_failed {
@@ -173,17 +181,23 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     match &report.gate {
         GateOutcome::Passed => outln!("Gate passed."),
         GateOutcome::Failed { offender } => match offender {
-            Some(b) => outln!("Gate failed — isolated {b}; main not advanced."),
-            None => outln!("Gate failed — main not advanced."),
+            Some(b) => outln!("Gate failed — isolated {b}; {target} not advanced by this fold."),
+            None => outln!("Gate failed — {target} not advanced by this fold."),
         },
         GateOutcome::Errored { reason } => {
             // Not a verdict about any branch — say so, and say what to fix.
-            outln!("Gate could NOT RUN — {reason}; {target} not advanced.");
+            outln!("Gate could NOT RUN — {reason}; {target} not advanced by this fold.");
             outln!("  No branch was blamed. Check `[merge_queue] gate_command`");
             outln!("  and `gate_setup_command` — the gate worktree is a bare");
             outln!("  checkout with no dependencies installed.");
         }
         GateOutcome::Skipped => {}
+    }
+    if !report.diagnostics.is_empty() {
+        outln!("{}", report.diagnostics);
+    }
+    if let Some(error) = &report.bookkeeping_error {
+        outln!("Queue bookkeeping failed (Git outcome unchanged): {error}");
     }
     if report.advanced {
         let retried = if report.cas_attempts > 1 {
@@ -201,7 +215,10 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
         );
         crate::integrate::report_resyncs(&target, &report.resyncs);
     } else {
-        outln!("{target} unchanged ({}).", short(&report.original));
+        outln!(
+            "{target} not advanced by this fold (starting tip {}).",
+            short(&report.original)
+        );
     }
     // push mode: converge by pushing the advanced target to origin.
     if push_mode && report.advanced {
@@ -213,5 +230,5 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
             }
         }
     }
-    Ok(())
+    report.request_result()
 }

@@ -11,6 +11,23 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 impl NotificationStore for Db {
+    fn has_cleanup_dispatch(&self, worktree_path: &str) -> Result<bool> {
+        let mut statement = self.conn().prepare(
+            "SELECT status, pending_worktree_path FROM agent_dispatches WHERE worktree_path=?1 OR pending_worktree_path=?1",
+        )?;
+        let mut rows = statement.query([worktree_path])?;
+        while let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            let pending: Option<String> = row.get(1)?;
+            if pending.as_deref() == Some(worktree_path)
+                || !crate::issue::AgentDispatchStatus::parse(&status).is_terminal()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Append a notification.  Returns the new row id.
     fn put_notification(
         &self,

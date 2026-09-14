@@ -8,9 +8,11 @@
 //! ([`thegn_svc::git::PlumbingOps`]), the throwaway-worktree gate, and the CAS
 //! retry loop.
 //!
-//! [`run_fold`] is synchronous and side-effecting on the repo; the CLI calls it
-//! directly and the host daemon calls it from `spawn_blocking`.
+//! [`run_selected_fold`] is the synchronous, side-effecting batch entrypoint.
+//! It retains pre-fold observations through snapshots, folding and publication;
+//! callers must run it off the interactive event loop.
 
+use crate::canonical_history::CanonicalHistory;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,12 +22,21 @@ use thegn_core::db::Db;
 use thegn_core::fold::{
     self, Author, Branch, CommitMeta, ConflictKind, FoldGit, FoldPlan, LandOpts, MergeOutcome,
 };
-use thegn_core::gate;
 use thegn_core::outln;
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
 use thegn_core::util;
 use thegn_svc::git::{CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
+
+#[path = "integrate_candidates.rs"]
+mod candidates;
+#[path = "integrate_gate.rs"]
+mod gate_runner;
+#[path = "integrate_persistence.rs"]
+mod persistence;
+pub(crate) use persistence::run_selected_fold;
+#[cfg(test)]
+use persistence::{observe_outcomes, persist};
 
 /// A unique throwaway path under the temp dir. `util::now()` is seconds-resolution,
 /// so a process-wide sequence keeps two near-simultaneous throwaway worktrees (two
@@ -59,6 +70,7 @@ impl std::error::Error for SigningFailed {}
 
 /// Drives the pure fold engine over real git plumbing at one repo root.
 struct PlumbingAdapter {
+    history: CanonicalHistory,
     loc: GitLoc,
     repo_root: PathBuf,
     regenerate_paths: Vec<String>,
@@ -84,36 +96,41 @@ impl PlumbingAdapter {
 
 impl FoldGit for PlumbingAdapter {
     fn merge_tree(&self, ours: &str, theirs: &str) -> Result<MergeOutcome> {
-        match CliGit.merge_tree(&self.loc, ours, theirs)? {
-            MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
-            MergeTreeOutcome::Conflict { paths, .. } => {
-                let base = CliGit.merge_base(&self.loc, ours, theirs)?;
-                Ok(self.resolve_conflict(base.as_deref(), ours, theirs, paths))
-            }
-        }
+        self.history
+            .checked(|| match CliGit.merge_tree(&self.loc, ours, theirs)? {
+                MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
+                MergeTreeOutcome::Conflict { paths, .. } => {
+                    let base = CliGit.merge_base(&self.loc, ours, theirs)?;
+                    Ok(self.resolve_conflict(base.as_deref(), ours, theirs, paths))
+                }
+            })
     }
     fn commit_tree(&self, tree: &str, parents: &[&str], msg: &str) -> Result<String> {
-        CliGit
-            .commit_tree_opts(&self.loc, tree, parents, msg, self.sign, None)
-            .map_err(|e| self.commit_err(e))
+        self.history.checked(|| {
+            CliGit
+                .commit_tree_opts(&self.loc, tree, parents, msg, self.sign, None)
+                .map_err(|e| self.commit_err(e))
+        })
     }
     fn merge_tree_base(&self, base: &str, ours: &str, theirs: &str) -> Result<MergeOutcome> {
-        match CliGit.merge_tree_base(&self.loc, base, ours, theirs)? {
-            MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
-            // A per-commit replay conflict is never a lockfile-regeneration
-            // case (that only makes sense for a whole-branch merge), so defer.
-            MergeTreeOutcome::Conflict { paths, .. } => {
-                match self.submodule_conflicts(Some(base), ours, theirs, &paths) {
-                    Ok(conflicts) if !conflicts.is_empty() => {
-                        Ok(MergeOutcome::SubmoduleConflict { paths, conflicts })
+        self.history.checked(
+            || match CliGit.merge_tree_base(&self.loc, base, ours, theirs)? {
+                MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
+                // A per-commit replay conflict is never a lockfile-regeneration
+                // case (that only makes sense for a whole-branch merge), so defer.
+                MergeTreeOutcome::Conflict { paths, .. } => {
+                    match self.submodule_conflicts(Some(base), ours, theirs, &paths) {
+                        Ok(conflicts) if !conflicts.is_empty() => {
+                            Ok(MergeOutcome::SubmoduleConflict { paths, conflicts })
+                        }
+                        // Conflict metadata is safety-critical. If the object DB
+                        // cannot be read, retain the generic conflict so no later
+                        // auto-resolution path can pick a pointer implicitly.
+                        Ok(_) | Err(_) => Ok(MergeOutcome::Conflict { paths }),
                     }
-                    // Conflict metadata is safety-critical. If the object DB
-                    // cannot be read, retain the generic conflict so no later
-                    // auto-resolution path can pick a pointer implicitly.
-                    Ok(_) | Err(_) => Ok(MergeOutcome::Conflict { paths }),
                 }
-            }
-        }
+            },
+        )
     }
     fn commit_tree_author(
         &self,
@@ -122,15 +139,18 @@ impl FoldGit for PlumbingAdapter {
         msg: &str,
         author: &Author,
     ) -> Result<String> {
-        CliGit
-            .commit_tree_opts(&self.loc, tree, parents, msg, self.sign, Some(author))
-            .map_err(|e| self.commit_err(e))
+        self.history.checked(|| {
+            CliGit
+                .commit_tree_opts(&self.loc, tree, parents, msg, self.sign, Some(author))
+                .map_err(|e| self.commit_err(e))
+        })
     }
     fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
-        CliGit.merge_base(&self.loc, a, b)
+        self.history.checked(|| CliGit.merge_base(&self.loc, a, b))
     }
     fn commits(&self, base_excl: &str, tip: &str) -> Result<Vec<CommitMeta>> {
-        CliGit.commits(&self.loc, base_excl, tip)
+        self.history
+            .checked(|| CliGit.commits(&self.loc, base_excl, tip))
     }
 }
 
@@ -385,7 +405,7 @@ pub struct DeferredReport {
     pub gate_failed: bool,
 }
 
-/// The outcome of one `run_fold` call.
+/// The outcome of one batch fold.
 #[derive(Debug, Clone)]
 pub struct FoldReport {
     pub target_branch: String,
@@ -393,8 +413,16 @@ pub struct FoldReport {
     pub final_tip: String,
     pub advanced: bool,
     pub landed: Vec<LandedReport>,
+    /// Object-DB folds not committed to the target. Never authorizes cleanup.
+    pub prepared: Vec<LandedReport>,
+    /// Candidates held before a complete fold plan could be produced.
+    pub unprepared: Vec<String>,
     pub deferred: Vec<DeferredReport>,
     pub gate: GateOutcome,
+    /// Bounded union/base/prefix diagnostics, including failures before CAS.
+    pub diagnostics: String,
+    /// Git may have advanced even when final cache persistence was refused.
+    pub bookkeeping_error: Option<String>,
     /// How many CAS attempts it took (main moving under the fold forces a re-fold).
     pub cas_attempts: u32,
     /// What happened to each live checkout of the target branch when the ref
@@ -402,6 +430,63 @@ pub struct FoldReport {
     /// the ones we could not fast-forward, so a stale working tree is never a
     /// silent surprise. Empty when nothing advanced.
     pub resyncs: Vec<util::CheckoutResync>,
+}
+
+impl FoldReport {
+    /// A no-op is successful; any requested branch still held is not.
+    pub(crate) fn request_result(&self) -> Result<()> {
+        match &self.gate {
+            GateOutcome::Errored { reason } => anyhow::bail!("integration held: {reason}"),
+            GateOutcome::Failed { .. } => anyhow::bail!("integration held: gate failed"),
+            _ if !self.prepared.is_empty()
+                || !self.unprepared.is_empty()
+                || !self.deferred.is_empty()
+                || (!self.advanced && !self.landed.is_empty()) =>
+            {
+                anyhow::bail!("integration incomplete: requested branches remain held")
+            }
+            _ if self.bookkeeping_error.is_some() => anyhow::bail!(
+                "queue bookkeeping unavailable: {}",
+                self.bookkeeping_error.as_deref().unwrap_or_default()
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Preserve readable text without executable terminal controls or bidi formatting.
+fn diagnostic_char(c: char) -> bool {
+    (!c.is_control() || matches!(c, '\n' | '\t'))
+        && !matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Preserve early union/base evidence even if a long bisect exhausts the budget.
+fn record_gate(diagnostics: &mut String, phase: &str, verdict: &GateVerdict) {
+    const MAX_DIAGNOSTICS: usize = 32 * 1024;
+    const TRUNCATED: &str = "\n[additional gate diagnostics omitted]\n";
+    if diagnostics.ends_with(TRUNCATED) {
+        return;
+    }
+    let (headline, log) = match verdict {
+        GateVerdict::Passed => ("passed", ""),
+        GateVerdict::Failed { log } => ("failed", log.as_str()),
+        GateVerdict::Error { reason, log } => (reason.as_str(), log.as_str()),
+    };
+    let entry = format!("[{phase}] {headline}\n{}\n", tail(log, 4000));
+    let mut clean = String::new();
+    for c in entry.chars().take(5000) {
+        if diagnostic_char(c) {
+            clean.push(c);
+        }
+    }
+    if diagnostics.len() + clean.len() + TRUNCATED.len() > MAX_DIAGNOSTICS {
+        diagnostics.push_str(TRUNCATED);
+    } else {
+        diagnostics.push_str(&clean);
+    }
 }
 
 /// Render raw conflict paths while replacing typed gitlink paths with their
@@ -446,6 +531,10 @@ pub struct Candidates {
     pub skipped_dirty: Vec<String>,
     /// branch name → its worktree path (the DB is keyed by worktree).
     pub worktrees: HashMap<String, String>,
+    /// Local Git identities captured during read-only discovery, never DB-routed.
+    pub(crate) identities: HashMap<String, candidates::LocalIdentity>,
+    /// Dirty candidates whose snapshot is pending explicit fold admission.
+    pub(crate) pending_snapshots: HashSet<String>,
 }
 
 /// The main checkout (first `git worktree list` entry) reachable from any path
@@ -468,7 +557,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     let mq = &cfg.repo_merge_queue(&repo_root);
     let target = resolve_target(mq, &repo_root);
     let override_gpg = cfg.repo_git(&repo_root).override_gpg;
-    let mut cands = candidate_branches(mq, &repo_root, &target, override_gpg)?;
+    let mut cands = candidate_branches(mq, &repo_root, &target)?;
     // The in-app `integrate` action reaches this too, so the opt-in guard lives
     // here rather than in the CLI: one keypress must not be able to land a branch
     // nobody nominated. A DB that won't open means we cannot prove anything was
@@ -479,11 +568,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
             .unwrap_or_default();
         hold_unenqueued(&mut cands, &enqueued);
     }
-    let report = run_fold(mq, &repo_root, cands.branches.clone())?;
-    if let Ok(db) = Db::open() {
-        let _ = persist(mq, &repo_root, &db, &cands, &report); // best-effort: cache write: the fold already happened; persist only feeds the UI queue/report
-    }
-    Ok(report)
+    run_selected_fold(mq, &repo_root, &cands, override_gpg)
 }
 
 /// Hold back every candidate that was not explicitly enqueued, returning the
@@ -526,8 +611,8 @@ pub fn enqueued_worktrees(db: &Db, target_branch: &str) -> HashSet<String> {
 }
 
 /// Collect a repo's foldable worktree branches: every linked worktree (not the
-/// main checkout, not the target branch itself). Dirty worktrees are snapshotted
-/// into a commit when `snapshot_dirty`, else skipped.
+/// main checkout, not the target branch itself). This discovery never snapshots.
+/// Dirty worktrees are included for later admission when `snapshot_dirty`, else skipped.
 ///
 /// NOTE: "eligible" here means only *foldable* — clean, and not already the
 /// target. It carries no notion of whether the branch was meant to land. Callers
@@ -537,14 +622,16 @@ pub fn candidate_branches(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     target_branch: &str,
-    override_gpg: bool,
 ) -> Result<Candidates> {
+    let (_, history) = CanonicalHistory::worktree_loc(repo_root)?;
     let porc = util::git_out(repo_root, &["worktree", "list", "--porcelain"])
         .context("git worktree list")?;
     let main = repo_root.to_string_lossy().to_string();
     let mut branches = Vec::new();
     let mut skipped_dirty = Vec::new();
     let mut worktrees = HashMap::new();
+    let mut identities = HashMap::new();
+    let mut pending_snapshots = HashSet::new();
     let mut wt_path = String::new();
     for line in porc.lines().chain(std::iter::once("")) {
         if let Some(p) = line.strip_prefix("worktree ") {
@@ -552,17 +639,26 @@ pub fn candidate_branches(
         } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
             let branch = b.to_string();
             if wt_path != main && branch != target_branch {
-                let loc = GitLoc::for_worktree(Path::new(&wt_path));
-                let tip = if cfg.snapshot_dirty {
-                    let msg = format!("snapshot: {branch} (fold-actor)");
-                    match CliGit.snapshot_worktree(&loc, &msg, override_gpg)? {
-                        Some(new_tip) => new_tip,
-                        None => CliGit.rev_parse(&loc, "HEAD")?,
-                    }
-                } else if CliGit.is_dirty(&loc).unwrap_or(false) {
+                let loc = GitLoc::Local(PathBuf::from(&wt_path));
+                let dirty = CliGit
+                    .is_dirty(&loc)
+                    .context("candidate dirty-state lookup failed")?;
+                if dirty && !cfg.snapshot_dirty {
                     skipped_dirty.push(branch.clone());
                     continue;
+                }
+                if dirty {
+                    pending_snapshots.insert(branch.clone());
+                }
+                let tip = if cfg.snapshot_dirty {
+                    let identity =
+                        candidates::LocalIdentity::read(repo_root, Path::new(&wt_path), &branch)?;
+                    let tip = identity.tip.clone();
+                    identities.insert(branch.clone(), identity);
+                    tip
                 } else {
+                    // Existing snapshot-disabled discovery stays a read-only
+                    // local tip lookup; it never needs snapshot-only authority.
                     CliGit.rev_parse(&loc, "HEAD")?
                 };
                 worktrees.insert(branch.clone(), wt_path.clone());
@@ -570,76 +666,14 @@ pub fn candidate_branches(
             }
         }
     }
+    history.revalidate()?;
     Ok(Candidates {
         branches,
         skipped_dirty,
         worktrees,
+        identities,
+        pending_snapshots,
     })
-}
-
-/// Mirror a fold's outcome into the `merge_queue` cache (the panel feed +
-/// auto-drain record). Best-effort: keyed by worktree path via `cands.worktrees`.
-pub fn persist(
-    cfg: &MergeQueueConfig,
-    repo_root: &Path,
-    db: &Db,
-    cands: &Candidates,
-    report: &FoldReport,
-) -> Result<()> {
-    use thegn_core::merge_lifecycle::LifecycleEvent;
-    // Only branches this fold actually ACTED on get a row. Enqueueing every
-    // candidate made the queue a record of what was considered rather than what
-    // was nominated, which had two costs: a bystander worktree was filed into
-    // `queued_folder` ("Merging") by a command the user thought only read, and
-    // `require_enqueue` could not distinguish a human's `merge add` from the
-    // previous run's own bookkeeping. A row is still needed BEFORE
-    // `update_merge_status`, which updates in place and would no-op otherwise.
-    let acted: Vec<&String> = report
-        .landed
-        .iter()
-        .map(|l| &l.branch)
-        .chain(report.deferred.iter().map(|d| &d.branch))
-        .collect();
-    for branch in acted {
-        if let Some(wt) = cands.worktrees.get(branch) {
-            db.enqueue_merge(wt, branch, &report.target_branch)?;
-            crate::merge_lifecycle::apply(cfg, db, repo_root, wt, branch, LifecycleEvent::Enqueued);
-        }
-    }
-    for l in &report.landed {
-        if let Some(wt) = cands.worktrees.get(&l.branch) {
-            db.update_merge_status(wt, "landed", Some(&l.commit), None, None)?;
-            crate::merge_lifecycle::apply(
-                cfg,
-                db,
-                repo_root,
-                wt,
-                &l.branch,
-                LifecycleEvent::Landed,
-            );
-        }
-    }
-    for d in &report.deferred {
-        if let Some(wt) = cands.worktrees.get(&d.branch) {
-            let status = if d.gate_failed {
-                "gate_failed"
-            } else {
-                "deferred"
-            };
-            let paths = (!d.paths.is_empty())
-                .then(|| conflict_details(&d.paths, &d.submodule_conflicts).join("\n"));
-            db.update_merge_status(wt, status, None, paths.as_deref(), None)?;
-            crate::merge_lifecycle::apply(
-                cfg,
-                db,
-                repo_root,
-                wt,
-                &d.branch,
-                LifecycleEvent::Failed,
-            );
-        }
-    }
-    Ok(())
 }
 
 /// A stable per-repo directory for the reused gate build cache, keyed on the
@@ -658,37 +692,6 @@ fn gate_base(repo_root: &Path) -> PathBuf {
     util::xdg_state_home()
         .join("thegn/gate")
         .join(format!("{name}-{key:016x}"))
-}
-
-/// Blocking advisory lock serializing gate runs on a reused worktree. The
-/// sidecar `<wt>.lock` file is created once and never removed (the worktree dir
-/// itself is churned; the lock must survive that). `File::lock` dies with the
-/// process, so it can't go stale. Best-effort: `None` (exotic fs / permissions)
-/// degrades to the old unserialized path rather than refusing to gate.
-#[cfg(unix)]
-fn gate_lock(wt: &Path) -> Option<std::fs::File> {
-    let lock_path = {
-        let mut p = wt.as_os_str().to_owned();
-        p.push(".lock");
-        PathBuf::from(p)
-    };
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
-    }
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-    f.lock().ok()?; // blocks until the prior gate releases
-    Some(f)
-}
-
-#[cfg(not(unix))]
-fn gate_lock(_wt: &Path) -> Option<std::fs::File> {
-    None
 }
 
 /// What one gate invocation established. The distinction between `Failed` and
@@ -714,182 +717,24 @@ impl GateVerdict {
     }
 }
 
-/// Build/test the folded tip. By default (`gate_reuse_worktree`) this runs in a
-/// stable per-repo worktree kept between folds, with a persistent
-/// `CARGO_TARGET_DIR` — so cargo does a warm incremental rebuild instead of a
-/// cold from-scratch compile (the local-compute win). With reuse off it falls
-/// back to a fresh throwaway `/tmp` worktree removed afterward (concurrency-safe,
-/// but always cold). Returns whether `gate_command` exited zero plus its captured
-/// combined output (tail-truncated), which the queue driver feeds to a fixing
-/// agent on a red gate.
-// off-loop: the fold runs from the CLI (`thegn integrate`) or from
-// spawn_fold's spawn_blocking (see the module doc) — never on the loop.
-#[expect(clippy::disallowed_methods)]
+/// Gate the exact commit in a verified, exclusively owned local checkout.
+/// Admission/setup/identity failures are infrastructure holds, never branch blame.
 pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> Result<GateVerdict> {
-    // Callers only reach here with a non-empty command (`gate_on` already checks
-    // it), but guard anyway: an empty gate is a green no-op, not a worktree churn.
     if cfg.gate_command.is_empty() {
         return Ok(GateVerdict::Passed);
     }
-
-    let reuse = cfg.gate_reuse_worktree;
-    // Where the gate builds, and where cargo writes artifacts. Reused: a stable
-    // per-repo worktree + target dir kept between folds. Throwaway: a unique /tmp
-    // worktree. An explicit `gate_target_dir` overrides the target location in
-    // either mode. Reuse depends on drains being serialized (queue design); the
-    // per-repo path also keeps concurrent drains of *different* repos apart.
-    let (wt, target_dir) = if reuse {
-        let base = gate_base(repo_root);
-        let td = if cfg.gate_target_dir.is_empty() {
-            base.join("target")
-        } else {
-            PathBuf::from(&cfg.gate_target_dir)
-        };
-        (base.join("wt"), Some(td))
-    } else if cfg.gate_target_dir.is_empty() {
-        (tmp_path("tg-foldgate"), None)
-    } else {
-        (
-            tmp_path("tg-foldgate"),
-            Some(PathBuf::from(&cfg.gate_target_dir)),
-        )
-    };
-    let wt_s = wt.to_string_lossy().to_string();
-
-    // Serialize concurrent gate runs on the SAME reused worktree: two `land` /
-    // `drain` processes (e.g. a CLI land + a running instance's autopilot) would
-    // otherwise check out DIFFERENT OIDs into one worktree and clobber each
-    // other's checkout + gate. The queue design assumes serialization but nothing
-    // enforced it ACROSS processes. A blocking flock on a persistent sidecar lock
-    // makes the second run wait its turn (a gate can take minutes — waiting is
-    // correct). Reuse mode only; throwaway mode already uses unique /tmp paths.
-    // Held for the whole prepare→gate→cleanup below (RAII: released on return).
-    let _gate_lock = if reuse { gate_lock(&wt) } else { None };
-
-    // (Re)create the gate worktree fresh at `wt`, pruning any stale registration
-    // for a path whose dir was removed out from under us.
-    let create = || {
-        if let Some(parent) = wt.parent() {
-            let _ = std::fs::create_dir_all(parent); // best-effort: create_dir_all is idempotent
-        }
-        let _ = util::git_ok(repo_root, &["worktree", "prune"]); // best-effort: drop stale registration
-        util::git_ok(
-            repo_root,
-            &["worktree", "add", "--detach", "--force", &wt_s, oid],
-        )
-    };
-    // Materialize the folded OID. Refresh a reused worktree in place — `checkout`
-    // only re-touches files that actually changed between folds, so cargo rebuilds
-    // just the affected crates. If that fails (stale/corrupt registration) self-heal
-    // by recreating it; the sibling `target/` dir survives. New paths create fresh.
-    let prepared = if reuse && wt.exists() {
-        util::git_ok(&wt, &["checkout", "--detach", "--force", oid]) || {
-            let _ = std::fs::remove_dir_all(&wt); // best-effort: self-heal a broken worktree
-            create()
-        }
-    } else {
-        create()
-    };
-    if !prepared {
-        anyhow::bail!("merge queue: could not prepare gate worktree at {wt_s}");
-    }
-
-    // One shell setup for both the (optional) provisioning step and the gate,
-    // so they see an identical environment.
-    let spawn = |command: &str| {
-        // Join the shared aggregate slice. `gate_command` is typically a full
-        // test suite — the single heaviest thing thegn starts — and it used to
-        // run wholly outside every ceiling, stacked on top of a pane budget
-        // that was already spent.
-        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            command.to_string(),
-        ]);
-        let mut cmd = std::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]).current_dir(&wt);
-        if let Some(td) = &target_dir {
-            let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
-            cmd.env("CARGO_TARGET_DIR", td);
-        }
-        // Scrub the git environment, exactly as `run_agent` does. An inherited
-        // GIT_DIR/GIT_INDEX_FILE would otherwise point the gate's own `git` at
-        // whatever repo invoked thegn instead of at the gate worktree.
-        for var in util::GIT_ENV_VARS {
-            cmd.env_remove(var);
-        }
-        cmd.env("THEGN_GATE", "1");
-        cmd.env("THEGN_WORKTREE", &wt);
-        cmd.env("THEGN_GATE_OID", oid);
-        cmd.output()
-    };
-
-    // Provision the worktree first. It is a bare checkout of the folded tip —
-    // no node_modules, no venv — so any gate whose entry point is a
-    // project-local binary dies instantly without this. Deliberately NOT part of
-    // the verdict: a failed setup is an environment failure, so it can neither
-    // blame the branch nor wake the fixing agent.
-    if !cfg.gate_setup_command.is_empty() {
-        match spawn(&cfg.gate_setup_command) {
-            Ok(o) if !o.status.success() => {
-                let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
-                log.push_str(&String::from_utf8_lossy(&o.stderr));
-                if !reuse {
-                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]); // best-effort: cleanup: a throwaway gate worktree must not fail the verdict; a failed removal leaks the dir only
-                }
-                return Ok(GateVerdict::Error {
-                    reason: format!(
-                        "gate_setup_command failed (exit {})",
-                        o.status
-                            .code()
-                            .map_or_else(|| "signal".to_string(), |c| c.to_string())
-                    ),
-                    log: tail(&log, 4000),
-                });
-            }
-            Err(e) => {
-                if !reuse {
-                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]); // best-effort: cleanup: a throwaway gate worktree must not fail the verdict; a failed removal leaks the dir only
-                }
-                return Ok(GateVerdict::Error {
-                    reason: "gate_setup_command could not be started".to_string(),
-                    log: format!("{e}"),
-                });
-            }
-            Ok(_) => {}
-        }
-    }
-
-    let out = spawn(&cfg.gate_command);
-
-    // A throwaway worktree is always removed; a reused one is kept — its warm
-    // target/ is the whole point.
-    if !reuse {
-        let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]); // best-effort: cleanup: a throwaway gate worktree must not fail the verdict; a failed removal leaks the dir only
-    }
-    // Classify rather than collapsing to a bool: the raw exit status is the only
-    // place "the command never ran" is distinguishable from "the tests failed",
-    // and dropping it here is what let `turbo: command not found` be recorded as
-    // a verdict about the branch. See `thegn_core::gate`.
-    Ok(match out {
-        Ok(o) => {
-            let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
-            log.push_str(&String::from_utf8_lossy(&o.stderr));
-            let log = tail(&log, 4000);
-            match gate::classify_exit(o.status.code(), false) {
-                gate::GateClass::Passed => GateVerdict::Passed,
-                gate::GateClass::Failed => GateVerdict::Failed { log },
-                gate::GateClass::Error => GateVerdict::Error {
-                    reason: gate::error_reason(o.status.code(), false).to_string(),
-                    log,
-                },
-            }
-        }
-        Err(e) => GateVerdict::Error {
-            reason: gate::error_reason(None, true).to_string(),
-            log: format!("gate command failed to start: {e}"),
-        },
-    })
+    Ok(
+        gate_runner::run(repo_root, oid, cfg).unwrap_or_else(|error| GateVerdict::Error {
+            reason: "gate preparation or identity unavailable".into(),
+            log: tail(
+                &format!("{error:#}")
+                    .chars()
+                    .filter(|c| diagnostic_char(*c))
+                    .collect::<String>(),
+                4000,
+            ),
+        }),
+    )
 }
 
 /// Keep the last `max` bytes of `s` on a char boundary (gate logs can be huge; the
@@ -918,31 +763,73 @@ fn bisect_offender(
     repo_root: &Path,
     adapter: &PlumbingAdapter,
     base: &str,
-    landed: &[LandedReport],
+    landed: &[Branch],
     cfg: &MergeQueueConfig,
     opts: &LandOpts,
+    diagnostics: &mut String,
 ) -> Result<Option<String>> {
+    // A red base says nothing about any candidate. Establish this before any
+    // prefix can be blamed; retain its diagnostic alongside the union failure.
+    let base_verdict = diagnosed_gate(repo_root, base, cfg, "base", diagnostics, &adapter.history);
+    match base_verdict {
+        GateVerdict::Passed => {}
+        GateVerdict::Failed { .. } => return Ok(None),
+        verdict @ GateVerdict::Error { .. } => return Err(BisectAborted(verdict).into()),
+    }
     let mut prefix: Vec<Branch> = Vec::new();
-    for l in landed {
-        // The branch tip is the merge commit's second parent — but we re-fold
-        // from the branch's own tip, which `candidate_branches` already gave us
-        // via the Landed entry's name; reuse the running adapter to re-merge.
-        prefix.push(Branch {
-            name: l.branch.clone(),
-            tip: branch_tip(repo_root, &l.branch)?,
-        });
-        let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths, opts)?;
+    for branch in landed {
+        // Re-fold the exact candidate object tested in the union. A branch ref
+        // may have moved during the union/base gate; re-reading it would test
+        // different code and attribute that verdict to the original snapshot.
+        prefix.push(branch.clone());
+        let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths, opts)
+            .map_err(|error| aborted_bisect(error, diagnostics))?;
         if plan.advanced() {
-            match gate_tip(repo_root, &plan.final_tip, cfg)? {
+            let verdict = diagnosed_gate(
+                repo_root,
+                &plan.final_tip,
+                cfg,
+                &format!("prefix {}", prefix.len()),
+                diagnostics,
+                &adapter.history,
+            );
+            match verdict {
                 GateVerdict::Passed => {}
-                GateVerdict::Failed { .. } => return Ok(Some(l.branch.clone())),
+                GateVerdict::Failed { .. } => return Ok(Some(branch.name.clone())),
                 // Environmental: identical at every prefix, so stop rather than
-                // blame `l.branch` for a missing binary.
+                // blame this candidate for a missing binary.
                 v @ GateVerdict::Error { .. } => return Err(BisectAborted(v).into()),
             }
         }
     }
     Ok(None)
+}
+
+fn aborted_bisect(error: anyhow::Error, diagnostics: &mut String) -> BisectAborted {
+    let verdict = GateVerdict::Error {
+        reason: "bisect prefix preparation unavailable".into(),
+        log: tail(&format!("{error:#}"), 4000),
+    };
+    record_gate(diagnostics, "prefix preparation", &verdict);
+    BisectAborted(verdict)
+}
+
+fn diagnosed_gate(
+    repo_root: &Path,
+    tip: &str,
+    cfg: &MergeQueueConfig,
+    phase: &str,
+    diagnostics: &mut String,
+    history: &CanonicalHistory,
+) -> GateVerdict {
+    let verdict = history
+        .checked(|| gate_tip(repo_root, tip, cfg))
+        .unwrap_or_else(|error| GateVerdict::Error {
+            reason: "gate preparation unavailable".into(),
+            log: tail(&format!("{error:#}"), 4000),
+        });
+    record_gate(diagnostics, phase, &verdict);
+    verdict
 }
 
 /// A bisect that stopped because the gate could not run. Carries the verdict so
@@ -961,11 +848,6 @@ impl std::fmt::Display for BisectAborted {
 
 impl std::error::Error for BisectAborted {}
 
-fn branch_tip(repo_root: &Path, branch: &str) -> Result<String> {
-    let loc = GitLoc::for_worktree(repo_root);
-    CliGit.rev_parse(&loc, &format!("refs/heads/{branch}"))
-}
-
 /// Compose a [`FoldReport`] from a plan plus any gate offenders. `advanced` is
 /// left false; callers set it after a successful CAS.
 fn build_report(
@@ -975,6 +857,7 @@ fn build_report(
     gate_offenders: &[String],
     gate: GateOutcome,
     cas_attempts: u32,
+    diagnostics: &str,
 ) -> FoldReport {
     let mut deferred: Vec<DeferredReport> = plan
         .deferred
@@ -996,7 +879,7 @@ fn build_report(
             gate_failed: true,
         });
     }
-    let landed: Vec<LandedReport> = plan
+    let prepared: Vec<LandedReport> = plan
         .landed
         .iter()
         .map(|l| LandedReport {
@@ -1010,9 +893,13 @@ fn build_report(
         original: original.to_string(),
         final_tip: plan.final_tip.clone(),
         advanced: false,
-        landed,
+        landed: Vec::new(),
+        prepared,
+        unprepared: Vec::new(),
         deferred,
         gate,
+        diagnostics: diagnostics.to_string(),
+        bookkeeping_error: None,
         cas_attempts,
     }
 }
@@ -1039,19 +926,101 @@ fn empty_plan(tip: &str) -> FoldPlan {
     }
 }
 
+fn history_failure_report(
+    target: &str,
+    original: &str,
+    candidates: &[Branch],
+    attempts: u32,
+    error: anyhow::Error,
+    earlier_diagnostics: &str,
+) -> FoldReport {
+    let mut diagnostics = earlier_diagnostics.to_owned();
+    let reason = "canonical Git history unavailable".to_string();
+    record_gate(
+        &mut diagnostics,
+        "history admission",
+        &GateVerdict::Error {
+            reason: reason.clone(),
+            log: tail(&format!("{error:#}"), 4000),
+        },
+    );
+    let mut report = build_report(
+        target,
+        original,
+        &empty_plan(original),
+        &[],
+        GateOutcome::Errored { reason },
+        attempts,
+        &diagnostics,
+    );
+    report.unprepared = candidates
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect();
+    report
+}
+
 /// Fold `candidates` onto the repo's target branch: merge clean branches in the
 /// object DB, gate the union, and CAS-advance the target ref. Clean branches
 /// land; conflicts and gate-offenders are deferred. No working tree is touched
 /// except the throwaway gate worktree and — after a successful advance — a
 /// guarded fast-forward of the repo's own main checkout (see
 /// [`util::resync_ff_checkout`]) so `git status` there stays coherent.
+#[cfg(test)]
 pub fn run_fold(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     candidates: Vec<Branch>,
 ) -> Result<FoldReport> {
-    let loc = GitLoc::for_worktree(repo_root);
+    run_fold_with_cas(cfg, repo_root, candidates, |loc, target, tip, base| {
+        CliGit.update_ref_cas(loc, target, tip, base)
+    })
+}
+
+/// The mutation seam is injectable only through this private function, so
+/// exhaustion can be tested without racing or modifying a real target branch.
+#[cfg(test)]
+fn run_fold_with_cas(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    candidates: Vec<Branch>,
+    advance: impl FnMut(&GitLoc, &str, &str, &str) -> Result<bool>,
+) -> Result<FoldReport> {
+    let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
+    run_fold_admitted(cfg, repo_root, candidates, loc, history, advance)
+}
+
+fn run_fold_observed(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    candidates: Vec<Branch>,
+    history: CanonicalHistory,
+) -> Result<FoldReport> {
+    anyhow::ensure!(
+        history.worktree_path() == repo_root,
+        "observed fold repository identity mismatch"
+    );
+    run_fold_admitted(
+        cfg,
+        repo_root,
+        candidates,
+        GitLoc::Local(repo_root.to_path_buf()),
+        history,
+        |loc, target, tip, base| CliGit.update_ref_cas(loc, target, tip, base),
+    )
+}
+
+fn run_fold_admitted(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    candidates: Vec<Branch>,
+    loc: GitLoc,
+    history: CanonicalHistory,
+    mut advance: impl FnMut(&GitLoc, &str, &str, &str) -> Result<bool>,
+) -> Result<FoldReport> {
+    history.revalidate()?;
     let adapter = PlumbingAdapter {
+        history,
         loc: loc.clone(),
         repo_root: repo_root.to_path_buf(),
         regenerate_paths: cfg.regenerate_paths.clone(),
@@ -1068,8 +1037,19 @@ pub fn run_fold(
     let mut excluded: HashSet<String> = HashSet::new();
     let mut gate_offenders: Vec<String> = Vec::new();
     let mut cas_attempts = 0u32;
+    let mut diagnostics = String::new();
 
     loop {
+        if let Err(error) = adapter.history.revalidate() {
+            return Ok(history_failure_report(
+                &target_branch,
+                &original,
+                &candidates,
+                cas_attempts,
+                error,
+                &diagnostics,
+            ));
+        }
         // Re-read the tip each round so a CAS retry folds onto the moved branch.
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let to_fold: Vec<Branch> = candidates
@@ -1080,25 +1060,46 @@ pub fn run_fold(
             .filter(|b| !util::git_ok(repo_root, &["merge-base", "--is-ancestor", &b.tip, &base]))
             .cloned()
             .collect();
+        let attempted: Vec<String> = to_fold.iter().map(|branch| branch.name.clone()).collect();
         let plan = match fold::fold(&adapter, &base, to_fold, &cfg.regenerate_paths, &opts) {
             Ok(p) => p,
-            // A signing failure stops the drain as infrastructure — no branch is
-            // blamed, no agent dispatched (the report carries an Errored gate).
+            // Any preparation failure (including signing) holds the requested
+            // candidates without inventing prepared commits or branch blame.
             Err(e) => {
-                let sf = e.downcast::<SigningFailed>()?;
+                let reason = "fold preparation unavailable".to_string();
+                record_gate(
+                    &mut diagnostics,
+                    "fold preparation",
+                    &GateVerdict::Error {
+                        reason: reason.clone(),
+                        log: tail(&format!("{e:#}"), 4000),
+                    },
+                );
                 let empty = empty_plan(&original);
-                return Ok(build_report(
+                let mut report = build_report(
                     &target_branch,
                     &original,
                     &empty,
                     &gate_offenders,
-                    GateOutcome::Errored {
-                        reason: sf.to_string(),
-                    },
+                    GateOutcome::Errored { reason },
                     cas_attempts,
-                ));
+                    &diagnostics,
+                );
+                report.unprepared = attempted;
+                return Ok(report);
             }
         };
+
+        if let Err(error) = adapter.history.revalidate() {
+            return Ok(history_failure_report(
+                &target_branch,
+                &original,
+                &candidates,
+                cas_attempts,
+                error,
+                &diagnostics,
+            ));
+        }
 
         if !plan.advanced() {
             // Nothing merged clean. If bisect held branches back, the gate is the
@@ -1115,12 +1116,20 @@ pub fn run_fold(
                 &gate_offenders,
                 gate,
                 cas_attempts,
+                &diagnostics,
             ));
         }
 
         // Test-gate the union before blessing it.
         let gate = if gate_on {
-            let verdict = gate_tip(repo_root, &plan.final_tip, cfg)?;
+            let verdict = diagnosed_gate(
+                repo_root,
+                &plan.final_tip,
+                cfg,
+                "union",
+                &mut diagnostics,
+                &adapter.history,
+            );
             // The gate could not run: report the environment and hold everything
             // back. Never bisect — the failure is identical at every prefix.
             if let GateVerdict::Error { reason, .. } = &verdict {
@@ -1133,39 +1142,45 @@ pub fn run_fold(
                         reason: reason.clone(),
                     },
                     cas_attempts,
+                    &diagnostics,
                 ));
             }
             if verdict.passed() {
                 GateOutcome::Passed
             } else if cfg.bisect_on_red {
-                let landed: Vec<LandedReport> = plan
+                let landed: Vec<Branch> = plan
                     .landed
                     .iter()
-                    .map(|l| LandedReport {
-                        branch: l.branch.name.clone(),
-                        commit: l.commit.clone(),
-                    })
+                    .map(|landed| landed.branch.clone())
                     .collect();
-                let bisected =
-                    match bisect_offender(repo_root, &adapter, &base, &landed, cfg, &opts) {
-                        Ok(o) => o,
-                        // The gate stopped being runnable mid-bisect: report the
-                        // environment rather than blaming whichever branch was next.
-                        Err(e) => {
-                            let reason = match e.downcast_ref::<BisectAborted>() {
-                                Some(b) => b.to_string(),
-                                None => return Err(e),
-                            };
-                            return Ok(build_report(
-                                &target_branch,
-                                &original,
-                                &plan,
-                                &gate_offenders,
-                                GateOutcome::Errored { reason },
-                                cas_attempts,
-                            ));
-                        }
-                    };
+                let bisected = match bisect_offender(
+                    repo_root,
+                    &adapter,
+                    &base,
+                    &landed,
+                    cfg,
+                    &opts,
+                    &mut diagnostics,
+                ) {
+                    Ok(o) => o,
+                    // The gate stopped being runnable mid-bisect: report the
+                    // environment rather than blaming whichever branch was next.
+                    Err(e) => {
+                        let reason = match e.downcast_ref::<BisectAborted>() {
+                            Some(b) => b.to_string(),
+                            None => return Err(e),
+                        };
+                        return Ok(build_report(
+                            &target_branch,
+                            &original,
+                            &plan,
+                            &gate_offenders,
+                            GateOutcome::Errored { reason },
+                            cas_attempts,
+                            &diagnostics,
+                        ));
+                    }
+                };
                 if let Some(off) = bisected {
                     excluded.insert(off.clone());
                     gate_offenders.push(off);
@@ -1178,6 +1193,7 @@ pub fn run_fold(
                     &gate_offenders,
                     GateOutcome::Failed { offender: None },
                     cas_attempts,
+                    &diagnostics,
                 ));
             } else {
                 return Ok(build_report(
@@ -1187,6 +1203,7 @@ pub fn run_fold(
                     &gate_offenders,
                     GateOutcome::Failed { offender: None },
                     cas_attempts,
+                    &diagnostics,
                 ));
             }
         } else {
@@ -1194,8 +1211,41 @@ pub fn run_fold(
         };
 
         // Green (or no gate) → atomically advance the target ref.
+        if let Err(error) = adapter.history.revalidate() {
+            return Ok(history_failure_report(
+                &target_branch,
+                &original,
+                &candidates,
+                cas_attempts,
+                error,
+                &diagnostics,
+            ));
+        }
         cas_attempts += 1;
-        if CliGit.update_ref_cas(&loc, &target_ref, &plan.final_tip, &base)? {
+        let advanced = match advance(&loc, &target_ref, &plan.final_tip, &base) {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                let reason = "target CAS operation failed".to_string();
+                record_gate(
+                    &mut diagnostics,
+                    "target CAS",
+                    &GateVerdict::Error {
+                        reason: reason.clone(),
+                        log: tail(&format!("{error:#}"), 4000),
+                    },
+                );
+                return Ok(build_report(
+                    &target_branch,
+                    &original,
+                    &plan,
+                    &gate_offenders,
+                    GateOutcome::Errored { reason },
+                    cas_attempts,
+                    &diagnostics,
+                ));
+            }
+        };
+        if advanced {
             // The fold moved the ref via pure plumbing, so the repo's MAIN
             // checkout (which is *on* this branch) now has a `HEAD` resolving to
             // the new tip while its index+tree still hold `base` — `git status`
@@ -1232,13 +1282,27 @@ pub fn run_fold(
                 &gate_offenders,
                 gate,
                 cas_attempts,
+                &diagnostics,
             );
             report.advanced = true;
+            report.landed = std::mem::take(&mut report.prepared);
             report.resyncs = resyncs;
             return Ok(report);
         }
         if cas_attempts >= 5 {
-            anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
+            return Ok(build_report(
+                &target_branch,
+                &original,
+                &plan,
+                &gate_offenders,
+                GateOutcome::Errored {
+                    reason: format!(
+                        "{target_branch} kept moving under the fold; CAS retry budget exhausted"
+                    ),
+                },
+                cas_attempts,
+                &diagnostics,
+            ));
         }
         // Lost the race — loop, re-read, re-fold.
     }
@@ -1309,7 +1373,7 @@ pub(crate) enum AttemptOutcome {
 }
 
 /// Attempt to land a *single* branch onto the repo's current target tip, the way
-/// the queue driver drains one at a time. Mirrors [`run_fold`]'s fold→gate→CAS
+/// the queue driver drains one at a time. Mirrors [`run_fold_admitted`]'s fold→gate→CAS
 /// path (re-reading the tip and re-folding on a lost CAS race), but for one branch
 /// and with a richer per-outcome result the driver can route to an agent. Never
 /// touches a working tree except the throwaway gate worktree and — on a successful
@@ -1320,7 +1384,23 @@ pub(crate) fn attempt_land(
     branch_name: &str,
     branch_loc: &GitLoc,
 ) -> Result<AttemptOutcome> {
-    let loc = GitLoc::for_worktree(repo_root);
+    attempt_land_admitted(cfg, repo_root, branch_name, branch_loc).or_else(|error| {
+        Ok(AttemptOutcome::GateError {
+            reason: "merge preparation or canonical history unavailable".into(),
+            log: tail(&format!("{error:#}"), 4000),
+        })
+    })
+}
+
+fn attempt_land_admitted(
+    cfg: &MergeQueueConfig,
+    repo_root: &Path,
+    branch_name: &str,
+    branch_loc: &GitLoc,
+) -> Result<AttemptOutcome> {
+    let (loc, history) = CanonicalHistory::worktree_loc(repo_root)?;
+    // A target-store observation is not proof about a remote/provider source.
+    let source_history = history.local_child(branch_loc)?;
     let target_branch = resolve_target(cfg, repo_root);
     let target_ref = format!("refs/heads/{target_branch}");
     // Cross-host: if the branch's worktree lives on another machine, fetch its
@@ -1337,6 +1417,7 @@ pub(crate) fn attempt_land(
         }
     };
     let adapter = PlumbingAdapter {
+        history,
         loc: loc.clone(),
         repo_root: repo_root.to_path_buf(),
         regenerate_paths: cfg.regenerate_paths.clone(),
@@ -1348,18 +1429,24 @@ pub(crate) fn attempt_land(
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
     let mut cas_attempts = 0u32;
     loop {
+        adapter.history.revalidate()?;
+        source_history.revalidate()?;
         let base = CliGit.rev_parse(&loc, &target_ref)?;
         let branch_tip = CliGit.rev_parse(&loc, &branch_ref)?;
         if util::git_ok(
             repo_root,
             &["merge-base", "--is-ancestor", &branch_tip, &base],
         ) {
+            adapter.history.revalidate()?;
+            source_history.revalidate()?;
             return Ok(AttemptOutcome::UpToDate);
         }
         let branch = Branch {
             name: branch_name.to_string(),
             tip: branch_tip,
         };
+        adapter.history.revalidate()?;
+        source_history.revalidate()?;
         let plan = match fold::fold(&adapter, &base, vec![branch], &cfg.regenerate_paths, &opts) {
             Ok(p) => p,
             // Signing failure ⇒ infrastructure error: stop with a reason, keep
@@ -1373,6 +1460,8 @@ pub(crate) fn attempt_land(
                 });
             }
         };
+        adapter.history.revalidate()?;
+        source_history.revalidate()?;
         if !plan.advanced() {
             // One branch that didn't advance the tip ⇒ it was deferred (conflict).
             let deferred = plan.deferred.first();
@@ -1387,7 +1476,11 @@ pub(crate) fn attempt_land(
         }
         let folded_tip = plan.final_tip.clone();
         if gate_on {
-            match gate_tip(repo_root, &folded_tip, cfg)? {
+            let verdict = adapter
+                .history
+                .checked(|| gate_tip(repo_root, &folded_tip, cfg))?;
+            source_history.revalidate()?;
+            match verdict {
                 GateVerdict::Passed => {}
                 GateVerdict::Failed { log } => {
                     return Ok(AttemptOutcome::GateFailed { log });
@@ -1397,10 +1490,14 @@ pub(crate) fn attempt_land(
                 }
             }
         }
+        adapter.history.revalidate()?;
+        source_history.revalidate()?;
         if !cfg.auto_land {
             return Ok(AttemptOutcome::Ready { tip: folded_tip });
         }
         cas_attempts += 1;
+        adapter.history.revalidate()?;
+        source_history.revalidate()?;
         if CliGit.update_ref_cas(&loc, &target_ref, &folded_tip, &base)? {
             // Every live checkout of the target, not just the main one — and the
             // outcomes ride out on the result so the caller can report the ones
@@ -1436,6 +1533,8 @@ mod enqueue_guard_tests {
                 })
                 .collect(),
             skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
             worktrees: pairs
                 .iter()
                 .map(|(b, w)| ((*b).to_string(), (*w).to_string()))
@@ -1512,22 +1611,47 @@ mod tests {
     /// we exercise `run_fold` against actual object-DB merges.
     struct Repo {
         dir: PathBuf,
+        _worktree: tempfile::TempDir,
+        _env: thegn_core::testenv::EnvGuard,
+        _state: tempfile::TempDir,
     }
     impl Repo {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "tg-integ-{tag}-{}-{}",
-                std::process::id(),
-                util::now()
-            ));
-            let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-            std::fs::create_dir_all(&dir).unwrap();
+            // GitLoc::for_worktree opens the process state DB even for local
+            // fixtures. Keep every test's implicit reads/migrations off live
+            // state, and do not execute the operator's Git hooks/configuration.
+            let state = tempfile::Builder::new()
+                .prefix("thegn-integ-state-")
+                .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+                .unwrap();
+            let state_path = state.path().to_str().unwrap();
+            let empty_git_config = state.path().join("absent.gitconfig");
+            let env = thegn_core::testenv::EnvGuard::set(&[
+                ("XDG_STATE_HOME", state_path),
+                ("XDG_CONFIG_HOME", state_path),
+                ("LOCALAPPDATA", state_path),
+                ("THEGN_DIR", state_path),
+                ("THEGN_PROFILE", ""),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", empty_git_config.to_str().unwrap()),
+            ]);
+            let worktree = tempfile::Builder::new()
+                .prefix(&format!("tg-integ-{tag}-"))
+                .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+                .unwrap();
+            let dir = worktree.path().to_path_buf();
             git(&dir, &["init", "-q", "-b", "main"]);
             git(&dir, &["config", "user.name", "t"]);
             git(&dir, &["config", "user.email", "t@e"]);
             git(&dir, &["config", "commit.gpgsign", "false"]);
-            let r = Repo { dir };
+            let r = Repo {
+                dir,
+                _worktree: worktree,
+                _env: env,
+                _state: state,
+            };
             r.commit("base.txt", "base\n", "c0");
+            Db::open().unwrap(); // owned private registry; no lossy location fallback
             r
         }
         fn commit(&self, file: &str, body: &str, msg: &str) {
@@ -1567,10 +1691,61 @@ mod tests {
                 })
                 .collect()
         }
-    }
-    impl Drop for Repo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+
+        /// Keep real nonempty-gate tests truthful on platforms where verified
+        /// local admission is unavailable. This is an exercised refusal, not an
+        /// ignored test or a successful substitute gate.
+        fn gate_supported_or_refused(&self, config: &MergeQueueConfig) -> bool {
+            if thegn_core::sandbox_backend::host_os()
+                != thegn_core::sandbox_backend::HostOs::Windows
+            {
+                return true;
+            }
+            assert!(!config.gate_command.is_empty());
+            let refs = self.out(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+            let index = std::fs::read(self.dir.join(".git/index")).unwrap();
+            let tracked: Vec<_> = self
+                .out(&["ls-files"])
+                .lines()
+                .map(|name| {
+                    let path = self.dir.join(name);
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect();
+            let sentinel = self._state.path().join("gate-refusal-sentinel");
+            std::fs::write(&sentinel, "must remain").unwrap();
+            match gate_tip(&self.dir, &self.out(&["rev-parse", "HEAD"]), config).unwrap() {
+                GateVerdict::Error { log, .. } => assert!(log.contains("unsupported")),
+                other => panic!("unsupported gate must refuse: {other:?}"),
+            }
+            assert!(run_fold(config, &self.dir, self.branch_set()).is_err());
+            let disabled = cfg("");
+            assert!(run_fold(&disabled, &self.dir, self.branch_set()).is_err());
+            assert!(matches!(
+                attempt_land(
+                    &disabled,
+                    &self.dir,
+                    "main",
+                    &GitLoc::Local(self.dir.clone())
+                )
+                .unwrap(),
+                AttemptOutcome::GateError { .. }
+            ));
+            assert_eq!(
+                self.out(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+                refs
+            );
+            assert_eq!(std::fs::read(self.dir.join(".git/index")).unwrap(), index);
+            for (path, bytes) in tracked {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "must remain");
+            false
+        }
+
+        fn history_supported_or_refused(&self) -> bool {
+            self.gate_supported_or_refused(&cfg("true"))
         }
     }
     // test code: fixture plumbing, never on the event loop.
@@ -1614,6 +1789,9 @@ mod tests {
     #[test]
     fn clean_disjoint_branches_all_land_and_advance_main() {
         let repo = Repo::new("clean");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         repo.feature("b2", "b.txt", "b\n");
         let before = repo.out(&["rev-parse", "main"]);
@@ -1652,7 +1830,7 @@ mod tests {
                 submodule_conflicts: vec![conflict.clone()],
             }],
         };
-        let report = build_report("main", "base", &plan, &[], GateOutcome::Skipped, 0);
+        let report = build_report("main", "base", &plan, &[], GateOutcome::Skipped, 0, "");
         assert_eq!(report.deferred[0].paths, ["vendor/lib"]);
         assert_eq!(
             report.deferred[0].submodule_conflicts,
@@ -1679,6 +1857,9 @@ mod tests {
     #[test]
     fn squash_strategy_lands_one_single_parent_commit() {
         let repo = Repo::new("squash");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature_multi(
             "feat",
             &[
@@ -1724,6 +1905,9 @@ mod tests {
     #[test]
     fn rebase_strategy_replays_commits_linearly_preserving_author() {
         let repo = Repo::new("rebase");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         // A commit by a different author, to prove authorship is preserved.
         git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
         std::fs::write(repo.dir.join("a.txt"), "a\n").unwrap();
@@ -1773,6 +1957,9 @@ mod tests {
     #[test]
     fn signing_failure_is_infrastructure_not_a_branch_verdict() {
         let repo = Repo::new("signfail");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
         // Force signing on, with a signer that fails fast (stands in for a locked
@@ -1817,6 +2004,9 @@ mod tests {
         }
 
         let repo = Repo::new("signed-fold");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "signed.txt", "signed\n");
         let gpg_home = repo.dir.join("gnupg-fixture");
         std::fs::create_dir(&gpg_home).unwrap();
@@ -1925,6 +2115,9 @@ mod tests {
     #[test]
     fn custom_merge_driver_resolves_a_conflict_through_a_worktree_merge() {
         let repo = Repo::new("driver");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         // A custom driver that always resolves to "ours" (exits 0 leaving %A).
         git(&repo.dir, &["config", "merge.takeours.driver", "true"]);
         repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
@@ -1949,6 +2142,9 @@ mod tests {
     #[test]
     fn conflicting_branch_is_deferred_clean_one_still_lands() {
         let repo = Repo::new("conflict");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("clean", "ok.txt", "ok\n");
         // Both edit base.txt → conflicts against main once nothing else, but
         // here main is unchanged so the conflict is branch-vs-base.
@@ -1969,13 +2165,25 @@ mod tests {
         assert_eq!(report.deferred.len(), 1);
         assert_eq!(report.deferred[0].branch, "bad");
         assert!(!report.deferred[0].gate_failed);
+        assert!(
+            report.request_result().is_err(),
+            "partial success reports held branches"
+        );
     }
 
     #[test]
     fn green_gate_advances_red_gate_holds_back() {
         let repo = Repo::new("gate");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
+
+        if !repo.gate_supported_or_refused(&cfg("true")) {
+            assert!(!repo.gate_supported_or_refused(&cfg("false")));
+            return;
+        }
 
         // Green gate → advances.
         let report = run_fold(&cfg("true"), &repo.dir, repo.branch_set()).unwrap();
@@ -1983,8 +2191,7 @@ mod tests {
         assert_eq!(report.gate, GateOutcome::Passed);
         assert_ne!(repo.out(&["rev-parse", "main"]), before);
 
-        // Red gate on a fresh branch → main is NOT advanced; branch deferred as
-        // a gate offender (bisect isolates the single landed branch).
+        // A universally red gate also fails at base: no branch can be blamed.
         let mid = repo.out(&["rev-parse", "main"]);
         repo.feature("b2", "b.txt", "b\n");
         let report = run_fold(&cfg("false"), &repo.dir, repo.branch_set()).unwrap();
@@ -1995,12 +2202,479 @@ mod tests {
             "red gate must not move main"
         );
         assert!(matches!(report.gate, GateOutcome::Failed { .. }));
+        assert!(report.landed.is_empty());
+        assert_eq!(report.prepared[0].branch, "b2");
+        assert!(report.deferred.is_empty());
+        assert!(report.diagnostics.contains("[base] failed"));
+    }
+
+    /// Every failed case is exercised with a real linked worktree and a private
+    /// DB. Destructive on-land policy is intentionally armed: speculative
+    /// persistence must never reach it. Implicit state access is isolated by Repo.
+    fn assert_held_persistence(repo: &Repo, mut config: MergeQueueConfig, report: &FoldReport) {
+        let private = tempfile::tempdir().unwrap();
+        let worktree = private.path().join("candidate");
+        git(
+            &repo.dir,
+            &["worktree", "add", worktree.to_str().unwrap(), "b1"],
+        );
+        let original_tip = repo.out(&["rev-parse", "b1"]);
+        let wt = worktree.to_string_lossy().to_string();
+        let db = Db::open_at(&private.path().join("test.db")).unwrap();
+        db.enqueue_merge(&wt, "b1", "main").unwrap();
+        // Prove stale optimistic result_oid is cleared, not retained by the
+        // nullable update API's COALESCE behavior.
+        db.update_merge_status(&wt, "queued", Some("stale-result"), None, None)
+            .unwrap();
+        config.organize_folders = true;
+        config.on_landed = thegn_core::config::OnLanded::Remove;
+        let branches = repo.branch_set();
+        let mut worktrees = HashMap::from([("b1".into(), wt.clone())]);
+        for (index, branch) in branches
+            .iter()
+            .filter(|branch| branch.name != "b1")
+            .enumerate()
+        {
+            let other = private.path().join(format!("candidate-other-{index}"));
+            git(
+                &repo.dir,
+                &["worktree", "add", other.to_str().unwrap(), &branch.name],
+            );
+            worktrees.insert(branch.name.clone(), other.to_string_lossy().into_owned());
+        }
+        let candidates = Candidates {
+            branches,
+            skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
+            worktrees,
+        };
+        let observations = observe_outcomes(&db, &candidates).unwrap();
+        persist(&config, &repo.dir, &db, &candidates, report, &observations).unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        let row = rows.iter().find(|row| row.worktree == wt).unwrap();
+        assert!(
+            rows.iter().all(|row| row.branch != "already-in-target"),
+            "bystanders are not published"
+        );
+        assert_eq!(row.status, "gate_error");
+        assert!(row.result_oid.is_none(), "never persist speculative commit");
+        assert!(row.error_detail.as_deref().unwrap().contains("not landed"));
+        assert!(worktree.join("a.txt").exists());
+        assert_eq!(repo.out(&["rev-parse", "b1"]), original_tip);
+        assert!(report.request_result().is_err());
+    }
+
+    #[test]
+    fn failed_union_cannot_persist_a_land_or_run_landed_lifecycle() {
+        let repo = Repo::new("failed-persist");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let mut config = cfg("printf 'union-failure-proof\\n'; exit 1");
+        config.bisect_on_red = false;
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(!report.advanced);
+        assert!(report.landed.is_empty());
+        assert_eq!(report.prepared.len(), 1);
         assert!(
             report
-                .deferred
-                .iter()
-                .any(|d| d.branch == "b2" && d.gate_failed)
+                .diagnostics
+                .contains("[union] failed\nunion-failure-proof")
         );
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn infrastructure_gate_holds_without_branch_blame_and_keeps_output() {
+        let repo = Repo::new("infra-persist");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg("printf 'infrastructure-proof\\n'; exit 127");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(matches!(report.gate, GateOutcome::Errored { .. }));
+        assert!(report.deferred.is_empty());
+        assert!(report.landed.is_empty());
+        assert!(report.diagnostics.contains("infrastructure-proof"));
+        assert!(!report.diagnostics.contains("[base]"));
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn red_base_is_not_a_candidate_failure_and_keeps_both_gate_phases() {
+        let repo = Repo::new("base-persist");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config =
+            cfg("if test -f a.txt; then printf union-red; else printf base-red; fi; exit 1");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.deferred.is_empty());
+        assert!(report.diagnostics.contains("[union] failed\nunion-red"));
+        assert!(report.diagnostics.contains("[base] failed\nbase-red"));
+        assert!(!report.diagnostics.contains("[prefix"));
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn prefix_infrastructure_error_keeps_union_base_and_prefix_diagnostics() {
+        let repo = Repo::new("prefix-infra");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        repo.feature("b2", "b.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg(
+            "if test -f b.txt; then printf union-red; exit 1; fi; if test -f a.txt; then printf prefix-infra; exit 127; fi; exit 0",
+        );
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(matches!(report.gate, GateOutcome::Errored { .. }));
+        assert!(report.deferred.is_empty());
+        assert!(report.landed.is_empty());
+        assert!(report.diagnostics.contains("union-red"));
+        assert!(report.diagnostics.contains("[base] passed"));
+        assert!(report.diagnostics.contains("[prefix 1]"));
+        assert!(report.diagnostics.contains("prefix-infra"));
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn bisect_tests_original_candidate_when_live_ref_moves_during_union_gate() {
+        let repo = Repo::new("bisect-pinned-input");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "original red snapshot\n");
+        let base = repo.out(&["rev-parse", "main"]);
+        let original_candidate = repo.out(&["rev-parse", "b1"]);
+        let candidates = repo.branch_set();
+        // Every gate runs in a detached private worktree sharing only this
+        // fixture's Git store. Move the candidate to green base while the red
+        // union is being tested: a live-ref re-read would now test other code.
+        let config = cfg(&format!(
+            "if test -f a.txt; then git update-ref refs/heads/b1 {base} || exit 127; printf original-snapshot-red; exit 1; fi; exit 0"
+        ));
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold(&config, &repo.dir, candidates).unwrap();
+        assert_ne!(original_candidate, base);
+        assert_eq!(
+            repo.out(&["rev-parse", "b1"]),
+            base,
+            "gate actually moved live ref"
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), base);
+        assert!(!report.advanced);
+        assert!(report.landed.is_empty());
+        assert!(report.prepared.is_empty());
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].branch, "b1");
+        assert!(
+            report.deferred[0].gate_failed,
+            "verdict belongs to original pinned snapshot"
+        );
+        assert!(report.diagnostics.contains("[base] passed"));
+        assert!(
+            report
+                .diagnostics
+                .contains("[prefix 1] failed\noriginal-snapshot-red")
+        );
+        assert!(report.request_result().is_err());
+    }
+
+    #[test]
+    fn cas_exhaustion_is_an_unadvanced_report_and_preserves_candidates() {
+        let repo = Repo::new("cas-hold");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg("printf green; exit 0");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let mut calls = 0;
+        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _| {
+            calls += 1;
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(calls, 5);
+        assert_eq!(report.cas_attempts, 5);
+        assert!(!report.advanced);
+        assert!(report.landed.is_empty());
+        assert!(
+            report
+                .request_result()
+                .unwrap_err()
+                .to_string()
+                .contains("CAS retry budget")
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn cas_io_error_keeps_prepared_candidate_and_gate_diagnostics() {
+        let repo = Repo::new("cas-error");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let original = repo.out(&["rev-parse", "main"]);
+        let config = cfg("true");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let report = run_fold_with_cas(&config, &repo.dir, repo.branch_set(), |_, _, _, _| {
+            anyhow::bail!("private-cas-error-proof")
+        })
+        .unwrap();
+        assert!(!report.advanced);
+        assert_eq!(report.cas_attempts, 1);
+        assert!(report.landed.is_empty());
+        assert_eq!(report.prepared.len(), 1);
+        assert!(report.diagnostics.contains("[union] passed"));
+        assert!(report.diagnostics.contains("private-cas-error-proof"));
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn signing_failure_preserves_unprepared_candidates_without_inventing_commits() {
+        let repo = Repo::new("signing-hold");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        git(&repo.dir, &["branch", "already-in-target", "main"]);
+        let original = repo.out(&["rev-parse", "main"]);
+        let missing_signer = repo.dir.join("absent-signing-program");
+        git(
+            &repo.dir,
+            &["config", "gpg.program", missing_signer.to_str().unwrap()],
+        );
+        let mut config = cfg("");
+        config.sign_commits = true;
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(!report.advanced);
+        assert!(report.landed.is_empty());
+        assert!(report.prepared.is_empty());
+        assert_eq!(report.unprepared, ["b1"]);
+        assert!(matches!(report.gate, GateOutcome::Errored { .. }));
+        assert!(report.diagnostics.contains("signing failed"));
+        assert_eq!(repo.out(&["rev-parse", "main"]), original);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn prefix_signing_error_keeps_phase_diagnostics_instead_of_blame() {
+        let repo = Repo::new("prefix-signing");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let missing_signer = repo.dir.join("absent-signing-program");
+        git(
+            &repo.dir,
+            &["config", "gpg.program", missing_signer.to_str().unwrap()],
+        );
+        let config = cfg("true");
+        if !repo.gate_supported_or_refused(&config) {
+            return;
+        }
+        let adapter = PlumbingAdapter {
+            history: CanonicalHistory::capture(&repo.dir).unwrap(),
+            loc: GitLoc::Local(repo.dir.clone()),
+            repo_root: repo.dir.clone(),
+            regenerate_paths: Vec::new(),
+            regenerate_command: String::new(),
+            sign: true,
+            rerere: false,
+        };
+        let mut diagnostics = String::new();
+        let error = bisect_offender(
+            &repo.dir,
+            &adapter,
+            &repo.out(&["rev-parse", "main"]),
+            &repo.branch_set(),
+            &config,
+            &land_opts(&config, "main"),
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<BisectAborted>().is_some());
+        assert!(diagnostics.contains("[base] passed"));
+        assert!(diagnostics.contains("[prefix preparation]"));
+        assert!(diagnostics.contains("signing failed"));
+    }
+
+    #[test]
+    fn persist_defensively_refuses_legacy_speculative_landed_entries() {
+        let repo = Repo::new("malformed-report");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let mut config = cfg("false");
+        config.bisect_on_red = false;
+        let mut report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        report.landed = std::mem::take(&mut report.prepared);
+        assert!(!report.advanced);
+        assert_held_persistence(&repo, config, &report);
+    }
+
+    #[test]
+    fn diagnostics_are_aggregate_bounded_and_keep_early_failure_context() {
+        let mut diagnostics = String::new();
+        record_gate(
+            &mut diagnostics,
+            "union",
+            &GateVerdict::Failed {
+                log: "union-marker".into(),
+            },
+        );
+        record_gate(
+            &mut diagnostics,
+            "base",
+            &GateVerdict::Failed {
+                log: "base-marker".into(),
+            },
+        );
+        for _ in 0..1000 {
+            record_gate(
+                &mut diagnostics,
+                "prefix",
+                &GateVerdict::Failed {
+                    log: "\x1b\0\u{9b}é".repeat(5000),
+                },
+            );
+        }
+        assert!(diagnostics.len() <= 32 * 1024);
+        assert!(diagnostics.contains("union-marker"));
+        assert!(diagnostics.contains("base-marker"));
+        assert!(diagnostics.contains("omitted"));
+        assert!(
+            !diagnostics
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+        );
+    }
+
+    #[test]
+    fn diagnostic_marker_reservation_holds_at_exact_byte_boundaries() {
+        // Exercise every UTF-8 alignment and near-boundary remaining capacity.
+        for remaining in 0..100 {
+            let marker = "\n[additional gate diagnostics omitted]\n";
+            let target = 32 * 1024 - marker.len() - remaining;
+            let mut diagnostics = "x".repeat(target);
+            record_gate(
+                &mut diagnostics,
+                "union",
+                &GateVerdict::Failed {
+                    log: "é".repeat(60),
+                },
+            );
+            record_gate(
+                &mut diagnostics,
+                "base",
+                &GateVerdict::Failed { log: "tail".into() },
+            );
+            assert!(diagnostics.len() <= 32 * 1024, "remaining={remaining}");
+            assert!(diagnostics.ends_with(marker));
+        }
+    }
+
+    #[test]
+    fn gate_diagnostics_drop_bidi_formatting_and_preserve_readable_unicode() {
+        for c in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            let mut diagnostics = String::new();
+            record_gate(
+                &mut diagnostics,
+                "union",
+                &GateVerdict::Failed {
+                    log: format!("before{c}after\n\t日本語 café"),
+                },
+            );
+            assert!(diagnostics.contains("beforeafter"));
+            assert!(!diagnostics.contains(c));
+            assert!(diagnostics.contains("\n\t日本語 café"));
+        }
+    }
+
+    #[test]
+    fn explicit_manual_fold_can_land_with_auto_land_disabled_and_noop_succeeds() {
+        let repo = Repo::new("manual-auto-off");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
+        repo.feature("b1", "a.txt", "candidate\n");
+        let mut config = cfg("");
+        config.auto_land = false;
+        let report = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced);
+        assert!(report.prepared.is_empty());
+        assert_eq!(report.landed.len(), 1);
+        assert!(report.request_result().is_ok());
+        let private = tempfile::tempdir().unwrap();
+        let worktree = private.path().join("candidate");
+        git(
+            &repo.dir,
+            &["worktree", "add", worktree.to_str().unwrap(), "b1"],
+        );
+        let db = Db::open_at(&private.path().join("test.db")).unwrap();
+        let candidates = Candidates {
+            branches: repo.branch_set(),
+            skipped_dirty: Vec::new(),
+            identities: HashMap::new(),
+            pending_snapshots: HashSet::new(),
+            worktrees: HashMap::from([("b1".into(), worktree.to_string_lossy().into_owned())]),
+        };
+        config.organize_folders = false;
+        let observations = observe_outcomes(&db, &candidates).unwrap();
+        persist(&config, &repo.dir, &db, &candidates, &report, &observations).unwrap();
+        let rows = db.list_merge_queue().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "landed");
+        assert_eq!(
+            rows[0].result_oid.as_deref(),
+            Some(report.final_tip.as_str())
+        );
+        assert_eq!(repo.out(&["rev-parse", "main"]), report.final_tip);
+        let noop = run_fold(&config, &repo.dir, repo.branch_set()).unwrap();
+        assert!(!noop.advanced);
+        assert!(noop.landed.is_empty());
+        assert!(noop.prepared.is_empty());
+        assert!(noop.request_result().is_ok());
     }
 
     /// Build a repo where branch `b1` and `main` both bump `Cargo.lock` (so the
@@ -2019,6 +2693,9 @@ mod tests {
     #[test]
     fn regenerable_lockfile_conflict_auto_lands_with_regenerate_command() {
         let repo = regen_repo("regen-land");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         let mut c = cfg("");
         c.regenerate_command = "printf 'regenerated\\n' > Cargo.lock".into();
 
@@ -2042,17 +2719,27 @@ mod tests {
     #[test]
     fn regenerable_conflict_defers_without_a_regenerate_command() {
         let repo = regen_repo("regen-defer");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         // cfg("") has regenerate_command = "" → no regeneration, just classify+defer.
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert!(!report.advanced);
         assert_eq!(report.deferred.len(), 1);
         assert_eq!(report.deferred[0].branch, "b1");
         assert_eq!(report.deferred[0].kind, ConflictKind::Regenerable);
+        assert!(
+            report.request_result().is_err(),
+            "conflict-only requested fold fails"
+        );
     }
 
     #[test]
     fn advancing_main_fast_forwards_the_main_checkout_working_tree() {
         let repo = Repo::new("resync-clean");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         repo.feature("b2", "b.txt", "b\n");
         // Before the fold the main checkout holds only base.txt on disk.
@@ -2070,6 +2757,9 @@ mod tests {
     #[test]
     fn resync_never_clobbers_uncommitted_work_in_the_main_checkout() {
         let repo = Repo::new("resync-dirty");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         // Genuine uncommitted edit in the main checkout.
         std::fs::write(repo.dir.join("base.txt"), "MY LOCAL EDIT\n").unwrap();
@@ -2089,6 +2779,9 @@ mod tests {
     #[test]
     fn attempt_land_lands_a_clean_branch() {
         let repo = Repo::new("al-clean");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
 
@@ -2103,6 +2796,9 @@ mod tests {
     #[test]
     fn attempt_land_reports_a_textual_conflict_without_moving_main() {
         let repo = Repo::new("al-conflict");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("bad", "base.txt", "changed\n");
         repo.commit("base.txt", "mainline\n", "main edits base");
         let before = repo.out(&["rev-parse", "main"]);
@@ -2123,8 +2819,14 @@ mod tests {
     #[test]
     fn attempt_land_reports_gate_failure_and_holds_main() {
         let repo = Repo::new("al-gate");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
+        if !repo.gate_supported_or_refused(&cfg("false")) {
+            return;
+        }
 
         match attempt_land(
             &cfg("false"),
@@ -2147,10 +2849,16 @@ mod tests {
     #[test]
     fn attempt_land_holds_at_ready_when_auto_land_is_off() {
         let repo = Repo::new("al-ready");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         let before = repo.out(&["rev-parse", "main"]);
         let mut c = cfg("true"); // green gate
         c.auto_land = false;
+        if !repo.gate_supported_or_refused(&c) {
+            return;
+        }
 
         match attempt_land(&c, &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap() {
             AttemptOutcome::Ready { tip } => assert!(!tip.is_empty()),
@@ -2166,6 +2874,9 @@ mod tests {
     #[test]
     fn attempt_land_is_uptodate_for_an_already_merged_branch() {
         let repo = Repo::new("al-uptodate");
+        if !repo.history_supported_or_refused() {
+            return;
+        }
         repo.feature("b1", "a.txt", "a\n");
         attempt_land(&cfg(""), &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap(); // land it
         // A second attempt sees b1's tip already an ancestor of main.

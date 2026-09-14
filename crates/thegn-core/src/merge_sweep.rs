@@ -19,6 +19,21 @@ pub struct MergedEntry {
     pub landed_at: i64,
 }
 
+/// A completed physical collection with deliberately unfinished ref cleanup.
+/// Stored as an exact reserved error_detail value, not a new queue status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupHold {
+    BranchRetained,
+}
+impl CleanupHold {
+    pub const fn marker(self) -> &'static str {
+        "thegn-cleanup-hold:v1:branch-retained"
+    }
+    pub fn from_detail(detail: Option<&str>) -> Option<Self> {
+        (detail == Some(Self::BranchRetained.marker())).then_some(Self::BranchRetained)
+    }
+}
+
 /// Seconds still to run on `landed_at`'s grace period, or `None` once it is up.
 ///
 /// A `landed_at` in the FUTURE returns the full ttl rather than a negative or

@@ -460,8 +460,7 @@ fn add_quiet(cfg: &Config, worktrees: Vec<String>, all: bool, quiet: bool) -> Re
         let root = repo_root()?;
         let mq = &cfg.repo_merge_queue(&root);
         let target = integrate::resolve_target(mq, &root);
-        let override_gpg = cfg.repo_git(&root).override_gpg;
-        let cands = integrate::candidate_branches(mq, &root, &target, override_gpg)?;
+        let cands = integrate::candidate_branches(mq, &root, &target)?;
         for s in &cands.skipped_dirty {
             if !quiet {
                 outln!(
@@ -540,11 +539,25 @@ fn sweep(cfg: &Config, force: bool) -> Result<()> {
         return Ok(());
     }
     let report = crate::merge_sweep::sweep(cfg, &root, force);
+    use crate::merge_sweep::safe_display;
     for b in &report.collected {
-        outln!("  ⌫ swept {b}");
+        outln!("  ⌫ swept {}", safe_display(b));
     }
     for b in &report.kept_dirty {
-        outln!("  • kept {b} — uncommitted changes");
+        outln!(
+            "  • kept {} — uncommitted, untracked or ignored work",
+            safe_display(b)
+        );
+    }
+    for (branch, reason) in &report.kept {
+        outln!(
+            "  • kept {} — {}",
+            safe_display(branch),
+            safe_display(reason)
+        );
+    }
+    for error in &report.bookkeeping_errors {
+        outln!("  ! cleanup bookkeeping: {}", safe_display(error));
     }
     if report.is_empty() {
         outln!("Nothing to sweep.");
@@ -779,7 +792,14 @@ fn land(cfg: &Config, worktree: Option<String>) -> Result<()> {
     match outcome {
         AttemptOutcome::Landed { commit, resyncs } => {
             let _ = db.update_merge_status(&wt_s, "landed", Some(&commit), None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
-            lifecycle(LifecycleEvent::Landed);
+            crate::merge_lifecycle::apply_landed(
+                &cfg.repo_merge_queue(&root),
+                &db,
+                &root,
+                &wt_s,
+                &branch,
+                &commit,
+            );
             outln!("✓ landed {branch} → {}", &commit[..commit.len().min(12)]);
             integrate::report_resyncs(&target, &resyncs);
         }

@@ -126,6 +126,7 @@ toml_edit = "0.25.12"
 unicode-width = "0.2"
 sha2 = "0.10"
 tempfile.workspace = true
+same-file.workspace = true
 base64 = "0.22"
 # Serve mode mounts the control-plane gRPC service into the TCP axum router.
 tonic.workspace = true
@@ -140,6 +141,7 @@ nix.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 [dev-dependencies]
+rusqlite.workspace = true
 # The architecture ratchets (`test/*-ratchet.txt`) share one helper.
 thegn-core = { workspace = true, features = ["test-utils"] }
 # Real on-disk fixtures for tests whose subject IS the filesystem — notably the

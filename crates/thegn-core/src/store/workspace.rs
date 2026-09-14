@@ -180,6 +180,10 @@ pub trait WorkspaceStore {
     /// All recorded worktrees (metadata only; git supplies live status).
     fn worktrees(&self) -> Result<Vec<WorktreeRow>>;
 
+    /// Exact registry observation for destructive admission. A missing row is
+    /// None; malformed fields and query failures are errors, never absence.
+    fn worktree_record(&self, worktree: &str) -> Result<Option<WorktreeRow>>;
+
     /// Swap the persisted sort positions of two worktrees (by path). Used by
     /// the sidebar's manual reorder (Shift+Alt+↑/↓): the caller picks the two
     /// adjacent siblings, this exchanges their `position` so the new order
@@ -263,6 +267,10 @@ pub trait WorkspaceStore {
 
     /// Insert or replace a worktree group's persisted row.
     fn put_tab_group(&self, session: &str, row: &crate::models::TabGroupRow) -> Result<()>;
+
+    /// Conservative cleanup guard: persisted sessions can retain runtime
+    /// ownership even before local session registries have been hydrated.
+    fn has_persisted_worktree_session(&self, worktree: &str) -> Result<bool>;
 
     /// Insert or replace one tab inside a worktree group.
     fn put_group_tab(&self, session: &str, row: &crate::models::GroupTabRow) -> Result<()>;
