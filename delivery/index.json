@@ -532,6 +532,10 @@
         {
           "issue": "THE-545",
           "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-634",
+          "project": "Runtime Security & Host Architecture"
         }
       ],
       "summary": "Bind own-PR automation to fresh selected PR author, authenticated viewer, repository, head and verified local route."
