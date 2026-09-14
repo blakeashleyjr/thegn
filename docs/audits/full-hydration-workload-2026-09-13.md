@@ -17,13 +17,13 @@ process. The helper-absent condition always runs first, so these are not
 randomized causal comparisons.
 
 | Worktrees | Helper present | First build ms | Later median ms | Parent CPU median ms | Scoped-child CPU median ms | Helper calls / 9 builds |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | No | 117.28 | 63.29 | 46.74 | 9.05 | 0 |
-| 1 | Fixture | 71.89 | 76.69 | 47.93 | 9.78 | 9 |
-| 8 | No | 157.66 | 79.99 | 62.35 | 9.87 | 0 |
-| 8 | Fixture | 90.81 | 91.22 | 63.22 | 10.04 | 9 |
-| 32 | No | 621.45 | 157.75 | 124.01 | 12.84 | 0 |
-| 32 | Fixture | 186.26 | 179.51 | 126.69 | 13.31 | 9 |
+| --------- | -------------- | -------------- | --------------- | -------------------- | -------------------------- | ----------------------- |
+| 1         | No             | 117.28         | 63.29           | 46.74                | 9.05                       | 0                       |
+| 1         | Fixture        | 71.89          | 76.69           | 47.93                | 9.78                       | 9                       |
+| 8         | No             | 157.66         | 79.99           | 62.35                | 9.87                       | 0                       |
+| 8         | Fixture        | 90.81          | 91.22           | 63.22                | 10.04                      | 9                       |
+| 32        | No             | 621.45         | 157.75          | 124.01               | 12.84                      | 0                       |
+| 32        | Fixture        | 186.26         | 179.51          | 126.69               | 13.31                      | 9                       |
 
 The larger worktree set increases parent-thread work in this fixture. Scoped
 child CPU is accounted separately and excludes external subprocess CPU. The

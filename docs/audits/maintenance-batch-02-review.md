@@ -8,28 +8,27 @@ Eight of the selected ten issues have implemented candidates with primary and
 independent source review. THE-484 has a source checkpoint with requested
 authority revisions; THE-154 remains under implementation and adversarial review.
 
-| Issue | Implementation and revisions | Evidence so far |
-| --- | --- | --- |
-| THE-628 | Preserve process snapshots, deterministic ties and sampled selection/action identity | Actual host: 79 monitor and 3 model-equality tests passed; independent source review passed. Final OS signal identity race is not solved. |
-| THE-286 | Bounded streaming Kitty parser; fix the escape-pair text-cap edge | Actual host: 14 tests passed; independent actual-source review/tests passed. |
-| THE-310 | Bounded amortized framing; refuse near-cap repeated compaction; synchronize late requests with terminal closure | Actual service: 13 tests passed; independent decoder and closure review passed. |
-| THE-471 | Bounded calendar display projection, preserved semantic data and matching width/fallback rules | Actual host: 6 detail and 4 reminder tests passed; independent review passed. |
-| THE-343 | Set-only clipboard parser, receipt-generation barriers and bounded FIFO retry; fix stale-prefix retries and nested control-string admission | Earlier host writer/backlog/parser tests passed; final parser 6/6 independent harness passed; final combined graph pending. |
-| THE-377 | Typed bounded command compilation, inert argv/POSIX quoting, borrowed input, explicit migration and pre-write validation | Final compiler 9/9 and config-write filter 16/16 passed; independent review accepted. Transport tests execute projections locally; remote terminal execution remains separate. |
-| THE-545 | Fresh author/viewer proof bound to selected PR/repository/head and verified local execution; recheck before side effects | Core proof/parser tests 5/5 passed. Review caught mismatched selected/fetched PR numbers and unproven remote execution routes; both now hold. Host/service tests pending. |
-| THE-483 | Checked independent refresh cadences, duration schema/write bounds and security-preserving load diagnostics | Core 32/32 plus existing config regressions 293/293 passed. Review fixed dropped environment security overrides and alias bypass. Small load benchmark +0.21% is within noise. |
-| THE-484 | Remaining signed duration/epoch consumers and authoritative provider-age quarantine | In progress; unknown ages must never authorize deletion. No provider actions are run by tests. |
-| THE-154 | Bounded resident I/O admission, owned cancellation and truthful lifecycle outcomes | In progress. Full native process-tree containment is outstanding; settled child/pipes must not be labeled a certified tree reap. |
+| Issue   | Implementation and revisions                                                                                                                | Evidence so far                                                                                                                                                                |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| THE-628 | Preserve process snapshots, deterministic ties and sampled selection/action identity                                                        | Actual host: 79 monitor and 3 model-equality tests passed; independent source review passed. Final OS signal identity race is not solved.                                      |
+| THE-286 | Bounded streaming Kitty parser; fix the escape-pair text-cap edge                                                                           | Actual host: 14 tests passed; independent actual-source review/tests passed.                                                                                                   |
+| THE-310 | Bounded amortized framing; refuse near-cap repeated compaction; synchronize late requests with terminal closure                             | Actual service: 13 tests passed; independent decoder and closure review passed.                                                                                                |
+| THE-471 | Bounded calendar display projection, preserved semantic data and matching width/fallback rules                                              | Actual host: 6 detail and 4 reminder tests passed; independent review passed.                                                                                                  |
+| THE-343 | Set-only clipboard parser, receipt-generation barriers and bounded FIFO retry; fix stale-prefix retries and nested control-string admission | Final combined host: 13 query/parser, 14 backlog and 9 writer tests passed; independent review accepted.                                                    |
+| THE-377 | Typed bounded command compilation, inert argv/POSIX quoting, borrowed input, explicit migration and pre-write validation                    | Final compiler 9/9 and config-write filter 16/16 passed; independent review accepted. Transport tests execute projections locally; remote terminal execution remains separate. |
+| THE-545 | Fresh author/viewer proof bound to selected PR/repository/head and verified local execution; recheck before side effects                    | Core proof/transport 5/5; host proof 5/5, PR-driver 20/20, review 5/5 and CI hold passed; service ladder 7/7. Selected-number and unproven-route gaps now hold.      |
+| THE-483 | Checked independent refresh cadences, duration schema/write bounds and security-preserving load diagnostics                                 | Core 32/32 plus existing config regressions 293/293 passed. Review fixed dropped environment security overrides and alias bypass. Small load benchmark +0.21% is within noise. |
+| THE-484 | Remaining signed duration/epoch consumers and authoritative provider-age quarantine                                                         | In progress; unknown ages must never authorize deletion. No provider actions are run by tests.                                                                                 |
+| THE-154 | Bounded resident I/O admission, owned cancellation and truthful lifecycle outcomes                                                          | In progress. Full native process-tree containment is outstanding; settled child/pipes must not be labeled a certified tree reap.                                               |
 
 The first assembled host graph compiled in 3m52s. Its selected run passed
 **165/165 tests**, including the monitor, model equality, parser, writer, calendar,
 render-plan and four sandbox-floor cases. These overlap the table's module
 counts; do not add them together. A separate five-test platform ratchet initially
 found the Unix-only workload in a general module. Moving it into the platform
-seam resolved the finding; the source ratchet rerun passed 5/5. Final compilation
-of the relocated test remains part of the next graph.
+seam resolved the finding; the source ratchet rerun passed 5/5. The second combined graph compiled the relocated test successfully.
 
-The next combined host/core/service build includes THE-545 and THE-483, the final
+The second combined host/core/service build includes THE-545 and THE-483, the final
 clipboard revision, and the merged duration/command pre-write guards. The sole
 config_write conflict was resolved using one prior document read and one next
 string; both validators run before any mkdir/write, and that exact validated
@@ -63,8 +62,9 @@ revisions, 79 monitor tests and three model-equality tests. These overlap the
 earlier 165-test checkpoint; they are not additive evidence.
 
 The core passed 566 configuration, duration and PR-proof tests. The service
-passed 39 forge-ladder and LSP tests. Separate custom-command compiler/transport
-checks are recorded with their own result files. This verifies the combined
+passed 39 forge-ladder and LSP tests. Ten disjoint custom-command compiler and query-transport tests also passed,
+bringing this core selection to 576. The compiler fixtures execute transport
+projections locally; no service custom-command test module exists. This verifies the combined
 duration and command pre-write guards, including the conflict resolution.
 
 Review of THE-484 requested present Fly custody, unambiguous account/lifetime
