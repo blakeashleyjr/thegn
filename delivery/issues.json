@@ -495,6 +495,97 @@
       "changes": [
         "harden-live-upgrades"
       ]
+    },
+    {
+      "issue": "THE-615",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "repair-session-recovery-and-terminal-teardown"
+      ]
+    },
+    {
+      "issue": "THE-616",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "repair-session-recovery-and-terminal-teardown"
+      ]
+    },
+    {
+      "issue": "THE-617",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "repair-session-recovery-and-terminal-teardown"
+      ]
+    },
+    {
+      "issue": "THE-618",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "repair-session-recovery-and-terminal-teardown"
+      ]
+    },
+    {
+      "issue": "THE-619",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
+    },
+    {
+      "issue": "THE-620",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
+    },
+    {
+      "issue": "THE-621",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
+    },
+    {
+      "issue": "THE-622",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
+    },
+    {
+      "issue": "THE-623",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
+    },
+    {
+      "issue": "THE-624",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "harden-live-diagnostics-and-forge"
+      ]
+    },
+    {
+      "issue": "THE-625",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "repair-performance-evidence-and-log-tail"
+      ]
+    },
+    {
+      "issue": "THE-626",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "repair-performance-evidence-and-log-tail"
+      ]
+    },
+    {
+      "issue": "THE-627",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "repair-performance-evidence-and-log-tail"
+      ]
     }
   ]
 }

@@ -616,6 +616,11 @@ async fn token_command_async(
 ) -> Option<String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
+    if !crate::plugin::proc::bounded_group_termination_supported() {
+        // Explicit environment tokens still work. Do not spawn a helper whose
+        // cancellation would depend on the legacy unbounded taskkill path.
+        return None;
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

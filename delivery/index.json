@@ -621,6 +621,38 @@
       "summary": "Complete runtime TUI localization and define plugin-visible string participation."
     },
     {
+      "change": "harden-live-diagnostics-and-forge",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-619",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-620",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-621",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-622",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-623",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-624",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Preserve input privacy, connectivity and host-correct bounded forge behavior across reloads."
+    },
+    {
       "change": "harden-live-upgrades",
       "lifecycle": "active",
       "disposition": "verification-gated",
@@ -742,6 +774,50 @@
         }
       ],
       "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
+    },
+    {
+      "change": "repair-performance-evidence-and-log-tail",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-625",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-626",
+          "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-627",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Correct performance measurement and log following; controlled hydration attribution remains open."
+    },
+    {
+      "change": "repair-session-recovery-and-terminal-teardown",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-615",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-616",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-617",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
+          "issue": "THE-618",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Restore session recovery, enforce final isolation floors and tolerate PTY hangup during teardown."
     },
     {
       "change": "require-canonical-merge-history",
