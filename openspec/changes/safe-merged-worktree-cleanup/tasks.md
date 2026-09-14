@@ -18,6 +18,14 @@
 
 The reviewed scoped changes are delivered to local main. No live cleanup or runtime mutation is claimed.
 
+## THE-588 actual successful-land acceptance
+
+- [x] Identify the missing positive proof: prior cleanup fixtures seeded landed metadata without performing a new target advance.
+- [x] Obtain primary and independent approval of a single-environment-lock, two-repository actual fold/persist/cleanup fixture.
+- [x] Execute the real target CAS followed by production persistence and configured removal; verify foreign state and retained branch/queue hold.
+- [x] Pass all 38 selected native lifecycle/cleanup and failed-fold tests at `b21cb20d`.
+- [ ] Pass strict host lint and source gates; land the reviewed fixture on local main before closing THE-588.
+
 ## THE-594 actual resource-admission regression follow-up
 
 - [x] Obtain primary approval for private registry custody and a path-scoped explicit-teardown entry observer, all cfg(test).
