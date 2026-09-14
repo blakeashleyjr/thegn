@@ -148,9 +148,9 @@ fn sync_accounts(
         }
         let sync = db.get_calendar_sync(&a.name).ok().flatten();
         let fresh = !force
-            && sync
-                .as_ref()
-                .is_some_and(|s| s.fetched_at > 0 && now - s.fetched_at < cfg.ttl_secs as i64);
+            && sync.as_ref().is_some_and(|s| {
+                thegn_core::time_policy::is_fresh(now, Some(s.fetched_at), cfg.ttl_secs)
+            });
         if fresh {
             continue;
         }

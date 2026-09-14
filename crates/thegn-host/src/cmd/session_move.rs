@@ -668,7 +668,7 @@ fn profile_db_path(paths: &ProfilePaths, default_state_home: &Path) -> PathBuf {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .map(|duration| thegn_core::time_policy::saturating_i64(duration.as_millis()))
         .unwrap_or(0)
 }
 

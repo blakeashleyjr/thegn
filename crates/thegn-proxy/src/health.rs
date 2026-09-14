@@ -66,7 +66,7 @@ impl Health {
             Some(t) => t,
             None => {
                 let backoff = backoff_from_config(backoff_config_for(kind), consecutive as u32);
-                now_ms + backoff.as_millis() as i64
+                now_ms.saturating_add(thegn_core::time_policy::saturating_i64(backoff.as_millis()))
             }
         };
         markers.insert(
@@ -109,7 +109,8 @@ impl Health {
             k,
             Marker {
                 reason: reason.to_string(),
-                next_probe_ms: now_ms + backoff.as_millis() as i64,
+                next_probe_ms: now_ms
+                    .saturating_add(thegn_core::time_policy::saturating_i64(backoff.as_millis())),
                 consecutive_failures: consecutive,
             },
         );

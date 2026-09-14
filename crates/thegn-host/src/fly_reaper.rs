@@ -8,14 +8,11 @@
 //! - a `creating` record older than [`CREATING_STALE_SECS`] ⇒ the create crashed
 //!   between the intent write and finalize: best-effort destroy + drop it.
 //!
-//! A `ready` record under the lifetime ceiling is deliberately left alone. If
-//! its Fly app was destroyed out-of-band the record is a harmless, non-billing
-//! stale IP-cache entry that the next attach re-resolves; reconciling it would
-//! cost a per-record Fly API probe (Fly exposes no cheap label-scoped app list
-//! the way the VPS providers do), which isn't worth it on the reaper's hot
-//! path. Unlike [`crate::vps_reaper`], this reaper never lists the Fly
-//! inventory — so it can only reconcile records it already has a reason to
-//! touch (lifetime / stale-creating).
+//! Ready records use a read-only Machines inventory reconciliation to verify
+//! the exact persisted machine ID, ownership metadata and provider creation time.
+//! Legacy local created_at is never promoted to provider age. Unknown or changed
+//! inventory remains visible in quarantine, with retry on the next pass. A
+//! staged create without authoritative machine identity cannot authorize expiry.
 //!
 //! Runs from the hydration thread ([`tick`] self-throttles to [`TICK_INTERVAL`]);
 //! network work runs on its own spawned thread.
@@ -29,7 +26,7 @@ use thegn_svc::vps::registry;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(300);
 /// Mirrors the VPS reaper's stale-`creating` threshold.
-const CREATING_STALE_SECS: i64 = 10 * 60;
+const CREATING_STALE_SECS: u64 = 10 * 60;
 
 /// Throttled entry: schedule one reconcile pass when due. Cheap (and free) when
 /// no `provider = "fly"` env is configured or the ledger has no Fly records.
@@ -66,37 +63,76 @@ fn reap(envs: &[EnvProviderConfig]) {
     let Some(pc) = envs.first() else { return };
     let now = thegn_core::util::now();
     for rec in registry::list().into_iter().filter(|r| r.provider == "fly") {
-        let age = now - rec.created_at;
-        let over_lifetime = pc.max_lifetime_secs > 0 && age >= pc.max_lifetime_secs as i64;
-        let stale_creating = rec.state == "creating" && age >= CREATING_STALE_SECS;
-
-        if over_lifetime || stale_creating {
-            let why = if over_lifetime {
-                "past max_lifetime_secs"
-            } else {
-                "stale creating (crashed create?)"
-            };
+        // Legacy created_at is local intent/finalization time, not provider
+        // machine age. Never promote it into destructive age evidence.
+        if pc.max_lifetime_secs == 0 && rec.state != "creating" {
+            continue;
+        }
+        if pc.max_lifetime_secs > thegn_core::time_policy::MAX_DURATION_SECS {
             thegn_core::msg::warn(&format!(
-                "fly reaper: destroying {} ({why}, age {}m) — a running machine bills",
-                rec.name,
-                age / 60
+                "fly reaper: quarantined {}: unsupported lifetime policy; repair duration configuration; no deletion attempted",
+                rec.name
             ));
-            let result = complete_reap(
-                crate::provider_factory::fly_provider_for(pc, &rec.name),
-                |provider| {
-                    crate::agent::block_on_provider(|| async {
-                        provider.destroy_remote_only(&rec.name).await
-                    })
-                },
-                || crate::remote_enqueue_auth::revoke_for_sandbox(pc, &rec.name, None).map(|_| ()),
-                |provider| provider.retire_destroyed(&rec.name),
-            );
-            if let Err(error) = result {
+            continue;
+        }
+        let Some(provider) = crate::provider_factory::fly_provider_for(pc, &rec.name) else {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: quarantined {}: managed identity or credentials unavailable; no deletion attempted",
+                rec.name
+            ));
+            continue;
+        };
+        let created = match crate::agent::block_on_provider(|| async {
+            provider
+                .reaper_creation_time(&rec.name, &rec.instance_id)
+                .await
+        }) {
+            Ok(created) => created,
+            Err(error) => {
                 thegn_core::msg::warn(&format!(
-                    "fly reaper: lifecycle for {} failed: {error:#}; ownership records remain for the next pass",
+                    "fly reaper: quarantined {}: creation time/identity could not be reconciled ({error:#}); no deletion attempted; next pass will retry",
                     rec.name
                 ));
+                continue;
             }
+        };
+        let decision = thegn_core::time_policy::resource_expiry(
+            now,
+            Some(created),
+            pc.max_lifetime_secs,
+            (rec.state == "creating").then_some(CREATING_STALE_SECS),
+        );
+        match decision {
+            thegn_core::time_policy::ResourceExpiry::Keep => continue,
+            thegn_core::time_policy::ResourceExpiry::Quarantine(reason) => {
+                thegn_core::msg::warn(&format!(
+                    "fly reaper: quarantined {}: {reason}; no deletion attempted",
+                    rec.name
+                ));
+                continue;
+            }
+            thegn_core::time_policy::ResourceExpiry::Expired => {}
+        }
+        thegn_core::msg::warn(&format!(
+            "fly reaper: destroying {} (verified provider age exceeds lifetime/stale-create policy)",
+            rec.name
+        ));
+        let result = complete_reap(
+            decision,
+            Some(provider),
+            |provider| {
+                crate::agent::block_on_provider(|| async {
+                    provider.destroy_remote_only(&rec.name).await
+                })
+            },
+            || crate::remote_enqueue_auth::revoke_for_sandbox(pc, &rec.name, None).map(|_| ()),
+            |provider| provider.retire_destroyed(&rec.name),
+        );
+        if let Err(error) = result {
+            thegn_core::msg::warn(&format!(
+                "fly reaper: lifecycle for {} failed: {error:#}; ownership records remain for the next pass",
+                rec.name
+            ));
         }
         // A `ready` record under the lifetime ceiling is left alone; a machine
         // destroyed out-of-band leaves only a harmless (non-billing) stale record
@@ -109,11 +145,19 @@ fn reap(envs: &[EnvProviderConfig]) {
 /// never leave a live remote with its return route, and only the final closure
 /// may remove machine/custody records.
 fn complete_reap<P>(
+    decision: thegn_core::time_policy::ResourceExpiry,
     provider: Option<P>,
     mut destroy_remote: impl FnMut(&P) -> Result<()>,
     mut revoke_route_token: impl FnMut() -> Result<()>,
     mut retire_ownership: impl FnMut(&P) -> Result<()>,
 ) -> Result<()> {
+    match decision {
+        thegn_core::time_policy::ResourceExpiry::Keep => return Ok(()),
+        thegn_core::time_policy::ResourceExpiry::Quarantine(reason) => {
+            anyhow::bail!("quarantined: {reason}")
+        }
+        thegn_core::time_policy::ResourceExpiry::Expired => {}
+    }
     let provider = provider.context("provider credentials or managed identity unavailable")?;
     revoke_route_token().context("route-to-host credential revocation failed")?;
     destroy_remote(&provider).context("remote destroy failed")?;
@@ -128,6 +172,7 @@ mod tests {
     fn run_with_failure(fail: Option<&str>) -> (Result<()>, Vec<&'static str>) {
         let calls = RefCell::new(Vec::new());
         let result = complete_reap(
+            thegn_core::time_policy::ResourceExpiry::Expired,
             (fail != Some("provider")).then_some(()),
             |_| {
                 calls.borrow_mut().push("destroy");
@@ -146,6 +191,38 @@ mod tests {
             },
         );
         (result, calls.into_inner())
+    }
+
+    #[test]
+    fn unknown_age_or_invalid_lifetime_never_reaches_any_lifecycle_action() {
+        for (created, lifetime) in [
+            (None, 60),
+            (Some(i64::MIN), 60),
+            (Some(101), 1),
+            (Some(1), u64::MAX),
+        ] {
+            let decision =
+                thegn_core::time_policy::resource_expiry(100, created, lifetime, Some(60));
+            let calls = std::cell::Cell::new(0);
+            let result = complete_reap(
+                decision,
+                Some(()),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 0);
+        }
     }
 
     #[test]

@@ -35,7 +35,7 @@ const COOLDOWN_CAP_MULT: u64 = 8;
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(u128::from(d.as_secs())))
         .unwrap_or(0)
 }
 
@@ -222,7 +222,9 @@ fn cool_lane(db: &Db, template: &ManagedTemplate, reason: &str, cfg: &Config) {
         kind: "create_failure".into(),
         reason: reason.chars().take(200).collect(),
         since_ms: now_ms,
-        retry_at_ms: now_ms + (base * mult * 1000) as i64,
+        retry_at_ms: now_ms.saturating_add(thegn_core::time_policy::saturating_i64(
+            u128::from(base) * u128::from(mult) * 1000,
+        )),
         consecutive,
     });
 }

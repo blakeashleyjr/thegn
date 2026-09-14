@@ -52,7 +52,7 @@ pub(crate) enum PlaceIntent {
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(u128::from(d.as_secs())))
         .unwrap_or(0)
 }
 
@@ -217,10 +217,13 @@ fn snapshot_host(
     // contexts only). A failed probe fails CLOSED for packing below.
     let mut probe_failed = false;
     if refresh {
-        let stale = row
-            .as_ref()
-            .and_then(|r| r.last_headroom)
-            .is_none_or(|t| unix_now().saturating_sub(t) > headroom_ttl_secs as i64);
+        let stale = row.as_ref().and_then(|r| r.last_headroom).is_none_or(|t| {
+            !thegn_core::time_policy::is_fresh(
+                unix_now(),
+                Some(t),
+                headroom_ttl_secs.saturating_add(1),
+            )
+        });
         if stale {
             match thegn_svc::host::runner_for(&binding.reach)
                 .and_then(|mut r| r.probe_headroom().map_err(|e| e.msg))
@@ -752,7 +755,7 @@ fn try_spillover(
     if order.is_empty() {
         return false;
     }
-    let now_ms = unix_now() * 1000;
+    let now_ms = thegn_core::util::now_ms();
     let marker_for = |env: &str| -> Option<thegn_core::spillover::SpillState> {
         let m = db.health_get(&format!("provider:{env}")).ok().flatten()?;
         Some(thegn_core::spillover::SpillState {
@@ -800,9 +803,9 @@ pub(crate) fn note_spillover_failure(cfg: &Config, worktree: &str, error: &str) 
         .health_get(&key)
         .ok()
         .flatten()
-        .map(|m| m.consecutive + 1)
+        .map(|m| m.consecutive.saturating_add(1))
         .unwrap_or(1);
-    let now_ms = unix_now() * 1000;
+    let now_ms = thegn_core::util::now_ms();
     let cooldown = thegn_core::spillover::spill_cooldown_ms(kind, consecutive, None);
     // best-effort: health is advisory, provisioning already surfaced the error
     let _ = db.health_mark(&HealthMarker {
@@ -810,7 +813,7 @@ pub(crate) fn note_spillover_failure(cfg: &Config, worktree: &str, error: &str) 
         kind: kind.as_str().to_string(),
         reason: error.chars().take(200).collect(),
         since_ms: now_ms,
-        retry_at_ms: now_ms + cooldown,
+        retry_at_ms: now_ms.saturating_add(cooldown),
         consecutive,
     });
 }
@@ -868,7 +871,7 @@ pub(crate) fn maintain_tick(cfg: &Config) {
             thegn_core::zone::sync_compute_budget_caps(&cfg, &db);
             // Watermark accrual: idempotent, catch-up-correct — cadence only
             // affects display freshness, never totals.
-            let now_ms = unix_now() * 1000;
+            let now_ms = thegn_core::util::now_ms();
             for m in db.live_compute_meters().unwrap_or_default() {
                 let _ = db.accrue_compute_meter(&m.resource, now_ms); // best-effort: cache write: meter accrual is ledger bookkeeping; display freshness only
             }

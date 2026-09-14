@@ -327,7 +327,7 @@ pub fn peak_across<'a>(accounts: &'a [AccountUsage]) -> Option<(usize, &'a Usage
 /// the window has no known reset.
 pub fn fmt_resets_in(resets_at: Option<i64>, now: i64) -> Option<String> {
     let at = resets_at?;
-    let rem = at - now;
+    let rem = i128::from(at) - i128::from(now);
     if rem <= 0 {
         return Some("now".to_string());
     }
@@ -384,7 +384,7 @@ pub fn forecast_exhaustion(
 ) -> Option<i64> {
     let run = current_run(samples);
     let (first, last) = (run.first()?, run.last()?);
-    let span = last.0 - first.0;
+    let span = last.0.checked_sub(first.0)?;
     if span < MIN_FORECAST_SPAN_SECS {
         return None;
     }
@@ -395,7 +395,13 @@ pub fn forecast_exhaustion(
     let remaining = (100.0 - last.1).max(0.0);
     // Round: `as i64` truncates, and f32 division lands a hair under the exact
     // answer often enough that a clean "1 hour" projection renders as 59m 59s.
-    let eta = now + (remaining / rate).round() as i64;
+    let seconds = f64::from((remaining / rate).round());
+    if !seconds.is_finite()
+        || !(0.0..=crate::time_policy::MAX_DURATION_SECS as f64).contains(&seconds)
+    {
+        return None;
+    }
+    let eta = crate::time_policy::deadline_seconds(now, seconds as u64)?;
     // Resetting before you run out is not a forecast worth showing.
     match resets_at {
         Some(r) if eta >= r => None,
@@ -805,8 +811,10 @@ impl CodexWindow {
     /// Resolve the absolute reset deadline: prefer `resets_at`, else `now +
     /// resets_in_seconds` (the older relative form).
     fn reset_at(&self, now: i64) -> Option<i64> {
-        self.resets_at
-            .or_else(|| self.resets_in_seconds.map(|s| now + s as i64))
+        self.resets_at.or_else(|| {
+            self.resets_in_seconds
+                .and_then(|s| crate::time_policy::deadline_seconds(now, s))
+        })
     }
 }
 
@@ -1233,9 +1241,10 @@ pub fn parse_antigravity_quota(bytes: &[u8], now: i64) -> Option<AccountUsage> {
     let mut windows = Vec::new();
     for (i, w) in sum.windows.iter().enumerate() {
         let label = safe_field(w.label.clone()).unwrap_or_else(|| format!("window {}", i + 1));
-        let resets_at = w
-            .resets_at
-            .or_else(|| w.resets_in_seconds.map(|s| now + s as i64));
+        let resets_at = w.resets_at.or_else(|| {
+            w.resets_in_seconds
+                .and_then(|s| crate::time_policy::deadline_seconds(now, s))
+        });
         windows.push(UsageWindow::new(
             &label,
             w.used_percent.unwrap_or(0.0) as f32,
@@ -1265,6 +1274,26 @@ mod tests {
             label: None,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn hostile_relative_usage_resets_and_epoch_spans_are_unknown_without_overflow() {
+        for delay in [i64::MAX as u64 - 1, i64::MAX as u64 + 1, u64::MAX] {
+            let window: CodexWindow =
+                serde_json::from_value(serde_json::json!({"resets_in_seconds":delay})).unwrap();
+            assert_eq!(window.reset_at(1000), None);
+            let body=serde_json::to_vec(&serde_json::json!({"windows":[{"label":"fixture","used_percent":5.0,"resets_in_seconds":delay}]})).unwrap();
+            let usage = parse_antigravity_quota(&body, 1000).unwrap();
+            assert_eq!(usage.windows[0].resets_at, None);
+        }
+        let window: CodexWindow =
+            serde_json::from_value(serde_json::json!({"resets_in_seconds":1})).unwrap();
+        assert_eq!(window.reset_at(i64::MAX), None);
+        assert!(fmt_resets_in(Some(i64::MAX), i64::MIN).is_some());
+        assert_eq!(
+            forecast_exhaustion(&[(i64::MIN, 10.0), (i64::MAX, 20.0)], i64::MAX, None),
+            None
+        );
     }
 
     #[test]

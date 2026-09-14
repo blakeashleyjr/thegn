@@ -668,7 +668,7 @@ fn record_usage_history(
         .collect();
     // best-effort: history is a nicety; a write failure must not fail the poll.
     let _ = db.put_usage_samples(&samples);
-    let since = now - i64::from(cfg.history_days) * 86_400;
+    let since = now.saturating_sub(i64::from(cfg.history_days) * 86_400);
     let _ = db.prune_usage_samples(since); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     for s in &samples {
         let hist = db

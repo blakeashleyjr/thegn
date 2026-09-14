@@ -50,7 +50,7 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const STEM: &str = "tg-hib";
 /// Age before a crashed-`capturing` row is discarded / a `destroying` row is
 /// re-driven by the healing sweep.
-const HEAL_AFTER_SECS: i64 = 10 * 60;
+const HEAL_AFTER_SECS: u64 = 10 * 60;
 
 /// Per-worktree failure backoff (in-memory: a restart retries, which is fine —
 /// the failure will just repeat its warning if it persists).
@@ -141,7 +141,10 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
     let now = thegn_core::util::now();
     let mut heal: Option<HibernationRow> = None;
     for row in db.hibernations().unwrap_or_default() {
-        let age = now - row.updated_at;
+        let Some(age) = thegn_core::time_policy::age_seconds(now, row.updated_at) else {
+            tracing::warn!(target: "thegn::hibernate", worktree = %row.worktree_path, "quarantined hibernation state with invalid/future update time; reconcile state; no destructive recovery attempted");
+            continue;
+        };
         match row.state.as_str() {
             // Crashed mid-capture: the VM is alive and the snapshot never
             // verified — drop the row so a later pass recaptures fresh.

@@ -117,7 +117,7 @@ pub(crate) fn mint_token(sandbox: &str) -> Option<String> {
     let token = format!("tgi_{}", encode_hex(&bytes));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0);
     thegn_core::db::Db::open()
         .ok()?

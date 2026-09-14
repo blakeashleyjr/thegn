@@ -138,7 +138,7 @@ impl Upstream {
     /// Milliseconds since the last health check, if any.
     pub fn health_age_ms(&self) -> Option<i64> {
         self.health_checked_at
-            .map(|t| t.elapsed().as_millis() as i64)
+            .map(|t| thegn_core::time_policy::saturating_i64(t.elapsed().as_millis()))
     }
 
     fn handshake(&mut self) -> Result<(), String> {

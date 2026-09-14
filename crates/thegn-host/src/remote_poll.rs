@@ -68,10 +68,7 @@ pub(crate) fn fetch_every_slots(interval_secs: u64) -> Option<u64> {
 /// trigger passes through, so a burst of worktree switches costs one fetch.
 /// Pure, so it's unit-tested.
 pub(crate) fn due(last_at: Option<i64>, now: i64, min_interval_secs: u64) -> bool {
-    match last_at {
-        Some(t) => now.saturating_sub(t) >= min_interval_secs as i64,
-        None => true,
-    }
+    !thegn_core::time_policy::is_fresh(now, last_at, min_interval_secs)
 }
 
 /// Refetch backoff after `failures` consecutive errors: the poll interval
@@ -172,7 +169,9 @@ fn release(repo: &str, now: i64, ok: bool, interval_secs: u64) {
         e.backoff_until = 0;
     } else {
         e.failures = e.failures.saturating_add(1);
-        e.backoff_until = now + backoff_secs(e.failures, interval_secs) as i64;
+        e.backoff_until =
+            thegn_core::time_policy::deadline_seconds(now, backoff_secs(e.failures, interval_secs))
+                .unwrap_or(i64::MAX);
     }
 }
 
@@ -521,6 +520,13 @@ fn next_sweep_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enormous_fetch_floor_cannot_narrow_into_an_immediate_retry() {
+        assert!(!due(Some(1), 1000, u64::MAX));
+        assert!(!due(Some(i64::MAX), i64::MIN, 1));
+        assert!(due(Some(1000), 1000, 0));
+    }
 
     #[test]
     fn cadence_honors_config_and_clamps() {

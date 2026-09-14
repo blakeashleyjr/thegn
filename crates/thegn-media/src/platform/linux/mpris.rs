@@ -634,7 +634,7 @@ fn f64_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<f64> {
 fn micros_of(v: &Value<'_>) -> Option<i64> {
     match peel(v) {
         Value::I64(n) => Some(*n),
-        Value::U64(n) => Some(*n as i64),
+        Value::U64(n) => i64::try_from(*n).ok(),
         Value::I32(n) => Some(*n as i64),
         Value::U32(n) => Some(*n as i64),
         Value::I16(n) => Some(*n as i64),
@@ -718,6 +718,13 @@ fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_media_duration_cannot_wrap_negative() {
+        assert_eq!(micros_of(&Value::U64(u64::MAX)), None);
+        assert_eq!(micros_of(&Value::U64(i64::MAX as u64)), Some(i64::MAX));
+        assert_eq!(micros_of(&Value::U64(30_000_000)), Some(30_000_000));
+    }
 
     #[test]
     fn tail_strips_prefix() {

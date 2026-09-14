@@ -56,3 +56,19 @@ isolation/network override alongside a bad TTL. Environment checks now clear onl
 invalid duration fields and apply every other explicit setting. A mixed security
 override regression covers this. Raw duration admission recognizes the two existing
 metrics duration aliases, so aliases cannot bypass write/profile range checks.
+
+
+THE-484 implements checked provider resource expiry with an explicit observable
+quarantine decision. Fly uses its existing authenticated read seam and requires
+one exact owned machine plus provider created_at; local ledger times are never
+promoted to authoritative age. Empty/multiple/malformed/mismatched inventories
+and transient reads retain ownership state for reconciliation. Last-read-to-delete
+identity races remain outside this numerical repair. VPS parser outputs feed the
+same checked age policy; missing and future timestamps do not authorize cleanup.
+
+The remaining consumer audit includes lease/breaker/budget configuration, budget
+storage window arithmetic, CI/calendar/weather/scan/LOC/Git/placement freshness,
+usage and proxy reset delays, jitter and epoch narrowing, and MPRIS durations.
+Strict pairing-code relative durations reject before mint/persistence. Local
+provisioning/hibernation timestamps are checked before age-derived destructive
+recovery. Complete file/cast classification and evidence live in the THE-484 audit.

@@ -971,7 +971,9 @@ impl MonitorOverlay {
             KeyCode::Char(' ') => {
                 self.paused = !self.paused;
                 if self.paused {
-                    self.paused_at = Some(self.last_now_ms as i64);
+                    self.paused_at = Some(thegn_core::time_policy::saturating_i64(u128::from(
+                        self.last_now_ms,
+                    )));
                     // Pin "now" so the frozen plot doesn't creep rightwards.
                     self.frozen_now_ms = Some(self.last_now_ms);
                 } else {
@@ -1440,7 +1442,12 @@ impl MonitorOverlay {
     fn paused_for(&self) -> String {
         let secs = self
             .paused_at
-            .map(|at| (self.last_now_ms as i64 - at).max(0) / 1000)
+            .map(|at| {
+                thegn_core::time_policy::saturating_i64(u128::from(self.last_now_ms))
+                    .saturating_sub(at)
+                    .max(0)
+                    / 1000
+            })
             .unwrap_or(0);
         if secs < 60 {
             format!("{secs}s")
