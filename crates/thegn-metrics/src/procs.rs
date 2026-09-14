@@ -55,6 +55,8 @@ pub enum ProcOwner {
 pub struct ProcSample {
     pub pid: u32,
     pub ppid: Option<u32>,
+    /// Sampled process birth time (Unix seconds), paired with PID for UI identity.
+    pub start_time: u64,
     /// Executable name, truncated. Deliberately **not** the full command line:
     /// reading `cmdline` is an extra syscall per process, and a command line can
     /// carry secrets that have no business in a UI list.
@@ -184,17 +186,7 @@ impl ProcSampler {
         // Pass 2: keep the union of the two top-N sets, so the UI can re-sort
         // without waiting for a fresh sample under a new key.
         let keep = self.rows.max(TOP_N).min(total);
-        let mut chosen: Vec<Pid> = Vec::with_capacity(keep * 2);
-        if keep > 0 {
-            let n = keep.min(self.scratch.len());
-            self.scratch
-                .select_nth_unstable_by(n - 1, |a, b| b.1.total_cmp(&a.1));
-            chosen.extend(self.scratch[..n].iter().map(|(p, _, _)| *p));
-            self.scratch
-                .select_nth_unstable_by(n - 1, |a, b| b.2.cmp(&a.2));
-            chosen.extend(self.scratch[..n].iter().map(|(p, _, _)| *p));
-        }
-        chosen = dedup_pids(chosen);
+        let chosen = choose_top(&mut self.scratch, keep);
 
         let procs = chosen
             .into_iter()
@@ -203,6 +195,7 @@ impl ProcSampler {
                 Some(ProcSample {
                     pid: pid.as_u32(),
                     ppid: p.parent().map(|x| x.as_u32()),
+                    start_time: p.start_time(),
                     name: p.name().to_string_lossy().chars().take(32).collect(),
                     cpu_pct: p.cpu_usage(),
                     rss_bytes: p.memory(),
@@ -251,9 +244,52 @@ impl ProcSampler {
     }
 }
 
+/// Keep the bounded union deterministically even when the OS process map arrives
+/// in a different order. Tie-breaking AFTER truncation cannot recover excluded
+/// rows, so both admission comparisons include PID.
+fn choose_top(scratch: &mut [(Pid, f32, u64)], keep: usize) -> Vec<Pid> {
+    let n = keep.min(scratch.len());
+    let mut chosen = Vec::with_capacity(n * 2);
+    if n > 0 {
+        scratch.select_nth_unstable_by(n - 1, |a, b| {
+            b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+        });
+        chosen.extend(scratch[..n].iter().map(|(p, _, _)| *p));
+        scratch.select_nth_unstable_by(n - 1, |a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        chosen.extend(scratch[..n].iter().map(|(p, _, _)| *p));
+    }
+    dedup_pids(chosen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tied_top_membership_is_independent_of_enumeration_order() {
+        let original: Vec<_> = (1..=100).map(|p| (Pid::from_u32(p), 0.0, 1024)).collect();
+        let want: Vec<_> = (1..=TOP_N as u32).map(Pid::from_u32).collect();
+        for shift in 0..original.len() {
+            let mut reordered = original.clone();
+            reordered.rotate_left(shift);
+            if shift % 2 == 0 {
+                reordered.reverse();
+            }
+            assert_eq!(choose_top(&mut reordered, TOP_N), want);
+        }
+    }
+
+    #[test]
+    fn top_union_keeps_distinct_cpu_and_memory_leaders_and_bounds() {
+        let mut scratch: Vec<_> = (1..=100)
+            .map(|p| (Pid::from_u32(p), p as f32, 101 - u64::from(p)))
+            .collect();
+        let out = choose_top(&mut scratch, 2);
+        assert_eq!(out, [1, 2, 99, 100].map(Pid::from_u32));
+        assert!(choose_top(&mut scratch, 0).is_empty());
+        assert_eq!(choose_top(&mut scratch, 1000).len(), 100);
+        assert!(choose_top(&mut [], 32).is_empty());
+    }
 
     #[test]
     fn dedup_pids_never_repeats() {
