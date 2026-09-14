@@ -253,6 +253,15 @@ fn raw_requires_both_explicit_policy_and_filter() {
 
 #[test]
 fn invalid_and_oversized_values_fail_without_partial_program() {
+    let huge = TemplateCtx {
+        selected_file: Some("x".repeat(2 * 1024 * 1024)),
+        ..Default::default()
+    };
+    assert!(matches!(
+        resolve(".SelectedFile", &huge).unwrap(),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    assert!(compile(&config("printf '%s' {{.SelectedFile}}"), &huge).is_err());
     for value in ["contains\0nul".into(), "x".repeat(1024 * 1024 + 1)] {
         assert!(compile(&config("printf '%s' {{.SelectedFile}}"), &context(&value)).is_err());
     }
@@ -268,9 +277,11 @@ fn invalid_and_oversized_values_fail_without_partial_program() {
 
 #[test]
 fn strict_validation_rejects_only_the_command_not_config_deserialization() {
-    let body = "[sandbox]\ndefault = 'none'\n[[git_commands]]\nkey='x'\ncommand='echo {{.SelectedFile}}'\n";
+    let body = "[sandbox]\nenabled = true\nnetwork = 'none'\n[[git_commands]]\nkey='x'\ncommand='echo {{.SelectedFile}}'\n";
     let cfg: crate::config::Config = toml::from_str(body).unwrap();
     assert_eq!(cfg.git_commands.len(), 1);
+    assert!(cfg.sandbox.enabled);
+    assert_eq!(cfg.sandbox.network, crate::config::Network::None);
     assert!(
         crate::config_validate::validate_str(body)
             .iter()
