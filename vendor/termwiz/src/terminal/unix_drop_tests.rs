@@ -83,6 +83,10 @@ fn hung_up_pty_drop_during_unwind_child() {
 
 #[test]
 fn hung_up_pty_drop_during_unwind_does_not_abort() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only parent waits for its exact reexecuted PTY unwind fixture, off the compositor"
+    )]
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg(format!(

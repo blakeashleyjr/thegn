@@ -97,14 +97,16 @@ impl Fixture {
         }
         std::fs::create_dir_all(state.join("thegn")).unwrap();
         let db = Db::open_at(&state.join("thegn/thegn.db")).unwrap();
-        let mut config = Config::default();
-        config.merge_queue = MergeQueueConfig {
-            target_branch: "main".into(),
-            snapshot_dirty: true,
-            gate_on: false,
-            require_enqueue: true,
-            organize_folders: false,
-            on_landed: OnLanded::Off,
+        let config = Config {
+            merge_queue: MergeQueueConfig {
+                target_branch: "main".into(),
+                snapshot_dirty: true,
+                gate_on: false,
+                require_enqueue: true,
+                organize_folders: false,
+                on_landed: OnLanded::Off,
+                ..Default::default()
+            },
             ..Default::default()
         };
         db.enqueue_merge(queued.to_str().unwrap(), "queued", "main")

@@ -260,22 +260,29 @@ fn late_viewer_origin_head_and_worktree_changes_hold_without_touching_owned_rows
                 assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
                 match case {
                     "viewer" => {} // The second fresh proof returns the rotated viewer.
-                    "origin" => assert!(
-                        fixture
+                    "origin" => {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "private synchronous fixture preparation callback, off the compositor"
+                        )]
+                        let changed = fixture
                             .loc
                             .git_command(&[
                                 "remote",
                                 "set-url",
                                 "origin",
-                                "https://github.com/other/project.git"
+                                "https://github.com/other/project.git",
                             ])
                             .output()
-                            .unwrap()
-                            .status
-                            .success()
-                    ),
-                    "head" => assert!(
-                        fixture
+                            .unwrap();
+                        assert!(changed.status.success());
+                    }
+                    "head" => {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "private synchronous fixture preparation callback, off the compositor"
+                        )]
+                        let committed = fixture
                             .loc
                             .git_command(&[
                                 "-c",
@@ -287,13 +294,12 @@ fn late_viewer_origin_head_and_worktree_changes_hold_without_touching_owned_rows
                                 "commit",
                                 "--allow-empty",
                                 "-m",
-                                "moved"
+                                "moved",
                             ])
                             .output()
-                            .unwrap()
-                            .status
-                            .success()
-                    ),
+                            .unwrap();
+                        assert!(committed.status.success());
+                    }
                     "worktree" => fixture
                         .db
                         .set_worktree_location(path, "changed-placement")

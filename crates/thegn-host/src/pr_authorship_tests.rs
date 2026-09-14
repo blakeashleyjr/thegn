@@ -21,6 +21,10 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let loc = GitLoc::Local(dir.path().into());
         let git = |args: &[&str]| {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "private synchronous fixture Git setup, off the compositor"
+            )]
             let output = loc.git_command(args).output().unwrap();
             assert!(
                 output.status.success(),
@@ -237,19 +241,21 @@ fn account_change_and_origin_change_after_preparation_hold() {
         &fixture.pr,
     )
     .unwrap();
-    assert!(
-        fixture
-            .loc
-            .git_command(&[
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/other/project.git"
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "private synchronous fixture origin mutation, off the compositor"
+    )]
+    let changed = fixture
+        .loc
+        .git_command(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/other/project.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(changed.success());
     assert!(
         revalidate(
             permit.as_ref(),
@@ -304,26 +310,27 @@ fn only_verified_review_completion_can_advance_the_permitted_head() {
         &fixture.pr,
     )
     .unwrap();
-    assert!(
-        fixture
-            .loc
-            .git_command(&[
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "verified fixture push"
-            ])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "private synchronous fixture commit, off the compositor"
+    )]
+    let committed = fixture
+        .loc
+        .git_command(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "verified fixture push",
+        ])
+        .output()
+        .unwrap();
+    assert!(committed.status.success());
     let mut after = fixture.pr.clone();
     after.head_ref_oid = fixture.loc.git_out(&["rev-parse", "HEAD"]).unwrap();
     let mut proof = fixture.proof.clone();
@@ -419,24 +426,26 @@ fn persisted_remote_malformed_and_changed_execution_locations_hold_before_proof(
     // A different checkout with identical repository/head evidence is still a
     // different selected execution location.
     let other = Fixture::new();
-    assert!(
-        other
-            .loc
-            .git_command(&["fetch", "--quiet", path, &fixture.pr.head_ref_oid])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    assert!(
-        other
-            .loc
-            .git_command(&["checkout", "--quiet", "--detach", "FETCH_HEAD"])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "private synchronous fixture fetch between owned local paths, off the compositor"
+    )]
+    let fetched = other
+        .loc
+        .git_command(&["fetch", "--quiet", path, &fixture.pr.head_ref_oid])
+        .output()
+        .unwrap();
+    assert!(fetched.status.success());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "private synchronous fixture checkout, off the compositor"
+    )]
+    let checked_out = other
+        .loc
+        .git_command(&["checkout", "--quiet", "--detach", "FETCH_HEAD"])
+        .output()
+        .unwrap();
+    assert!(checked_out.status.success());
     assert_eq!(
         other.loc.git_out(&["rev-parse", "HEAD"]),
         Some(fixture.pr.head_ref_oid.clone())

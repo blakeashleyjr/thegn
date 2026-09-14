@@ -721,7 +721,11 @@ mod tests {
                     impl Drop for Release {
                         fn drop(&mut self) {
                             if let Err(error) = std::fs::write(&self.0, "release") {
-                                eprintln!("private hook release failed: {error}");
+                                std::io::Write::write_fmt(
+                                    &mut std::io::stderr(),
+                                    format_args!("private hook release failed: {error}\n"),
+                                )
+                                .unwrap_or(()); // Best-effort diagnostic during cleanup/unwind.
                             }
                         }
                     }

@@ -11,6 +11,10 @@ fn git(executable: &Path, cwd: &Path, args: &[&str]) {
     for variable in thegn_core::util::GIT_ENV_VARS {
         command.env_remove(variable);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hydration workload prepares owned private Git fixtures without a compositor"
+    )]
     let output = command
         .current_dir(cwd)
         .args(args)
