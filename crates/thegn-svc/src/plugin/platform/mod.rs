@@ -9,3 +9,6 @@ pub(crate) use unix::*;
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
+
+#[cfg(test)]
+mod native_tests;

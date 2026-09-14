@@ -1,9 +1,9 @@
 # THE-154: resident plugin lifecycle investigation and proposed repair
 
-Status: scoped lifecycle plan approved by primary review. Native Unix validation and Windows cross type-check passed; final host integration and scoped landing review remain pending. Full THE-154 acceptance remains open.
+Status (September 14): the scoped lifecycle repair landed on local main. Its final assembled gate passed 48 plugin regressions, host integration, and scoped clippy; all 48 passed again during native Linux landing validation. Full THE-154 acceptance remains open. The native test/CI follow-up below is approved; its new execution evidence is still pending.
 This is an existing lifecycle defect, not a plugin feature expansion.
 
-## Current reachable defects
+## Historical defects at the original audit baseline (repaired)
 
 `plugin/session.rs` shares ChildStdin behind a mutex and performs blocking
 write_all/flush from SessionWriter callers, including compositor callbacks.
@@ -216,3 +216,53 @@ source Unix platform harness passed **4/4**, including these guards, final drop
 and zero idle wakeups. The integrating reviewer will run the final plugin suite
 (expected 48 tests) with host integration and quick/clippy; that final graph is
 not claimed by the earlier 46-test checkpoint.
+
+## September 14: native fixture and CI follow-up
+
+Primary approved a test-only repair of the native verification gap against main
+`1ef8228f`. The Windows CI job selected service IPC tests and host platform tests,
+but never the resident service lifecycle tests. The existing service fixtures use
+`sh`, so adding their names to the Windows job would depend on a foreign shell.
+
+The new `plugin::platform::native_tests` module reexecutes the Rust unit-test
+binary with an exact ignored helper selector and a private child-only mode. An
+explicit READY message proves the fixture reached its intended behavior before
+admission/control assertions. The helper is not a regression pass and is not a
+shipping executable. Every fixture has a 20-second process-local watchdog;
+parent assertion unwinding requests cleanup through the retained supervisor.
+There are no fixture grandchildren or broad process kills.
+
+Eight native regressions cover a stopped stdin reader and calling-thread
+progress, the write deadline, stdout EOF while the leader lives, native pipe and
+protocol failures, callback panic, final reply and pending-RPC EOF, concurrent
+shutdown/kill, and spawn failure followed by replacement. All settlement claims
+remain `tree: Unproven`. The existing deterministic Windows cancellation test
+is selected separately by its exact full name; cancellation between the worker
+latch and ReadFile must be repeated until the actual thread finishes.
+
+The opt-in Windows CI job runs both selections. Its opt-in policy, macOS full
+build/test job, production platform code and plugin availability are unchanged.
+No CI dispatch, push or native Windows/macOS execution is performed by this
+change. Linux execution and foreign-target compilation will be recorded after
+the coordinated validation slot becomes available.
+
+| Gate                              | Evidence before this follow-up                                 | Remaining evidence                                                                                     |
+| --------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Native Linux lifecycle            | Landed plugin subset 48/48, rerun during September 14 landing  | Execute the eight new portable regressions and existing subset                                         |
+| Windows library/tests compilation | Full service `x86_64-pc-windows-gnu --tests` crosscheck passed | Recheck added test source; this cannot prove Windows runtime behavior                                  |
+| Native Windows lifecycle          | No recorded resident fixture execution                         | Run the explicit native CI selections on Windows, including CancelSynchronousIo race and failure paths |
+| Darwin source compilation         | Isolated actual-source platform/tests crosscheck passed        | Added portable fixture source is not covered by that historical check                                  |
+| Native macOS lifecycle            | No recorded resident fixture execution                         | Execute resident tests on macOS to exercise SIGCHLD/WNOWAIT and native pipes                           |
+| Complete escaped-tree containment | No enforceable resident tree owner on any supported platform   | Architectural containment prerequisite and native descendant/accounting evidence                       |
+
+Complete-tree closure cannot be obtained by reusing the current host Windows
+helper: it assigns the Job Object after spawn and permits a direct-child fallback.
+Its existing tree-labelled tests observe the leader, not complete descendant
+accounting. A pre-execution non-breakaway job owner and completion evidence are
+still required. Linux process groups and pidfds do not contain setsid/setpgid
+escape. The existing bwrap sandbox is a different launch path and permission
+contract, not a drop-in resident owner; a PID-namespace or protected cgroup owner
+requires a separate availability and escape policy. There is no existing macOS
+complete-tree containment seam to extract. These are outstanding prerequisites,
+not claims that an unproven tree is a known living descendant or a reason to
+disable otherwise working plugins.

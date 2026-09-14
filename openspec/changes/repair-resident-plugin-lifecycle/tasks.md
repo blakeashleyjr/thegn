@@ -17,3 +17,11 @@
 - [ ] Execute native Windows cancellation/admission/lifecycle fixtures.
 - [ ] Supply enforceable escaped-descendant containment and platform failure policy.
 - [ ] Prove complete process-tree cleanup with native platform evidence.
+
+## September 14 native verification follow-up
+
+- [x] Primary approval for portable test-only reexec fixtures and explicit native Windows CI selection; no containment implementation.
+- [x] Add explicit READY, finite fixture lifetime, assertion-unwind cleanup and shell-independent lifecycle/failure coverage.
+- [x] Select native lifecycle and exact Windows cancellation-race regressions in the existing opt-in CI job; preserve macOS pipeline.
+- [ ] Execute new native Linux regressions and foreign-target source checks, recording their different proof limits.
+- [ ] Complete independent adversarial review, scoped checks and local landing of the follow-up.
