@@ -57,6 +57,14 @@ fn read_doc(path: &Path) -> Result<DocumentMut> {
 }
 
 fn write_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
+    let prior = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {} before validation", path.display()));
+        }
+    };
+    crate::custom_cmd::validate_write(&prior, &doc.to_string()).map_err(anyhow::Error::msg)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
