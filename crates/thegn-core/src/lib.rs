@@ -45,6 +45,7 @@ pub mod config_calendar;
 pub mod config_ci;
 pub mod config_compat;
 pub mod config_daemon;
+mod config_diagnostics;
 pub mod config_defaults;
 pub mod config_drawer;
 pub mod config_env_tables;

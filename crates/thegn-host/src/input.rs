@@ -5,6 +5,50 @@ use termwiz::input::{KeyCode, Modifiers};
 
 use crate::emulator::MouseMode;
 
+/// Safe keyboard diagnostics. Never format the original key or action payload:
+/// terminal echo policy belongs to the child and cannot authorize host logging.
+pub(crate) fn log_dispatch(
+    raw: &KeyCode,
+    raw_mods: Modifiers,
+    normalized: &crate::sequence::Key,
+    dispatch: &crate::sequence::MatchResult,
+) {
+    if !tracing::enabled!(target: "thegn::input", tracing::Level::DEBUG) {
+        return;
+    }
+    let result = match dispatch {
+        crate::sequence::MatchResult::None => "forwarded",
+        crate::sequence::MatchResult::Pending => "pending",
+        crate::sequence::MatchResult::Matched(_) => "matched",
+    };
+    tracing::debug!(target: "thegn::input",
+        raw_key = diagnostic_key(raw), raw_mods = ?raw_mods,
+        norm_key = diagnostic_key(&normalized.code), norm_mods = ?normalized.mods,
+        result, "key dispatch");
+}
+
+pub(crate) fn diagnostic_key(key: &KeyCode) -> &'static str {
+    // An allowlist prevents future payload-bearing variants from leaking too.
+    match key {
+        KeyCode::Char(_) => "character",
+        KeyCode::UpArrow => "up",
+        KeyCode::DownArrow => "down",
+        KeyCode::LeftArrow => "left",
+        KeyCode::RightArrow => "right",
+        KeyCode::Escape => "escape",
+        KeyCode::Enter => "enter",
+        KeyCode::Tab => "tab",
+        KeyCode::Backspace => "backspace",
+        KeyCode::Delete => "delete",
+        KeyCode::Home => "home",
+        KeyCode::End => "end",
+        KeyCode::PageUp => "page_up",
+        KeyCode::PageDown => "page_down",
+        KeyCode::Function(_) => "function",
+        _ => "other",
+    }
+}
+
 /// True when a termwiz key event represents the physical Escape key.
 ///
 /// Most terminals decode Esc as [`KeyCode::Escape`], but CSI-u/fixterms
@@ -430,5 +474,112 @@ mod tests {
         );
         // Nothing when the app didn't ask.
         assert!(encode_mouse(PaneMouse::Press(0), M::None, true, 0, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn compositor_log_targets_cannot_serialize_raw_keyboard_payloads() {
+        // Cover every tracing target in the compositor, including startup/
+        // dormant-frame paths outside normal key dispatch.
+        let source = include_str!("run.rs");
+        for call in source.split("tracing::").skip(1) {
+            let call: String = call
+                .split(");")
+                .next()
+                .unwrap()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            for forbidden in [
+                "?k.key",
+                "?input_key.code",
+                "?dispatch",
+                "key=?",
+                "event=?k,",
+                "input=?k,",
+            ] {
+                assert!(
+                    !call.contains(forbidden),
+                    "raw keyboard payload in tracing call: {forbidden}"
+                );
+            }
+        }
+        assert!(source.contains("key = crate::input::diagnostic_key(&k.key)"));
+    }
+
+    #[test]
+    fn broad_diagnostics_never_capture_characters_or_action_payloads() {
+        for filter in [
+            "debug,thegn=debug,thegn_core=debug,thegn_svc=debug",
+            "trace",
+        ] {
+            let capture = Capture::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                for key in [
+                    KeyCode::Char('☃'),
+                    KeyCode::Char('密'),
+                    KeyCode::Char('\x01'),
+                    KeyCode::Numpad7,
+                ] {
+                    tracing::debug!(target: "thegn::frame", key = diagnostic_key(&key), "dormant dismissed by key");
+                    let normalized = crate::sequence::Key::modified(key, Modifiers::CTRL);
+                    log_dispatch(
+                        &key,
+                        Modifiers::CTRL,
+                        &normalized,
+                        &crate::sequence::MatchResult::None,
+                    );
+                    log_dispatch(
+                        &key,
+                        Modifiers::CTRL,
+                        &normalized,
+                        &crate::sequence::MatchResult::Pending,
+                    );
+                    log_dispatch(
+                        &key,
+                        Modifiers::CTRL,
+                        &normalized,
+                        &crate::sequence::MatchResult::Matched(crate::keymap::Action::Custom(
+                            54321,
+                        )),
+                    );
+                }
+            });
+            let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            for forbidden in ["☃", "密", "Char(", "Numpad7", "54321", "Custom(", "\\u{1}"] {
+                assert!(
+                    !output.contains(forbidden),
+                    "sensitive payload {forbidden:?} in {output}"
+                );
+            }
+            for retained in ["CTRL", "forwarded", "pending", "matched", "character"] {
+                assert!(output.contains(retained), "missing diagnostic {retained}");
+            }
+        }
     }
 }

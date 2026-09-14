@@ -31,8 +31,9 @@ fn is_false(value: &bool) -> bool {
 }
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
+#[track_caller]
 pub fn config_warn(msg: &str) {
-    crate::msg::warn(&format!("config: {msg}"));
+    crate::config_diagnostics::warn(msg);
 }
 
 /// Validate a chrono strftime format string.
@@ -5876,6 +5877,7 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
         };
+        let _diagnostic_source = crate::config_diagnostics::source(&file, &s);
         let normalized = crate::config_compat::normalize(&s)?;
         for diagnostic in &normalized.diagnostics {
             config_warn(diagnostic);
@@ -5909,7 +5911,10 @@ impl Config {
         // shared base still loads while the profile refines it. Below env/`--set`.
         if let Some(pfile) = Self::profile_overlay_path(env)
             && let Ok(ps) = std::fs::read_to_string(&pfile)
-            && let Err(e) = Self::apply_toml_overlay(&mut cfg, &ps)
+            && let Err(e) = {
+                let _profile_source = crate::config_diagnostics::source(&pfile, &ps);
+                Self::apply_toml_overlay(&mut cfg, &ps)
+            }
         {
             config_warn(&format!("profile config {}: {e}", pfile.display()));
         }
@@ -5971,6 +5976,7 @@ impl Config {
     /// keys the overlay omits are preserved). The mechanism behind the profile
     /// (and later subprofile) full overlays. Pure + unit-tested.
     pub fn apply_toml_overlay(cfg: &mut Config, toml_str: &str) -> Result<(), String> {
+        let _diagnostic_source = crate::config_diagnostics::source("overlay", toml_str);
         let normalized = crate::config_compat::normalize(toml_str)?;
         for diagnostic in normalized.diagnostics {
             config_warn(&diagnostic);
