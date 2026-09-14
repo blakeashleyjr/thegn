@@ -7,7 +7,7 @@
 - [x] Add Windows finite owned pipe workers and repeated exact-thread cancellation.
 - [x] Bind provider pending calls and replies to their originating session.
 - [x] Wire one supervisor across reloads and cleanup outside all UI-loop returns.
-- [x] Pass focused native Unix session/provider/lifecycle fixtures (45 passed; additional counting-waker fixture passed in an actual-source harness).
+- [x] Pass focused native Unix session/provider/lifecycle fixtures (46 passed at the last native checkpoint; final guard/group/newline source harnesses passed, final assembled suite pending).
 - [ ] Pass host integration and required source/format checks.
 - [ ] Complete independent adversarial review of the final checkpoint.
 - [ ] Coordinate local landing.

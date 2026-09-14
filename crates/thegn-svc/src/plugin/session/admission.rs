@@ -230,8 +230,7 @@ impl SessionWriter {
                 SessionFailure::TooLarge
             }
         })?;
-        frame.0.push(b'\n');
-        self.admit(frame.0)
+        self.admit(frame.finish())
     }
 
     pub fn respond(&self, response: &RpcResponse) -> Result<(), SessionFailure> {
@@ -249,6 +248,18 @@ impl SessionWriter {
 }
 
 struct BoundedFrame(Vec<u8>, usize);
+
+impl BoundedFrame {
+    fn finish(mut self) -> Vec<u8> {
+        // Serde may finish at a non-power-of-two capacity. An ordinary push
+        // could double that allocation beyond the frame/remaining-byte cap.
+        if self.0.len() == self.0.capacity() {
+            self.0.reserve_exact(1);
+        }
+        self.0.push(b'\n');
+        self.0
+    }
+}
 
 impl Write for BoundedFrame {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -321,6 +332,30 @@ mod tests {
         let mut small = BoundedFrame(Vec::new(), 127);
         assert!(serde_json::to_writer(&mut small, &"x".repeat(MAX_LINE_BYTES)).is_err());
         assert!(small.0.len() <= 127 && small.0.capacity() <= 128);
+    }
+
+    #[test]
+    fn resident_final_newline_does_not_double_large_json_allocation() {
+        let value = serde_json::json!({"id":1_000_000,"method":"provider.call",
+            "params":{"a":"x".repeat(300_000),"b":"y".repeat(300_044)}});
+        let mut frame = BoundedFrame(Vec::new(), MAX_LINE_BYTES - 1);
+        serde_json::to_writer(&mut frame, &value).unwrap();
+        assert_eq!(frame.0.len(), 600_108);
+        assert_eq!(
+            frame.0.capacity(),
+            frame.0.len(),
+            "fixture must hit delimiter growth boundary"
+        );
+        let wire = frame.finish();
+        assert_eq!(wire.len(), 600_109);
+        assert!(wire.capacity() <= MAX_LINE_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&wire).unwrap(),
+            value
+        );
+        let shared = Shared::new();
+        SessionWriter(shared.clone()).send_json(&value).unwrap();
+        assert!(shared.pop().unwrap().capacity() <= MAX_LINE_BYTES);
     }
 
     #[test]

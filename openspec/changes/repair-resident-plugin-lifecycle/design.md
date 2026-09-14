@@ -28,7 +28,10 @@ restriction without an idle timer. Non-Linux native behavior remains unverified.
 
 Unix creates a process group before exec. waitid(WNOWAIT) observes exit without
 releasing leader identity; group signaling precedes the consuming wait. An
-ECHILD/consuming-wait identity loss forbids all later signals. Neither process
+ECHILD/consuming-wait identity loss forbids all later signals and numeric waits.
+Original-group success or ESRCH is followed by a kill through the still-owned
+unreaped Child, because the leader may have moved out of that group. Other group
+errors remain reported; no newly discovered group is signaled. Neither process
 groups nor direct-child Windows termination prove tree containment.
 
 An owner guard is created before the future is submitted. Cancellation, including
