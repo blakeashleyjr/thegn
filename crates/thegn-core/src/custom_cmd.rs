@@ -6,6 +6,7 @@
 //! referenced-but-missing value is a hard error, never a silent empty string —
 //! that's how people force-push the wrong branch.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -72,7 +73,7 @@ mod command_tests;
 
 /// Resolve a dotted path against the context. Case-sensitive; accepts the
 /// lazygit alias spellings alongside the canonical thegn names.
-fn resolve(path: &str, ctx: &TemplateCtx) -> Result<String, TemplateError> {
+fn resolve<'a>(path: &str, ctx: &'a TemplateCtx) -> Result<Cow<'a, str>, TemplateError> {
     let missing = || TemplateError::MissingValue(path.to_string());
     if let Some(key) = path
         .strip_prefix(".Form.")
@@ -81,12 +82,16 @@ fn resolve(path: &str, ctx: &TemplateCtx) -> Result<String, TemplateError> {
         if key.is_empty() {
             return Err(TemplateError::UnknownPath(path.to_string()));
         }
-        return ctx.prompt_responses.get(key).cloned().ok_or_else(missing);
+        return ctx
+            .prompt_responses
+            .get(key)
+            .map(|value| Cow::Borrowed(value.as_str()))
+            .ok_or_else(missing);
     }
     let commit = |get: fn(&CommitVars) -> &str| {
         ctx.selected_commit
             .as_ref()
-            .map(|c| get(c).to_string())
+            .map(|c| Cow::Borrowed(get(c)))
             .ok_or_else(missing)
     };
     match path {
@@ -97,35 +102,43 @@ fn resolve(path: &str, ctx: &TemplateCtx) -> Result<String, TemplateError> {
         ".SelectedBranch.Name" | ".SelectedLocalBranch.Name" => ctx
             .selected_branch
             .as_ref()
-            .map(|b| b.name.clone())
+            .map(|b| Cow::Borrowed(b.name.as_str()))
             .ok_or_else(missing),
         ".SelectedBranch.Upstream" | ".SelectedLocalBranch.Upstream" => ctx
             .selected_branch
             .as_ref()
-            .and_then(|b| b.upstream.clone())
+            .and_then(|b| b.upstream.as_deref().map(Cow::Borrowed))
             .ok_or_else(missing),
         ".CheckedOutBranch.Name" => ctx
             .checked_out_branch
             .as_ref()
-            .map(|b| b.name.clone())
+            .map(|b| Cow::Borrowed(b.name.as_str()))
             .ok_or_else(missing),
         ".CheckedOutBranch.Upstream" => ctx
             .checked_out_branch
             .as_ref()
-            .and_then(|b| b.upstream.clone())
+            .and_then(|b| b.upstream.as_deref().map(Cow::Borrowed))
             .ok_or_else(missing),
-        ".SelectedFile" | ".SelectedFile.Name" => ctx.selected_file.clone().ok_or_else(missing),
+        ".SelectedFile" | ".SelectedFile.Name" => ctx
+            .selected_file
+            .as_deref()
+            .map(Cow::Borrowed)
+            .ok_or_else(missing),
         ".SelectedStash.Index" | ".SelectedStashEntry.Index" => ctx
             .selected_stash
             .as_ref()
-            .map(|s| s.index.to_string())
+            .map(|s| Cow::Owned(s.index.to_string()))
             .ok_or_else(missing),
         ".SelectedStash.Message" | ".SelectedStashEntry.Message" => ctx
             .selected_stash
             .as_ref()
-            .map(|s| s.message.clone())
+            .map(|s| Cow::Borrowed(s.message.as_str()))
             .ok_or_else(missing),
-        ".WorktreePath" => ctx.worktree_path.clone().ok_or_else(missing),
+        ".WorktreePath" => ctx
+            .worktree_path
+            .as_deref()
+            .map(Cow::Borrowed)
+            .ok_or_else(missing),
         _ => Err(TemplateError::UnknownPath(path.to_string())),
     }
 }

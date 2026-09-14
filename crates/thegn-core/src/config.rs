@@ -6179,7 +6179,7 @@ impl Config {
         }
 
         for diagnostic in crate::custom_cmd::validate_commands(&self.git_commands) {
-            crate::msg::warn(&diagnostic);
+            config_warn(&diagnostic);
         }
         for p in &mut self.pins {
             if let Some(cwd) = &p.cwd {
