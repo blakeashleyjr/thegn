@@ -21,6 +21,7 @@ pub struct PreviewConfig {
     /// Explicit candidate ports, ahead of pane/package-script hints.
     pub ports: Vec<u16>,
     /// Wall-clock limit for one bounded HTTP fetch.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub fetch_timeout_ms: u64,
     /// Maximum response bytes retained by one fetch.
     pub max_body_bytes: usize,
@@ -61,6 +62,7 @@ impl PreviewConfig {
 pub struct PreviewOverlay {
     pub enabled: Option<bool>,
     pub ports: Option<Vec<u16>>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub fetch_timeout_ms: Option<u64>,
     pub max_body_bytes: Option<usize>,
     pub allow_external_urls: Option<bool>,

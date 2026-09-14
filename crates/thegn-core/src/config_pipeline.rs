@@ -66,6 +66,7 @@ pub struct PipelineStage {
     /// as blocked, in seconds. **Advisory — thegn never fires this timer**; the
     /// Lead passes it to `thegn session wait --timeout` (milliseconds), which is
     /// the only watchdog that exists.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_secs: u64,
     /// The stage the Lead advances to when this one finishes. Unset = terminal.
     /// Advisory: no thegn code path follows this edge.
@@ -161,6 +162,7 @@ pub struct TransportRetry {
     pub max_attempts: u32,
     /// Base backoff in ms; doubles per attempt (`base * 2^(n-1)`), capped at
     /// 60 s by [`crate::pipeline_exit::MAX_BACKOFF_MS`].
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_MILLIS"))]
     pub backoff_ms: u64,
     /// Substrings (case-insensitive) that classify a dead worker's final
     /// screen as a retryable transport failure. **Replaces** the default list
