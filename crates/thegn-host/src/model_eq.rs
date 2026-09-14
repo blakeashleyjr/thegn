@@ -4,6 +4,13 @@
 use crate::chrome::FrameModel;
 
 impl FrameModel {
+    /// Hydration owns Git/DB state, while the process sampler owns this snapshot.
+    /// Transfer it at the authoritative swap so hydration cannot blank a live
+    /// process table between samples. Moving avoids copying the bounded row set.
+    pub fn carry_live_processes_from(&mut self, current: &mut Self) {
+        self.procs = std::mem::take(&mut current.procs);
+    }
+
     /// True when a freshly hydrated model carries no render-affecting change
     /// versus the one on screen — i.e. the 2 s "safety" refresh tick produced
     /// byte-identical git/db data. The event loop uses this to drain the
@@ -59,6 +66,8 @@ mod tests {
             glyph: '●',
         });
         other.stats.cpu_pct = Some(99);
+        other.procs.total = 42;
+        other.procs.enabled = true;
         // Loop-owned like `sidebar_focused`: re-derived by `SidebarState::sync`
         // after every model swap, so hydration equality must not read it.
         // Pinned here deliberately — if it ever joined `hydration_eq`, arming

@@ -17,6 +17,7 @@ const MAX_DEPTH: usize = 32;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcRow {
     pub pid: u32,
+    pub start_time: u64,
     pub name: String,
     pub owner: ProcOwner,
     pub cpu_pct: f32,
@@ -86,6 +87,7 @@ fn cmp(a: &ProcSample, b: &ProcSample, sort: ProcSort) -> std::cmp::Ordering {
 fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
     ProcRow {
         pid: p.pid,
+        start_time: p.start_time,
         name: p.name.clone(),
         owner: p.owner,
         cpu_pct: p.cpu_pct,
@@ -118,7 +120,7 @@ pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
             snap.procs.iter().filter(|p| matches(p, &filter)).collect();
         kept.sort_by(|a, b| {
             let ord = cmp(a, b, sort);
-            if desc { ord.reverse() } else { ord }
+            (if desc { ord.reverse() } else { ord }).then_with(|| a.pid.cmp(&b.pid))
         });
         return kept.iter().map(|p| row_of(p, 0, false)).collect();
     }
@@ -149,7 +151,7 @@ fn tree_rows(snap: &ProcSnapshot, sort: ProcSort, desc: bool, filter: &str) -> V
     let order = |v: &mut Vec<&ProcSample>| {
         v.sort_by(|a, b| {
             let ord = cmp(a, b, sort);
-            if desc { ord.reverse() } else { ord }
+            (if desc { ord.reverse() } else { ord }).then_with(|| a.pid.cmp(&b.pid))
         });
     };
     order(&mut roots);
@@ -263,6 +265,7 @@ mod tests {
             cpu_pct: cpu,
             rss_bytes: rss,
             run_secs: 0,
+            start_time: 100,
             owner: ProcOwner::Other,
         }
     }
@@ -282,6 +285,34 @@ mod tests {
             desc: true,
             filter: filter.to_string(),
             tree,
+        }
+    }
+
+    #[test]
+    fn tied_flat_and_tree_rows_have_stable_pid_order() {
+        for tree in [false, true] {
+            for desc in [false, true] {
+                for sort in [ProcSort::Cpu, ProcSort::Rss, ProcSort::Name] {
+                    let mut procs: Vec<_> = (1..=12)
+                        .map(|pid| sample(pid, None, "same", 0.0, 1024))
+                        .collect();
+                    for shift in 0..12 {
+                        procs.rotate_left(shift);
+                        procs.reverse();
+                        let v = ProcSnapshotView {
+                            tree,
+                            desc,
+                            sort,
+                            filter: String::new(),
+                        };
+                        let got: Vec<_> = rows(&snap(procs.clone()), v)
+                            .into_iter()
+                            .map(|r| r.pid)
+                            .collect();
+                        assert_eq!(got, (1..=12).collect::<Vec<_>>());
+                    }
+                }
+            }
         }
     }
 

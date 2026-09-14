@@ -9933,6 +9933,7 @@ async fn event_loop<T: Terminal>(
             // hydration must not replace it with its empty default.
             let notification_delivery = model.notification_delivery.clone();
             let notification_delivery_configured = model.notification_delivery_configured;
+            next_model.carry_live_processes_from(&mut model);
             model = next_model;
             model.ctrl_digits_reportable = ctrl_digits_reportable;
             model.notification_delivery = notification_delivery;
