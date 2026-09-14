@@ -27,6 +27,13 @@ harness 505/506 resurfaces scoped as AR 581).
 **Status legend:** `[x]` done · `[~]` partial · `[ ]` not started. Statuses are
 verified against the codebase. See `CLAUDE.md` for architecture.
 
+**September 13 live-build remediation:** THE-614 tracks the bounded fixes and
+review gates in [the remediation record](docs/audits/remediation-2026-09-13.md).
+The active OpenSpec changes cover session recovery/teardown, diagnostics/forge,
+performance/log following, build Git identity, and the existing merge/upgrade
+safety work. These are repairs to existing roadmap capabilities; canonical
+landing and environment-dependent verification remain pending.
+
 ---
 
 ## Progress summary (as of 2026-07-06)

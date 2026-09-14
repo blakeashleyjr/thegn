@@ -729,7 +729,7 @@ fmt-check:
 # `cargo test`. This recipe is the single source of truth shared by the CI
 # `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
 # the note there.
-test: contract-ratchets test-live
+test: contract-ratchets test-live test-build-metadata
     cargo nextest run --workspace
 
 # Doctest pass. Split out of `test` (and therefore off pre-push) because it is
@@ -1098,6 +1098,11 @@ live-plan level="debug" size_mb="20" files="5":
 # Private launcher regression tests; no Cargo or live-state mutation.
 test-live:
     python3 -B test/live_test.py
+
+# Real tiny Cargo fixtures exercise Git-only invalidation and linked-worktree
+# freshness without rebuilding the application.
+test-build-metadata:
+    python3 -B test/build_metadata_test.py
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,
