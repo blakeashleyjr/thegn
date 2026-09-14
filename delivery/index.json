@@ -537,6 +537,22 @@
       "summary": "Identity signing schema exists, but pane injection, enable semantics, precedence evidence, and dedicated help remain."
     },
     {
+      "change": "bound-duration-and-refresh-policy",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-483",
+          "project": "Alpha Reliability & State Compatibility"
+        },
+        {
+          "issue": "THE-484",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Bound duration and cadence conversion while retaining security policy and quarantining unknown destructive ages."
+    },
+    {
       "change": "bound-shared-framed-protocols",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
