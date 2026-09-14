@@ -13,6 +13,7 @@
 //! makes shell-script plugins impossible to write.
 
 pub mod loader;
+mod platform;
 pub mod proc;
 pub mod provider;
 pub mod session;
@@ -22,4 +23,4 @@ pub use loader::{
 };
 pub use proc::{PluginError, PluginRun, spawn_ndjson};
 pub use provider::{BridgeError, PluginIssueBackend, ProviderBridge};
-pub use session::{ResidentSession, SessionEvent, SessionWriter};
+pub use session::{ResidentSession, ResidentSupervisor, SessionEvent, SessionWriter};

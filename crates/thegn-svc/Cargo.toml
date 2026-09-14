@@ -85,6 +85,9 @@ tower = { version = "0.5", features = ["util"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_IO"] }
+
 [dev-dependencies]
 # One dev-dep, two reasons: the architecture ratchets (`test/*-ratchet.txt`)
 # share a helper from it, and `thegn_core::testenv::EnvGuard` is the shared

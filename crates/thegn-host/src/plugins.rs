@@ -19,7 +19,8 @@ use thegn_core::plugin_api::{
     SurfaceId,
 };
 use thegn_svc::plugin::{
-    LoadedPlugin, PluginError, PluginRun, ResidentSession, SessionEvent, SessionWriter,
+    LoadedPlugin, PluginError, PluginRun, ResidentSession, ResidentSupervisor, SessionEvent,
+    SessionWriter,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -71,6 +72,7 @@ type Disabled = Arc<Mutex<std::collections::BTreeSet<String>>>;
 /// every resident session.
 pub(crate) struct PluginsHost {
     stop: Arc<AtomicBool>,
+    supervisor: ResidentSupervisor,
     sessions: Sessions,
     disabled: Disabled,
     tx: tokio_mpsc::UnboundedSender<PluginMsg>,
@@ -82,6 +84,7 @@ pub(crate) struct PluginsHost {
 /// `CadenceHint::Interval` contributions. Call this only after the first frame
 /// has flushed (see the wiring in `run.rs`).
 pub(crate) fn spawn_plugins_host(
+    supervisor: ResidentSupervisor,
     specs: Vec<PluginSpec>,
     config_dir: PathBuf,
     tx: tokio_mpsc::UnboundedSender<PluginMsg>,
@@ -92,6 +95,7 @@ pub(crate) fn spawn_plugins_host(
     let disabled: Disabled = Arc::new(Mutex::new(Default::default()));
     let host = PluginsHost {
         stop: stop.clone(),
+        supervisor: supervisor.clone(),
         sessions: sessions.clone(),
         disabled: disabled.clone(),
         tx: tx.clone(),
@@ -102,7 +106,9 @@ pub(crate) fn spawn_plugins_host(
         .spawn(move || {
             // Utility: resident plugin contributions render as visible UI content.
             crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
-            setup_and_schedule(specs, config_dir, sessions, disabled, stop, tx, waker)
+            setup_and_schedule(
+                supervisor, specs, config_dir, sessions, disabled, stop, tx, waker,
+            )
         });
     if let Err(e) = spawn {
         tracing::warn!(target: "thegn::plugin", error = %e, "plugin host thread failed to start");
@@ -117,6 +123,7 @@ impl PluginsHost {
         let id = plugin.spec.manifest.id.as_str().to_string();
         let stop = self.stop.clone();
         let sessions = self.sessions.clone();
+        let supervisor = self.supervisor.clone();
         let tx = self.tx.clone();
         let waker = self.waker.clone();
         let spawn = std::thread::Builder::new()
@@ -128,7 +135,7 @@ impl PluginsHost {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                let writer = match spawn_session(&plugin, &tx, &waker) {
+                let writer = match spawn_session(&supervisor, &plugin, &tx, &waker) {
                     Ok(session) => {
                         let w = session.writer();
                         lock(&sessions).insert(id.clone(), session);
@@ -178,6 +185,9 @@ impl PluginsHost {
 
     pub(crate) fn set_disabled(&self, plugin: &str) {
         lock(&self.disabled).insert(plugin.to_string());
+        if let Some(session) = lock(&self.sessions).get(plugin) {
+            session.kill();
+        }
     }
 
     /// Best-effort `deactivate` + kill on every resident session. Idempotent.
@@ -187,12 +197,12 @@ impl PluginsHost {
         }
         let sessions = std::mem::take(&mut *lock(&self.sessions));
         for (id, session) in sessions {
-            // best-effort: the session may already be dead; kill() reaps it.
+            // Admission only: the supervisor owns termination and reaping.
             let _ = session
                 .writer()
                 .notify(PluginCallback::Deactivate, serde_json::json!({}));
             session.kill();
-            tracing::debug!(target: "thegn::plugin", plugin = %id, "session shut down");
+            tracing::debug!(target: "thegn::plugin", plugin = %id, "session close requested; awaiting owned lifecycle receipt");
         }
     }
 }
@@ -210,6 +220,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Spawn one resident session whose events are tagged with the plugin id,
 /// queued on the loop channel and waker-pulsed.
 fn spawn_session(
+    supervisor: &ResidentSupervisor,
     plugin: &LoadedPlugin,
     tx: &tokio_mpsc::UnboundedSender<PluginMsg>,
     waker: &TerminalWaker,
@@ -217,7 +228,10 @@ fn spawn_session(
     let id = plugin.spec.manifest.id.as_str().to_string();
     let tx = tx.clone();
     let waker = waker.clone();
+    supervisor.wait_for_release(&id)?;
     ResidentSession::spawn(
+        supervisor,
+        &id.clone(),
         &plugin.spec.command,
         &plugin.spec.env,
         plugin.effective_cwd().as_deref(),
@@ -249,6 +263,7 @@ struct SchedEntry {
 
 #[allow(clippy::too_many_arguments)]
 fn setup_and_schedule(
+    supervisor: ResidentSupervisor,
     specs: Vec<PluginSpec>,
     config_dir: PathBuf,
     sessions: Sessions,
@@ -282,7 +297,7 @@ fn setup_and_schedule(
             }
         };
         let writer = match plugin.spec.mode {
-            PluginMode::Resident => match spawn_session(&plugin, &tx, &waker) {
+            PluginMode::Resident => match spawn_session(&supervisor, &plugin, &tx, &waker) {
                 Ok(session) => {
                     let w = session.writer();
                     lock(&sessions).insert(id.clone(), session);
