@@ -9,3 +9,5 @@ A persistent round-robin ready list retries at most 64 panes per drain pass. The
 Actual-source evidence: five parser tests pass; combined real writer/perf/parser harness 19 passes; backlog/parser harness 13 passes, overlapping the five parser tests (do not sum as independent). Fixtures cover queries/ambiguous fields, every split, canonical base64 bounds, pane isolation, refused replacement, generation barriers, bounded FIFO, lock-contention lost-wake recovery and existing metrics exclusion. Full host integration and independent adversarial review remain pending.
 
 Primary review found that 64 stale ready entries could starve an unvisited live set. Stale/nonpending entries now retire without consuming the admission budget; a successful bounded pass explicitly wakes if unvisited entries remain (including sync mode). Two deterministic regressions exercise both cases.
+
+Independent review required respecting surrounding DCS/APC/PM/SOS strings: the clipboard scanner now ignores OSC-looking payload bytes through ST, including embedded BEL and split ST. Six actual parser tests pass after this revision.

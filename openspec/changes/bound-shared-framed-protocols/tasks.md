@@ -6,6 +6,6 @@
 - [x] Run actual decoder/reader adversarial tests.
 - [x] Run LSP/bridge/agent close integration tests in svc.
 - [x] Revise near-cap sliding-window append after primary review; deterministic move-count regression passes.
-- [ ] Repeat focused svc validation after the primary revision.
+- [x] Repeat focused svc validation after the primary revision (13 passed, including late concurrent LSP closure).
 - [ ] Run scoped clippy and independent adversarial review.
 - [ ] Complete coordinated landing.
