@@ -15,6 +15,9 @@ enum State {
     Discard {
         escape: bool,
     },
+    SkipString {
+        escape: bool,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +54,7 @@ impl Clipboard {
                             self.partial.extend_from_slice(b"\x1b]");
                             State::Osc { escape: false }
                         }
+                        b'P' | b'_' | b'^' | b'X' => State::SkipString { escape: false },
                         0x1b => State::Escape,
                         _ => State::Text,
                     };
@@ -93,6 +97,18 @@ impl Clipboard {
                             escape: byte == 0x1b,
                         };
                     }
+                }
+                State::SkipString { escape } => {
+                    // DCS/APC/PM/SOS bodies may contain OSC-looking bytes or
+                    // BEL. Only ST ends these strings; their contents cannot
+                    // become top-level clipboard commands.
+                    self.state = if escape && byte == b'\\' {
+                        State::Text
+                    } else {
+                        State::SkipString {
+                            escape: byte == 0x1b,
+                        }
+                    };
                 }
                 State::Discard { escape } => {
                     self.state = if byte == 7 || escape && byte == b'\\' {
@@ -262,6 +278,21 @@ mod tests {
         c.feed(b"\x1b]52;c;eA==\x07");
         assert!(c.has_pending());
     }
+    #[test]
+    fn clipboard_sequences_inside_other_control_strings_are_not_admitted() {
+        for kind in b"P_^X" {
+            let mut c = Clipboard::default();
+            c.feed(&[0x1b, *kind]);
+            c.feed(b"payload\x1b]52;c;eA==\x07more\x1b]52;c;eQ==\x07\x1b");
+            assert!(!c.has_pending());
+            c.feed(b"\\\x1b]52;c;eg==\x07");
+            assert_eq!(
+                pending(&mut c).as_deref(),
+                Some(b"\x1b]52;c;eg==\x07".as_slice())
+            );
+        }
+    }
+
     #[test]
     fn barrier_discards_both_partial_and_refused_pending() {
         let mut c = Clipboard::default();
