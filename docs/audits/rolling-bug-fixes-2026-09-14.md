@@ -5,18 +5,22 @@ This round continues the previously landed audit candidate from local main
 
 ## Reviewed source and acceptance
 
-| Issue   | Change and reviewed checkpoint                                                    | Evidence / current limit                                                                                                                                                                 |
-| ------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| THE-483 | Shared actual ticker worker and hostile-interval thread fixtures, `c6f9a9ec`      | All three actual host fixtures passed; independent source review accepted.                                                                                                               |
-| THE-634 | Own-only admission for direct headless review handoffs, `02876bcc` and `415a7e78` | All eight new tests passed, including late authority changes and non-UTF-8 alias refusal. Parent THE-545 generation binding remains open.                                                |
-| THE-154 | Portable resident lifecycle fixtures and native Windows CI selection, `58457da2`  | Eight new plus 48 existing Linux plugin tests and two ratchets passed; Windows full service/tests crosscheck passed. Native Windows/macOS and full process-tree containment remain open. |
-| THE-591 | Already-landed atomic final outcome persistence                                   | Independent review accepted 14 atomic DB tests, eight persistence tests, speculative-land regressions and actual CLI proof.                                                              |
-| THE-595 | Already-landed read-only discovery and selected-only snapshots                    | Strengthened native CLI harness passed 106 commands against main `1ef8228f`, covering target/source refs, indexes, contents and DB state.                                                |
-| THE-597 | Already-landed owned gate workspace locking/materialization                       | Independent review accepted actual native adversarial gate/path fixtures and private CLI proof; unsupported non-Unix backend remains fail-closed.                                        |
-| THE-600 | Registry corruption after admission test, `db2dbb55`                              | Actual pre-destroy rendezvous with a second SQLite writer; independent source review accepted, final compiled gate pending.                                                              |
-| THE-593 | Result refinalization stale-selection tests, `7ad070c6`                           | Independent source review accepted; identical-value ABA remains explicitly outside value-based comparison guarantees. Final compiled gate pending.                                       |
-| THE-594 | Actual projection/sync registry cleanup tests, `ceb4b5da`                         | Independent source review accepted positive/negative production cleanup paths; final compiled gate pending.                                                                              |
-| THE-606 | Already-landed canonical history admission                                        | Existing native history fixtures passed; current full configured workspace gate is still required.                                                                                       |
+| Issue   | Change and reviewed checkpoint                                                      | Evidence / current limit                                                                                                                                                                 |
+| ------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| THE-483 | Shared actual ticker worker and hostile-interval thread fixtures, `c6f9a9ec`        | All three actual host fixtures passed; independent source review accepted.                                                                                                               |
+| THE-634 | Own-only admission for direct headless review handoffs, `02876bcc` and `415a7e78`   | All eight new tests passed, including late authority changes and non-UTF-8 alias refusal. Parent THE-545 generation binding remains open.                                                |
+| THE-154 | Portable resident lifecycle fixtures and native Windows CI selection, `58457da2`    | Eight new plus 48 existing Linux plugin tests and two ratchets passed; Windows full service/tests crosscheck passed. Native Windows/macOS and full process-tree containment remain open. |
+| THE-591 | Already-landed atomic final outcome persistence                                     | Independent review accepted 14 atomic DB tests, eight persistence tests, speculative-land regressions and actual CLI proof.                                                              |
+| THE-595 | Already-landed read-only discovery and selected-only snapshots                      | Strengthened native CLI harness passed 106 commands against main `1ef8228f`, covering target/source refs, indexes, contents and DB state.                                                |
+| THE-597 | Already-landed owned gate workspace locking/materialization                         | Independent review accepted actual native adversarial gate/path fixtures and private CLI proof; unsupported non-Unix backend remains fail-closed.                                        |
+| THE-600 | Registry corruption after admission test, `db2dbb55`                                | Actual pre-destroy rendezvous with a second SQLite writer; independent review accepted and all 50 cleanup tests passed.                                                                  |
+| THE-593 | Result refinalization stale-selection tests, `7ad070c6`                             | Independent review accepted and actual stale-selection/clear fixtures passed; identical-value ABA remains outside value-based comparison guarantees.                                     |
+| THE-594 | Actual projection/sync registry cleanup tests, `ceb4b5da`                           | Independent review accepted actual registry refusal, custody restoration and same-selection positive cleanup; all 50 cleanup tests passed.                                               |
+| THE-606 | Already-landed canonical history admission                                          | Native canonical-history fixtures and the complete 8,354-test workspace run passed; private CLI proof is retained.                                                                       |
+| THE-377 | Correct command examples and justified per-entry environment exclusions, `b22ec481` | All three previously failing contracts and the complete workspace pass; reopened issue can close after landing.                                                                          |
+| THE-635 | Apply plain/color policy to structured fields, `4e212d09`                           | Actual plain/TTY/JSON formatter and isolated production-sink regressions pass; no payload stripping.                                                                                     |
+| THE-636 | Own local watchdog worktree, shell and state, `c3acc7a4`                            | All watchdog cases pass, including actual single-swap behavior and explicit outer fixture cleanup; native Unix evidence.                                                                 |
+| THE-637 | Pin private Git branch and identity, `6c077905`                                     | Both previously failing divergence/conflict tests and the service Git suite pass with isolated Git configuration.                                                                        |
 
 ## Coordinated verification
 
@@ -34,11 +38,10 @@ The normal CLI source `1ef8228f` is pinned by SHA-256 in
 private effective configuration and success receipt. The test only manipulates
 its owned temporary Git/XDG/DB fixtures.
 
-Final source/delivery ratchets, formatting and 156 strict OpenSpec validations
-passed after assembling the cleanup tests. The full configured `just test` gate
-is running with a per-test wrapper that gives each executable private XDG state
-and isolated Git configuration, while preserving the configured test selection.
-Final full-gate, scoped clippy and local landing receipts will be recorded here.
+Final source/delivery ratchets, formatting and 157 strict OpenSpec validations
+passed at the assembled source checkpoint. The full workspace runs use a per-test
+wrapper giving each executable private XDG state and isolated Git configuration,
+while preserving configured test selection. Final results appear below.
 
 No live restart, external push, live queue cleanup or provider dispatch is part
 of this fixture validation. Main's existing user justfile comments are preserved.
@@ -66,3 +69,76 @@ The newly assembled cleanup subset passed all 50 tests in
 `/tmp/thegn-rolling-cleanup-20260914-results.json`, including the actual late-hook
 registry mutation, result-only refinalization, attached projection/sync refusal,
 and the same-selection positive cleanup control after resource custody release.
+
+## Remaining full-gate fixture repairs
+
+The second full run executed all 8,354 selected tests: 8,348 passed and six
+failed, with 26 configured skips. THE-635's real formatter/sink regressions and
+all new ticker, admission, cleanup and plugin fixtures passed. The six failures
+were three THE-377 command-example/environment-contract checks, THE-636's
+watchdog fixture selecting Podman before private cleanup failed, and THE-637's
+Git fixtures assuming global branch/identity defaults.
+
+THE-377 was reopened rather than retaining its earlier scoped closure. Valid
+separate argv/safe-shell examples now document the actual fields, and precisely
+two per-entry command keys have justified environment-override exclusions; no
+schema walker or admission policy was weakened. THE-636 now owns an existing
+worktree and private state, disables provider routing and runs the production
+clean-shell path through an rc-free Unix adapter. Its platform fixture preserves
+the original test identities and makes successful cleanup explicit. The exact
+old private overlay residue was removed after checking mounts and helpers; its
+receipt is `/tmp/thegn-owned-watchdog-fixture-cleanup-20260914.log`. THE-637 pins
+bare main and conflicting-merge identity, checks conflict exit status and uses
+TempDir custody. All three repairs received primary and independent review.
+The third complete workspace run tests this assembled revision.
+
+The first strict lint attempt also identified three direct println macros in
+native reexec fixtures. Explicit owned stdout writes preserve the protocol frames
+and flushes without lint suppression; independent review approved that revision.
+
+## Complete workspace acceptance
+
+At source `5b698dc4`, the third workspace run passed **8,354/8,354 tests**, with
+26 configured skips, in 185.563 seconds. A parsed receipt verifies every selected
+name matches the second run and all six previous failures now pass. The count is
+Nextest's configured test count, not a claim that helper entries are independent
+regressions. Source receipt: `/tmp/thegn-rolling-full-workspace3-results-20260914.json`.
+
+The `just test` recipe's workspace stage was run as `cargo nextest run --workspace
+--locked --no-fail-fast`. Its three contract selections (2 plugin schema, 2 control
+schema, 1 surface ledger) passed in the original explicit preflight and are also
+included in the final full run. The final `just test-live test-build-metadata`
+invocation passed 21 live-build and 3 build-metadata tests. These logs together
+cover the configured recipe; the workspace log alone is not the entire recipe.
+No additional tests were skipped to obtain this result.
+
+The final all-targets lint run subsequently reported 14 host-test findings and
+one core-test finding: fixture diagnostics, equivalent initializer/control-flow
+style, a cloned assertion slice and synchronous owned fixture command annotations.
+Those test-only revisions require independent review, affected regression
+execution and a successful strict lint rerun before landing. Their annotations
+are local to verified off-compositor fixture statements, not runtime exemptions.
+
+## Post-lint revision verification
+
+The approved test-only lint repair is `6c7bcdc0`. All **139 selected affected
+host/core tests passed**, in 10.497 seconds (7,335 tests filtered out of this
+focused selection). This overlaps the full workspace result; counts are not
+added. The full workspace source `5b698dc4` and this revision have identical
+production behavior. Raw logs and the exact-name receipt retain both checkpoints.
+
+All three subagents reviewed the final fixture changes across authors, and the
+primary inspected every diff. The final full-run independent receipt verifies
+8,354 unique passes, the same selected names as the previous run, all six prior
+failures corrected, all three contract selections and both Python preflights.
+Source/delivery ratchets and all 157 strict OpenSpec items passed after lint
+cleanup. Strict Clippy passed for host/core/service with `--all-targets -- -D
+warnings` at `6c7bcdc0`, in 2m31s. Full treefmt CI also passed. The primary approves
+this reviewed candidate for the user-authorized local-main merge.
+
+Scoped closure after landing is supported for THE-377, THE-483, THE-591,
+THE-593, THE-594, THE-595, THE-597, THE-600, THE-606, THE-634, THE-635, THE-636
+and THE-637. THE-545 remains open for actual credential/account-generation
+binding; THE-154 remains open for native platform and complete process-tree
+acceptance. THE-630 has a reviewed sampler investigation/plan; its implementation
+has not landed. THE-631/632/633 remain queued performance follow-ups.

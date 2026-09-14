@@ -59,12 +59,14 @@ cache-key collision and zero provider/preparation/launch calls. It reuses the
 existing platform non-Unicode fixture helper, whose byte-path case runs on Unix;
 the unsupported platform branch returns without claiming native path coverage.
 
-At the initial review checkpoint, rustfmt and diff checks pass. Production host
-compilation, focused regression execution and independent source review are
-pending coordinated gates. The intended test selection is `review_handoff::`
-(existing selection/overlay cases plus the seven new cases), `pr_authorship::`,
-the existing PR queue/CI denial cases and durable review cases. Root owns the
-final combined graph, lint and local-main landing.
+The compiled host gate at `38107f9d` passed all eight new admission-helper
+regressions, the existing handoff cases, and shared authorship/queue/CI/review
+coverage within 299 host passes. Independent adversarial review accepted the
+non-UTF-8 refusal revision. The full workspace second run also passed these
+cases; its six unrelated failures and subsequent repairs are recorded in the
+rolling audit. Final combined validation and local landing are recorded there.
+This bounded direct-path defect is tracked as THE-634; it does not close the
+parent credential-generation requirement below.
 
 ## Remaining THE-545 acceptance
 
