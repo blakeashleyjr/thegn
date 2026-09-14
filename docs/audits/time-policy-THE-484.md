@@ -66,9 +66,25 @@ No live provider or process action was executed during this work.
 | Media MPRIS duration | Out-of-range unsigned input is rejected instead of wrapping negative |
 | Pairing-code relative lifetime | Checked before mint/persistence; unsupported duration cannot produce a past deadline |
 
-Standalone actual-source tests currently pass: shared time/schedule/panic 11,
-backoff 13 and git calendar 5. Full consumer/core/service/proxy/media tests,
-combined host gates, final primary and independent reviews remain pending.
+Focused production-compiler gates at 2dbe30aa passed: core118 (time/config,
+cache scheduling, usage, breaker, budget, backoff and Git calendar), extra core26
+(lease, host configuration, healing and spillover), service28 (Fly/VPS parsing,
+exact/absent/mismatched custody and read retry), and proxy/media26 (reset headers,
+body resets, health and MPRIS). These are selected tests, not whole-crate suites.
+Logs: `/tmp/thegn-time-policy-484-core-tests.log`,
+`/tmp/thegn-time-policy-484-core-boundaries.log`,
+`/tmp/thegn-time-policy-484-svc-tests.log`, and
+`/tmp/thegn-time-policy-484-proxy-media-tests.log`.
+
+Standalone actual-source tests pass: shared time/schedule/panic11 in debug and
+optimized builds, backoff13, Git calendar5, and the shared host ambiguity gate1
+linked against the compiled core. The deadline fixture also exercises fractional
+seconds ceiling and nonfinite rejection. No provider network, D-Bus or process
+signal was used by these fixtures. Primary and independent source reviews
+approved 2dbe30aa after revisions. Strict OpenSpec, idle guard, ignored-result
+ratchet (340 pins) and diff checks pass. Final combined host checks and canonical
+landing remain pending with the integration owner; no broad/native lifecycle or
+full release-suite claim is made.
 
 ## Remaining `as i64` classification
 
