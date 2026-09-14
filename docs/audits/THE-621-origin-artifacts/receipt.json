@@ -70,6 +70,48 @@
       "path": "thegn-THE621-authority-counterexample-20260914.source.json",
       "bytes": 705,
       "sha256": "7d072c1b8085f19c6cb30cc7c8bff55f7f15cc184a6762ceadad4ec52202813b"
+    },
+    {
+      "path": "thegn-THE621-counterfactual-native-20260914.log",
+      "sha256": "e3493abea6d442e6498e040a93108ce75d87f3912e5db43bf70c2a93985e3175",
+      "bytes": 2090
+    },
+    {
+      "path": "the621.patch",
+      "sha256": "4ef3cc5f005827da2f1acac0bf985c87f602c09785a87d8f1667db9823a45ac6",
+      "bytes": 1436
+    },
+    {
+      "path": "thegn-THE621-ratchets-final-20260914.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "bytes": 4797
+    },
+    {
+      "path": "thegn-THE621-openspec-20260914.log",
+      "sha256": "1317a5b1861f16e77c67362763e7f73554f91daa2e83f2642a08d0a67bff76ad",
+      "bytes": 52
+    },
+    {
+      "path": "thegn-THE621-treefmt-retry-20260914.log",
+      "sha256": "8deb175ec6a683363b4ebef17227dca6a95e1f3309747045362d60c22a7a293a",
+      "bytes": 99
     }
-  ]
+  ],
+  "counterfactual": {
+    "source": "5e2f5bf2bcb3b2473e48775850133983e1f7be31",
+    "mutation": "Only parse_owner_repo restored to7014 parent; new fixture unchanged",
+    "exit_code": 100,
+    "selected": 1,
+    "failed_expected": 1,
+    "seconds": 0.083,
+    "expected_failure": "foreign path @github.com returned Some identity instead of None",
+    "scope": "Pure parser assertion fails before per-origin Git/token gate; positive candidate independently exercises that actual gate",
+    "watchdog_seconds": 30
+  },
+  "source_gates": {
+    "ratchets_exit_code": 0,
+    "strict_change_validation_exit_code": 0,
+    "treefmt_retry_exit_code": 0,
+    "historical_failures": "Initial delivery metadata transitions failed validation until active lifecycle removed delivered_at. First treefmt changed copied Rust evidence; original bytes restored under .rs.txt and hashes verified before passing retry."
+  }
 }

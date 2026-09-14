@@ -18,7 +18,11 @@ The new origin fixture uses private Git state and an inert injected token;
 it never sends a native request or reads real credentials.
 
 Evidence is recorded in the adjacent `THE-621-origin-artifacts/` directory.
-Actual local-main landing and final source-only gates remain pending here.
+Source ratchets, strict change validation and treefmt now pass. The disposable
+old-parser counterfactual compiled and failed the expected foreign-path identity
+assertion in 0.083 seconds (one selected test, exit100); it fails before the
+per-origin Git/token gate. The positive candidate independently exercises that
+actual gate. Local-main landing remains pending at this checkpoint.
 These scoped results do not claim another full-workspace test run.
 
 The broader `forge::remote_host` routing defect is tracked as THE-642. Some Git
