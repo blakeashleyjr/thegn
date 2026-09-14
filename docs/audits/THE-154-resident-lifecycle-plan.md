@@ -1,6 +1,6 @@
 # THE-154: resident plugin lifecycle investigation and proposed repair
 
-Status: scoped lifecycle plan approved by primary review. Native Unix validation passed; Windows cross type-check, host integration and final independent review remain pending. Full THE-154 acceptance remains open.
+Status: scoped lifecycle plan approved by primary review. Native Unix validation and Windows cross type-check passed; final host integration and scoped landing review remain pending. Full THE-154 acceptance remains open.
 This is an existing lifecycle defect, not a plugin feature expansion.
 
 ## Current reachable defects
@@ -192,3 +192,27 @@ and will be part of final assembled validation. The initial three failing
 fixtures and their actual fixes (queue preflight and pidfd readiness) are not
 counted as passes. Windows cross type-check is running; native Windows execution
 and escaped-tree containment remain outstanding.
+
+## Final review revisions and remaining integration gate
+
+The native plugin suite passed **46/46** after the lost-identity guards and idle
+waker fixture (`/tmp/thegn-maintenance-resident-final-linux.log`). The complete
+Windows svc library and test graph passed `cargo check --offline --locked -p
+thegn-svc --target x86_64-pc-windows-gnu --tests` in 13.12s; the three existing
+warnings are outside the lifecycle files. This compiles the Windows cancellation
+fixture but does not execute it. The isolated Darwin exact-source platform and
+embedded tests also cross type-checked; native macOS behavior is unverified.
+
+Two final reviewed refinements follow that native checkpoint. BoundedFrame now
+reserves exactly the missing newline byte before pushing it; an ordinary
+provider.call-shaped JSON fixture previously grew from capacity 600108 to 1200216,
+and now finishes at capacity 600109 within 1 MiB. The independent exact-source
+serializer check passed. Final Unix ownership also rejects all numeric waits
+following identity loss, and termination targets the still-owned leader after
+original-group success or ESRCH without discovering another group. Both injected
+group outcomes are tested using an owned shell builtin with no descendants;
+lost/reaped identity reaches no later signal or wait syscall. The final actual-
+source Unix platform harness passed **4/4**, including these guards, final drop
+and zero idle wakeups. The integrating reviewer will run the final plugin suite
+(expected 48 tests) with host integration and quick/clippy; that final graph is
+not claimed by the earlier 46-test checkpoint.
