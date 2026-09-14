@@ -13,7 +13,7 @@
 - [x] Pass 14 source-only ratchet commands and strict change validation.
 - [x] Complete final rustfmt, taplo, and diff whitespace checks.
 - [x] Complete independent adversarial review and address findings.
-- [ ] Root review, delivery registry reconciliation, and permitted landing.
+- [x] Root review, delivery registry reconciliation, and user-authorized local landing.
 
 ## THE-635: plain field color policy
 

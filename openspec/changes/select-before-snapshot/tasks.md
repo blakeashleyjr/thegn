@@ -6,7 +6,8 @@
 - [x] THE-595: fail-closed status, branch/HEAD/common-dir and registry tests.
 - [x] Native fixed-binary proof of failed gate, atomic final status, no sweep and retained successful land.
 - [x] Independent source review and scoped gates before component commit.
-- [ ] THE-588/THE-589/THE-591 combined integration and normal gate before THE-586 retry.
+- [x] Complete selected-only snapshot/atomic persistence integration and the combined private native gate.
+- [ ] THE-588 destructive cleanup acceptance and actual THE-586 native queue retry remain separate.
 
 ## Scoped evidence
 
@@ -33,4 +34,4 @@ both source HEADs, indexes, content, all repository refs and logical DB contents
 Actual selected-only snapshots, failed gates without speculative landed state,
 and successful retained folds also passed. Independent review accepted this
 THE-595 proof. The earlier syntax-only limitation above is superseded; the full
-combined gate and other issues' acceptance remain separate obligations.
+combined gate is now complete; other issues' acceptance remains separate.

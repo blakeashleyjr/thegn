@@ -51,3 +51,5 @@ Root integration follow-through: the behavior-equivalent lint cleanup is
 again passed all 48 plugin tests. Post-lint host/core affected selections passed
 27 and eight tests. These are overlapping confirmation runs, not additional
 unique coverage. Full native platform and containment acceptance remains open.
+
+September 14 rolling follow-up: eight portable native reexec fixtures plus all 48 existing plugin regressions passed on Linux, followed by the complete 8,354-test workspace gate. Final fixture-only lint revisions received independent review and passed strict all-target checks before local landing. This supersedes scoped landing/lint holds above. Native Windows/macOS runtime evidence, the new complete Darwin fixture graph and escaped-tree containment remain open; earlier crosschecks are not native execution.

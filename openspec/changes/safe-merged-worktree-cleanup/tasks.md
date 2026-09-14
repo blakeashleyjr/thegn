@@ -14,9 +14,9 @@
 - [x] THE-600: verify strict registry/resource observations reject malformed remote, tenancy and dispatch rows before hooks and after admission (18 core, 81 host focused tests passed).
 - [x] THE-600 September 14 follow-up: execute the real post-hook registry-decoder corruption regression and independently review it before closure.
 - [x] Complete primary and independent review of THE-593/THE-594/THE-600 scoped repairs; broader THE-588/THE-596 obligations remain separate.
-- [ ] Integrate with THE-589 and pass the normal native delivery gate.
+- [x] Integrate the reviewed scoped repairs with THE-589 and pass the private native delivery gate; live queue cleanup is separate.
 
-No live cleanup, runtime mutation, or successful delivery is claimed here.
+The reviewed scoped changes are delivered to local main. No live cleanup or runtime mutation is claimed.
 
 ## THE-594 actual resource-admission regression follow-up
 

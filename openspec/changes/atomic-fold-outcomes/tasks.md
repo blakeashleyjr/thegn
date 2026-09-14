@@ -7,7 +7,7 @@
 - [x] THE-589: retain previously passing 39-test fold outcome behavior after integration.
 - [x] Integrate THE-588's commit-bound `apply_landed` call and pass the combined scoped core/host gate.
 - [ ] THE-588: separate destructive cleanup ownership safeguards before native queue retry.
-- [ ] Normal native gate and explicit approval before any local-main merge.
+- [x] Complete normal native/full workspace gate and user-authorized local-main landing.
 
 Component evidence: core `db_aux::merge_outcome_tests` passed 13/13;
 host `integrate::` plus `handlers::merge_queue::` passed 49/49. The final
@@ -34,5 +34,5 @@ in `/tmp/thegn-native-unblocked-host-results.json`. The normal CLI built from
 gates without transient queued/landed writes and successful retained folds.
 Evidence is retained at `/tmp/thegn-integrate-native-tw5m0z40/evidence` and the
 September 14 local landing audit. THE-591's scoped repair is accepted; remaining
-cleanup ownership contracts, full workspace gate and native queue operations
+cleanup ownership contracts and native queue operations
 are separate obligations.

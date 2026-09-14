@@ -8,7 +8,7 @@
 - [x] THE-606: private initial/post-callback and unsupported transport/platform tests.
 - [x] Independent source review, source ratchets and focused host regression gate.
 - [x] Record representative focused timing and added probe cost without weakening proof.
-- [ ] Combined source review, full native gate and private CLI proof before delivery.
+- [x] Combined source review, full native gate and private CLI proof before delivery.
 
 Source2 focused gate: 203/203 passed, 3015 skipped, exit 0; nextest run
 `9c8b3d7f-0567-4320-8cfd-ef902f34e2b9`. Build 3m37s, tests 44.384s.
@@ -38,3 +38,5 @@ No native test pass or live queue outcome is claimed. Private Git mechanics
 evidence exists separately under
 `/tmp/thegn-audit/the597-ancestry.1jRz0X`; it establishes the original Git behavior,
 not runtime validation of this implementation.
+
+September 14 superseding acceptance: current production code passed all 8,354 selected workspace tests, with 26 configured skips; contract and live/build-metadata stages also passed. The pinned normal CLI at main 1ef8228f passed the 106-command owned-fixture harness (13 actual Thegn invocations plus setup/probes). Final test-only lint revisions passed affected regressions and strict lint before local-main landing. See docs/audits/rolling-bug-fixes-2026-09-14.md. Historical pending native-CLI prose above is superseded; no live queue outcome is claimed.

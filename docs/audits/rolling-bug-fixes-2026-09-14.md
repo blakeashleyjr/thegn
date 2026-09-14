@@ -142,3 +142,20 @@ and THE-637. THE-545 remains open for actual credential/account-generation
 binding; THE-154 remains open for native platform and complete process-tree
 acceptance. THE-630 has a reviewed sampler investigation/plan; its implementation
 has not landed. THE-631/632/633 remain queued performance follow-ups.
+
+## Local-main landing
+
+The reviewed candidate `0e726cb70e35f643126215aa982947a08942387e` was fast-forwarded
+into canonical local main on September 14, 2026, from `1ef8228f`. Its final code
+checkpoint is `6c7bcdc0`; the intervening commit records reviewed validation only.
+The final follow-up commit reconciles documentation after this actual landing.
+
+Saved byte hashes confirm the user's justfile comments and existing live-audit
+files were preserved. The merge did not push a remote or restart the live build.
+The complete workspace pass, affected post-lint pass, strict Clippy, source and
+specification gates support the 13 scoped Linear closures listed above. Broader
+THE-545/THE-154 acceptance and the queued BTOP performance work remain explicit.
+Durable raw receipts, private CLI evidence, independent reviews and a verified
+Git bundle are preserved in `docs/audits/remediation-2026-09-13-artifacts/`, with
+a refreshed byte-count/SHA-256 manifest. Earlier failed-run artifacts remain
+historical evidence rather than being relabeled as successful runs.

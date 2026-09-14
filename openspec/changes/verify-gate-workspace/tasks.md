@@ -9,7 +9,7 @@
 - [x] THE-597: owned blocking writer waits, unknown-wait poison and safe index cleanup.
 - [x] THE-597: preserve gate-authorized filters; used/unused/failure regressions.
 - [x] Independent source review and scoped host regression gate.
-- [ ] Combined THE-588/THE-589/THE-591/THE-595 gate and fixed private CLI proof.
+- [x] Combined scoped THE-588/THE-589/THE-591/THE-595 gate and fixed private CLI proof.
 - [ ] THE-601: separately bound initial process capture and gate cancellation.
 
 Source6 diagnostic host gate passed 139/139 (Nextest
@@ -36,5 +36,5 @@ The target-inclusive private CLI regression passed all 106 commands against
 normal CLI source `1ef8228f`; its complete evidence is at
 `/tmp/thegn-integrate-native-tw5m0z40/evidence`. Independent acceptance review
 approved THE-597's repair scope. Native success on unsupported non-Unix gate
-backends, the full combined gate and THE-601's separate cancellation scope are
+backends and THE-601's separate cancellation scope are
 not established by these Linux results.

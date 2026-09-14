@@ -20,4 +20,4 @@ The hostile matrix projects real programmatic Config values through the startup 
 
 The isolated harness extracts the actual worker function and cadence helper bodies, includes the actual repository fixture source, and links cached core/Tokio dependencies. Its minimal event enum excludes unrelated host variants; it is not a whole-host release build. Logs are `/tmp/thegn-ticker-{real,overflow}-worker-{debug,optimized}-{build,tests}.log`; reproducible extraction/build script is `/tmp/thegn-ticker-harness-build.py`. Production files were never mutated for the counterfactual.
 
-Independent source review accepted the production ordering/priming/wake preservation after correcting a fixture omission for the legitimate Issues event at tick120. The actual host gate now passes. Final primary landing approval remains required.
+Independent source review accepted the production ordering/priming/wake preservation after correcting a fixture omission for the legitimate Issues event at tick120. The actual host gate now passes. Primary approved and landed this follow-up after complete workspace and post-lint verification; see the rolling audit.
