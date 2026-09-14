@@ -32,6 +32,21 @@ hidden-index state SHALL prevent automatic removal.
 - **AND** the already authorized hook effect remains observable; refusal does
   not claim to undo a hook that has already run.
 
+### Requirement: Selected landed identity remains authoritative
+
+Automatic cleanup and asynchronous panel clearing SHALL compare the complete
+originally selected landed row before consuming it. Missing, requeued, reassigned
+or refinalized observations SHALL revoke that selection. This is a comparison of
+observed values; same-value ABA that restores every observed field is outside
+this guarantee unless a durable generation is separately implemented.
+
+#### Scenario: Only the recorded result changes after selection
+
+- **WHEN** another connection changes the result OID to a different real commit
+  while leaving the selected row's status and other fields unchanged
+- **THEN** stale automatic cleanup SHALL refuse before lifecycle hooks or removal
+- **AND** asynchronous clearing SHALL preserve the row and count zero deletions.
+
 ### Requirement: Automatic collection retains branches until ref-type proof exists
 
 Automatic collection SHALL NOT mutate source, target or other branch refs.

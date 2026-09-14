@@ -82,6 +82,13 @@ old selection. Duplicate selections cannot inflate cleared counts. Actual land
 callers carry the commit through `apply_landed`; generic Landed/UpToDate events
 without a matching recorded result cannot trigger destructive cleanup.
 
+This is comparison of the full observed row values, not a durable generation.
+A same-value ABA (another writer changes a row and then restores every observed
+value, including timestamps, before revalidation) is not excluded. Detecting that
+history requires a separately implemented durable generation; these guards make
+no such claim. Changed result OIDs revoke eligibility even when every other row
+value is unchanged, for both physical cleanup and asynchronous panel clearing.
+
 THE-594 settles the environment once and uses a dedicated conservative local
 callback, never the ambient-reloading explicit teardown routine. Worktree and
 workspace selections are checked with error-preserving DB reads. Active
