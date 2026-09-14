@@ -161,6 +161,10 @@ fn undeclared_capability_is_not_sent_and_returns_not_available() {
 fn framing_smoke_for_test_helpers() {
     // Guards that the shared codec the fake server uses is sane.
     let mut d = FrameDecoder::new();
-    d.push(&thegn_svc::lsp::framing::encode("{\"x\":1}"));
-    assert_eq!(d.next_message().as_deref(), Some("{\"x\":1}"));
+    d.push(&thegn_svc::lsp::framing::encode("{\"x\":1}"))
+        .expect("valid frame fits decoder bounds");
+    assert_eq!(
+        d.next_message().expect("valid frame decodes").as_deref(),
+        Some("{\"x\":1}")
+    );
 }
