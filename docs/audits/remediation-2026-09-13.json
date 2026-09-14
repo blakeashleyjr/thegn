@@ -89,5 +89,17 @@
     "THE-586"
   ],
   "canonicalMerge": "blocked: original .git is read-only",
-  "reviewState": "implementation and validation in progress"
+  "reviewState": "adversarial source revisions approved; native execution gates remain failed",
+  "hostResults": {
+    "passed": 179,
+    "failed": 97,
+    "ignored": 1
+  },
+  "nextBatch": "THE-629",
+  "processView": "THE-628",
+  "btopFollowups": [
+    "THE-630",
+    "THE-631",
+    "THE-632"
+  ]
 }

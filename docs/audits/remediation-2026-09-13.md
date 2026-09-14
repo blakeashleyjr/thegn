@@ -67,7 +67,29 @@ are listed in `remediation-2026-09-13.json`.
   Positive ownership admission is blocked by uid 65534 ancestry; Unix socket
   creation returns EPERM. These remain failed validation requirements, not
   skipped/passing tests. Production ownership checks were not weakened.
-- Runtime tests, combined-code review and adversarial verdict remain pending.
+- Combined final core tests: logging 16, config diagnostic cache 4 and merge
+  state/outcome/policy regressions 119 passed. Combined host test build passed (3m24s).
+- Session candidate: actual-source recovery/relay 8, patched real PTY 4,
+  isolation-floor 10 and decoder 2 tests passed. HTTP adapter test failed at
+  socket bind with EPERM; native Windows evidence remains pending.
+- Forge candidate: 24 tests passed; actual input-module privacy tests 13 passed.
+- Performance candidate: 20 actual-source boundary tests and 8 svc log tests
+  passed. Full model hydration attribution remains unresolved (THE-627).
+- Independent adversarial review found three issues: cross-repository sweep
+  selection before TTL, close-under-backpressure deadlock, and unbounded
+  Windows taskkill on credential cancellation. Each was sent for revision and
+  the revised source was approved by the independent reviewer. Foreign Git
+  identities are now filtered before policy, pane owner lifetime independently
+  wakes the relay and unsupported credential helpers are refused before spawn.
+  Host execution found 179 passed, 97 failed and one pre-existing ignored test
+  across 277 selected cases. Failures are concentrated in canonical-history,
+  gate, cleanup and socket/signing fixtures; strict ownership admission rejects
+  unmapped uid65534 ancestors before the tests reach their intended assertions.
+  These are not accepted as green or silently skipped. Remaining native
+  validation prevents final landing approval.
+- Existing residuals explicitly outside completed scope: direct symbolic fold
+  target admission (THE-596), configured merge-gate output bounds (THE-601),
+  native Windows gate admission and full hydration root-cause evidence.
 
 ## Execution limits and landing
 
@@ -82,3 +104,37 @@ The audit's healthy database checks, zero new crash count, conservative stale
 worktree retention and negotiated keyboard capabilities are observations, not
 new defects to fix. No stale worktree cleanup or repository credential change
 is authorized by the tests in this remediation.
+
+## Combined host results
+
+Tests ran individually in private XDG directories, four concurrent workers,
+90-second per-test deadlines, and exact names against the compiled production
+test binary. No application/live terminal was started. Per-test outputs and
+machine-readable results are retained with the final handoff artifacts.
+
+| Module            | Passed | Failed | Ignored |
+| ----------------- | -----: | -----: | ------: |
+| agent             |      4 |      0 |       0 |
+| canonical_history |      8 |      8 |       0 |
+| compositor        |     15 |      0 |       1 |
+| daemon            |      5 |      1 |       0 |
+| frame_writer      |      7 |      0 |       0 |
+| input             |     13 |      0 |       0 |
+| integrate         |     21 |     64 |       0 |
+| merge_lifecycle   |     22 |     12 |       0 |
+| merge_sweep       |      4 |      8 |       0 |
+| pane              |     29 |      0 |       0 |
+| pane_recovery     |      5 |      0 |       0 |
+| perf              |     15 |      0 |       0 |
+| perf_timing       |      5 |      0 |       0 |
+| platform          |      6 |      4 |       0 |
+| render_plan       |     20 |      0 |       0 |
+
+Controlled synthetic workload passed in the unoptimized test profile:
+config-load medians 3.44–3.77ms; effective-environment resolution 0.215ms
+for one row to 1.482ms for 32 rows. One-row surface diffs measured
+46/101/149µs at 80×24/160×48/240×72 versus full resync 310/1204/2657µs,
+with equivalent reconstructed cells. These are scoped candidate measurements,
+not before/after speedups or full hydration/terminal latency evidence.
+
+Final assembled svc test binary: 39 selected tests passed; two control-client endpoint tests failed on forbidden socket creation (EPERM). This includes the final forge, log-tail and strict-roster parser sources. Source ratchets, ten delivery fixtures and all three runtime OpenSpec strict validations passed.
