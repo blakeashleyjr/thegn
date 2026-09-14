@@ -230,6 +230,14 @@ pub(crate) fn probe() -> ProbeReport {
     provider().probe()
 }
 
+#[path = "devcontainer_probe_cache.rs"]
+mod probe_cache;
+
+/// Hydration asks only after the shared status classifier establishes demand.
+pub(crate) fn cached_probe() -> ProbeReport {
+    probe_cache::probe()
+}
+
 fn sessions() -> &'static std::sync::Mutex<std::collections::HashMap<String, DevcontainerSession>> {
     static SESSIONS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, DevcontainerSession>>,
@@ -274,6 +282,19 @@ pub(crate) fn status_for_selected(
     sandbox: &thegn_core::config::SandboxConfig,
     approvals: &thegn_core::config_resolve::Approvals,
     probe: &ProbeReport,
+) -> DevcontainerStatus {
+    status_for_selected_with_probe(config, selection, worktree, sandbox, approvals, || {
+        probe.clone()
+    })
+}
+
+fn status_for_selected_with_probe(
+    config: &thegn_core::devcontainer::DevContainer,
+    selection: &thegn_core::devcontainer_select::SelectionResult,
+    worktree: &Path,
+    sandbox: &thegn_core::config::SandboxConfig,
+    approvals: &thegn_core::config_resolve::Approvals,
+    probe: impl FnOnce() -> ProbeReport,
 ) -> DevcontainerStatus {
     let variant = selection
         .selected
@@ -329,30 +350,44 @@ pub(crate) fn status_for_selected(
         && inventory.refused.is_empty()
         && inventory.reserved.is_empty()
         && inventory.unknown.is_empty();
-    let state = if !source_present {
-        DevcontainerState::Degraded
-    } else if !source_approved || !outcome.pending.is_empty() {
-        DevcontainerState::Pending
-    } else if probe.ready() && provider_eligible {
-        DevcontainerState::Ready
-    } else {
-        DevcontainerState::Degraded
-    };
-    let reason = if !source_present {
-        Some("no image/build/compose source".into())
+    // Eligibility and every pending request settle before executable discovery.
+    // This is the same classifier doctor uses with its already-supplied report.
+    let refusal = if !source_present {
+        Some((DevcontainerState::Degraded, "no image/build/compose source"))
     } else if !source_approved {
-        Some("container source awaits trust approval".into())
+        Some((
+            DevcontainerState::Pending,
+            "container source awaits trust approval",
+        ))
     } else if !outcome.pending.is_empty() {
-        Some("devcontainer requests await trust approval".into())
+        Some((
+            DevcontainerState::Pending,
+            "devcontainer requests await trust approval",
+        ))
     } else if !provider_eligible {
-        Some("config contains fields the CLI provider cannot safely apply".into())
+        Some((
+            DevcontainerState::Degraded,
+            "config contains fields the CLI provider cannot safely apply",
+        ))
     } else {
-        probe.reason.clone()
+        None
     };
+    if let Some((state, reason)) = refusal {
+        return DevcontainerStatus {
+            variant,
+            state,
+            reason: Some(reason.into()),
+        };
+    }
+    let probe = probe();
     DevcontainerStatus {
         variant,
-        state,
-        reason,
+        state: if probe.ready() {
+            DevcontainerState::Ready
+        } else {
+            DevcontainerState::Degraded
+        },
+        reason: probe.reason,
     }
 }
 
@@ -365,7 +400,7 @@ pub(crate) fn status_for_worktree(
     worktree: &Path,
     environment: &thegn_core::env::Environment,
     approvals: &thegn_core::config_resolve::Approvals,
-    probe: &ProbeReport,
+    probe: impl FnOnce() -> ProbeReport,
 ) -> Option<DevcontainerStatus> {
     // An explicitly uncontained local environment is a deliberate execution
     // choice, not a failed devcontainer launch. Hide repo devcontainer status
@@ -410,7 +445,7 @@ pub(crate) fn status_for_worktree(
             reason: Some(reason),
         });
     };
-    Some(status_for_selected(
+    Some(status_for_selected_with_probe(
         config, &selection, worktree, sandbox, approvals, probe,
     ))
 }
@@ -446,34 +481,8 @@ impl DevcontainerProvider for CliProvider {
             return ProbeReport::unavailable(format!("`{CLI_NAME}` not found on PATH"));
         };
         let mut command = Command::new(executable);
-        command
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        match run_bounded(&mut command, PROBE_TIMEOUT) {
-            Ok(output) if output.status.success() => ProbeReport {
-                state: ProbeState::Ready,
-                executable: Some(executable.display().to_string()),
-                version: first_line(&output.stdout).or_else(|| first_line(&output.stderr)),
-                reason: None,
-            },
-            Ok(output) => ProbeReport {
-                state: ProbeState::Degraded,
-                executable: Some(executable.display().to_string()),
-                version: first_line(&output.stdout).or_else(|| first_line(&output.stderr)),
-                reason: Some(format!(
-                    "`{CLI_NAME} --version` exited with {}",
-                    output.status
-                )),
-            },
-            Err(error) => ProbeReport {
-                state: ProbeState::Degraded,
-                executable: Some(executable.display().to_string()),
-                version: None,
-                reason: Some(format!("bounded version probe failed: {error}")),
-            },
-        }
+        command.arg("--version");
+        probe_command(executable, command, PROBE_TIMEOUT)
     }
 
     fn start(
@@ -596,6 +605,34 @@ fn verify_config_digest(path: &Path, expected: &[u8; 32]) -> anyhow::Result<()> 
         "devcontainer config changed after trust approval; refusing provider use"
     );
     Ok(())
+}
+
+/// Shared result policy for fresh doctor/launch probes and cached hydration.
+/// The capture layer returns the actual exit status and both bounded streams.
+fn probe_command(executable: &Path, command: Command, timeout: Duration) -> ProbeReport {
+    match crate::bounded_git_probe::capture_capability(command, timeout, 16 * 1024) {
+        Ok(output) if output.status.success() => ProbeReport {
+            state: ProbeState::Ready,
+            executable: Some(executable.display().to_string()),
+            version: first_line(&output.stdout).or_else(|| first_line(&output.stderr)),
+            reason: None,
+        },
+        Ok(output) => ProbeReport {
+            state: ProbeState::Degraded,
+            executable: Some(executable.display().to_string()),
+            version: first_line(&output.stdout).or_else(|| first_line(&output.stderr)),
+            reason: Some(format!(
+                "`{CLI_NAME} --version` exited with {}",
+                output.status
+            )),
+        },
+        Err(error) => ProbeReport {
+            state: ProbeState::Degraded,
+            executable: Some(executable.display().to_string()),
+            version: None,
+            reason: Some(format!("bounded version probe failed: {error}")),
+        },
+    }
 }
 
 fn first_line(bytes: &[u8]) -> Option<String> {
@@ -938,8 +975,194 @@ mod tests {
             dir.path(),
             &environment,
             &thegn_core::config_resolve::Approvals::deny_all(),
-            &ProbeReport::unavailable("not installed"),
+            || ProbeReport::unavailable("not installed"),
         );
         assert_eq!(status, None);
+    }
+
+    #[test]
+    fn lazy_status_refusals_do_not_discover_or_probe_and_keep_status_precedence() {
+        use std::cell::Cell;
+        use thegn_core::config::{SandboxConfig, SandboxProfile};
+        use thegn_core::config_resolve::Approvals;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".devcontainer.json");
+        // Approval mode: 0 denies everything, 1 approves only the image,
+        // 2 approves the complete exact request set. No request is executed.
+        for (body, approval_mode, pinned, strong, expected) in [
+            (r#"{}"#, 2, false, false, DevcontainerState::Degraded),
+            (
+                r#"{"image":"repo"}"#,
+                0,
+                false,
+                false,
+                DevcontainerState::Pending,
+            ),
+            (
+                r#"{"image":"repo","postCreateCommand":"must-not-run"}"#,
+                1,
+                false,
+                false,
+                DevcontainerState::Pending,
+            ),
+            (
+                r#"{"image":"repo"}"#,
+                2,
+                true,
+                false,
+                DevcontainerState::Degraded,
+            ),
+            (
+                r#"{"image":"repo"}"#,
+                2,
+                false,
+                true,
+                DevcontainerState::Degraded,
+            ),
+            (
+                r#"{"image":"repo","containerEnv":{"BLOCKED":"${localEnv:THEGN_FIXTURE_SECRET}"}}"#,
+                2,
+                false,
+                false,
+                DevcontainerState::Degraded,
+            ),
+            (
+                r#"{"image":"repo","runArgs":["--privileged"]}"#,
+                2,
+                false,
+                false,
+                DevcontainerState::Degraded,
+            ),
+            (
+                r#"{"image":"repo","shutdownAction":"none"}"#,
+                2,
+                false,
+                false,
+                DevcontainerState::Degraded,
+            ),
+            (
+                r#"{"image":"repo","mysteryFixtureField":true}"#,
+                2,
+                false,
+                false,
+                DevcontainerState::Degraded,
+            ),
+            (
+                r#"{"image":"repo"}"#,
+                2,
+                false,
+                false,
+                DevcontainerState::Ready,
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let selection = thegn_core::devcontainer_select::select_and_parse(dir.path(), None);
+            let config = selection.config.as_ref().unwrap();
+            let approvals = Approvals::from_canonical(
+                thegn_core::devcontainer_overlay::gate_requests(config)
+                    .into_iter()
+                    .filter(|request| {
+                        approval_mode == 2
+                            || (approval_mode == 1 && request.key.starts_with("devcontainer.image"))
+                    })
+                    .map(|request| request.canonical()),
+            );
+            let sandbox = SandboxConfig {
+                profile: if strong {
+                    SandboxProfile::default()
+                } else {
+                    SandboxProfile::Open
+                },
+                image: if pinned {
+                    "trusted-image".into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            };
+            let calls = Cell::new(0);
+            let report = ProbeReport {
+                state: ProbeState::Ready,
+                executable: Some("fixture".into()),
+                version: Some("1".into()),
+                reason: None,
+            };
+            let actual = status_for_selected_with_probe(
+                config,
+                &selection,
+                dir.path(),
+                &sandbox,
+                &approvals,
+                || {
+                    calls.set(calls.get() + 1);
+                    report.clone()
+                },
+            );
+            assert_eq!(actual.state, expected, "{body}");
+            assert_eq!(
+                calls.get(),
+                usize::from(expected == DevcontainerState::Ready),
+                "{body}"
+            );
+            assert_eq!(
+                actual,
+                status_for_selected(
+                    config,
+                    &selection,
+                    dir.path(),
+                    &sandbox,
+                    &approvals,
+                    &report
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn absent_off_invalid_and_ambiguous_selection_never_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.env.clear();
+        let mut environment = thegn_core::env::Environment {
+            name: "fixture".into(),
+            placement: thegn_core::placement::Placement::Local,
+            sandbox: thegn_core::config::SandboxConfig {
+                profile: thegn_core::config::SandboxProfile::Open,
+                ..Default::default()
+            },
+            data: thegn_core::config::DataMode::InEnv,
+            unresolved_selection: false,
+        };
+        let status = |environment: &thegn_core::env::Environment| {
+            status_for_worktree(
+                &cfg,
+                dir.path(),
+                dir.path(),
+                environment,
+                &thegn_core::config_resolve::Approvals::deny_all(),
+                || panic!("ineligible selection must not probe"),
+            )
+        };
+        assert!(status(&environment).is_none());
+        environment.sandbox.devcontainer = thegn_core::config::DevcontainerMode::Off;
+        assert_eq!(status(&environment).unwrap().state, DevcontainerState::Off);
+        environment.sandbox.devcontainer = thegn_core::config::DevcontainerMode::default();
+        std::fs::write(dir.path().join(".devcontainer.json"), "{ invalid").unwrap();
+        assert_eq!(
+            status(&environment).unwrap().state,
+            DevcontainerState::Invalid
+        );
+        std::fs::remove_file(dir.path().join(".devcontainer.json")).unwrap();
+        for variant in ["first", "second"] {
+            let path = dir.path().join(".devcontainer").join(variant);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("devcontainer.json"), r#"{"image":"fixture"}"#).unwrap();
+        }
+        assert_eq!(
+            status(&environment).unwrap().state,
+            DevcontainerState::Ambiguous
+        );
+        environment.sandbox.enabled = false;
+        assert!(status(&environment).is_none());
     }
 }

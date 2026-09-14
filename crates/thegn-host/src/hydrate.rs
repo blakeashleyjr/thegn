@@ -1329,7 +1329,7 @@ fn collect_sidebar_status(
     // pre-gate behaviour — see `activity_step::Agentness`.
     let mut activity_agents = std::collections::BTreeMap::new();
     let db_worktrees = db.worktrees().unwrap_or_default();
-    let devcontainer_probe = crate::devcontainer_provider::probe();
+    let mut devcontainer_probe = None;
     for wt in &db_worktrees {
         if wt.worktree.is_empty() || wt.repo_root.is_empty() {
             continue;
@@ -1349,7 +1349,11 @@ fn collect_sidebar_status(
             std::path::Path::new(&wt.worktree),
             &environment,
             &approvals,
-            &devcontainer_probe,
+            || {
+                devcontainer_probe
+                    .get_or_insert_with(crate::devcontainer_provider::cached_probe)
+                    .clone()
+            },
         ) {
             status
                 .devcontainer_status

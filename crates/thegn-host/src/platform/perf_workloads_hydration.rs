@@ -174,6 +174,10 @@ fn controlled_full_hydration_workload() {
             .unwrap_or_default()
             .lines()
             .count();
+        assert_eq!(
+            probes, 0,
+            "unrelated model hydration must never probe a devcontainer helper"
+        );
         results.push(serde_json::json!({"worktrees": count, "fixture_helper_present": helper,
             "helper_invocations_total": probes, "samples": samples,
             "scope": "actual build_model, 64 tracked files per worktree, one dirty file, no providers, no terminal; helper is an immediate local fixture; first sample may be cold"}));
