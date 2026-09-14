@@ -16,8 +16,8 @@ The hostile matrix projects real programmatic Config values through the startup 
 - Same harness with optimized worker compilation: six tests pass.
 - Original unchecked PR-queue multiplication restored only in a private harness: debug hostile-worker fixture fails with `attempt to multiply with overflow`, then observes the real output/ack channel close. The other five tests pass.
 - The same original mutation in optimized mode survives and all six tests pass. Historical source already used `is_multiple_of`, whose zero-divisor behavior silently disables that periodic request; it does not panic. This counterfactual therefore demonstrates debug worker-death detection only. Existing debug/optimized nonzero conversion tests independently cover wrapped-zero arithmetic.
-- Full actual host compilation and its three running-worker fixtures: pending combined graph gate.
+- Full actual host compilation at combined source38107f9d succeeded. The combined host receipt reports299/299 passed, including all three `hydrate::refresh_ticker::tests` fixtures. Parent also reports44 focused core time/calendar/atomic tests passed. Actual host receipt: `/tmp/thegn-rolling-host-20260914-results.json`.
 
 The isolated harness extracts the actual worker function and cadence helper bodies, includes the actual repository fixture source, and links cached core/Tokio dependencies. Its minimal event enum excludes unrelated host variants; it is not a whole-host release build. Logs are `/tmp/thegn-ticker-{real,overflow}-worker-{debug,optimized}-{build,tests}.log`; reproducible extraction/build script is `/tmp/thegn-ticker-harness-build.py`. Production files were never mutated for the counterfactual.
 
-Independent source review accepted the production ordering/priming/wake preservation after correcting a fixture omission for the legitimate Issues event at tick120. Final host tests and primary landing approval remain required.
+Independent source review accepted the production ordering/priming/wake preservation after correcting a fixture omission for the legitimate Issues event at tick120. The actual host gate now passes. Final primary landing approval remains required.

@@ -21,5 +21,5 @@
 
 - [x] Obtain primary approval for one shared production spawner/loop with statically dispatched owned I/O boundaries.
 - [x] Add bounded channel-clock fixtures for each hostile cadence family, disabled schedules, and ordinary startup/periodic coalescing.
-- [ ] Run actual host worker fixtures and counterfactual unchecked-overflow failure; record exact evidence.
+- [x] Run actual host worker fixtures (3/3 within combined299/299) and counterfactual unchecked-overflow debug failure; record exact evidence and optimized counterfactual limitation.
 - [ ] Complete primary and independent review and land the acceptance follow-up.
