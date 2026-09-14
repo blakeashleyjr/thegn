@@ -16,3 +16,10 @@
 - [x] Complete primary and independent source review at 2dbe30aa after custody, ambiguous environment policy and empty VPS ID revisions; focused service checks, formatting, idle guard, ignored-result ratchet and strict OpenSpec pass.
 - [ ] Complete final combined host checks and delivery gates; broad/native provider lifecycle gates remain separately required.
 - [ ] Land reviewed changes on canonical local main when Git metadata is writable.
+
+## THE-483 running-worker acceptance follow-up
+
+- [x] Obtain primary approval for one shared production spawner/loop with statically dispatched owned I/O boundaries.
+- [x] Add bounded channel-clock fixtures for each hostile cadence family, disabled schedules, and ordinary startup/periodic coalescing.
+- [ ] Run actual host worker fixtures and counterfactual unchecked-overflow failure; record exact evidence.
+- [ ] Complete primary and independent review and land the acceptance follow-up.
