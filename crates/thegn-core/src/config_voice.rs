@@ -31,6 +31,7 @@ pub struct VoiceConfig {
     pub command: Vec<String>,
     /// Maximum capture length.  The effective value is clamped to a finite,
     /// bounded range before the host starts a worker.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub max_seconds: u64,
 }
 

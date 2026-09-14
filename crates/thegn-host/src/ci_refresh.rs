@@ -18,7 +18,7 @@ pub(crate) mod ci_autofix;
 /// Clamped to ≥ 5s — every tick is a provider subprocess (`gh run list`), so a
 /// faster cadence would thrash. Pure, so it's unit-tested.
 pub(crate) fn ci_every_slots(poll_interval_secs: u64) -> u64 {
-    (poll_interval_secs.max(5) * 1000) / 500
+    thegn_core::time_policy::cadence_slots(poll_interval_secs, 5, 500).get()
 }
 
 /// Freshness guard for the CI run-history cache: a non-forced refresh

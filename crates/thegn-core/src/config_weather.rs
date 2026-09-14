@@ -52,11 +52,14 @@ pub struct WeatherConfig {
     /// `auto` (from the locale), `metric`, or `imperial`.
     pub units: WeatherUnits,
     /// Seconds between refreshes. Always floored at [`MIN_REFRESH_SECS`].
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub refresh_interval_secs: u64,
     /// Past this age the reading is dimmed and dated rather than shown as
     /// current.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub stale_after_secs: u64,
     /// Past this age the reading is hidden entirely; `0` disables expiry.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub hard_expiry_secs: u64,
     /// Show the day strip in the calendar popup.
     pub show_forecast: bool,
@@ -65,6 +68,7 @@ pub struct WeatherConfig {
     pub forecast_days: usize,
     /// Seconds before a fetch is abandoned. Clamped to `3..=60` in
     /// [`WeatherConfig::timeout`].
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub timeout_secs: u64,
     /// Secret ref (`"env:VAR"` / `"file:PATH"`) for the reserved keyed
     /// providers. A raw key here is a validation **error** — credentials never

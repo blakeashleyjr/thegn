@@ -46,6 +46,7 @@ pub struct NetworkConfig {
     pub offline_after_failures: u32,
     /// While offline, re-probe for connectivity at most this often (seconds).
     /// Clamped to at least 1.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub recovery_probe_secs: u64,
 }
 

@@ -503,6 +503,7 @@ fn walk_object(
         ));
         return;
     }
+    crate::config_duration::check_number(obj, value, path, errs);
     // The strict enum check: only nodes carrying the `config_enum!` marker,
     // and only string TOML values — `failover` keys legally accept a bool
     // (`de_failover`), and genuinely wrong types are already reported by the

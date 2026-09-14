@@ -87,8 +87,10 @@ pub struct CiConfig {
     pub provider: CiProviderKind,
     /// Freshness window (seconds): non-forced refreshes (ticker, tab switch)
     /// skip while the cache is younger. `0` disables; `g` always refetches.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub ttl_secs: u64,
     /// Run-history refresh cadence (seconds), min 5 (a subprocess per poll).
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub poll_interval_secs: u64,
     /// How many recent runs to fetch and display.
     pub max_runs: usize,

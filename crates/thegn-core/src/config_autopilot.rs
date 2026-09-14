@@ -23,6 +23,7 @@ pub struct AutopilotConfig {
     pub max_attempts: u32,
     pub agent: String,
     pub agent_command: String,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: u64,
     pub open_as: AutopilotOpenAs,
     pub done_on_merge: bool,
@@ -81,6 +82,7 @@ pub struct AutopilotOverlay {
     pub max_attempts: Option<u32>,
     pub agent: Option<String>,
     pub agent_command: Option<String>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub agent_timeout_secs: Option<u64>,
     pub open_as: Option<AutopilotOpenAs>,
     pub done_on_merge: Option<bool>,

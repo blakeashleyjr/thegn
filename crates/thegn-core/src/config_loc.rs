@@ -24,6 +24,7 @@ pub struct LocConfig {
     /// Per-worktree re-count TTL (seconds). The background scanner skips rows
     /// younger than this, and pumps at a quarter of it so a budget-bounded round
     /// still sweeps every worktree inside one window. `0` counts every pump.
+    #[schemars(range(max = "crate::time_policy::MAX_CADENCE_SECS"))]
     pub scan_interval_secs: u64,
     /// Worktrees counted per background round. tokei walks the whole tree, so a
     /// bounded round keeps one background-lane permit from being held for
@@ -36,6 +37,7 @@ pub struct LocConfig {
     /// bypass it for that single path — but no more often than this, or a save
     /// storm would re-walk the tree continuously. `0` disables content-driven
     /// recounts entirely (the TTL alone governs).
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub watch_invalidate_secs: u64,
 }
 

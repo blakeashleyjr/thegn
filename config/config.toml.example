@@ -1,6 +1,9 @@
 # thegn config — copy to ~/.config/thegn/config.toml and edit.
 # All keys are optional (sane defaults apply). Home-manager users get this
 # generated automatically from programs.thegn.
+# Numeric duration maxima: polling cadences 31 days; other durations ten
+# 365-day years, in each key's documented units. Existing zero/floor semantics
+# still apply. See docs/duration-policy.md for strict checks and runtime recovery.
 
 # ── Release channel ───────────────────────────────────────────────────────────
 # thegn ships in two channels. The regular (stable) build runs the AI-free

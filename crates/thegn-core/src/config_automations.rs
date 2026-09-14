@@ -56,6 +56,7 @@ pub struct AutomationsConfig {
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
     #[serde(default = "default_action_timeout_secs")]
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub action_timeout_secs: u64,
     #[serde(default = "default_audit_retention_per_rule")]
     pub audit_retention_per_rule: usize,
@@ -83,6 +84,7 @@ pub struct AutomationsOverlay {
     pub enabled: Option<bool>,
     pub max_concurrent: Option<usize>,
     pub queue_capacity: Option<usize>,
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub action_timeout_secs: Option<u64>,
     pub audit_retention_per_rule: Option<usize>,
     pub rules: Option<Vec<AutomationRuleConfig>>,
@@ -131,8 +133,10 @@ pub struct AutomationRuleConfig {
     pub predicate: AutomationPredicateConfig,
     pub then: AutomationActionConfig,
     #[serde(default = "default_debounce_secs")]
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub debounce_secs: u64,
     /// Required only for `when = "worktree_idle"`; independent of debounce.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub idle_secs: Option<u64>,
     pub once_per_key: bool,
     #[serde(default = "default_max_per_hour")]

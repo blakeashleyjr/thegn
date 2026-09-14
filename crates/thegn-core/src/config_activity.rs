@@ -66,6 +66,7 @@ pub struct ActivityConfig {
     /// Deliberately long: a compile, a test suite and a video encode all peg a
     /// core legitimately, and a report that fires on those is one you learn to
     /// ignore. An hour is well past any of them.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub runaway_secs: f64,
     /// How long a working worktree must stay quiet before its dot turns
     /// "finished / needs you". A *confirming* observation is always also
@@ -74,20 +75,25 @@ pub struct ActivityConfig {
     /// Raised from the legacy 5.0: that value equalled the poll cadence, so the
     /// grace aliased away entirely and a single quiet window flipped the dot —
     /// the "turns red while the agent is still working" bug.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub quiet_grace_secs: f64,
     /// How long a finished/blocked worktree must be *continuously* busy before
     /// its dot goes back to working. Guards against a single spinner redraw or
     /// stray watcher blip clearing a dot the user hasn't seen.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub resume_grace_secs: f64,
     /// Ignore pane output younger than this: spawn banners, prompt paint and a
     /// reattach's scrollback replay are not live agent work.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub spawn_grace_secs: f64,
     /// Output this soon after a keystroke into the same pane is echo (or an
     /// immediate command response), not unsolicited agent work.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub unsolicited_gap_secs: f64,
     /// Floor on the output-freshness window. The window is normally the elapsed
     /// poll interval, which a coalesced or rate-limited poll can compress to
     /// almost nothing — dropping a legitimately fresh stamp on the floor.
+    #[schemars(range(max = "crate::time_policy::MAX_DURATION_SECS"))]
     pub output_hint_ttl_secs: f64,
     /// Only a worktree with a real agent may show a "needs you" dot. A plain
     /// shell that ran a command and went quiet returns to no dot instead of
