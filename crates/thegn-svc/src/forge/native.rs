@@ -179,18 +179,14 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
     }
 }
 
-/// Parse `owner/repo` from a git remote URL (ssh or https, with/without
-/// `.git`). One parser for the workspace: `thegn_core::forge::model`'s.
+/// Parse one unambiguous public-GitHub authority and repository identity.
+/// Unsupported origin forms stay on the CLI fallback before token resolution.
 pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
-    // This implementation uses api.github.com. A syntactically valid owner/repo
-    // on another forge is not permission to query the same name on GitHub.
-    if super::remote_host(url).as_deref() != Some("github.com") {
-        return None;
-    }
-    nwo_from_remote_url(url).and_then(|nwo| {
-        nwo.split_once('/')
-            .map(|(o, r)| (o.to_string(), r.to_string()))
-    })
+    // Git's get-url output includes a newline. Use the existing strict origin
+    // parser for both authority and path: an @ inside a foreign URL's path must
+    // never be mistaken for userinfo authorizing api.github.com credentials.
+    let repository = thegn_core::forge::authorship::GithubRepository::from_origin(url.trim())?;
+    (repository.host == "github.com").then_some((repository.owner, repository.name))
 }
 
 /// Per-request timeout on octocrab GraphQL calls. A stalled TLS handshake to
