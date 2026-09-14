@@ -173,15 +173,24 @@ pub(crate) fn drive_queue(
                     cfg.agent_on_floor_miss,
                 )
             },
+            runner: |template: &str,
+                     worktree: &str,
+                     branch: &str,
+                     target: &str,
+                     failure: &Failure,
+                     sandbox: Option<thegn_core::sandbox::SandboxSpec>| {
+                run_agent(cfg, template, worktree, branch, target, failure, sandbox)
+            },
         },
     )
 }
 
 /// Private injection points exercise the actual loop without launching Git or
 /// an agent. Production supplies the same concrete operations as before.
-struct DriveActions<A, F> {
+struct DriveActions<A, F, R> {
     attempt: A,
     floor: F,
+    runner: R,
 }
 
 fn drive_queue_with(
@@ -194,6 +203,7 @@ fn drive_queue_with(
     mut actions: DriveActions<
         impl FnMut(&str, &thegn_core::remote::GitLoc) -> anyhow::Result<AttemptOutcome>,
         impl FnMut(&str) -> crate::agent_run::AgentDispatch,
+        impl FnMut(&str, &str, &str, &str, &Failure, Option<thegn_core::sandbox::SandboxSpec>) -> bool,
     >,
 ) -> DriveOutcome {
     let mut out = DriveOutcome::default();
@@ -407,9 +417,8 @@ fn drive_queue_with(
                 // Run to completion; the re-attempt (top of loop) is the real
                 // arbiter of whether the fix worked, so ignore the exit code.
                 if let Some(template) = agent_cmd.as_deref() {
-                    let _ = run_agent(
+                    let _ = (actions.runner)(
                         // best-effort: the re-attempt at the top of the loop is the real arbiter (comment above)
-                        cfg,
                         template,
                         &item.worktree,
                         &item.branch,
