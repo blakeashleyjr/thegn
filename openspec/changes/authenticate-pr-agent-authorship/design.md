@@ -7,3 +7,11 @@ A shared host gate binds this proof to the selected execution location's origin,
 `own_prs_only = false` remains explicit authorization for the broader policy and performs no new identity queries. GitHub and configured GitHub Enterprise origins have a proof implementation. GitLab/Forgejo and ambiguous origin forms remain readable but own-only automation is held with a diagnostic; no URL-owner or login-only fallback is used. HTTPS, SCP-style git SSH and explicit ssh://git@host forms are supported without ports, URL credentials, query/fragment or extra path segments.
 
 This closes an authorship check, not all automation authority races. External credential changes after the final check are not frozen (THE-541); broader durable queue ownership/checkout authority remains THE-550. The proof read uses the existing blocking GitHub CLI subprocess seam and inherits its lifecycle/timeout limitations. No live provider calls, agent dispatches, or review resolutions are used in validation.
+
+The interactive headless review fallback also uses this shared admission. Its UI
+captures the selection and queues a worker; DB/git/forge reads and sandbox
+resolution stay off the compositor. The worker matches the canonical worktree
+cache key, selected PR number/branch/head and displayed URL to the fresh local
+proof before preparation, then revalidates immediately before launch. Live-pane
+paste without submission is unchanged. The remaining account-generation binding
+at the actual credentialed runner is still outstanding under THE-541/THE-233.

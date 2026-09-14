@@ -422,6 +422,12 @@ jobs:
       # the real-pipe truth gate for the daemon IPC seam. Scoped to the ipc
       # module until the full suite is validated on Windows.
       - run: cargo test -p thegn-svc --lib --locked ipc
+      # Real native child pipes, bounded admission/deadlines, pending RPC
+      # closure, and owned cleanup. The ignored reexec entry is helper-only;
+      # this selection executes eight regressions, not the helper as a pass.
+      - run: "cargo test -p thegn-svc --lib --locked plugin::platform::native_tests::"
+      # Exercise the Windows-only between-latch-and-ReadFile cancellation race.
+      - run: "cargo test -p thegn-svc --lib --locked plugin::platform::windows::tests::"
       # Job Object semantics on a real kernel: terminate() reaps the tree and
       # dropping the last handle (KILL_ON_JOB_CLOSE) reaps it too.
       - run: "cargo test -p thegn-host --locked platform::"

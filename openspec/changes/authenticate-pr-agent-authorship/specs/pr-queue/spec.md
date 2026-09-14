@@ -33,3 +33,14 @@ When own-only PR policy is enabled, automatic agent handoffs SHALL require curre
 
 - **WHEN** a preclaim identity or preparation gate holds
 - **THEN** the stale invocation returns its diagnostic without updating or reparking the current durable task row
+
+#### Scenario: Interactive review falls back to a headless agent
+
+- **WHEN** a review handoff selects the headless fallback with own-only policy enabled
+- **THEN** a blocking worker verifies the selected worktree, repository URL, PR number, branch and head through shared fresh authorship admission before sandbox preparation, and revalidates before launch
+- **AND** unavailable or changed evidence holds without starting an agent or modifying a durable claim or attempt count
+
+#### Scenario: Review feedback is pasted into an existing agent pane
+
+- **WHEN** the handoff selects an existing live agent pane
+- **THEN** feedback remains pasted without submission under the existing interactive behavior
