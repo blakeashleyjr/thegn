@@ -173,11 +173,15 @@ impl Role {
 /// filter replaces this default outright rather than merging with it.
 const BRIDGED_LOG_DIRECTIVE: &str = "log=error";
 
+fn default_level_filter(level: LogLevel) -> EnvFilter {
+    EnvFilter::new(format!("{},{BRIDGED_LOG_DIRECTIVE}", level.as_str()))
+}
+
 fn level_filter(default: LogLevel) -> EnvFilter {
     // `THEGN_LOG` (tracing directives) wins; else the configured level.
     match std::env::var("THEGN_LOG") {
         Ok(s) if !s.trim().is_empty() => EnvFilter::builder().parse_lossy(s),
-        _ => EnvFilter::new(format!("{},{BRIDGED_LOG_DIRECTIVE}", default.as_str())),
+        _ => default_level_filter(default),
     }
 }
 
@@ -200,7 +204,10 @@ static LEVEL_RELOAD: OnceLock<Box<dyn Fn(EnvFilter) + Send + Sync>> = OnceLock::
 /// layer is fixed at WARN and never reloads.
 pub fn reload_level(level: LogLevel) {
     if let Some(f) = LEVEL_RELOAD.get() {
-        f(EnvFilter::new(level.as_str()));
+        // A configuration reconciliation never overrides an explicit request.
+        if !env_level_is_set() {
+            f(default_level_filter(level));
+        }
     }
 }
 
@@ -1081,6 +1088,8 @@ mod tests {
             .env_remove("THEGN_LOG_LEVEL");
         if case == "cli" {
             command.env("THEGN_LOG", "debug");
+        } else if case == "host-filter-override" {
+            command.env("THEGN_LOG", "warn,log=warn");
         }
         command.output().unwrap()
     }
@@ -1091,6 +1100,9 @@ mod tests {
             "ring",
             "host-text",
             "host-json",
+            "host-filter",
+            "host-config-dedup",
+            "host-filter-override",
             "cli",
             "bad-file",
             "restore",
@@ -1162,6 +1174,56 @@ mod tests {
                 tracing::trace!(target: "thegn::install-test", "reloaded trace");
                 // A second install exercises the idempotent try-init failure path.
                 install(Role::Daemon, &cfg);
+            }
+            "host-config-dedup" => {
+                let cfg = LogConfig {
+                    file: true,
+                    dir: dir.to_string_lossy().into_owned(),
+                    ..LogConfig::default()
+                };
+                install(Role::Host, &cfg);
+                let path = dir.join("runtime.toml");
+                let body = "workspaces_dir = '/fixture'\n[network]\nmode = 'bad-mode'\n";
+                std::fs::write(&path, body).unwrap();
+                let load = || {
+                    crate::config::Config::try_load_layered(
+                        &crate::config::MapEnv(Default::default()),
+                        &[],
+                        Some(path.clone()),
+                    )
+                    .unwrap()
+                };
+                load();
+                load();
+                let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
+                assert_eq!(log.matches("unknown network mode").count(), 1);
+                assert_eq!(log.matches("workspaces_dir").count(), 1);
+                std::fs::write(&path, body.replace("bad-mode", "changed-mode")).unwrap();
+                load();
+                let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
+                assert_eq!(log.matches("unknown network mode").count(), 2);
+                assert!(log.contains("changed-mode"));
+            }
+            "host-filter" | "host-filter-override" => {
+                let cfg = LogConfig {
+                    file: true,
+                    dir: dir.to_string_lossy().into_owned(),
+                    ..LogConfig::default()
+                };
+                install(Role::Host, &cfg);
+                tracing::warn!(target: "log", "dependency before reload");
+                tracing::warn!(target: "thegn::install-test", "application before reload");
+                reload_level(LogLevel::Trace);
+                tracing::warn!(target: "log", "dependency after reload");
+                tracing::warn!(target: "thegn::install-test", "application after reload");
+                tracing::trace!(target: "thegn::install-test", "application trace after reload");
+                let log = std::fs::read_to_string(dir.join("thegn.log")).unwrap();
+                let explicit = case == "host-filter-override";
+                assert_eq!(log.contains("dependency before reload"), explicit);
+                assert_eq!(log.contains("dependency after reload"), explicit);
+                assert!(log.contains("application before reload"));
+                assert!(log.contains("application after reload"));
+                assert_eq!(log.contains("application trace after reload"), !explicit);
             }
             "host-json" => {
                 let cfg = LogConfig {

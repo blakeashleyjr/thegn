@@ -15240,7 +15240,7 @@ async fn event_loop<T: Terminal>(
                 // `Wake`/`Resized` never reach here, so background hydration
                 // can't dismiss it.
                 if center_dormant {
-                    tracing::debug!(target: "thegn::frame", key = ?k.key, "dormant dismissed by key");
+                    tracing::debug!(target: "thegn::frame", key = crate::input::diagnostic_key(&k.key), "dormant dismissed by key");
                     center_dormant = false;
                     need_relayout = true;
                     dirty = true;
@@ -19909,22 +19909,7 @@ async fn event_loop<T: Terminal>(
                         None => keymap.dispatch(mode, input_key.clone()),
                     }
                 };
-                // Diagnostic: raw termwiz key + modifier bits (pre/post
-                // normalization) and the action they resolved to. Free unless
-                // `THEGN_LOG=thegn::input=debug`. This is the ground truth
-                // for chord-match bugs (e.g. a terminal dropping SHIFT on an
-                // arrow, or adding an enhancement flag that breaks exact match).
-                if tracing::enabled!(target: "thegn::input", tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        target: "thegn::input",
-                        raw_key = ?k.key,
-                        raw_mods = ?k.modifiers,
-                        norm_key = ?input_key.code,
-                        norm_mods = ?input_key.mods,
-                        result = ?dispatch,
-                        "key dispatch"
-                    );
-                }
+                crate::input::log_dispatch(&k.key, k.modifiers, &input_key, &dispatch);
                 match dispatch {
                     crate::sequence::MatchResult::Matched(action) => {
                         use crate::keymap::Action;

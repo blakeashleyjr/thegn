@@ -235,10 +235,16 @@ impl Forge for Ladder<dyn Forge> {
 pub fn github(enterprise: bool) -> Ladder<dyn Forge> {
     Ladder::new(
         if enterprise { "ghe" } else { "github" },
-        vec![
-            Box::new(GithubNative::new()) as Box<dyn Forge>,
-            Box::new(GithubCli { enterprise }) as Box<dyn Forge>,
-        ],
+        if enterprise {
+            // Native currently implements only api.github.com; the CLI resolves
+            // enterprise endpoints and host-scoped credentials from the origin.
+            vec![Box::new(GithubCli { enterprise }) as Box<dyn Forge>]
+        } else {
+            vec![
+                Box::new(GithubNative::new()) as Box<dyn Forge>,
+                Box::new(GithubCli { enterprise }) as Box<dyn Forge>,
+            ]
+        },
     )
 }
 
