@@ -5892,16 +5892,13 @@ fn parse_bool(raw: &str, key: &str) -> Option<bool> {
 }
 
 fn apply_env_duration_checked(cfg: &mut Config, env: &dyn EnvSource) {
-    let overlay = env_overlay(env);
-    let errors = crate::config_duration::errors_for_env_overlay(&overlay);
-    if errors.is_empty() {
-        overlay.apply(cfg);
-    } else {
-        config_warn(&format!(
-            "environment duration override rejected: {}",
-            errors.join("; ")
-        ));
+    let mut overlay = env_overlay(env);
+    for error in crate::config_duration::retain_valid_env_durations(&mut overlay) {
+        config_warn(&error);
     }
+    // Invalid duration fields never discard unrelated explicit authority such
+    // as a stronger isolation floor, disabled network, or fail-closed behavior.
+    overlay.apply(cfg);
 }
 
 impl Config {

@@ -22,7 +22,7 @@ and pre-write validation. The permissive base-file path retains parsed settings
 and warns. Runtime periodic conversion caps unsupported cadence values; invalid
 destructive duration remains raw until the reaper quarantines it. This is targeted
 duration recovery and does not fix the general loader-admission issue THE-505.
-An explicit overlay with a newly invalid duration is rejected atomically; an
+A CLI/profile overlay with a newly invalid duration is rejected atomically; an
 unrelated repair remains possible when a base already contains diagnosed errors.
 
 The shared ticker gets an unwind-only notification guard: exactly one error
@@ -50,3 +50,9 @@ Model and PR due decisions are independent. A due PR subsumes a coincident model
 refresh; hostile model intervals cannot starve an ordinary PR schedule. Nine
 actual-source standalone cadence/schedule/panic fixtures pass in both debug and
 optimized builds; final updated core admission tests and combined host remain pending.
+
+Adversarial review found whole-environment rejection could drop a valid stronger
+isolation/network override alongside a bad TTL. Environment checks now clear only
+invalid duration fields and apply every other explicit setting. A mixed security
+override regression covers this. Raw duration admission recognizes the two existing
+metrics duration aliases, so aliases cannot bypass write/profile range checks.

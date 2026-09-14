@@ -6,9 +6,11 @@ existing units: seconds, milliseconds, or days. Feature-specific lower limits
 and zero behavior remain documented with each key; zero does not acquire a new
 global meaning. Absolute timestamps are not subject to duration limits.
 
-`config validate`, config writes, and explicit CLI/environment/profile overlays
-reject newly introduced invalid durations. Writes validate before replacing a
-file. Existing unrelated problems do not prevent repairing another setting.
+`config validate`, config writes, and explicit CLI/profile overlays reject
+newly introduced invalid durations. The environment ignores each invalid duration
+field while applying valid unrelated overrides, including security policy. Writes
+validate before replacing a file. Existing unrelated problems do not prevent
+repairing another setting.
 
 The permissive base-file loader retains a successfully parsed configuration and
 reports an invalid duration instead of discarding unrelated sandbox policy.
