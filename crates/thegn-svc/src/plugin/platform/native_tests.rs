@@ -73,7 +73,11 @@ fn resident_native_fixture_entry() {
         close_standard_stream(false);
     }
     // Leading newline isolates the handshake from libtest's test-name prefix.
-    println!("\n{{\"method\":\"{READY}\",\"params\":{{}}}}");
+    writeln!(
+        std::io::stdout(),
+        "\n{{\"method\":\"{READY}\",\"params\":{{}}}}"
+    )
+    .unwrap();
     std::io::stdout().flush().unwrap();
     match mode.as_str() {
         "blocked" | "closed-stdin" => {}
@@ -84,10 +88,12 @@ fn resident_native_fixture_entry() {
             match mode.as_str() {
                 "final-reply" => {
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    println!(
+                    writeln!(
+                        std::io::stdout(),
                         "{}",
                         serde_json::json!({"id": request["id"], "result": {"final": true}})
-                    );
+                    )
+                    .unwrap();
                     std::io::stdout().flush().unwrap();
                     std::process::exit(0);
                 }
@@ -97,7 +103,11 @@ fn resident_native_fixture_entry() {
                     std::io::stdout().flush().unwrap();
                 }
                 "callback" => {
-                    println!("{{\"method\":\"fixture_callback\",\"params\":{{}}}}");
+                    writeln!(
+                        std::io::stdout(),
+                        "{{\"method\":\"fixture_callback\",\"params\":{{}}}}"
+                    )
+                    .unwrap();
                     std::io::stdout().flush().unwrap();
                 }
                 _ => unreachable!(),
