@@ -2481,6 +2481,9 @@ pub(crate) fn build_model(
 ) -> FrameModel {
     use thegn_core::remote::GitLoc;
 
+    // Every complete model build is covered, including the post-commit resend.
+    // Scoped child threads have a distinct ledger; no parent CPU is double-counted.
+    let _cpu = crate::perf::measure(crate::perf::Subsys::Hydrate);
     let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);
     let loc = GitLoc::for_worktree(&cwd);
@@ -2490,7 +2493,9 @@ pub(crate) fn build_model(
 
     // Single layered-config load reused for notification priority + tasks below
     // (CLI overrides + DB-defined hosts included — see `load_hydration_config`).
+    let config_t0 = crate::perf::enabled().then(std::time::Instant::now);
     let app_cfg = load_hydration_config();
+    let config_us = config_t0.map(|t| t.elapsed().as_micros() as u64);
     // Mirror the active repo's merged-worktree grace period for the merge
     // section's countdown. Resolved per-repo (so a `[workspace.<slug>]` override
     // counts) and zeroed under any `on_landed` without a grace period, which the
@@ -2504,6 +2509,7 @@ pub(crate) fn build_model(
     let alert_kinds = app_cfg.notifications.alert_kind_names();
     let counted_kinds = app_cfg.notifications.counted_unread_kind_names();
 
+    let sidebar_t0 = crate::perf::enabled().then(std::time::Instant::now);
     let mut sidebar_workspaces = workspace_list(session, Some(db));
     let sidebar_db_worktrees = db_worktree_list(db, &app_cfg);
     // Recover lost repo paths before querying folders: folder rows are keyed by
@@ -2538,6 +2544,7 @@ pub(crate) fn build_model(
         &counted_kinds,
         &app_cfg.lifecycle,
     );
+    let sidebar_us = sidebar_t0.map(|t| t.elapsed().as_micros() as u64);
     // Self-throttled housekeeping (network/DB on own threads): VPS leak reaper
     // + placement engine + hibernator (snapshot-then-destroy for idle VMs).
     crate::vps_reaper::tick(&app_cfg);
@@ -2599,7 +2606,9 @@ pub(crate) fn build_model(
     let active_placement_kind = show_placement.then(|| active_env.placement.kind());
     let active_placement_label = show_placement.then(|| active_env.placement.label());
 
+    let panel_t0 = crate::perf::enabled().then(std::time::Instant::now);
     let panel = build_panel(&cwd, db, &hints, &app_cfg);
+    let panel_us = panel_t0.map(|t| t.elapsed().as_micros() as u64);
 
     // Decorate the tab-bar placement chip with the backing host's readiness
     // (hosts-as-resources): `[ssh]` stays clean when the host is ready,
@@ -2660,6 +2669,9 @@ pub(crate) fn build_model(
     tracing::debug!(
         target: "thegn::hydrate",
         build_model_ms = t0.elapsed().as_millis() as u64,
+        config_us,
+        sidebar_us,
+        panel_us,
         diff_files = panel.files.len(),
         changes = panel.changes.len(),
         merging = panel.merge.is_some(),
@@ -2807,6 +2819,7 @@ pub(crate) fn build_panel(
     ) = std::thread::scope(|s| {
         // Raw `Result`s (branch/ahead/merge) merged post-scope: `panel_header_cache`.
         let h_branch = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             crate::git_handle::get()
                 .current_branch(&loc)
                 .map_err(|_| ())
@@ -2814,15 +2827,25 @@ pub(crate) fn build_panel(
         // diff + the semantic entity summary share the diff result and need only
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             let entries = crate::git_handle::get()
                 .diff_files(&loc, "HEAD")
                 .unwrap_or_default();
             let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
             (entries, entities)
         });
-        let h_status = s.spawn(|| crate::git_handle::get().status(&loc).unwrap_or_default());
-        let h_ahead = s.spawn(|| crate::git_handle::get().ahead_behind(&loc).map_err(|_| ()));
-        let h_merge = s.spawn(|| crate::git_handle::get().merge_state(&loc).map_err(|_| ()));
+        let h_status = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
+            crate::git_handle::get().status(&loc).unwrap_or_default()
+        });
+        let h_ahead = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
+            crate::git_handle::get().ahead_behind(&loc).map_err(|_| ())
+        });
+        let h_merge = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
+            crate::git_handle::get().merge_state(&loc).map_err(|_| ())
+        });
         // While a merge/rebase is live, the working tree/index carries the whole
         // incoming diff staged, so the changes list is dominated by files the
         // *merge* brings in, not the user's own edits. Compute the incoming path
@@ -2830,6 +2853,7 @@ pub(crate) fn build_panel(
         // `git diff HEAD...<HEAD-ref>`) so `build_change_rows` can tag and group
         // them apart. Empty (and near-free) outside a merge.
         let h_incoming = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
             crate::git_handle::get()
                 .merge_state(&loc)
                 .ok()
@@ -2844,12 +2868,16 @@ pub(crate) fn build_panel(
                 })
                 .unwrap_or_default()
         });
-        let h_stash_count = s.spawn(|| crate::git_handle::get().stash_count(&loc).unwrap_or(0));
+        let h_stash_count = s.spawn(|| {
+            let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
+            crate::git_handle::get().stash_count(&loc).unwrap_or(0)
+        });
         // Section-gated heavy reads: spawned only when their section is open, so
         // an idle panel pays nothing. The branch PR-badge join is DB-backed and
         // stays on the main thread below; only the raw `branches_full` runs here.
         let h_log = want_log.then(|| {
             s.spawn(|| {
+                let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
                 crate::git_handle::get()
                     .log_graph(&loc, log_n)
                     .unwrap_or_default()
@@ -2859,6 +2887,7 @@ pub(crate) fn build_panel(
         // from another tab (or an earlier hydration) is reused verbatim below.
         let h_branches = need_branch_fetch.then(|| {
             s.spawn(|| {
+                let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
                 crate::git_handle::get()
                     .branches_full(&loc)
                     .unwrap_or_default()
@@ -2866,6 +2895,7 @@ pub(crate) fn build_panel(
         });
         let h_stashes = want_stashes.then(|| {
             s.spawn(|| {
+                let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
                 crate::git_handle::get()
                     .stash_list(&loc)
                     .unwrap_or_default()
@@ -2876,6 +2906,7 @@ pub(crate) fn build_panel(
         #[expect(clippy::disallowed_methods)]
         let h_ls = want_lsfiles.then(|| {
             s.spawn(|| {
+                let _cpu = crate::perf::measure(crate::perf::Subsys::HydrateChild);
                 loc.git_command(&["ls-files"])
                     .output()
                     .ok()
@@ -3581,10 +3612,7 @@ pub(crate) fn spawn_model_hydration(
                     return None;
                 }
             };
-            let first = {
-                let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
-                build_model(&session, &db, hints.clone())
-            };
+            let first = build_model(&session, &db, hints.clone());
             // `commits_loading` = the open Commits section needs a fresh list;
             // `warm_commits` (set on a switch) also pre-warms a *closed* section.
             let show_commits = first.panel.commits_loading;

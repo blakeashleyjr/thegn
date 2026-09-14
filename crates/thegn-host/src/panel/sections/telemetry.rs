@@ -58,7 +58,7 @@ fn loop_block(ctx: &SectionCtx) -> Vec<PanelRow> {
     ])));
     rows.push(PanelRow::plain(Line::split(
         vec![sp(1), seg(g(), "hot "), seg(ac(), s.hot_source)],
-        vec![seg(d(), format!("idle {:.0}%", s.idle_ratio * 100.0))],
+        vec![seg(d(), format!("loop idle {:.0}%", s.idle_ratio * 100.0))],
     )));
     if ctx.deep() {
         let gw = ctx.cols.saturating_sub(8).clamp(12, 64);

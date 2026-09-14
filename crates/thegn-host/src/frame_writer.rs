@@ -32,7 +32,11 @@
 
 use std::collections::VecDeque;
 use std::io::Write as _;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::time::Instant;
+
+use crate::perf_timing::{FrameStamp, WriterMetrics};
 
 use termwiz::terminal::TerminalWaker;
 
@@ -50,7 +54,7 @@ pub(crate) enum WriterStatus {
 
 enum Msg {
     /// A composed frame (wire bytes + trailing graphics/bell).
-    Frame(Vec<u8>),
+    Frame(Vec<u8>, Option<FrameStamp>),
     /// Order-preserving passthrough (OSC 52, kitty deletes, muse marker…).
     Oob(Vec<u8>),
 }
@@ -62,11 +66,13 @@ struct Q {
     status: WriterStatus,
     consec_errs: u32,
     shutdown: bool,
+    metrics: WriterMetrics,
 }
 
 struct Inner {
     q: Mutex<Q>,
     cv: Condvar,
+    metrics_deferrals: AtomicU64,
 }
 
 pub(crate) struct FrameWriter {
@@ -91,8 +97,10 @@ impl FrameWriter {
                 status: WriterStatus::Ok,
                 consec_errs: 0,
                 shutdown: false,
+                metrics: WriterMetrics::default(),
             }),
             cv: Condvar::new(),
+            metrics_deferrals: AtomicU64::new(0),
         });
         let handle = (!sync).then(|| {
             let inner = Arc::clone(&inner);
@@ -129,9 +137,9 @@ impl FrameWriter {
     /// Submit a composed frame. Returns false when the queue is full (the
     /// caller deferred composing, so this only races a concurrent drain —
     /// never drops). Sync mode writes inline.
-    pub(crate) fn submit_frame(&self, bytes: Vec<u8>) -> bool {
+    pub(crate) fn submit_frame(&self, bytes: Vec<u8>, stamp: Option<FrameStamp>) -> bool {
         if self.sync {
-            self.write_inline(&bytes);
+            self.write_inline(&bytes, stamp);
             return true;
         }
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
@@ -139,7 +147,7 @@ impl FrameWriter {
             return false;
         }
         q.frames_queued += 1;
-        q.msgs.push_back(Msg::Frame(bytes));
+        q.msgs.push_back(Msg::Frame(bytes, stamp));
         drop(q);
         self.inner.cv.notify_one();
         true
@@ -152,7 +160,7 @@ impl FrameWriter {
             return;
         }
         if self.sync {
-            self.write_inline(&bytes);
+            self.write_inline(&bytes, None);
             return;
         }
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
@@ -174,10 +182,45 @@ impl FrameWriter {
     }
 
     /// Sync-mode write on the caller thread, with the same classification.
-    fn write_inline(&self, bytes: &[u8]) {
+    fn write_inline(&self, bytes: &[u8], stamp: Option<FrameStamp>) {
+        let started = stamp.map(|_| Instant::now());
         let result = write_and_flush(bytes);
+        let finished = started.map(|_| Instant::now());
         let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
+            q.metrics.record(stamp, started, finished, result.is_ok());
+        }
         apply_write_result(&mut q, result);
+    }
+
+    /// Never wait behind a producer for diagnostics. The fixed-size ledger is
+    /// retained if contended and included in a later existing rollup.
+    pub(crate) fn take_metrics(&self) -> Option<WriterMetrics> {
+        let mut q = match self.inner.q.try_lock() {
+            Ok(q) => q,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                self.inner.metrics_deferrals.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let mut metrics = std::mem::take(&mut q.metrics);
+        metrics.deferred_rollups = self.inner.metrics_deferrals.swap(0, Ordering::Relaxed);
+        Some(metrics)
+    }
+
+    /// The termwiz debug renderer writes synchronously outside this writer.
+    pub(crate) fn record_external_frame(
+        &self,
+        stamp: Option<FrameStamp>,
+        started: Instant,
+        finished: Instant,
+        success: bool,
+    ) {
+        if let Some(stamp) = stamp {
+            let mut q = self.inner.q.lock().unwrap_or_else(|e| e.into_inner());
+            q.metrics.record(stamp, started, finished, success);
+        }
     }
 }
 
@@ -203,7 +246,7 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
             let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(m) = q.msgs.pop_front() {
-                    if matches!(m, Msg::Frame(_)) {
+                    if matches!(m, Msg::Frame(..)) {
                         q.frames_queued = q.frames_queued.saturating_sub(1);
                     }
                     break Some(m);
@@ -215,29 +258,49 @@ fn writer_main(inner: &Inner, waker: &TerminalWaker) {
             }
         };
         let Some(msg) = msg else { break };
-        let bytes = match &msg {
-            Msg::Frame(b) | Msg::Oob(b) => b,
-        };
-        // After a Fatal, drop writes (the loop is tearing down); keep draining
-        // so shutdown never deadlocks.
-        let fatal = {
-            let q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
-            matches!(q.status, WriterStatus::Fatal(_))
-        };
-        if fatal {
-            continue;
-        }
-        let result = write_and_flush(bytes);
-        let errored = result.is_err();
-        {
-            let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
-            apply_write_result(&mut q, result);
-        }
+        let errored = write_message(inner, msg, write_and_flush);
         if errored {
             // The loop acts on the status (full repaint / teardown) — wake it.
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     }
+}
+
+/// One message, with the sink injected for isolated boundary tests. Queue locks
+/// are never held during sink I/O; only fixed-size status/metric updates follow.
+fn write_message(
+    inner: &Inner,
+    msg: Msg,
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> bool {
+    let bytes = match &msg {
+        Msg::Frame(b, _) | Msg::Oob(b) => b,
+    };
+    // After a Fatal, drop writes (the loop is tearing down); keep draining
+    // so shutdown never deadlocks.
+    let fatal = {
+        let q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(q.status, WriterStatus::Fatal(_))
+    };
+    if fatal {
+        return false;
+    }
+    let stamp = match &msg {
+        Msg::Frame(_, stamp) => *stamp,
+        Msg::Oob(_) => None,
+    };
+    let started = stamp.map(|_| Instant::now());
+    let result = write(bytes);
+    let finished = started.map(|_| Instant::now());
+    let errored = result.is_err();
+    {
+        let mut q = inner.q.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(stamp), Some(started), Some(finished)) = (stamp, started, finished) {
+            q.metrics.record(stamp, started, finished, !errored);
+        }
+        apply_write_result(&mut q, result);
+    }
+    errored
 }
 
 fn write_and_flush(bytes: &[u8]) -> std::io::Result<()> {
@@ -287,7 +350,85 @@ mod tests {
             status: WriterStatus::Ok,
             consec_errs: 0,
             shutdown: false,
+            metrics: WriterMetrics::default(),
         }
+    }
+
+    fn test_writer() -> FrameWriter {
+        FrameWriter {
+            inner: Arc::new(Inner {
+                q: Mutex::new(q()),
+                cv: Condvar::new(),
+                metrics_deferrals: AtomicU64::new(0),
+            }),
+            handle: None,
+            sync: false,
+        }
+    }
+
+    #[test]
+    fn completion_is_recorded_after_sink_returns_and_oob_is_excluded() {
+        let writer = test_writer();
+        let stamp = FrameStamp {
+            queued_at: Instant::now(),
+            input_at: Some(Instant::now()),
+        };
+        assert!(!write_message(
+            &writer.inner,
+            Msg::Frame(vec![1], Some(stamp)),
+            |bytes| {
+                assert_eq!(bytes, [1]);
+                // A blocked sink must not hold the UI's queue/metrics mutex.
+                assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 0);
+                Ok(())
+            }
+        ));
+        assert_eq!(writer.take_metrics().unwrap().completion_us.count(), 1);
+        assert!(!write_message(&writer.inner, Msg::Oob(vec![2]), |_| Ok(())));
+        let metrics = writer.take_metrics().unwrap();
+        assert_eq!(metrics.completion_us.count(), 0);
+        assert_eq!(metrics.failed_frames, 0);
+    }
+
+    #[test]
+    fn failed_frame_never_becomes_a_successful_completion() {
+        let writer = test_writer();
+        let stamp = FrameStamp {
+            queued_at: Instant::now(),
+            input_at: None,
+        };
+        assert!(write_message(
+            &writer.inner,
+            Msg::Frame(vec![], Some(stamp)),
+            |_| { Err(std::io::ErrorKind::Interrupted.into()) }
+        ));
+        let metrics = writer.take_metrics().unwrap();
+        assert_eq!(metrics.failed_frames, 1);
+        assert_eq!(metrics.completion_us.count(), 0);
+        assert_eq!(metrics.input_completion_us.count(), 0);
+    }
+
+    #[test]
+    fn metrics_drain_never_waits_on_queue_contention_and_keeps_samples() {
+        let writer = test_writer();
+        let mut guard = writer.inner.q.lock().unwrap();
+        guard.metrics.failed_frames = 7;
+        assert!(writer.take_metrics().is_none());
+        drop(guard);
+        let metrics = writer.take_metrics().unwrap();
+        assert_eq!(metrics.failed_frames, 7);
+        assert_eq!(metrics.deferred_rollups, 1);
+        assert_eq!(writer.take_metrics().unwrap().failed_frames, 0);
+    }
+
+    #[test]
+    fn timing_metadata_keeps_the_existing_frame_queue_bound() {
+        let writer = test_writer();
+        assert!(writer.submit_frame(vec![1], None));
+        assert!(writer.submit_frame(vec![2], None));
+        assert!(!writer.frame_slot_free());
+        assert!(!writer.submit_frame(vec![3], None));
+        assert_eq!(writer.inner.q.lock().unwrap().msgs.len(), FRAME_QUEUE_DEPTH);
     }
 
     #[cfg(unix)] // EIO-as-transient is unix errno classification
