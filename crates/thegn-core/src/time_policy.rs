@@ -80,6 +80,78 @@ pub fn deadline_seconds(now: i64, delay_secs: u64) -> Option<i64> {
     now.checked_add(i64::try_from(delay_secs).ok()?)
 }
 
+/// Fractional provider delays use ceiling seconds, never an earlier reset.
+pub fn deadline_seconds_from_float(now: i64, seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || !(0.0..=MAX_DURATION_SECS as f64).contains(&seconds) {
+        return None;
+    }
+    deadline_seconds(now, seconds.ceil() as u64)
+}
+
+/// Checked relative delay in milliseconds. Absolute epochs use the full signed
+/// range; only the relative delay is subject to the operational duration bound.
+pub fn deadline_millis(now_ms: i64, delay_ms: u64) -> Option<i64> {
+    if now_ms < 0 || delay_ms > MAX_DURATION_MILLIS {
+        return None;
+    }
+    now_ms.checked_add(i64::try_from(delay_ms).ok()?)
+}
+
+/// Provider headers may contain fractional seconds. Reject nonfinite/oversized
+/// input before conversion and round up so a retry never precedes the delay.
+pub fn deadline_millis_from_seconds(now_ms: i64, seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || !(0.0..=MAX_DURATION_SECS as f64).contains(&seconds) {
+        return None;
+    }
+    deadline_millis(now_ms, (seconds * 1000.0).ceil() as u64)
+}
+
+/// Compare elapsed time in either unit without signed narrowing. Unlike a
+/// provider creation timestamp, zero is a valid injected clock origin here.
+pub fn elapsed_at_least(now: i64, since: i64, duration: u64) -> bool {
+    now >= since && (i128::from(now) - i128::from(since)) as u128 >= u128::from(duration)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceExpiry {
+    Keep,
+    Expired,
+    Quarantine(&'static str),
+}
+
+/// Age can authorize a destructive action only when all active time policies
+/// are supported and provider creation time is known and ordered. Caller-owned
+/// resource identity must be verified separately before supplying the timestamp.
+pub fn resource_expiry(
+    now: i64,
+    created: Option<i64>,
+    lifetime_secs: u64,
+    orphan_after_secs: Option<u64>,
+) -> ResourceExpiry {
+    if lifetime_secs > MAX_DURATION_SECS
+        || orphan_after_secs.is_some_and(|seconds| seconds > MAX_DURATION_SECS)
+    {
+        return ResourceExpiry::Quarantine(
+            "unsupported lifetime policy; repair duration configuration",
+        );
+    }
+    if lifetime_secs == 0 && orphan_after_secs.is_none() {
+        return ResourceExpiry::Keep;
+    }
+    let Some(age) = created.and_then(|at| age_seconds(now, at)) else {
+        return ResourceExpiry::Quarantine(
+            "creation time is missing, invalid or future; reconcile provider inventory",
+        );
+    };
+    if (lifetime_secs > 0 && age >= lifetime_secs)
+        || orphan_after_secs.is_some_and(|seconds| age >= seconds)
+    {
+        ResourceExpiry::Expired
+    } else {
+        ResourceExpiry::Keep
+    }
+}
+
 /// Saturating duration conversion for existing signed-millisecond APIs. Convert
 /// in the wider domain first, so large unsigned durations cannot become negative.
 pub fn duration_millis(seconds: u64) -> i64 {
@@ -94,6 +166,63 @@ pub fn saturating_i64(value: u128) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_quarantines_unknown_provider_time_and_bad_policy() {
+        for now in [1, 1_700_000_000, i64::MAX] {
+            for created in [None, Some(i64::MIN), Some(-1), Some(0)] {
+                assert!(matches!(
+                    resource_expiry(now, created, 60, None),
+                    ResourceExpiry::Quarantine(_)
+                ));
+                assert!(matches!(
+                    resource_expiry(now, created, 0, Some(600)),
+                    ResourceExpiry::Quarantine(_)
+                ));
+            }
+            assert!(matches!(
+                resource_expiry(now, Some(1), u64::MAX, Some(1)),
+                ResourceExpiry::Quarantine(_)
+            ));
+        }
+        assert!(matches!(
+            resource_expiry(100, Some(101), 1, None),
+            ResourceExpiry::Quarantine(_)
+        ));
+        assert_eq!(
+            resource_expiry(100, Some(50), 51, None),
+            ResourceExpiry::Keep
+        );
+        assert_eq!(
+            resource_expiry(100, Some(50), 50, None),
+            ResourceExpiry::Expired
+        );
+        assert_eq!(resource_expiry(100, None, 0, None), ResourceExpiry::Keep);
+        assert_eq!(
+            resource_expiry(100, Some(50), 0, Some(50)),
+            ResourceExpiry::Expired
+        );
+    }
+
+    #[test]
+    fn fractional_provider_delays_and_elapsed_extremes_are_checked() {
+        assert_eq!(deadline_millis_from_seconds(1000, 0.0001), Some(1001));
+        assert_eq!(deadline_millis_from_seconds(1000, 0.5), Some(1500));
+        for seconds in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            MAX_DURATION_SECS as f64 + 1.0,
+        ] {
+            assert_eq!(deadline_millis_from_seconds(1000, seconds), None);
+        }
+        assert_eq!(deadline_millis(i64::MAX, 1), None);
+        assert_eq!(deadline_millis(1000, u64::MAX), None);
+        assert!(!elapsed_at_least(0, 0, u64::MAX));
+        assert!(!elapsed_at_least(-1, 0, 0));
+        assert!(elapsed_at_least(i64::MAX, i64::MIN, u64::MAX));
+    }
 
     #[test]
     fn cadence_floors_caps_and_units_never_produce_zero() {

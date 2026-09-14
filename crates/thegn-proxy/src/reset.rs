@@ -50,7 +50,7 @@ pub fn parse_reset_from_body(body: &[u8], now_ms: i64) -> Option<i64> {
         && let Ok(secs) = std::str::from_utf8(&c[1]).unwrap_or("").parse::<f64>()
         && secs > 0.0
     {
-        return Some(now_ms + (secs * 1000.0) as i64);
+        return thegn_core::time_policy::deadline_millis_from_seconds(now_ms, secs);
     }
     for re in [&*QUOTA_RESET_DELAY, &*RETRY_DELAY] {
         if let Some(c) = re.captures(body)
@@ -58,7 +58,7 @@ pub fn parse_reset_from_body(body: &[u8], now_ms: i64) -> Option<i64> {
             && let Some(ms) = parse_go_duration_ms(s)
             && ms > 0
         {
-            return Some(now_ms + ms);
+            return thegn_core::time_policy::deadline_millis(now_ms, u64::try_from(ms).ok()?);
         }
     }
     None
@@ -101,12 +101,36 @@ fn parse_go_duration_ms(s: &str) -> Option<i64> {
         // trailing number with no unit is invalid in Go durations
         return None;
     }
-    Some(total_ms as i64)
+    if !total_ms.is_finite()
+        || !(0.0..=thegn_core::time_policy::MAX_DURATION_MILLIS as f64).contains(&total_ms)
+    {
+        return None;
+    }
+    Some(total_ms.ceil() as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_provider_reset_delay_cannot_create_a_past_deadline() {
+        for delay in [
+            "18446744073709551615",
+            "99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+        ] {
+            let body = format!("{{\"resets_in_seconds\":{delay}}}");
+            assert_eq!(parse_reset_from_body(body.as_bytes(), 1000), None);
+        }
+        assert_eq!(
+            parse_reset_from_body(br#"{"resets_in_seconds":1}"#, i64::MAX),
+            None
+        );
+        assert_eq!(
+            parse_reset_from_body(br#"{"retryDelay":"999999999999999999999999h"}"#, 1000),
+            None
+        );
+    }
 
     #[test]
     fn rfc3339_timestamp() {

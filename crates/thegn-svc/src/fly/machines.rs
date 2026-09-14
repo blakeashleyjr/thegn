@@ -247,6 +247,42 @@ pub fn parse_machine(v: &serde_json::Value) -> Option<FlyMachine> {
     })
 }
 
+/// Authoritative age evidence for the exact ledger machine. App deletion can
+/// affect every machine, so any extra/unparseable inventory must quarantine.
+/// The sandbox name is the Machine's name; the enclosing app name is derived
+/// separately by the provider and must not be compared to this field.
+pub fn reaper_creation_time(
+    inventory: &serde_json::Value,
+    sandbox_name: &str,
+    machine_id: &str,
+    host: &str,
+) -> Result<i64, &'static str> {
+    if sandbox_name.is_empty() || machine_id.is_empty() || host.is_empty() {
+        return Err("managed machine identity is incomplete");
+    }
+    let rows = inventory
+        .as_array()
+        .ok_or("machine inventory is malformed")?;
+    if rows.len() != 1 {
+        return Err("machine inventory is empty or contains multiple resources");
+    }
+    let machine = parse_machine(&rows[0]).ok_or("machine inventory is malformed")?;
+    if machine.id != machine_id
+        || machine.name != sandbox_name
+        || machine.metadata.get(MANAGED_KEY).map(String::as_str) != Some(MANAGED_VAL)
+        || machine.metadata.get(HOST_KEY).map(String::as_str) != Some(host)
+    {
+        return Err("machine identity or ownership metadata changed");
+    }
+    rows[0]
+        .get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp())
+        .filter(|&value| value > 0)
+        .ok_or("provider creation time is missing or invalid")
+}
+
 /// Parse a list response (`[ {machine}, … ]`), keeping only thegn-managed
 /// machines (client-side metadata filter — the endpoint has no selector).
 pub fn parse_machine_list(v: &serde_json::Value) -> Vec<FlyMachine> {
@@ -258,6 +294,64 @@ pub fn parse_machine_list(v: &serde_json::Value) -> Vec<FlyMachine> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod reaper_time_tests {
+    use super::*;
+    #[test]
+    fn only_exact_single_owned_machine_provides_creation_evidence() {
+        let row = serde_json::json!({"id":"machine-id", "name":"sandbox-name", "state":"started",
+            "created_at":"2026-01-01T00:00:00Z", "config":{"metadata":{"managed-by":"thegn","tg-host":"host-id"}}});
+        let inventory = serde_json::json!([row.clone()]);
+        assert!(reaper_creation_time(&inventory, "sandbox-name", "machine-id", "host-id").is_ok());
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([row.clone(), row.clone()]),
+            serde_json::json!([row.clone(), null]),
+        ] {
+            assert!(reaper_creation_time(&bad, "sandbox-name", "machine-id", "host-id").is_err());
+        }
+        for (name, id, host) in [
+            ("other", "machine-id", "host-id"),
+            ("sandbox-name", "other", "host-id"),
+            ("sandbox-name", "", "host-id"),
+            ("sandbox-name", "machine-id", "other"),
+        ] {
+            assert!(reaper_creation_time(&inventory, name, id, host).is_err());
+        }
+        for time in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!("bad"),
+            serde_json::json!("1960-01-01T00:00:00Z"),
+        ] {
+            let mut changed = row.clone();
+            changed["created_at"] = time;
+            assert!(
+                reaper_creation_time(
+                    &serde_json::json!([changed]),
+                    "sandbox-name",
+                    "machine-id",
+                    "host-id"
+                )
+                .is_err()
+            );
+        }
+        let mut changed = row;
+        changed["config"]["metadata"]["managed-by"] = serde_json::json!("foreign");
+        assert!(
+            reaper_creation_time(
+                &serde_json::json!([changed]),
+                "sandbox-name",
+                "machine-id",
+                "host-id"
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

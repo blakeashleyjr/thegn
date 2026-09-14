@@ -430,6 +430,60 @@ impl FlyProvider {
         self.shim(id).await?.run_exec(argv, cwd, env).await
     }
 
+    /// Read-only age reconciliation for the exact persisted managed machine.
+    /// A failed read keeps the ledger intact so the next pass can retry.
+    pub async fn reaper_creation_time(&self, name: &str, machine_id: &str) -> Result<i64> {
+        anyhow::ensure!(
+            !machine_id.is_empty(),
+            "fly: pending create has no authoritative machine identity"
+        );
+        let account = thegn_core::managed_ssh::account_label(&self.spec.key_path);
+        let custody = thegn_core::managed_ssh::read("fly", &account, name)
+            .context("fly: read persisted managed ownership before age reconciliation")?;
+        self.reaper_time_with_custody(name, machine_id, custody, || async {
+            self.get_json(&machines::machines_url(
+                &self.spec.api_base(),
+                &app_name(name),
+            ))
+            .await
+        })
+        .await
+    }
+
+    /// Custody admission precedes even the inventory read. Keeping the read
+    /// injectable makes absent/mismatched-custody zero-network behavior testable.
+    async fn reaper_time_with_custody<F, Fut>(
+        &self,
+        name: &str,
+        machine_id: &str,
+        custody: Option<thegn_core::managed_ssh::AuthorizedKeyRecord>,
+        read_inventory: F,
+    ) -> Result<i64>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<serde_json::Value>>,
+    {
+        anyhow::ensure!(
+            !machine_id.is_empty(),
+            "fly: authoritative machine identity is missing"
+        );
+        let custody = custody.context(
+            "fly: persisted managed ownership is absent; quarantine before inventory read",
+        )?;
+        anyhow::ensure!(
+            custody.provider == "fly"
+                && custody.account == thegn_core::managed_ssh::account_label(&self.spec.key_path)
+                && custody.instance == name
+                && custody.key_path == self.spec.key_path
+                && custody.key_fingerprint
+                    == thegn_core::managed_ssh::key_fingerprint(&self.spec.pubkey),
+            "fly: persisted managed ownership does not match current identity; quarantine before inventory read"
+        );
+        let inventory = read_inventory().await?;
+        machines::reaper_creation_time(&inventory, name, machine_id, &host_label())
+            .map_err(anyhow::Error::msg)
+    }
+
     /// Delete the Fly app without retiring local ownership records. Reapers use
     /// this boundary so a later route-token revocation failure leaves enough
     /// durable state to retry the complete lifecycle safely.
@@ -638,6 +692,79 @@ impl ProviderFiles for FlyProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn absent_or_mismatched_reaper_custody_never_reads_inventory_or_admits_cleanup() {
+        let provider = FlyProvider::new(spec());
+        let valid = thegn_core::managed_ssh::AuthorizedKeyRecord {
+            provider: "fly".into(),
+            account: thegn_core::managed_ssh::account_label(&provider.spec.key_path),
+            instance: provider.spec.name.clone(),
+            key_path: provider.spec.key_path.clone(),
+            key_fingerprint: thegn_core::managed_ssh::key_fingerprint(&provider.spec.pubkey),
+            authorized_at: 1,
+            proxy_worktree: None,
+            rotation_recovery: None,
+        };
+        let mut cases = vec![None];
+        for field in ["provider", "account", "instance", "path", "fingerprint"] {
+            let mut wrong = valid.clone();
+            match field {
+                "provider" => wrong.provider = "other".into(),
+                "account" => wrong.account = "other".into(),
+                "instance" => wrong.instance = "different-sandbox".into(),
+                "path" => wrong.key_path = "/different-key".into(),
+                _ => wrong.key_fingerprint = "different-fingerprint".into(),
+            }
+            cases.push(Some(wrong));
+        }
+        for custody in cases {
+            let reads = std::cell::Cell::new(0);
+            let mut cleanup_admissions = 0;
+            let result = provider
+                .reaper_time_with_custody(&provider.spec.name, "machine-id", custody, || async {
+                    reads.set(reads.get() + 1);
+                    Ok(serde_json::json!([]))
+                })
+                .await;
+            if result.is_ok() {
+                cleanup_admissions += 1;
+            }
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("persisted managed ownership")
+            );
+            assert_eq!((reads.get(), cleanup_admissions), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_reaper_custody_reads_once_and_preserves_transient_failure() {
+        let provider = FlyProvider::new(spec());
+        let valid = thegn_core::managed_ssh::AuthorizedKeyRecord {
+            provider: "fly".into(),
+            account: thegn_core::managed_ssh::account_label(&provider.spec.key_path),
+            instance: provider.spec.name.clone(),
+            key_path: provider.spec.key_path.clone(),
+            key_fingerprint: thegn_core::managed_ssh::key_fingerprint(&provider.spec.pubkey),
+            authorized_at: 1,
+            proxy_worktree: None,
+            rotation_recovery: None,
+        };
+        let reads = std::cell::Cell::new(0);
+        for fail in [true, false] {
+            let result = provider.reaper_time_with_custody(&provider.spec.name, "machine-id", Some(valid.clone()), || async {
+                reads.set(reads.get() + 1);
+                anyhow::ensure!(!fail, "transient read failure");
+                Ok(serde_json::json!([{"id":"machine-id", "name":provider.spec.name, "state":"started",
+                    "created_at":"2026-01-01T00:00:00Z", "config":{"metadata":{"managed-by":"thegn", "tg-host":host_label()}}}]))
+            }).await;
+            assert_eq!(result.is_err(), fail);
+        }
+        assert_eq!(reads.get(), 2, "read failure must remain retryable");
+    }
 
     fn spec() -> FlySpec {
         FlySpec {

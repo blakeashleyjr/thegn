@@ -8,10 +8,10 @@ const WEEK: i64 = 7 * DAY;
 
 /// The Monday 00:00 (UTC) on or before `t`. Unix epoch (1970-01-01) was a
 /// Thursday, so weekday-from-epoch needs a +3 day shift to make Monday 0.
-fn week_floor(t: i64) -> i64 {
-    let days = t.div_euclid(DAY);
+fn week_floor(t: i64) -> i128 {
+    let days = i128::from(t).div_euclid(i128::from(DAY));
     let weekday = (days + 3).rem_euclid(7); // Mon=0 … Sun=6
-    (days - weekday) * DAY
+    (days - weekday) * i128::from(DAY)
 }
 
 /// Weekday index of `t`: Mon=0 … Sun=6.
@@ -27,12 +27,12 @@ pub fn day_counts(epochs: &[i64], now: i64, weeks: usize) -> Vec<[u32; 7]> {
         return grid;
     }
     let last_week = week_floor(now);
-    let first_week = last_week - (weeks as i64 - 1) * WEEK;
+    let first_week = last_week - (weeks as i128 - 1) * i128::from(WEEK);
     for &t in epochs {
-        if t < first_week || t >= last_week + WEEK {
+        if i128::from(t) < first_week || i128::from(t) >= last_week + i128::from(WEEK) {
             continue;
         }
-        let w = ((week_floor(t) - first_week) / WEEK) as usize;
+        let w = ((week_floor(t) - first_week) / i128::from(WEEK)) as usize;
         if let Some(week) = grid.get_mut(w) {
             week[weekday(t)] += 1;
         }
@@ -85,12 +85,21 @@ mod tests {
     const MON: i64 = 1_780_876_800;
 
     #[test]
+    fn extreme_provider_epochs_do_not_overflow_calendar_buckets() {
+        for now in [i64::MIN, i64::MAX] {
+            let grid = day_counts(&[i64::MIN, 0, i64::MAX], now, 52);
+            assert_eq!(grid.len(), 52);
+            assert_eq!(grid.iter().flatten().sum::<u32>(), 1);
+        }
+    }
+
+    #[test]
     fn week_floor_and_weekday_anchor_on_monday() {
-        assert_eq!(week_floor(MON), MON);
+        assert_eq!(week_floor(MON), i128::from(MON));
         assert_eq!(weekday(MON), 0);
         assert_eq!(weekday(MON + 3 * DAY), 3); // Thursday
         assert_eq!(weekday(MON + 6 * DAY + 3600), 6); // Sunday
-        assert_eq!(week_floor(MON + 6 * DAY + 3600), MON);
+        assert_eq!(week_floor(MON + 6 * DAY + 3600), i128::from(MON));
         // Epoch itself was a Thursday.
         assert_eq!(weekday(0), 3);
         // Negative times stay sane (pre-epoch).

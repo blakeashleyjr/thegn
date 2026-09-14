@@ -46,7 +46,7 @@ pub(crate) fn export_pane_cast(panes: &Panes, pane_id: u32, cfg: &Config) -> Str
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| thegn_core::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0)
 }
 

@@ -137,7 +137,7 @@ fn health_note(status: &crate::chrome::DaemonStatus, now_ms: i64) -> (String, To
     // never-registered "no daemon" — the probe on activation says whether the
     // socket is unreachable or the daemon is alive but wedged.
     if status.stale {
-        let age = (now_ms - status.heartbeat_at).max(0);
+        let age = now_ms.saturating_sub(status.heartbeat_at).max(0);
         let ago = fmt_uptime((age / 1000) as u64);
         return (
             format!("crashed/wedged · heartbeat {ago} ago (stale)"),
@@ -147,7 +147,7 @@ fn health_note(status: &crate::chrome::DaemonStatus, now_ms: i64) -> (String, To
     if !status.present {
         return ("no daemon".into(), Tok::Slot(S::Ghost));
     }
-    let age = (now_ms - status.heartbeat_at).max(0);
+    let age = now_ms.saturating_sub(status.heartbeat_at).max(0);
     let ago = fmt_uptime((age / 1000) as u64);
     if age <= DAEMON_HEARTBEAT_TTL_MS {
         (
@@ -232,7 +232,7 @@ fn identity_cells(
     if !d.hostname.is_empty() {
         kv.push(("host".into(), d.hostname.clone(), Tok::Slot(S::Dim)));
     }
-    let uptime = (ctx.now_ms - d.started_at_ms).max(0) as u64 / 1000;
+    let uptime = ctx.now_ms.saturating_sub(d.started_at_ms).max(0) as u64 / 1000;
     kv.push(("uptime".into(), fmt_uptime(uptime), Tok::Slot(S::Text)));
     if !d.daemon_id.is_empty() {
         // The registry handle is long; its leading bytes are enough to match
@@ -420,7 +420,7 @@ fn session_rows(v: &[SessionInfo], now_ms: i64, wide: bool) -> TableSection {
         .iter()
         .take(shown)
         .map(|s| {
-            let age = ((now_ms - s.created_at_ms).max(0) / 1000) as u64;
+            let age = (now_ms.saturating_sub(s.created_at_ms).max(0) / 1000) as u64;
             let att_tone = if s.attached_clients > 0 {
                 Tok::Hue(Hue::Green)
             } else {

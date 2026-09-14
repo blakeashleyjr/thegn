@@ -172,7 +172,7 @@ pub(crate) fn should_fetch(
     // already floored at `MIN_REFRESH_SECS`, so a stray `0` cannot turn this
     // into "always fetch".
     if let Some(at) = cached_at
-        && now - at < cfg.refresh_secs() as i64
+        && thegn_core::time_policy::is_fresh(now, Some(at), cfg.refresh_secs())
     {
         return false;
     }

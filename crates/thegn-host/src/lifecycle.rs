@@ -329,10 +329,18 @@ where
     // and no warm spare appears. Destroy stale ones so a replacement is created; a
     // genuinely in-flight provision (clone + nix + seeded devShell) finishes well
     // under this ceiling. (`provisioning` rows don't heartbeat, so age = created_at.)
-    const PROVISION_STALE_SECS: i64 = 20 * 60;
+    const PROVISION_STALE_SECS: u64 = 20 * 60;
     let mut provisioning = 0usize;
     for s in spares.iter().filter(|s| s.state == "provisioning") {
-        if now - s.created_at >= PROVISION_STALE_SECS {
+        let Some(age) = thegn_core::time_policy::age_seconds(now, s.created_at) else {
+            thegn_core::msg::warn(&format!(
+                "warm pool: quarantined {}: invalid/future provisioning time; reconcile inventory; no deletion attempted",
+                s.sandbox_name
+            ));
+            provisioning += 1;
+            continue;
+        };
+        if age >= PROVISION_STALE_SECS {
             thegn_core::msg::warn(&format!(
                 "warm pool: clearing stale provisioning spare {} (orphaned by a prior \
                  session or hung) so the pool refills",
@@ -349,7 +357,7 @@ where
         .filter(|s| s.state == "ready")
         .map(|s| ReadySpare {
             name: s.sandbox_name.clone(),
-            idle_secs: (now - s.updated_at).max(0) as u64,
+            idle_secs: thegn_core::time_policy::age_seconds(now, s.updated_at).unwrap_or(0),
             // A ready spare whose base was built against a different flake.lock
             // than the repo's current one must rotate even while parked — else a
             // ParkIdle pool serves a stale toolchain forever. Only meaningful once

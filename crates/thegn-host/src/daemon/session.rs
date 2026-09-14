@@ -1176,7 +1176,7 @@ fn unix_now_secs() -> f64 {
 }
 
 fn now_ms() -> i64 {
-    (unix_now_secs() * 1000.0) as i64
+    thegn_core::util::now_ms()
 }
 
 /// Apply the live-error state machine to the newly completed history lines.

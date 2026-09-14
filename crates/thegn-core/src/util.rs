@@ -140,7 +140,7 @@ pub fn short_hash(s: &str, len: usize) -> String {
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| crate::time_policy::saturating_i64(u128::from(d.as_secs())))
         .unwrap_or(0)
 }
 
@@ -152,7 +152,7 @@ pub fn now() -> i64 {
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| crate::time_policy::saturating_i64(d.as_millis()))
         .unwrap_or(0)
 }
 

@@ -299,7 +299,7 @@ async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let now = now_ms();
     out.push_str(&format!(
         "# HELP model_proxy_uptime_seconds Daemon uptime.\n# TYPE model_proxy_uptime_seconds gauge\nmodel_proxy_uptime_seconds {}\n",
-        (now - state.started_ms).max(0) / 1000
+        now.saturating_sub(state.started_ms).max(0) / 1000
     ));
     out.push_str(
         "# HELP model_proxy_backend_exhausted Backend is cooling down.\n# TYPE model_proxy_backend_exhausted gauge\n",
@@ -356,7 +356,7 @@ struct StatsQuery {
 /// The JSON stats rollup behind `/stats` and `thegn proxy stats`.
 async fn stats(State(state): State<SharedState>, Query(q): Query<StatsQuery>) -> Response {
     let now = now_ms();
-    let since_ms = now - q.since_secs.unwrap_or(86_400).max(0) * 1000;
+    let since_ms = now.saturating_sub(q.since_secs.unwrap_or(86_400).max(0).saturating_mul(1000));
     let (rows, budgets) = match state.db.lock() {
         Ok(g) => (
             g.model_proxy_requests_since(since_ms, 10_000)
@@ -375,7 +375,7 @@ async fn stats(State(state): State<SharedState>, Query(q): Query<StatsQuery>) ->
         })
         .collect();
     let body = json!({
-        "uptime_secs": (now - state.started_ms).max(0) / 1000,
+        "uptime_secs": now.saturating_sub(state.started_ms).max(0) / 1000,
         "since_ms": since_ms,
         "stats": rollup,
         "budgets": budgets,
