@@ -25,6 +25,7 @@ use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 mod cleanup;
 #[cfg(test)]
 pub(crate) use cleanup::TestIsolation;
+pub(crate) use cleanup::common as repository_identity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CleanupOutcome {
