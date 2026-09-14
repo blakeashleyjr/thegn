@@ -22,7 +22,9 @@ Source ratchets, strict change validation and treefmt now pass. The disposable
 old-parser counterfactual compiled and failed the expected foreign-path identity
 assertion in 0.083 seconds (one selected test, exit100); it fails before the
 per-origin Git/token gate. The positive candidate independently exercises that
-actual gate. Local-main landing remains pending at this checkpoint.
+actual gate. Local main fast-forwarded to `16288656262992c677e26ede4127a37bacb56fe1`
+on September 14. The canonical justfile and all 143 pre-existing untracked
+files were rehashed unchanged after landing. No push or live restart occurred.
 These scoped results do not claim another full-workspace test run.
 
 The broader `forge::remote_host` routing defect is tracked as THE-642. Some Git

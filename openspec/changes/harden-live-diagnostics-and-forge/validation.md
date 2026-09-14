@@ -16,7 +16,9 @@ that new test. Strict `cargo clippy --offline --locked -p thegn-svc --all-target
 -- -D warnings` also passed. Both used two Cargo jobs, an empty Rust wrapper and
 the private native target. Primary and independent adversarial source review
 approved the repair. See `docs/audits/THE-621-native-origin-acceptance.md` for
-hashed receipts and limits. Local landing remains pending at this checkpoint.
+hashed receipts and limits. Reviewed local-main landing completed at
+`16288656262992c677e26ede4127a37bacb56fe1`; later metadata-only confirmation
+does not change the tested Rust source.
 
 General configured-forge host routing still uses the older helper and is tracked
 separately as THE-642. This fix independently protects the native credential gate;
