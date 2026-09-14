@@ -23,7 +23,7 @@ struct FixtureIo {
 impl Drop for FixtureIo {
     fn drop(&mut self) {
         // Nonblocking terminal receipt, including a worker panic before priming.
-        drop(self.finished.try_send(()));
+        self.finished.try_send(()).unwrap_or(());
     }
 }
 impl TickerIo for FixtureIo {

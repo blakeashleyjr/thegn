@@ -5,18 +5,18 @@ This round continues the previously landed audit candidate from local main
 
 ## Reviewed source and acceptance
 
-| Issue | Change and reviewed checkpoint | Evidence / current limit |
-| --- | --- | --- |
-| THE-483 | Shared actual ticker worker and hostile-interval thread fixtures, `c6f9a9ec` | All three actual host fixtures passed; independent source review accepted. |
-| THE-634 | Own-only admission for direct headless review handoffs, `02876bcc` and `415a7e78` | All eight new tests passed, including late authority changes and non-UTF-8 alias refusal. Parent THE-545 generation binding remains open. |
-| THE-154 | Portable resident lifecycle fixtures and native Windows CI selection, `58457da2` | Eight new plus 48 existing Linux plugin tests and two ratchets passed; Windows full service/tests crosscheck passed. Native Windows/macOS and full process-tree containment remain open. |
-| THE-591 | Already-landed atomic final outcome persistence | Independent review accepted 14 atomic DB tests, eight persistence tests, speculative-land regressions and actual CLI proof. |
-| THE-595 | Already-landed read-only discovery and selected-only snapshots | Strengthened native CLI harness passed 106 commands against main `1ef8228f`, covering target/source refs, indexes, contents and DB state. |
-| THE-597 | Already-landed owned gate workspace locking/materialization | Independent review accepted actual native adversarial gate/path fixtures and private CLI proof; unsupported non-Unix backend remains fail-closed. |
-| THE-600 | Registry corruption after admission test, `db2dbb55` | Actual pre-destroy rendezvous with a second SQLite writer; independent source review accepted, final compiled gate pending. |
-| THE-593 | Result refinalization stale-selection tests, `7ad070c6` | Independent source review accepted; identical-value ABA remains explicitly outside value-based comparison guarantees. Final compiled gate pending. |
-| THE-594 | Actual projection/sync registry cleanup tests, `ceb4b5da` | Independent source review accepted positive/negative production cleanup paths; final compiled gate pending. |
-| THE-606 | Already-landed canonical history admission | Existing native history fixtures passed; current full configured workspace gate is still required. |
+| Issue   | Change and reviewed checkpoint                                                    | Evidence / current limit                                                                                                                                                                 |
+| ------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| THE-483 | Shared actual ticker worker and hostile-interval thread fixtures, `c6f9a9ec`      | All three actual host fixtures passed; independent source review accepted.                                                                                                               |
+| THE-634 | Own-only admission for direct headless review handoffs, `02876bcc` and `415a7e78` | All eight new tests passed, including late authority changes and non-UTF-8 alias refusal. Parent THE-545 generation binding remains open.                                                |
+| THE-154 | Portable resident lifecycle fixtures and native Windows CI selection, `58457da2`  | Eight new plus 48 existing Linux plugin tests and two ratchets passed; Windows full service/tests crosscheck passed. Native Windows/macOS and full process-tree containment remain open. |
+| THE-591 | Already-landed atomic final outcome persistence                                   | Independent review accepted 14 atomic DB tests, eight persistence tests, speculative-land regressions and actual CLI proof.                                                              |
+| THE-595 | Already-landed read-only discovery and selected-only snapshots                    | Strengthened native CLI harness passed 106 commands against main `1ef8228f`, covering target/source refs, indexes, contents and DB state.                                                |
+| THE-597 | Already-landed owned gate workspace locking/materialization                       | Independent review accepted actual native adversarial gate/path fixtures and private CLI proof; unsupported non-Unix backend remains fail-closed.                                        |
+| THE-600 | Registry corruption after admission test, `db2dbb55`                              | Actual pre-destroy rendezvous with a second SQLite writer; independent source review accepted, final compiled gate pending.                                                              |
+| THE-593 | Result refinalization stale-selection tests, `7ad070c6`                           | Independent source review accepted; identical-value ABA remains explicitly outside value-based comparison guarantees. Final compiled gate pending.                                       |
+| THE-594 | Actual projection/sync registry cleanup tests, `ceb4b5da`                         | Independent source review accepted positive/negative production cleanup paths; final compiled gate pending.                                                                              |
+| THE-606 | Already-landed canonical history admission                                        | Existing native history fixtures passed; current full configured workspace gate is still required.                                                                                       |
 
 ## Coordinated verification
 
