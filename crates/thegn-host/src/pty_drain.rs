@@ -481,7 +481,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                 })
                 .unwrap_or((0, 0));
             let mut emu_text: Vec<u8> = Vec::new();
-            for piece in ctx.corner_relay.feed(b) {
+            ctx.corner_relay.feed_with(b, |piece| {
                 match piece {
                     crate::kitty_relay::Piece::Emulator(t) => {
                         p.feed(&t);
@@ -509,7 +509,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                         }
                     }
                 }
-            }
+            });
             // DA/DSR/OSC replies + OSC52 passthrough on the graphics-stripped
             // bytes only (the kitty probe, if any, was answered by the relay).
             if !emu_text.is_empty() {
