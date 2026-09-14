@@ -1,0 +1,10 @@
+{
+  "worktree": "/tmp/thegn-maintenance-04-origin-20260914",
+  "files": {
+    "crates/thegn-svc/src/forge/native.rs": "f0da99f3eeff6623480af4fad7397764e53b5a186ac1eed974d26cee30a11a3b",
+    "crates/thegn-svc/src/forge/native_regression_tests.rs": "0eaf241bcdda72d9433169c66fcc1dc7727ef16401149d4ab9b0f6b4489d7591",
+    "crates/thegn-core/src/forge/authorship.rs": "2d12413cde69754823025c7695765f6ad5b3bdb9a442508970aad7c905d37a71",
+    "crates/thegn-svc/src/forge/mod.rs": "2ca24bea6b766f9e6c694afaf99427bd63112b9586e78aacee79730a3dbd6941"
+  },
+  "scope": "read-only source review; no test/build/network execution by reviewer"
+}

@@ -1,0 +1,75 @@
+{
+  "source": "5e2f5bf2bcb3b2473e48775850133983e1f7be31",
+  "exit_code": 0,
+  "selected": 26,
+  "passed": 26,
+  "skipped_unselected": 668,
+  "test_seconds": 0.923,
+  "passed_tests": [
+    "thegn-svc forge::native::regression_tests::reaper_spawn_failure_retains_child_and_capacity",
+    "thegn-svc forge::native::regression_tests::helper_capacity_stays_reserved_until_ownership_is_released",
+    "thegn-svc forge::native::regression_tests::public_host_validation_precedes_credentials",
+    "thegn-svc forge::native::regression_tests::sdk_graphql_envelopes_fall_through_without_offline_evidence",
+    "thegn-svc forge::native::regression_tests::sdk_error_classification_drives_the_real_ladder",
+    "thegn-svc forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens",
+    "thegn-svc forge::native::regression_tests::cancelling_token_future_terminates_owned_group",
+    "thegn-svc forge::native::regression_tests::token_helper_success_failure_and_output_bound",
+    "thegn-svc forge::native::regression_tests::timeout_and_transport_failure_feed_native_circuit",
+    "thegn-svc forge::native::regression_tests::typed_http_answers_are_not_global_network_failures",
+    "thegn-svc forge::native::tests::graphql_no_pr_node_maps_to_no_pr",
+    "thegn-svc forge::native::tests::graphql_pr_list_parses_headers",
+    "thegn-svc forge::native::regression_tests::unknown_wait_ownership_is_reaped_without_group_signal",
+    "thegn-svc forge::native::tests::graphql_pr_maps_fields_and_rolls_up_checks",
+    "thegn-svc forge::native::tests::native_branch_resolution_is_local_rev_parse",
+    "thegn-svc forge::native::tests::owner_repo_parses_ssh_and_https_forms",
+    "thegn-svc forge::native::tests::token_is_trimmed",
+    "thegn-svc forge::native::tests::token_precedence_prefers_gh_token_then_github_token_then_cli",
+    "thegn-svc forge::tests::authorship_falls_back_as_one_operation_and_auth_errors_remain_final",
+    "thegn-svc forge::tests::auth_failure_is_final",
+    "thegn-svc forge::native::regression_tests::token_timeout_kills_descendants_even_after_parent_exit",
+    "thegn-svc forge::tests::forge_set_routes_by_host",
+    "thegn-svc forge::tests::native_answer_wins",
+    "thegn-svc forge::tests::github_ladder_is_native_over_cli_and_kinds_agree_with_reserved",
+    "thegn-svc forge::tests::not_configured_falls_through_to_cli",
+    "thegn-svc forge::tests::remote_host_parses_every_url_shape"
+  ],
+  "clippy_exit_code": 0,
+  "scope": "service forge selection and native gates; not full workspace",
+  "artifacts": [
+    {
+      "path": "thegn-THE621-native-20260914.log",
+      "bytes": 3749,
+      "sha256": "b7387bf6c8767c6b7ce01bde9df55c68d6a72fa9364a06d91f990395493f7266"
+    },
+    {
+      "path": "thegn-THE621-clippy-20260914.log",
+      "bytes": 5271,
+      "sha256": "4fbb2c98dbb801f4f76998b5e595ccd9c1e358783009bb63173925615a8ed3d0"
+    },
+    {
+      "path": "thegn-THE621-independent-source-review-20260914.md",
+      "bytes": 5408,
+      "sha256": "dbae7155b36aa538f285cb11205bf03ff64d5b04432bdf807ce3833075938036"
+    },
+    {
+      "path": "thegn-THE621-independent-source-review-20260914.json",
+      "bytes": 629,
+      "sha256": "24963660911fcaf06525df5e4f02a20c1ce2c037022a6c4a71314e1108612c8e"
+    },
+    {
+      "path": "thegn-THE621-authority-counterexample-20260914.rs.txt",
+      "bytes": 1924,
+      "sha256": "791e0dbe9eea52898a2f2717650c0cd11828d202b940de021bbaed0abaa092d5"
+    },
+    {
+      "path": "thegn-THE621-authority-counterexample-20260914.log",
+      "bytes": 325,
+      "sha256": "b756897b07ac67daa2751c02a11a52ab7c979b3de50c312740a8174187f72d45"
+    },
+    {
+      "path": "thegn-THE621-authority-counterexample-20260914.source.json",
+      "bytes": 705,
+      "sha256": "7d072c1b8085f19c6cb30cc7c8bff55f7f15cc184a6762ceadad4ec52202813b"
+    }
+  ]
+}

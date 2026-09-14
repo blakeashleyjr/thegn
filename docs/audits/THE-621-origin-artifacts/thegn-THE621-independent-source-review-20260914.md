@@ -1,0 +1,27 @@
+# THE621 independent adversarial source review — 2026-09-14
+
+APPROVE two-file candidate for root's targeted native build in `/tmp/thegn-maintenance-04-origin-20260914`. Fresh Linear THE621 acceptance requires native public-GitHub requests only for validated github.com origins, unsupported origins refusing token acquisition/native requests, origin variants and ladder selection. Existing canonical host check did not fully meet that contract. This review does not claim the candidate has compiled or its new native fixture has run.
+
+## Concrete repair and compatibility
+
+The former composition checked authority with forge::remote_host and then independently extracted a loose owner/repo. `https://evil.example/foo@github.com/bar` was consequently admitted as owner `foo@github.com`, repo `bar` for api.github.com. Root's retained actual-function pure harness and expected assertion failure are `/tmp/thegn-THE621-authority-counterexample-20260914.rs` and `.log`; the log shows the incorrect Some identity before assertion failure. I read the copied functions and corresponding source; this is parser evidence, not a network/token execution.
+
+The replacement calls the existing strict GithubRepository::from_origin on trimmed Git get-url output and takes host/owner/name from that single parse. Host comparison requires exactly normalized github.com. A slash terminates HTTPS/SSH authority before any path processing; path @, query/fragment delimiters, extra segments, traversal/percent escapes and misleading authority fields cannot be reinterpreted as authorization. The strict component grammar admits only bounded ASCII repository components. Surrounding output trimming remains explicit for Git's newline. There is no change to token precedence, endpoint, circuit, SDK transport, errors, ladder fallback or repository authorship implementation.
+
+Supported HTTPS, mixed-case host, ssh://git@ and SCP git@github.com forms preserve exact owner/repo and optional .git handling. Some otherwise usable Git origins (explicit ports, HTTPS userinfo, other schemes, extra trailing path forms) conservatively fall through to the existing CLI. This is deliberate supported-native-form narrowing, not disabling repository support or claiming general-purpose Git URL validation. GHE continues to use the existing CLI-only ladder. Shared authorship parser was not weakened.
+
+## New fixture nonvacuity
+
+The one new Rust test `forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens` contains 22 origin cases, not22 separate passing tests:18 negatives and4 positives. Check the actual module registration/compiled selector when root enumerates tests.
+
+It creates an owned private Git repository, checks every Git init/config operation's successful status, sets each real origin in that same repository, then calls the production gate_with_token/owner_repo/get-url chain. Each negative also tests the pure parser and requires the exact origin-refusal reason plus zero injected token calls. Thus a mere NotConfigured/circuit refusal is insufficient. The four supported controls require one token callback and the exact token/owner/repo tuple; a globally open circuit, missing Git, blanket deny, or discarded identity cannot satisfy these. The token is an inert private string; no GraphQL/request method is invoked. Successful cleanup uses strict TempDir::close. Current global circuit tests use private GhCircuit instances, so they do not intentionally poison this gate fixture.
+
+Existing public_host_validation_precedes_credentials retains explicit GHE/foreign origins and the enterprise CLI-only layer count. Original parser variants, SDK error/fallback/circuit and ladder tests should remain in root's focused native gate. Counterfactual should preserve the new fixture while restoring only the old native parser in a disposable build; the first foreign-path case must fail, without any network request. Root's pure old-source counterexample is already retained, but is not a substitute for the new actual Git gate execution.
+
+## Remaining separate routing defect
+
+`forge::remote_host` is intentionally untouched and still misparses @ appearing after a foreign URL's path begins. Its remaining production caller, ForgeSet::for_loc, uses that host to choose a configured forge entry. Therefore a remote such as `https://evil.example/foo@github.com/bar` can select the github.com entry instead of the actual host/default. A separate maintenance issue is warranted for accurate general origin-host routing and a fake-forge selection regression. Keep it outside this narrow native-credential repair: the new native parser independently refuses it; GithubCli uses the original location/origin for its own host handling. Source here proves wrong routing/identity selection, not credential exfiltration, a write to a foreign endpoint, or a remaining bypass of the repaired native gate.
+
+That future parser must preserve its broader protocol/port/host compatibility rather than blindly reusing the public GitHub owner/repo admission grammar. No tracker issue was created and no other source was changed by this reviewer.
+
+Exact reviewed file hashes: `/tmp/thegn-THE621-independent-source-review-20260914.json`. Validation here is read-only source review and git diff --check only; no Cargo, Git commands under test, CLI/network/provider execution or Linear writes.

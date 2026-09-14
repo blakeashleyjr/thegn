@@ -1,0 +1,48 @@
+mod model {
+pub fn nwo_from_remote_url(url: &str) -> Option<String> {
+    let s = url.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    // Drop the scheme+host (`scheme://host/…`) or the scp `git@host:` prefix,
+    // leaving the `owner/repo[/…]` path.
+    let path = if let Some((_, rest)) = s.split_once("://") {
+        rest.split_once('/').map(|(_, p)| p)?
+    } else if let Some((_, rest)) = s.split_once(':') {
+        rest
+    } else {
+        return None;
+    };
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+}
+mod forge {
+pub fn remote_host(url: &str) -> Option<String> {
+    let u = url.trim();
+    let u = u.strip_prefix("ssh://").unwrap_or(u);
+    let u = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .unwrap_or(u);
+    let u = u.split_once('@').map(|(_, r)| r).unwrap_or(u);
+    let host = u.split(['/', ':']).next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+ pub mod native {use crate::model::nwo_from_remote_url;
+pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
+    // This implementation uses api.github.com. A syntactically valid owner/repo
+    // on another forge is not permission to query the same name on GitHub.
+    if super::remote_host(url).as_deref() != Some("github.com") {
+        return None;
+    }
+    nwo_from_remote_url(url).and_then(|nwo| {
+        nwo.split_once('/')
+            .map(|(o, r)| (o.to_string(), r.to_string()))
+    })
+}
+}}
+fn main() { let origin="https://evil.example/foo@github.com/bar"; let parsed=forge::native::parse_owner_repo(origin); println!("origin={origin:?}, native_identity={parsed:?}"); assert!(parsed.is_none(), "foreign authority must not admit native identity"); }

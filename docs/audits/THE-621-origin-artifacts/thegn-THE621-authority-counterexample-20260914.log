@@ -1,0 +1,5 @@
+origin="https://evil.example/foo@github.com/bar", native_identity=Some(("foo@github.com", "bar"))
+
+thread 'main' (1633019) panicked at /tmp/thegn-THE621-authority-counterexample-20260914.rs:48:178:
+foreign authority must not admit native identity
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
