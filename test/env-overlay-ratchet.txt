@@ -139,11 +139,16 @@ git.auto_fetch_min_interval_secs
 git.auto_fetch_notify
 git.merge_guard
 git.override_gpg
+# git_commands.{argv,template_policy} — trusted per-entry command configuration,
+# like command/context below. An ambient THEGN_* knob cannot address one list
+# entry and must not widen its shell-template admission policy.
+git_commands.argv
 git_commands.command
 git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+git_commands.template_policy
 hooks.pre_create
 hooks.post_create
 hooks.pre_destroy

@@ -828,9 +828,12 @@ command = ""           # template with {path} (shell-quoted for you), {line}, {c
 open_in = "auto"       # auto | pane | external — where the launch runs
 
 # User-defined git commands, surfaced in the git panel's custom-commands menu
-# (`x`). `command` is a template expanded against the current selection — see
-# the list below — then run via `sh -c`. The `| quote` filter shell-quotes a
-# value. Referencing an empty selection is an error, never a silent "".
+# (`x`). Choose `argv` or `command` for each entry. Each `argv` element remains
+# one argument after selection expansion. `command` is trusted shell text run
+# via `sh -c`; placeholders require an explicit `template_policy` and must be
+# complete unquoted arguments under "safe". The optional `| quote` filter does
+# not make a placeholder inside existing shell quotes safe. Referencing an empty
+# selection is an error, never a silent "".
 #   {{.SelectedCommit.Sha}} / .Short / .Subject / .Author
 #   {{.SelectedBranch.Name}} / .Upstream      (also .SelectedLocalBranch.*)
 #   {{.CheckedOutBranch.Name}} / .Upstream
@@ -841,12 +844,18 @@ open_in = "auto"       # auto | pane | external — where the launch runs
 # key = "P"                    # hotkey inside the custom-commands menu
 # context = "branches"         # commits | branches | files | stash | global
 # argv = ["git", "push", "--force-with-lease", "origin", "{{.SelectedBranch.Name}}"]
-# # Alternatively: command = "git push origin {{.SelectedBranch.Name}}"
-# # Shell placeholders require: template_policy = "safe"
-# # Keep each shell placeholder a complete unquoted argument.
 # description = "force-push selected branch"
 # output = "popup"             # none | popup | terminal
 # prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
+#
+# # A separate shell-template entry; do not also set argv on this entry.
+# [[git_commands]]
+# key = "L"
+# context = "commits"
+# command = "git log -1 {{.SelectedCommit.Sha}}"  # trusted shell template
+# template_policy = "safe"     # required for shell placeholders; complete unquoted args
+# description = "show selected commit"
+# output = "popup"
 
 # Tracing diagnostics. CLI tracing can go to level-gated, branded stderr; the
 # compositor and pane daemon use their own rotating file sinks when tracing is
