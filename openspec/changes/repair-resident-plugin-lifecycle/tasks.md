@@ -10,7 +10,7 @@
 - [x] Pass focused native Unix session/provider/lifecycle fixtures (final assembled service plugin suite 48/48 passed).
 - [x] Pass host integration and required source/format checks (assembled tests, scoped clippy and source/format gates; native platform acceptance remains below).
 - [x] Complete independent adversarial review of the final checkpoint (53502768).
-- [ ] Coordinate local landing.
+- [x] Coordinate scoped local landing (ea807922; native acceptance below remains open).
 
 ## Full THE-154 acceptance remains outstanding
 
