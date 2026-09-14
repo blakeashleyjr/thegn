@@ -1,9 +1,5 @@
 //! Opt-in bounded workloads for candidate hot paths. No terminal or live DB.
 
-#[cfg(unix)]
-#[path = "perf_workloads_hydration.rs"]
-mod hydration;
-
 use std::time::Instant;
 use termwiz::surface::{Change, Position, Surface};
 

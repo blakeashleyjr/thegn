@@ -488,3 +488,6 @@ mod remote_credential_tests {
         assert!(!sentinel.exists());
     }
 }
+#[cfg(test)]
+#[path = "perf_workloads_hydration.rs"]
+mod perf_workloads_hydration;
