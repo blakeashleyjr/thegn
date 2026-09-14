@@ -397,6 +397,7 @@ mod tests {
             title: "t".into(),
             state: "OPEN".into(),
             url: "u".into(),
+            author: None,
             is_draft: false,
             head_ref_name: "feat".into(),
             head_ref_oid: "abc".into(),

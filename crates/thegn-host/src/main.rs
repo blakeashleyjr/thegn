@@ -178,6 +178,7 @@ mod platform_ratchet_tests;
 mod plugin_providers;
 mod plugins;
 mod pr_driver;
+mod pr_authorship;
 mod pr_view;
 mod predict;
 mod preview;

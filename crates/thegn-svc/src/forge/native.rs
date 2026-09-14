@@ -73,7 +73,7 @@ query($owner:String!,$repo:String!,$head:String!){
   repository(owner:$owner,name:$repo){
     pullRequests(headRefName:$head, first:1, states:[OPEN,MERGED,CLOSED]){
       nodes{
-        number title state url isDraft headRefName headRefOid baseRefName
+        number title state url author{login ... on User{id}} isDraft headRefName headRefOid baseRefName
         mergeable mergeStateStatus reviewDecision
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           contexts(first:100){ nodes{
@@ -154,6 +154,9 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
                 title: s("title"),
                 state: s("state"),
                 url: s("url"),
+                author: node
+                    .get("author")
+                    .and_then(|author| serde_json::from_value(author.clone()).ok()),
                 is_draft: node
                     .get("isDraft")
                     .and_then(Value::as_bool)

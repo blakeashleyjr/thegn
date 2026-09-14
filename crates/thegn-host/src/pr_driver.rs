@@ -178,7 +178,6 @@ pub(crate) fn drive_queue(
         tracing::warn!(target: "thegn::prq", "{msg}");
         out.warnings.push(msg);
     }
-    let me = viewer_login(forge, repo_root);
 
     let now = thegn_core::util::now();
     for item in items {
@@ -269,7 +268,7 @@ pub(crate) fn drive_queue(
             worktree: item.worktree.clone(),
             agent_attempts: attempts,
             last_head_oid: item.last_head_oid.clone(),
-            is_own: is_own_pr(&fetched, me.as_deref()),
+            is_own: true, // fresh shared admission runs before any dispatch side effect
             agent_available: agent_cmd.is_some(),
         };
 
@@ -426,6 +425,23 @@ pub(crate) fn drive_queue(
             }
 
             QueueAction::DispatchAgent(kind) => {
+                let authorship = match crate::pr_authorship::acquire(
+                    cfg.own_prs_only,
+                    db,
+                    forge,
+                    &loc,
+                    &item.forge,
+                    item.number,
+                    &fetched.pr,
+                ) {
+                    Ok(proof) => proof,
+                    Err(reason) => {
+                        out.warnings.push(format!("PR #{}: {reason}", item.number));
+                        out.needs_human.push(item.number);
+                        step(PrqStatus::NeedsHuman.as_str(), reason, &mut progress);
+                        continue;
+                    }
+                };
                 // Before waking an agent on a red build, try the cheap thing: a
                 // lot of red CI is a flake, and a re-run costs nothing but a
                 // little wall-clock.
@@ -482,6 +498,27 @@ pub(crate) fn drive_queue(
                     crate::agent_run::AgentDispatch::Run(spec) => spec,
                 };
 
+                let (Some(wt), Some(template)) = (item.worktree.as_deref(), agent_cmd.as_deref())
+                else {
+                    continue;
+                };
+                let Some((vars, prompt)) = compose(cfg, kind, wt, &item, &fetched, &blocker) else {
+                    continue;
+                };
+                // Preparation can block. Recheck author/account/head before
+                // consuming the attempt; unknown or changed evidence holds.
+                if let Err(reason) = crate::pr_authorship::revalidate(
+                    authorship.as_ref(),
+                    db,
+                    forge,
+                    &loc,
+                    &fetched.pr,
+                    false,
+                ) {
+                    out.warnings.push(format!("PR #{}: {reason}", item.number));
+                    out.needs_human.push(item.number);
+                    continue;
+                }
                 let next = attempts + 1;
                 let _ = db.set_pr_agent_attempts(&item.key, next); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 let note = format!("agent fixing ({next}/{})", cfg.agent_max_attempts);
@@ -495,13 +532,16 @@ pub(crate) fn drive_queue(
                 );
                 step(PrqStatus::AgentRunning.as_str(), &note, &mut progress);
 
-                // Safe: `decide` returns DispatchAgent only with a worktree and a
-                // resolved command.
-                let (Some(wt), Some(template)) = (item.worktree.as_deref(), agent_cmd.as_deref())
-                else {
-                    continue;
-                };
-                run_agent(cfg, kind, template, wt, &item, &fetched, &blocker, sandbox);
+                crate::agent_run::run(&crate::agent_run::AgentTaskRun {
+                    kind,
+                    worktree: wt,
+                    prompt: &prompt,
+                    command_template: template,
+                    vars: &vars,
+                    timeout_secs: cfg.agent_timeout_secs,
+                    sandbox,
+                    credential_free: false,
+                });
 
                 // The exit code decides nothing — the next refresh does, exactly
                 // as in the merge queue. An agent can exit non-zero having pushed
@@ -743,71 +783,13 @@ fn merge_method(m: PrMergeMethod) -> MergeMethod {
     }
 }
 
-/// Whether the session's user authored this PR.
-///
-/// Unknown viewer ⇒ **not** ours. That is the safe direction: `own_prs_only`
-/// then blocks the agent rather than letting it write to a colleague's PR
-/// because `gh` happened to be unreadable.
-fn is_own_pr(f: &FetchedPr, me: Option<&str>) -> bool {
-    let Some(me) = me.filter(|m| !m.is_empty()) else {
-        return false;
-    };
-    // `PrStatus` carries no author field, so fall back to the URL's owner only
-    // when the PR lives in the viewer's own namespace. Threads authored by the
-    // viewer are not evidence of authorship.
-    f.pr.url
-        .split('/')
-        .nth(3)
-        .is_some_and(|owner| owner.eq_ignore_ascii_case(me))
-}
-
-/// The authenticated forge user, if it can be read.
-fn viewer_login(forge: &dyn Forge, repo_root: &Path) -> Option<String> {
-    let loc = GitLoc::from_db(&repo_root.to_string_lossy(), None);
-    forge
-        .whoami(&loc)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 fn describe(e: &ForgeError) -> String {
     e.describe()
 }
 
-/// Compose the prompt and run the agent in the PR's worktree.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one call site; a context struct would cost more than it saves"
-)]
-fn run_agent(
-    cfg: &PrQueueConfig,
-    kind: TaskKind,
-    template: &str,
-    worktree: &str,
-    item: &PrItem,
-    fetched: &FetchedPr,
-    blocker: &Blocker,
-    sandbox: Option<thegn_core::sandbox::SandboxSpec>,
-) {
-    let Some((vars, prompt)) = compose(cfg, kind, worktree, item, fetched, blocker) else {
-        return;
-    };
-    crate::agent_run::run(&crate::agent_run::AgentTaskRun {
-        kind,
-        worktree,
-        prompt: &prompt,
-        command_template: template,
-        vars: &vars,
-        timeout_secs: cfg.agent_timeout_secs,
-        sandbox,
-        credential_free: false,
-    });
-}
-
 /// Build the task variables and render the prompt for a PR blocker.
 ///
-/// Split out of [`run_agent`] so the mapping (which blocker fills which
+/// The mapping (which blocker fills which
 /// variables) is unit-testable without spawning anything.
 fn compose(
     cfg: &PrQueueConfig,
@@ -965,6 +947,7 @@ mod tests {
                 title: "Add widget".into(),
                 state: "OPEN".into(),
                 url: "https://github.com/me/repo/pull/7".into(),
+                author: None,
                 is_draft: false,
                 head_ref_name: "feat".into(),
                 head_ref_oid: "abc".into(),
@@ -1131,17 +1114,6 @@ mod tests {
             ),
             QueueAction::Wait
         );
-    }
-
-    #[test]
-    fn authorship_is_unknown_unless_the_viewer_is_known() {
-        let f = fetched(vec![]);
-        // Unknown viewer ⇒ not ours, so `own_prs_only` errs toward NOT writing.
-        assert!(!is_own_pr(&f, None));
-        assert!(!is_own_pr(&f, Some("")));
-        assert!(is_own_pr(&f, Some("me")));
-        assert!(is_own_pr(&f, Some("ME")), "case-insensitive");
-        assert!(!is_own_pr(&f, Some("someone-else")));
     }
 
     #[test]
@@ -1353,6 +1325,68 @@ mod tests {
     }
 
     #[test]
+    fn own_pr_denial_never_reruns_ci_spends_budget_or_launches_an_agent() {
+        for mismatched_number in [false, true] {
+            use crate::pr_authorship::tests::Fixture;
+            use std::sync::atomic::Ordering;
+            let fixture = Fixture::new();
+            let path = fixture.dir.path().to_str().unwrap();
+            let db = Db::open_at(&fixture.dir.path().join("queue.db")).unwrap();
+            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+                .unwrap();
+            let sentinel = fixture.dir.path().join("agent-must-not-run");
+            let mut cfg = cfg();
+            cfg.watch = vec![PrWatchKind::Ci];
+            cfg.agent_command = format!("touch {}", sentinel.display());
+            cfg.own_prs_only = true;
+            let mut proof = fixture.proof.clone();
+            if mismatched_number {
+                proof.number = 8;
+                proof.pr_id = "PR_8".into();
+            } else {
+                proof.viewer.id = "U_other".into();
+            }
+            let mut forge = fixture.forge(vec![proof]);
+            if mismatched_number {
+                forge.pr.number = 8;
+                forge.pr.url = "https://github.com/organization/project/pull/8".into();
+            }
+            forge.pr.status_check_rollup = vec![
+                serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                    .unwrap(),
+            ];
+            let items = db
+                .list_pr_queue()
+                .unwrap()
+                .iter()
+                .map(PrItem::from)
+                .collect();
+            let out = drive_queue(
+                &cfg,
+                &Config::default(),
+                &forge,
+                fixture.dir.path(),
+                &db,
+                items,
+                |_| {},
+            );
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|s| s.contains("own-PR automation held")),
+                "{out:?}"
+            );
+            assert_eq!(
+                forge.proof_calls.load(Ordering::SeqCst),
+                usize::from(!mismatched_number)
+            );
+            assert_eq!(forge.reruns.load(Ordering::SeqCst), 0);
+            assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+            assert!(!sentinel.exists());
+        }
+    }
+
+    #[test]
     fn fake_forge_drives_a_green_pr_to_auto_merge() {
         let (_dir, db) = temp_db("prq-auto");
         let forge = FakeForge::new(Some(green_pr()));
@@ -1368,7 +1402,10 @@ mod tests {
         );
         assert_eq!(out.merged, vec![7], "{out:?}");
         let calls = forge.calls();
-        assert!(calls.iter().any(|c| c == "whoami"), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c == "whoami"),
+            "namespace identity is never an authorization source: {calls:?}"
+        );
         assert!(
             calls.iter().any(|c| c.starts_with("pr_status Number(7)")),
             "{calls:?}"
