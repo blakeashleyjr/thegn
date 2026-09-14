@@ -427,9 +427,11 @@ pub(crate) fn drive_queue(
             QueueAction::DispatchAgent(kind) => {
                 let authorship = match crate::pr_authorship::acquire(
                     cfg.own_prs_only,
+                    db,
                     forge,
                     &loc,
                     &item.forge,
+                    item.number,
                     &fetched.pr,
                 ) {
                     Ok(proof) => proof,
@@ -507,6 +509,7 @@ pub(crate) fn drive_queue(
                 // consuming the attempt; unknown or changed evidence holds.
                 if let Err(reason) = crate::pr_authorship::revalidate(
                     authorship.as_ref(),
+                    db,
                     forge,
                     &loc,
                     &fetched.pr,
@@ -1323,50 +1326,64 @@ mod tests {
 
     #[test]
     fn own_pr_denial_never_reruns_ci_spends_budget_or_launches_an_agent() {
-        use crate::pr_authorship::tests::Fixture;
-        use std::sync::atomic::Ordering;
-        let fixture = Fixture::new();
-        let path = fixture.dir.path().to_str().unwrap();
-        let db = Db::open_at(&fixture.dir.path().join("queue.db")).unwrap();
-        db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
-            .unwrap();
-        let sentinel = fixture.dir.path().join("agent-must-not-run");
-        let mut cfg = cfg();
-        cfg.watch = vec![PrWatchKind::Ci];
-        cfg.agent_command = format!("touch {}", sentinel.display());
-        cfg.own_prs_only = true;
-        let mut proof = fixture.proof.clone();
-        proof.viewer.id = "U_other".into();
-        let mut forge = fixture.forge(vec![proof]);
-        forge.pr.status_check_rollup = vec![
-            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
-                .unwrap(),
-        ];
-        let items = db
-            .list_pr_queue()
-            .unwrap()
-            .iter()
-            .map(PrItem::from)
-            .collect();
-        let out = drive_queue(
-            &cfg,
-            &Config::default(),
-            &forge,
-            fixture.dir.path(),
-            &db,
-            items,
-            |_| {},
-        );
-        assert!(
-            out.warnings
+        for mismatched_number in [false, true] {
+            use crate::pr_authorship::tests::Fixture;
+            use std::sync::atomic::Ordering;
+            let fixture = Fixture::new();
+            let path = fixture.dir.path().to_str().unwrap();
+            let db = Db::open_at(&fixture.dir.path().join("queue.db")).unwrap();
+            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+                .unwrap();
+            let sentinel = fixture.dir.path().join("agent-must-not-run");
+            let mut cfg = cfg();
+            cfg.watch = vec![PrWatchKind::Ci];
+            cfg.agent_command = format!("touch {}", sentinel.display());
+            cfg.own_prs_only = true;
+            let mut proof = fixture.proof.clone();
+            if mismatched_number {
+                proof.number = 8;
+                proof.pr_id = "PR_8".into();
+            } else {
+                proof.viewer.id = "U_other".into();
+            }
+            let mut forge = fixture.forge(vec![proof]);
+            if mismatched_number {
+                forge.pr.number = 8;
+                forge.pr.url = "https://github.com/organization/project/pull/8".into();
+            }
+            forge.pr.status_check_rollup = vec![
+                serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                    .unwrap(),
+            ];
+            let items = db
+                .list_pr_queue()
+                .unwrap()
                 .iter()
-                .any(|s| s.contains("own-PR automation held")),
-            "{out:?}"
-        );
-        assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(forge.reruns.load(Ordering::SeqCst), 0);
-        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
-        assert!(!sentinel.exists());
+                .map(PrItem::from)
+                .collect();
+            let out = drive_queue(
+                &cfg,
+                &Config::default(),
+                &forge,
+                fixture.dir.path(),
+                &db,
+                items,
+                |_| {},
+            );
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|s| s.contains("own-PR automation held")),
+                "{out:?}"
+            );
+            assert_eq!(
+                forge.proof_calls.load(Ordering::SeqCst),
+                usize::from(!mismatched_number)
+            );
+            assert_eq!(forge.reruns.load(Ordering::SeqCst), 0);
+            assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+            assert!(!sentinel.exists());
+        }
     }
 
     #[test]

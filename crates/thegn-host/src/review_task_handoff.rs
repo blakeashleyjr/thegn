@@ -116,9 +116,11 @@ fn handle_loaded(
         .unwrap_or_default();
     let authorship = match crate::pr_authorship::acquire(
         queue.own_prs_only,
+        db,
         forge,
         loc,
         selected_forge,
+        context.pr_number,
         &before,
     ) {
         Ok(proof) => proof,
@@ -161,7 +163,7 @@ fn handle_loaded(
         .set("threads", "durable per-thread review task");
     // Preparation can block; denial before the final revision CAS is read-only.
     if let Err(reason) =
-        crate::pr_authorship::revalidate(authorship.as_ref(), forge, loc, &before, false)
+        crate::pr_authorship::revalidate(authorship.as_ref(), db, forge, loc, &before, false)
     {
         return reason.into();
     }
@@ -282,7 +284,7 @@ fn handle_loaded(
         task.id, verified_head, task.source_revision
     );
     if let Err(reason) =
-        crate::pr_authorship::revalidate(authorship.as_ref(), forge, loc, &after, true)
+        crate::pr_authorship::revalidate(authorship.as_ref(), db, forge, loc, &after, true)
     {
         return park(db, &task, reason);
     }
@@ -584,47 +586,61 @@ mod tests {
 
     #[test]
     fn unknown_author_holds_review_before_claim_without_reparking_the_row() {
-        use crate::pr_authorship::tests::Fixture;
-        use std::sync::atomic::Ordering;
-        let fixture = Fixture::new();
-        let db = Db::open_at(&fixture.dir.path().join("own-review.db")).unwrap();
-        let mut task = task(&db);
-        task.worktree_path = fixture.dir.path().to_string_lossy().into_owned();
-        task.expected_head_oid = fixture.pr.head_ref_oid.clone();
-        task.issue_id = "pr:github:organization/project#7".into();
-        let context = HandleContext {
-            pr_number: 7,
-            repository: "organization/project".into(),
-            ..context(&task)
-        };
-        let sentinel = fixture.dir.path().join("agent-must-not-run");
-        let queue = PrQueueConfig {
-            own_prs_only: true,
-            agent_command: format!("touch {}", sentinel.display()),
-            ..Default::default()
-        };
-        let mut proof = fixture.proof.clone();
-        proof.viewer.id = "U_other".into();
-        let forge = fixture.forge(vec![proof]);
-        // Another owner claimed this revision while this invocation prepared.
-        db.update_review_task_status(task.id, AgentDispatchStatus::Running)
-            .unwrap();
-        let result = handle_loaded(
-            &db,
-            &Config::default(),
-            &queue,
-            &forge,
-            &fixture.loc,
-            &context,
-            task.clone(),
-        );
-        assert!(result.contains("own-PR automation held"), "{result}");
-        assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
-        let current = db.get_review_task(task.id).unwrap().unwrap();
-        assert_eq!(current.status, AgentDispatchStatus::Running);
-        assert_eq!(current.source_revision, task.source_revision);
-        assert_eq!(current.forge_action_attempts, 0);
-        assert!(!sentinel.exists());
+        for mismatched_number in [false, true] {
+            use crate::pr_authorship::tests::Fixture;
+            use std::sync::atomic::Ordering;
+            let fixture = Fixture::new();
+            let db = Db::open_at(&fixture.dir.path().join("own-review.db")).unwrap();
+            let mut task = task(&db);
+            task.worktree_path = fixture.dir.path().to_string_lossy().into_owned();
+            task.expected_head_oid = fixture.pr.head_ref_oid.clone();
+            task.issue_id = "pr:github:organization/project#7".into();
+            let context = HandleContext {
+                pr_number: 7,
+                repository: "organization/project".into(),
+                ..context(&task)
+            };
+            let sentinel = fixture.dir.path().join("agent-must-not-run");
+            let queue = PrQueueConfig {
+                own_prs_only: true,
+                agent_command: format!("touch {}", sentinel.display()),
+                ..Default::default()
+            };
+            let mut proof = fixture.proof.clone();
+            if mismatched_number {
+                proof.number = 8;
+                proof.pr_id = "PR_8".into();
+            } else {
+                proof.viewer.id = "U_other".into();
+            }
+            let mut forge = fixture.forge(vec![proof]);
+            if mismatched_number {
+                forge.pr.number = 8;
+                forge.pr.url = "https://github.com/organization/project/pull/8".into();
+            }
+            // Another owner claimed this revision while this invocation prepared.
+            db.update_review_task_status(task.id, AgentDispatchStatus::Running)
+                .unwrap();
+            let result = handle_loaded(
+                &db,
+                &Config::default(),
+                &queue,
+                &forge,
+                &fixture.loc,
+                &context,
+                task.clone(),
+            );
+            assert!(result.contains("own-PR automation held"), "{result}");
+            assert_eq!(
+                forge.proof_calls.load(Ordering::SeqCst),
+                usize::from(!mismatched_number)
+            );
+            let current = db.get_review_task(task.id).unwrap().unwrap();
+            assert_eq!(current.status, AgentDispatchStatus::Running);
+            assert_eq!(current.source_revision, task.source_revision);
+            assert_eq!(current.forge_action_attempts, 0);
+            assert!(!sentinel.exists());
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use thegn_core::ci_log::CiLogEntry;
 use thegn_core::config::{CiAutofixMode, Config};
 use thegn_core::forge::{FetchedPr, Forge};
 use thegn_core::pr_queue::{Blocker, PrqStatus};
-use thegn_core::store::{CacheStore, NotificationStore, WorktreeAuxStore};
+use thegn_core::store::{CacheStore, NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
 /// Consider one newly cached failed-job log.  Missing or stale context is
 /// surfaced as a deduplicated notification; it is never treated as permission
@@ -150,7 +150,15 @@ fn consider_candidate_with_forge(
         return;
     }
 
-    let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
+    let location = match db.location_for(worktree) {
+        Ok(location) => location,
+        Err(_) if pq.own_prs_only => {
+            notify(crate::pr_authorship::HELD.into());
+            return;
+        }
+        Err(_) => None,
+    };
+    let loc = thegn_core::remote::GitLoc::from_db(worktree, location.as_deref());
     let forges;
     let provider = if let Some(forge) = selected_forge {
         forge
@@ -178,9 +186,11 @@ fn consider_candidate_with_forge(
     }
     let authorship = match crate::pr_authorship::acquire(
         pq.own_prs_only,
+        db,
         provider,
         &loc,
         &item.forge,
+        item.number,
         &fetched.pr,
     ) {
         Ok(proof) => proof,
@@ -238,9 +248,14 @@ fn consider_candidate_with_forge(
     // before consuming the attempt and spawning. A refresh race therefore
     // spends at most one dispatch without permanently suppressing a candidate
     // that was held by infrastructure or rejected by prompt validation.
-    if let Err(reason) =
-        crate::pr_authorship::revalidate(authorship.as_ref(), provider, &loc, &fetched.pr, false)
-    {
+    if let Err(reason) = crate::pr_authorship::revalidate(
+        authorship.as_ref(),
+        db,
+        provider,
+        &loc,
+        &fetched.pr,
+        false,
+    ) {
         notify(reason.into());
         return;
     }
@@ -292,45 +307,59 @@ mod authorship_tests {
 
     #[test]
     fn foreign_author_never_claims_or_spends_a_ci_attempt() {
-        let fixture = Fixture::new();
-        let path = fixture.dir.path().to_str().unwrap();
-        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
-        db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
-            .unwrap();
-        let sentinel = fixture.dir.path().join("agent-must-not-run");
-        let mut cfg = Config::default();
-        cfg.ci.autofix.mode = CiAutofixMode::Auto;
-        cfg.pr_queue.enabled = true;
-        cfg.pr_queue.agent_command = format!("touch {}", sentinel.display());
-        cfg.pr_queue.own_prs_only = true;
-        let mut proof = fixture.proof.clone();
-        proof.viewer.id = "U_other".into();
-        let mut forge = fixture.forge(vec![proof]);
-        forge.pr.status_check_rollup = vec![
-            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
-                .unwrap(),
-        ];
-        let entry = CiLogEntry {
-            worktree: path.into(),
-            head_sha: fixture.pr.head_ref_oid.clone(),
-            text: "fixture failure".into(),
-            run_id: "run".into(),
-            job_id: "job".into(),
-            ..Default::default()
-        };
-        consider_candidate_with_forge(&cfg, &db, &entry, false, Some(&forge));
-        assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
-        assert!(!sentinel.exists());
-        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
-        assert!(
-            db.claim_ci_autofix(&entry.candidate()).unwrap(),
-            "denial must not consume the candidate claim"
-        );
-        assert!(
-            db.get_unread_notifications()
-                .unwrap()
-                .iter()
-                .any(|n| n.message.contains("own-PR automation held"))
-        );
+        for mismatched_number in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.dir.path().to_str().unwrap();
+            let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
+            db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+                .unwrap();
+            let sentinel = fixture.dir.path().join("agent-must-not-run");
+            let mut cfg = Config::default();
+            cfg.ci.autofix.mode = CiAutofixMode::Auto;
+            cfg.pr_queue.enabled = true;
+            cfg.pr_queue.agent_command = format!("touch {}", sentinel.display());
+            cfg.pr_queue.own_prs_only = true;
+            let mut proof = fixture.proof.clone();
+            if mismatched_number {
+                proof.number = 8;
+                proof.pr_id = "PR_8".into();
+            } else {
+                proof.viewer.id = "U_other".into();
+            }
+            let mut forge = fixture.forge(vec![proof]);
+            if mismatched_number {
+                forge.pr.number = 8;
+                forge.pr.url = "https://github.com/organization/project/pull/8".into();
+            }
+            forge.pr.status_check_rollup = vec![
+                serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                    .unwrap(),
+            ];
+            let entry = CiLogEntry {
+                worktree: path.into(),
+                head_sha: fixture.pr.head_ref_oid.clone(),
+                text: "fixture failure".into(),
+                run_id: "run".into(),
+                job_id: "job".into(),
+                ..Default::default()
+            };
+            consider_candidate_with_forge(&cfg, &db, &entry, false, Some(&forge));
+            assert_eq!(
+                forge.proof_calls.load(Ordering::SeqCst),
+                usize::from(!mismatched_number)
+            );
+            assert!(!sentinel.exists());
+            assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+            assert!(
+                db.claim_ci_autofix(&entry.candidate()).unwrap(),
+                "denial must not consume the candidate claim"
+            );
+            assert!(
+                db.get_unread_notifications()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.message.contains("own-PR automation held"))
+            );
+        }
     }
 }
