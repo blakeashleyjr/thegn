@@ -71,6 +71,16 @@ fn consider_candidate(
     entry: &CiLogEntry,
     human_authorized: bool,
 ) {
+    consider_candidate_with_forge(full, db, entry, human_authorized, None);
+}
+
+fn consider_candidate_with_forge(
+    full: &Config,
+    db: &thegn_core::db::Db,
+    entry: &CiLogEntry,
+    human_authorized: bool,
+    selected_forge: Option<&dyn Forge>,
+) {
     let root = thegn_core::repo::main_worktree(Path::new(&entry.worktree))
         .unwrap_or_else(|| Path::new(&entry.worktree).to_path_buf());
     let ci = full.repo_ci(&root);
@@ -141,8 +151,13 @@ fn consider_candidate(
     }
 
     let loc = thegn_core::remote::GitLoc::for_worktree(Path::new(worktree));
-    let forge = crate::forge_handle::get();
-    let provider = forge.for_loc(&loc);
+    let forges;
+    let provider = if let Some(forge) = selected_forge {
+        forge
+    } else {
+        forges = crate::forge_handle::get();
+        forges.for_loc(&loc)
+    };
     let Some(fetched) = provider.fetch_pr(&loc, item.number).ok() else {
         notify(format!(
             "CI job {} failed for PR #{}; the current PR head could not be verified",
@@ -161,13 +176,19 @@ fn consider_candidate(
     if !matches!(blocker, Blocker::Ci(_)) {
         return;
     }
-    if pq.own_prs_only && !is_own_pr(provider, &loc, &fetched) {
-        notify(format!(
-            "CI job {} failed for PR #{}; PR ownership could not be verified for autofix",
-            entry.job_name, item.number
-        ));
-        return;
-    }
+    let authorship = match crate::pr_authorship::acquire(
+        pq.own_prs_only,
+        provider,
+        &loc,
+        &item.forge,
+        &fetched.pr,
+    ) {
+        Ok(proof) => proof,
+        Err(reason) => {
+            notify(reason.into());
+            return;
+        }
+    };
 
     if ci.autofix.mode == CiAutofixMode::Suggest && !human_authorized {
         notify(format!(
@@ -217,6 +238,12 @@ fn consider_candidate(
     // before consuming the attempt and spawning. A refresh race therefore
     // spends at most one dispatch without permanently suppressing a candidate
     // that was held by infrastructure or rejected by prompt validation.
+    if let Err(reason) =
+        crate::pr_authorship::revalidate(authorship.as_ref(), provider, &loc, &fetched.pr, false)
+    {
+        notify(reason.into());
+        return;
+    }
     if !db.claim_ci_autofix(&candidate).unwrap_or(false) {
         return;
     }
@@ -257,14 +284,53 @@ fn head_is_current(
         && !forge.id().is_empty()
 }
 
-fn is_own_pr(forge: &dyn Forge, loc: &thegn_core::remote::GitLoc, fetched: &FetchedPr) -> bool {
-    let Some(me) = forge.whoami(loc).ok().map(|s| s.trim().to_string()) else {
-        return false;
-    };
-    fetched
-        .pr
-        .url
-        .split('/')
-        .nth(3)
-        .is_some_and(|owner| owner.eq_ignore_ascii_case(&me))
+#[cfg(test)]
+mod authorship_tests {
+    use super::*;
+    use crate::pr_authorship::tests::Fixture;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn foreign_author_never_claims_or_spends_a_ci_attempt() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().to_str().unwrap();
+        let db = thegn_core::db::Db::open_at(&fixture.dir.path().join("ci.db")).unwrap();
+        db.enqueue_pr(path, 7, Some(path), "fixture", "main", "github")
+            .unwrap();
+        let sentinel = fixture.dir.path().join("agent-must-not-run");
+        let mut cfg = Config::default();
+        cfg.ci.autofix.mode = CiAutofixMode::Auto;
+        cfg.pr_queue.enabled = true;
+        cfg.pr_queue.agent_command = format!("touch {}", sentinel.display());
+        cfg.pr_queue.own_prs_only = true;
+        let mut proof = fixture.proof.clone();
+        proof.viewer.id = "U_other".into();
+        let mut forge = fixture.forge(vec![proof]);
+        forge.pr.status_check_rollup = vec![
+            serde_json::from_value(serde_json::json!({"name":"test", "conclusion":"FAILURE"}))
+                .unwrap(),
+        ];
+        let entry = CiLogEntry {
+            worktree: path.into(),
+            head_sha: fixture.pr.head_ref_oid.clone(),
+            text: "fixture failure".into(),
+            run_id: "run".into(),
+            job_id: "job".into(),
+            ..Default::default()
+        };
+        consider_candidate_with_forge(&cfg, &db, &entry, false, Some(&forge));
+        assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
+        assert!(!sentinel.exists());
+        assert_eq!(db.list_pr_queue().unwrap()[0].agent_attempts, 0);
+        assert!(
+            db.claim_ci_autofix(&entry.candidate()).unwrap(),
+            "denial must not consume the candidate claim"
+        );
+        assert!(
+            db.get_unread_notifications()
+                .unwrap()
+                .iter()
+                .any(|n| n.message.contains("own-PR automation held"))
+        );
+    }
 }

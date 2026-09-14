@@ -61,7 +61,7 @@ pub(crate) fn handle(cfg: &Config, context: &HandleContext) -> String {
     // the repository root is a read-only query location, never a task
     // worktree.
     if task.worktree_path.trim().is_empty() {
-        return park(&db, &task, "review task has no worktree to handle");
+        return "review task has no worktree to handle".into();
     }
     let root = crate::integrate::main_checkout(Path::new(&task.worktree_path))
         .unwrap_or_else(|| Path::new(&task.worktree_path).to_path_buf());
@@ -85,17 +85,10 @@ fn handle_loaded(
         return format!("review task is {}, not queued", task.status.as_str());
     }
     if task.worktree_path.trim().is_empty() {
-        return park(db, &task, "review task has no worktree to handle");
+        return "review task has no worktree to handle".into();
     }
     if cooldown_active(&task, thegn_core::util::now_ms()) {
-        return park(db, &task, "review thread resolution is still cooling down");
-    }
-    match db.claim_review_task(task.id, &task.source_revision) {
-        Ok(true) => {}
-        Ok(false) => {
-            return "review task changed before handling; refresh and retry".into();
-        }
-        Err(error) => return format!("review task could not start durably: {error}"),
+        return "review thread resolution is still cooling down".into();
     }
 
     // Exact configured role/command only. Unlike interactive review handoff,
@@ -105,27 +98,43 @@ fn handle_loaded(
         task.role.as_str(),
         queue.agent_command.as_str(),
     ) else {
-        return park(
-            db,
-            &task,
-            "configured review-task role/command could not be resolved",
-        );
+        return "configured review-task role/command could not be resolved".into();
     };
     let before = match forge.pr_status(loc, PrRef::Number(context.pr_number)) {
         Ok(pr) => pr,
-        Err(error) => return park_after_forge_error(db, &task, "pre-handoff PR refresh", &error),
+        Err(error) => return format!("pre-handoff PR refresh failed: {}", error.describe()),
     };
     if before.head_ref_oid != task.expected_head_oid {
-        return park(
-            db,
-            &task,
-            &format!(
-                "PR head moved before handling (expected {}, found {})",
-                task.expected_head_oid, before.head_ref_oid
-            ),
-        );
+        return "PR head moved before handling; refresh and retry".into();
     }
 
+    let selected_forge = task
+        .issue_id
+        .strip_prefix("pr:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(forge, _)| forge)
+        .unwrap_or_default();
+    let authorship = match crate::pr_authorship::acquire(
+        queue.own_prs_only,
+        forge,
+        loc,
+        selected_forge,
+        &before,
+    ) {
+        Ok(proof) => proof,
+        Err(reason) => return reason.into(),
+    };
+    if let Some(permit) = &authorship {
+        if !permit.matches_review(&context.repository, context.pr_number)
+            || task.issue_id
+                != format!(
+                    "pr:{selected_forge}:{}#{}",
+                    context.repository, context.pr_number
+                )
+        {
+            return crate::pr_authorship::HELD.into();
+        }
+    }
     let sandbox = match crate::agent_run::agent_floor_gate(
         cfg,
         &task.worktree_path,
@@ -139,7 +148,7 @@ fn handle_loaded(
             sandbox
         }
         crate::agent_run::AgentDispatch::InfraHold(reason) => {
-            return park(db, &task, &format!("review handoff blocked: {reason}"));
+            return format!("review handoff blocked: {reason}");
         }
     };
     let vars = TaskVars::new()
@@ -150,6 +159,20 @@ fn handle_loaded(
         .set("pr_url", &before.url)
         .set("pr_title", &before.title)
         .set("threads", "durable per-thread review task");
+    // Preparation can block; denial before the final revision CAS is read-only.
+    if let Err(reason) =
+        crate::pr_authorship::revalidate(authorship.as_ref(), forge, loc, &before, false)
+    {
+        return reason.into();
+    }
+    match db.claim_review_task(task.id, &task.source_revision) {
+        Ok(true) => {}
+        Ok(false) => {
+            return "review task changed before handling; refresh and retry".into();
+        }
+        Err(error) => return format!("review task could not start durably: {error}"),
+    }
+
     let _agent_ok = crate::agent_run::run(&crate::agent_run::AgentTaskRun {
         kind: TaskKind::PrReview,
         worktree: &task.worktree_path,
@@ -258,6 +281,11 @@ fn handle_loaded(
         "thegn review task {} updated head {} for revision {}; please re-review.",
         task.id, verified_head, task.source_revision
     );
+    if let Err(reason) =
+        crate::pr_authorship::revalidate(authorship.as_ref(), forge, loc, &after, true)
+    {
+        return park(db, &task, reason);
+    }
     match forge.resolve_review_thread(loc, &context.thread_id, &reply) {
         Ok(()) => finish_resolved(db, &task, context, &verified_head),
         Err(error) => park_after_forge_error(db, &task, "review thread resolve", &error),
@@ -533,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_without_configured_agent_transitions_to_waiting_human() {
+    fn handle_without_configured_agent_leaves_unclaimed_revision_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join("handle.db")).unwrap();
         let task = task(&db);
@@ -549,9 +577,54 @@ mod tests {
         assert!(message.contains("could not be resolved"));
         assert_eq!(
             db.get_review_task(task.id).unwrap().unwrap().status,
-            AgentDispatchStatus::WaitingHuman
+            AgentDispatchStatus::Queued
         );
-        assert!(!db.get_unread_notifications().unwrap().is_empty());
+        assert!(db.get_unread_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_author_holds_review_before_claim_without_reparking_the_row() {
+        use crate::pr_authorship::tests::Fixture;
+        use std::sync::atomic::Ordering;
+        let fixture = Fixture::new();
+        let db = Db::open_at(&fixture.dir.path().join("own-review.db")).unwrap();
+        let mut task = task(&db);
+        task.worktree_path = fixture.dir.path().to_string_lossy().into_owned();
+        task.expected_head_oid = fixture.pr.head_ref_oid.clone();
+        task.issue_id = "pr:github:organization/project#7".into();
+        let context = HandleContext {
+            pr_number: 7,
+            repository: "organization/project".into(),
+            ..context(&task)
+        };
+        let sentinel = fixture.dir.path().join("agent-must-not-run");
+        let queue = PrQueueConfig {
+            own_prs_only: true,
+            agent_command: format!("touch {}", sentinel.display()),
+            ..Default::default()
+        };
+        let mut proof = fixture.proof.clone();
+        proof.viewer.id = "U_other".into();
+        let forge = fixture.forge(vec![proof]);
+        // Another owner claimed this revision while this invocation prepared.
+        db.update_review_task_status(task.id, AgentDispatchStatus::Running)
+            .unwrap();
+        let result = handle_loaded(
+            &db,
+            &Config::default(),
+            &queue,
+            &forge,
+            &fixture.loc,
+            &context,
+            task.clone(),
+        );
+        assert!(result.contains("own-PR automation held"), "{result}");
+        assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
+        let current = db.get_review_task(task.id).unwrap().unwrap();
+        assert_eq!(current.status, AgentDispatchStatus::Running);
+        assert_eq!(current.source_revision, task.source_revision);
+        assert_eq!(current.forge_action_attempts, 0);
+        assert!(!sentinel.exists());
     }
 
     #[test]

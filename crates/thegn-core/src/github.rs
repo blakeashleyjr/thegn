@@ -95,7 +95,7 @@ pub(crate) fn classify(stderr: &str) -> GhError {
     }
 }
 
-const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,\
+const PR_FIELDS: &str = "number,title,state,url,author,isDraft,headRefName,headRefOid,baseRefName,\
                          mergeable,mergeStateStatus,reviewDecision,statusCheckRollup";
 
 /// Fetch the PR state for a worktree, mapping every failure mode to a PanelState.
@@ -590,6 +590,9 @@ impl GithubCli {
     }
 }
 
+#[path = "github_authorship.rs"]
+mod authorship_transport;
+
 impl Probe for GithubCli {
     fn probe(&self) -> ProbeReport {
         let availability = match crate::util::which_path("gh") {
@@ -857,5 +860,13 @@ impl Forge for GithubCli {
     }
     fn whoami(&self, loc: &GitLoc) -> Result<String, GhError> {
         gh_out(loc, &["api", "user", "--jq", ".login"])
+    }
+
+    fn pr_authorship(
+        &self,
+        loc: &GitLoc,
+        number: u64,
+    ) -> Result<crate::forge::authorship::PrAuthorship, GhError> {
+        authorship_transport::fetch(loc, self.id(), number)
     }
 }

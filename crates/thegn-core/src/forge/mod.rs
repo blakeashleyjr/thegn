@@ -125,6 +125,7 @@ pub struct ForgeCaps {
     pub notifications: bool,
     pub open_in_browser: bool,
     pub whoami: bool,
+    pub pr_authorship: bool,
 }
 
 impl ForgeCaps {
@@ -148,6 +149,7 @@ impl ForgeCaps {
         notifications: true,
         open_in_browser: true,
         whoami: true,
+        pr_authorship: true,
     };
 }
 
@@ -195,6 +197,8 @@ pub struct FetchedPr {
     pub pr: PrStatus,
     pub threads: Vec<ReviewThreadRow>,
 }
+
+pub mod authorship;
 
 /// A line comment on a PR diff.
 #[derive(Debug, Clone, Copy)]
@@ -426,10 +430,20 @@ pub trait Forge: Probe + Send + Sync {
         unsupported!("open_in_browser")
     }
 
-    /// The authenticated user's login. The one identity probe: onboarding,
-    /// doctor and the PR queue's own-PR check all use it.
+    /// The authenticated user's display login for onboarding and doctor.
+    /// Automated ownership admission requires `pr_authorship` instead.
     fn whoami(&self, _loc: &GitLoc) -> Result<String, ForgeError> {
         unsupported!("whoami")
+    }
+
+    /// Fresh same-request PR author/viewer evidence in this location's forge
+    /// authority. Providers without stable authenticated identities deny.
+    fn pr_authorship(
+        &self,
+        _loc: &GitLoc,
+        _number: u64,
+    ) -> Result<authorship::PrAuthorship, ForgeError> {
+        unsupported!("authenticated PR authorship")
     }
 
     // --- provided compositions -------------------------------------------------

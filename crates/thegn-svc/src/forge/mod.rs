@@ -78,6 +78,7 @@ impl Forge for Ladder<dyn Forge> {
             c.notifications |= lc.notifications;
             c.open_in_browser |= lc.open_in_browser;
             c.whoami |= lc.whoami;
+            c.pr_authorship |= lc.pr_authorship;
         }
         c
     }
@@ -224,6 +225,13 @@ impl Forge for Ladder<dyn Forge> {
     }
     fn whoami(&self, loc: &GitLoc) -> Result<String, ForgeError> {
         forward!(self, "whoami", |l| l.whoami(loc))
+    }
+    fn pr_authorship(
+        &self,
+        loc: &GitLoc,
+        number: u64,
+    ) -> Result<thegn_core::forge::authorship::PrAuthorship, ForgeError> {
+        forward!(self, "pr_authorship", |l| l.pr_authorship(loc, number))
     }
 }
 
@@ -385,6 +393,7 @@ mod tests {
                 pr_status: true,
                 merge: self.id == "cli",
                 resolve_review_thread: self.id == "cli",
+                pr_authorship: self.id == "cli",
                 ..ForgeCaps::default()
             }
         }
@@ -400,6 +409,36 @@ mod tests {
         }
         fn pr_list(&self, _: &GitLoc, _: usize) -> Result<Vec<PrHeader>, ForgeError> {
             Ok(vec![])
+        }
+        fn pr_authorship(
+            &self,
+            _: &GitLoc,
+            number: u64,
+        ) -> Result<thegn_core::forge::authorship::PrAuthorship, ForgeError> {
+            self.calls.lock().unwrap().push("pr_authorship");
+            self.status.clone()?;
+            if self.id != "cli" {
+                return Err(ForgeError::Unsupported("pr_authorship"));
+            }
+            let identity = thegn_core::forge::model::PrAuthor {
+                id: self.id.into(),
+                login: self.id.into(),
+                is_bot: false,
+            };
+            Ok(thegn_core::forge::authorship::PrAuthorship {
+                provider: "github".into(),
+                repository: thegn_core::forge::authorship::GithubRepository::from_origin(
+                    "https://github.com/org/repo.git",
+                )
+                .unwrap(),
+                repository_id: "R_repo".into(),
+                pr_id: "PR_7".into(),
+                number,
+                head: "a".repeat(40),
+                state: "OPEN".into(),
+                author: identity.clone(),
+                viewer: identity,
+            })
         }
         fn merge_pr(
             &self,
@@ -454,6 +493,24 @@ mod tests {
         );
         assert!(l.resolve_review_thread(&loc(), "thread", "reply").is_ok());
         assert!(l.caps().resolve_review_thread);
+    }
+
+    #[test]
+    fn authorship_falls_back_as_one_operation_and_auth_errors_remain_final() {
+        let l = ladder(Err(ForgeError::NotConfigured("no native identity")));
+        assert!(l.caps().pr_authorship);
+        let proof = l.pr_authorship(&loc(), 7).unwrap();
+        assert_eq!(proof.author.id, "cli");
+        assert_eq!(proof.viewer.id, "cli");
+        assert_eq!(proof.number, 7);
+        assert!(matches!(
+            ladder(Err(ForgeError::NotAuthenticated)).pr_authorship(&loc(), 7),
+            Err(ForgeError::NotAuthenticated)
+        ));
+        assert!(matches!(
+            ladder(Err(ForgeError::Offline)).pr_authorship(&loc(), 7),
+            Err(ForgeError::Offline)
+        ));
     }
 
     #[test]
