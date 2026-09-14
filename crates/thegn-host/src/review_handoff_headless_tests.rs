@@ -2,7 +2,7 @@ use super::*;
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
-use thegn_core::store::{NotificationStore, WorkspaceStore};
+use thegn_core::store::{NotificationStore, WorkspaceStore, WorktreeAuxStore};
 
 use crate::pr_authorship::tests::Fixture;
 
@@ -353,6 +353,6 @@ fn preparation_failure_never_reaches_launch_even_with_valid_authority() {
         || Err("fixture sandbox unavailable".into()),
         forbid_launch,
     );
-    assert_eq!(result.as_deref(), Err("fixture sandbox unavailable"));
+    assert_eq!(result.unwrap_err(), "fixture sandbox unavailable");
     assert_eq!(forge.proof_calls.load(Ordering::SeqCst), 1);
 }
