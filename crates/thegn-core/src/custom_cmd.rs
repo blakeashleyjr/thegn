@@ -2,7 +2,7 @@
 //! `git push {{.SelectedBranch.Name | quote}}` with dotted paths resolved
 //! against the current UI selection (and prompt responses collected first).
 //!
-//! Pure string → string; config parsing and execution live elsewhere. A
+//! Compiled commands keep argument data separate from trusted shell syntax. A
 //! referenced-but-missing value is a hard error, never a silent empty string —
 //! that's how people force-push the wrong branch.
 
@@ -53,6 +53,7 @@ pub enum TemplateError {
     UnknownFilter(String),
     /// Malformed placeholder: unterminated `{{`, empty body, non-dotted path.
     Syntax(String),
+    Policy(&'static str),
 }
 
 impl fmt::Display for TemplateError {
@@ -62,6 +63,7 @@ impl fmt::Display for TemplateError {
             Self::MissingValue(p) => write!(f, "no value for '{p}' in the current selection"),
             Self::UnknownFilter(x) => write!(f, "unknown template filter '{x}'"),
             Self::Syntax(m) => write!(f, "template syntax error: {m}"),
+            Self::Policy(m) => write!(f, "custom command: {m}"),
         }
     }
 }
@@ -75,7 +77,8 @@ impl std::error::Error for TemplateError {}
 /// including lone `{` / `}` (so `awk '{print $1}'` survives). The only filter
 /// is `quote` ([`crate::util::sh_quote`]). Unknown paths, missing selection
 /// values, unknown filters and malformed placeholders are all hard errors.
-pub fn expand(template: &str, ctx: &TemplateCtx) -> Result<String, TemplateError> {
+#[cfg(test)]
+fn expand(template: &str, ctx: &TemplateCtx) -> Result<String, TemplateError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -91,7 +94,13 @@ pub fn expand(template: &str, ctx: &TemplateCtx) -> Result<String, TemplateError
     Ok(out)
 }
 
+mod command;
+pub use command::{ExpandedCommand, compile, validate_commands};
+#[cfg(test)]
+mod command_tests;
+
 /// Evaluate one trimmed placeholder body: `.Dotted.Path [| filter]`.
+#[cfg(test)]
 fn eval_placeholder(body: &str, ctx: &TemplateCtx) -> Result<String, TemplateError> {
     if body.is_empty() {
         return Err(TemplateError::Syntax("empty placeholder".to_string()));

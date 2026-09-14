@@ -3210,7 +3210,7 @@ enum GitAfter {
     NewWorktree,
     /// Spawn this command into a fresh center tab (custom-command
     /// `output = "terminal"`).
-    Terminal(String),
+    Terminal(thegn_core::custom_cmd::ExpandedCommand),
     /// Open a file in the configured editor in a new center tab (used for
     /// conflict-file resolution — the user resolves markers, saves, then
     /// stages the file normally).
@@ -3328,12 +3328,12 @@ fn run_custom_command(
         return GitAfter::None;
     };
     let ctx = git_template_ctx(panel_ui, model, wires.session, prompts);
-    match thegn_core::custom_cmd::expand(&cmd.command, &ctx) {
+    match thegn_core::custom_cmd::compile(cmd, &ctx) {
         Ok(line) => match cmd.output {
             GitCmdOutput::Terminal => GitAfter::Terminal(line),
             out => {
                 enqueue_git_op(
-                    GitOp::Custom {
+                    GitOp::CustomTemplate {
                         command: line,
                         capture: out == GitCmdOutput::Popup,
                     },
@@ -4204,7 +4204,13 @@ fn handle_git_msg(
                     ov.custom_cmds.push(i);
                     pairs.push((
                         key,
-                        c.description.clone().unwrap_or_else(|| c.command.clone()),
+                        c.description.clone().unwrap_or_else(|| {
+                            if c.argv.is_empty() {
+                                c.command.clone()
+                            } else {
+                                c.argv[0].clone()
+                            }
+                        }),
                     ));
                 }
                 if pairs.is_empty() {
@@ -16416,11 +16422,12 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 }
                                 GitAfter::Terminal(cmd) => {
+                                    let argv = cmd.terminal_argv();
                                     let cwd = active_cwd(&session);
-                                    open_command_tab(
+                                    crate::actions::open_argv_tab(
                                         &mut session,
                                         &mut panes,
-                                        &cmd,
+                                        &argv,
                                         cwd.as_deref(),
                                         chrome.center,
                                     );
@@ -16499,11 +16506,12 @@ async fn event_loop<T: Terminal>(
                                         need_relayout = true;
                                     }
                                     GitAfter::Terminal(cmd) => {
+                                        let argv = cmd.terminal_argv();
                                         let cwd = active_cwd(&session);
-                                        open_command_tab(
+                                        crate::actions::open_argv_tab(
                                             &mut session,
                                             &mut panes,
-                                            &cmd,
+                                            &argv,
                                             cwd.as_deref(),
                                             chrome.center,
                                         );
@@ -17913,11 +17921,12 @@ async fn event_loop<T: Terminal>(
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
                         }
                         GitAfter::Terminal(cmd) => {
+                            let argv = cmd.terminal_argv();
                             let cwd = active_cwd(&session);
-                            open_command_tab(
+                            crate::actions::open_argv_tab(
                                 &mut session,
                                 &mut panes,
-                                &cmd,
+                                &argv,
                                 cwd.as_deref(),
                                 chrome.center,
                             );

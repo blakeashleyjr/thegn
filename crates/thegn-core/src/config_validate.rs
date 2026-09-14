@@ -103,6 +103,7 @@ fn validate_normalized(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            errs.extend(crate::custom_cmd::validate_commands(&cfg.git_commands));
             errs.extend(cfg.autopilot.validate("autopilot"));
             for (slug, ws) in &cfg.workspace {
                 errs.extend(

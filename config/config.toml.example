@@ -837,7 +837,10 @@ open_in = "auto"       # auto | pane | external — where the launch runs
 # [[git_commands]]
 # key = "P"                    # hotkey inside the custom-commands menu
 # context = "branches"         # commits | branches | files | stash | global
-# command = "git push --force-with-lease origin {{.SelectedBranch.Name | quote}}"
+# argv = ["git", "push", "--force-with-lease", "origin", "{{.SelectedBranch.Name}}"]
+# # Alternatively: command = "git push origin {{.SelectedBranch.Name}}"
+# # Shell placeholders require: template_policy = "safe"
+# # Keep each shell placeholder a complete unquoted argument.
 # description = "force-push selected branch"
 # output = "popup"             # none | popup | terminal
 # prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]

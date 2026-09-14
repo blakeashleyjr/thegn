@@ -17,7 +17,7 @@ pub trait CustomOps: GitBackend {
             .stdin(std::process::Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
-            .with_context(|| format!("run custom command: {command}"))?;
+            .context("run custom command")?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -26,6 +26,25 @@ pub trait CustomOps: GitBackend {
             bail!("command failed: {}", tail.join(" · "));
         }
         Ok(stdout)
+    }
+
+    /// Execute only a command admitted by the custom-template compiler.
+    fn run_custom_template(
+        &self,
+        loc: &GitLoc,
+        command: &thegn_core::custom_cmd::ExpandedCommand,
+    ) -> Result<String> {
+        let out = command
+            .command(loc)
+            .stdin(std::process::Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .context("run custom command")?;
+        if !out.status.success() {
+            // Child stderr may echo its arguments, including prompt secrets.
+            bail!("custom command failed ({})", out.status);
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
