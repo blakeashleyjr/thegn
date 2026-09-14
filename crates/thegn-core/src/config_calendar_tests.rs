@@ -460,3 +460,14 @@ fn calendar_display_labels_warn_without_rejecting_legacy_config() {
         toml::from_str("[[clocks]]\nzone = 'UTC'\nlabel = '👩‍💻 中文'\n").unwrap();
     assert!(display_warnings(&cfg).is_empty());
 }
+
+#[test]
+fn calendar_display_warns_for_trimmed_control_only_labels() {
+    let cfg: CalendarConfig =
+        toml::from_str("[[clocks]]\nzone = 'UTC'\nlabel = \"\\n\"\n").unwrap();
+    assert_eq!(display_warnings(&cfg).len(), 1);
+    assert!(
+        validate_calendar(&cfg).is_empty(),
+        "display warnings must not become errors"
+    );
+}
