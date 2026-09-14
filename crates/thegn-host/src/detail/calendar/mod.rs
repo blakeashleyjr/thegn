@@ -192,7 +192,7 @@ fn preferred_cols(docs: &CalendarDocs, weather_cols: usize) -> usize {
         .clocks
         .iter()
         .map(|c| {
-            let label = if c.label.is_empty() {
+            let label = if c.label.trim().is_empty() {
                 ResolvedClock::label_from_zone(c.zone)
             } else {
                 c.label.clone()

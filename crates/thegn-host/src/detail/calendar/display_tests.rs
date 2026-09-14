@@ -108,6 +108,23 @@ fn calendar_width_uses_the_same_sanitized_clock_label_as_drawing() {
 }
 
 #[test]
+fn calendar_width_and_clock_readings_share_whitespace_fallback() {
+    let mut docs = CalendarDocs::default();
+    docs.clocks.push(ResolvedClock {
+        label: "\n\r ".into(),
+        zone: "America/Argentina/ComodRivadavia".parse().unwrap(),
+        format: String::new(),
+        is_home: false,
+    });
+    let readings = thegn_core::calendar::read_clocks(&docs.clocks, chrono::Utc::now(), Tz::UTC);
+    let label = thegn_core::calendar::display::DisplayText::new(
+        &readings[0].label,
+        thegn_core::calendar::display::Field::ClockLabel,
+    );
+    assert_eq!(preferred_cols(&docs, 0), (label.cells() + 30).max(44));
+}
+
+#[test]
 fn calendar_display_sites_keep_the_safe_projection() {
     // Narrow cross-surface ratchet: raw values stay in domain state, while all
     // currently reachable untrusted calendar display sites name the policy.
