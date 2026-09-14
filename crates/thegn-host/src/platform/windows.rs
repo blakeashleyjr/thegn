@@ -212,6 +212,19 @@ pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Pin a CLI file identity while following ordinary executable symlinks.
+/// Metadata-only access does not consume bytes from a replaced special file.
+pub(crate) fn open_capability_identity(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().access_mode(0).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "capability identity is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Purpose-scoped directory identity open. BACKUP_SEMANTICS enables directory
 /// handles only here; ordinary file opens keep their existing security flags.
 /// Refuse all final-component reparse points, including directory junctions.

@@ -264,6 +264,22 @@ pub fn open_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Pin a CLI file identity while following ordinary executable symlinks.
+/// Reject replacement with a special file without blocking on FIFO input.
+pub(crate) fn open_capability_identity(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "capability identity is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Directory-identity opening for automatic cleanup; callers verify type.
 pub fn open_directory_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     open_nofollow(path)
@@ -495,3 +511,7 @@ mod perf_workloads_hydration;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "sandbox_floor_preflight_tests.rs"]
 mod sandbox_floor_preflight_tests;
+
+#[cfg(test)]
+#[path = "capability_identity_tests.rs"]
+mod capability_identity_tests;
