@@ -15,3 +15,10 @@
 - [ ] Integrate with THE-589 and pass the normal native delivery gate.
 
 No live cleanup, runtime mutation, or successful delivery is claimed here.
+
+## THE-594 actual resource-admission regression follow-up
+
+- [x] Obtain primary approval for private registry custody and a path-scoped explicit-teardown entry observer, all cfg(test).
+- [x] Add actual automatic-cleanup cases for projection, provider sync and both; retain exact queue/cache/refs/content and refuse before hooks.
+- [x] Add same-selection positive cleanup after registry release, custody unwind restoration, and worktree-selection change alongside workspace-selection coverage.
+- [ ] Run focused actual host tests and independent review; record exact results before closure.
