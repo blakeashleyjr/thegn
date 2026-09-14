@@ -209,6 +209,20 @@ pub fn frame_json(frame: &EventFrame) -> Value {
     value
 }
 
+fn parse_session_roster(v: Value) -> Result<Vec<SessionInfo>> {
+    let sessions: Vec<SessionInfo> = serde_json::from_value(
+        v.get("sessions")
+            .context("session roster is missing sessions")?
+            .clone(),
+    )
+    .context("invalid session roster")?;
+    anyhow::ensure!(
+        sessions.iter().all(|session| !session.id.is_empty()),
+        "session roster contains an empty identifier"
+    );
+    Ok(sessions)
+}
+
 impl ControlClient {
     pub fn new(addr: ControlAddr) -> Self {
         Self { addr }
@@ -270,9 +284,7 @@ impl ControlClient {
 
     pub async fn sessions(&self) -> Result<Vec<SessionInfo>> {
         let v = self.request("GET", "/v1/sessions", None).await?;
-        Ok(serde_json::from_value(
-            v.get("sessions").cloned().unwrap_or(Value::Array(vec![])),
-        )?)
+        parse_session_roster(v)
     }
 
     /// `GET /v1/worktrees` — the worktrees registered with the instance.
@@ -1198,6 +1210,33 @@ where
 mod tests {
     use super::*;
     use thegn_core::db::Db;
+
+    #[test]
+    fn authoritative_roster_rejects_missing_malformed_or_empty_identities() {
+        assert!(
+            parse_session_roster(serde_json::json!({"sessions": []}))
+                .unwrap()
+                .is_empty()
+        );
+        let session = SessionInfo {
+            id: "live".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_session_roster(serde_json::json!({"sessions": [session]}))
+                .unwrap()
+                .len(),
+            1
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"sessions": null}),
+            serde_json::json!({"sessions": [{}]}),
+            serde_json::json!({"sessions": [SessionInfo::default()]}),
+        ] {
+            assert!(parse_session_roster(invalid).is_err());
+        }
+    }
 
     #[test]
     fn remote_address_debug_redacts_the_bearer() {

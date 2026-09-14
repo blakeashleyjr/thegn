@@ -98,17 +98,20 @@ impl ExecSource for ProviderSource {
         rows: u16,
     ) -> BoxFuture<'a, Result<ExecSession>> {
         Box::pin(async move {
-            match self.iroh_override() {
-                Some(iroh) => {
-                    iroh.attach_exec(&self.sandbox_id, session, cols, rows)
-                        .await
-                }
-                None => {
-                    self.provider
-                        .attach_exec(&self.sandbox_id, session, cols, rows)
-                        .await
-                }
-            }
+            // Iroh streams never announce a persistent session id. A named id
+            // therefore belongs to the native provider, even if call-home
+            // connectivity changed since it was opened.
+            self.provider
+                .attach_exec(&self.sandbox_id, session, cols, rows)
+                .await
+        })
+    }
+
+    fn session_absent<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            self.provider
+                .exec_session_absent(&self.sandbox_id, session)
+                .await
         })
     }
 

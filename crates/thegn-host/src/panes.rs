@@ -547,6 +547,7 @@ impl Panes {
             // attach takes the scrollback tail even if another pane in this
             // process already attached the same session.
             attached_once: Default::default(),
+            last_client: Default::default(),
         });
         let id = self.next_id;
         self.next_id += 1;
