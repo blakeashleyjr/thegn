@@ -837,9 +837,104 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods)]
+    fn refinalized_result_oid_revokes_selected_cleanup_before_hooks() {
+        let isolation = crate::merge_lifecycle::TestIsolation::new();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let db_path = parent.join("private.db");
+        let db = Db::open_at(&db_path).unwrap();
+        let (root, wt) = fixture(&parent, "refinalized", &db, &isolation);
+        let selected = db.list_merge_queue().unwrap().remove(0);
+        let git = |args: &[&str]| {
+            let output = isolation
+                .git(&root)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        // Both results are real commits, and the old landed commit is still an
+        // ancestor of main. Git eligibility cannot mask the stale DB identity.
+        git(&[
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "private replacement result",
+        ]);
+        let replacement = git(&["rev-parse", "HEAD"]);
+        assert_ne!(Some(replacement.as_str()), selected.result_oid.as_deref());
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            writer
+                .execute(
+                    "UPDATE merge_queue SET result_oid=?1 WHERE worktree=?2",
+                    [replacement.as_str(), wt.to_str().unwrap()],
+                )
+                .unwrap(),
+            1
+        );
+        let mut expected = selected.clone();
+        expected.result_oid = Some(replacement);
+        assert_eq!(db.list_merge_queue().unwrap(), [expected.clone()]);
+        let before_refs = git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+        ]);
+        let marker = parent.join("unexpected-pre-destroy");
+        let mut cfg = local_config();
+        cfg.hooks.pre_destroy = vec![thegn_core::hooks::HookEntry::Command(format!(
+            "printf ran > {}",
+            util::sh_quote(marker.to_str().unwrap())
+        ))];
+        let outcome = crate::merge_lifecycle::remove_landed_with_config(
+            &cfg,
+            &db,
+            &root,
+            wt.to_str().unwrap(),
+            "feature",
+            "main",
+            selected.result_oid.as_deref(),
+            &selected,
+            true,
+        );
+        assert!(
+            matches!(outcome, crate::merge_lifecycle::CleanupOutcome::Refused { reason }
+            if reason.contains("selected landed queue entry changed"))
+        );
+        assert!(!marker.exists(), "stale selection reached pre_destroy");
+        assert_eq!(std::fs::read(wt.join("tracked")).unwrap(), b"keep\n");
+        assert_eq!(
+            git(&[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads"
+            ]),
+            before_refs
+        );
+        // Manual asynchronous clearing must respect the same stale selected
+        // value, even though status, branch, timestamps and location all match.
+        assert_eq!(clear_selected_landed(&db, &[selected]).unwrap(), 0);
+        assert_eq!(db.list_merge_queue().unwrap(), [expected]);
+    }
+
+    #[test]
     fn manual_clear_only_deletes_exact_selected_landed_rows() {
         let db = Db::open_memory().unwrap();
-        for wt in ["unchanged", "retried", "revoked"] {
+        for wt in ["unchanged", "retried", "revoked", "refinalized"] {
             db.enqueue_merge(wt, "feature", "main").unwrap();
             db.update_merge_status(wt, "landed", Some("fixture-oid"), None, None)
                 .unwrap();
@@ -848,11 +943,19 @@ mod tests {
         selected.extend(selected.clone()); // duplicate UI selection must not inflate success
         db.enqueue_merge("retried", "feature", "main").unwrap();
         db.remove_merge_entry("revoked").unwrap();
+        db.update_merge_status("refinalized", "landed", Some("new-result"), None, None)
+            .unwrap();
         assert_eq!(clear_selected_landed(&db, &selected).unwrap(), 1);
         let remaining = db.list_merge_queue().unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].worktree, "retried");
-        assert_eq!(remaining[0].status, "queued");
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|row| row.worktree == "retried" && row.status == "queued")
+        );
+        assert!(remaining.iter().any(|row| row.worktree == "refinalized"
+            && row.status == "landed"
+            && row.result_oid.as_deref() == Some("new-result")));
     }
 
     fn report(collected: &[&str], kept: &[&str]) -> SweepReport {
