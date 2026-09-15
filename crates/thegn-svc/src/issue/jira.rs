@@ -19,6 +19,8 @@ use futures_util::future::BoxFuture;
 pub struct JiraBackend {
     http: Option<TrackerHttpClient>,
     http_error: Option<&'static str>,
+    /// Configured instance URL, retained for provider-independent browse links.
+    base_url: String,
     project_key: Option<String>,
 }
 
@@ -55,6 +57,7 @@ impl JiraBackend {
         JiraBackend {
             http,
             http_error,
+            base_url,
             project_key,
         }
     }
