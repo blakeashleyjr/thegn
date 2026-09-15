@@ -532,6 +532,13 @@
       ]
     },
     {
+      "issue": "THE-598",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "preserve-winning-host-environment"
+      ]
+    },
+    {
       "issue": "THE-600",
       "project": "Runtime Security & Host Architecture",
       "changes": [
