@@ -68,6 +68,57 @@ impl GitHubIssuesBackend {
         }
         Ok(())
     }
+
+    /// Resolve the repository authority that this invocation actually asked
+    /// `gh` to use. A scoped filter is part of the invocation, and a later
+    /// configured `--repo` flag wins because it is appended later to argv.
+    /// Response URLs are checked against this admitted authority; they never
+    /// get to choose their own host.
+    fn effective_repo(&self, filter_repo: Option<&str>) -> Result<Option<String>, IssueError> {
+        self.validate_extra_flags()?;
+        let mut selected = filter_repo.map(str::to_owned);
+        let mut flags = self.extra_flags.iter();
+        while let Some(flag) = flags.next() {
+            if let Some(repo) = flag
+                .strip_prefix("--repo=")
+                .or_else(|| flag.strip_prefix("-R="))
+            {
+                selected = Some(repo.to_owned());
+            } else if flag == "--repo" || flag == "-R" {
+                selected = Some(
+                    flags
+                        .next()
+                        .ok_or_else(|| {
+                            IssueError::Parse("GitHub --repo/-R flag requires owner/repo".into())
+                        })?
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(repo) = selected.as_deref() {
+            super::identity::github_repo(repo).map_err(IssueError::Parse)?;
+        }
+        Ok(selected)
+    }
+
+    fn effective_host(&self, filter_repo: Option<&str>) -> Result<Option<String>, IssueError> {
+        let repo = self.effective_repo(filter_repo)?;
+        self.host_for_repo(repo.as_deref())
+    }
+
+    fn host_for_repo(&self, repo: Option<&str>) -> Result<Option<String>, IssueError> {
+        if let Some(repo) = repo {
+            let parts: Vec<&str> = repo.split('/').collect();
+            if let [host, _, _] = parts.as_slice() {
+                return Ok(Some((*host).to_owned()));
+            }
+        }
+        let host = std::env::var("GH_HOST").ok().filter(|h| !h.is_empty());
+        if let Some(host) = host.as_deref() {
+            super::identity::github_host_for_url(host).map_err(IssueError::Parse)?;
+        }
+        Ok(host)
+    }
 }
 
 // ---- JSON shapes from `gh issue list --json` --------------------------------
@@ -130,12 +181,12 @@ fn issue_repo_number_from_url(
         Ok(parsed) => parsed,
         Err(_) => return None,
     };
+    // Query and fragment are part of a public browse URL; they do not
+    // change the admitted authority or repository path.
     if !matches!(parsed.scheme(), "https" | "http")
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.port().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
     {
         return None;
     }
@@ -170,12 +221,11 @@ fn repo_from_url_with_host(url: &str, configured_host: Option<&str>) -> Option<S
     issue_repo_number_from_url(url, configured_host).map(|(repo, _)| repo)
 }
 
-fn validated_repo_number_from_url(url: &str) -> Result<(String, String), IssueError> {
-    let configured = match std::env::var("GH_HOST") {
-        Ok(host) => Some(host),
-        Err(_) => None,
-    };
-    issue_repo_number_from_url(url, configured.as_deref()).ok_or_else(|| {
+fn validated_repo_number_from_url(
+    url: &str,
+    expected_host: Option<&str>,
+) -> Result<(String, String), IssueError> {
+    issue_repo_number_from_url(url, expected_host).ok_or_else(|| {
         IssueError::Parse("GitHub issue URL is not a valid configured host/repo issue route".into())
     })
 }
@@ -197,14 +247,6 @@ fn split_id(id: &str) -> Result<(Option<&str>, &str), IssueError> {
             Ok((None, body))
         }
     }
-}
-
-fn gh_issue_to_domain(gi: GhIssue) -> Result<Issue, IssueError> {
-    let configured = match std::env::var("GH_HOST") {
-        Ok(host) => Some(host),
-        Err(_) => None,
-    };
-    gh_issue_to_domain_with_host(gi, configured.as_deref())
 }
 
 fn gh_issue_to_domain_with_host(
@@ -291,7 +333,11 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            issues.into_iter().map(gh_issue_to_domain).collect()
+            let expected_host = self.effective_host(filter.repo.as_deref())?;
+            issues
+                .into_iter()
+                .map(|issue| gh_issue_to_domain_with_host(issue, expected_host.as_deref()))
+                .collect()
         })
     }
 
@@ -319,6 +365,7 @@ impl IssueBackend for GitHubIssuesBackend {
             }
             let detail: GhIssueDetail =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
+            let expected_host = self.host_for_repo(repo)?;
             let comments = detail
                 .comments
                 .into_iter()
@@ -332,7 +379,7 @@ impl IssueBackend for GitHubIssuesBackend {
                 })
                 .collect();
             Ok(IssueDetail {
-                issue: gh_issue_to_domain(detail.issue)?,
+                issue: gh_issue_to_domain_with_host(detail.issue, expected_host.as_deref())?,
                 comments,
             })
         })
@@ -355,7 +402,8 @@ impl IssueBackend for GitHubIssuesBackend {
             // authority for the follow-up view; never downgrade malformed
             // output to a bare number or the process cwd.
             let url = self.gh(&args)?.trim().to_string();
-            let (repo, number) = validated_repo_number_from_url(&url)?;
+            let expected_host = self.host_for_repo(None)?;
+            let (repo, number) = validated_repo_number_from_url(&url, expected_host.as_deref())?;
             let json = self.gh(&[
                 "issue",
                 "view",
@@ -367,7 +415,7 @@ impl IssueBackend for GitHubIssuesBackend {
             ])?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(gh_issue_to_domain(gi)?)
+            Ok(gh_issue_to_domain_with_host(gi, expected_host.as_deref())?)
         })
     }
 
@@ -410,7 +458,8 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(gh_issue_to_domain(gi)?)
+            let expected_host = self.host_for_repo(repo)?;
+            Ok(gh_issue_to_domain_with_host(gi, expected_host.as_deref())?)
         })
     }
 
@@ -439,7 +488,11 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            issues.into_iter().map(gh_issue_to_domain).collect()
+            let expected_host = self.effective_host(None)?;
+            issues
+                .into_iter()
+                .map(|issue| gh_issue_to_domain_with_host(issue, expected_host.as_deref()))
+                .collect()
         })
     }
 }
@@ -517,8 +570,11 @@ mod tests {
             None
         );
         assert_eq!(
-            repo_from_url_with_host("https://github.com/o/r/issues/1?x=1", Some("github.com")),
-            None
+            repo_from_url_with_host(
+                "https://github.com/o/r/issues/1?x=1#comment",
+                Some("github.com")
+            ),
+            Some("o/r".into())
         );
         assert_eq!(
             repo_from_url_with_host("https://github.com/o/r/tree/1", Some("github.com")),
@@ -532,6 +588,43 @@ mod tests {
             repo_from_url_with_host("https://ghe.example/o//r/issues/1", Some("ghe.example")),
             None
         );
+    }
+
+    #[test]
+    fn explicit_enterprise_scope_admits_response_without_ambient_gh_host() {
+        let backend = GitHubIssuesBackend::new(vec!["--repo".into(), "ghe.example/o/r".into()]);
+        assert_eq!(
+            backend.effective_host(None).unwrap().as_deref(),
+            Some("ghe.example")
+        );
+        let unconfigured = GitHubIssuesBackend::new(Vec::new());
+        assert_eq!(
+            unconfigured
+                .effective_host(Some("ghe.example/o/r"))
+                .unwrap(),
+            Some("ghe.example".into())
+        );
+        assert_eq!(
+            unconfigured.host_for_repo(Some("ghe.example/o/r")).unwrap(),
+            Some("ghe.example".into())
+        );
+        let gi: GhIssue = serde_json::from_value(json!({
+            "number": 7,
+            "title": "enterprise",
+            "state": "OPEN",
+            "url": "https://ghe.example/o/r/issues/7?view=full#top"
+        }))
+        .unwrap();
+        let issue = gh_issue_to_domain_with_host(gi, Some("ghe.example")).unwrap();
+        assert_eq!(issue.id, "github:ghe.example/o/r#7");
+        let wrong: GhIssue = serde_json::from_value(json!({
+            "number": 7,
+            "title": "wrong host",
+            "state": "OPEN",
+            "url": "https://github.com/o/r/issues/7"
+        }))
+        .unwrap();
+        assert!(gh_issue_to_domain_with_host(wrong, Some("ghe.example")).is_err());
     }
 
     #[test]

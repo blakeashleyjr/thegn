@@ -51,7 +51,9 @@ pub(crate) fn issue_backends() -> Vec<(String, Box<dyn IssueBackend>)> {
 /// Append every registered plugin issue provider to `router`.
 pub(crate) fn extend_issue_router(router: &mut thegn_svc::issue::IssueRouter) {
     for (account, backend) in issue_backends() {
-        router.push_backend(account, backend);
+        if let Err(error) = router.push_backend(account, backend) {
+            tracing::warn!(error = %error, "rejecting invalid issue provider registration");
+        }
     }
 }
 

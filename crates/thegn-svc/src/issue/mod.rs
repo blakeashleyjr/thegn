@@ -117,7 +117,7 @@ pub fn validate_issue_id(id: &str) -> Result<(), IssueError> {
         let (plugin_id, key) = rest.split_once(':').ok_or_else(|| {
             IssueError::Parse("plugin issue id must use plugin:<namespace>:<key>".into())
         })?;
-        identity::builtin_segment(plugin_id, "plugin namespace").map_err(IssueError::Parse)?;
+        identity::plugin_namespace(plugin_id).map_err(IssueError::Parse)?;
         identity::plugin_key(key).map_err(IssueError::Parse)?;
         return Ok(());
     }
@@ -162,8 +162,6 @@ fn validate_public_url(url: &str) -> Result<(), IssueError> {
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
     {
         return Err(IssueError::Parse(
             "issue URL has an invalid public authority".into(),
@@ -185,8 +183,7 @@ pub fn validate_control_issue_id(id: &str) -> Result<(), IssueError> {
 
 pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
     if let Some(plugin_namespace) = issue.provider.strip_prefix("plugin:") {
-        identity::builtin_segment(plugin_namespace, "plugin namespace")
-            .map_err(IssueError::Parse)?;
+        identity::plugin_namespace(plugin_namespace).map_err(IssueError::Parse)?;
     }
     let expected = format!("{}:", issue.provider);
     if !issue.id.starts_with(&expected) {
@@ -390,8 +387,21 @@ pub struct IssueRouter {
 impl IssueRouter {
     /// Append a dynamically-provided backend (provider-as-plugin): `account`
     /// labels its rows like a configured account's name would.
-    pub fn push_backend(&mut self, account: String, inner: Box<dyn IssueBackend>) {
+    pub fn push_backend(
+        &mut self,
+        account: String,
+        inner: Box<dyn IssueBackend>,
+    ) -> Result<(), IssueError> {
+        if let Some(namespace) = inner.provider_id().strip_prefix("plugin:") {
+            identity::plugin_namespace(namespace).map_err(IssueError::Parse)?;
+        }
+        if inner.provider_id().is_empty()
+            || inner.provider_id().contains(':') && !inner.provider_id().starts_with("plugin:")
+        {
+            return Err(IssueError::Parse("invalid issue provider namespace".into()));
+        }
         self.inner.push(AccountBackend { account, inner });
+        Ok(())
     }
 
     pub fn from_config(cfg: &IssuesConfig) -> Self {
@@ -874,12 +884,18 @@ mod spec {
     #[test]
     fn plugin_namespace_routes_by_complete_registered_prefix() {
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
-        router.push_backend("demo".into(), Box::new(PluginMarker { id: "plugin:demo" }));
-        router.push_backend(
-            "nested".into(),
-            Box::new(PluginMarker {
-                id: "plugin:demo:extra",
-            }),
+        router
+            .push_backend("demo".into(), Box::new(PluginMarker { id: "plugin:demo" }))
+            .unwrap();
+        assert!(
+            router
+                .push_backend(
+                    "nested".into(),
+                    Box::new(PluginMarker {
+                        id: "plugin:demo:extra",
+                    }),
+                )
+                .is_err()
         );
         assert_eq!(
             router
@@ -889,9 +905,9 @@ mod spec {
         );
         assert_eq!(
             router
-                .backend_for_id("plugin:demo:extra:key")
+                .backend_for_id("plugin:demo:opaque:key")
                 .map(|b| b.provider_id()),
-            Some("plugin:demo:extra")
+            Some("plugin:demo")
         );
         assert!(router.backend_for_id("plugin:other:opaque").is_none());
         assert!(validate_control_issue_id("plugin:demo:opaque/key#7").is_ok());
@@ -901,12 +917,14 @@ mod spec {
     fn malformed_control_id_reaches_no_fake_provider_effect() {
         let updates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
-        router.push_backend(
-            "fake".into(),
-            Box::new(CountingBackend {
-                updates: updates.clone(),
-            }),
-        );
+        router
+            .push_backend(
+                "fake".into(),
+                Box::new(CountingBackend {
+                    updates: updates.clone(),
+                }),
+            )
+            .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -931,18 +949,22 @@ mod spec {
         let first = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
-        router.push_backend(
-            "first".into(),
-            Box::new(CountingBackend {
-                updates: first.clone(),
-            }),
-        );
-        router.push_backend(
-            "second".into(),
-            Box::new(CountingBackend {
-                updates: second.clone(),
-            }),
-        );
+        router
+            .push_backend(
+                "first".into(),
+                Box::new(CountingBackend {
+                    updates: first.clone(),
+                }),
+            )
+            .unwrap();
+        router
+            .push_backend(
+                "second".into(),
+                Box::new(CountingBackend {
+                    updates: second.clone(),
+                }),
+            )
+            .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -985,6 +1007,8 @@ mod spec {
         issue.blocked_by.clear();
         issue.url = "https://user:password@example.com/issue/42".into();
         assert!(validate_issue_identity(&issue).is_err());
+        issue.url = "https://kaneo.example/dashboard/project/p1/board?task=t1#focus".into();
+        assert!(validate_issue_identity(&issue).is_ok());
         issue.url.clear();
         issue.id = "github:owner/repo#0".into();
         assert!(validate_issue_identity(&issue).is_err());
