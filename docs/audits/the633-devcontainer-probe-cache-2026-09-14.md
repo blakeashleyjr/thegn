@@ -1,32 +1,55 @@
 # THE-633: demand-only devcontainer capability probes
 
-Candidate source is in the isolated maintenance acceptance worktree, based on main `7014a496`. This report records source scope and pending gates; it does not claim tests have run.
+This standalone candidate is based on canonical `59a9c944` (which already
+contains the landed THE617 floor extraction). It applies only the THE633
+component from `774f3d78536387b6f103ad76311259448f12ce07`, followed by the
+test-only Nix fixture corrections `ae68f518f0cbe04d01fb7b33a5780235ef33d948`
+and `53d9a0c6f5fe8ca402497f7fc38cca52dcb30457`. No THE639 startup, monitor,
+renderer, sampler, or unrelated performance implementation is included.
 
-`hydrate::collect_sidebar_status` previously invoked `devcontainer_provider::probe` before examining any worktree. The existing controlled actual `build_model` workload records nine immediate fake-helper executions for nine unrelated hydration samples. The repair asks the existing status classifier to request a capability report lazily, then memoizes it within that build and uses a bounded demand-only cache across builds.
+The repair makes capability probing demand-driven through the existing status
+classifier, then uses a bounded, generation-fenced single-flight cache keyed
+by executable identity, cwd, environment and relevant configuration. It
+retains truthful selection/refusal precedence, separate ready/failure expiry,
+changed-input and ABA invalidation, waiter re-observation, and bounded input
+capture. The capability lane has independent retained subprocess custody and
+does not consume Git's lane budget. Unix and Windows identity helpers validate
+the selected executable safely; the Windows source is included but no Windows
+native execution is claimed here.
 
-The cache uses the actual inherited command environment, cwd and executable identity. It retains only a digest of environment values, follows ordinary executable symlinks, validates the opened descriptor as regular, and rejects oversized or unverifiable input snapshots. Ready results expire after 30 seconds; unavailable/degraded results after 5 seconds. Installation, PATH/input changes and replacement trigger fresh discovery without waiting for TTL. Generation tokens refuse stale and A→B→A completion, and Condvar waiters recapture their own inputs. There is no timer or detached cache producer.
+The selected test boundary is the 19 exact probe/cache/provider/identity
+selectors recorded in `the633-2026-09-15/native-pass-excerpt.log`. The
+supplied combined05 full receipt identifies source
+`33c0db71a3efd91a5637be47fd2d353fd628056a`, reports 8465/8465 passed and 26
+skipped, and contains all 19 lines. The receipt is copied into that evidence
+directory with its original SHA-256; the compact excerpt preserves the exact
+pass ordinals without copying the full log.
 
-Capability capture shares the existing private bounded engine with Git, but has a separate one-slot counter and retained reaper/queue, a maximum of two seconds and 16 KiB per stream. Git keeps two slots, 15 seconds, 2 MiB per stream and its original nonzero-refusal policy. The capability layer returns the real status plus both output streams so the provider preserves nonzero version diagnostics. Late readers/children retain their lane budget; a blocked capability reaper cannot block Git reaping.
+The existing actual `build_model` fixture records nine helper calls for each
+helper-present nine-build sequence before the demand gate and zero afterward
+at 1, 8 and 32 private worktrees. The candidate keeps the four-line
+`probes == 0` acceptance assertion for this existing fixture. The retained
+measurement has a qualified hydration-only interpretation: it demonstrates
+removal of unrelated probes, carries the original timing flags and repeat
+disposition, and makes no release-speed, equivalent-performance, or
+whole-application claim. This candidate does not rerun the ignored workload.
 
-Source revisions from review:
+The source-hash manifest proves byte identity of all 17 selected component
+files against the final tested05 fixture source. The only metadata additions
+are the reciprocal THE633 `delivery/index.json` and `delivery/issues.json`
+records; no THE639 record is added. OpenSpec design, proposal, spec and task
+files remain scoped to the cache change. The task record intentionally retains
+native/current-graph and landing work as pending for root's final evidence
+readback.
 
-- Independent review found `same_file::Handle::from_path` could block on a FIFO swapped after `is_file`. Platform identity opening now uses Unix nonblocking flags (Windows metadata-only access) and descriptor regular-file validation before conversion. The FIFO fixture includes an owned rescue descriptor so the counterfactual blocking implementation fails without stranding its reader.
-- The provider's entire lazy refusal precedence stays in the original classifier; source trust, non-source pending requests, user-pinned source, sandbox policy, blocked substitutions and recognized field disposition are not duplicated in cache code.
-- Cache-key construction has explicit entry/count/aggregate/path bounds. Standard-library environment snapshot allocation and OS filesystem latency are not hard realtime guarantees.
-- Admission tests assert exact refusal categories, preventing ordinary spawn failure from satisfying an invalid-policy test accidentally.
-- A native premise review found this Nix host has no `/bin/sleep`. The follow-up fixture repair resolves `sh` and `sleep` from the initial test PATH, validates their resolved regular-file targets while preserving absolute invocation paths, and passes sleep as a positional argument to the private shell. Preserving the basename matters because Nix `sleep` resolves to the multicall `coreutils` executable. The first integrated native run passed 152/153 selected tests; the hung-helper fixture exposed this invocation defect and its corrected timeout assertion still needs execution. Missing required tools fail supported Unix tests explicitly; non-Unix builds do not register the POSIX-only fixtures. Independent stdout/stderr overflow coverage has its own test and does not require sleep. No native result is claimed from the earlier silent-return cases.
+The durable evidence directory is `docs/audits/the633-2026-09-15/` and
+contains the source hashes, full receipt copy, 19-line pass excerpt, and
+qualified hydration count record. This private candidate was prepared with
+source checks only; no Cargo/build/native/performance/provider process was
+run, and the canonical checkout was not edited.
 
-Regression fixtures added, execution pending:
-
-- Seven cache tests cover precise TTL edges, unavailable→installed, changed environment/cwd/PATH, equal-size/equal-mtime replacement while the old handle is pinned, actual Condvar coalescing, waiter reobservation, stale and ABA completion, unwind/poison recovery and bounded input refusal.
-- One POSIX fixture runs the actual cache→captured environment/cwd→provider→bounded subprocess path. It proves one invocation across repeated demand and preserves nonzero status/version diagnostics.
-- Two classifier tests cover no selection, disabled/uncontained, malformed/ambiguous selection, source/non-source approvals, source precedence, sandbox policy, blocked environment expansion, refused/reserved/unknown fields and the eligible positive control.
-- Seven capture tests cover exact pre-spawn admission categories, fixed lane limits, full nonzero stdout/stderr, each stream's overflow, a hung owned child, retained inherited-pipe capacity while Git still captures, and a blocked capability reaper while Git reaping completes.
-- Two Unix identity tests cover FIFO replacement refusal and an ordinary executable symlink positive control.
-- The existing ignored `platform::unix::perf_workloads_hydration::controlled_full_hydration_workload` now asserts zero probes for its unrelated worktrees. Run the same release workload at `THEGN_AUDIT_WORKTREES=1`, `8`, and `32`, serialized with process-sampler measurements. It creates private Git/DB fixtures and a private PATH containing git/sh plus an optional immediate fake devcontainer; no real provider is invoked. HOME is never changed. This proves owned fixture behavior, not absence of every possible read of host-home configuration.
-
-Pending landing gates: actual host fixture compilation/execution, existing Git and provider regression tests, final primary/independent review, controlled before/after measurements, and integrated configured/lint gates. Native Windows and Darwin execution are not established by Linux tests; any cross-check must be reported separately.
-
-Remaining scope: this cache is diagnostic coherence, not atomic executable attestation against hostile same-UID modification. In-place changes that restore identity metadata can remain undetected until a later demanded TTL refresh. OS spawn/filesystem calls themselves are not interruptible.
-
-[THE-639](https://linear.app/blakeashley/issue/THE-639/bound-devcontainer-startup-output-and-retain-child-ownership-through) tracks the separate startup/up capture and custody defect. In `devcontainer_provider.rs`, `CliProvider::start` still calls `run_bounded` (currently line 526); that helper (currently line 667) waits for exit before `read_to_end`, has no output limit, and performs a blocking wait on timeout. Those lifecycle operations are deliberately outside THE-633's version-probe repair.
+Remaining limits are explicit: the cache is diagnostic coherence rather than
+atomic hostile same-UID executable attestation, in-place identity restoration
+can remain undetected until a later demanded refresh, and Linux evidence does
+not establish Windows or Darwin runtime behavior. Root owns final current
+graph, native, lint, landing and closure decisions.

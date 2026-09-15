@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "issue": "THE-633",
+  "candidate_base": "59a9c944bcc94107ded859932864ffaf9be1ffb3",
+  "candidate_commit_pending": true,
+  "component_commits": {
+    "production_and_initial_tests": "774f3d78536387b6f103ad76311259448f12ce07",
+    "final_fixture_extraction": "ae68f518f0cbe04d01fb7b33a5780235ef33d948",
+    "final_fixture_nix_invocation": "53d9a0c6f5fe8ca402497f7fc38cca52dcb30457",
+    "delivery_hunk_source": "1b05e78283bc6a15189356fe31e1690c38a66f34"
+  },
+  "scope": "Standalone THE633 cache/probe extraction; no THE639 startup, monitor, renderer, sampler, or unrelated performance implementation",
+  "source_hash_manifest": "source-hashes.json",
+  "source_files_byte_identical_to_tested05_final": 17,
+  "source_files_compared": 17,
+  "durable_files": [
+    {
+      "path": "thegn-maintenance05-combined-full-native-receipt-20260915.json",
+      "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310"
+    },
+    {
+      "path": "native-pass-excerpt.log",
+      "sha256": "d4ea948cdd83966b8247aa5edeabb0547adac8b5806c14d32842a2eb5947fa44",
+      "line_count": 19,
+      "note": "Exact lines extracted from the supplied full log."
+    },
+    {
+      "path": "source-hashes.json",
+      "note": "Candidate and tested05 final source SHA-256 pairs for all selected component files."
+    },
+    {
+      "path": "hydration-probe-count-evidence.md",
+      "note": "Qualified historical actual build_model 9-to-0 helper-call evidence; no new performance claim."
+    }
+  ],
+  "full_native_evidence": {
+    "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "log": "/tmp/thegn-maintenance05-combined-full-native-20260915.log",
+    "log_sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
+    "receipt": "/tmp/thegn-maintenance05-combined-full-native-receipt-20260915.json",
+    "receipt_sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310",
+    "tests_run": 8465,
+    "passed": 8465,
+    "skipped": 26,
+    "the633_exact_selectors": 19
+  },
+  "hydration_measurement": {
+    "baseline_helper_present_calls": {"1": 9, "8": 9, "32": 9},
+    "candidate_helper_present_calls": {"1": 0, "8": 0, "32": 0},
+    "fixture": "actual build_model with private Git/DB fixtures",
+    "performance_run_in_this_candidate": false,
+    "release_speed_claim": false,
+    "independent_review": "/tmp/thegn-batch03-hydration-performance-review-20260914.md",
+    "independent_review_sha256": "359ef8afe85a71e2beecc673a7cfe39f3c9c46f6b9a910e45ccc3c39bddc8780"
+  },
+  "source_only_preparation": {
+    "cargo_or_build_run": false,
+    "native_test_run": false,
+    "performance_workload_run": false,
+    "canonical_checkout_edited": false,
+    "provider_or_real_container_started": false,
+    "status": "private_candidate_ready_for_root_review"
+  }
+}

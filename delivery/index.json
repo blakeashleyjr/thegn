@@ -582,6 +582,18 @@
       "summary": "Bound and amortize shared framed decoding and close failed transports coherently."
     },
     {
+      "change": "cache-demanded-devcontainer-probes",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-633",
+          "project": "Workspace Product & Observability"
+        }
+      ],
+      "summary": "Demand-gated bounded capability capture and coherent single-flight cache implemented; native regression and release hydration evidence remain pending."
+    },
+    {
       "change": "complete-devcontainer-support",
       "lifecycle": "active",
       "disposition": "verification-gated",
