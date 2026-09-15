@@ -244,6 +244,9 @@ mod sprite_bridge;
 mod ssh_shim;
 mod stage_prompt;
 mod startup_heal;
+// THE-603 is an unwired capture primitive; THE-592 owns future startup admission.
+#[allow(dead_code)]
+mod state_host_capture;
 mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;

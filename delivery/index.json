@@ -1095,6 +1095,18 @@
       "delivered_at": "2026-09-15"
     },
     {
+      "change": "strict-state-host-capture",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-603",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Unwired strict WAL capture with retained absence witnesses, orphan-sidecar refusal and owned permission/race fixtures. Current source review and native/lint gates remain pending; THE-592 owns launch-authority integration."
+    },
+    {
       "change": "verify-gate-workspace",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
