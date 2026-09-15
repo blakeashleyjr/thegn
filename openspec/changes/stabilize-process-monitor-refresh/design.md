@@ -9,7 +9,10 @@ swap; do not re-seed it from stale arbitrary model copies. Existing config
 Apply PID tie-breaks inside both top-N CPU and RSS admission comparisons. Applying
 them only when sorting visible rows is too late to stabilize cutoff membership.
 The union remains bounded to at most twice the configured retained count. Flat
-and tree views use the same deterministic PID secondary ordering.
+and tree views use the same deterministic PID secondary ordering. The view
+comparator returns ordinary ascending order for CPU, RSS, Name, and PID; one
+shared desc reversal then gives every key the same displayed direction. Name
+keeps the existing lexical String ordering and does not add case folding.
 
 Use sampled `(pid, start_time)` identity when a passive refresh rebuilds the
 process rows. Preserve the selected process if still retained; otherwise retain

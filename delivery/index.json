@@ -1073,9 +1073,13 @@
         {
           "issue": "THE-628",
           "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-640",
+          "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Preserve process snapshots, deterministic row order and sampled selection identity across refreshes."
+      "summary": "Preserve process snapshots, deterministic row order and sampled selection identity across refreshes; align every process sort with its displayed direction."
     },
     {
       "change": "verify-gate-workspace",
