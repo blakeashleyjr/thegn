@@ -24,8 +24,8 @@ provider/phase/status policy fields only; credentials, query values, and
 arbitrary response text are not copied into diagnostics.
 
 Explicitly configured self-hosted HTTP origins, including LAN origins, remain
-supported. Unsupported schemes, credentials, paths, queries, fragments, and
-origin escapes are refused. Future cancellation is carried by dropping the
+supported, including configured base paths. Unsupported schemes, URL userinfo,
+base-URL queries/fragments, and request origin or base-path escapes are refused. Future cancellation is carried by dropping the
 owned provider future; no detached body or decode task is introduced.
 
 ## Scope
