@@ -29,7 +29,6 @@ identity/attempt preservation, full OID panel equality, truthful summary severit
 and a bounded held-admission path with one attempt and zero agent execution.
 Existing authenticated provider-source refusal assertions remain intact.
 
-
 ## THE-219 retry-progress acceptance follow-up
 
 The neighboring-edge audit is `docs/audits/THE-219-retry-progress.md`. There is
