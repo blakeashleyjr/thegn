@@ -13,128 +13,100 @@
 //! target [`IssueStatus`] is resolved back to a concrete column slug for the
 //! task's project (see `resolve_status_slug`).
 
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thegn_core::issue::{
     Issue, IssueComment, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssuePriority,
     IssueStatus,
 };
 
+use super::http::{TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation};
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
 pub struct KaneoBackend {
-    client: Client,
-    /// Origin without a trailing slash and without the `/api` suffix.
+    http: Option<TrackerHttpClient>,
+    http_error: Option<&'static str>,
+    /// Origin without a trailing slash, retained for issue permalink output.
     base_url: String,
-    api_key: String,
     workspace_id: Option<String>,
     project_id: Option<String>,
 }
 
 impl KaneoBackend {
-    pub fn new(
+    pub(crate) fn new(
         base_url: String,
         api_key: String,
         workspace_id: Option<String>,
         project_id: Option<String>,
+        budget: std::sync::Arc<TrackerHttpBudget>,
     ) -> Self {
+        let authorization = format!("Bearer {api_key}");
+        let (http, http_error) =
+            match TrackerHttpClient::new("kaneo", &base_url, authorization, budget) {
+                Ok(http) => (Some(http), None),
+                Err(IssueError::Policy(message)) => (None, Some(message)),
+                Err(_) => (None, Some("tracker HTTP client configuration failed")),
+            };
         KaneoBackend {
-            // Bounded timeouts: a stalled tracker must not pin a background
-            // permit forever (mirrors gh.rs's OCTOCRAB_REQUEST_TIMEOUT). Falls
-            // back to the default client if the builder somehow fails.
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
+            http,
+            http_error,
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
             workspace_id: workspace_id.filter(|s| !s.is_empty()),
             project_id: project_id.filter(|s| !s.is_empty()),
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}/api/{}", self.base_url, path.trim_start_matches('/'))
+    fn http(&self) -> Result<&TrackerHttpClient, IssueError> {
+        self.http.as_ref().ok_or_else(|| {
+            IssueError::Policy(self.http_error.unwrap_or("tracker HTTP origin refused"))
+        })
     }
 
-    async fn get<R: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<R, IssueError> {
-        let resp = self
-            .client
-            .get(self.url(path))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-        if resp.status() == 401 || resp.status() == 403 {
-            return Err(IssueError::Auth(format!("Kaneo HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            return Err(IssueError::Api(format!("Kaneo HTTP {}", resp.status())));
-        }
-        resp.json()
+    async fn get<R: for<'de> Deserialize<'de>>(
+        op: &mut TrackerHttpOperation<'_>,
+        path: &str,
+    ) -> Result<R, IssueError> {
+        op.get(&format!("/api/{}", path.trim_start_matches('/')))
             .await
-            .map_err(|e| IssueError::Parse(e.to_string()))
     }
 
     async fn send_body<B: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
+        op: &mut TrackerHttpOperation<'_>,
         method: reqwest::Method,
         path: &str,
         body: &B,
     ) -> Result<R, IssueError> {
-        let resp = self
-            .client
-            .request(method, self.url(path))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(body)
-            .send()
-            .await?;
-        if resp.status() == 401 || resp.status() == 403 {
-            return Err(IssueError::Auth(format!("Kaneo HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(IssueError::Api(format!("Kaneo {path}: {txt}")));
-        }
-        resp.json()
-            .await
-            .map_err(|e| IssueError::Parse(e.to_string()))
+        op.json(
+            method,
+            &format!("/api/{}", path.trim_start_matches('/')),
+            body,
+        )
+        .await
     }
 
-    async fn delete_req(&self, path: &str) -> Result<(), IssueError> {
-        let resp = self
-            .client
-            .delete(self.url(path))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-        if resp.status() == 401 || resp.status() == 403 {
-            return Err(IssueError::Auth(format!("Kaneo HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(IssueError::Api(format!("Kaneo DELETE {path}: {txt}")));
-        }
-        Ok(())
+    async fn delete_req(op: &mut TrackerHttpOperation<'_>, path: &str) -> Result<(), IssueError> {
+        op.empty(
+            reqwest::Method::DELETE,
+            &format!("/api/{}", path.trim_start_matches('/')),
+        )
+        .await
     }
 
     /// Best-effort resolve of the authenticated user's id, so `assignee_me` can
     /// narrow via the `assigneeId` query param. Works for session / device-flow
     /// tokens (`/auth/get-session` returns a user); under API-key auth the
     /// session is null and we return `None` (⇒ no assignee narrowing).
-    async fn current_user_id(&self) -> Option<String> {
-        let session: SessionResp = self.get("auth/get-session").await.ok()?;
+    async fn current_user_id(&self, op: &mut TrackerHttpOperation<'_>) -> Option<String> {
+        let session: SessionResp = Self::get(op, "auth/get-session").await.ok()?;
         session.user.map(|u| u.id)
     }
 
     /// The project ids to scan: the single configured project, else every
     /// project in the configured workspace. Empty when neither is configured.
-    async fn scope_project_ids(&self) -> Result<Vec<String>, IssueError> {
+    async fn scope_project_ids(
+        &self,
+        op: &mut TrackerHttpOperation<'_>,
+    ) -> Result<Vec<String>, IssueError> {
         if let Some(pid) = &self.project_id {
             return Ok(vec![pid.clone()]);
         }
@@ -144,7 +116,8 @@ impl KaneoBackend {
             // error (the panel then shows this account as empty).
             return Ok(Vec::new());
         };
-        let projects: Vec<KaneoProject> = self.get(&format!("project?workspaceId={ws}")).await?;
+        let projects: Vec<KaneoProject> =
+            Self::get(op, &format!("project?workspaceId={ws}")).await?;
         Ok(projects.into_iter().map(|p| p.id).collect())
     }
 
@@ -152,6 +125,7 @@ impl KaneoBackend {
     /// each with the status derived from its column (`isFinal` + name).
     async fn project_issues(
         &self,
+        op: &mut TrackerHttpOperation<'_>,
         project_id: &str,
         assignee_id: Option<&str>,
         limit: usize,
@@ -160,7 +134,7 @@ impl KaneoBackend {
         if let Some(uid) = assignee_id {
             path.push_str(&format!("&assigneeId={uid}"));
         }
-        let board: BoardResp = self.get(&path).await?;
+        let board: BoardResp = Self::get(op, &path).await?;
         let mut out = Vec::new();
         for col in board.data.columns {
             let status = map_column_status(&col.slug, &col.name, col.is_final);
@@ -386,13 +360,12 @@ fn task_to_domain(
 /// project-scoped column Kaneo expects). Returns `None` when the project has no
 /// matching column.
 async fn resolve_status_slug(
-    backend: &KaneoBackend,
+    op: &mut TrackerHttpOperation<'_>,
     project_id: &str,
     target: IssueStatus,
 ) -> Result<Option<String>, IssueError> {
-    let board: BoardResp = backend
-        .get(&format!("task/tasks/{project_id}?limit=1"))
-        .await?;
+    let board: BoardResp =
+        KaneoBackend::get(op, &format!("task/tasks/{project_id}?limit=1")).await?;
     // Prefer an exact status match; fall back to a Done→final column.
     let mut fallback_final: Option<String> = None;
     for col in &board.data.columns {
@@ -421,8 +394,12 @@ impl KaneoBackend {
 
     /// Every project in the configured workspace.
     pub async fn list_projects(&self) -> Result<Vec<KaneoProjectInfo>, IssueError> {
+        let http = self.http()?;
+        let mut op = http.operation();
+        op.prepare().await?;
         let ws = self.require_workspace()?;
-        let projects: Vec<KaneoProject> = self.get(&format!("project?workspaceId={ws}")).await?;
+        let projects: Vec<KaneoProject> =
+            Self::get(&mut op, &format!("project?workspaceId={ws}")).await?;
         Ok(projects
             .into_iter()
             .map(|p| KaneoProjectInfo {
@@ -435,9 +412,11 @@ impl KaneoBackend {
 
     /// A project's board: columns (in order) each with their issues.
     pub async fn board(&self, project_id: &str) -> Result<Vec<KaneoColumnInfo>, IssueError> {
-        let board: BoardResp = self
-            .get(&format!("task/tasks/{project_id}?limit=100"))
-            .await?;
+        let http = self.http()?;
+        let mut op = http.operation();
+        op.prepare().await?;
+        let board: BoardResp =
+            Self::get(&mut op, &format!("task/tasks/{project_id}?limit=100")).await?;
         let ws = board.data.workspace_id.clone();
         Ok(board
             .data
@@ -467,14 +446,21 @@ impl KaneoBackend {
         dest_project: &str,
         dest_status: Option<&str>,
     ) -> Result<(), IssueError> {
+        let http = self.http()?;
+        let mut op = http.operation();
+        op.prepare().await?;
         let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
         let mut body = serde_json::json!({ "destinationProjectId": dest_project });
         if let Some(s) = dest_status {
             body["destinationStatus"] = serde_json::json!(s);
         }
-        let _: serde_json::Value = self
-            .send_body(reqwest::Method::PUT, &format!("task/move/{task_id}"), &body)
-            .await?;
+        let _: serde_json::Value = Self::send_body(
+            &mut op,
+            reqwest::Method::PUT,
+            &format!("task/move/{task_id}"),
+            &body,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -502,50 +488,63 @@ impl IssueBackend for KaneoBackend {
         filter: &'a IssueFilter,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
-            let projects = self.scope_project_ids().await?;
-            if projects.is_empty() {
-                return Ok(Vec::new());
-            }
-            let assignee = if filter.assignee_me {
-                self.current_user_id().await
-            } else {
-                None
-            };
-            let per_project = filter.limit.clamp(1, 100);
-            let mut all = Vec::new();
-            for pid in projects {
-                match self
-                    .project_issues(&pid, assignee.as_deref(), per_project)
-                    .await
-                {
-                    Ok(issues) => all.extend(issues),
-                    Err(e) => {
-                        tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed")
-                    }
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
+            self.list_issues_with_op(&mut op, filter).await
+        })
+    }
+
+    async fn list_issues_with_op(
+        &self,
+        op: &mut TrackerHttpOperation<'_>,
+        filter: &IssueFilter,
+    ) -> Result<Vec<Issue>, IssueError> {
+        let projects = self.scope_project_ids(op).await?;
+        if projects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let assignee = if filter.assignee_me {
+            self.current_user_id(op).await
+        } else {
+            None
+        };
+        let per_project = filter.limit.clamp(1, 100);
+        let mut all = Vec::new();
+        for pid in projects {
+            match self
+                .project_issues(op, &pid, assignee.as_deref(), per_project)
+                .await
+            {
+                Ok(issues) => all.extend(issues),
+                Err(e) => {
+                    tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed")
                 }
             }
-            // Client-side status filter (Kaneo filters by a single column slug, not
-            // our status buckets) + overall limit.
-            if !filter.statuses.is_empty() {
-                all.retain(|i| filter.statuses.contains(&i.status));
-            }
-            all.sort_by_key(|i| std::cmp::Reverse(i.updated_at_ms));
-            if filter.limit > 0 {
-                all.truncate(filter.limit);
-            }
-            Ok(all)
-        })
+        }
+        // Client-side status filter (Kaneo filters by a single column slug, not
+        // our status buckets) + overall limit.
+        if !filter.statuses.is_empty() {
+            all.retain(|i| filter.statuses.contains(&i.status));
+        }
+        all.sort_by_key(|i| std::cmp::Reverse(i.updated_at_ms));
+        if filter.limit > 0 {
+            all.truncate(filter.limit);
+        }
+        Ok(all)
     }
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-            let task: KaneoTask = self.get(&format!("task/{task_id}")).await?;
+            let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
             // A bare task fetch has no column `isFinal` context; map from the slug.
             let status = map_column_status(&task.status, &task.status, false);
             let issue = task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref());
-            let comments: Vec<KaneoComment> = self
-                .get(&format!("comment/{task_id}"))
+            let comments: Vec<KaneoComment> = Self::get(&mut op, &format!("comment/{task_id}"))
                 .await
                 .unwrap_or_default();
             let comments = comments
@@ -565,6 +564,9 @@ impl IssueBackend for KaneoBackend {
         draft: &'a IssueDraft,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let project_id = draft
                 .project_id
                 .clone()
@@ -573,9 +575,8 @@ impl IssueBackend for KaneoBackend {
                     IssueError::Api("Kaneo create requires a project id (config or draft)".into())
                 })?;
             // Initial column: the first column of the project's board.
-            let board: BoardResp = self
-                .get(&format!("task/tasks/{project_id}?limit=1"))
-                .await?;
+            let board: BoardResp =
+                Self::get(&mut op, &format!("task/tasks/{project_id}?limit=1")).await?;
             let status = board
                 .data
                 .columns
@@ -584,21 +585,25 @@ impl IssueBackend for KaneoBackend {
                 .unwrap_or_else(|| "to-do".into());
 
             #[derive(Serialize)]
-            struct CreateBody {
-                title: String,
-                description: String,
+            struct CreateBody<'a> {
+                title: &'a str,
+                description: &'a str,
                 priority: &'static str,
                 status: String,
             }
             let body = CreateBody {
-                title: draft.title.clone(),
-                description: draft.body.clone().unwrap_or_default(),
+                title: &draft.title,
+                description: draft.body.as_deref().unwrap_or_default(),
                 priority: priority_to_kaneo(draft.priority),
                 status,
             };
-            let created: KaneoTask = self
-                .send_body(reqwest::Method::POST, &format!("task/{project_id}"), &body)
-                .await?;
+            let created: KaneoTask = Self::send_body(
+                &mut op,
+                reqwest::Method::POST,
+                &format!("task/{project_id}"),
+                &body,
+            )
+            .await?;
             let status = map_column_status(&created.status, &created.status, false);
             Ok(task_to_domain(
                 created,
@@ -615,6 +620,9 @@ impl IssueBackend for KaneoBackend {
         patch: &'a IssuePatch,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
 
             if let Some(title) = &patch.title {
@@ -622,13 +630,13 @@ impl IssueBackend for KaneoBackend {
                 struct TitleBody<'a> {
                     title: &'a str,
                 }
-                let _: serde_json::Value = self
-                    .send_body(
-                        reqwest::Method::PUT,
-                        &format!("task/title/{task_id}"),
-                        &TitleBody { title },
-                    )
-                    .await?;
+                let _: serde_json::Value = Self::send_body(
+                    &mut op,
+                    reqwest::Method::PUT,
+                    &format!("task/title/{task_id}"),
+                    &TitleBody { title },
+                )
+                .await?;
             }
 
             if let Some(p) = patch.priority {
@@ -636,43 +644,47 @@ impl IssueBackend for KaneoBackend {
                 struct PrioBody {
                     priority: &'static str,
                 }
-                let _: serde_json::Value = self
-                    .send_body(
-                        reqwest::Method::PUT,
-                        &format!("task/priority/{task_id}"),
-                        &PrioBody {
-                            priority: priority_to_kaneo(p),
-                        },
-                    )
-                    .await?;
+                let _: serde_json::Value = Self::send_body(
+                    &mut op,
+                    reqwest::Method::PUT,
+                    &format!("task/priority/{task_id}"),
+                    &PrioBody {
+                        priority: priority_to_kaneo(p),
+                    },
+                )
+                .await?;
             }
 
             if let Some(status) = patch.status {
                 // Resolve the target status to a project column slug first (needs
                 // the task's project id).
-                let task: KaneoTask = self.get(&format!("task/{task_id}")).await?;
-                if let Some(slug) = resolve_status_slug(self, &task.project_id, status).await? {
+                let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
+                if let Some(slug) = resolve_status_slug(&mut op, &task.project_id, status).await? {
                     #[derive(Serialize)]
                     struct StatusBody {
                         status: String,
                     }
-                    let _: serde_json::Value = self
-                        .send_body(
-                            reqwest::Method::PUT,
-                            &format!("task/status/{task_id}"),
-                            &StatusBody { status: slug },
-                        )
-                        .await?;
+                    let _: serde_json::Value = Self::send_body(
+                        &mut op,
+                        reqwest::Method::PUT,
+                        &format!("task/status/{task_id}"),
+                        &StatusBody { status: slug },
+                    )
+                    .await?;
                 } else {
-                    return Err(IssueError::Api(format!(
-                        "no Kaneo column maps to status {:?} in this project",
-                        status
-                    )));
+                    return Err(IssueError::Api("Kaneo status target unavailable".into()));
                 }
             }
 
             // Return the refreshed task.
-            self.get_issue(id).await.map(|d| d.issue)
+            let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
+            let status = map_column_status(&task.status, &task.status, false);
+            Ok(task_to_domain(
+                task,
+                status,
+                &self.base_url,
+                self.workspace_id.as_deref(),
+            ))
         })
     }
 
@@ -682,6 +694,9 @@ impl IssueBackend for KaneoBackend {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             // Kaneo has no workspace-wide text search over REST that we rely on, so
             // list within scope and filter titles client-side.
             let filter = IssueFilter {
@@ -689,7 +704,7 @@ impl IssueBackend for KaneoBackend {
                 ..Default::default()
             };
             let needle = query.to_ascii_lowercase();
-            let mut issues = self.list_issues(&filter).await?;
+            let mut issues = self.list_issues_with_op(&mut op, &filter).await?;
             issues.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
             issues.truncate(limit.max(1));
             Ok(issues)
@@ -702,14 +717,21 @@ impl IssueBackend for KaneoBackend {
         body: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-            let _: serde_json::Value = self
-                .send_body(
-                    reqwest::Method::POST,
-                    &format!("comment/{task_id}"),
-                    &serde_json::json!({ "content": body }),
-                )
-                .await?;
+            #[derive(Serialize)]
+            struct CommentBody<'a> {
+                content: &'a str,
+            }
+            let _: serde_json::Value = Self::send_body(
+                &mut op,
+                reqwest::Method::POST,
+                &format!("comment/{task_id}"),
+                &CommentBody { content: body },
+            )
+            .await?;
             Ok(())
         })
     }
@@ -720,35 +742,37 @@ impl IssueBackend for KaneoBackend {
         label: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             let ws = self.require_workspace()?;
             // Reuse an existing workspace label of the same name; otherwise create
             // it and assign in one shot (labels are workspace-scoped).
-            let existing: Vec<KaneoLabelRow> = self
-                .get(&format!("label/workspace/{ws}"))
+            let existing: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/workspace/{ws}"))
                 .await
                 .unwrap_or_default();
             if let Some(l) = existing.iter().find(|l| l.name.eq_ignore_ascii_case(label)) {
-                let _: serde_json::Value = self
-                    .send_body(
-                        reqwest::Method::PUT,
-                        &format!("label/{}/task", l.id),
-                        &serde_json::json!({ "taskId": task_id }),
-                    )
-                    .await?;
+                let _: serde_json::Value = Self::send_body(
+                    &mut op,
+                    reqwest::Method::PUT,
+                    &format!("label/{}/task", l.id),
+                    &serde_json::json!({ "taskId": task_id }),
+                )
+                .await?;
             } else {
-                let _: serde_json::Value = self
-                    .send_body(
-                        reqwest::Method::POST,
-                        "label",
-                        &serde_json::json!({
-                            "name": label,
-                            "color": "#6b7280",
-                            "workspaceId": ws,
-                            "taskId": task_id,
-                        }),
-                    )
-                    .await?;
+                let _: serde_json::Value = Self::send_body(
+                    &mut op,
+                    reqwest::Method::POST,
+                    "label",
+                    &serde_json::json!({
+                        "name": label,
+                        "color": "#6b7280",
+                        "workspaceId": ws,
+                        "taskId": task_id,
+                    }),
+                )
+                .await?;
             }
             Ok(())
         })
@@ -760,15 +784,17 @@ impl IssueBackend for KaneoBackend {
         label: &'a str,
     ) -> BoxFuture<'a, Result<(), IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-            let on_task: Vec<KaneoLabelRow> = self
-                .get(&format!("label/task/{task_id}"))
+            let on_task: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/task/{task_id}"))
                 .await
                 .unwrap_or_default();
             let Some(l) = on_task.iter().find(|l| l.name.eq_ignore_ascii_case(label)) else {
-                return Err(IssueError::Api(format!("task has no label {label:?}")));
+                return Err(IssueError::Api("Kaneo label target unavailable".into()));
             };
-            self.delete_req(&format!("label/{}/task", l.id)).await
+            Self::delete_req(&mut op, &format!("label/{}/task", l.id)).await
         })
     }
 }

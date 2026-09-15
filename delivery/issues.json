@@ -399,6 +399,13 @@
       ]
     },
     {
+      "issue": "THE-321",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "centralize-tracker-http-policy"
+      ]
+    },
+    {
       "issue": "THE-326",
       "project": "Client API & Remote Access",
       "changes": [
