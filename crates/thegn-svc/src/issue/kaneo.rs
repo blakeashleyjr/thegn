@@ -774,12 +774,7 @@ impl IssueBackend for KaneoBackend {
             // Return the refreshed task.
             let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
             let status = map_column_status(&task.status, &task.status, false);
-            Ok(task_to_domain(
-                task,
-                status,
-                &self.base_url,
-                self.workspace_id.as_deref(),
-            ))
+            task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref())
         })
     }
 

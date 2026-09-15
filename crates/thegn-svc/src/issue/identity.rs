@@ -64,7 +64,7 @@ pub(crate) fn builtin_segment<'a>(value: &'a str, label: &str) -> Result<&'a str
 /// Validate a plugin's registered namespace. Plugin business keys are opaque
 /// and may contain `:`, but the namespace itself is a routing delimiter and
 /// must be one flat, non-delimiter segment.
-pub(crate) fn plugin_namespace<'a>(value: &'a str) -> Result<&'a str, String> {
+pub(crate) fn plugin_namespace(value: &str) -> Result<&str, String> {
     builtin_segment(value, "plugin namespace")?;
     if value.contains(':') {
         return Err("plugin namespace must not contain ':'".into());
@@ -72,7 +72,7 @@ pub(crate) fn plugin_namespace<'a>(value: &'a str) -> Result<&'a str, String> {
     Ok(value)
 }
 
-pub(crate) fn builtin_identity<'a>(value: &'a str) -> Result<&'a str, String> {
+pub(crate) fn builtin_identity(value: &str) -> Result<&str, String> {
     bounded(value, BUILTIN_ID_MAX, "tracker identity")?;
     if value == "."
         || value == ".."
@@ -89,7 +89,7 @@ pub(crate) fn builtin_identity<'a>(value: &'a str) -> Result<&'a str, String> {
 /// Plugin business keys are opaque UTF-8.  They are bounded and cannot carry
 /// controls, while provider-specific path restrictions remain the plugin's
 /// responsibility.  The control transport encodes the complete envelope once.
-pub(crate) fn plugin_key<'a>(value: &'a str) -> Result<&'a str, String> {
+pub(crate) fn plugin_key(value: &str) -> Result<&str, String> {
     if value.is_empty() {
         return Err("plugin issue key must not be empty".into());
     }
@@ -104,7 +104,7 @@ pub(crate) fn plugin_key<'a>(value: &'a str) -> Result<&'a str, String> {
     Ok(value)
 }
 
-pub(crate) fn github_number<'a>(number: &'a str) -> Result<&'a str, String> {
+pub(crate) fn github_number(number: &str) -> Result<&str, String> {
     bounded(number, 20, "GitHub issue number")?;
     if !number.bytes().all(|b| b.is_ascii_digit()) {
         return Err("GitHub issue number must contain only ASCII digits".into());
@@ -118,7 +118,7 @@ pub(crate) fn github_number<'a>(number: &'a str) -> Result<&'a str, String> {
     Ok(number)
 }
 
-pub(crate) fn github_repo<'a>(repo: &'a str) -> Result<&'a str, String> {
+pub(crate) fn github_repo(repo: &str) -> Result<&str, String> {
     bounded(repo, BUILTIN_ID_MAX, "GitHub repository")?;
     let parts: Vec<&str> = repo.split('/').collect();
     let (host, owner, name) = match parts.as_slice() {
@@ -134,7 +134,7 @@ pub(crate) fn github_repo<'a>(repo: &'a str) -> Result<&'a str, String> {
     Ok(repo)
 }
 
-pub(crate) fn github_host_for_url<'a>(value: &'a str) -> Result<&'a str, String> {
+pub(crate) fn github_host_for_url(value: &str) -> Result<&str, String> {
     bounded(value, GITHUB_COMPONENT_MAX, "GitHub host")?;
     let bytes = value.as_bytes();
     if !bytes.first().is_some_and(|b| b.is_ascii_alphanumeric())
