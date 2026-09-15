@@ -54,19 +54,9 @@ fn both_recursive_families_use_actual_flattened_depth_before_serialization() {
         let mut cfg = config();
         insert(&mut cfg, nested(MAX_DEPTH - 5));
         assert!(admit(&cfg).is_ok(), "inclusive full structural admission");
-        if cfg.plugins.is_empty() {
-            assert!(compose_host_definitions_checked(&cfg, &empty_snapshot()).is_ok());
-        } else {
-            // Existing ApiVersion serializes a string but derives an object
-            // schema. Preserve that legacy schema refusal; this fixture proves
-            // plugin depth admission, not a repair of its schema declaration.
-            let value = serde_json::to_value(&cfg).unwrap();
-            assert!(!config_validate::validate_config_schema_value(&value).is_empty());
-            assert_eq!(
-                compose_host_definitions_checked(&cfg, &empty_snapshot()).unwrap_err(),
-                HostCompositionError::InvalidFinalConfig
-            );
-        }
+        let composed = compose_host_definitions_checked(&cfg, &empty_snapshot()).unwrap();
+        assert!(composed.config().plugins == cfg.plugins);
+        assert!(composed.config().model_proxy.providers == cfg.model_proxy.providers);
         let mut invalid = config();
         insert(&mut invalid, nested(MAX_DEPTH - 5 + 1));
         let (result, events) = semantic_observation::capture(|| {

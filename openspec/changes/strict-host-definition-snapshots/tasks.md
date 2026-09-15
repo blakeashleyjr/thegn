@@ -24,6 +24,7 @@
 - [x] Admit pre/post byte and structural limits, stage/profile/rule caps and effective-profile work before validation or cloning.
 - [x] Borrow rejected input and preflight both recursive JSON families before serialization; charge and preserve skipped build/issue state.
 - [x] Add private SQLite-to-composition-to-resolver fixtures, raw-source refusal, semantic/schema failures, redaction and inclusive work/data boundary controls.
+- [x] Align ApiVersion schema metadata with its unchanged string wire format; add actual Config and full plugin-depth composition controls (narrow THE-199 prerequisite).
 - [ ] Complete primary and independent review of the composition implementation and address findings.
 - [ ] Compile/run the new composition fixtures, recovered snapshot fixtures, THE-598 merge fixtures and existing config validation tests on the same source.
 

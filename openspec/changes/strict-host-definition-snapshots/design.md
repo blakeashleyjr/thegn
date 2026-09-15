@@ -147,9 +147,11 @@ operations and checked failure skips later profiles. Legacy ordered diagnostics
 and current compatibility branches remain separate positive controls. Native
 compilation/execution and final independent source review are pending.
 
-One inherited schema limitation is explicitly retained: plugin ApiVersion
-serializes as a string while its generated schema describes an object. The
-plugin recursive-depth positive control proves structural admission at the
-limit, then expects that existing final-schema refusal. Provider-default JSON
-has a full successful composition control at the depth limit. This component
-does not silently relax the shared schema to fix an unrelated plugin contract.
+A narrow prerequisite corrects ApiVersion's generated schema to match its
+existing string wire format, using String's schema with the stable ApiVersion
+name. Serialization, numeric parsing and negotiation remain unchanged. Both
+plugin caps and provider-default JSON now have full successful composition
+controls at depth 32, with depth 33 refused before cloning. Actual Config
+validation covers valid plugins and malformed version/shape controls. This
+schema-only correction is tracked under THE-199; its broader contract work
+remains open. Native verification of this prerequisite remains pending.

@@ -9,11 +9,23 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 /// Semantic version of the API contract itself.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApiVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+}
+
+// The wire representation is a string; the unchanged Deserialize implementation
+// owns the three-u32 grammar. Deriving from the Rust fields describes an object.
+impl schemars::JsonSchema for ApiVersion {
+    fn schema_name() -> String {
+        "ApiVersion".into()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        <String as schemars::JsonSchema>::json_schema(generator)
+    }
 }
 
 /// Current Plugin API contract version implemented by this crate.
@@ -1927,6 +1939,82 @@ mod wire_tests {
             let j = serde_json::to_string(&c).unwrap();
             let back: RpcErrorCode = serde_json::from_str(&j).unwrap();
             assert_eq!(back, c);
+        }
+    }
+
+    fn config_with_plugin_api(api_literal: &str) -> String {
+        format!(
+            r#"
+[[plugins]]
+id = "schema-fixture"
+name = "Schema fixture"
+version = "1.0.0"
+api = {api_literal}
+command = ["never-run-schema-fixture"]
+enabled = false
+"#
+        )
+    }
+
+    #[test]
+    fn api_version_schema_matches_unchanged_string_wire_format() {
+        let schema = schemars::schema_for!(ApiVersion);
+        assert_eq!(
+            <ApiVersion as schemars::JsonSchema>::schema_name(),
+            "ApiVersion"
+        );
+        assert_eq!(
+            schema.schema.instance_type,
+            Some(schemars::schema::InstanceType::String.into())
+        );
+        assert!(schema.schema.object.is_none());
+        let version = ApiVersion::new(1, 2, 3);
+        let encoded = serde_json::to_string(&version).unwrap();
+        assert_eq!(encoded, r#""1.2.3""#);
+        assert_eq!(
+            serde_json::from_str::<ApiVersion>(&encoded).unwrap(),
+            version
+        );
+    }
+
+    #[test]
+    fn valid_plugin_api_passes_actual_config_validation() {
+        for spelling in ["1.2.3", "01.002.0003", "+1.+2.+3"] {
+            let source = config_with_plugin_api(&format!("{spelling:?}"));
+            let config: crate::config::Config = toml::from_str(&source).unwrap();
+            assert_eq!(config.plugins[0].manifest.api, ApiVersion::new(1, 2, 3));
+            assert!(crate::config_validate::validate_str(&source).is_empty());
+            let value = serde_json::to_value(&config).unwrap();
+            assert_eq!(value["plugins"][0]["api"], "1.2.3");
+            assert!(crate::config_validate::validate_config_schema_value(&value).is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_plugin_api_remains_rejected_by_wire_and_config_validation() {
+        for api in ["", "1.2", "1.2.3.4", "x.2.3", "-1.2.3", "4294967296.2.3"] {
+            let literal = format!("{api:?}");
+            assert!(serde_json::from_str::<ApiVersion>(&literal).is_err());
+            let source = config_with_plugin_api(&literal);
+            assert!(toml::from_str::<crate::config::Config>(&source).is_err());
+            assert!(!crate::config_validate::validate_str(&source).is_empty());
+        }
+        let source = config_with_plugin_api(r#""1.2.3""#);
+        let config: crate::config::Config = toml::from_str(&source).unwrap();
+        for wrong_shape in [
+            serde_json::Value::Null,
+            serde_json::json!(123),
+            serde_json::json!({"major": 1, "minor": 2, "patch": 3}),
+        ] {
+            assert!(serde_json::from_value::<ApiVersion>(wrong_shape.clone()).is_err());
+            let mut value = serde_json::to_value(&config).unwrap();
+            value["plugins"][0]["api"] = wrong_shape;
+            assert!(!crate::config_validate::validate_config_schema_value(&value).is_empty());
+        }
+        for literal in ["123", "{ major = 1, minor = 2, patch = 3 }"] {
+            let source = config_with_plugin_api(literal);
+            assert!(toml::from_str::<crate::config::Config>(&source).is_err());
+            assert!(!crate::config_validate::validate_str(&source).is_empty());
         }
     }
 
