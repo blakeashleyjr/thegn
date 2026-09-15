@@ -304,8 +304,19 @@ fn parse_updated_at(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn linear_issue_to_domain(li: LinearIssue) -> Issue {
-    Issue {
+fn checked_workflow_state_id(raw: &str) -> Result<String, IssueError> {
+    let admitted = super::identity::builtin_segment(raw, "Linear workflow state id")
+        .map_err(IssueError::Parse)?;
+    // This value is still placed in a GraphQL string literal below. Escape it
+    // even after syntax admission so a provider response cannot terminate the
+    // literal or graft fields onto the mutation.
+    Ok(escape_graphql_str(admitted))
+}
+
+fn linear_issue_to_domain(li: LinearIssue) -> Result<Issue, IssueError> {
+    super::identity::builtin_identity(&li.identifier).map_err(IssueError::Parse)?;
+    super::validate_public_url(&li.url)?;
+    let issue = Issue {
         id: format!("linear:{}", li.identifier),
         number: li.identifier.clone(),
         provider: "linear".into(),
@@ -326,7 +337,9 @@ fn linear_issue_to_domain(li: LinearIssue) -> Issue {
         updated_at_ms: parse_updated_at(&li.updated_at),
         due_at_ms: li.due_date.as_deref().and_then(super::parse_due_date_ms),
         ..Default::default()
-    }
+    };
+    super::validate_issue_identity(&issue)?;
+    Ok(issue)
 }
 
 // ---- query constants --------------------------------------------------------
@@ -470,12 +483,11 @@ impl IssueBackend for LinearBackend {
             }
             let query = build_list_query(filter, self.team_id.as_deref());
             let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
-            Ok(data
-                .issues
+            data.issues
                 .nodes
                 .into_iter()
                 .map(linear_issue_to_domain)
-                .collect())
+                .collect()
         })
     }
 
@@ -504,7 +516,7 @@ impl IssueBackend for LinearBackend {
                 })
                 .collect();
             Ok(IssueDetail {
-                issue: linear_issue_to_domain(li.issue),
+                issue: linear_issue_to_domain(li.issue)?,
                 comments,
             })
         })
@@ -550,6 +562,7 @@ impl IssueBackend for LinearBackend {
             data.issue_create
                 .issue
                 .map(linear_issue_to_domain)
+                .transpose()?
                 .ok_or_else(|| IssueError::Api("issueCreate returned no issue".into()))
         })
     }
@@ -607,7 +620,8 @@ impl IssueBackend for LinearBackend {
                 }
                 let states: StatesData = Self::gql(&mut op, &state_query, Vars {}).await?;
                 if let Some(state_node) = states.workflow_states.nodes.first() {
-                    fields.push(format!(r#"stateId: "{}""#, state_node.id));
+                    let state_id = checked_workflow_state_id(&state_node.id)?;
+                    fields.push(format!(r#"stateId: "{state_id}""#));
                 }
             }
 
@@ -615,7 +629,7 @@ impl IssueBackend for LinearBackend {
                 // Nothing to change — fetch and return the current state.
                 let query = build_get_query(id.strip_prefix("linear:").unwrap_or(id));
                 let data: LinearIssueWithComments = Self::gql(&mut op, &query, Vars {}).await?;
-                return Ok(linear_issue_to_domain(data.issue.issue));
+                return linear_issue_to_domain(data.issue.issue);
             }
 
             let fields_str = fields.join(", ");
@@ -630,6 +644,7 @@ impl IssueBackend for LinearBackend {
             data.issue_update
                 .issue
                 .map(linear_issue_to_domain)
+                .transpose()?
                 .ok_or_else(|| IssueError::Api("issueUpdate returned no issue".into()))
         })
     }
@@ -648,12 +663,11 @@ impl IssueBackend for LinearBackend {
             ensure_dynamic_input(query_str)?;
             let query = build_search_query(query_str, limit);
             let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
-            Ok(data
-                .issues
+            data.issues
                 .nodes
                 .into_iter()
                 .map(linear_issue_to_domain)
-                .collect())
+                .collect()
         })
     }
 }
@@ -738,6 +752,17 @@ mod tests {
     }
 
     #[test]
+    fn workflow_state_id_is_admitted_and_escaped_before_mutation() {
+        assert_eq!(
+            checked_workflow_state_id(r##"state";title:"injected""##).unwrap(),
+            r##"state\";title:\"injected\""##
+        );
+        assert!(checked_workflow_state_id("state/child").is_err());
+        assert!(checked_workflow_state_id("state\nchild").is_err());
+        assert!(checked_workflow_state_id(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
     fn issue_to_domain_maps_all_fields() {
         let li: LinearIssue = serde_json::from_value(json!({
             "id": "uuid-1",
@@ -753,7 +778,7 @@ mod tests {
             "updatedAt": "1970-01-01T00:00:04Z"
         }))
         .unwrap();
-        let issue = linear_issue_to_domain(li);
+        let issue = linear_issue_to_domain(li).unwrap();
         assert_eq!(issue.id, "linear:ABC-123");
         assert_eq!(issue.number, "ABC-123");
         assert_eq!(issue.provider, "linear");
@@ -777,7 +802,7 @@ mod tests {
             "updatedAt": "not-a-date"
         }))
         .unwrap();
-        let issue = linear_issue_to_domain(li);
+        let issue = linear_issue_to_domain(li).unwrap();
         assert_eq!(issue.body, None);
         assert_eq!(issue.status, IssueStatus::Backlog, "no state ⇒ backlog");
         assert_eq!(issue.priority, IssuePriority::None, "default priority 0");
@@ -785,6 +810,31 @@ mod tests {
         assert!(issue.labels.is_empty());
         assert_eq!(issue.branch_hint, None);
         assert_eq!(issue.updated_at_ms, 0);
+    }
+
+    #[test]
+    fn issue_to_domain_rejects_provider_identity_or_url_before_returning() {
+        let mut li: LinearIssue = serde_json::from_value(json!({
+            "id": "uuid-3",
+            "identifier": "ABC-9",
+            "title": "Bounded",
+            "url": "https://linear.app/x/issue/ABC-9",
+            "updatedAt": "not-a-date"
+        }))
+        .unwrap();
+        li.identifier = "ABC/9".into();
+        assert!(linear_issue_to_domain(li).is_err());
+
+        let mut li: LinearIssue = serde_json::from_value(json!({
+            "id": "uuid-4",
+            "identifier": "ABC-9",
+            "title": "Bounded",
+            "url": "https://linear.app/x/issue/ABC-9",
+            "updatedAt": "not-a-date"
+        }))
+        .unwrap();
+        li.url = "file:///tmp/issue".into();
+        assert!(linear_issue_to_domain(li).is_err());
     }
 
     #[test]
@@ -796,6 +846,80 @@ mod tests {
         );
         assert!(backend.http().is_ok());
     }
+
+    #[tokio::test]
+    async fn update_status_escapes_provider_state_id_before_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let route_calls = Arc::clone(&calls);
+        let route_queries = Arc::clone(&queries);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                let route_queries = Arc::clone(&route_queries);
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let call = route_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 1 {
+                        route_queries
+                            .lock()
+                            .unwrap()
+                            .push(payload["query"].as_str().unwrap().to_owned());
+                    }
+                    let body = if call == 0 {
+                        json!({
+                            "data": {
+                                "workflowStates": {
+                                    "nodes": [{"id": "state\";title:\"injected"}]
+                                }
+                            }
+                        })
+                    } else {
+                        json!({"data": {"issueUpdate": {"issue": null}}})
+                    };
+                    let mut response =
+                        (StatusCode::OK, Body::from(body.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            Some("team-1".into()),
+            budget,
+            &format!("http://{address}"),
+        );
+        let result = backend
+            .update_issue(
+                "linear:ABC-1",
+                &IssuePatch {
+                    status: Some(IssueStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(IssueError::Api(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let query = queries.lock().unwrap().first().cloned().unwrap();
+        assert!(query.contains(r##"stateId: "state\";title:\"injected""##));
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
     #[tokio::test]
     async fn update_status_uses_one_budget_across_linear_requests() {
         use std::sync::atomic::{AtomicUsize, Ordering};
