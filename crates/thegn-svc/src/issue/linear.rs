@@ -33,8 +33,27 @@ impl LinearBackend {
         team_id: Option<String>,
         budget: std::sync::Arc<TrackerHttpBudget>,
     ) -> Self {
+        Self::new_at_origin(api_key, team_id, budget, LINEAR_API)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        api_key: String,
+        team_id: Option<String>,
+        budget: std::sync::Arc<TrackerHttpBudget>,
+        origin: &str,
+    ) -> Self {
+        Self::new_at_origin(api_key, team_id, budget, origin)
+    }
+
+    fn new_at_origin(
+        api_key: String,
+        team_id: Option<String>,
+        budget: std::sync::Arc<TrackerHttpBudget>,
+        origin: &str,
+    ) -> Self {
         let (http, http_error) =
-            match TrackerHttpClient::new("linear", LINEAR_API, api_key.clone(), budget) {
+            match TrackerHttpClient::new("linear", origin, api_key.clone(), budget) {
                 Ok(http) => (Some(http), None),
                 Err(IssueError::Policy(message)) => (None, Some(message)),
                 Err(_) => (None, Some("tracker HTTP client configuration failed")),
@@ -642,7 +661,14 @@ impl IssueBackend for LinearBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn state(ty: &str) -> Option<LinearState> {
         serde_json::from_value(json!({ "type": ty })).unwrap()
@@ -763,12 +789,68 @@ mod tests {
 
     #[test]
     fn constructor_admits_official_linear_endpoint() {
-        let backend = LinearBackend::new(
+        let backend = LinearBackend::new_with_budget(
             "linear-test-key".into(),
             None,
             std::sync::Arc::new(TrackerHttpBudget::with_permits(1)),
         );
         assert!(backend.http().is_ok());
+    }
+    #[tokio::test]
+    async fn update_status_uses_one_budget_across_linear_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let call = route_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = if call == 0 {
+                        json!({"data": {"workflowStates": {"nodes": [{"id": "state-1"}]}}})
+                    } else {
+                        json!({"data": {"issueUpdate": {"issue": null}}})
+                    };
+                    let mut response =
+                        (StatusCode::OK, Body::from(body.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        // The first helper request is admitted; the second helper request is
+        // refused by the same operation before the fake server can see it.
+        budget.fail_after_prepared_requests_for_test(1);
+        let backend = LinearBackend::new_for_test(
+            "linear-secret".into(),
+            Some("team-1".into()),
+            Arc::clone(&budget),
+            &format!("http://{address}"),
+        );
+        let result = backend
+            .update_issue(
+                "linear:ABC-1",
+                &IssuePatch {
+                    status: Some(IssueStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(IssueError::Timeout("operation deadline exceeded"))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
     }
 }
 

@@ -609,6 +609,7 @@ impl IssueBackend for KaneoBackend {
                 .await
             {
                 Ok(issues) => all.extend(issues),
+                Err(e @ IssueError::Timeout(_)) => return Err(e),
                 Err(e) => {
                     tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed")
                 }
@@ -910,7 +911,14 @@ struct KaneoComment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn priority_maps_and_reverses() {
@@ -1119,5 +1127,57 @@ mod tests {
         .unwrap();
         assert_eq!(l.id, "l1");
         assert_eq!(l.name, "bug");
+    }
+    #[tokio::test]
+    async fn list_expansion_returns_budget_error_before_kaneo_project_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let call = route_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = if call == 0 {
+                        json!([{"id": "project-1"}])
+                    } else {
+                        json!({"data": {"columns": []}})
+                    };
+                    let mut response =
+                        (StatusCode::OK, Body::from(body.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.fail_after_prepared_requests_for_test(1);
+        let backend = KaneoBackend::new_with_budget(
+            format!("http://{address}"),
+            "kaneo-secret".into(),
+            Some("workspace-1".into()),
+            None,
+            Arc::clone(&budget),
+        );
+        let result = backend
+            .list_issues(&IssueFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(IssueError::Timeout("operation deadline exceeded"))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -734,7 +734,14 @@ fn urlencoding_simple(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn status(cat: &str) -> Option<JiraStatus> {
         serde_json::from_value(json!({
@@ -915,7 +922,7 @@ mod tests {
 
     #[test]
     fn constructor_admits_self_hosted_base_path() {
-        let backend = JiraBackend::new(
+        let backend = JiraBackend::new_with_budget(
             "http://jira.lan:8080/company/jira".into(),
             "user@example.test".into(),
             "jira-test-token".into(),
@@ -923,5 +930,58 @@ mod tests {
             std::sync::Arc::new(TrackerHttpBudget::with_permits(1)),
         );
         assert!(backend.http().is_ok());
+    }
+    #[tokio::test]
+    async fn create_issue_returns_budget_error_before_jira_followup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |_: Request| {
+                let route_calls = Arc::clone(&route_calls);
+                async move {
+                    let call = route_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = if call == 0 {
+                        json!({"key": "PROJ-2"})
+                    } else {
+                        json!({})
+                    };
+                    let mut response =
+                        (StatusCode::OK, Body::from(body.to_string())).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            }));
+            axum::serve(listener, app).await.unwrap();
+        });
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        budget.fail_after_prepared_requests_for_test(1);
+        let backend = JiraBackend::new_with_budget(
+            format!("http://{address}"),
+            "user@example.test".into(),
+            "jira-secret".into(),
+            None,
+            Arc::clone(&budget),
+        );
+        let result = backend
+            .create_issue(&IssueDraft {
+                title: "created through fixture".into(),
+                project_id: Some("PROJ".into()),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(IssueError::Timeout("operation deadline exceeded"))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
     }
 }
