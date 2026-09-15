@@ -1293,6 +1293,42 @@ fn pr_linked_diff_emits_once_for_new_prs_only() {
 }
 
 #[test]
+fn tracker_cache_hydration_discards_malformed_identities_before_panel_use() {
+    use thegn_core::issue::Issue;
+    use thegn_core::store::CacheStore;
+
+    let db = thegn_core::db::Db::open_memory().unwrap();
+    let valid = Issue {
+        id: "jira:PROJ-7".into(),
+        provider: "jira".into(),
+        number: "PROJ-7".into(),
+        url: "https://jira.example/browse/PROJ-7".into(),
+        ..Default::default()
+    };
+    let mut traversal = valid.clone();
+    traversal.id = "jira:../admin".into();
+    let mut namespace = valid.clone();
+    namespace.provider = "kaneo".into();
+    let mut unsafe_url = valid.clone();
+    unsafe_url.url = "javascript:alert(1)".into();
+    let json = serde_json::to_string(&[valid.clone(), traversal, namespace, unsafe_url]).unwrap();
+    db.put_issue_cache("fixture-repo", "jira", "fixture", &json)
+        .unwrap();
+    let mut panel = crate::panel::PanelData::default();
+    crate::hydrate_tracker::populate_tracker(
+        &db,
+        "fixture-repo",
+        std::path::Path::new("/fixture-worktree"),
+        &thegn_core::config::Config::default(),
+        &mut panel,
+    );
+    assert_eq!(panel.tracker_issues, vec![valid]);
+    // Filtering a stale cache is a read operation, not an implicit rewrite.
+    let cached = db.get_all_issue_cache("fixture-repo").unwrap();
+    assert_eq!(cached, vec![("jira".into(), json)]);
+}
+
+#[test]
 fn tracker_diff_emits_status_changes_and_blocker_resolved_once() {
     use std::collections::HashSet;
     use thegn_core::issue::{Issue, IssueStatus};
