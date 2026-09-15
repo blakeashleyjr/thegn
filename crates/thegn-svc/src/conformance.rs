@@ -214,7 +214,12 @@ mod tests {
                 provider: *k,
                 ..Default::default()
             };
-            let built = crate::issue::backend_from_account(&a, None).is_some();
+            let built = crate::issue::backend_from_account(
+                &a,
+                None,
+                crate::issue::http::TrackerHttpBudget::process(),
+            )
+            .is_some();
             assert_eq!(
                 built,
                 *k != IssueProviderKind::None && !k.is_reserved(),
@@ -293,6 +298,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                crate::issue::http::TrackerHttpBudget::process(),
             );
             if *kind == IssueProviderKind::None {
                 assert!(backend.is_none());

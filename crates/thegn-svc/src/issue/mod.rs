@@ -8,6 +8,7 @@
 
 pub mod capabilities;
 pub mod github;
+pub(crate) mod http;
 pub mod jira;
 pub mod kaneo;
 pub mod kaneo_auth;
@@ -15,6 +16,7 @@ pub mod linear;
 pub mod secret;
 
 use futures_util::future::BoxFuture;
+use std::sync::Arc;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 use thegn_core::seam::{ErrorClass, SeamError};
@@ -31,6 +33,9 @@ pub enum IssueError {
     Api(String),
     Subprocess(String),
     Parse(String),
+    Policy(&'static str),
+    Timeout(&'static str),
+    BodyLimit(&'static str),
 }
 
 impl std::fmt::Display for IssueError {
@@ -38,11 +43,16 @@ impl std::fmt::Display for IssueError {
         match self {
             IssueError::NotConfigured => write!(f, "no issue provider configured"),
             IssueError::Unsupported(op) => write!(f, "{op} is not supported by this provider"),
-            IssueError::Network(e) => write!(f, "network: {e}"),
+            // Reqwest errors may carry the full request URL, including query
+            // material. Keep tracker diagnostics static and redacted.
+            IssueError::Network(_) => write!(f, "network: tracker request failed"),
             IssueError::Auth(s) => write!(f, "auth: {s}"),
             IssueError::Api(s) => write!(f, "api: {s}"),
             IssueError::Subprocess(s) => write!(f, "subprocess: {s}"),
             IssueError::Parse(s) => write!(f, "parse: {s}"),
+            IssueError::Policy(s) => write!(f, "tracker policy: {s}"),
+            IssueError::Timeout(s) => write!(f, "tracker timeout: {s}"),
+            IssueError::BodyLimit(s) => write!(f, "tracker body limit: {s}"),
         }
     }
 }
@@ -70,6 +80,7 @@ impl SeamError for IssueError {
             IssueError::NotConfigured => ErrorClass::NotConfigured,
             IssueError::Auth(_) => ErrorClass::Auth,
             IssueError::Network(e) if e.is_connect() || e.is_timeout() => ErrorClass::Transient,
+            IssueError::Timeout(_) => ErrorClass::Transient,
             IssueError::Network(_) => ErrorClass::Other,
             IssueError::Subprocess(message)
                 if message
@@ -79,9 +90,11 @@ impl SeamError for IssueError {
             {
                 ErrorClass::NotInstalled
             }
-            IssueError::Api(_) | IssueError::Subprocess(_) | IssueError::Parse(_) => {
-                ErrorClass::Other
-            }
+            IssueError::Api(_)
+            | IssueError::Subprocess(_)
+            | IssueError::Parse(_)
+            | IssueError::Policy(_)
+            | IssueError::BodyLimit(_) => ErrorClass::Other,
         }
     }
 
@@ -183,12 +196,17 @@ pub trait IssueBackend: Send + Sync {
 pub(crate) fn backend_from_account(
     a: &IssueAccount,
     dir: Option<&std::path::Path>,
+    http_budget: Arc<http::TrackerHttpBudget>,
 ) -> Option<Box<dyn IssueBackend>> {
     match a.provider {
         IssueProviderKind::Linear => {
             let api_key = secret::resolve_account_token(&a.token, "linear").unwrap_or_default();
             let team_id = (!a.team_id.is_empty()).then(|| a.team_id.clone());
-            Some(Box::new(linear::LinearBackend::new(api_key, team_id)))
+            Some(Box::new(linear::LinearBackend::new(
+                api_key,
+                team_id,
+                http_budget,
+            )))
         }
         IssueProviderKind::Github => {
             let mut b = github::GitHubIssuesBackend::new(a.extra_flags.clone());
@@ -202,6 +220,7 @@ pub(crate) fn backend_from_account(
                 a.email.clone(),
                 api_token,
                 (!a.project_key.is_empty()).then(|| a.project_key.clone()),
+                http_budget,
             )))
         }
         IssueProviderKind::Kaneo => {
@@ -216,6 +235,7 @@ pub(crate) fn backend_from_account(
                 api_key,
                 (!a.workspace_id.is_empty()).then(|| a.workspace_id.clone()),
                 (!a.project_id.is_empty()).then(|| a.project_id.clone()),
+                http_budget,
             )))
         }
         IssueProviderKind::None => None,
@@ -266,7 +286,7 @@ impl IssueRouter {
     }
 
     pub fn from_config(cfg: &IssuesConfig) -> Self {
-        Self::from_config_at(cfg, None)
+        Self::from_config_with_http_budget(cfg, http::TrackerHttpBudget::process())
     }
 
     /// Like [`from_config`](Self::from_config), but anchors subprocess-backed
@@ -274,13 +294,30 @@ impl IssueRouter {
     /// resolve against that worktree instead of the process cwd. Callers
     /// fetching for a specific worktree should prefer this.
     pub fn from_config_at(cfg: &IssuesConfig, dir: Option<&std::path::Path>) -> Self {
+        Self::from_config_at_with_http_budget(cfg, dir, http::TrackerHttpBudget::process())
+    }
+
+    pub(crate) fn from_config_with_http_budget(
+        cfg: &IssuesConfig,
+        http_budget: Arc<http::TrackerHttpBudget>,
+    ) -> Self {
+        Self::from_config_at_with_http_budget(cfg, None, http_budget)
+    }
+
+    pub(crate) fn from_config_at_with_http_budget(
+        cfg: &IssuesConfig,
+        dir: Option<&std::path::Path>,
+        http_budget: Arc<http::TrackerHttpBudget>,
+    ) -> Self {
         let inner = cfg
             .active_accounts()
             .into_iter()
             .filter_map(|acct| {
-                backend_from_account(&acct, dir).map(|inner| AccountBackend {
-                    account: acct.name,
-                    inner,
+                backend_from_account(&acct, dir, Arc::clone(&http_budget)).map(|inner| {
+                    AccountBackend {
+                        account: acct.name,
+                        inner,
+                    }
                 })
             })
             .collect();

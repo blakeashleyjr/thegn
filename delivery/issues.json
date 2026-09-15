@@ -385,6 +385,13 @@
       ]
     },
     {
+      "issue": "THE-321",
+      "project": "Alpha Reliability & State Compatibility",
+      "changes": [
+        "centralize-tracker-http-policy"
+      ]
+    },
+    {
       "issue": "THE-343",
       "project": "Runtime Security & Host Architecture",
       "changes": [
