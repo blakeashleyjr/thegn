@@ -464,9 +464,25 @@ mod tests {
             sample(50, None, "unrelated", 1.0, 1),
         ];
         let s = snap(procs);
-        let r = rows(&s, view("needle", true));
-        let pids: Vec<u32> = r.iter().map(|x| x.pid).collect();
-        assert_eq!(pids, [10, 20, 30], "ancestry retained, unrelated dropped");
+        for sort in [ProcSort::Name, ProcSort::Pid] {
+            for desc in [false, true] {
+                let r = rows(
+                    &s,
+                    ProcSnapshotView {
+                        sort,
+                        desc,
+                        filter: "needle".into(),
+                        tree: true,
+                    },
+                );
+                assert_eq!(
+                    r.iter().map(|x| x.pid).collect::<Vec<_>>(),
+                    [10, 20, 30],
+                    "{sort:?} desc={desc}: ancestry retained, unrelated dropped"
+                );
+                assert_eq!(r.iter().map(|x| x.depth).collect::<Vec<_>>(), [0, 1, 2]);
+            }
+        }
     }
 
     #[test]
@@ -480,5 +496,39 @@ mod tests {
         let r = rows(&s, view("", true));
         // Both appear exactly once; the walk terminates.
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn tree_name_pid_keep_elided_roots_and_cycles_both_directions() {
+        let procs = vec![
+            sample(10, None, "alpha-root", 0.0, 0),
+            sample(20, Some(999), "orphan", 0.0, 0),
+            sample(30, Some(40), "cycle-a", 0.0, 0),
+            sample(40, Some(30), "cycle-b", 0.0, 0),
+        ];
+        for sort in [ProcSort::Name, ProcSort::Pid] {
+            for desc in [false, true] {
+                let r = rows(
+                    &snap(procs.clone()),
+                    ProcSnapshotView {
+                        sort,
+                        desc,
+                        filter: String::new(),
+                        tree: true,
+                    },
+                );
+                assert_eq!(
+                    r.iter().map(|x| x.pid).collect::<Vec<_>>(),
+                    if desc {
+                        [20, 10, 40, 30]
+                    } else {
+                        [10, 20, 30, 40]
+                    },
+                    "{sort:?} desc={desc}"
+                );
+                assert_eq!(r.iter().map(|x| x.depth).collect::<Vec<_>>(), [0, 0, 0, 1]);
+                assert!(r.iter().find(|x| x.pid == 20).unwrap().elided_parent);
+            }
+        }
     }
 }

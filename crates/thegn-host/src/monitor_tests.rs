@@ -498,22 +498,37 @@ fn process_sort_keys_render_both_directions_and_keep_confirmation_identity() {
         assert_eq!(ov.prefs.proc_sort, sort);
         assert_eq!(
             ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
-            descending
+            if ov.prefs.proc_desc {
+                descending
+            } else {
+                ascending
+            }
         );
-        assert!(headings(&ov)[0].1.contains(&format!("{label}↓")));
+        assert!(headings(&ov)[0].1.contains(&format!(
+            "{label}{}",
+            if ov.prefs.proc_desc { "↓" } else { "↑" }
+        )));
 
         assert_eq!(ch(&mut ov, 'r'), MonitorOutcome::PrefsChanged);
         ov.sync(&model, &hist, screen);
         assert_eq!(
             ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
-            ascending
+            if ov.prefs.proc_desc {
+                descending
+            } else {
+                ascending
+            }
         );
-        assert!(headings(&ov)[0].1.contains(&format!("{label}↑")));
+        assert!(headings(&ov)[0].1.contains(&format!(
+            "{label}{}",
+            if ov.prefs.proc_desc { "↓" } else { "↑" }
+        )));
     }
 
     // Sorting is complete before opening confirmation. A passive rank change
     // must leave the pending prompt bound to the sampled identity.
     ch(&mut ov, 'm');
+    ch(&mut ov, 'r');
     ov.sync(&model, &hist, screen);
     ch(&mut ov, 'x');
     let (pid, start_time, label) = match &ov.confirm {
@@ -525,12 +540,16 @@ fn process_sort_keys_render_both_directions_and_keep_confirmation_identity() {
         }) => (*pid, *start_time, label.clone()),
         other => panic!("expected signal confirmation, got {other:?}"),
     };
+    assert_eq!(
+        (pid, start_time, label.as_str()),
+        (17, 100, "pid 17 middle")
+    );
     let mut changed = model.clone();
     changed.procs.procs[2].rss_bytes = 400;
     ov.refresh(&changed, &ctx_at(&hist, screen));
     assert_eq!(
         ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
-        [42, 3, 17]
+        [17, 3, 42]
     );
     assert!(matches!(
         &ov.confirm,
