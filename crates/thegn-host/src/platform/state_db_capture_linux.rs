@@ -54,7 +54,7 @@ fn filesystem(file: &File) -> Result<i64, Error> {
     }
     // Linux filesystem magic values are 32-bit even when __fsword_t is wider;
     // normalize sign extension on a 32-bit build before classification.
-    Ok((unsafe { value.assume_init() }.f_type as i64) & 0xffff_ffff)
+    Ok(i64::from(unsafe { value.assume_init() }.f_type as u32))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,12 +273,11 @@ impl PresentObservation {
             match open_at(parent.as_raw_fd(), &sidecar.name) {
                 Ok(file) => {
                     let current = inspect(&file, false, self.chain.uid)?;
-                    if let Some((pinned, expected)) = &sidecar.observed {
-                        if current != *expected
-                            || inspect(pinned, false, self.chain.uid)? != *expected
-                        {
-                            return Err(Error::Changed);
-                        }
+                    if let Some((pinned, expected)) = &sidecar.observed
+                        && (current != *expected
+                            || inspect(pinned, false, self.chain.uid)? != *expected)
+                    {
+                        return Err(Error::Changed);
                     }
                     // Missing sidecars may legitimately be created by SQLite.
                     // They still must pass the same type/owner/FS/mode checks.
