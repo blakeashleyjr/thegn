@@ -501,8 +501,7 @@ mod tests {
             reqwest::Client::new()
                 .get("https://[invalid]/?token=NETWORK_SENTINEL")
                 .build()
-                .err()
-                .expect("invalid request URL should produce a reqwest error"),
+                .expect_err("invalid request URL should produce a reqwest error"),
         );
         let debug = format!("{error:?}");
         assert!(!debug.contains("NETWORK_SENTINEL"));

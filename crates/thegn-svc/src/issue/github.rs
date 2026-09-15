@@ -164,12 +164,9 @@ struct GhActor {
 }
 
 fn parse_ms(s: Option<&str>) -> i64 {
-    s.and_then(|s| match chrono::DateTime::parse_from_rfc3339(s) {
-        Ok(dt) => Some(dt),
-        Err(_) => None,
+    s.map_or(0, |value| {
+        chrono::DateTime::parse_from_rfc3339(value).map_or(0, |dt| dt.timestamp_millis())
     })
-    .map(|dt| dt.timestamp_millis())
-    .unwrap_or(0)
 }
 
 /// Extract `owner/repo` from a GitHub issue/PR URL.  The authority is parsed

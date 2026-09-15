@@ -701,12 +701,12 @@ impl IssueBackend for KaneoBackend {
             )
             .await?;
             let status = map_column_status(&created.status, &created.status, false);
-            Ok(task_to_domain(
+            task_to_domain(
                 created,
                 status,
                 &self.base_url,
                 self.workspace_id.as_deref(),
-            )?)
+            )
         })
     }
 
