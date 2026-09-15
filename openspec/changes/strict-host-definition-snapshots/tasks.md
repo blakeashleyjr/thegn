@@ -51,7 +51,7 @@ this scoped evidence. Reviewed local landing remains pending. THE-592 launch
 adapter integration and THE-603/THE-604/runtime obligations remain separate;
 this change is not an authority or issue-closure claim.
 
-- [ ] Complete reviewed local-main landing after root review.
+- [x] Complete reviewed local-main landing after root review.
 
 ## Remaining issue acceptance
 
@@ -62,3 +62,5 @@ prerequisite for the new authority adapter, not completed launch permission.
 Host opening/absence handling (THE-603), external store compatibility (THE-604),
 launch adapter integration (THE-592) and runtime containment remain separate
 obligations. No provider or launch execution occurs in these components/tests.
+
+Reviewed local-main landing completed at `a0f9730892931ce56c7c22aac18c0bfd390b892a`; the earlier landing hold is superseded. THE-592/THE-603/THE-604 obligations remain separate.

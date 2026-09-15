@@ -1083,7 +1083,7 @@
     },
     {
       "change": "strict-host-definition-snapshots",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "residual-split",
       "owners": [
         {
@@ -1091,7 +1091,8 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Strict persisted-host capture and bounded checked composition; source/review/native/specification/delivery gates complete for the exact tested source, reviewed local landing pending, with launch adapter integration owned by THE-592."
+      "summary": "THE-602 strict persisted capture and bounded checked composition delivered on local main a0f97308 after root and independent review. All 15 changed source/schema/env files match full05 tested source; original failures and corrected native/strict-lint evidence retained. THE-592 launch integration and THE-603/THE-604 remain separate.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "verify-gate-workspace",
