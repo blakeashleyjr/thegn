@@ -8,6 +8,7 @@
 
 pub mod capabilities;
 pub mod github;
+pub(crate) mod identity;
 pub mod jira;
 pub mod kaneo;
 pub mod kaneo_auth;
@@ -106,6 +107,34 @@ pub(crate) fn parse_due_date_ms(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp_millis())
+}
+
+/// Validate an issue row at the cache/router boundary.  This is syntax-only;
+/// account ownership and stale-response authority remain THE-324 concerns.
+pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
+    let expected = format!("{}:", issue.provider);
+    let key = issue
+        .id
+        .strip_prefix(&expected)
+        .ok_or_else(|| IssueError::Parse("issue id/provider namespace mismatch".into()))?;
+    match issue.provider.as_str() {
+        "github" => {
+            let body = key.strip_prefix("github:").unwrap_or(key);
+            if let Some((repo, number)) = body.rsplit_once('#') {
+                identity::github_repo(repo).map_err(IssueError::Parse)?;
+                identity::github_number(number).map_err(IssueError::Parse)?;
+            } else {
+                identity::github_number(body).map_err(IssueError::Parse)?;
+            }
+        }
+        "jira" => identity::jira_key(key).map_err(IssueError::Parse)?,
+        "kaneo" => identity::kaneo_id(key, "Kaneo task id").map_err(IssueError::Parse)?,
+        provider if provider.starts_with("plugin:") => {
+            identity::plugin_key(key).map_err(IssueError::Parse)?;
+        }
+        _ => identity::builtin_identity(key).map_err(IssueError::Parse)?,
+    }
+    Ok(())
 }
 
 /// Provider-agnostic issue tracker seam.
@@ -363,7 +392,19 @@ impl IssueRouter {
         let mut all = Vec::new();
         for b in &self.inner {
             match b.inner.list_issues(filter).await {
-                Ok(mut issues) => all.append(&mut issues),
+                Ok(issues) => match issues
+                    .into_iter()
+                    .map(|issue| {
+                        validate_issue_identity(&issue)?;
+                        Ok(issue)
+                    })
+                    .collect::<Result<Vec<_>, IssueError>>()
+                {
+                    Ok(mut valid) => all.append(&mut valid),
+                    Err(e) => {
+                        tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue list failed")
                 }
@@ -380,18 +421,26 @@ impl IssueRouter {
     ) -> Vec<(String, &'static str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
-            out.push((
-                b.account.clone(),
-                b.inner.provider_id(),
-                b.inner.list_issues(filter).await,
-            ));
+            let result = b.inner.list_issues(filter).await.and_then(|issues| {
+                issues
+                    .into_iter()
+                    .map(|issue| {
+                        validate_issue_identity(&issue)?;
+                        Ok(issue)
+                    })
+                    .collect()
+            });
+            out.push((b.account.clone(), b.inner.provider_id(), result));
         }
         out
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
         match self.backend_for_id(id) {
-            Some(b) => b.get_issue(id).await,
+            Some(b) => b.get_issue(id).await.and_then(|detail| {
+                validate_issue_identity(&detail.issue)?;
+                Ok(detail)
+            }),
             None => Err(self.id_miss(id)),
         }
     }
@@ -399,14 +448,20 @@ impl IssueRouter {
     /// Create an issue on the first configured provider.
     pub async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
         match self.inner.first() {
-            Some(b) => b.inner.create_issue(draft).await,
+            Some(b) => b.inner.create_issue(draft).await.and_then(|issue| {
+                validate_issue_identity(&issue)?;
+                Ok(issue)
+            }),
             None => Err(IssueError::NotConfigured),
         }
     }
 
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
         match self.backend_for_id(id) {
-            Some(b) => b.update_issue(id, patch).await,
+            Some(b) => b.update_issue(id, patch).await.and_then(|issue| {
+                validate_issue_identity(&issue)?;
+                Ok(issue)
+            }),
             None => Err(self.id_miss(id)),
         }
     }
@@ -445,7 +500,19 @@ impl IssueRouter {
         let mut all = Vec::new();
         for b in &self.inner {
             match b.inner.search(query, limit).await {
-                Ok(mut issues) => all.append(&mut issues),
+                Ok(issues) => match issues
+                    .into_iter()
+                    .map(|issue| {
+                        validate_issue_identity(&issue)?;
+                        Ok(issue)
+                    })
+                    .collect::<Result<Vec<_>, IssueError>>()
+                {
+                    Ok(mut valid) => all.append(&mut valid),
+                    Err(e) => {
+                        tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue search failed")
                 }
@@ -597,6 +664,25 @@ mod spec {
             r.backend_for_id("jira:PROJ-1").map(|b| b.provider_id()),
             Some("linear")
         );
+    }
+
+    #[test]
+    fn cache_boundary_rejects_cross_provider_and_malformed_ids() {
+        let mut issue: Issue = serde_json::from_value(serde_json::json!({
+            "id": "github:owner/repo#42",
+            "number": "42",
+            "provider": "github",
+            "title": "ok",
+            "status": "todo",
+            "priority": "low",
+            "url": ""
+        }))
+        .unwrap();
+        assert!(validate_issue_identity(&issue).is_ok());
+        issue.id = "github:owner/repo#0".into();
+        assert!(validate_issue_identity(&issue).is_err());
+        issue.provider = "jira".into();
+        assert!(validate_issue_identity(&issue).is_err());
     }
 
     #[test]

@@ -45,18 +45,35 @@ impl JiraBackend {
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!(
+    fn url(&self, path: &str) -> Result<String, IssueError> {
+        let mut base = reqwest::Url::parse(&self.base_url)
+            .map_err(|e| IssueError::Parse(format!("invalid Jira base URL: {e}")))?;
+        if !matches!(base.scheme(), "https" | "http")
+            || base.host_str().is_none()
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+        {
+            return Err(IssueError::Parse(
+                "Jira base URL must be an authenticated origin without query".into(),
+            ));
+        }
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let joined = format!(
             "{}/rest/api/3/{}",
-            self.base_url,
-            path.trim_start_matches('/')
-        )
+            base.path().trim_end_matches('/'),
+            route.trim_start_matches('/')
+        );
+        base.set_path(&joined);
+        base.set_query((!query.is_empty()).then_some(query));
+        Ok(base.to_string())
     }
 
     async fn get<R: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<R, IssueError> {
         let resp = self
             .client
-            .get(self.url(path))
+            .get(self.url(path)?)
             .header("Authorization", &self.auth)
             .header("Accept", "application/json")
             .send()
@@ -79,7 +96,7 @@ impl JiraBackend {
     ) -> Result<R, IssueError> {
         let resp = self
             .client
-            .post(self.url(path))
+            .post(self.url(path)?)
             .header("Authorization", &self.auth)
             .header("Content-Type", "application/json")
             .json(body)
@@ -100,7 +117,7 @@ impl JiraBackend {
     async fn put<B: Serialize>(&self, path: &str, body: &B) -> Result<(), IssueError> {
         let resp = self
             .client
-            .put(self.url(path))
+            .put(self.url(path)?)
             .header("Authorization", &self.auth)
             .header("Content-Type", "application/json")
             .json(body)
@@ -305,6 +322,20 @@ fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
     }
 }
 
+fn checked_jira_key(raw: &str) -> Result<&str, IssueError> {
+    super::identity::jira_key(raw).map_err(IssueError::Parse)
+}
+
+fn jira_path(key: &str, suffix: &str) -> Result<String, IssueError> {
+    checked_jira_key(key)?;
+    if !matches!(suffix, "" | "/transitions") {
+        return Err(IssueError::Parse(
+            "Jira path suffix contains an unstructured delimiter".into(),
+        ));
+    }
+    Ok(format!("issue/{key}{suffix}"))
+}
+
 const JIRA_FIELDS: &str =
     "summary,description,status,priority,assignee,labels,updated,duedate,comment";
 
@@ -358,7 +389,10 @@ impl IssueBackend for JiraBackend {
             Ok(result
                 .issues
                 .into_iter()
-                .map(jira_issue_to_domain)
+                .map(|issue| {
+                    checked_jira_key(&issue.key)?;
+                    Ok(jira_issue_to_domain(issue))
+                })
                 .collect())
         })
     }
@@ -366,8 +400,9 @@ impl IssueBackend for JiraBackend {
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
             let key = id.strip_prefix("jira:").unwrap_or(id);
+            checked_jira_key(key)?;
             let ji: JiraIssue = self
-                .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
+                .get(&format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?))
                 .await?;
             let comments = ji
                 .fields
@@ -406,6 +441,7 @@ impl IssueBackend for JiraBackend {
                     IssueError::Api("Jira create requires a project key in config".into())
                 })?
                 .to_string();
+            super::identity::jira_project(&project_key).map_err(IssueError::Parse)?;
 
             let priority_name = match draft.priority {
                 IssuePriority::Urgent => "Highest",
@@ -466,8 +502,12 @@ impl IssueBackend for JiraBackend {
             };
 
             let created: CreateResponse = self.post("issue", &body).await?;
+            checked_jira_key(&created.key)?;
             let ji: JiraIssue = self
-                .get(&format!("issue/{}?fields={JIRA_FIELDS}", created.key))
+                .get(&format!(
+                    "{}?fields={JIRA_FIELDS}",
+                    jira_path(&created.key, "")?
+                ))
                 .await?;
             Ok(jira_issue_to_domain(ji))
         })
@@ -480,11 +520,12 @@ impl IssueBackend for JiraBackend {
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
             let key = id.strip_prefix("jira:").unwrap_or(id);
+            checked_jira_key(key)?;
 
             // Status update via transitions.
             if let Some(status) = patch.status {
                 let transitions: JiraTransitions =
-                    self.get(&format!("issue/{key}/transitions")).await?;
+                    self.get(&jira_path(key, "/transitions")?).await?;
                 let target_cat = match status {
                     IssueStatus::Backlog | IssueStatus::Todo => "new",
                     IssueStatus::InProgress => "indeterminate",
@@ -515,7 +556,7 @@ impl IssueBackend for JiraBackend {
                 }
                 let _: serde_json::Value = self
                     .post(
-                        &format!("issue/{key}/transitions"),
+                        &jira_path(key, "/transitions")?,
                         &TransitionBody {
                             transition: TransitionId {
                                 id: trans.id.clone(),
@@ -537,7 +578,7 @@ impl IssueBackend for JiraBackend {
                     summary: String,
                 }
                 self.put(
-                    &format!("issue/{key}"),
+                    &jira_path(key, "")?,
                     &UpdateBody {
                         fields: UpdateFields {
                             summary: title.clone(),
@@ -548,8 +589,9 @@ impl IssueBackend for JiraBackend {
             }
 
             let ji: JiraIssue = self
-                .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
+                .get(&format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?))
                 .await?;
+            checked_jira_key(&ji.key)?;
             Ok(jira_issue_to_domain(ji))
         })
     }
@@ -576,7 +618,10 @@ impl IssueBackend for JiraBackend {
             Ok(result
                 .issues
                 .into_iter()
-                .map(jira_issue_to_domain)
+                .map(|issue| {
+                    checked_jira_key(&issue.key)?;
+                    Ok(jira_issue_to_domain(issue))
+                })
                 .collect())
         })
     }
