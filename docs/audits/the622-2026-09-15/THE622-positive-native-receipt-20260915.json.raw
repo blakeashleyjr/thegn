@@ -1,0 +1,9 @@
+{
+  "binary_sha256": "b473720166b2eefcefe3e9d99250ee943a060c55349c990064f69d628da1b9a3",
+  "source": "27c0ccad5399c84612fa35aea7841b0d4209458c",
+  "later_source_equivalence": "dd5e4d07 changes Linux host only",
+  "log": "/tmp/thegn-THE622-positive-parallel-libtest-20260915.log",
+  "log_sha256": "dcd47db0f4e48dc23ed3d85473fd510ac86700b5fef92f451ec1dea28db73657",
+  "exit_code": 0,
+  "libtest_threads": 4
+}

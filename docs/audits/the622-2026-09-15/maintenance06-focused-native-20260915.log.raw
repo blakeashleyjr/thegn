@@ -1,0 +1,318 @@
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/thegn-media)
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/thegn-svc)
+   Compiling gtui-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/gtui-core)
+   Compiling thegn-metrics v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/thegn-metrics)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/thegn-core)
+   Compiling gtui-query v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/gtui-query)
+   Compiling tg-kit v0.1.0 (/tmp/thegn-maintenance-06-combined-20260915/crates/tg-kit)
+   Compiling gtui-render v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/gtui-render)
+   Compiling gtui-app v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/gtui-app)
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/thegn-host)
+   Compiling termwiz v0.23.3 (/tmp/thegn-maintenance-06-combined-20260915/vendor/termwiz)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/hyperlink.rs:247:18
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match> {
+    |                  ^^^^^            ^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                  |
+    |                  the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match<'_>> {
+    |                                                     ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/image.rs:567:17
+    |
+567 |     pub fn data(&self) -> MutexGuard<ImageDataType> {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+567 |     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
+    |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:12:12
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>>;
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>>;
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:22:9
+   |
+22 |         &self,
+   |         ^^^^^ the lifetime is elided here
+...
+27 |     ) -> Option<SearchResult>;
+   |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+27 |     ) -> Option<SearchResult<'_>>;
+   |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:88:12
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>> {
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>> {
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/lineedit/history.rs:109:9
+    |
+109 |         &self,
+    |         ^^^^^ the lifetime is elided here
+...
+114 |     ) -> Option<SearchResult> {
+    |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+114 |     ) -> Option<SearchResult<'_>> {
+    |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:511:25
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<Line>> {
+    |                         ^^^^^         ^^^^^^^^^ the same lifetime is hidden here
+    |                         |
+    |                         the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+    |                                           +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:526:24
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<[Change]>) {
+    |                        ^^^^^ the lifetime is elided here       ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+    |                                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/clusterline.rs:165:17
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter<'_> {
+    |                                              ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/line.rs:609:19
+    |
+609 |     pub fn as_str(&self) -> Cow<str> {
+    |                   ^^^^^     ^^^^^^^^ the same lifetime is hidden here
+    |                   |
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+609 |     pub fn as_str(&self) -> Cow<'_, str> {
+    |                                 +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> vendor/termwiz/src/surface/line/line.rs:1014:21
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef> {
+     |                     ^^^^^ the lifetime is elided here   ^^^^^^^ the same lifetime is hidden here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+     |                                                                ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/terminal/mod.rs:74:27
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+   |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                           |
+   |                           the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+   |                                                                 ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/terminal/unix.rs:389:27
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+    |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                           |
+    |                           the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+    |                                                                 ++++
+
+warning: `termwiz` (lib) generated 13 warnings (run `cargo fix --lib -p termwiz` to apply 13 suggestions)
+   Compiling gtui-embed v0.1.0-alpha.2 (/tmp/thegn-maintenance-06-combined-20260915/crates/gtui-embed)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 04s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 74d7f6f1-01ef-46bb-9207-96ece285636a with nextest profile: default
+    Starting 121 tests across 39 binaries (8220 tests skipped)
+        PASS [   0.210s] (  1/121) thegn-core config_forge::tests::forge_config_defaults_to_github
+        PASS [   0.213s] (  2/121) thegn-core connectivity::tests::changed_failure_policy_applies_to_next_evidence
+        PASS [   0.220s] (  3/121) thegn-core config_forge::tests::forge_kind_round_trips_as_str_and_default
+        PASS [   0.224s] (  4/121) thegn-core config_forge::tests::forge_kind_parses_canon_and_alias
+        PASS [   0.204s] (  5/121) thegn-core connectivity::tests::config_reload_child
+        PASS [   0.196s] (  6/121) thegn-core connectivity::tests::flips_offline_after_threshold
+        PASS [   0.207s] (  7/121) thegn-core connectivity::tests::edge_returns_only_on_transition
+        PASS [   0.232s] (  8/121) thegn-core connectivity::tests::config_reload_global_state_is_consistent
+        PASS [   0.171s] (  9/121) thegn-core connectivity::tests::hot_conn_round_trips
+        PASS [   0.178s] ( 10/121) thegn-core connectivity::tests::global_wrapper_executes_every_path
+        PASS [   0.207s] ( 11/121) thegn-core connectivity::tests::online_and_unknown_never_probe
+        PASS [   0.208s] ( 12/121) thegn-core connectivity::tests::policy_reload_preserves_evidence_and_recovery
+        PASS [   0.191s] ( 13/121) thegn-core connectivity::tests::probe_throttled_to_cadence
+        PASS [   0.198s] ( 14/121) thegn-core connectivity::tests::success_resets_streak_below_threshold
+        PASS [   0.202s] ( 15/121) thegn-core connectivity::tests::success_restores_immediately
+        PASS [   0.244s] ( 16/121) thegn-core connectivity::tests::thresholds_clamp_to_minimum
+        PASS [   0.171s] ( 17/121) thegn-core forge::tests::error_classes_and_messages
+        PASS [   0.170s] ( 18/121) thegn-core forge::tests::fetch_pr_composes_status_and_threads
+        PASS [   0.163s] ( 19/121) thegn-core forge::tests::optional_ops_default_to_unsupported_and_never_panic
+        PASS [   0.182s] ( 20/121) thegn-core forge::tests::pr_panel_folds_errors_into_states
+        PASS [   0.195s] ( 21/121) thegn-core forge::tests::small_types
+        PASS [   0.396s] ( 22/121) thegn-core host_config_checked::tests::actual_capture_contributes_unshadowed_host_and_preserves_declarative_winner
+        PASS [   0.297s] ( 23/121) thegn-core host_config_checked::tests::bounds::existing_project_schema_branches_remain_shared
+        PASS [   0.204s] ( 24/121) thegn-core host_config_checked::tests::bounds::semantic_observation_restores_nested_and_unwound_fixture_custody
+        PASS [   0.185s] ( 25/121) thegn-core host_config_checked::tests::bounds::streaming_byte_counter_refuses_one_over_without_retaining_payload
+        PASS [   0.731s] ( 26/121) thegn-core host_config_checked::tests::bounds::complete_config_string_and_key_limits_precede_semantic_work
+        PASS [   0.186s] ( 27/121) thegn-core host_config_checked::tests::bounds::structure_depth_node_container_key_and_utf8_limits_are_inclusive
+        PASS [   0.407s] ( 28/121) thegn-core host_config_checked::tests::captured_revision_is_immutable_and_new_capture_refuses_new_corruption
+        PASS [   0.309s] ( 29/121) thegn-core host_config_checked::tests::explicit_environment_and_undefined_host_fallback_keep_existing_semantics
+        PASS [   0.410s] ( 30/121) thegn-core host_config_checked::tests::first_error_stops_before_later_profile_clone_and_legacy_order_is_retained
+        PASS [   0.753s] ( 31/121) thegn-core host_config_checked::tests::disabled_sections_and_non_pane_hosts_are_not_new_global_restrictions
+        PASS [   0.786s] ( 32/121) thegn-core host_config_checked::tests::final_semantics_schema_and_debug_are_checked_without_echoing_inputs
+        PASS [   0.770s] ( 33/121) thegn-core host_config_checked::tests::malformed_shadowed_source_refuses_before_composition_or_semantic_entry
+        PASS [   0.934s] ( 34/121) thegn-core host_config_checked::tests::pipeline_limit_admits_actual_chain_and_refuses_cycle_or_oversized_graph
+        PASS [   0.472s] ( 35/121) thegn-core host_config_checked::tests::recursive::deep_rejected_input_stays_borrowed_and_is_disposed_by_owned_fixture
+        PASS [   0.355s] ( 36/121) thegn-core host_config_checked::tests::recursive::null_plugin_caps_also_consume_preflight_work
+        PASS [   1.073s] ( 37/121) thegn-core host_config_checked::tests::recursive::both_recursive_families_use_actual_flattened_depth_before_serialization
+        PASS [   0.267s] ( 38/121) thegn-core host_config_checked::tests::recursive::recursive_node_budget_is_shared_across_both_config_families
+        PASS [   1.898s] ( 39/121) thegn-core host_config_checked::tests::profile_rule_and_effective_visit_limits_are_inclusive_before_any_clone
+        PASS [   0.649s] ( 40/121) thegn-core host_config_checked::tests::recursive::skipped_build_structural_refusal_does_not_clone_or_discard_input
+        PASS [   0.538s] ( 41/121) thegn-core host_db_capture::tests::busy_and_diagnostics_do_not_echo_sql_or_paths
+        PASS [   1.144s] ( 42/121) thegn-core host_config_checked::tests::replacement_counts_effective_rules_but_still_charges_original_clone_bytes
+        PASS [   0.182s] ( 43/121) thegn-core host_db_capture::tests::missing_and_invalid_sources_are_not_absent_or_fabricated_snapshots
+        PASS [   0.524s] ( 44/121) thegn-core host_db_capture::tests::malformed_and_version_errors_remain_typed
+        PASS [   0.289s] ( 45/121) thegn-core host_db_capture::tests::query_like_literal_filenames_are_explicitly_unsupported
+        PASS [   5.344s] ( 46/121) thegn-core host_config_checked::tests::bounds::complete_configs_at_byte_limit_pass_and_post_merge_growth_is_refused
+        PASS [   0.264s] ( 47/121) thegn-core host_db_capture::tests::wal_capture_sees_uncheckpointed_rows_without_changing_logical_state
+        PASS [   0.235s] ( 48/121) thegn-core host_db_snapshot::tests::active_transaction_is_not_committed_or_rolled_back_by_snapshot
+        PASS [   0.224s] ( 49/121) thegn-core host_db_snapshot::tests::capture_failure_rolls_back_only_its_owned_transaction_without_policy_changes
+        PASS [   0.227s] ( 50/121) thegn-core host_db_snapshot::tests::corrupt_database_is_not_schema_zero_or_empty_snapshot
+        PASS [   0.538s] ( 51/121) thegn-core host_db_snapshot::tests::byte_limits_check_metadata_and_aggregate_before_copy
+        PASS [   0.468s] ( 52/121) thegn-core host_db_snapshot::tests::current_empty_and_sorted_definitions_use_object_safe_store_seam
+        PASS [   0.276s] ( 53/121) thegn-core host_db_snapshot::tests::duplicate_names_refuse_even_identical_definitions
+        PASS [   0.267s] ( 54/121) thegn-core host_db_snapshot::tests::existing_busy_policy_is_respected_without_claiming_query_deadline
+        PASS [   0.724s] ( 55/121) thegn-core host_db_snapshot::tests::definition_count_and_sparse_inventory_have_independent_exact_limits
+        PASS [   3.304s] ( 56/121) thegn-core host_config_checked::tests::recursive::skipped_build_and_issue_restriction_survive_and_share_the_byte_budget
+        PASS [   0.185s] ( 57/121) thegn-core host_db_snapshot::tests::null_inventory_is_not_a_definition_but_empty_named_definition_is_invalid
+        PASS [   0.342s] ( 58/121) thegn-core host_db_snapshot::tests::malformed_rows_are_not_laundered_through_legacy_host_defs
+        PASS [   0.223s] ( 59/121) thegn-core host_db_snapshot::tests::ordinary_required_schema_is_checked_without_reading_schema_sql
+        PASS [   0.701s] ( 60/121) thegn-core host_db_snapshot::tests::malformed_persisted_definitions_refuse_even_when_declarative_host_shadows_name
+        PASS [   0.329s] ( 61/121) thegn-core host_db_snapshot::tests::schema_strings_and_column_count_are_bounded_before_owned_copies
+        PASS [   0.258s] ( 62/121) thegn-core host_db_snapshot::tests::sql_types_utf8_and_control_names_fail_without_contents_in_error
+        PASS [   0.262s] ( 63/121) thegn-core host_db_snapshot::tests::temporary_table_cannot_shadow_verified_main_table
+        PASS [   0.262s] ( 64/121) thegn-core host_db_snapshot::tests::versions_are_read_fallibly_inside_owned_transaction
+        PASS [   0.249s] ( 65/121) thegn-core host_definition_snapshot::tests::cached_schema_preserves_generic_validator_results
+        PASS [   0.211s] ( 66/121) thegn-core host_definition_snapshot::tests::duplicate_keys_are_rejected_before_value_collapse
+        PASS [   0.194s] ( 67/121) thegn-core host_definition_snapshot::tests::errors_never_echo_private_definition_contents
+        PASS [   0.386s] ( 68/121) thegn-core host_db_snapshot::tests::wal_writer_cannot_mix_new_version_schema_or_data_into_existing_snapshot
+        PASS [   0.204s] ( 69/121) thegn-core host_definition_snapshot::tests::json_and_row_budgets_refuse_without_truncation
+        PASS [   0.197s] ( 70/121) thegn-core host_definition_snapshot::tests::names_are_checked_and_snapshot_is_sorted
+        PASS [   0.195s] ( 71/121) thegn-core host_definition_snapshot::tests::raw_schema_validation_precedes_lenient_host_decode
+        PASS [   0.243s] ( 72/121) thegn-host::static_commands_process static_cli_support::child_observation_error_revokes_later_signals_and_waits
+        PASS [   0.715s] ( 73/121) thegn-host::static_commands_process configured_get_still_loads_file_and_runs_legacy_profile_startup
+        PASS [   0.939s] ( 74/121) thegn-host::static_commands_process unix::early_closed_stdout_keeps_schema_catalog_and_completion_exit_success
+        PASS [   1.613s] ( 75/121) thegn-host::static_commands_process paths_alias_registration_help_and_version_keep_their_output_contract
+        PASS [   0.161s] ( 76/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::actual_filesystem_classification_is_not_a_test_injected_label
+        PASS [   0.200s] ( 77/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::actual_post_read_guard_refuses_replacement_without_returning_copied_data
+        PASS [   0.176s] ( 78/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::existing_sidecar_disappearance_holds_but_new_regular_sidecar_is_checked
+        PASS [   0.257s] ( 79/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::missing_ancestor_replacement_and_permission_change_hold
+        PASS [   2.385s] ( 80/121) thegn-host::static_commands_process static_output_ignores_missing_malformed_config_and_invalid_overrides
+        PASS [   2.327s] ( 81/121) thegn-host::static_commands_process static_output_precedes_legacy_migration_and_both_profile_selectors
+        PASS [   0.300s] ( 82/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::missing_base_and_missing_parent_creation_refuse_before_sql
+        PASS [   0.260s] ( 83/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::missing_only_is_absent_and_does_not_create_parents
+        PASS [   0.224s] ( 84/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::orphan_sidecars_preclude_absence_before_and_after_observation
+        PASS [   0.168s] ( 85/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::ownership_and_io_classification_do_not_launder_other_users_or_errors
+        PASS [   0.187s] ( 86/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::permission_restore_guard_survives_assertion_unwind
+        PASS [   0.221s] ( 87/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::production_route_does_not_ignore_globally_writable_ancestors
+        PASS [   0.219s] ( 88/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::raw_traversal_relative_uri_and_component_budgets_refuse
+        PASS [   0.245s] ( 89/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::replacements_are_detectors_not_a_consumed_sqlite_inode_proof
+        PASS [   0.235s] ( 90/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::shared_modes_and_sidecar_aliases_refuse_without_contents_in_errors
+        PASS [   0.371s] ( 91/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::rooted_real_wal_helper_captures_latest_definitions_and_typed_errors
+        PASS [   0.274s] ( 92/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::symlinks_and_static_special_files_never_reach_sqlite
+        PASS [   0.340s] ( 93/121) thegn-host::bin/thegn platform::state_db_capture::linux::tests::unreadable_parent_and_database_hold_then_recover_after_permission_restore
+        PASS [   0.306s] ( 94/121) thegn-svc forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback
+        PASS [   0.203s] ( 95/121) thegn-svc forge::native::regression_tests::helper_capacity_stays_reserved_until_ownership_is_released
+        PASS [   0.463s] ( 96/121) thegn-svc forge::native::regression_tests::cancelling_token_future_terminates_owned_group
+        PASS [   0.256s] ( 97/121) thegn-svc forge::native::regression_tests::public_host_validation_precedes_credentials
+        PASS [   0.177s] ( 98/121) thegn-svc forge::native::regression_tests::reaper_spawn_failure_retains_child_and_capacity
+        PASS [   0.160s] ( 99/121) thegn-svc forge::native::regression_tests::sdk_error_classification_drives_the_real_ladder
+        PASS [   2.528s] (100/121) thegn-host::static_commands_process unix::static_commands_do_not_open_fifo_configuration_but_configured_siblings_do
+        PASS [   0.175s] (101/121) thegn-svc forge::native::regression_tests::sdk_graphql_envelopes_fall_through_without_offline_evidence
+        PASS [   0.272s] (102/121) thegn-svc forge::native::regression_tests::timeout_and_transport_failure_feed_native_circuit
+        PASS [   0.247s] (103/121) thegn-svc forge::native::regression_tests::token_helper_success_failure_and_output_bound
+        PASS [   0.402s] (104/121) thegn-svc forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens
+        PASS [   0.250s] (105/121) thegn-svc forge::native::regression_tests::typed_http_answers_are_not_global_network_failures
+        PASS [   0.217s] (106/121) thegn-svc forge::native::tests::graphql_no_pr_node_maps_to_no_pr
+        PASS [   0.358s] (107/121) thegn-svc forge::native::regression_tests::unknown_wait_ownership_is_reaped_without_group_signal
+        PASS [   0.639s] (108/121) thegn-svc forge::native::regression_tests::token_timeout_kills_descendants_even_after_parent_exit
+        PASS [   0.200s] (109/121) thegn-svc forge::native::tests::graphql_pr_list_parses_headers
+        PASS [   0.173s] (110/121) thegn-svc forge::native::tests::graphql_pr_maps_fields_and_rolls_up_checks
+        PASS [   0.218s] (111/121) thegn-svc forge::native::tests::native_branch_resolution_is_local_rev_parse
+        PASS [   0.187s] (112/121) thegn-svc forge::native::tests::owner_repo_parses_ssh_and_https_forms
+        PASS [   0.188s] (113/121) thegn-svc forge::native::tests::token_is_trimmed
+        PASS [   0.189s] (114/121) thegn-svc forge::native::tests::token_precedence_prefers_gh_token_then_github_token_then_cli
+        PASS [   0.173s] (115/121) thegn-svc forge::tests::auth_failure_is_final
+        PASS [   0.179s] (116/121) thegn-svc forge::tests::authorship_falls_back_as_one_operation_and_auth_errors_remain_final
+        PASS [   0.181s] (117/121) thegn-svc forge::tests::forge_set_routes_by_host
+        PASS [   0.175s] (118/121) thegn-svc forge::tests::github_ladder_is_native_over_cli_and_kinds_agree_with_reserved
+        PASS [   0.206s] (119/121) thegn-svc forge::tests::native_answer_wins
+        PASS [   0.208s] (120/121) thegn-svc forge::tests::not_configured_falls_through_to_cli
+        PASS [   0.278s] (121/121) thegn-svc forge::tests::remote_host_parses_every_url_shape
+────────────
+     Summary [  13.963s] 121 tests run: 121 passed, 8220 skipped

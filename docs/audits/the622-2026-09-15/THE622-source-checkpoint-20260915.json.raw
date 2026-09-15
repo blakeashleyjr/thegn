@@ -1,0 +1,40 @@
+{
+  "base": "cb8c3f77f7b06d926d17f7b05fe579bc640b4b84",
+  "guard_prerequisite": "0180c225d56921fd851936d7ba5ef208762da757",
+  "moved_block_original_sha256": "665f61bf542a35f96fdabdc534f2775c522c949784ce32479321a5b38ec46d77",
+  "new_shared_source_sha256": "c82ae54690938b7f65fb794335e0580e30b06426c3c92fdad77a47abba719864",
+  "custody_equal_except_pub_super_whitespace_trailing_signature_comma": true,
+  "existing_observation_regression_byte_identical": true,
+  "native_rs_only_adds_cfg_test_registration": true,
+  "existing_sdk_fixture_only_pub_super_visibility": true,
+  "native_executed": false,
+  "files": {
+    "crates/thegn-host/tests/static_cli_support/mod.rs": "8853e91c5531dc9b074acfe7660dba2be0511abbbf2c7510671e02a8b34c2d33",
+    "crates/thegn-svc/src/forge/native.rs": "b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944",
+    "crates/thegn-svc/src/forge/native_global_connectivity_tests.rs": "b0f5e8e4374dd7075b6e64533fd01b10762a8953fea53b46f8dea4f3207a925c",
+    "crates/thegn-svc/src/forge/native_regression_tests.rs": "ff7bc3e96bd1e0d0b1febe4d78323e2ca72f77341ba1d23ca29ef0cb41da4b82",
+    "delivery/index.json": "e7cfe16545e89539aa72c7df3c9f0962fc4a837d7309cb913a34b86344ef7d4d",
+    "delivery/issues.json": "488d1440cd4dbeecf07532aac77b1d38d5b40639cf4202eaa1e867112cd92eba",
+    "openspec/changes/verify-native-forge-connectivity/design.md": "7485889c5eb5b69665339ce86ed3e7f8fa7e93d5168b7d4dc09308a22d25d8ca",
+    "openspec/changes/verify-native-forge-connectivity/proposal.md": "34424d5d0fb5b019b144b95c0abd5ba7cf87413cfc3bda01ca5ce5a0359f8194",
+    "openspec/changes/verify-native-forge-connectivity/specs/forge/spec.md": "802cb2fc56cabdfedbc06da8396655b6204a0385df123288e4f03ba65ca1d0aa",
+    "openspec/changes/verify-native-forge-connectivity/tasks.md": "7e1cde37a17ae2da2d5435dd811a644db88c2f7ae2b657ae8a93c5a5fa058f93",
+    "openspec/changes/verify-native-forge-connectivity/validation.md": "6cd42088158125da7ea74503af8f81a00ee063fac6833644ac04ff601d11e063",
+    "test/support/owned_test_child.rs": "c82ae54690938b7f65fb794335e0580e30b06426c3c92fdad77a47abba719864"
+  },
+  "commit": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "clean": true,
+  "checks": {
+    "source_ratchets": {
+      "log": "/tmp/thegn-THE622-source-ratchets-final-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "exit_code": 0
+    },
+    "openspec": {
+      "log": "/tmp/thegn-THE622-openspec-20260915.log",
+      "sha256": "5d686d89008ad2df9da2a49542f4e3431a8e64cb582cf4c5504652265a364bbb",
+      "exit_code": 0
+    },
+    "rustfmt_and_diff_check": "passed; source only"
+  }
+}

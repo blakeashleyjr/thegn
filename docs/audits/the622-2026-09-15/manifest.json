@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "artifact": "THE-622 durable source/native evidence manifest",
+  "created_at_utc": "2026-09-15T16:10:00Z",
+  "candidate_base": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "canonical_metadata_ancestry": "060afad525a14547336e8d2170803a66af877812",
+  "scope": [
+    "THE-622 verify-native-forge-connectivity"
+  ],
+  "raw_files": [
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-build-20260915.jsonl.raw",
+      "sha256": "3babb53e652c319b677f671451bf51672981197dd12cb3597b108d7a8d56b3a5"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-build-20260915.log.raw",
+      "sha256": "0a462a007f1b97a80bd00e93858034780bf116375f26d045e7a6b8695aa931ca"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-independent-review-luna-20260915.json.raw",
+      "sha256": "9418543b679f0dc1540b2a61315fc23680c9be9aa578e4ff617fb1c5b1fe925c"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-independent-review-luna-20260915.md.raw",
+      "sha256": "ee767ee4fbd4ebb3a03b9d47bf7ec845b0f9d9b47e6a30a513f80de0813e4beb"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-native-20260915.log.raw",
+      "sha256": "11e5b378b65879db8a8fa15d788905a288cef118b2b9aa6d707e8a4b7ae69ebb"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-native-receipt-20260915.json.raw",
+      "sha256": "fa07e88d5ac996f8f8dc4e4349dbee099df4f50710cf35ab3f94de506c0a6286"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-source-20260915.json.raw",
+      "sha256": "0cdab023863be21ebd220f6fa805addcfd334ab0d6d064c15210947d26e0c45a"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-source-20260915.md.raw",
+      "sha256": "6f74ea10f53ff2ce38acfa0953d57ba6463f2b244cd2627f619c7ab3fb180b4b"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-counterfactual-svc-tests.d.raw",
+      "sha256": "2f5994a3362dc1dae6b76e54edf01d8e08f7ff49781229d6205d461ca0487f1b"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-final-native-independent-review-luna-20260915.json.raw",
+      "sha256": "f697953e599406f383dabed750c29d4936823c9e001e794c709c81df6cb9cadf"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-final-native-independent-review-luna-20260915.md.raw",
+      "sha256": "edad66e1b73b32870e5bea5c47d1c7811247b9353d83b6ee414ce34660085b11"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-fresh-issue-20260915.json.raw",
+      "sha256": "c0e4dd61509ee9fb02edc92c580adfdb561832925a235a904f2b65b9d6506ccc"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-implementation-review-20260915.md.raw",
+      "sha256": "2b85e778e69b19769f3a8c02c0e3fbef2e569edd115b6c45981298f1d57af6c1"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-independent-source-review-20260915.md.raw",
+      "sha256": "b463916a2ae267c1b90f0c0c59b0322ba3c358f7a9e180ac3f4fd0ef42a3c3bc"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-openspec-20260915.log.raw",
+      "sha256": "5d686d89008ad2df9da2a49542f4e3431a8e64cb582cf4c5504652265a364bbb"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-original-custody-block-20260915.rs.raw",
+      "sha256": "665f61bf542a35f96fdabdc534f2775c522c949784ce32479321a5b38ec46d77"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-positive-native-receipt-20260915.json.raw",
+      "sha256": "facf2edd98c264396020d9b2ff0f479b6889c235aebfeab5e13a5a8bee957780"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-positive-parallel-libtest-20260915.log.raw",
+      "sha256": "dcd47db0f4e48dc23ed3d85473fd510ac86700b5fef92f451ec1dea28db73657"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-primary-source-approval-20260915.json.raw",
+      "sha256": "d9b7fea05c67e0d1a8f0d664cce50d114ac1b519016dfddb34e7613853502828"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-source-checkpoint-20260915.json.raw",
+      "sha256": "5d8831b53a5556f4b50d2ce0d97926e07c14b600c1dc388bcbdf30f55b5b8559"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-source-ratchets-20260915.log.raw",
+      "sha256": "be349b7bec670aeffcd8b385b677922c16f4c88367db5a0de1e1ca69b7265160"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/maintenance06-corrected-clippy-20260915.log.raw",
+      "sha256": "bf7f8cd96cdf9f7b7c1df3405bfe00715327da9ad90c8f5cd686c7f1d9b340c4"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/maintenance06-corrected-gates-receipt-20260915.json.raw",
+      "sha256": "1351eb903a054ce2e04bf8ca14f4b5891762eb563f6302f7307333e360fbb241"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/maintenance06-focused-native-20260915.log.raw",
+      "sha256": "94e6693c851cc1d62de35c092483b5d6fc26110b91f728826b7b89e9b5cf88c3"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/maintenance06-focused-native-receipt-20260915.json.raw",
+      "sha256": "374ac6cf961718a9db82f022108583b4adcf04b7a6b22e755fd12c7635dfb7a2"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/maintenance06-original-clippy-20260915.log.raw",
+      "sha256": "a2cea0597b9991f391f56d1d1e1cf78d4b2455f04f74373d6cb1e87245810e88"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-final-landing-adversarial-luna-20260915.md.raw",
+      "sha256": "3ee7c2e3f4bfa3b14b8115822dc358532350c0c8807ac12962e4d0c060cab631"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-final-landing-adversarial-luna-20260915.json.raw",
+      "sha256": "bb9a6daaa21b90af8d4120e71e27648c5ed43cbe9e1852d40f61046deeb789cd"
+    }
+  ],
+  "external_pinned_artifacts": [
+    {
+      "kind": "counterfactual_binary",
+      "path": "/tmp/thegn-THE622-counterfactual-native-evidence-20260915/svc-tests",
+      "sha256": "8e7e00aadf41bfade055717aa6f7b0be100fdc0db758885997c8eab149ef09a0",
+      "retained_outside_candidate": true
+    },
+    {
+      "kind": "positive_binary",
+      "path": "/tmp/thegn-THE622-positive-native-evidence-20260915/svc-tests",
+      "sha256": "b473720166b2eefcefe3e9d99250ee943a060c55349c990064f69d628da1b9a3",
+      "retained_outside_candidate": true
+    }
+  ],
+  "omitted": [
+    "No binaries are committed. No source/native/build operation is repeated."
+  ],
+  "reviewed_local_main_landing": "7c05e3a47cc6a1e32dd2100fcc7dfc8fd6befd05"
+}

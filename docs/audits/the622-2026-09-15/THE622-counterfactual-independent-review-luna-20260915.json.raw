@@ -1,0 +1,52 @@
+{
+  "review": "THE622 exact counterfactual independent source review",
+  "reviewer": "luna",
+  "date": "2026-09-15",
+  "checkout": "/tmp/thegn-THE622-counterfactual-20260915",
+  "parent_commit": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "native_executed": false,
+  "original_candidate_mutated": false,
+  "patch": {
+    "path": "/tmp/thegn-THE622-counterfactual-20260915.patch",
+    "sha256": "65f8e3d70af720a58f205e6c88b3e92aa405066661db7d2787b92e572bf629f1",
+    "files_changed": 1,
+    "lines_deleted": 1,
+    "target": "GhCircuit::record_success global report_success statement only"
+  },
+  "source_hashes": {
+    "before_native_rs": "b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944",
+    "after_native_rs": "dce13599ccf296b4f9bd1d8bc4a0152b163042ace3cd5dc1665fe4198e70da69",
+    "fixture": "b0f5e8e4374dd7075b6e64533fd01b10762a8953fea53b46f8dea4f3207a925c",
+    "connectivity": "0c7f8a7c594dfd443e3033450a0b42e4dda89f8d995fdd5dcea2bdbd1af7afd3",
+    "owned_child": "c82ae54690938b7f65fb794335e0580e30b06426c3c92fdad77a47abba719864",
+    "cargo_toml": "5f090efbbff6886c2f4c294888d934ddb30aff05953c8c9bef64160c1612a84e",
+    "cargo_lock": "9d6aec3f25e6bef65ad59937627fa27550f7ecfdf7f10b1834d29e540668a324"
+  },
+  "selectors": {
+    "parent": "forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback",
+    "child": "forge::native::global_connectivity_tests::isolated_sdk_connectivity_child",
+    "child_independent_selection_allowed": false
+  },
+  "invariants_verified": {
+    "global_seed_helper_unchanged": true,
+    "matrix_fixture_unchanged": true,
+    "child_marker_and_owned_custody_unchanged": true,
+    "local_circuit_reset_remains": true,
+    "only_report_success_removed_from_native": true,
+    "strict_diff_check": true
+  },
+  "expected_failure": {
+    "first_case": "errors-only reachable GraphQL answer",
+    "assertion": "reachable errors-only must publish global success: left Offline, right Online",
+    "parent": "SDK fixture failed after nonzero child status and bounded diagnostics",
+    "reason": "seed(true) leaves global Offline/one; reached_server path no longer calls GhCircuit global report_success"
+  },
+  "not_proven_by_counterfactual": [
+    "later reachable cases",
+    "fallback call counts",
+    "transport controls",
+    "complete eleven-case receipt",
+    "explicit normal-success TempDir::close"
+  ],
+  "verdict": "source-approved for the specified counterfactual execution; no landing approval"
+}
