@@ -10,9 +10,9 @@
 - [x] Run all five new core regressions and existing host-definition compatibility tests; preserve core coverage requirements.
 - [x] Execute the old-body counterfactual and confirm a meaningful precedence failure with tests retained.
 - [x] Run strict OpenSpec and reciprocal delivery validation, source ratchets and applicable lint gates.
-- [ ] Record exact native evidence and reviewed local-main landing before closing THE-598; preserve THE-602/THE-603/THE-592 boundaries.
+- [x] Record exact native evidence and reviewed local-main landing before closing THE-598; preserve THE-602/THE-603/THE-592 boundaries.
       Before a future PR, run `just ci` as required by CLAUDE.md. This local-only
       landing requires the scoped native, lint, source/OpenSpec and delivery gates
       above; no unexecuted workspace coverage or full-CI result is claimed.
 
-[Original receipts and independent reviews](../../../docs/audits/maintenance-04-2026-09-15/manifest.json) retain the invalid stale-artifact attempt, corrected six-test pass and rebuilt two-failure counterfactual. No full-a446 or coverage-percentage claim is made; strict Clippy and final metadata checks passed; reviewed local-main landing remains pending.
+[Original receipts and independent reviews](../../../docs/audits/maintenance-04-2026-09-15/manifest.json) retain the invalid stale-artifact attempt, corrected six-test pass and rebuilt two-failure counterfactual. No full-a446 or coverage-percentage claim is made; strict Clippy and final metadata checks passed; reviewed implementation landed on local main at `c0d3d860a22db0a7fddafb3d338bf40b25248ade`. Tracker closure/readback remains pending.

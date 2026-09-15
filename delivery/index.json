@@ -679,7 +679,7 @@
     },
     {
       "change": "fix-static-cli-startup",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -687,7 +687,8 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Static CLI repair has current native, old-binary counterfactual and strict lint/source evidence; reviewed local-main landing remains pending. Checked admission/source workers remain separate."
+      "summary": "Static CLI startup boundary delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade with scoped native/counterfactual and strict lint/source evidence. Checked admission/source workers remain separate.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "harden-live-diagnostics-and-forge",
@@ -868,19 +869,20 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "THE-219 retry-progress and private actual-CLI acceptance have segmented native/counterfactual and strict lint/source evidence; local-main landing remains pending. THE-608/THE-610 shared obligations remain separate."
+      "summary": "THE-219 finite held-retry and private actual-drain acceptance delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade. THE-608/THE-610 shared diagnostic and remaining acceptance obligations are not completed by this record."
     },
     {
       "change": "preserve-winning-host-environment",
-      "lifecycle": "active",
-      "disposition": "verification-gated",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-598",
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Winning-host synthesis has native precedence/compatibility, rebuilt counterfactual and strict lint/source evidence; reviewed local-main landing remains pending. Strict capture and launch composition are separate."
+      "summary": "Winning-host environment synthesis delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade with native precedence/compatibility, rebuilt counterfactual and strict lint/source evidence. Strict capture and launch composition remain separate.",
+      "delivered_at": "2026-09-14"
     },
     {
       "change": "repair-kitty-stream-parser",
