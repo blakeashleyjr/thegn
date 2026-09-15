@@ -1121,6 +1121,18 @@
       "delivered_at": "2026-09-15"
     },
     {
+      "change": "validate-tracker-identifiers",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-322",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Admit bounded tracker identities before provider paths, options, caches, and control transport."
+    },
+    {
       "change": "verify-gate-workspace",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

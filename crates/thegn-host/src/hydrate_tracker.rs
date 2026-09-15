@@ -101,7 +101,10 @@ pub(crate) fn spawn_issue_cache_refresh(
                 .ok()
                 .flatten()
                 .and_then(|(j, _)| serde_json::from_str(&j).ok())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())
+                .collect();
             for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked)
             {
                 let _ = crate::automation_events::emit(&db, kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
@@ -249,6 +252,7 @@ pub(crate) fn populate_tracker(
     if let Ok(cached) = db.get_all_issue_cache(repo_key) {
         for (_provider, json) in cached {
             if let Ok(mut issues) = serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&json) {
+                issues.retain(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok());
                 panel.tracker_issues.append(&mut issues);
             }
         }

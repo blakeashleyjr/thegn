@@ -385,6 +385,13 @@
       ]
     },
     {
+      "issue": "THE-322",
+      "project": "Client API & Remote Access",
+      "changes": [
+        "validate-tracker-identifiers"
+      ]
+    },
+    {
       "issue": "THE-343",
       "project": "Runtime Security & Host Architecture",
       "changes": [

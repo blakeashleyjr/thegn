@@ -611,8 +611,9 @@ impl ControlClient {
 
     /// `GET /v1/issues/{id}` — one issue with detail/comments.
     pub async fn issue_get(&self, id: &str) -> Result<thegn_core::issue::IssueDetail> {
+        let encoded = crate::issue::identity::encode_control_segment(id).map_err(|e| anyhow!(e))?;
         let v = self
-            .request("GET", &format!("/v1/issues/{id}"), None)
+            .request("GET", &format!("/v1/issues/{encoded}"), None)
             .await?;
         Ok(serde_json::from_value(v)?)
     }
@@ -623,10 +624,11 @@ impl ControlClient {
         id: &str,
         patch: &thegn_core::issue::IssuePatch,
     ) -> Result<thegn_core::issue::Issue> {
+        let encoded = crate::issue::identity::encode_control_segment(id).map_err(|e| anyhow!(e))?;
         let v = self
             .request(
                 "POST",
-                &format!("/v1/issues/{id}"),
+                &format!("/v1/issues/{encoded}"),
                 Some(serde_json::to_value(patch)?),
             )
             .await?;
@@ -635,9 +637,10 @@ impl ControlClient {
 
     /// `POST /v1/issues/{id}/comment` — add a comment.
     pub async fn issue_comment(&self, id: &str, body: &str) -> Result<()> {
+        let encoded = crate::issue::identity::encode_control_segment(id).map_err(|e| anyhow!(e))?;
         self.request(
             "POST",
-            &format!("/v1/issues/{id}/comment"),
+            &format!("/v1/issues/{encoded}/comment"),
             Some(json!({ "body": body })),
         )
         .await

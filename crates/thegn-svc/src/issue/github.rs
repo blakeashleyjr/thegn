@@ -50,6 +50,19 @@ impl GitHubIssuesBackend {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    fn validate_extra_flags(&self) -> Result<(), IssueError> {
+        let mut iter = self.extra_flags.iter();
+        while let Some(flag) = iter.next() {
+            if flag == "--repo" {
+                let repo = iter.next().ok_or_else(|| {
+                    IssueError::Parse("GitHub --repo flag requires owner/repo".into())
+                })?;
+                super::identity::github_repo(repo).map_err(IssueError::Parse)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---- JSON shapes from `gh issue list --json` --------------------------------
@@ -98,44 +111,83 @@ fn parse_ms(s: Option<&str>) -> i64 {
         .unwrap_or(0)
 }
 
-/// Extract `owner/repo` from a GitHub issue/PR URL
-/// (`https://github.com/owner/repo/issues/42` → `owner/repo`). Returns `None`
-/// for URLs that don't match, so the id falls back to the bare-number form.
+/// Extract `owner/repo` from a GitHub issue/PR URL.  The authority is parsed
+/// structurally so a lookalike such as `github.com.attacker/…` cannot become a
+/// repository. `GH_HOST` keeps the `gh` CLI's enterprise host convention.
 fn repo_from_url(url: &str) -> Option<String> {
-    let rest = url.split("github.com/").nth(1)?;
-    let mut parts = rest.trim_start_matches('/').split('/');
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let expected = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".into());
+    if !host.eq_ignore_ascii_case(expected.trim()) {
+        return None;
+    }
+    let mut parts = parsed.path_segments()?;
     let owner = parts.next().filter(|s| !s.is_empty())?;
     let repo = parts.next().filter(|s| !s.is_empty())?;
-    Some(format!("{owner}/{repo}"))
+    let repo = format!("{owner}/{repo}");
+    super::identity::github_repo(&repo).ok()?;
+    Some(repo)
+}
+
+fn validated_repo_from_url(url: &str) -> Result<String, IssueError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| IssueError::Parse(format!("invalid GitHub issue URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| IssueError::Parse("GitHub issue URL has no host".into()))?;
+    let expected = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".into());
+    if !matches!(parsed.scheme(), "https" | "http")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !host.eq_ignore_ascii_case(expected.trim())
+    {
+        return Err(IssueError::Parse(
+            "GitHub issue URL authority is not the configured host".into(),
+        ));
+    }
+    repo_from_url(url).ok_or_else(|| IssueError::Parse("GitHub issue URL lacks owner/repo".into()))
 }
 
 /// Split an issue id back into `(Some(owner/repo), number)`. Accepts both the
 /// scoped `github:owner/repo#42` form (carries the repo so get/close/edit hit
 /// the right repo) and the legacy bare `github:42` / `42` form (no repo).
-fn split_id(id: &str) -> (Option<&str>, &str) {
+fn split_id(id: &str) -> Result<(Option<&str>, &str), IssueError> {
     let body = id.strip_prefix("github:").unwrap_or(id);
     match body.rsplit_once('#') {
-        Some((repo, number)) if !repo.is_empty() => (Some(repo), number),
-        _ => (None, body),
+        Some((repo, number)) if !repo.is_empty() => {
+            super::identity::github_repo(repo).map_err(IssueError::Parse)?;
+            super::identity::github_number(number).map_err(IssueError::Parse)?;
+            Ok((Some(repo), number))
+        }
+        Some(_) => Err(IssueError::Parse("malformed scoped GitHub issue id".into())),
+        None => {
+            super::identity::github_number(body).map_err(IssueError::Parse)?;
+            Ok((None, body))
+        }
     }
 }
 
-fn gh_issue_to_domain(gi: GhIssue) -> Issue {
+fn gh_issue_to_domain(gi: GhIssue) -> Result<Issue, IssueError> {
+    let number = gi.number.to_string();
+    super::identity::github_number(&number).map_err(IssueError::Parse)?;
     let status = match gi.state.as_str() {
         "CLOSED" => IssueStatus::Done,
         _ => IssueStatus::Todo,
     };
     // Carry owner/repo in the id (`github:owner/repo#N`) so later get/update/
     // search can pass `--repo` and never resolve `gh` against the process cwd —
-    // which could close the wrong repo's issue. Falls back to the bare-number
-    // form when the URL is unparseable.
-    let id = match repo_from_url(&gi.url) {
-        Some(repo) => format!("github:{repo}#{}", gi.number),
-        None => format!("github:{}", gi.number),
-    };
-    Issue {
-        id,
-        number: gi.number.to_string(),
+    // which could close the wrong repo's issue. An unparseable response URL is
+    // rejected above rather than downgraded to an unscoped number.
+    let repo = validated_repo_from_url(&gi.url)?;
+    Ok(Issue {
+        id: format!("github:{repo}#{number}"),
+        number: number.clone(),
         provider: "github".into(),
         title: gi.title,
         body: gi.body,
@@ -150,7 +202,7 @@ fn gh_issue_to_domain(gi: GhIssue) -> Issue {
         // but a milestone date is not an issue deadline) — `due_at_ms` stays
         // `None`, so the `overdue` notification kind never fires for GitHub.
         ..Default::default()
-    }
+    })
 }
 
 const GH_LIST_FIELDS: &str = "number,title,state,body,assignees,labels,url,updatedAt";
@@ -185,22 +237,24 @@ impl IssueBackend for GitHubIssuesBackend {
             // `gh issue list` falls back to the process cwd's repo, which is not the
             // active worktree — so unscoped fetches leak issues from other repos.
             if let Some(repo) = filter.repo.as_deref().filter(|r| !r.is_empty()) {
+                super::identity::github_repo(repo).map_err(IssueError::Parse)?;
                 args.extend(["--repo", repo]);
             }
             // Include extra flags configured by the user.
+            self.validate_extra_flags()?;
             let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
             args.extend(extra);
 
             let json = self.gh(&args)?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(issues.into_iter().map(gh_issue_to_domain).collect())
+            issues.into_iter().map(gh_issue_to_domain).collect()
         })
     }
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
-            let (repo, number) = split_id(id);
+            let (repo, number) = split_id(id)?;
             let mut args: Vec<&str> = vec![
                 "issue",
                 "view",
@@ -235,7 +289,7 @@ impl IssueBackend for GitHubIssuesBackend {
                 })
                 .collect();
             Ok(IssueDetail {
-                issue: gh_issue_to_domain(detail.issue),
+                issue: gh_issue_to_domain(detail.issue)?,
                 comments,
             })
         })
@@ -261,10 +315,11 @@ impl IssueBackend for GitHubIssuesBackend {
                 .next()
                 .ok_or_else(|| IssueError::Parse("unexpected gh issue create output".into()))?
                 .to_string();
+            super::identity::github_number(&number).map_err(IssueError::Parse)?;
             let json = self.gh(&["issue", "view", &number, "--json", GH_LIST_FIELDS])?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(gh_issue_to_domain(gi))
+            Ok(gh_issue_to_domain(gi)?)
         })
     }
 
@@ -274,7 +329,7 @@ impl IssueBackend for GitHubIssuesBackend {
         patch: &'a IssuePatch,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
-            let (repo, number) = split_id(id);
+            let (repo, number) = split_id(id)?;
             // Scope every mutation to the issue's own repo — without `--repo`, `gh`
             // resolves against the process cwd and can close/edit the wrong repo's
             // issue #N.
@@ -307,7 +362,7 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(gh_issue_to_domain(gi))
+            Ok(gh_issue_to_domain(gi)?)
         })
     }
 
@@ -330,12 +385,13 @@ impl IssueBackend for GitHubIssuesBackend {
             ];
             // Apply the user's extra flags (e.g. `--repo owner/repo`) so search is
             // scoped the same way list_issues is, rather than falling back to cwd.
+            self.validate_extra_flags()?;
             let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
             args.extend(extra);
             let json = self.gh(&args)?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(issues.into_iter().map(gh_issue_to_domain).collect())
+            issues.into_iter().map(gh_issue_to_domain).collect()
         })
     }
 }
@@ -365,7 +421,7 @@ mod tests {
             "updatedAt": "1970-01-01T00:00:06Z"
         }))
         .unwrap();
-        let issue = gh_issue_to_domain(gi);
+        let issue = gh_issue_to_domain(gi).unwrap();
         // The id now carries owner/repo so mutations can pass `--repo`.
         assert_eq!(issue.id, "github:o/r#42");
         assert_eq!(issue.number, "42");
@@ -389,8 +445,8 @@ mod tests {
             repo_from_url("https://github.com/my-org/my.repo/issues/1").as_deref(),
             Some("my-org/my.repo")
         );
-        // Enterprise / non-github.com host or malformed URL ⇒ no repo (falls
-        // back to bare-number id).
+        // Enterprise / non-github.com host or malformed URL is not accepted by
+        // the default GitHub authority parser.
         assert_eq!(repo_from_url("https://example.com/o/r/issues/1"), None);
         assert_eq!(repo_from_url("not a url"), None);
         assert_eq!(repo_from_url("https://github.com/o"), None);
@@ -399,10 +455,10 @@ mod tests {
     #[test]
     fn split_id_round_trips_scoped_and_bare_ids() {
         // Scoped id: repo is recovered for `--repo`, number is bare.
-        assert_eq!(split_id("github:o/r#42"), (Some("o/r"), "42"));
+        assert_eq!(split_id("github:o/r#42").unwrap(), (Some("o/r"), "42"));
         // Legacy bare ids (with or without prefix) carry no repo.
-        assert_eq!(split_id("github:42"), (None, "42"));
-        assert_eq!(split_id("42"), (None, "42"));
+        assert_eq!(split_id("github:42").unwrap(), (None, "42"));
+        assert_eq!(split_id("42").unwrap(), (None, "42"));
         // An id built from a real issue round-trips through split_id.
         let gi: GhIssue = serde_json::from_value(json!({
             "number": 99,
@@ -411,9 +467,23 @@ mod tests {
             "url": "https://github.com/acme/widgets/issues/99"
         }))
         .unwrap();
-        let id = gh_issue_to_domain(gi).id;
+        let id = gh_issue_to_domain(gi).unwrap().id;
         assert_eq!(id, "github:acme/widgets#99");
-        assert_eq!(split_id(&id), (Some("acme/widgets"), "99"));
+        assert_eq!(split_id(&id).unwrap(), (Some("acme/widgets"), "99"));
+        assert!(split_id("github:acme/widgets#0").is_err());
+        assert!(split_id("github:acme/widgets#42#43").is_err());
+    }
+
+    #[test]
+    fn malformed_response_url_does_not_downgrade_to_bare_id() {
+        let gi: GhIssue = serde_json::from_value(json!({
+            "number": 42,
+            "title": "bad authority",
+            "state": "OPEN",
+            "url": "https://github.com.attacker/o/r/issues/42"
+        }))
+        .unwrap();
+        assert!(gh_issue_to_domain(gi).is_err());
     }
 
     #[test]
@@ -425,7 +495,7 @@ mod tests {
             "url": "https://github.com/o/r/issues/7"
         }))
         .unwrap();
-        let issue = gh_issue_to_domain(gi);
+        let issue = gh_issue_to_domain(gi).unwrap();
         assert_eq!(issue.status, IssueStatus::Done);
         assert_eq!(issue.body, None);
         assert!(issue.assignees.is_empty());
