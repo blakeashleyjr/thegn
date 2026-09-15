@@ -222,11 +222,16 @@ impl PluginIssueBackend {
         serde_json::from_value(out).map_err(|e| IssueError::Api(format!("bad {op} reply: {e}")))
     }
 
-    fn validate_issue(&self, issue: Issue) -> Result<Issue, IssueError> {
+    fn checked_input<'a>(&self, id: &'a str) -> Result<&'a str, IssueError> {
         let prefix = format!("{}:", self.provider_id);
-        let key = issue.id.strip_prefix(&prefix).ok_or_else(|| {
-            IssueError::Parse("plugin returned an issue from another provider".into())
+        let key = id.strip_prefix(&prefix).ok_or_else(|| {
+            IssueError::Parse("plugin issue id does not match the exact plugin namespace".into())
         })?;
+        crate::issue::identity::plugin_key(key).map_err(IssueError::Parse)
+    }
+
+    fn validate_issue(&self, issue: Issue) -> Result<Issue, IssueError> {
+        let key = self.checked_input(&issue.id)?;
         crate::issue::identity::plugin_key(key).map_err(IssueError::Parse)?;
         if issue.provider != self.provider_id {
             return Err(IssueError::Parse(
@@ -264,8 +269,7 @@ impl IssueBackend for PluginIssueBackend {
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
-            crate::issue::identity::plugin_key(id.strip_prefix("plugin:").unwrap_or(id))
-                .map_err(IssueError::Parse)?;
+            self.checked_input(id)?;
             self.validate_detail(self.op("get_issue", serde_json::json!({ "id": id }))?)
         })
     }
@@ -290,8 +294,7 @@ impl IssueBackend for PluginIssueBackend {
                 "id": id,
                 "patch": serde_json::to_value(patch).unwrap_or_default(),
             });
-            crate::issue::identity::plugin_key(id.strip_prefix("plugin:").unwrap_or(id))
-                .map_err(IssueError::Parse)?;
+            self.checked_input(id)?;
             self.validate_issue(self.op("update_issue", args)?)
         })
     }
@@ -319,8 +322,7 @@ impl IssueBackend for PluginIssueBackend {
             return Box::pin(async { Err(IssueError::unsupported("add_comment")) });
         }
         Box::pin(async move {
-            crate::issue::identity::plugin_key(id.strip_prefix("plugin:").unwrap_or(id))
-                .map_err(IssueError::Parse)?;
+            self.checked_input(id)?;
             self.op::<serde_json::Value>(
                 "add_comment",
                 serde_json::json!({ "id": id, "body": body }),
@@ -338,8 +340,7 @@ impl IssueBackend for PluginIssueBackend {
             return Box::pin(async { Err(IssueError::unsupported("attach_label")) });
         }
         Box::pin(async move {
-            crate::issue::identity::plugin_key(id.strip_prefix("plugin:").unwrap_or(id))
-                .map_err(IssueError::Parse)?;
+            self.checked_input(id)?;
             self.op::<serde_json::Value>(
                 "attach_label",
                 serde_json::json!({ "id": id, "label": label }),
@@ -357,8 +358,7 @@ impl IssueBackend for PluginIssueBackend {
             return Box::pin(async { Err(IssueError::unsupported("detach_label")) });
         }
         Box::pin(async move {
-            crate::issue::identity::plugin_key(id.strip_prefix("plugin:").unwrap_or(id))
-                .map_err(IssueError::Parse)?;
+            self.checked_input(id)?;
             self.op::<serde_json::Value>(
                 "detach_label",
                 serde_json::json!({ "id": id, "label": label }),

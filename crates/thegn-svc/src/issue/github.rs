@@ -54,9 +54,14 @@ impl GitHubIssuesBackend {
     fn validate_extra_flags(&self) -> Result<(), IssueError> {
         let mut iter = self.extra_flags.iter();
         while let Some(flag) = iter.next() {
-            if flag == "--repo" {
+            let inline = flag
+                .strip_prefix("--repo=")
+                .or_else(|| flag.strip_prefix("-R="));
+            if let Some(repo) = inline {
+                super::identity::github_repo(repo).map_err(IssueError::Parse)?;
+            } else if flag == "--repo" || flag == "-R" {
                 let repo = iter.next().ok_or_else(|| {
-                    IssueError::Parse("GitHub --repo flag requires owner/repo".into())
+                    IssueError::Parse("GitHub --repo/-R flag requires owner/repo".into())
                 })?;
                 super::identity::github_repo(repo).map_err(IssueError::Parse)?;
             }
@@ -106,52 +111,64 @@ struct GhActor {
 }
 
 fn parse_ms(s: Option<&str>) -> i64 {
-    s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0)
+    s.and_then(|s| match chrono::DateTime::parse_from_rfc3339(s) {
+        Ok(dt) => Some(dt),
+        Err(_) => None,
+    })
+    .map(|dt| dt.timestamp_millis())
+    .unwrap_or(0)
 }
 
 /// Extract `owner/repo` from a GitHub issue/PR URL.  The authority is parsed
 /// structurally so a lookalike such as `github.com.attacker/…` cannot become a
 /// repository. `GH_HOST` keeps the `gh` CLI's enterprise host convention.
-fn repo_from_url(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
+fn issue_repo_number_from_url(
+    url: &str,
+    configured_host: Option<&str>,
+) -> Option<(String, String)> {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return None,
+    };
     if !matches!(parsed.scheme(), "https" | "http")
         || !parsed.username().is_empty()
         || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
     {
         return None;
     }
     let host = parsed.host_str()?;
-    let expected = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".into());
-    if !host.eq_ignore_ascii_case(expected.trim()) {
+    let expected = configured_host.unwrap_or("github.com").trim();
+    if expected.is_empty() || expected.contains('/') || !host.eq_ignore_ascii_case(expected) {
         return None;
     }
-    let mut parts = parsed.path_segments()?;
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let repo = parts.next().filter(|s| !s.is_empty())?;
-    let repo = format!("{owner}/{repo}");
-    super::identity::github_repo(&repo).ok()?;
-    Some(repo)
+    let parts: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
+    if parts.len() != 4 || !matches!(parts[2], "issues" | "pull") {
+        return None;
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    if super::identity::github_repo(&repo).is_err()
+        || super::identity::github_number(parts[3]).is_err()
+    {
+        return None;
+    }
+    Some((repo, parts[3].to_string()))
 }
 
-fn validated_repo_from_url(url: &str) -> Result<String, IssueError> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| IssueError::Parse(format!("invalid GitHub issue URL: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| IssueError::Parse("GitHub issue URL has no host".into()))?;
-    let expected = std::env::var("GH_HOST").unwrap_or_else(|_| "github.com".into());
-    if !matches!(parsed.scheme(), "https" | "http")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || !host.eq_ignore_ascii_case(expected.trim())
-    {
-        return Err(IssueError::Parse(
-            "GitHub issue URL authority is not the configured host".into(),
-        ));
-    }
-    repo_from_url(url).ok_or_else(|| IssueError::Parse("GitHub issue URL lacks owner/repo".into()))
+fn repo_from_url_with_host(url: &str, configured_host: Option<&str>) -> Option<String> {
+    issue_repo_number_from_url(url, configured_host).map(|(repo, _)| repo)
+}
+
+fn validated_repo_number_from_url(url: &str) -> Result<(String, String), IssueError> {
+    let configured = match std::env::var("GH_HOST") {
+        Ok(host) => Some(host),
+        Err(_) => None,
+    };
+    issue_repo_number_from_url(url, configured.as_deref()).ok_or_else(|| {
+        IssueError::Parse("GitHub issue URL is not a valid configured host/repo issue route".into())
+    })
 }
 
 /// Split an issue id back into `(Some(owner/repo), number)`. Accepts both the
@@ -174,6 +191,17 @@ fn split_id(id: &str) -> Result<(Option<&str>, &str), IssueError> {
 }
 
 fn gh_issue_to_domain(gi: GhIssue) -> Result<Issue, IssueError> {
+    let configured = match std::env::var("GH_HOST") {
+        Ok(host) => Some(host),
+        Err(_) => None,
+    };
+    gh_issue_to_domain_with_host(gi, configured.as_deref())
+}
+
+fn gh_issue_to_domain_with_host(
+    gi: GhIssue,
+    configured_host: Option<&str>,
+) -> Result<Issue, IssueError> {
     let number = gi.number.to_string();
     super::identity::github_number(&number).map_err(IssueError::Parse)?;
     let status = match gi.state.as_str() {
@@ -184,7 +212,13 @@ fn gh_issue_to_domain(gi: GhIssue) -> Result<Issue, IssueError> {
     // search can pass `--repo` and never resolve `gh` against the process cwd —
     // which could close the wrong repo's issue. An unparseable response URL is
     // rejected above rather than downgraded to an unscoped number.
-    let repo = validated_repo_from_url(&gi.url)?;
+    let (repo, url_number) = issue_repo_number_from_url(&gi.url, configured_host)
+        .ok_or_else(|| IssueError::Parse("GitHub issue URL has invalid authority/route".into()))?;
+    if url_number != number {
+        return Err(IssueError::Parse(
+            "GitHub issue number does not match its response URL".into(),
+        ));
+    }
     Ok(Issue {
         id: format!("github:{repo}#{number}"),
         number: number.clone(),
@@ -308,15 +342,20 @@ impl IssueBackend for GitHubIssuesBackend {
             } else {
                 args.extend(["--body", ""]);
             }
-            // gh issue create prints the URL; fetch the number from it.
+            // gh issue create prints the URL. Keep its exact repository
+            // authority for the follow-up view; never downgrade malformed
+            // output to a bare number or the process cwd.
             let url = self.gh(&args)?.trim().to_string();
-            let number = url
-                .rsplit('/')
-                .next()
-                .ok_or_else(|| IssueError::Parse("unexpected gh issue create output".into()))?
-                .to_string();
-            super::identity::github_number(&number).map_err(IssueError::Parse)?;
-            let json = self.gh(&["issue", "view", &number, "--json", GH_LIST_FIELDS])?;
+            let (repo, number) = validated_repo_number_from_url(&url)?;
+            let json = self.gh(&[
+                "issue",
+                "view",
+                &number,
+                "--repo",
+                &repo,
+                "--json",
+                GH_LIST_FIELDS,
+            ])?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
             Ok(gh_issue_to_domain(gi)?)
@@ -421,7 +460,7 @@ mod tests {
             "updatedAt": "1970-01-01T00:00:06Z"
         }))
         .unwrap();
-        let issue = gh_issue_to_domain(gi).unwrap();
+        let issue = gh_issue_to_domain_with_host(gi, Some("github.com")).unwrap();
         // The id now carries owner/repo so mutations can pass `--repo`.
         assert_eq!(issue.id, "github:o/r#42");
         assert_eq!(issue.number, "42");
@@ -438,18 +477,58 @@ mod tests {
     #[test]
     fn repo_from_url_extracts_owner_repo() {
         assert_eq!(
-            repo_from_url("https://github.com/o/r/issues/42").as_deref(),
+            repo_from_url_with_host("https://github.com/o/r/issues/42", Some("github.com"))
+                .as_deref(),
             Some("o/r")
         );
         assert_eq!(
-            repo_from_url("https://github.com/my-org/my.repo/issues/1").as_deref(),
+            repo_from_url_with_host(
+                "https://github.com/my-org/my.repo/issues/1",
+                Some("github.com")
+            )
+            .as_deref(),
             Some("my-org/my.repo")
         );
         // Enterprise / non-github.com host or malformed URL is not accepted by
         // the default GitHub authority parser.
-        assert_eq!(repo_from_url("https://example.com/o/r/issues/1"), None);
-        assert_eq!(repo_from_url("not a url"), None);
-        assert_eq!(repo_from_url("https://github.com/o"), None);
+        assert_eq!(
+            repo_from_url_with_host("https://example.com/o/r/issues/1", Some("github.com")),
+            None
+        );
+        assert_eq!(
+            repo_from_url_with_host("not a url", Some("github.com")),
+            None
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://github.com/o", Some("github.com")),
+            None
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://github.com:443/o/r/issues/1", Some("github.com")),
+            None
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://github.com/o/r/issues/1?x=1", Some("github.com")),
+            None
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://github.com/o/r/tree/1", Some("github.com")),
+            None
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://ghe.example/o/r/issues/1", Some("ghe.example")),
+            Some("o/r".into())
+        );
+    }
+
+    #[test]
+    fn extra_repo_flag_forms_are_checked() {
+        let mut backend = GitHubIssuesBackend::new(vec!["-R".into(), "o/r".into()]);
+        assert!(backend.validate_extra_flags().is_ok());
+        backend.extra_flags = vec!["--repo=o/r".into()];
+        assert!(backend.validate_extra_flags().is_ok());
+        backend.extra_flags = vec!["-R=../r".into()];
+        assert!(backend.validate_extra_flags().is_err());
     }
 
     #[test]
@@ -467,7 +546,9 @@ mod tests {
             "url": "https://github.com/acme/widgets/issues/99"
         }))
         .unwrap();
-        let id = gh_issue_to_domain(gi).unwrap().id;
+        let id = gh_issue_to_domain_with_host(gi, Some("github.com"))
+            .unwrap()
+            .id;
         assert_eq!(id, "github:acme/widgets#99");
         assert_eq!(split_id(&id).unwrap(), (Some("acme/widgets"), "99"));
         assert!(split_id("github:acme/widgets#0").is_err());
@@ -483,7 +564,7 @@ mod tests {
             "url": "https://github.com.attacker/o/r/issues/42"
         }))
         .unwrap();
-        assert!(gh_issue_to_domain(gi).is_err());
+        assert!(gh_issue_to_domain_with_host(gi, Some("github.com")).is_err());
     }
 
     #[test]
@@ -495,7 +576,7 @@ mod tests {
             "url": "https://github.com/o/r/issues/7"
         }))
         .unwrap();
-        let issue = gh_issue_to_domain(gi).unwrap();
+        let issue = gh_issue_to_domain_with_host(gi, Some("github.com")).unwrap();
         assert_eq!(issue.status, IssueStatus::Done);
         assert_eq!(issue.body, None);
         assert!(issue.assignees.is_empty());

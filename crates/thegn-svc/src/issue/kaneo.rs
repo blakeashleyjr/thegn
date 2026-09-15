@@ -70,10 +70,33 @@ impl KaneoBackend {
             ));
         }
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let route = route.trim_start_matches('/');
+        for segment in route.split('/') {
+            if segment.is_empty() || matches!(segment, "." | "..") {
+                return Err(IssueError::Parse(
+                    "Kaneo route contains an invalid path segment".into(),
+                ));
+            }
+            super::identity::builtin_segment(segment, "Kaneo route segment")
+                .map_err(IssueError::Parse)?;
+        }
         let base_path = base.path().trim_end_matches('/').to_owned();
-        let joined = format!("{base_path}/api/{}", route.trim_start_matches('/'));
+        let joined = format!("{base_path}/api/{route}");
         base.set_path(&joined);
-        base.set_query((!query.is_empty()).then_some(query));
+        base.set_query(None);
+        if !query.is_empty() {
+            let mut pairs = base.query_pairs_mut();
+            for pair in query.split('&') {
+                let (key, value) = pair.split_once('=').ok_or_else(|| {
+                    IssueError::Parse("Kaneo query must contain key=value pairs".into())
+                })?;
+                super::identity::builtin_segment(key, "Kaneo query key")
+                    .map_err(IssueError::Parse)?;
+                super::identity::builtin_segment(value, "Kaneo query value")
+                    .map_err(IssueError::Parse)?;
+                pairs.append_pair(key, value);
+            }
+        }
         Ok(base.to_string())
     }
 
@@ -366,12 +389,34 @@ fn parse_ms(s: Option<&str>) -> i64 {
 /// `base_url/api`; when the web client lives elsewhere this link may not
 /// resolve, but the id/number still identify the task.
 fn task_url(base_url: &str, workspace_id: Option<&str>, project_id: &str, task_id: &str) -> String {
-    match workspace_id {
-        Some(ws) if !ws.is_empty() => {
-            format!("{base_url}/dashboard/{ws}/project/{project_id}/board?task={task_id}")
-        }
-        _ => format!("{base_url}/dashboard/project/{project_id}/board?task={task_id}"),
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return String::new();
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return String::new();
     }
+    {
+        let Ok(mut segments) = url.path_segments_mut() else {
+            return String::new();
+        };
+        segments.clear();
+        segments.push("dashboard");
+        if let Some(ws) = workspace_id.filter(|ws| !ws.is_empty()) {
+            segments.push(ws);
+        }
+        segments.push("project");
+        segments.push(project_id);
+        segments.push("board");
+    }
+    url.set_query(None);
+    url.query_pairs_mut().append_pair("task", task_id);
+    url.to_string()
 }
 
 fn task_to_domain(
@@ -415,7 +460,7 @@ fn task_to_domain(
     })
 }
 
-fn checked_id(raw: &str, label: &str) -> Result<&str, IssueError> {
+fn checked_id<'a>(raw: &'a str, label: &str) -> Result<&'a str, IssueError> {
     super::identity::kaneo_id(raw, label).map_err(IssueError::Parse)
 }
 
@@ -488,7 +533,7 @@ impl KaneoBackend {
             .get(&format!("task/tasks/{project_id}?limit=100"))
             .await?;
         let ws = board.data.workspace_id.clone();
-        Ok(board
+        board
             .data
             .columns
             .into_iter()
@@ -499,14 +544,14 @@ impl KaneoBackend {
                     .into_iter()
                     .map(|t| task_to_domain(t, status, &self.base_url, ws.as_deref()))
                     .collect::<Result<Vec<_>, _>>()?;
-                KaneoColumnInfo {
+                Ok(KaneoColumnInfo {
                     name: c.name,
                     slug: c.slug,
                     is_final: c.is_final,
                     issues,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Move a task to another project (and optionally a target column/status).
@@ -1001,6 +1046,30 @@ mod tests {
         let u = task_url("https://k", None, "p1", "t1");
         assert!(u.contains("/project/p1/") && u.contains("task=t1"), "{u}");
         assert!(!u.contains("//project"), "no empty workspace segment: {u}");
+    }
+
+    #[test]
+    fn api_url_encodes_structured_query_and_rejects_traversal() {
+        let backend =
+            KaneoBackend::new("https://k.example/base".into(), "token".into(), None, None);
+        let encoded = backend.url("task/tasks/p1?workspaceId=客户").unwrap();
+        assert!(
+            encoded.contains("workspaceId=%E5%AE%A2%E6%88%B7"),
+            "{encoded}"
+        );
+        assert!(backend.url("task/../secret").is_err());
+        assert!(backend.url("task/t?workspaceId=a%26evil%3Dx").is_err());
+        assert!(backend.url("task/t?workspaceId=a&evil=x").is_ok());
+    }
+
+    #[test]
+    fn task_link_uses_url_segments_and_query_encoding() {
+        let u = task_url("https://k", Some("ws/客户"), "p/1", "t#1");
+        assert!(
+            u.contains("/dashboard/ws%2F%E5%AE%A2%E6%88%B7/project/p%2F1/board"),
+            "{u}"
+        );
+        assert!(u.ends_with("?task=t%231"), "{u}");
     }
 
     #[test]
