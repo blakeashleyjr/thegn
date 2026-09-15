@@ -34,8 +34,16 @@
       "sha256": "c7d5322d5aa155e8a6f510cdae298e6b8ea1ab612b53280bb1fb2fa3b736f457"
     },
     {
-      "path": "thegn-THE633-final-adversarial-luna-20260915.md",
+      "path": "thegn-THE633-final-adversarial-luna-20260915.md.log",
       "sha256": "57d2d5f4e9de699376026f16a79aae0c90350f93fe7647091c50541654b39d44"
+    },
+    {
+      "path": "thegn-THE633-final-format-20260915.log",
+      "sha256": "54ceb22973b325947cad89f1f767c439a8c6398e12f1320b5b928b8523777f69"
+    },
+    {
+      "path": "thegn-THE633-final-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f"
     },
     {
       "path": "thegn-THE633-standalone-fmt-20260915.log",
@@ -101,7 +109,9 @@
     "strict_spec": 0,
     "initial_fmt": 1,
     "fmt_changed": "Two Markdown files only",
-    "corrected_specific_fmt": 0
+    "corrected_specific_fmt": 0,
+    "final_ratchets": 0,
+    "final_specific_fmt": 0
   },
   "strict_lint_reuse": {
     "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
@@ -113,9 +123,16 @@
   "independent_review": {
     "verdict": "Source and corrected metadata approved for root-owned landing",
     "files": [
-      "thegn-THE633-final-adversarial-luna-20260915.md",
+      "thegn-THE633-final-adversarial-luna-20260915.md.log",
       "thegn-THE633-final-adversarial-luna-20260915.json"
     ],
     "historical_paragraph": "The earlier 17-file wording in the raw Markdown describes the original metadata defect; its final paragraph and JSON confirm resolution. Original reviewer bytes are preserved."
+  },
+  "final_graph": {
+    "merge_commit": "de40adb604c795ac289fccb95fa809924442124b",
+    "canonical_parent": "11a8cdbd592068a325b48ef3e9a4f2416b4a5757",
+    "merge_conflicts": false,
+    "new_native_run": false,
+    "root_review": "THE-603 additive capture files merged without changing any of the twelve THE-633 Rust paths; both components were already present in combined06 tested source."
   }
 }
