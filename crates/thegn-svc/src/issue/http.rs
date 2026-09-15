@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
 use serde::{Serialize, de::DeserializeOwned};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -38,9 +38,7 @@ pub(crate) fn ensure_dynamic_input(value: &str) -> Result<(), IssueError> {
 pub(crate) struct TrackerHttpBudget {
     semaphore: Arc<Semaphore>,
     #[cfg(test)]
-    expired_for_test: Arc<AtomicBool>,
-    #[cfg(test)]
-    fail_after_prepared_requests: Arc<AtomicUsize>,
+    expire_after_responses: Arc<AtomicUsize>,
 }
 
 impl TrackerHttpBudget {
@@ -55,20 +53,13 @@ impl TrackerHttpBudget {
         Self {
             semaphore: Arc::new(Semaphore::new(permits)),
             #[cfg(test)]
-            expired_for_test: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_after_prepared_requests: Arc::new(AtomicUsize::new(usize::MAX)),
+            expire_after_responses: Arc::new(AtomicUsize::new(usize::MAX)),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn expire_operations_for_test(&self) {
-        self.expired_for_test.store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_after_prepared_requests_for_test(&self, requests: usize) {
-        self.fail_after_prepared_requests
+    pub(crate) fn expire_after_responses_for_test(&self, requests: usize) {
+        self.expire_after_responses
             .store(requests, Ordering::Release);
     }
 }
@@ -116,10 +107,6 @@ impl TrackerHttpClient {
             client: self,
             deadline: Instant::now() + OPERATION_TIMEOUT,
             permit: None,
-            #[cfg(test)]
-            expired_for_test: Arc::clone(&self.budget.expired_for_test),
-            #[cfg(test)]
-            fail_after_prepared_requests: Arc::clone(&self.budget.fail_after_prepared_requests),
         }
     }
 
@@ -129,10 +116,6 @@ impl TrackerHttpClient {
             client: self,
             deadline: Instant::now() + timeout,
             permit: None,
-            #[cfg(test)]
-            expired_for_test: Arc::clone(&self.budget.expired_for_test),
-            #[cfg(test)]
-            fail_after_prepared_requests: Arc::clone(&self.budget.fail_after_prepared_requests),
         }
     }
 
@@ -163,18 +146,33 @@ pub(crate) struct TrackerHttpOperation<'a> {
     client: &'a TrackerHttpClient,
     deadline: Instant,
     permit: Option<OwnedSemaphorePermit>,
-    #[cfg(test)]
-    expired_for_test: Arc<AtomicBool>,
-    #[cfg(test)]
-    fail_after_prepared_requests: Arc<AtomicUsize>,
 }
 
 impl TrackerHttpOperation<'_> {
-    fn remaining(&self) -> Result<Duration, IssueError> {
-        #[cfg(test)]
-        if self.expired_for_test.load(Ordering::Acquire) {
-            return Err(IssueError::Timeout("operation deadline exceeded"));
+    #[cfg(test)]
+    fn expire_for_test(&mut self) {
+        self.deadline = Instant::now() - Duration::from_nanos(1);
+    }
+
+    /// Simulate time exhaustion after a successfully consumed response. Only
+    /// this operation expires: a mutant that creates a fresh operation for the
+    /// next provider request will dispatch it and fail the sequence fixture.
+    #[cfg(test)]
+    fn response_consumed_for_test(&mut self) {
+        let previous = self
+            .client
+            .budget
+            .expire_after_responses
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .unwrap_or(0);
+        if previous == 1 {
+            self.expire_for_test();
         }
+    }
+
+    fn remaining(&self) -> Result<Duration, IssueError> {
         self.deadline
             .checked_duration_since(Instant::now())
             .ok_or(IssueError::Timeout("operation deadline exceeded"))
@@ -199,20 +197,7 @@ impl TrackerHttpOperation<'_> {
     /// Callers use this before constructing dynamic query strings or bodies;
     /// request helpers call it again harmlessly through `send`.
     pub(crate) async fn prepare(&mut self) -> Result<(), IssueError> {
-        let already_had_permit = self.permit.is_some();
         self.acquire().await?;
-        #[cfg(test)]
-        if already_had_permit {
-            let remaining = self
-                .fail_after_prepared_requests
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                    value.checked_sub(1)
-                })
-                .unwrap_or(0);
-            if remaining == 0 {
-                return Err(IssueError::Timeout("operation deadline exceeded"));
-            }
-        }
         self.remaining()?;
         Ok(())
     }
@@ -289,6 +274,9 @@ impl TrackerHttpOperation<'_> {
         let response = self.send(request).await?;
         self.check_response(&response, false)?;
         let _ = read_bounded(self.deadline, response).await?;
+        self.remaining()?;
+        #[cfg(test)]
+        self.response_consumed_for_test();
         Ok(())
     }
 
@@ -304,6 +292,9 @@ impl TrackerHttpOperation<'_> {
         let response = self.send(request).await?;
         self.check_response(&response, false)?;
         let _ = read_bounded(self.deadline, response).await?;
+        self.remaining()?;
+        #[cfg(test)]
+        self.response_consumed_for_test();
         Ok(())
     }
 
@@ -317,6 +308,8 @@ impl TrackerHttpOperation<'_> {
         let value = serde_json::from_slice(&bytes)
             .map_err(|_| IssueError::Parse("tracker JSON decode failed".into()))?;
         let _ = self.remaining()?;
+        #[cfg(test)]
+        self.response_consumed_for_test();
         Ok(value)
     }
 
@@ -875,7 +868,7 @@ mod tests {
         // Deterministically consume the operation's budget between provider
         // requests. A fresh-deadline-per-request implementation would send a
         // second request; the production operation must refuse before I/O.
-        budget.expire_operations_for_test();
+        operation.expire_for_test();
         assert!(matches!(
             operation.get::<serde_json::Value>("/provider/second").await,
             Err(IssueError::Timeout("operation deadline exceeded"))

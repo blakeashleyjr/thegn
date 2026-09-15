@@ -828,7 +828,7 @@ mod tests {
         let budget = Arc::new(TrackerHttpBudget::with_permits(1));
         // The first helper request is admitted; the second helper request is
         // refused by the same operation before the fake server can see it.
-        budget.fail_after_prepared_requests_for_test(1);
+        budget.expire_after_responses_for_test(1);
         let backend = LinearBackend::new_for_test(
             "linear-secret".into(),
             Some("team-1".into()),
