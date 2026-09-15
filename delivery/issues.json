@@ -546,6 +546,13 @@
       ]
     },
     {
+      "issue": "THE-602",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "strict-host-definition-snapshots"
+      ]
+    },
+    {
       "issue": "THE-606",
       "project": "Runtime Security & Host Architecture",
       "changes": [

@@ -56,6 +56,7 @@ mod workspace;
 mod worktree_aux;
 mod zone;
 
+pub use crate::host_definition_snapshot::{HostDefinitionReadError, HostDefinitionsSnapshot};
 pub use account::AccountStore;
 pub use automation::{
     AutomationAdmission, AutomationRunRow, AutomationStateRow, AutomationStore, NewAutomationRun,

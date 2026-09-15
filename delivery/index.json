@@ -1076,6 +1076,18 @@
       "summary": "Preserve process snapshots, deterministic row order and sampled selection identity across refreshes."
     },
     {
+      "change": "strict-host-definition-snapshots",
+      "lifecycle": "active",
+      "disposition": "residual-split",
+      "owners": [
+        {
+          "issue": "THE-602",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Recover strict bounded persisted-host capture; current native verification and final semantic composition acceptance remain outstanding."
+    },
+    {
       "change": "verify-gate-workspace",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

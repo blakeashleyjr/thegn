@@ -331,6 +331,15 @@ impl HostStore for Db {
         Ok(out)
     }
 
+    fn host_defs_checked(
+        &self,
+    ) -> std::result::Result<
+        crate::host_definition_snapshot::HostDefinitionsSnapshot,
+        crate::host_definition_snapshot::HostDefinitionReadError,
+    > {
+        crate::host_db_snapshot::read(self.conn())
+    }
+
     fn host_inventory(&self, id: &HostId) -> Result<Vec<InventoryEntry>> {
         let mut stmt = self.conn().prepare(
             "SELECT kind, digest, arch, ref_name, present_at, verified_at, size_bytes
