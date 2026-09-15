@@ -402,9 +402,10 @@ impl IssueBackend for GitHubIssuesBackend {
             } else {
                 args.extend(["--body", ""]);
             }
-            // gh issue create prints the URL. Keep its exact repository
-            // authority for the follow-up view; never downgrade malformed
-            // output to a bare number or the process cwd.
+            // Creation currently follows gh's anchored-directory contract;
+            // account/draft repository precedence is tracked by THE-315.
+            // Validate the printed URL and retain its exact repository for
+            // the follow-up view, with no malformed-output cwd fallback.
             let url = self.gh(&args)?.trim().to_string();
             let (repo, number) = validated_repo_number_from_url(&url, expected_host.as_deref())?;
             let json = self.gh(&[
