@@ -950,7 +950,7 @@
           "project": "Alpha Reliability & State Compatibility"
         }
       ],
-      "summary": "Restore session recovery, enforce final isolation floors and tolerate PTY hangup during teardown."
+      "summary": "Restore session recovery, enforce final isolation floors and tolerate PTY hangup during teardown. THE-617 residual preflight-failure acceptance landed on local main 046483b6 on September 15 with exact combined05 fixture evidence and independent review; shared remaining tasks retain their own status."
     },
     {
       "change": "require-canonical-merge-history",
