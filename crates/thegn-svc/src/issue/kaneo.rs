@@ -1041,6 +1041,9 @@ mod tests {
             "url: {}",
             a.url
         );
+        // Exercise the actual Kaneo producer output at the router/cache
+        // identity boundary; task links legitimately carry `?task=`.
+        assert!(crate::validate_issue_identity(a).is_ok(), "url: {}", a.url);
         // The final column maps to Done regardless of name.
         assert_eq!(issues[1].status, IssueStatus::Done);
     }

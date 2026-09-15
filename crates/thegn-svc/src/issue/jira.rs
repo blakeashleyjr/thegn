@@ -319,6 +319,11 @@ fn checked_jira_key(raw: &str) -> Result<&str, IssueError> {
     super::identity::jira_key(raw).map_err(IssueError::Parse)
 }
 
+fn project_filter_jql(project: &str) -> Result<String, IssueError> {
+    super::identity::jira_project(project).map_err(IssueError::Parse)?;
+    Ok(format!("project = \"{project}\""))
+}
+
 fn jira_path(key: &str, suffix: &str) -> Result<String, IssueError> {
     checked_jira_key(key)?;
     if !matches!(suffix, "" | "/transitions") {
@@ -362,8 +367,7 @@ impl IssueBackend for JiraBackend {
             }
 
             if let Some(proj) = &self.project_key {
-                checked_jira_key(proj)?;
-                jql_parts.push(format!("project = \"{proj}\""));
+                jql_parts.push(project_filter_jql(proj)?);
             }
 
             if !filter.statuses.is_empty() {
@@ -862,6 +866,12 @@ mod tests {
         ]);
         assert_eq!(all.matches("\"To Do\"").count(), 1, "deduped: {all}");
         assert_eq!(all.matches("\"Done\"").count(), 1, "deduped: {all}");
+    }
+
+    #[test]
+    fn project_filter_accepts_configured_project_without_issue_number() {
+        assert_eq!(project_filter_jql("PROJ").unwrap(), "project = \"PROJ\"");
+        assert!(project_filter_jql("PROJ-7").is_err());
     }
 
     #[test]

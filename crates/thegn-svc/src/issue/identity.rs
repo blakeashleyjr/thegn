@@ -61,6 +61,17 @@ pub(crate) fn builtin_segment<'a>(value: &'a str, label: &str) -> Result<&'a str
     Ok(value)
 }
 
+/// Validate a plugin's registered namespace. Plugin business keys are opaque
+/// and may contain `:`, but the namespace itself is a routing delimiter and
+/// must be one flat, non-delimiter segment.
+pub(crate) fn plugin_namespace<'a>(value: &'a str) -> Result<&'a str, String> {
+    builtin_segment(value, "plugin namespace")?;
+    if value.contains(':') {
+        return Err("plugin namespace must not contain ':'".into());
+    }
+    Ok(value)
+}
+
 pub(crate) fn builtin_identity<'a>(value: &'a str) -> Result<&'a str, String> {
     bounded(value, BUILTIN_ID_MAX, "tracker identity")?;
     if value == "."
