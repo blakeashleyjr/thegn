@@ -491,3 +491,7 @@ mod remote_credential_tests {
 #[cfg(test)]
 #[path = "perf_workloads_hydration.rs"]
 mod perf_workloads_hydration;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "sandbox_floor_preflight_tests.rs"]
+mod sandbox_floor_preflight_tests;

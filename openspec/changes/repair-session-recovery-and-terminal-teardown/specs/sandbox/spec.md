@@ -16,6 +16,12 @@ bypass fail-closed admission, including after a stronger runtime fails setup.
 - **WHEN** the final host or remote bare class misses a floor whose policy is degrade
 - **THEN** preparation returns the actual class with a floor-specific warning
 
+#### Scenario: A stronger runtime passes ensure but fails exec preflight
+
+- **WHEN** automatic preparation resolves a candidate that meets the configured floor, verifies its runtime state, and then its exec preflight fails
+- **THEN** the final host fallback is checked against the floor again, refusing on fail, reporting the missed floor on degrade, and permitting an explicitly disabled floor
+- **AND** an explicitly selected runtime retains its preflight error instead of silently falling through to the host
+
 ### Requirement: Backend availability diagnostics state observed evidence
 
 Runtime diagnostics SHALL distinguish executable presence from successful
