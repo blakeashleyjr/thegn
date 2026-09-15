@@ -10,11 +10,11 @@
 
 ## Current verification and delivery
 
-- [ ] Complete primary and independent review of the recovered current-source candidate and address findings.
-- [ ] Compile and run the focused core snapshot/schema/HostStore tests in the coordinated native lane.
-- [ ] Run source/OpenSpec/delivery gates, strict lint and required local component checks.
-- [ ] Record exact current source and raw test receipts before any scoped local landing.
-- [ ] Reconcile THE-602 partial implementation and remaining acceptance; do not mark Done from the strict reader alone.
+- [x] Complete primary and independent review of the recovered current-source candidate and address findings.
+- [x] Compile and run the focused core snapshot/schema/HostStore tests in the coordinated native lane; the current candidate is byte-identical to the source-bound combined05 full receipt.
+- [x] Run source/OpenSpec/delivery gates, strict lint and required local component checks.
+- [x] Record exact current source and raw test receipts before any scoped local landing.
+- [x] Reconcile THE-602 partial implementation and remaining acceptance; do not mark Done from the strict reader alone.
 
 ## Checked composition implementation
 
@@ -25,17 +25,33 @@
 - [x] Borrow rejected input and preflight both recursive JSON families before serialization; charge and preserve skipped build/issue state.
 - [x] Add private SQLite-to-composition-to-resolver fixtures, raw-source refusal, semantic/schema failures, redaction and inclusive work/data boundary controls.
 - [x] Align ApiVersion schema metadata with its unchanged string wire format; add actual Config and full plugin-depth composition controls (narrow THE-199 prerequisite).
-- [ ] Complete primary and independent review of the composition implementation and address findings.
-- [ ] Compile/run the new composition fixtures, recovered snapshot fixtures, THE-598 merge fixtures and existing config validation tests on the same source.
+- [x] Complete primary and independent review of the composition implementation and address findings.
+- [x] Compile/run the new composition fixtures, recovered snapshot fixtures, THE-598 merge fixtures and existing config validation tests on the same source; preserve the exact source-bound combined05 receipt and historical pre-correction failure.
 
 ## Retained historical evidence
 
 The original tasks recorded a 50/50 focused-core pass, including 22 snapshot
 regressions, under nextest run `5f3a5c93-0737-49af-8961-4c810487e392`, and
 historical root/peer reviews. The raw test receipt was not recovered with this
-component. Those statements remain historical claims, not verification of this
-recovered candidate or its new regression. Current review and native gates above
-remain unchecked until separately completed.
+component. The current exact source-bound combined05 receipt is recorded in the
+final checkpoint below; the historical pre-correction failures remain retained.
+
+## Final evidence checkpoint — 2026-09-15
+
+The standalone private candidate merges canonical `b025ec5d` into `bb97ec24`
+with a clean three-way merge. The resulting audit is
+`docs/audits/THE-602-host-composition-2026-09-15.md`; its manifest records the
+source hashes and external receipt hashes. The six implementation/schema/env
+paths remain byte-identical to tested source `33c0db71`. The combined05 full
+receipt reports 8465/8465 passed and 26 skipped; the historical 4203/4205
+pre-correction result and corrected metadata 4/4 result remain preserved.
+
+Source, review, native, OpenSpec, ratchet and delivery gates are complete for
+this scoped evidence. Reviewed local landing remains pending. THE-592 launch
+adapter integration and THE-603/THE-604/runtime obligations remain separate;
+this change is not an authority or issue-closure claim.
+
+- [ ] Complete reviewed local-main landing after root review.
 
 ## Remaining issue acceptance
 

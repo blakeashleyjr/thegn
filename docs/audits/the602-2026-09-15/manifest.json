@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "issue": "THE-602",
+  "scope": "durable source/review/native evidence references for standalone host composition candidate",
+  "candidate": {
+    "base": "bb97ec24e6d679400b4e97615e4e27d2c4a97039",
+    "merged_canonical": "b025ec5d877f191d65cc831c95035c493c49c7f6",
+    "merge_commit": "8c0bb31f45193a723cba4d7fe0d87b52059e19e7",
+    "tree_before_audit": "f8b878a4a7ebde6d3d50a5edb1b6a7cbc157740d",
+    "forbidden_diff_paths": ["THE603", "THE639", "THE640", "performance"],
+    "forbidden_diff_count": 0
+  },
+  "tested_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+  "source_hashes": {
+    "crates/thegn-core/src/host_config_checked.rs": "5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996",
+    "crates/thegn-core/src/host_db_snapshot.rs": "c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0",
+    "crates/thegn-core/src/host_definition_snapshot.rs": "d814d0c3c9cac8f76577cca8e819db571daa00955bf887215d5da46fe8574c05",
+    "crates/thegn-core/src/plugin_api.rs": "ab18e52bfffa1258e6a6e3694f275019299ca428da26e65f80ce015f0ad7137c",
+    "docs/api/plugin-api-0.3.json": "dd472746494661fa8975c0fae4f80e5f919a4e955555fec66a7eced4d55ce543",
+    "test/env-overlay-ratchet.txt": "52dbd42ca6eddf08635f1834f80932e915083d05fd554f4ce7764598cf826ad3"
+  },
+  "receipts": [
+    {"kind": "combined05_full_native_receipt", "path": "/tmp/thegn-maintenance05-combined-full-native-receipt-20260915.json", "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310", "source": "33c0db71", "tests_run": 8465, "passed": 8465, "skipped": 26, "exit_code": 0},
+    {"kind": "combined05_full_native_log", "path": "/tmp/thegn-maintenance05-combined-full-native-20260915.log", "sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b"},
+    {"kind": "historical_pre_correction", "source": "16996e29049e2ab9ef1e097f20841478ec035760", "path": "/tmp/thegn-THE602-current-core-native-receipt-20260915.json", "sha256": "8450476a9e47b13a1839ca2af800b5e394ed5322c7a2608f1632b487aa588d76", "passed": 4203, "failed": 2, "skipped": 2},
+    {"kind": "corrected_metadata_native_log", "source": "560a7beefb497f32d8498e7277d23d1a07310899", "path": "/tmp/thegn-THE602-metadata-final-native-20260915.log", "sha256": "0f77a9cdc8143da3faff4d531d515a390690236fb6e6e3d5a6712dd82e32934d", "passed": 4, "failed": 0},
+    {"kind": "primary_source_review", "path": "/tmp/thegn-THE602-final-source-independent-review-20260914.json", "sha256": "a5e1c8f7fdbb23158e6677c7f491a9784d97cb7b8dcd69dd59c643e5e82d2a5b"},
+    {"kind": "independent_source_review", "path": "/tmp/thegn-THE602-independent-source-review-20260914.json", "sha256": "4440cfaf69697a96fcbabf3a870cf6e7495e825d3b3ebc289218aa3944ff2c3a"},
+    {"kind": "metadata_checkpoint", "path": "/tmp/thegn-THE602-metadata-checkpoint-20260915.json", "sha256": "e2c1e64fb9069a2ea26b1ee800226400b99adfd4faadad7dc8286089da7bc945"},
+    {"kind": "source_ratchets", "path": "/tmp/thegn-THE602-composition-ratchets-20260914.log", "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f", "exit_code": 0},
+    {"kind": "openspec", "path": "/tmp/thegn-THE602-composition-openspec-20260914.log", "sha256": "b7299aeb93b7ae206b758763690cdd633a915671a6afa6084acd6083482168fe", "exit_code": 0},
+    {"kind": "format", "path": "/tmp/thegn-THE602-composition-format-20260914.log", "sha256": "2b3163ded053a3a9007b41a562f910ad54c014c6e888657bd0aaf64c57415d99", "exit_code": 0}
+  ],
+  "limits": {"config_bytes": 4194304, "depth": 32, "nodes": 65536, "container_entries": 1024, "key_bytes": 256, "string_bytes": 65536, "pipeline_stages": 64, "profiles": 64, "automation_rules": 256, "effective_rule_visits": 4096, "automation_work_bytes": 16777216},
+  "status": "gates_complete_landing_pending",
+  "limitations": ["No new native build was run for this candidate; exact source identity binds the existing 8465-test receipt.", "THE-592 adapter/launch authority, THE-603, THE-604, and runtime containment remain separate.", "No issue closure or Linear mutation asserted."]
+}
