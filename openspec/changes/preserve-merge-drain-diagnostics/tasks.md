@@ -49,3 +49,14 @@ acceptance. Earlier shared-change receipts above remain historical evidence for
 their stated sources, not substitutes for current Part B/native gates.
 
 THE-219 current Part B execution is retained without reduction in [the shared evidence manifest](../../../docs/audits/maintenance-04-2026-09-15/manifest.json). Strict Clippy and final metadata checks passed; reviewed implementation landed on local main at `c0d3d860a22db0a7fddafb3d338bf40b25248ade`. Tracker closure/readback remains pending. The shared historical live-queue gate and THE-608/THE-610 acceptance are not completed by this update.
+
+## THE-608 scoped acceptance reconciliation — 2026-09-15
+
+- [x] Independently review the current diagnostic driver, exact nullable SQLite replacement, legacy None behavior and panel/transport assertions against the full issue.
+- [x] Verify seven current source hashes and nine exact core/driver/panel/authenticated-transport PASS records from native623; retain its unrelated full-run failure.
+- [x] Reconcile the fixed normal CLI Part B receipts for stale-field clearing and same-row recovery, preserving the distinction from injected deferred-conflict mapping and authenticated gate-error proof.
+- [x] Retain narrowly scoped original review/issue/evidence payloads and exact hashes in the dated audit manifest.
+- [x] Verify current33c0 full native:8,465/8,465 passed,26 skipped; nine exact diagnostic selectors and seven current-source hashes match. Retain original failures and exact receipt/log hashes.
+- [ ] Complete final metadata review, source checks and local landing, then reconcile THE-608 tracker state.
+
+[The dated diagnostic acceptance audit](../../../docs/audits/THE-608-diagnostic-acceptance-2026-09-15.md) records this layered evidence. The old shared fixed-CLI/private-native/live-queue checkbox remains historical and unchecked: these scoped THE-608 receipts do not claim live user queue integration or complete THE-610. No provider, merge, cleanup or push action is authorized by this metadata update.
