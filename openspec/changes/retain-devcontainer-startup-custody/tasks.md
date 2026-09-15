@@ -8,4 +8,4 @@
 - [x] Verify the source-bound full05 native run, including all 23 startup/migrated selectors and shared devcontainer/Git/capability regressions.
 - [x] Demonstrate intended counterfactual failures for delayed stderr reading, premature spawn claim and displaced-session custody on unwind. Preserve shipping no-fallback coverage in the positive suite.
 - [x] Record Linux native coverage and explicit platform/custody limits; verify source-bound strict lint and current source/specification/formatting gates.
-- [ ] Land reviewed changes into local main and attach exact scoped evidence to THE-639.
+- [x] Land reviewed changes into local main at `491320b7` on September 15 and record exact scoped evidence for THE-639.
