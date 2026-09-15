@@ -28,3 +28,15 @@ loop without consuming agent attempts or dispatching an agent.
 - **WHEN** admission returns an infrastructure hold
 - **THEN** the drain reports one held/deferred result for that item and returns from its retry loop
 - **AND** it neither immediately repeats admission nor blames the branch
+
+#### Scenario: Hold permits later independent drain and next item
+
+- **WHEN** a conflict or red-gate branch receives an isolation infrastructure hold in a multi-item drain
+- **THEN** that item stops once without spending its remediation budget and the next selected item is processed
+- **AND** a later independent drain can re-enumerate the held row and proceed after admission recovers
+
+#### Scenario: Admitted agent makes no source change
+
+- **WHEN** an admitted fixing-agent attempt returns without repairing the branch
+- **THEN** immediate refolding consumes the already-incremented finite local attempt budget
+- **AND** no advisory agent exit result refunds attempts or creates an unbudgeted immediate retry
