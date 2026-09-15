@@ -1146,6 +1146,18 @@
       "delivered_at": "2026-09-15"
     },
     {
+      "change": "validate-sandbox-volume-sources",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-247",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Reject path-like named-volume sources at every sandbox entry boundary and propagate bounded terminal errors before launch effects."
+    },
+    {
       "change": "verify-gate-workspace",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

@@ -361,6 +361,107 @@ fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
     cfg
 }
 
+fn sandbox_with_invalid_volume() -> thegn_core::sandbox::SandboxSpec {
+    thegn_core::sandbox::SandboxSpec {
+        backend: thegn_core::sandbox::Backend::Podman,
+        placement: thegn_core::placement::Placement::Local,
+        image: Some("img:latest".into()),
+        worktree: PathBuf::from("/wt/x"),
+        mounts: Vec::new(),
+        env: Vec::new(),
+        env_overrides: std::collections::HashMap::new(),
+        env_block: Vec::new(),
+        network: thegn_core::sandbox::Network::Nat,
+        network_allow: Vec::new(),
+        network_block: Vec::new(),
+        read_only_root: false,
+        no_new_privileges: false,
+        pids_limit: None,
+        drop_capabilities: Vec::new(),
+        add_capabilities: Vec::new(),
+        file_access: thegn_core::sandbox::FileAccess::Worktree,
+        ports: Vec::new(),
+        gpu: None,
+        limits: thegn_core::sandbox::SandboxLimits::default(),
+        volumes: vec![("/tmp/state".into(), "/mnt/state".into())],
+        compose: None,
+        build: None,
+        init_script: None,
+        devenv: false,
+        devenv_path: None,
+        name: "tg-wt".into(),
+        vpn: None,
+        oci_host: None,
+        oci_runtime: None,
+        daemon_persistent: false,
+    }
+}
+
+#[test]
+fn compose_spec_propagates_volume_refusal_without_host_fallback() {
+    let cfg = Config::default();
+    let loc = GitLoc::from_db("/wt/x", None);
+    let outcome = SandboxOutcome {
+        spec: Some(sandbox_with_invalid_volume()),
+        backend_label: "podman".into(),
+        warnings: Vec::new(),
+        shell: String::new(),
+        is_remote: false,
+        cwd_override: None,
+        location: None,
+        degraded_from_provider: false,
+        route_ssh_target: None,
+    };
+    let error = compose_spec(
+        &cfg,
+        "/wt/x",
+        None,
+        "shell",
+        &loc,
+        &outcome,
+        LaunchExtras::default(),
+    )
+    .expect_err("invalid volume must prevent LaunchSpec construction");
+    assert!(error.chain().any(|source| {
+        source
+            .downcast_ref::<thegn_core::sandbox::VolumeAdmissionError>()
+            .is_some()
+    }));
+    assert!(!error.to_string().contains("/tmp/state"));
+}
+
+#[test]
+fn final_composed_volume_gate_blocks_launch_effect_sentinel() {
+    // This exercises the same production gate used after Ready/remote spec
+    // composition. An invalid source must stop before any effect represented by
+    // the sentinel callback (VPN, ensure, OCI argv, or host fallback).
+    let mut spec = sandbox_with_invalid_volume();
+    let mut effects = 0;
+    let result = admit_final_sandbox_spec_then(&mut spec, |_| {
+        effects += 1;
+        Ok(())
+    });
+    assert!(result.is_err(), "invalid final spec must be terminal");
+    assert_eq!(effects, 0, "no launch effect may follow refusal");
+}
+
+#[test]
+fn configured_volume_refusal_precedes_agent_host_fallback() {
+    with_temp_state("configured-volume-refusal", || {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["missing-runtime".into()];
+        cfg.sandbox
+            .volumes
+            .insert("/tmp/state".into(), "/mnt/state".into());
+        let loc = GitLoc::from_db("/wt/x", None);
+        let error = prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None)
+            .expect_err("configured invalid volume must not fall through to host");
+        assert!(error.to_string().contains("configured volume admission"));
+        assert!(!error.to_string().contains("/tmp/state"));
+    });
+}
+
 #[test]
 fn provisioned_agent_kinds_derive_from_picker() {
     // Mirrors a real picker: managed Agent (provider pi) + claude + hermes +
@@ -745,7 +846,8 @@ fn compose_spec_host_fallback_is_login_shell() {
         &loc,
         &host,
         LaunchExtras::default(),
-    );
+    )
+    .expect("valid volume names");
     assert_eq!(
         spec.argv,
         vec![
@@ -913,7 +1015,8 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
         &loc,
         &sb,
         LaunchExtras::default(),
-    );
+    )
+    .expect("valid volume names");
     let joined = spec.argv.join(" ");
     assert!(
         joined.contains("bash --norc --noprofile"),
@@ -925,6 +1028,9 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
 fn prepare_sandbox_none_backend_falls_to_host() {
     let mut cfg = Config::default();
     cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
+    cfg.sandbox
+        .volumes
+        .insert("/tmp/ignored".into(), "/mnt/ignored".into());
     let loc = GitLoc::from_db("/wt/x", None);
     let out =
         prepare_sandbox_env(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false, None).unwrap();

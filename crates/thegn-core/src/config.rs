@@ -3982,6 +3982,9 @@ pub struct SandboxConfig {
     pub ports: Vec<String>, // e.g. ["8080:8080"]
     pub gpu: Option<String>,
     pub limits: SandboxLimits,
+    /// Named OCI volumes (`name = destination`). Names use the sandbox
+    /// admission grammar: ASCII alphanumeric first byte, minimum two bytes,
+    /// then only ASCII alphanumeric/`_`/`-`/`.`; path-like keys are refused.
     pub volumes: std::collections::HashMap<String, String>,
     pub compose: Option<String>,
     /// Programmatic Dockerfile build (set by the devcontainer overlay from a

@@ -167,7 +167,7 @@ pub(crate) fn maybe_materialize(
             // stall for seconds on a wedged runtime, so its resolve phases must
             // stream to the tab's splash instead of leaving the seed frozen.
             let spec_result =
-                observed(&|| Ok(crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)))
+                observed(&|| crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox))
                     .map(|spec| {
                         // Record what actually got entered, not what was picked:
                         // `spec.backend` is argv-derived, so the chip can never

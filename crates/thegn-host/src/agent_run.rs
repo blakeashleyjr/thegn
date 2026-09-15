@@ -135,7 +135,13 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
     // (floor already cleared by `agent_floor_gate`), run the command INSIDE the
     // resolved sandbox first, then join the slice on top.
     let inner_argv = match &task.sandbox {
-        Some(spec) => thegn_core::sandbox::enter_argv(spec, &command),
+        Some(spec) => match thegn_core::sandbox::enter_argv(spec, &command) {
+            Ok(argv) => argv,
+            Err(error) => {
+                tracing::error!("{error}; refusing queued agent sandbox launch");
+                return false;
+            }
+        },
         None => vec![util::shell(), "-lc".to_string(), command.clone()],
     };
     let argv = thegn_core::sandbox_cpucap::wrap_background_argv(inner_argv);

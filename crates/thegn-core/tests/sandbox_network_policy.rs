@@ -62,7 +62,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
 }
 
 fn run_in(spec: &SandboxSpec, cmd: &str) -> String {
-    let argv = enter_argv(spec, cmd);
+    let argv = enter_argv(spec, cmd).expect("valid volume names");
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()

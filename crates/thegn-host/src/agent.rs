@@ -11,6 +11,7 @@
 
 use crate::agent_configs::with_provision_timeout;
 use crate::remote_sync::ssh_none_guard;
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
@@ -385,6 +386,11 @@ pub fn prepare_sandbox_env(
     let mut explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == thegn_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
+    // Validate sources carried by the effective configuration before any
+    // resolver/provider path can return `None` and turn the launch into a
+    // host shell. An explicit disabled/`none` policy intentionally ignores
+    // the sandbox volume map and keeps its historical host behavior.
+    admit_configured_volume_sources(&sb)?;
     // The CLI provider is an optional, host-owned execution adapter. It is
     // considered only after core selection/trust and only for local, unprojected
     // worktrees. Its raw config path is never handed to the process when the
@@ -659,6 +665,11 @@ pub fn prepare_sandbox_env(
                 recursive_submodules,
                 &mut warnings,
             );
+            // Validate the fully composed spec after Ready-host/remote fixups,
+            // before VPN attachment or any ensure/secret-file/container effect.
+            // A malformed named-volume source is terminal for this launch, not
+            // an ordinary backend miss that may fall through to host execution.
+            admit_final_sandbox_spec(&spec)?;
             // Isolation floor: compare the HONEST class of what this launch would
             // enter (after the runtime degrade `finalize_*` just applied) against
             // the demanded floor. A fail-closed miss must abort BEFORE anything
@@ -701,21 +712,27 @@ pub fn prepare_sandbox_env(
                     dropped.join(", ")
                 ));
             }
-            // VPN up BEFORE the container (joins the sidecar netns); failure bails.
-            if let Err(e) = attach_vpn(&mut spec) {
-                anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
-            }
-            // `ensure` proves the container RUNNING, but not that OCI `exec` works
-            // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
-            match sandbox::ensure(&spec).and_then(|()| {
-                thegn_core::sandbox_preflight::preflight_exec(&spec)
-                    // No prefix here: `preflight_exec` now owns its own error
-                    // classing — a generic runtime failure still reads "exec
-                    // probe failed: …", while a verified mount failure carries a
-                    // headline + remedy that must arrive first in the
-                    // width-fitted status line.
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            }) {
+            // Keep the final validation adjacent to the effects it protects:
+            // VPN attachment and container ensure/exec are reached only after
+            // the fully composed spec has passed the admission gate.
+            let launch = admit_final_sandbox_spec_then(&mut spec, |spec| {
+                // VPN up BEFORE the container (joins the sidecar netns); failure bails.
+                if let Err(e) = attach_vpn(spec) {
+                    anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
+                }
+                // `ensure` proves the container RUNNING, but not that OCI `exec` works
+                // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
+                Ok(sandbox::ensure(spec).and_then(|()| {
+                    thegn_core::sandbox_preflight::preflight_exec(spec)
+                        // No prefix here: `preflight_exec` now owns its own error
+                        // classing — a generic runtime failure still reads "exec
+                        // probe failed: …", while a verified mount failure carries a
+                        // headline + remedy that must arrive first in the
+                        // width-fitted status line.
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                }))
+            })?;
+            match launch {
                 Ok(()) => {
                     return Ok(SandboxOutcome {
                         backend_label: spec.backend.label().to_string(),
@@ -879,6 +896,40 @@ pub fn prepare_sandbox_env(
         degraded_from_provider,
         route_ssh_target,
     })
+}
+
+/// Validate the effective configured sources before backend resolution. The
+/// resolver is allowed to return `None` for a disabled/explicit-host policy,
+/// but an enabled sandbox with configured sources must refuse malformed input
+/// before that `None` can become a host fallback.
+fn admit_configured_volume_sources(sb: &thegn_core::config::SandboxConfig) -> anyhow::Result<()> {
+    if !sb.enabled || sb.backend == thegn_core::config::SandboxBackend::None {
+        return Ok(());
+    }
+    thegn_core::sandbox::admit_volume_sources(sb.volumes.keys().map(String::as_str))
+        .map_err(anyhow::Error::new)
+        .context("sandbox configured volume admission failed")
+}
+
+/// Validate a fully composed spec at the last pure boundary before runtime
+/// effects. Keeping this as the production gate also gives tests a behavioral
+/// seam: an invalid spec returns before a caller can perform VPN, ensure,
+/// secret-file, or OCI argv work.
+fn admit_final_sandbox_spec(spec: &thegn_core::sandbox::SandboxSpec) -> anyhow::Result<()> {
+    thegn_core::sandbox::admit_volumes(spec)
+        .map_err(anyhow::Error::new)
+        .context("sandbox volume admission failed")
+}
+
+/// Run the effectful launch phase only after the final spec passes admission.
+/// The callback form makes the no-effect guarantee directly testable without
+/// starting an OCI runtime or VPN in unit tests.
+fn admit_final_sandbox_spec_then<T>(
+    spec: &mut thegn_core::sandbox::SandboxSpec,
+    effects: impl FnOnce(&mut thegn_core::sandbox::SandboxSpec) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    admit_final_sandbox_spec(spec)?;
+    effects(spec)
 }
 
 /// Bring up the worktree's VPN tunnel (if `[sandbox.vpn]` requested one) before
@@ -3019,7 +3070,7 @@ pub fn compose_spec(
     loc: &GitLoc,
     sb: &SandboxOutcome,
     extras: LaunchExtras<'_>,
-) -> LaunchSpec {
+) -> anyhow::Result<LaunchSpec> {
     // If the resolved env's sandbox config has an explicit shell override, use
     // it for shell panes. Empty string = resolve from host $SHELL (the default).
     let sb_shell = sb.shell.trim().to_string();
@@ -3166,7 +3217,9 @@ pub fn compose_spec(
                 blocked_devcontainer_argv()
             }
         },
-        (Some(spec), _) => sandbox::enter_argv(spec, &cmd),
+        (Some(spec), _) => sandbox::enter_argv(spec, &cmd)
+            .map_err(anyhow::Error::new)
+            .context("sandbox entry refused")?,
         (None, None) => {
             // Host fallback: a login shell so PATH/env expand — still CAPPED. There
             // is no sandbox spec here (no container runtime, or one turned off), but
@@ -3200,14 +3253,14 @@ pub fn compose_spec(
         }
         None => sb.backend_label.clone(),
     };
-    LaunchSpec {
+    Ok(LaunchSpec {
         argv,
         cwd,
         env,
         backend,
         warnings,
         degraded,
-    }
+    })
 }
 
 fn blocked_devcontainer_argv() -> Vec<String> {
@@ -3650,7 +3703,7 @@ pub fn launch_spec_full(
         }
     }
 
-    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
+    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras)?;
     // On the bare-host path (no sandbox spec and no provider session) the bundle
     // identity + build env ride the pane env (layered on the curated base in
     // `spawn_with_env`). A provider CLI is also host-side, but its environment
