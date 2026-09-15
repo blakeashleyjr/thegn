@@ -55,12 +55,15 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(json),
         Action::Coverage { json } => coverage(json),
-        Action::Schema => {
-            outln!("{}", CONTROL_SCHEMA.trim_end());
-            Ok(())
-        }
+        Action::Schema => print_schema(),
         Action::Call { cap, params } => call(cfg, &cap, params.as_deref()),
     }
+}
+
+/// Print only the embedded schema; no configuration or controller is needed.
+pub(crate) fn print_schema() -> Result<()> {
+    outln!("{}", CONTROL_SCHEMA.trim_end());
+    Ok(())
 }
 
 /// Every surface's implemented capability-id table, gathered from the
@@ -109,7 +112,7 @@ fn cli_control_caps() -> Vec<&'static str> {
 }
 
 /// The per-surface coverage ledger — what `thegn api coverage` prints.
-fn coverage(json: bool) -> Result<()> {
+pub(crate) fn coverage(json: bool) -> Result<()> {
     let ledgers = surface_ledgers();
     if json {
         let rows: Vec<serde_json::Value> = ledgers
@@ -164,7 +167,7 @@ fn coverage(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn list(json: bool) -> Result<()> {
+pub(crate) fn list(json: bool) -> Result<()> {
     use thegn_core::capability::{CATALOG, Surface, scope_of};
     if json {
         let rows: Vec<serde_json::Value> = CATALOG
