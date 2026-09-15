@@ -16,3 +16,11 @@
 - [ ] Run `just ci` once at the final pre-PR gate, or record environment limitations.
 
 Evidence and outstanding environment checks: `docs/audits/live-build-2026-09-13-session-remediation.md`.
+
+## THE-617 preflight-failure follow-up — September 14
+
+- [x] Add a private Linux fake-OCI fixture through actual launch preparation, proving stronger-candidate resolution, ensure success and exec-preflight failure before the final fail/degrade/off decision.
+- [x] Preserve explicit-runtime refusal and independently review the exact argv allowlist, owned cleanup and diagnostic assertions.
+- [ ] Compile and execute the new fixture, run scoped lint/ratchets/specification validation, and complete reviewed local landing.
+
+The earlier full workspace receipt passed 8354/8354 tests with 26 configured skips; it predates this new regression and does not prove its execution. Exact scope and pending evidence: `docs/audits/THE-617-preflight-floor-acceptance-2026-09-14.md`. No real OCI isolation or new runtime support is claimed.
