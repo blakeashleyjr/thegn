@@ -1096,7 +1096,7 @@
     },
     {
       "change": "strict-state-host-capture",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1104,7 +1104,8 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Unwired strict WAL capture with retained absence witnesses, orphan-sidecar refusal and owned permission/race fixtures. Current source review and native/lint gates remain pending; THE-592 owns launch-authority integration."
+      "summary": "THE-603 additive strict WAL capture and Linux stable-namespace admission delivered on local main c6191b2a after root and independent review, source-bound positive/strict-lint evidence and two isolated counterfactual failures. THE-592/THE-607 integration remains separate.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "verify-gate-workspace",
