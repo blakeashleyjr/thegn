@@ -1,0 +1,330 @@
+{
+  "schema_version": 1,
+  "scope": "THE611/219/598 segmented acceptance evidence with completed strict lint and source gates; reviewed local-main landing remains pending",
+  "sources": {
+    "full_focused": "6233502620110aee5663ee17806a60e8f4109ce3",
+    "fixture_correction": "a4468a8ec6372b3905a7b545f5a5b740162ebf17"
+  },
+  "no_binaries": true,
+  "original_receipts_not_reduced": true,
+  "files": [
+    {
+      "file": "thegn-611-598-segmented-receipt-review-20260914.md.raw",
+      "source": "/tmp/thegn-611-598-segmented-receipt-review-20260914.md",
+      "bytes": 6315,
+      "sha256": "57634208802916dc55afcc6c5222a4278d534276c4461e0ed070ac50cc744387",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-611-598-segmented-receipt-review-20260914.md"
+    },
+    {
+      "file": "thegn-THE219-combined-drain-receipt-1-20260914.json.raw",
+      "source": "/tmp/thegn-THE219-combined-drain-receipt-1-20260914.json",
+      "bytes": 81041,
+      "sha256": "f01852479fb7a07d8f514a7b52b5715956c279dde90e92f45457cb1468bbf3c3",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE219-combined-drain-receipt-1-20260914.json"
+    },
+    {
+      "file": "thegn-THE219-combined-drain-receipt-2-20260914.json.raw",
+      "source": "/tmp/thegn-THE219-combined-drain-receipt-2-20260914.json",
+      "bytes": 76970,
+      "sha256": "0b1726ec50b36f1298080cc6b4a413eca77382eb28ff0ddf6ea423d45ff8a1f4",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE219-combined-drain-receipt-2-20260914.json"
+    },
+    {
+      "file": "thegn-THE219-counterfactual-native-20260914.log",
+      "source": "/tmp/thegn-THE219-counterfactual-native-20260914.log",
+      "bytes": 12157,
+      "sha256": "1a43a0c8e347340f6a178640335ae2eaa537c943507544db10537e070f40e5b1",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE219-counterfactual-native-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-THE219-counterfactual-native-receipt-20260914.json",
+      "bytes": 613,
+      "sha256": "2b238e8484bafbb7d3bab8bffd2da4bac68c6f29f0fad77ef64029e6a9ba169c",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE219-counterfactual-native-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-THE219-part-b-independent-review-20260914.md.raw",
+      "source": "/tmp/thegn-THE219-part-b-independent-review-20260914.md",
+      "bytes": 3173,
+      "sha256": "39e45040efc6832d9be5def2a54e101fade033ca078d98496e03bbabe24f94ac",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE219-part-b-independent-review-20260914.md"
+    },
+    {
+      "file": "thegn-THE598-counterfactual-retry-independent-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-THE598-counterfactual-retry-independent-receipt-20260914.json",
+      "bytes": 3598,
+      "sha256": "cd7355e65a9ef3ae7b992b7b6c26627079fac649b0ecac2bd3d02c77b19f8414",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE598-counterfactual-retry-independent-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-THE598-counterfactual-retry-independent-review-20260914.md.raw",
+      "source": "/tmp/thegn-THE598-counterfactual-retry-independent-review-20260914.md",
+      "bytes": 4890,
+      "sha256": "246629245728aa79a87551804ce42d05a8a25ca5e5ebec5119c1ec406fd9a23f",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE598-counterfactual-retry-independent-review-20260914.md"
+    },
+    {
+      "file": "thegn-THE598-fixture-correction-native-20260914.log",
+      "source": "/tmp/thegn-THE598-fixture-correction-native-20260914.log",
+      "bytes": 3955,
+      "sha256": "657c270c61e5ef5d2b44006e2122931a394ad9d9010f7be43cdc8ce9aee0c88e",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE598-fixture-correction-native-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-THE598-fixture-correction-native-receipt-20260914.json",
+      "bytes": 1110,
+      "sha256": "b12794f23964034562fbaf96f05b449be74d0bc6f2772ab782560b1b333b10fa",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE598-fixture-correction-native-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-THE598-independent-review-20260914.md.raw",
+      "source": "/tmp/thegn-THE598-independent-review-20260914.md",
+      "bytes": 2507,
+      "sha256": "690a0ed075bf648cca05f170d1a17a5f0d08158249b6293dbc87324d0f2e82db",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE598-independent-review-20260914.md"
+    },
+    {
+      "file": "thegn-THE598-old-body-counterfactual-native-20260914.log",
+      "source": "/tmp/thegn-THE598-old-body-counterfactual-native-20260914.log",
+      "bytes": 752,
+      "sha256": "21bfc712dbe72abf8d124eb60137979c7a47205822aa5475710c557eb2e46a47",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE598-old-body-counterfactual-native-retry-20260914.log",
+      "source": "/tmp/thegn-THE598-old-body-counterfactual-native-retry-20260914.log",
+      "bytes": 3947,
+      "sha256": "14339e484dde379e37f5ac0663a7553d967be74f4374cdb3bb12861fc4eb22ad",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE598-stale-counterfactual-20260914.json.raw",
+      "source": "/tmp/thegn-THE598-stale-counterfactual-20260914.json",
+      "bytes": 1514,
+      "sha256": "30e512a690b6dc8a89e1b3030583d250b3451c9ba98092a0f2849229ebeb2256",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE598-stale-counterfactual-20260914.json"
+    },
+    {
+      "file": "fixed-stale-thegn_core-3d96bbbea2ccaf51.d",
+      "source": "/tmp/thegn-THE598-stale-counterfactual-evidence-20260914/thegn_core-3d96bbbea2ccaf51.d",
+      "bytes": 48857,
+      "sha256": "a4bd0dad3c15d768715f8a324a1bd44ecb9aee2bdf3ae51cf784bc4c91bcb546",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE611-fresh-host-native-20260914.log",
+      "source": "/tmp/thegn-THE611-fresh-host-native-20260914.log",
+      "bytes": 11997,
+      "sha256": "10c240c299c97e2792a3f262cb3a67b54940d5162f0483b6b72fa0ac598d07cd",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE611-fresh-host-native-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-THE611-fresh-host-native-receipt-20260914.json",
+      "bytes": 900,
+      "sha256": "cbae45af86deb0b8daf27a7c46f65032bda046870cfabb178122131dd6e99683",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE611-fresh-host-native-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-THE611-old-binary-counterfactual-native-20260914.log",
+      "source": "/tmp/thegn-THE611-old-binary-counterfactual-native-20260914.log",
+      "bytes": 9692,
+      "sha256": "d8d11ac39cc1be488242123a644fd77bf4ee3901cba23e59eb3f845531bfd21d",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE611-old-binary-counterfactual-native-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-THE611-old-binary-counterfactual-native-receipt-20260914.json",
+      "bytes": 3713,
+      "sha256": "e806846d5452c7b49610f0337a958ffbfc16581c62f9f3839a18e050c7ec1e31",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE611-old-binary-counterfactual-native-receipt-20260914.json"
+    },
+    {
+      "file": "the611_old_binary_cf_8wc4x24k-c73e51b400d56794.d",
+      "source": "/tmp/thegn-THE611-old-binary-native-evidence-20260914/the611_old_binary_cf_8wc4x24k-c73e51b400d56794.d",
+      "bytes": 970,
+      "sha256": "becadd0f9ed7ba9be722c890fffc1211591304b32fc229143dcbe1c86e16d4a3",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE611-old-binary-startup-canary-20260914.log",
+      "source": "/tmp/thegn-THE611-old-binary-startup-canary-20260914.log",
+      "bytes": 799,
+      "sha256": "96521e65775fe9e0ed557338900a197a20361e22fcbb4c0ae357007ff74a21d5",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-THE611-old-binary-startup-canary-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-THE611-old-binary-startup-canary-receipt-20260914.json",
+      "bytes": 1188,
+      "sha256": "e5ac2732104da0a2ef539b014776baf45e6d1cf9ba3980b51153af235ed6ed08",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE611-old-binary-startup-canary-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-THE611-stale-artifact-20260914.md.raw",
+      "source": "/tmp/thegn-THE611-stale-artifact-20260914.md",
+      "bytes": 1120,
+      "sha256": "cefe4c1178bd76b1605897bd7f90a7624bc1ffbafbe36fa0b64ed851f7bbeac8",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-THE611-stale-artifact-20260914.md"
+    },
+    {
+      "file": "mutant-retry-thegn_core-3d96bbbea2ccaf51.d",
+      "source": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn_core-3d96bbbea2ccaf51.d",
+      "bytes": 48997,
+      "sha256": "e8c3ae75abbdf94ea35692819052649ffa3ffc8fdd9548891854551efeb7801d",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "the219.patch",
+      "source": "/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219.patch",
+      "bytes": 659,
+      "sha256": "89d38c936f0e4a25c664781e8e24d2c207f731f418e1d9e6dbbcb7e9ecc74446",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance-04-combined-focused-20260914.log",
+      "source": "/tmp/thegn-maintenance-04-combined-focused-20260914.log",
+      "bytes": 209606,
+      "sha256": "d1dc22c58cfea9acab82bb7d2a7049ccfbf1687dbd790e1af7bc40b79d00162c",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance-04-combined-focused-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-maintenance-04-combined-focused-receipt-20260914.json",
+      "bytes": 7170,
+      "sha256": "b5b0066080b6813238ab25e198c733037b5dedcd35102779f95298758e588dc2",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-maintenance-04-combined-focused-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-maintenance-04-combined-full-native-20260914.log",
+      "source": "/tmp/thegn-maintenance-04-combined-full-native-20260914.log",
+      "bytes": 971821,
+      "sha256": "c0581fc1f608277265bca0875f200c37f631431b88c6ada16be2cd0d0df6f111",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance-04-combined-full-native-receipt-20260914.json.raw",
+      "source": "/tmp/thegn-maintenance-04-combined-full-native-receipt-20260914.json",
+      "bytes": 613,
+      "sha256": "c92685e08af9d1b06cc74399a7d6fcee9ad2240f17ca299ee39843a2114bcd55",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-maintenance-04-combined-full-native-receipt-20260914.json"
+    },
+    {
+      "file": "thegn-the219-part-a-independent-review-20260914.md.raw",
+      "source": "/tmp/thegn-the219-part-a-independent-review-20260914.md",
+      "bytes": 2365,
+      "sha256": "8e4afc70445bd829b807e858bb5a66d74c5244a80b843c98a1adfcf06417beac",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-the219-part-a-independent-review-20260914.md"
+    },
+    {
+      "file": "thegn-the219-part-a-native-retry-20260914.log",
+      "source": "/tmp/thegn-the219-part-a-native-retry-20260914.log",
+      "bytes": 9664,
+      "sha256": "3a6bfd98001507797586ac893fb0769011313826b3fcedf60bfde2851effe91d",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-ratchets-20260915.log",
+      "source": "/tmp/thegn-maintenance04-ratchets-20260915.log",
+      "bytes": 4797,
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-openspec-20260915.log",
+      "source": "/tmp/thegn-maintenance04-openspec-20260915.log",
+      "bytes": 4951,
+      "sha256": "7dabe8f880a38b6929bb649b21d92e289899cc7ac5399c5123a2e69bcf34647c",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-treefmt-20260915.log",
+      "source": "/tmp/thegn-maintenance04-treefmt-20260915.log",
+      "bytes": 101,
+      "sha256": "8817a081ce1f09865a1db95ebdbb7e6f50d904d84fd84f01a8fb89679db58eb3",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-nonrust-lint-20260915.log",
+      "source": "/tmp/thegn-maintenance04-nonrust-lint-20260915.log",
+      "bytes": 1976,
+      "sha256": "f30d71a171c57b2cfc13a83acad747f67f4b2d29f842e99dec1a8c1429c7ac20",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-final-gates-receipt-20260915.json.raw",
+      "source": "/tmp/thegn-maintenance04-final-gates-receipt-20260915.json",
+      "bytes": 1821,
+      "sha256": "381aab56f9e3193cad7fe269573239c0b74d230a2c2b424cfb51e2029181a261",
+      "original_bytes_preserved": true,
+      "original_filename": "thegn-maintenance04-final-gates-receipt-20260915.json"
+    },
+    {
+      "file": "thegn-maintenance-04-combined-clippy-20260915.log",
+      "source": "/tmp/thegn-maintenance-04-combined-clippy-20260915.log",
+      "bytes": 9256,
+      "sha256": "ccfe565d24720f9e5d7450d1b26ac4bb66cd1e8a0f4b15552190c40c272f76d7",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-final-metadata-ratchets-20260915.log",
+      "source": "/tmp/thegn-maintenance04-final-metadata-ratchets-20260915.log",
+      "bytes": 4797,
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-maintenance04-final-metadata-openspec-20260915.log",
+      "source": "/tmp/thegn-maintenance04-final-metadata-openspec-20260915.log",
+      "bytes": 4951,
+      "sha256": "7dabe8f880a38b6929bb649b21d92e289899cc7ac5399c5123a2e69bcf34647c",
+      "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-three-fix-final-docs-validation-20260915.json.raw",
+      "source": "/tmp/thegn-three-fix-final-docs-validation-20260915.json",
+      "original_filename": "thegn-three-fix-final-docs-validation-20260915.json",
+      "bytes": 1072,
+      "sha256": "232ca57132c00a9a8a0e8b5f52df49e124a15a4490cc310521d832e32404579d",
+      "original_bytes_preserved": true
+    }
+  ],
+  "completed_source_gates": {
+    "ratchets": 0,
+    "openspec": 0,
+    "treefmt": 0,
+    "nonrust_lint": 0,
+    "exit_status_provenance": "Root retained execution results; logs copied unchanged. Gates ran before this evidence/documentation import."
+  },
+  "pending": [
+    "final review/commit",
+    "reviewed local-main landing and tracker closure"
+  ],
+  "payload_naming": "Original JSON/Markdown payloads use .json.raw/.md.raw to avoid configured formatter patterns; original bytes and SHA256 unchanged. Generated manifest.json and README.md are not original payloads.",
+  "completed_final_gates": {
+    "receipt": "thegn-maintenance04-final-gates-receipt-20260915.json.raw",
+    "clippy": 0,
+    "ratchets": 0,
+    "openspec": 0,
+    "final_scoped_documentation": "thegn-three-fix-final-docs-validation-20260915.json.raw"
+  }
+}

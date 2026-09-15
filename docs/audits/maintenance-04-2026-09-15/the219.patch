@@ -1,0 +1,13 @@
+diff --git a/crates/thegn-host/src/merge_driver.rs b/crates/thegn-host/src/merge_driver.rs
+index ff752f2d..07e54ec1 100644
+--- a/crates/thegn-host/src/merge_driver.rs
++++ b/crates/thegn-host/src/merge_driver.rs
+@@ -395,7 +395,7 @@ fn drive_queue_with(
+                         });
+                         // Held for a later drain; NOT a branch/gate failure.
+                         out.deferred.push(item.branch.clone());
+-                        break;
++                        continue;
+                     }
+                     crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
+                         thegn_core::msg::warn(&warning);

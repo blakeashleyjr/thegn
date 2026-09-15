@@ -1,0 +1,14 @@
+{
+  "issue": "THE-611",
+  "selector": "static_output_precedes_legacy_migration_and_both_profile_selectors",
+  "exit_code": 101,
+  "test_seconds": 0.46,
+  "expected_semantic_failure": true,
+  "log": "/tmp/thegn-THE611-old-binary-startup-canary-20260914.log",
+  "log_sha256": "96521e65775fe9e0ed557338900a197a20361e22fcbb4c0ae357007ff74a21d5",
+  "binary": "/tmp/thegn-THE611-old-binary-native-evidence-20260914/the611_old_binary_cf_8wc4x24k-c73e51b400d56794",
+  "binary_sha256": "cfa04962364bf7103568ea6db7c9d035e7a97c9804f4f152a952c343e430ac6a",
+  "outer_watchdog": "timeout --verbose --kill-after=5s 30s; no foreground/preserve-status; no signal output or timeout exit",
+  "observed": "First config path with CLI profile and malformed private config reports migrating2 legacy paths and falling back to defaults; unchanged success(output) rejects nonempty stderr.",
+  "limits": "Failure precedes snapshot comparison, explicit strict Fixture.close, environment-profile iteration and later STATIC rows. Exact owned child had been observed/reaped before output validation. Modern complete canary fixture passed in focused/full native gates; no all-assertions-reached claim for old binary."
+}

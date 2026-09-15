@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.36s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID f1dbaf3a-f05b-4afc-b0c2-2a6212a56a22 with nextest profile: counterfactual
+    Starting 2 tests across 1 binary (4090 tests skipped)
+        PASS [   0.283s] (1/2) thegn-core host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment
+        PASS [   0.300s] (2/2) thegn-core host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings
+────────────
+     Summary [   0.605s] 2 tests run: 2 passed, 4090 skipped

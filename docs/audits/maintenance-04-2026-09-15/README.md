@@ -1,0 +1,9 @@
+# Three-fix segmented acceptance evidence
+
+Scoped native/counterfactual, strict workspace Clippy and source gates are complete. Final review, local-main landing and issue closure remain pending.
+
+Original receipts, logs and reviews are copied byte-for-byte. Both THE219 actual CLI receipts are complete, including their captured phase/SQL/cleanup data; none is reduced to a summary. The combined full run remains an exit100 record (8376 passed, one ratchet failed). Its focused68 pass and corrected a446 six-test pass are separate, overlapping gates. The first THE598 mutant two-PASS attempt and earlier THE611 stale unit-artifact incident remain explicitly invalid where their source provenance failed. The rebuilt THE598 mutant has two intended semantic failures. Counterfactual assertion reach and cleanup limits remain in the independent reviews.
+
+`manifest.json` maps each artifact to its original path, byte size and SHA256. Original JSON and Markdown payloads end in `.json.raw` and `.md.raw`; the suffix changes only their repository names, preserving bytes and hashes. Configured treefmt patterns do not match `.raw` files. The generated manifest and this README remain ordinary reviewable metadata. Runtime binaries are intentionally excluded; their hashes and external pin paths remain in original receipts. Identically named fixed and mutant core depfiles have distinct local filename prefixes, with unchanged contents. Original receipt paths are not rewritten.
+
+Revalidate the original payload hashes after metadata changes. The final Clippy/source/spec/metadata receipt and original logs are now included. The strict workspace/all-target Clippy command exited zero in 13m58s; inherited dependency warnings remain in the raw log. Local-main evidence must be added only after landing. Do not relabel historical binaries or turn this segmented record into a claimed single full-a446 pass.

@@ -1,0 +1,73 @@
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-combined-20260914/crates/thegn-media)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-combined-20260914/crates/thegn-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 20s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 1e17c82a-1c66-4bd9-bbf6-ce4e0c943b72 with nextest profile: default
+    Starting 6 tests across 1 binary (4086 tests skipped)
+        PASS [   0.096s] (1/6) thegn-core host_config::merge_tests::explicit_environment_survives_host_definition_merge_and_resolution
+        PASS [   0.107s] (2/6) thegn-core host_config::merge_tests::declared_nonpane_reaches_never_synthesize_losing_db_environments
+        PASS [   0.129s] (3/6) thegn-core host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings
+        PASS [   0.133s] (4/6) thegn-core host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment
+        PASS [   0.105s] (5/6) thegn-core host_config::merge_tests::unshadowed_db_definitions_resolve_only_supported_pane_reaches
+        PASS [   0.274s] (6/6) thegn-core platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint
+────────────
+     Summary [   0.392s] 6 tests run: 6 passed, 4086 skipped
+        PASS [   0.096s] (1/6) thegn-core host_config::merge_tests::explicit_environment_survives_host_definition_merge_and_resolution
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::explicit_environment_survives_host_definition_merge_and_resolution ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.00s
+
+
+        PASS [   0.107s] (2/6) thegn-core host_config::merge_tests::declared_nonpane_reaches_never_synthesize_losing_db_environments
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::declared_nonpane_reaches_never_synthesize_losing_db_environments ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.01s
+
+  stderr ───
+    thegn: config: execution environment "precedence-fixture" is not defined under [env.precedence-fixture]; using the default
+
+        PASS [   0.129s] (3/6) thegn-core host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.00s
+
+
+        PASS [   0.133s] (4/6) thegn-core host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.00s
+
+
+        PASS [   0.105s] (5/6) thegn-core host_config::merge_tests::unshadowed_db_definitions_resolve_only_supported_pane_reaches
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::unshadowed_db_definitions_resolve_only_supported_pane_reaches ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.00s
+
+  stderr ───
+    thegn: config: execution environment "precedence-fixture" is not defined under [env.precedence-fixture]; using the default
+
+        PASS [   0.274s] (6/6) thegn-core platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint
+  stdout ───
+
+    running 1 test
+    test platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.19s
+
+

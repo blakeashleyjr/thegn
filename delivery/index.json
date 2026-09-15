@@ -687,7 +687,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Dispatch existing static CLI output before effective configuration loading, migration and profile side effects; native acceptance and local landing remain pending."
+      "summary": "Static CLI repair has current native, old-binary counterfactual and strict lint/source evidence; reviewed local-main landing remains pending. Checked admission/source workers remain separate."
     },
     {
       "change": "harden-live-diagnostics-and-forge",
@@ -868,7 +868,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Preserve exact drain diagnostics and terminate held retries; THE-219 adds retry-progress and private CLI acceptance, while THE-608 retains its separate verification gates."
+      "summary": "THE-219 retry-progress and private actual-CLI acceptance have segmented native/counterfactual and strict lint/source evidence; local-main landing remains pending. THE-608/THE-610 shared obligations remain separate."
     },
     {
       "change": "preserve-winning-host-environment",
@@ -880,7 +880,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Winning-host environment synthesis is source-reviewed; native precedence/compatibility tests, old-body counterfactual and local-main delivery remain pending. Strict capture and checked launch composition are separate."
+      "summary": "Winning-host synthesis has native precedence/compatibility, rebuilt counterfactual and strict lint/source evidence; reviewed local-main landing remains pending. Strict capture and launch composition are separate."
     },
     {
       "change": "repair-kitty-stream-parser",

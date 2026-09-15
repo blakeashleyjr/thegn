@@ -1,0 +1,33 @@
+# THE598 actual counterfactual retry — independent verdict
+
+Accepted as a meaningful two-test counterfactual. No new source or test revision is requested by this result. Review only: no Cargo, process/test execution or source mutation.
+
+Machine-readable receipt: `/tmp/thegn-THE598-counterfactual-retry-independent-receipt-20260914.json`.
+
+The retry log explicitly compiles thegn-core from `/tmp/thegn-THE598-counterfactual-20260914-830dgf7c/source/crates/thegn-core`, then runs nextest25ba2d6f-c6ad-4dbe-af96-e19964bb3965: two failures, zero passes,0.281s after5m57 compilation. Root reports exit100. This is not a compile error or timeout failure.
+
+The resulting artifact is156396376bytes, SHA256 `553d111137e99542325d39d94c274b6b795c8a7a09574a0ec6c501dc042bb6f1`; it differs from the preserved stale fixed artifact `733ec587b636aa3fc68f2bf6e5fbe528e0f7ce4e4b868eb1360dab7fae737069`. Its depfile SHA256 `e8c3ae75abbdf94ea35692819052649ffa3ffc8fdd9548891854551efeb7801d` identifies the actual counterfactual CARGO_MANIFEST_DIR. I read and hashed these runtime artifacts without changing them; root was asked to retain them before shared-target reuse.
+
+Both exact selectors fail at host_config_merge_tests.rs115, the full synthesized env.ssh JSON equality:
+
+- `host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment`: the declared Local catalog host remains the winner, but the old body synthesized settings from the losing DB SSH definition.
+- `host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings`: its first loop case is DB Local against declared SSH; the same old-body mistake copies losing DB connection settings.
+
+Actual left values are database host, port2202, mosh, database identity/jump/config, forward_agent=false and ConnectTimeout22. Expected right values are the declared host, port2201, ssh, declared identity/jump/config, forward_agent=true and ConnectTimeout11. This exercises the repaired precedence boundary, not host-key policy, incidental parser output or a fabricated assertion.
+
+Assertion-order limits matter: catalog equality, actual resolve_environment, resolved-name and env.host checks are reached. The private resolution directory is strictly closed inside resolve before returning, so cleanup precedes the intended failure. The SSH-settings equality fails before later unresolved-selection/placement assertions; those later assertions are not counterfactually exercised, and later iterations of the SSH test are not reached. The normal fixed five-test suite covers the full matrix. No additional mutant is needed merely to force every later assertion to fail independently.
+
+The old-body source remains byte-identical to its recorded pre-touch value. The only intentional invalidation was mtime, and the actual compilation/new depfile/new binary now supply the missing proof. The earlier no-compile two-PASS attempt remains invalid in `/tmp/thegn-THE598-stale-counterfactual-20260914.json`; do not relabel or delete it.
+
+## Combined three-fix gate assessment
+
+No substantive implementation or regression-fixture revision is indicated beyond the reviewed test-only a446 host-key correction. Relevant retained evidence is deliberately segmented:
+
+- Combined623 focused68/68 covers611 parser/actual CLI,219 driver/actual CLI,598 precedence and compatibility; receipt/log hash rechecked here.
+- Combined623 full workspace ran8377:8376 passed, one host-key literal ratchet failed,26 configured skips. That full run remains an exit100 record, not a clean pass.
+- a446's only source delta is the private host fixture extra argument. Its fresh six-test gate passed all five598 tests plus the exact formerly failing ratchet.
+- The now-valid598 old-body retry fails semantically twice.611's old-binary FIFO/startup reds and219's bounded hold-loop counterfactual remain separate reviewed evidence, with their documented reach limits.
+
+Pending strict Clippy, applicable source/spec/delivery metadata checks, final provenance/assembly and landing still need completion. There is no evidence-driven reason to repeat the entire8377 suite solely for the already-tested fixture literal correction, provided root preserves this exact segmented source boundary. Any further functional source changes require their own appropriate verification. Do not add overlapping test counts or advertise a single clean full-a446 run. This recommendation does not close an issue, waive the renderer performance hold, or validate unintegrated617/633/639 work.
+
+Root-authorized preservation completed: retry binary and depfile now retained in `/tmp/thegn-THE598-retry-evidence-20260914-ya367f6b`. Each source hash was checked before and after copying; each destination hash matches, with independent inodes and no overwrite. `manifest.json` and the receipt record paths, hashes, sizes and inode identities. No artifact execution occurred.

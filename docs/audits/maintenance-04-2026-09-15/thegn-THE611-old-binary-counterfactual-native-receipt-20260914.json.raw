@@ -1,0 +1,55 @@
+{
+  "issue": "THE-611",
+  "source": "6233502620110aee5663ee17806a60e8f4109ce3",
+  "exit_code": 100,
+  "expected_semantic_failure": true,
+  "run_id": "f4b21161-9926-4ada-827d-c82c964ca3dd",
+  "build_seconds": 7.57,
+  "test_seconds": 10.272,
+  "log": "/tmp/thegn-THE611-old-binary-counterfactual-native-20260914.log",
+  "log_sha256": "d8d11ac39cc1be488242123a644fd77bf4ee3901cba23e59eb3f845531bfd21d",
+  "test_binary": "/tmp/thegn-THE611-old-binary-native-evidence-20260914/the611_old_binary_cf_8wc4x24k-c73e51b400d56794",
+  "test_binary_sha256": "cfa04962364bf7103568ea6db7c9d035e7a97c9804f4f152a952c343e430ac6a",
+  "depfile": "/tmp/thegn-THE611-old-binary-native-evidence-20260914/the611_old_binary_cf_8wc4x24k-c73e51b400d56794.d",
+  "depfile_sha256": "becadd0f9ed7ba9be722c890fffc1211591304b32fc229143dcbe1c86e16d4a3",
+  "selector": "unix::static_commands_do_not_open_fifo_configuration_but_configured_siblings_do",
+  "old_product": {
+    "source_revision": "9a96dde4e6eeeeaf79ef8d66fa4768eabfde4ee5",
+    "source_path": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+    "pinned_binary": "/tmp/thegn-batch03-binaries-20260914/candidate-9a96dde4-debug",
+    "sha256": "80e1ddd69e3f7fd34ea78ae66754273b7cbbbffc164473d90717c34efd36add6",
+    "size": 536741152,
+    "profile": "debug, ordinary shipping allocator, functional UI only",
+    "build_log": "/tmp/thegn-batch03-row-cursor-normal-build-20260914.log",
+    "build_exit_code": 0,
+    "build_duration": "29.69s",
+    "native_result": "78/78 focused host monitor and renderer tests passed",
+    "source_note": "Rust source frozen9a96; test-only iterator lint correction queued after release build. Production source unchanged."
+  },
+  "copied_sources": [
+    {
+      "source": "crates/thegn-host/tests/static_commands_process.rs",
+      "source_sha256": "d2b9e69366ed418893353fb22466dfde98f7b84c3d76d34ed72805813d52b96a",
+      "staged": "/tmp/thegn-THE611-old-binary-stage-20260914-8wc4x24k/tests/the611_old_binary_cf_8wc4x24k.rs",
+      "destination_relative_to_checkout": "crates/thegn-host/tests/the611_old_binary_cf_8wc4x24k.rs",
+      "sha256": "c70c282e54d7054a98f561fef0f8d5af3961ac8ff6c9b4e4b2a180db2ceb869b"
+    },
+    {
+      "source": "crates/thegn-host/tests/static_cli_support/mod.rs",
+      "source_sha256": "da850076b922be75813233136fc38ba4d97fc1c2e013afdbed606f4e0881c87f",
+      "staged": "/tmp/thegn-THE611-old-binary-stage-20260914-8wc4x24k/tests/the611_old_binary_cf_8wc4x24k_support/mod.rs",
+      "destination_relative_to_checkout": "crates/thegn-host/tests/the611_old_binary_cf_8wc4x24k_support/mod.rs",
+      "sha256": "5fe16aa2d958661af4f33ae5dc65773c6d1f17968f13de52de80712122ef8be0"
+    },
+    {
+      "source": "crates/thegn-host/tests/static_cli_support/unix.rs",
+      "source_sha256": "aadd5d84bdce8223cf4f5991bea2135b59993b9ef76affd1cfa95e69283b4d8a",
+      "staged": "/tmp/thegn-THE611-old-binary-stage-20260914-8wc4x24k/tests/the611_old_binary_cf_8wc4x24k_support/unix.rs",
+      "destination_relative_to_checkout": "crates/thegn-host/tests/the611_old_binary_cf_8wc4x24k_support/unix.rs",
+      "sha256": "aadd5d84bdce8223cf4f5991bea2135b59993b9ef76affd1cfa95e69283b4d8a"
+    }
+  ],
+  "custody_evidence": "Exact owned CLI deadline panic is after successful child.terminate(DEADLINE) assertion; terminate only succeeds after retained Child.try_wait returns Some. No custody error or outer timeout. This is not a separately exported strict TempDir.close receipt on the panic path.",
+  "actual_build_scope": "Workspace compile completed7.57s, package line thegn-host; exact new target depfile/binary retained, no assertion that Cargo invoked only one compiler without verbose trace.",
+  "restored_clean_status": true
+}

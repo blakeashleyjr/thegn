@@ -1,0 +1,38 @@
+{
+  "source": "a4468a8ec6372b3905a7b545f5a5b740162ebf17",
+  "scope": "Final seven documentation/task/delivery edits and generated evidence manifest/README; no Rust edits",
+  "scoped_treefmt": {
+    "exit_code": 0,
+    "paths": 9,
+    "processed_markdown": 7,
+    "changed": 0,
+    "milliseconds": 851
+  },
+  "delivery": {
+    "argv": [
+      "python3",
+      "scripts/delivery_state.py",
+      "validate"
+    ],
+    "exit_code": 0,
+    "output": "delivery state: change/issue schemas, bidirectional ownership, lifecycle, docs, and contract ratchets valid"
+  },
+  "scoped_openspec": [
+    {
+      "change": "fix-static-cli-startup",
+      "exit_code": 0,
+      "output": "Change 'fix-static-cli-startup' is valid\n"
+    },
+    {
+      "change": "preserve-merge-drain-diagnostics",
+      "exit_code": 0,
+      "output": "Change 'preserve-merge-drain-diagnostics' is valid\n"
+    },
+    {
+      "change": "preserve-winning-host-environment",
+      "exit_code": 0,
+      "output": "Change 'preserve-winning-host-environment' is valid\n"
+    }
+  ],
+  "landing_pending": true
+}

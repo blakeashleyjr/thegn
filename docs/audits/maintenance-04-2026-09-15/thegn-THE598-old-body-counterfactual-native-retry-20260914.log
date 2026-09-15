@@ -1,0 +1,53 @@
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-THE598-counterfactual-20260914-830dgf7c/source/crates/thegn-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 57s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 25ba2d6f-c6ad-4dbe-af96-e19964bb3965 with nextest profile: counterfactual
+    Starting 2 tests across 1 binary (4090 tests skipped)
+        FAIL [   0.148s] (1/2) thegn-core host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment
+        FAIL [   0.121s] (2/2) thegn-core host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings
+────────────
+     Summary [   0.281s] 2 tests run: 0 passed, 2 failed, 4090 skipped
+        FAIL [   0.148s] (1/2) thegn-core host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment ... FAILED
+
+    failures:
+
+    failures:
+        host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment' (3409424) panicked at crates/thegn-core/src/host_config_merge_tests.rs:115:13:
+    assertion `left == right` failed
+      left: Object {"extra_args": Array [String("-o"), String("ConnectTimeout=22")], "forward_agent": Bool(false), "host": String("database@database.invalid"), "identity": String("/fixture/database/identity"), "jump_host": String("database-jump.invalid"), "port": Number(2202), "ssh_config": String("/fixture/database/ssh-config"), "transport": String("mosh")}
+     right: Object {"extra_args": Array [String("-o"), String("ConnectTimeout=11")], "forward_agent": Bool(true), "host": String("declared@declared.invalid"), "identity": String("/fixture/declared/identity"), "jump_host": String("declared-jump.invalid"), "port": Number(2201), "ssh_config": String("/fixture/declared/ssh-config"), "transport": String("ssh")}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.121s] (2/2) thegn-core host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings
+  stdout ───
+
+    running 1 test
+    test host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings ... FAILED
+
+    failures:
+
+    failures:
+        host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4091 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings' (3409427) panicked at crates/thegn-core/src/host_config_merge_tests.rs:115:13:
+    assertion `left == right` failed
+      left: Object {"extra_args": Array [String("-o"), String("ConnectTimeout=22")], "forward_agent": Bool(false), "host": String("database@database.invalid"), "identity": String("/fixture/database/identity"), "jump_host": String("database-jump.invalid"), "port": Number(2202), "ssh_config": String("/fixture/database/ssh-config"), "transport": String("mosh")}
+     right: Object {"extra_args": Array [String("-o"), String("ConnectTimeout=11")], "forward_agent": Bool(true), "host": String("declared@declared.invalid"), "identity": String("/fixture/declared/identity"), "jump_host": String("declared-jump.invalid"), "port": Number(2201), "ssh_config": String("/fixture/declared/ssh-config"), "transport": String("ssh")}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+error: test run failed

@@ -1,0 +1,25 @@
+{
+  "issue": "THE-598",
+  "counterfactual_attempt_exit": 0,
+  "counterfactual_attempt_valid": false,
+  "reason": "No core compilation; existing core artifact depfile embeds combined checkout, not mutated source checkout. The mutation file and copied fixture predated the fixed compiled artifact, so shared target freshness reused the fixed binary.",
+  "log": "/tmp/thegn-THE598-old-body-counterfactual-native-20260914.log",
+  "log_sha256": "21bfc712dbe72abf8d124eb60137979c7a47205822aa5475710c557eb2e46a47",
+  "fixed_binary_pin": "/tmp/thegn-THE598-stale-counterfactual-evidence-20260914/thegn_core-3d96bbbea2ccaf51",
+  "fixed_binary_sha256": "733ec587b636aa3fc68f2bf6e5fbe528e0f7ce4e4b868eb1360dab7fae737069",
+  "depfile_pin": "/tmp/thegn-THE598-stale-counterfactual-evidence-20260914/thegn_core-3d96bbbea2ccaf51.d",
+  "depfile_sha256": "a4bd0dad3c15d768715f8a324a1bd44ecb9aee2bdf3ae51cf784bc4c91bcb546",
+  "depfile_environment_proof": [
+    "# env-dep:CARGO_MANIFEST_DIR=/tmp/thegn-maintenance-04-combined-20260914/crates/thegn-core",
+    "# env-dep:CARGO_PKG_VERSION=0.1.0-alpha.2"
+  ],
+  "source_before": {
+    "sha256": "102917a46d80b82c036f674be5266a78f88565c272ff914f9c773158c638d56c",
+    "mtime_ns": 1789431819490691419
+  },
+  "source_after": {
+    "sha256": "102917a46d80b82c036f674be5266a78f88565c272ff914f9c773158c638d56c",
+    "mtime_ns": 1789435743795355080
+  },
+  "invalidation": "Only CF host_config.rs mtime advanced; bytes unchanged. No package clean or fixed-source mutation. Retry required."
+}

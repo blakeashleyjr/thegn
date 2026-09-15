@@ -1,0 +1,69 @@
+{
+  "issue": "THE-598",
+  "counterfactual_attempt_valid": true,
+  "exit_code": 100,
+  "exit_code_provenance": "Root execution result; log independently confirms nextest two-test failure summary",
+  "log": "/tmp/thegn-THE598-old-body-counterfactual-native-retry-20260914.log",
+  "log_sha256": "14339e484dde379e37f5ac0663a7553d967be74f4374cdb3bb12861fc4eb22ad",
+  "run_id": "25ba2d6f-c6ad-4dbe-af96-e19964bb3965",
+  "build_seconds": 357,
+  "test_seconds": 0.281,
+  "passed": 0,
+  "failed": 2,
+  "selectors": [
+    "host_config::merge_tests::declared_local_shadows_db_ssh_in_resolved_environment",
+    "host_config::merge_tests::declared_ssh_shadows_db_reaches_and_connection_settings"
+  ],
+  "failure_assertion": "host_config_merge_tests.rs:115 full synthesized env.ssh JSON equality; database values versus winning declared values",
+  "assertion_scope": "Both tests reach actual resolve_environment and strict owned temporary-directory close, then fail SSH settings equality. Later placement assertions and later SSH-loop reaches are not reached.",
+  "binary": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn_core-3d96bbbea2ccaf51",
+  "binary_sha256": "553d111137e99542325d39d94c274b6b795c8a7a09574a0ec6c501dc042bb6f1",
+  "binary_bytes": 156396376,
+  "depfile": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn_core-3d96bbbea2ccaf51.d",
+  "depfile_sha256": "e8c3ae75abbdf94ea35692819052649ffa3ffc8fdd9548891854551efeb7801d",
+  "depfile_manifest_proof": "# env-dep:CARGO_MANIFEST_DIR=/tmp/thegn-THE598-counterfactual-20260914-830dgf7c/source/crates/thegn-core",
+  "stale_fixed_binary_sha256": "733ec587b636aa3fc68f2bf6e5fbe528e0f7ce4e4b868eb1360dab7fae737069",
+  "source": "/tmp/thegn-THE598-counterfactual-20260914-830dgf7c/source",
+  "source_sha256": "102917a46d80b82c036f674be5266a78f88565c272ff914f9c773158c638d56c",
+  "fixture_sha256": "f370bf8a5fe2687a74ba8be8e386f239adcbe64ccf0e3979ca7466020c02ece0",
+  "prior_invalid_attempt": "/tmp/thegn-THE598-stale-counterfactual-20260914.json",
+  "limits": "No runtime execution by reviewer. Exact retry binary/depfile copied to exclusive independent-inode evidence directory and rehashed; original stale attempt retained separately. No full-green or closure claim.",
+  "retained_artifacts": {
+    "directory": "/tmp/thegn-THE598-retry-evidence-20260914-ya367f6b",
+    "copy": "shutil.copy2 into exclusive new directory; no overwrite/no hard links",
+    "artifacts": [
+      {
+        "source": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn_core-3d96bbbea2ccaf51",
+        "copy": "/tmp/thegn-THE598-retry-evidence-20260914-ya367f6b/thegn_core-3d96bbbea2ccaf51",
+        "sha256": "553d111137e99542325d39d94c274b6b795c8a7a09574a0ec6c501dc042bb6f1",
+        "bytes": 156396376,
+        "source_device_inode": [
+          45,
+          66379780
+        ],
+        "copy_device_inode": [
+          45,
+          66862968
+        ],
+        "independent_inode": true,
+        "source_hash_before_and_after_copy_verified": true
+      },
+      {
+        "source": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn_core-3d96bbbea2ccaf51.d",
+        "copy": "/tmp/thegn-THE598-retry-evidence-20260914-ya367f6b/thegn_core-3d96bbbea2ccaf51.d",
+        "sha256": "e8c3ae75abbdf94ea35692819052649ffa3ffc8fdd9548891854551efeb7801d",
+        "bytes": 48997,
+        "source_device_inode": [
+          45,
+          66376350
+        ],
+        "copy_device_inode": [
+          45,
+          66862972
+        ],
+        "independent_inode": true,
+        "source_hash_before_and_after_copy_verified": true
+      }
+    ]
+  }
+}

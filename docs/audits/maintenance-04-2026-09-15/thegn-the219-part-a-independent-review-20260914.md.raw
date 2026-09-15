@@ -1,0 +1,13 @@
+# THE219 Part A independent source review
+
+Reviewed the frozen two-file working diff in `/tmp/thegn-maintenance-04-drain-20260914` against the approved Part A plan. Source approval; no scoped blocker found. No Cargo, CLI, agent, provider or counterfactual execution performed by this reviewer.
+
+Reviewed SHA256: `merge_driver.rs` b91b385799e497a89518fd390c433fd878f0be05577aff4c4883f4f5dd77c236; `merge_driver_status_tests.rs` 102db350ff824687ec5b3ad27f3681ecd51400b4b099e623d458b2113e795fe8.
+
+The sole production behavior seam statically forwards the same captured config and original six runner arguments, including borrowed failure and moved sandbox. The advisory result stays ignored. No loop, retry, authority, status or lifecycle behavior changes. The existing InfraHold inner-loop break remains intact.
+
+The private file-backed SQLite fixture observes every status UPDATE through a second connection, including repeated identical agent_running values. Its independent budget trigger and complete persisted/progress/panel field comparisons catch extra writes without notifications and stale details. Both conflict and red-gate cases start with spent budget, stop after one refused admission, continue the next item, then reread the same database row for genuine floor recovery through the inert runner. The unchanged false-returning runner consumes only remaining budget; GateError refuses both floor and runner while continuing the next item. Explicit main target avoids Git default-branch discovery; folder organization is disabled; none of the new paths calls the actual agent runner or produces Landed/UpToDate lifecycle outcomes.
+
+Callback ceilings make the proposed isolated InfraHold break→continue counterfactual fail on its second fold. Native compilation, the four new tests and existing module, strict lint, and that exact counterfactual remain required. Ten-second elapsed assertions are post-return checks, not watchdogs; the root-owned retained test-process deadline remains necessary. Private database handles precede TempDir destruction and success explicitly closes both before strict cleanup.
+
+This is actual driver/SQL admission and budget evidence once executed, not actual CLI acceptance or real sandbox establishment. Part B, THE304 provisioning, THE227 status typing, THE228 reset semantics and live retry acceptance remain separate.

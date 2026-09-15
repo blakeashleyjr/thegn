@@ -1,0 +1,45 @@
+# Independent segmented receipt review — THE611 / THE598
+
+Read-only review. No Cargo, process/test execution, source edits or tracker changes. This review does not wait for or attribute results to the pending598 retry53490.
+
+## THE598 corrected current-source positive gate: accepted
+
+Receipt `/tmp/thegn-THE598-fixture-correction-native-receipt-20260914.json` identifies combined `a4468a8ec6372b3905a7b545f5a5b740162ebf17`, nextest `1e17c82a-1c66-4bd9-bbf6-ce4e0c943b72`, six unique tests passed, exit0,0.392s test time after2m20 compilation. Raw log SHA256 independently matches `657c270c61e5ef5d2b44006e2122931a394ad9d9010f7be43cdc8ce9aee0c88e`. The log explicitly compiles current combined thegn-core; it is not the later no-compile counterfactual attempt.
+
+All five host_config::merge_tests are present, plus `platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint`. Duplicate PASS lines in the detailed-output section do not create extra tests. Source a446 changes only the private extra SSH argument from HostKeyAlias to distinct ConnectTimeout11/22 values, preserving actual precedence and full settings assertions. No production merge algorithm changed. Expected missing-env diagnostics in the nonpane/unshadowed cases are retained; they do not replace the asserted resolution outcomes.
+
+This is six focused current-source passes, not a new full-workspace pass.
+
+## THE611 old-binary startup canary: accepted limited counterfactual
+
+Receipt `/tmp/thegn-THE611-old-binary-startup-canary-receipt-20260914.json` and raw log hash independently match `96521e65775fe9e0ed557338900a197a20361e22fcbb4c0ae357007ff74a21d5`. The retained integration-test binary hash matches `cfa04962364bf7103568ea6db7c9d035e7a97c9804f4f152a952c343e430ac6a` (26110208bytes). Its depfile names the copied counterfactual fixture and support files; the retained support equals the staged reviewed source. Its binary() explicitly returns the immutable candidate9a96 debug application path. This test binary is distinct from that old application binary.
+
+Exact selector `static_output_precedes_legacy_migration_and_both_profile_selectors` runs the unchanged fixture. Its first iteration is env_profile=false and first STATIC row is `config path`; it appends CLI `--profile fixture-profile`, passes the malformed private input and seeds private legacy directories.
+
+Actual assertion order and result:
+
+1. execute observes the child status using try_wait; Some status consumes the child and clears its owned handle before bounded stdout/stderr reading and returning Output.
+2. check_output calls success first. The status-success assertion passed, because the next empty-stderr assertion is the recorded panic at support/mod.rs321.
+3. Stderr reports legacy migration with two renamed paths, followed by malformed TOML and fallback to defaults. This proves old startup reached those behaviors before producing the static result. It is a reported two-path migration, not a completed independent filesystem-diff assertion.
+4. The test exits101 in0.46s, without watchdog signal output or timeout exit. The configured outer bound remains30s plus5s escalation; it did not cause this failure.
+
+The stdout config-path comparison, filesystem snapshot comparison, no-app/config/state assertions, strict Fixture.close, later STATIC rows and env-profile=true iteration were NOT reached. Do not claim the complete old-binary canary matrix ran. Child settlement is established by source ordering before validation; fixture TempDir cleanup on assertion unwind is ordinary Drop, not the strict cleanup assertion that lies later. There is no receipt proving strict directory removal after that panic. No timeout or Held-child path was used in this observed run.
+
+This is a meaningful independent semantic red for early static dispatch. It complements the separately retained FIFO red and modern full fixture positives; it is not a fresh modern positive or universal old-path coverage claim.
+
+## THE598 initial counterfactual attempt: rejected as proof
+
+`/tmp/thegn-THE598-stale-counterfactual-20260914.json` truthfully marks the attempt invalid. I verified:
+
+- Raw attempt log SHA256 `21bfc712dbe72abf8d124eb60137979c7a47205822aa5475710c557eb2e46a47`; it reports a1.36s Finished line, no core compilation, and two passing selectors.
+- Retained fixed artifact SHA256 `733ec587b636aa3fc68f2bf6e5fbe528e0f7ce4e4b868eb1360dab7fae737069` (156393048bytes).
+- Retained depfile SHA256 `a4bd0dad3c15d768715f8a324a1bd44ecb9aee2bdf3ae51cf784bc4c91bcb546`, including `CARGO_MANIFEST_DIR=/tmp/thegn-maintenance-04-combined-20260914/crates/thegn-core`. This identifies the fixed combined source environment, not the mutated private checkout.
+- The counterfactual source diff still restores only the old merge_host_defs behavior: catalog insertion preserves declared host, but synthesized placement/SSH use the losing DB definition. The current file SHA256 equals both recorded before/after values `102917a46d80b82c036f674be5266a78f88565c272ff914f9c773158c638d56c`; recorded mtime advances without byte change.
+
+Thus those two PASS results neither refute the regression nor prove the old body passed; they executed a reused fixed artifact. Preserve the failed-provenance attempt in history. Touching only the mutant file is a reasonable targeted invalidation, but is not proof by itself that the pending rebuilt binary contains that source.
+
+The retry gate must show actual counterfactual core compilation, retain the resulting binary/depfile with source identity and hash, and run the two exact precedence selectors under the preselected finite bound. Expected meaningful failures are the Local-vs-SSH placement mismatch and the SSH winner/connection-settings mismatch, not compile errors, policy/host-key ratchet failures or outer watchdog termination. Neither a retry outcome nor its artifact provenance is claimed here.
+
+## Readiness
+
+These reviewed receipts are valid inputs to the root's segmented gate: accepted six fixed-source tests and limited611 semantic red, explicitly invalid first598 mutant attempt, pending598 rebuilt-mutant validation. Remaining configured/full-segment, strict lint, artifact provenance, final assembly and landing requirements remain root-owned. No full clean pass, final issue closure or performance acceptance is inferred.

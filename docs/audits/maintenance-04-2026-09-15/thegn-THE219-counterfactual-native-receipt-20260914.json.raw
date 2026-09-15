@@ -1,0 +1,13 @@
+{
+  "source": "c3e4cd55d5f86ec326c47fda28f063ad1bf33788",
+  "mutation_patch": "/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219.patch",
+  "mutation": "Only InfraHold break to continue",
+  "exit_code": 100,
+  "expected_failed": 2,
+  "selected": 2,
+  "seconds": 0.436,
+  "watchdog_seconds": 30,
+  "actual_observation": "Both conflict/red-gate selectors reject second held fold, actual count2 versus1; no native CLI infinite loop or real agent execution",
+  "log": "/tmp/thegn-THE219-counterfactual-native-20260914.log",
+  "log_sha256": "1a43a0c8e347340f6a178640335ae2eaa537c943507544db10537e070f40e5b1"
+}

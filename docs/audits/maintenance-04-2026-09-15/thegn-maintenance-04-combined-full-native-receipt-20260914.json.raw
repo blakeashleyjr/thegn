@@ -1,0 +1,14 @@
+{
+  "source": "6233502620110aee5663ee17806a60e8f4109ce3",
+  "source_clean": true,
+  "exit_code": 100,
+  "log": "/tmp/thegn-maintenance-04-combined-full-native-20260914.log",
+  "log_sha256": "c0581fc1f608277265bca0875f200c37f631431b88c6ada16be2cd0d0df6f111",
+  "summary": [
+    "Summary [1208.442s] 8377 tests run: 8376 passed (2 slow), 1 failed, 26 skipped"
+  ],
+  "failure_lines": [
+    "FAIL [   1.190s] (2842/8377) thegn-core platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint",
+    "FAIL [   1.190s] (2842/8377) thegn-core platform_ratchet_tests::host_key_literals_stay_in_the_chokepoint"
+  ]
+}
