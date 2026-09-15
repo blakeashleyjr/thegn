@@ -30,3 +30,7 @@ claim. CPU/RSS prelude assertions passed where the selector reaches them. The
 counterfactual did not run a live process action. Counterfactual and final
 adversarial evidence are complete; local-main landing remains root-owned and
 pending.
+
+## Local-main landing
+
+Reviewed source and evidence landed on local main at `fdcefcb687b901d2362bcce6f1d6b3d7be4a57fb`. The candidate pending statements above are historical. Fourteen exact native regressions passed; three old-comparator runs failed their intended first Name assertions. Scoped production-bin strict Clippy and final formatting, source ratchets and specification gates passed. The shared process-refresh and performance obligations remain open. No live process action, push or live restart occurred.

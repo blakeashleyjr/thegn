@@ -29,3 +29,5 @@ The corrected repository audit is
 `docs/audits/process-sort-THE-640.md`; its current SHA-256 is recorded in the
 manifest. Landing and closure remain pending root review. No landing approval
 is implied by this checkpoint.
+
+Final root review and local-main landing completed at `fdcefcb687b901d2362bcce6f1d6b3d7be4a57fb`; earlier pending-landing wording is superseded. Final source, specification and formatting gates passed.

@@ -14,4 +14,4 @@
 - [x] THE-640: Run the focused native host monitor/view checks and record no live process actions.
 - [x] THE-640: Run and retain the old-comparator counterfactual in its separate private clone.
 - [x] THE-640: Complete independent adversarial review of the direction, tree, filter, and confirmation evidence.
-- [ ] THE-640: Complete reviewed local-main landing and reconcile the issue/delivery records.
+- [x] THE-640: Complete reviewed local-main landing and reconcile the issue/delivery records.

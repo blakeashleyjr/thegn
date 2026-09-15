@@ -6,7 +6,7 @@
   "private_checkpoint": "cc3a61142d9a26c2c949e50f8fc7398b1e991125",
   "canonical_source_merge": "b025ec5d877f191d65cc831c95035c493c49c7f6",
   "reviewed_test_source": "9553d36878b8e4726524997d2cd7e05e3b4b1f93",
-  "scope": "Positive native, counterfactual, source/native reviews, and scoped production-bin lint evidence; landing and closure remain pending.",
+  "scope": "Reviewed THE640 code/evidence delivered to local main; Linear closure follows final metadata receipt.",
   "source_hashes": {
     "crates/thegn-host/src/monitor/procs_view.rs": "3ceb2630d5f36f1d16fda8828c55140c1f5c5b2c160be10eeff95dcb931701f6",
     "crates/thegn-host/src/monitor_tests.rs": "222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237"
@@ -123,13 +123,13 @@
     "positive_native": "complete",
     "counterfactual": "complete; build 27339 and intended native failures independently reviewed",
     "final_adversarial_review": "complete via independent source/native review",
-    "landing": "pending",
+    "landing": "complete at fdcefcb687b901d2362bcce6f1d6b3d7be4a57fb",
     "closure": "pending",
     "strict_scoped_clippy": "complete; root admission/log exit 0"
   },
   "counterfactual_wording_correction": {
     "audit": "docs/audits/process-sort-THE-640.md",
-    "audit_sha256": "1226ea9014e23d59dddcbaaf6d66bc61c35f5f84c32d0a2586ea1c01a62ac317",
+    "audit_sha256": "65ec10cd3a541fb72113a7839346c2e123edbc31c03330f2d51f678c39ad8c2d",
     "meaning": "The historical pre-run wording was superseded by the captured build 27339 native log: each first Name-direction assertion failed before later PID assertions in that test process.",
     "native_status": "complete: build 27339 exited 0; three intended Name-direction failures observed with exit 101; later PID assertions did not execute after the first panic."
   },
@@ -169,5 +169,22 @@
     "admission_sha256": "3e9d57161506f5da6a38dbdeb73a23ae314b22a286a8b0df4687c959ca505d03",
     "quota_sha256": "5b93774756d65f0d878f97773ca993aae4dcb9e4ed6395946f95b23add8916d9",
     "scope": "one scoped production-bin clippy run, one job, CPU quota 100%; no affinity claim"
+  },
+  "final_source_gates": {
+    "ratchets": {
+      "path": "/tmp/thegn-THE640-final-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "exit_code": 0
+    },
+    "openspec": {
+      "path": "/tmp/thegn-THE640-final-openspec-20260915.log",
+      "sha256": "bf97cb282336636ef851efb84ab5ef0f3af44fd1a386e522329ed3af05ae6c5e",
+      "exit_code": 0
+    },
+    "format": {
+      "path": "/tmp/thegn-THE640-final-format-20260915.log",
+      "sha256": "09faf55d578ace4148ba7a8412a68a996f12a473545e857dfd15424996150a52",
+      "exit_code": 0
+    }
   }
 }

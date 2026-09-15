@@ -1079,7 +1079,7 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Preserve process snapshots, deterministic row order and sampled selection identity across refreshes; align every process sort with its displayed direction."
+      "summary": "THE-640 sort direction fix delivered to local main fdcefcb6 after 14 focused native passes, three intended old-comparator failures, independent review, scoped strict lint and source gates. Shared THE-628 process-refresh/performance acceptance remains separate."
     },
     {
       "change": "verify-gate-workspace",
