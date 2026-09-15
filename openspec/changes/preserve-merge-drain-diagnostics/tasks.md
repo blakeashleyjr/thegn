@@ -39,11 +39,13 @@ fixed CLI/native rehearsal and live queue outcome remain unverified.
 - [x] Execute bounded old InfraHold break-to-continue counterfactual:2/2 intended second-fold assertion failures, retained `/tmp/thegn-THE219-counterfactual-native-receipt-20260914.json`.
 - [x] Audit all branch-local retry/continue arms and direct CLI/UI dispatch; record the progress argument and its limits in `docs/audits/THE-219-retry-progress.md`.
 - [x] Author and independently review Part B owned actual CLI conflict/red-gate hold, next-item and independent plain-drain recovery fixtures.
-- [ ] Compile and execute both actual Part B CLI tests with exact binary/config/SQL/cleanup receipts.
-- [ ] Complete current candidate strict lint, scoped specs/reciprocal delivery checks and required native gates.
+- [x] Compile and execute both actual Part B CLI tests with exact binary/config/SQL/cleanup receipts.
+- [x] Complete current candidate strict lint, scoped specs/reciprocal delivery checks and required native gates.
 - [ ] Review and land the complete THE-219 acceptance candidate on local main with its exact receipts.
 
 These follow-up boxes concern THE-219 only. They do not complete THE-608,
 THE-232 process lifetime, other launch/containment obligations or live queue
 acceptance. Earlier shared-change receipts above remain historical evidence for
 their stated sources, not substitutes for current Part B/native gates.
+
+THE-219 current Part B execution is retained without reduction in [the shared evidence manifest](../../../docs/audits/maintenance-04-2026-09-15/manifest.json). Strict Clippy and final metadata checks passed; reviewed local-main landing remains pending. The shared historical live-queue gate and THE-608/THE-610 acceptance are not completed by this update.
