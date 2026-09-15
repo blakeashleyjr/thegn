@@ -21,6 +21,13 @@ clamp the old cursor position to the remaining rows. Explicit sort and filter
 commands SHALL retain their existing selection semantics. Manual wheel scrolling
 MUST NOT be pulled back to the selection by a passive sample.
 
+For every sort key (CPU, memory, Name, and PID), the displayed down arrow SHALL
+mean descending values and the displayed up arrow SHALL mean ascending values.
+Name ordering SHALL use the existing lexical comparator. The direction contract
+MUST apply in both flat and tree views, including roots, siblings, and cycle
+leftovers, while retaining the PID tie-break for equal CPU, memory, or Name
+values.
+
 #### Scenario: Many idle processes tie at the retained cutoff
 
 - **WHEN** process enumeration returns more tied CPU/RSS rows than the retained limit in a different order
@@ -37,3 +44,11 @@ MUST NOT be pulled back to the selection by a passive sample.
 - **WHEN** the process identity named by a pending confirmation has vanished or has a different sampled birth time in the latest displayed snapshot
 - **THEN** confirming refuses the action and asks for a fresh selection
 - **AND** a reused PID does not inherit an earlier process's signal escalation state
+
+#### Scenario: Sort arrows match all process keys
+
+- **WHEN** the user selects CPU, memory, Name, or PID and toggles the existing
+  reverse key
+- **THEN** the rendered key label and arrow agree with the exact ascending or
+  descending order in flat and tree views
+- **AND** equal CPU, memory, or Name values remain ordered by ascending PID

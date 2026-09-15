@@ -1,6 +1,7 @@
 # Tasks
 
 - [x] Investigate hydration publication, process sampling, bounded admission, and monitor selection.
+- [x] THE-640: correct Name/PID comparator direction and add focused flat/tree, builder, key, and confirmation regressions.
 - [x] Obtain primary reviewer approval of the bounded fix and regression plan.
 - [x] Preserve sampler-owned process state at authoritative hydration swap.
 - [x] Stabilize top-N admission and flat/tree tie ordering.
