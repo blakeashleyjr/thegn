@@ -1,3 +1,14 @@
+# Reviewed verification — 2026-09-15
+
+The final source `72d161b2e1868561fd2f5bce9facde8b0345512a` passed strict
+workspace all-target Clippy and the shared 145-test Linux matrix (77 core,
+16 svc, 52 host). See [the durable audit](../../../docs/audits/maintenance07-2026-09-15.md)
+and its hashed manifest for exact source, selectors, raw logs, historical
+failures, independent reviews, and platform/scope limitations. No additional
+release or per-issue compilation was used.
+
+## Historical source checkpoint
+
 # Validation checkpoint
 
 Source implementation is frozen in a private candidate. No Cargo command,

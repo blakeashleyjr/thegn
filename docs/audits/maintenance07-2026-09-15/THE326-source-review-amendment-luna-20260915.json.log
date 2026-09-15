@@ -1,0 +1,20 @@
+{
+  "issue": "THE-326",
+  "date": "2026-09-15",
+  "source_path": "/tmp/thegn-THE326-private-luna-20260915-a",
+  "production_commit": "58f1f3f749d61c10a375fabe73bf7d759aad2972",
+  "metadata_head": "ce0cffe2",
+  "verdict": "approved_source_only",
+  "resolved_blocker": "All FRP input validation precedes token resolution and typed document construction.",
+  "evidence": [
+    "plan_frp_resolving_token validates all provider-derived fields before resolve_token",
+    "frp_rejects_invalid_fields_before_secret_resolution counts zero resolver calls",
+    "frp_rejects_zero_local_port_before_serialization counts zero resolver calls",
+    "wire-shape tests preserve HTTP/HTTPS/UDP output",
+    "deny_unknown_fields and token redaction tests remain"
+  ],
+  "exclusions": [
+    "No build/test/provider execution",
+    "Native admission remains root-owned"
+  ]
+}

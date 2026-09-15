@@ -1,0 +1,98 @@
+{
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "cpu_max": "100000 100000",
+  "binary_sha256": "6dc4956cfcb759924b552aa71b027800c701caa646118b4a81c48cbf699e1b8d",
+  "harness_sha256": "7e5c8e42419b00c0951dc8756bc8b85dab2b554c22a8bc5e93478a613b8eb7b1",
+  "started_at_utc": "2026-09-15T22:02:00.364105+00:00",
+  "cases": [
+    {
+      "kind": "symlink",
+      "private_root": "/tmp/thegn-222-hostile-native-ggqmekx5",
+      "passed": true,
+      "exit_codes": [
+        0,
+        0
+      ],
+      "outcomes": [
+        "loser",
+        "loser"
+      ],
+      "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+      "entry_identity_unchanged": true,
+      "all_children_settled": true,
+      "cleanup": "owned entries removed after settlement"
+    },
+    {
+      "kind": "regular",
+      "private_root": "/tmp/thegn-222-hostile-native-ufqhwm1i",
+      "passed": true,
+      "exit_codes": [
+        0,
+        0
+      ],
+      "outcomes": [
+        "loser",
+        "loser"
+      ],
+      "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+      "entry_identity_unchanged": true,
+      "all_children_settled": true,
+      "cleanup": "owned entries removed after settlement"
+    },
+    {
+      "kind": "hardlink",
+      "private_root": "/tmp/thegn-222-hostile-native-lin8ttbu",
+      "passed": true,
+      "exit_codes": [
+        0,
+        0
+      ],
+      "outcomes": [
+        "loser",
+        "loser"
+      ],
+      "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+      "entry_identity_unchanged": true,
+      "all_children_settled": true,
+      "cleanup": "owned entries removed after settlement"
+    },
+    {
+      "kind": "fifo",
+      "private_root": "/tmp/thegn-222-hostile-native-30_3hszz",
+      "passed": true,
+      "exit_codes": [
+        0,
+        0
+      ],
+      "outcomes": [
+        "loser",
+        "loser"
+      ],
+      "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+      "entry_identity_unchanged": true,
+      "all_children_settled": true,
+      "cleanup": "owned entries removed after settlement"
+    },
+    {
+      "kind": "directory",
+      "private_root": "/tmp/thegn-222-hostile-native-lqx736c2",
+      "passed": true,
+      "exit_codes": [
+        0,
+        0
+      ],
+      "outcomes": [
+        "loser",
+        "loser"
+      ],
+      "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+      "entry_identity_unchanged": true,
+      "all_children_settled": true,
+      "cleanup": "owned entries removed after settlement"
+    }
+  ],
+  "qualification": "Linux pinned Rust create_exclusive helper. Hostile entries are installed before two synchronized create attempts; no claim of arbitrary same-UID atomic custody.",
+  "finished_at_utc": "2026-09-15T22:02:00.601796+00:00",
+  "passed": 5,
+  "failed": 0
+}

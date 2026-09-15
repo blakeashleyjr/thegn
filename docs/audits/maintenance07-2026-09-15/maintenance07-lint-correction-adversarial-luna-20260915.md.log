@@ -1,0 +1,33 @@
+# THE maintenance07 lint-correction adversarial source review
+
+Date: 2026-09-15
+Reviewer: Luna high, independent source/log review
+
+## Reviewed objects
+
+- Base: `fbd133823509fcdf1eb7912792dfec1a4c7760da`
+- Intermediate merge correction: `912b1016ff8068f168685a84581620a6b80d4d7d`
+- Final correction: `72d161b2e1868561fd2f5bce9facde8b0345512a`
+- Final correction tree: `010fdb95a4a02a4f8d18423fcd7dc21b65ca9502`
+- Worktree: `/tmp/thegn-maintenance-07-combined-20260915`
+- Changed files: `crates/thegn-host/src/merge_remote.rs`, `crates/thegn-host/src/agent_tests.rs`, `crates/thegn-host/src/platform/gate_path.rs`
+- Final source SHA-256: `merge_remote.rs` `b954093216b2ba4e6ebdeb7a93c15fb7b56426b7dfa7b5901b6fae7ef4299f05`; `agent_tests.rs` `f8093159dc94eee09b5ee6093a5ebe205a41b2baacd786851b06cfd3b17e1d70`; `gate_path.rs` `0c00b12e4c861cca89b8a7bdb586dfb3f97eb2bd639e6b038407047c390c7383`
+- Retained initial strict-lint log SHA-256: `a999f6ad383efd3e48379114fc8434e3ebef633f2b802046fef5f49c1a32f807`
+
+## Source findings
+
+The final fbd→72d diff is exactly three Rust files: merge_remote.rs (25 insertions/25 deletions), agent_tests.rs (2 substitutions), and gate_path.rs (1 deletion). The intermediate 912b merge correction is unchanged in the final tree. It addresses all three diagnostics in the retained strict log:
+
+1. In `fetch_bundle_with_root`, the failed-fetch cleanup `match` no longer has an unreachable `return`. Both arms still call `anyhow::bail!`, so cleanup success and cleanup failure remain terminal with the same messages and the bundle custody is still consumed exactly once.
+2. In both the Unix and Windows arms of `BundleTemp::new_in`, `Ok(custody)` is now the cfg-selected block’s tail expression. The unsupported-platform arm remains the final `Err`; no constructor result or cleanup path changes.
+3. Unix `cleanup` uses a let-chain for `file.take()` plus `remove_verified()`. It still removes the owned file only after the same identity check, records the same failure, then performs the existing parent verification/removal. Replacement/divergence preservation is unchanged.
+
+The test-only `precreate_leaf` changes in both Unix and Windows arms are equivalent to the former nested condition: the fixture write is attempted only when requested, and the same nonrecursive cleanup/error composition is returned on failure. Edition 2024 and the repository’s Rust 1.89 floor support the let-chain syntax. The cfg blocks are mutually exclusive (`unix`, `windows`, or unsupported), and each selected `new_in` block has a valid `io::Result<Self>` tail expression.
+
+The final two-file follow-up is test-only: the fixture now uses the public `thegn_core::config::{Network,FileAccess}` enum paths, matching the `SandboxSpec` field types, and the redundant outer test-module `OsStrExt` import is removed. The FIFO test retains its local `OsStrExt` import. No production behavior changed in this follow-up. A source diff check was clean, and the worktree is clean. No compiler, Cargo, lint, test, native, or provider command was run for this review.
+
+## Gate status
+
+The final 72d161 source correction is approved by this independent review: the three original merge_remote lint fixes preserve cleanup, failure, and divergence semantics; the two test-only follow-ups correct the public enum paths and remove the redundant import without behavior changes. Strict-lint **must still be rerun** against 72d161 before native compilation; the retained initial log predates the correction and this review does not claim a clean rerun.
+
+Root owns the required strict-lint/native rerun and final landing decision.

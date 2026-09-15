@@ -1,0 +1,1318 @@
+{
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "started_at_utc": "2026-09-15T21:48:58.650388+00:00",
+  "tests": [
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::agent_container_name_roundtrips_and_is_not_orphan",
+      "exit_code": 0,
+      "seconds": 0.089,
+      "exact_one_pass": true,
+      "output_sha256": "68a93aada7acba00b60ad0119335a680ca092516bb069e63200997edcf425b07"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::apple_cpu_limit_is_rounded_to_whole_cores",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "9eca39d4f3d7f427ac3f9e2ab4a9e79a1318980cccfa8e099c7be66a41e76aae"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::apple_create_opts_omit_flags_its_run_rejects",
+      "exit_code": 0,
+      "seconds": 0.081,
+      "exact_one_pass": true,
+      "output_sha256": "9fc8d45ee124b590062d9cc7965147608ab2cd35d937d1e461ad0d863adf94dd"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::apple_inspect_json_is_parsed_where_go_templates_do_not_exist",
+      "exit_code": 0,
+      "seconds": 0.091,
+      "exact_one_pass": true,
+      "output_sha256": "524e456624ba26465034bad076654ec7d2b05ecee9b9a01af9104ee4b1ed2268"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_carries_knobs_and_optional_image",
+      "exit_code": 0,
+      "seconds": 0.084,
+      "exact_one_pass": true,
+      "output_sha256": "5ff4448b58dcd5f09311cd6e5793514864e1f5186d673c1879bd672fcdfa905c"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_hostname_defaults_to_name_then_overrides",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "de817fb34bb4ee0667205cffa61f405a267f47759db78fc268d40ec4169f5b14"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_maps_each_provider_to_its_params",
+      "exit_code": 0,
+      "seconds": 0.079,
+      "exact_one_pass": true,
+      "output_sha256": "36cd1e4dca0abd62168f24a4578ce79466c6a6671c797c4bf52fec5c9d13315a"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_none_provider_is_none",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "722a8cb32e1672850c74322966a7d3f6af568ea498f7f96df8ea67fa07422b0d"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches",
+      "exit_code": 0,
+      "seconds": 0.085,
+      "exact_one_pass": true,
+      "output_sha256": "ad996a98a973f661263af56cf8221fc71ab5964e28c1eaa3ab803ae4fcc936a0"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_binds_worktree_and_gitdir",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "e15aa9e91cc497d0cf661d3f105983d9c7f2a2496305d6ba0dfa1c257708ca3d"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_die_with_parent_is_gated_by_daemon_persistent",
+      "exit_code": 0,
+      "seconds": 0.085,
+      "exact_one_pass": true,
+      "output_sha256": "97f049510d3f91edb2edae8ad0921787d43eed7fb2e4a2d2cac8cfa78ad0502a"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_local_keeps_host_matching_env_off_argv",
+      "exit_code": 0,
+      "seconds": 0.104,
+      "exact_one_pass": true,
+      "output_sha256": "3944036efe67affbf1911cf56186f21c10bf97edac5178904999a13aed51418e"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_local_omits_ambient_matching_marker",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "6e10abb79f7c039c792077e252024be88e6a77cf03e317d86541e1ad2e7e8e7e"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::cfg_mounts_covered_by_parent_are_skipped",
+      "exit_code": 0,
+      "seconds": 0.093,
+      "exact_one_pass": true,
+      "output_sha256": "dbdc28d123705a1e934b9c7350b77de2211715998c2637ed0a840401e2dc5353"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::container_list_parsing_is_fail_closed_per_backend",
+      "exit_code": 0,
+      "seconds": 0.085,
+      "exact_one_pass": true,
+      "output_sha256": "9454f11f1d021ea17543363808716c5be7952e44732f59156fce3a1ade35d392"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::container_name_with_profile_adds_slug",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "7aa9002db0ef0c103347e4bc4a886eabbfdfe749d024243c436adee4876125e2"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::container_status_required_mounts_are_a_subset_of_created_mounts",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "67a49259fa9fb5fb6331c52c293b4f9fb975bd074f09c88fa0dd36c38ea5070c"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::devenv_wraps_inner",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "2e624a1ec9d0d38966fda1ecd0711d10adb82371b9f1fdd6a13c152cf58a5c90"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::dropped_hardening_is_reported_not_swallowed",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "497e4b586facb93cd0444ff4aef4b45f1fc66a10fec08155dfb100b6cfe8f67f"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::empty_oci_image_uses_default_image",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "c5548d8acd2c14858721ead2accebc18043501dc4681dadc1fb7ed650f2d4a84"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::ensure_stale_and_keepid_rm_go_through_oci_prefix",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "40cb593bf2c2c3068736f616ac5eb41141baf7d44e39d431ec4083b7c6bd13ce"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::file_access_none_removes_workdir",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "9d7451486344d28a07d2cd67cbafd4c1a88c8714ff6da41dd3ed42a5db26d17b"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::gc_sweeps_every_oci_backend_that_can_hold_a_container",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "93f01b46e68fb27c741cd370df22aadf85e6acdcd005831a94fe9daa7f4fcee4"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::guest_shares_host_abi_is_true_for_everything_but_a_foreign_oci_guest",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "13dcaefec7760aaf24a73758e5ae1b1a8b8df53b317d2e4e96749457609c74cb"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::host_toolchain_mounts_are_all_ro_and_exist",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "47bef284c02f728ba33d419ff5fc0648f04be8b9c4c8e2d3e9b334dca8a38d62"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::host_toolchain_mounts_are_withheld_when_the_guest_abi_differs",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "a64fc9cdadd7195d97a9ba88ba809c8f5161d61b3cbbb5d8f94ff8dc8e6b3a20"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::host_toolchain_mounts_injected_for_oci_not_bwrap",
+      "exit_code": 0,
+      "seconds": 1.186,
+      "exact_one_pass": true,
+      "output_sha256": "e36303cf42b83acb6cc2b3174bfce279fb20293326fefa9a947a9576f0b553fc"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees",
+      "exit_code": 0,
+      "seconds": 0.079,
+      "exact_one_pass": true,
+      "output_sha256": "9c530bfe146f91e869b426a13b68d4e031fe86c437110e4281b414e1dba45a6e"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::mosh_wraps_backend_over_ssh",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "d8d69f8b7cf47ed6f911f84da9dc4b48351e0ed1866f490de0223e337afd41a0"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::mount_parsing",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "9fb43ad330abdc5fc3ce7cf3830eb92b3f0067c16e22714fe23bf0da489bf47f"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::named_volume_admission_accepts_existing_names_and_rejects_paths",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "a4f36c0812813a86989e945bc0caa07979639fd995bd22eee065d775c2eaa97f"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::named_volume_admission_precedes_oci_ensure_without_side_effects",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "4bcf087342e110ed04f5bda74102bfbb866fad0615999fc1160802ae7fc381e4"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::named_volume_admission_reports_pair_index_without_host_fallback",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "65768569c3ac90b02c666d6651522b6b16ec3834656a6456d6097121bde0c745"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::none_backend_skips_cd_for_unretargeted_remote_worktree",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "04699554157fce03757154a50729be082d1c42b322178ab7971577580b76606a"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_create_opts_map_userns_and_mounts",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "21fbbeb419588aec671039ba707d145a9ebe2fe207a3fbd706dc42d9ef88559a"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_local_secrets_go_to_env_file_not_argv",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "e9b2fc3cd13b671f7e09428b76f5eaefd4be3d28f591fa69b332d1b8628261ca"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_emit_sealed_hardening",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "454d9069ec2fb52d96e6093e150e2b76f39d75442e28822ca0bee853d082a56d"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_in_container_mode_adds_net_admin_and_tun",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "f559b29dff0433d2a022170dc98545556bc0dc38110fa6e990514fed4fd2ce02"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "2a6006f77fe8aaf2f40cf7a04ae2c9024ea70c51d4127317ce9c4a898a15797a"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_never_bind_mount_host_dns_files",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "91312d90960ed1554d5d949b7bec4c3c47b317c571db5cc1d0243ebe733d135f"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_open_profile_adds_no_hardening",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "8449311906c6288c20b2b867d840bad2aca8170b614b1090f17d43aeae001a2c"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_without_vpn_keep_normal_network_and_ports",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "exact_one_pass": true,
+      "output_sha256": "466c37e8fa41de32edf8546931e6acb9cc5815080fabdcf776a117860f9971b0"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_prefix_injects_remote_daemon_connection",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "9d8ad648eacad1810f2b878a3c8cfc3196500f2f0b8006d3e88867413613ca7f"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_runtime_injected_only_for_oci_backends_when_set",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "0564ae95201434acd50d42231c397169cd5716f865e2231e5223ba107800ef3c"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::podman_and_docker_ps_parse_and_mark_ours",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "753f3ac16d7ea6ae1968e6fc042ad3293e085d9047c7a73207b8d7cef6003d15"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::podman_exec_preserves_paths",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "8064380f386ffa74a1afef296c1c16bdf264fa0ce632513bb84ce46d18881c76"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_enter_argv_wraps_with_mosh",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "bc303da429f5bbf79d1d98a2c6ccc944d79adfe7bb9698d3ba0c1751304a33bc"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_enter_argv_wraps_with_ssh",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "fef985b706a8725a645368fd6a7d5afe0b454ba7d45d11ebedc9bbec7c6bd87d"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_none_bare_shell_cds_and_moshes",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "502843cda50d313ace76acb016c40615c926b5fac64b161ed74730d6a1dbe838"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_oci_keeps_all_env_inline_as_carrier",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "ba989df4469e52504a5caedcb7e857b888bb3856e0f5ecd997cea19c65a2041b"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::sandbox_profile_baselines",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "0c760515e50c2e0faebca1a4435383d21aab0a880efa1bdbe1d39958c5c704aa"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::ssh_transport_uses_tty",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "cf69e9d5d1d9a1d38e9a0e369b4b14d59a01631cbeff3770b6f6fb77267d38bb"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::systemd_local_secrets_go_to_environment_file_not_argv",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "07b1d5de30bb69a546b3541c65d0fc2457958fcbfa510d6c2740869b714437d9"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::teardown_targets_oci_host_daemon",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "95f1aa0e393627f543c171a848fa0ddb4f0bb3d3b8bf2090bd0da6dbd7ebf73b"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_gc_identifies_orphans",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "526c3699a58cbfd630faac7117576ad1736fc9cfa39b0d0a71a9c4ca1dcc1788"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_identify_orphans_empty_inputs",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "exact_one_pass": true,
+      "output_sha256": "6dfdf264f3507b6e6e81322d66d75fa065814315f5bb80dd00a3039fb4a57384"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_identify_orphans_names_only_thegn_containers",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "0cf16c8120ae237bd5a424da69d3799fa6ccf15411235e061e3103c70bd662fc"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_parse_sandbox_stats",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "e149ed6786befcc5dbd4d79cbeb60cc4c94ad9374aace619934963627d1d5bb4"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_run_gc_noop_when_no_backend_available",
+      "exit_code": 0,
+      "seconds": 0.564,
+      "exact_one_pass": true,
+      "output_sha256": "8e5eb5b4654bc44c7fb60d176b89d16c2861cb71718c0b68bffa0cb7ddb9c5c0"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_sandbox_all_oci_flags_applied",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "ee801eb38789609e3938cdd4465fa876d297e8ab40239587604a1c03f8176256"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_win_native_sandboxes_do_not_parse_as_oci",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "7ba1b1b76971be865044bc960bcb17258946714e043abd5f6df3565931644838"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::the_nix_daemon_socket_is_withheld_from_a_foreign_guest",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "bc350b9df423198cf69688db1563db528d15cf1c0fdc65ff4f7b920e578fead5"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::vpn_sidecar_name_roundtrips",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "c42b8e7739d26136e497ced2db4cc3e7996592ec8b7e4e3598e4ab804adcc49b"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::wrap_script_skips_exec_for_or_and_pipe_fallbacks",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "6e2a3957b626c7cf30655399054e11e04ca6cab965f72159ce7cf9da7f2c556d"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::a_merely_capped_host_shell_is_not_a_systemd_sandbox",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "c066b9c2d6db63fd53e163dc55e3c648544431ffeeb087c1379b3f9bcfddc2b6"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::a_path_named_after_a_runtime_is_not_containment",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "049f98c0f3cde6846532ad6935c950b56d92bd129ba38653b71d84abfc13aa55"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::a_transport_handing_off_after_dashdash_is_seen",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "0bee5ae6c3cfbb3143e922f573b9d836214d1c1b49dcadc06deb8f40a4f1ea76"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::every_backend_round_trips",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "6f63b5c205672086b4d57edbce7e94d975d4cb1e2ec6efe99f7ea01c72a78c02"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::every_backend_round_trips_through_the_cpu_cap",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "17a38dd590971acc273bb04ac4f2f7d57a4b7f16ef1b160f13408e9070b7ccb5"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::falling_back_to_a_different_container_is_still_reported",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "d56d6d87a772911492b464702c0a00a61530a391cd0497cf28f66a6cb5e87294"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::host_and_auto_requests_are_not_degradations",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "85878d27a71ac1130396a2f79629f6d61163c06e0246c8d17c968cb4214d27e0"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::host_shell_is_never_read_as_contained",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "52faf78332cd976a41e180f1b5a6cc16d952b1f1f27111e0001dd2225d7173ce"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::reconcile_is_quiet_when_the_request_was_honoured",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "f73119776c3698a49391cbc2973588d55e14e7a5b372dfdac9f88c990cc94012"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::reconcile_reports_the_truth_not_the_request",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "eede4add1dfa2922b2a0df55c97b0abbf54d554705e2af6718cdb3937bbbcba4"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::remote_placement_still_reports_the_runtime",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "907995b7e0638c7b383069a6fe411df58f00fe3b621b152e4cdb967ed0dbb70f"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::rootful_podman_is_distinguished_from_rootless",
+      "exit_code": 0,
+      "seconds": 0.079,
+      "exact_one_pass": true,
+      "output_sha256": "1600f17427821141d1baa0fffe5f81dd5228f6ee8b3aa4438f917cc7b9812ddd"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::windows_native_is_taken_at_its_word",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "76c7cf94def5e53cbf2866354fc77f0fcab98f2a62cc7b314e6f702f052b77b6"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_errors_without_server_addr",
+      "exit_code": 0,
+      "seconds": 0.086,
+      "exact_one_pass": true,
+      "output_sha256": "713c23c11d3b5ef440a3ec476d409e984820fa6e1ac28ae6d5500a01cc48d8fc"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_escapes_utf8_token_and_redacts_plan_debug",
+      "exit_code": 0,
+      "seconds": 0.081,
+      "exact_one_pass": true,
+      "output_sha256": "66b949673691c740190f2299f14b4ca066e71a1c119c5f83c864fdfcf0dcc43d"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_http_https_and_udp_keep_their_explicit_wire_shapes",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "07aa19a7529167a484d7fe5c2cff5a01febe0ccbff798b876d9b1191889d26c5"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_https_errors_without_subdomain_host",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "d7358d94a2f51d999e65e69d4563c5c991927a98dd3a5ccd3a91bd1dfa04ad5a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_https_materializes_toml_and_derives_subdomain_url",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "13f6ee5c511d235a180d1d2e72c0813da113777c63343b4b266e1641952b5b90"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "201a802558c698391c19271818a2b111b3b4efe781aa76232073ee118cf09b8c"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_preserves_a_63_byte_label_for_tcp_proxy_name",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "f5967a74888eb61613b404ba59858ee53902b94c4013d1d93673d423dcc18954"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_invalid_fields_before_secret_resolution",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "93d84abfc148f9f9aea49ecd674b19c7a767592f99fc2b20dce3565140acf0d2"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_invalid_or_overlong_dns_components",
+      "exit_code": 0,
+      "seconds": 0.074,
+      "exact_one_pass": true,
+      "output_sha256": "97092030a83835d36b3bdc34fec66e02fdf1246458854c406d34938b9b636286"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_unsupported_extra_lines",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "84f0265dbcc2966d1f2d0628939ec813aa3333852383fa64d5e07b7fab2c99f1"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_zero_local_port_before_serialization",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "7fc0da247ae20da2d614365815c3a4693590f8215af787a157dfadb978b1b122"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_zero_remote_port_for_fixed_tcp_address",
+      "exit_code": 0,
+      "seconds": 0.07,
+      "exact_one_pass": true,
+      "output_sha256": "895ed4006f67660e16c93126f8df04d9b9c096beebd6f3657837cfea34b4ba05"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_tcp_derives_host_port_and_no_subdomain",
+      "exit_code": 0,
+      "seconds": 0.075,
+      "exact_one_pass": true,
+      "output_sha256": "d0723267de001cf286124a4d0af00440bce061a52c034bb2b3756f04ac14ce0a"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_token_and_explicit_subdomain_and_vhost_port",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "9d26bc1affd5a090b0bfd8707fcc076e50da4596a8e6df56b2e3fda99b4489e6"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_typed_document_rejects_duplicate_keys_and_injected_tables",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "exact_one_pass": true,
+      "output_sha256": "7bccd48ecd8149503f90f4e86d10e8c64c1fcf85da8123bea0948c0e83d1c3eb"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_typed_document_rejects_unknown_fields",
+      "exit_code": 0,
+      "seconds": 0.077,
+      "exact_one_pass": true,
+      "output_sha256": "edc4cf83e2428f8fbcc99b8cf1d0109ec834fcee1ea22df4dbe75d1f0c4281e1"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::compose_spec_clean_shell_choice_uses_rc_free_shell",
+      "exit_code": 0,
+      "seconds": 0.091,
+      "exact_one_pass": true,
+      "output_sha256": "bcc92a475e3825802211bfe93e0d360ef4443273abee38fd3b3697839e27960b"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::compose_spec_host_fallback_is_login_shell",
+      "exit_code": 0,
+      "seconds": 0.084,
+      "exact_one_pass": true,
+      "output_sha256": "d763a01ba92f93e774e6862bf769baceda312a204e307061c77e762b258db9f0"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::compose_spec_propagates_volume_refusal_without_host_fallback",
+      "exit_code": 0,
+      "seconds": 0.083,
+      "exact_one_pass": true,
+      "output_sha256": "1c41fd84e31ebcf308f8d6848b3b6c7cc5d1f1dbb6a33bdeba5ca4411da69731"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::configured_volume_refusal_precedes_agent_host_fallback",
+      "exit_code": 0,
+      "seconds": 0.185,
+      "exact_one_pass": true,
+      "output_sha256": "16473fd8bbe297331869cd78e71e13e6fba5ac996a88cc42ba6496c85886d859"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::explicit_host_does_not_override_fail_closed_floor",
+      "exit_code": 0,
+      "seconds": 0.591,
+      "exact_one_pass": true,
+      "output_sha256": "7b306c17fcfb28982bb768ad21a527af27c6864d53206d612f47517408e2d57c"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::explicit_host_pick_overrides_nonauto_config",
+      "exit_code": 0,
+      "seconds": 0.533,
+      "exact_one_pass": true,
+      "output_sha256": "ba80810e8b9801f24a9ed0dea03c03a862e4b99464edd0542df2ab464b913bf4"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::final_composed_volume_gate_blocks_launch_effect_sentinel",
+      "exit_code": 0,
+      "seconds": 0.102,
+      "exact_one_pass": true,
+      "output_sha256": "581de1d320d71198ba3bfe0f61afb733127d6843f965b88f36b30812af435da0"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate",
+      "exit_code": 0,
+      "seconds": 0.198,
+      "exact_one_pass": true,
+      "output_sha256": "2d1d40ca3ab9da09b6b819d60f99c9d934713f401512429ef4a32c2017e0f8cf"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::final_host_floor_degrade_reports_the_missed_boundary",
+      "exit_code": 0,
+      "seconds": 0.559,
+      "exact_one_pass": true,
+      "output_sha256": "b6149440883e0ce6dedabedec6a995ff2878b57ef5713adc5d4e7935184fe02a"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::prepare_sandbox_none_backend_falls_to_host",
+      "exit_code": 0,
+      "seconds": 0.504,
+      "exact_one_pass": true,
+      "output_sha256": "df14ce6e4573e87e17d41ea62f3fc8336f4005ff80d0fb3fa4b764dbc48be9c4"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::accepted_replacement_disposes_old_provider_on_owner_before_admission_reopens",
+      "exit_code": 0,
+      "seconds": 0.131,
+      "exact_one_pass": true,
+      "output_sha256": "8360e6975be924229573f969807201230d0e64606ff4eef782f1e8efc13b90b1"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::busy_refusal_does_not_construct_or_drop_another_provider",
+      "exit_code": 0,
+      "seconds": 0.399,
+      "exact_one_pass": true,
+      "output_sha256": "fea7372ba760d5798b944ce97044ca34d1875dab9ee003823c7dea99d3f2616f"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::caller_timeout_during_preparation_prevents_late_spawn",
+      "exit_code": 0,
+      "seconds": 0.195,
+      "exact_one_pass": true,
+      "output_sha256": "8d0f3e6db76949f298a6191028acb38a132d780e6009391923c6e5f2fa4d35d7"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown",
+      "exit_code": 0,
+      "seconds": 0.394,
+      "exact_one_pass": true,
+      "output_sha256": "d5df6c18953f43f1e777f2414c3e0fed0f0f2aba691095f6e4a73646e08c3442"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody",
+      "exit_code": 0,
+      "seconds": 0.126,
+      "exact_one_pass": true,
+      "output_sha256": "5f4058d0e8e9e6466c616fc56775ee972bd8bd5a35e6b95f24a8d0776e7de533"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::fixture_assertion_unwind_releases_owned_work_without_double_panic",
+      "exit_code": 0,
+      "seconds": 0.193,
+      "exact_one_pass": true,
+      "output_sha256": "63c8f31e92ed26ab3018f8f99879aaf328b132957b03b1805513df753ef6cbbd"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::fixture_timeout_retains_real_directory_and_unfinished_handles_until_explicit_settlement",
+      "exit_code": 0,
+      "seconds": 0.19,
+      "exact_one_pass": true,
+      "output_sha256": "ee40ef80ec87b8d8b88c18f7a1565ebbe38e7edf764eaff82511d171e86340fb"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::held_startup_does_not_occupy_git_or_capability_capture_lanes",
+      "exit_code": 0,
+      "seconds": 0.414,
+      "exact_one_pass": true,
+      "output_sha256": "b28ea5ca99dd3562c6188ddb647d13e1178cf630e175daf3e03b313c0e70ebac"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::hung_leader_and_nonzero_inherited_stderr_respect_the_caller_deadline",
+      "exit_code": 0,
+      "seconds": 0.7,
+      "exact_one_pass": true,
+      "output_sha256": "e282b775b10b1f6b12502f205f60940caa960d6a0de040f2daf9d1c32199f4f6"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::nonzero_exit_keeps_bounded_stderr_diagnostic_and_resource_marker",
+      "exit_code": 0,
+      "seconds": 0.092,
+      "exact_one_pass": true,
+      "output_sha256": "c540ab0fc8f4aeb5caf5b31839064618860a2c5aca835d8a33109e213f1f54ea"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::producer_panic_retains_child_and_payload_without_running_its_destructor_on_caller",
+      "exit_code": 0,
+      "seconds": 0.096,
+      "exact_one_pass": true,
+      "output_sha256": "e20b33d209c585a35ea381239e9716f7126cb815f9247c0195d775ddf3d1674a"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::reader_and_wait_failures_after_spawn_never_fall_back_or_repeat_wait",
+      "exit_code": 0,
+      "seconds": 0.131,
+      "exact_one_pass": true,
+      "output_sha256": "08e1db095c47c6a31865ea5025e74bc73debef4e76e5f63c32f1ffc3b83550b4"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::real_startup_stdout_null_success_and_exact_stderr_bound",
+      "exit_code": 0,
+      "seconds": 0.242,
+      "exact_one_pass": true,
+      "output_sha256": "d94b3346306a9d5747fe2673ce03bc25db2147ea79ce024f710e262f947959f1"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::reservation_and_owner_launch_refuse_before_provider_construction",
+      "exit_code": 0,
+      "seconds": 0.083,
+      "exact_one_pass": true,
+      "output_sha256": "98f82b820d4790c4fdff8224530cb135a0d627466dc906c82b78e3b94ee97349"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::shipping_agent_startup_decision_holds_nonzero_and_inherited_pipe_without_fallback",
+      "exit_code": 0,
+      "seconds": 0.525,
+      "exact_one_pass": true,
+      "output_sha256": "d912ed6a73bfb1a0279bacd3e3a0bca864537f36884a20ff1e256278af8816e9"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::shipping_agent_success_and_unavailable_probe_preserve_existing_fallback_behavior",
+      "exit_code": 0,
+      "seconds": 0.099,
+      "exact_one_pass": true,
+      "output_sha256": "e5c4398bb9fc033b8940b2989e136eefa60693e7a53c70d1558c403a0b741f01"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::stderr_overflow_is_held_and_does_not_admit_a_second_start",
+      "exit_code": 0,
+      "seconds": 0.142,
+      "exact_one_pass": true,
+      "output_sha256": "2fd6880a5cce990d8ed83566ac26de80f991f153a6ab79bf7257be45feb53099"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::uncertain_wait_outcome_forbids_fixture_retry_even_when_public_reason_changed",
+      "exit_code": 0,
+      "seconds": 0.106,
+      "exact_one_pass": true,
+      "output_sha256": "9ec7db6e8f1d3c53bd518da965389baecae882bc1ba6d17f3db3c926543b9c42"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::unwind_after_owner_spawn_installs_handle_before_abandoning_start_gate",
+      "exit_code": 0,
+      "seconds": 0.083,
+      "exact_one_pass": true,
+      "output_sha256": "6ef1c458aee9b9227ae8bb2bbcbaadb23baecf6327ab5f32a84f4262725f08af"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::zero_timeout_refuses_before_provider_factory",
+      "exit_code": 0,
+      "seconds": 0.102,
+      "exact_one_pass": true,
+      "output_sha256": "97def80ff141ac72f3fad143bffedbeabacb90971adf602787792058362230f6"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_and_fetch_moves_a_tip_between_stores",
+      "exit_code": 0,
+      "seconds": 0.208,
+      "exact_one_pass": true,
+      "output_sha256": "1a82459160e3979604c6b04c82e16ceb60b04c759cb7878f6ea23d3345df31fc"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_cleanup_preserves_an_observed_replacement",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "5da58d1e3e735b782736dd39b797cdebd3c1bfec83107579ad1d0c8160010a9d"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_creation_collision_preserves_preexisting_leaf",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "exact_one_pass": true,
+      "output_sha256": "74c18e2e4719cc8f6439c52a4933717b037462e62de7b1a7da7588369621d976"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_custody_rejects_special_replacements_and_keeps_modes",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "f57cb26cd6ff0f8c41aedb741cee75648854667495d914da000d5032130dea59"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_unwind_after_injected_write_failure_cleans_owned_fixture",
+      "exit_code": 0,
+      "seconds": 0.078,
+      "exact_one_pass": true,
+      "output_sha256": "2f27545a1fc598e1e8cb95199ed1ab218de0bf397e255a467777223e796f646e"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_write_and_flush_failures_finish_without_recursive_cleanup",
+      "exit_code": 0,
+      "seconds": 0.081,
+      "exact_one_pass": true,
+      "output_sha256": "e4602d90dbc683922e7c062a723a8afc282402e7a0cfd90330e01888009fde1a"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_write_revalidation_failure_preserves_replacement",
+      "exit_code": 0,
+      "seconds": 0.087,
+      "exact_one_pass": true,
+      "output_sha256": "08188d54b7462c779ace894220054d55c2fae139ad08a145a304274786f63db7"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::different_host_needs_ingest",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "2f24c26b427beaf176024f874086ec1092f2093014ef446506f784977773c118"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::ensure_tip_returns_heads_ref_when_same_store",
+      "exit_code": 0,
+      "seconds": 0.081,
+      "exact_one_pass": true,
+      "output_sha256": "78278e20253ae650c05004986b0f023f301b107e8554dd650143070320d3be7e"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::mq_ref_is_namespaced",
+      "exit_code": 0,
+      "seconds": 0.09,
+      "exact_one_pass": true,
+      "output_sha256": "a01fcbc53ff053e1a85ffbc5393fbfb11a5e856e7a1c6e9b9a1b3ffdf659ea27"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::same_store_needs_no_ingest",
+      "exit_code": 0,
+      "seconds": 0.09,
+      "exact_one_pass": true,
+      "output_sha256": "4550b5dafd8e3653425fcb2bd05942c17c41845df6728acb9579355f4d199cb5"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "panes::tests::terminal_invalid_configured_volume_refuses_before_no_spec_fallback",
+      "exit_code": 0,
+      "seconds": 0.089,
+      "exact_one_pass": true,
+      "output_sha256": "e7c04f2852bf3784fbd12f12efbc353bc392d6ca9c380c786441115da5bfa9c2"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "panes::tests::terminal_launch_spec_builds_ssh_mosh_and_local_argv",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "96a9f5a899e8423387d0a7e6ae606d234f7ec09731c688a6ba31feedde575451"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::directory_rejects_alias_permissions_and_physical_replacement",
+      "exit_code": 0,
+      "seconds": 0.082,
+      "exact_one_pass": true,
+      "output_sha256": "90a714d6632731ac267a34af0af97d5b51079ad08ab38f5748abdfc92cfc403a"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::exclusive_regular_creation_has_one_winner_across_two_owned_children",
+      "exit_code": 0,
+      "seconds": 0.113,
+      "exact_one_pass": true,
+      "output_sha256": "f0fb7665ef47d3c7ce058f8c7ad327a63aa85ff6845744f654adbdd860198b29"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::exclusive_regular_creation_never_adopts_an_existing_leaf",
+      "exit_code": 0,
+      "seconds": 0.086,
+      "exact_one_pass": true,
+      "output_sha256": "11b37a57d33cc122f1bb866b63bd8a62a274358a15748822862f9dd74a0af2a3"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::failed_identity_cleanup_preserves_a_replacement",
+      "exit_code": 0,
+      "seconds": 0.081,
+      "exact_one_pass": true,
+      "output_sha256": "aae5cf4459c343b40d6432c948eae38a6ccad243347bfd965b8b75da4819e454"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::foreign_owner_and_privilege_sharing_never_admit_regular_files",
+      "exit_code": 0,
+      "seconds": 0.083,
+      "exact_one_pass": true,
+      "output_sha256": "3311adf882931bb4fcdcb831ee24c951f1951163f2b95fb5dcb5cdf2261d8fc9"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::lock_is_nonblocking_and_releases_with_its_owner",
+      "exit_code": 0,
+      "seconds": 0.08,
+      "exact_one_pass": true,
+      "output_sha256": "f73802d3d3c5c4751a1468c192246a395c57ddf953b3516d8177e371c07cf61c"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::lock_open_failure_is_not_unlocked_success",
+      "exit_code": 0,
+      "seconds": 0.084,
+      "exact_one_pass": true,
+      "output_sha256": "3ebd34e5f7aa70448d313ce34a02d7a426e8d988a3fff99a0e2a570e3e668842"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::lock_rejects_symlinks_hardlinks_and_replaced_identity",
+      "exit_code": 0,
+      "seconds": 0.087,
+      "exact_one_pass": true,
+      "output_sha256": "1aa769be75074bd1c17db1afe5cce7ce0e788a16be11549147ab1d3c5e5e7f24"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::special_files_and_oversized_identity_fail_without_waiting",
+      "exit_code": 0,
+      "seconds": 0.084,
+      "exact_one_pass": true,
+      "output_sha256": "23ddc4f07d739c5aef5310aa35a1643777b53cbfcb0138b2c5067f4d71e81c85"
+    }
+  ],
+  "log": "/tmp/thegn-maintenance07-focused-native-20260915.log",
+  "runner": "/tmp/thegn-private-test-runner-20260914.py",
+  "runner_sha256": "6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07",
+  "finished_at_utc": "2026-09-15T21:49:16.902121+00:00",
+  "passed": 145,
+  "failed": 0,
+  "log_sha256": "84b7613b1305b23f9b63a869c0b94c1a2ffe1eb49290029df4eae65c4788fb39"
+}

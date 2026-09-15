@@ -1,0 +1,68 @@
+{
+  "review": "maintenance07-consolidated-integration-adversarial",
+  "date": "2026-09-15",
+  "reviewer": "Luna high",
+  "candidate_path": "/tmp/thegn-maintenance-07-combined-20260915",
+  "candidate_commit": "fbd133823509fcdf1eb7912792dfec1a4c7760da",
+  "local_base": "f293594d",
+  "verdict": "approved-source-consolidated-build-pending",
+  "scope": "source/provenance only; no Cargo/build/test/native/provider/canonical/Linear operation",
+  "approved_private_finals": {
+    "THE-222": {
+      "commit": "7ad19e619ab7491c9cd665508a0c8294a8a7acab",
+      "path": "/tmp/thegn-THE222-impl-luna-20260915"
+    },
+    "THE-247": {
+      "commit": "b6f479701ea1d7489c9d19f82e0e384721c2dc59",
+      "path": "/tmp/thegn-THE247-private-luna-20260915-b"
+    },
+    "THE-326": {
+      "commit": "a5a3bfe7",
+      "path": "/tmp/thegn-THE326-private-luna-20260915-a"
+    }
+  },
+  "full_source_sha256": {
+    "crates/thegn-host/src/merge_remote.rs": "5f61b3316aace3b7fad9ca1becda491c352d264d0901bd4035c010b85f2c10d5",
+    "crates/thegn-host/src/platform/gate_path.rs": "885097bfa74cd134c3c77c233eae00659299d1e706deeb698eabe0737b6c9887",
+    "crates/thegn-host/src/platform/windows.rs": "ac743210f86df1745d95f2b083f80dd371768467f5b2a0697b37c006fb7ac4d8",
+    "crates/thegn-host/src/platform/mod.rs": "4dee24fecb18fe2f8050805c56cbd9778358165df3dde17521fd963e3526e2e9",
+    "crates/thegn-host/src/devcontainer_provider.rs": "44e2c12a45e69bc686c4e30f22258ef5963dedd640a1bd4501683d91e8b84ea3",
+    "crates/thegn-host/src/devcontainer_startup.rs": "368223778a2695d3794288adacabcb115ad9fb0a82a078dfd3eb16d4f294ceed",
+    "crates/thegn-host/src/bounded_git_probe.rs": "164b4db61316ab4e0abf661bb469d113cc4a8a074c187c3655bbc5a67f5a6e1f",
+    "crates/thegn-host/src/devcontainer_probe_cache.rs": "4da7e442e736f82b2f7d4f6ffafae138a49ae0d5960594777061e542a5608e57",
+    "crates/thegn-host/src/hydrate.rs": "4455278cb82dedfe4a3588c433ddbd91e3b98cdf155fbcb2647e1315a971ad65",
+    "crates/thegn-host/src/platform/unix.rs": "c5ae8c7b8fa02c5b7653076e5ade81dc1d0cb7c029800fddb1d0354e98e05e64",
+    "crates/thegn-core/src/sandbox.rs": "eaca583f2e93518f57960626dfdbcaececae2612cdf18d11d7fc2c35ee8c3c04",
+    "crates/thegn-host/src/agent.rs": "137ca95623db636d8aa2aa03f45c21088c174d3fb74a1aa3284d8b6789f89c55",
+    "crates/thegn-svc/src/share/mod.rs": "1502b5f75076f26542095b80ebada72c4a00961527357c300ac02c49656c5ecf",
+    "crates/thegn-svc/src/share/tests.rs": "59f0d73835cbcf0520d748f6008527f319308d4bfc9dbc8a457d147b3b17d229",
+    "crates/thegn-core/src/config.rs": "16ada0b7c1db2449b6fd6320f2a71231e427740c3ffd53ccfbcadff1bd48cad4"
+  },
+  "exact_equal_private_final": {
+    "THE-222 merge_remote.rs": "5f61b3316aace3b7fad9ca1becda491c352d264d0901bd4035c010b85f2c10d5",
+    "THE-222 gate_path.rs": "885097bfa74cd134c3c77c233eae00659299d1e706deeb698eabe0737b6c9887",
+    "THE-247 sandbox.rs": "eaca583f2e93518f57960626dfdbcaececae2612cdf18d11d7fc2c35ee8c3c04",
+    "THE-326 share/mod.rs": "1502b5f75076f26542095b80ebada72c4a00961527357c300ac02c49656c5ecf",
+    "THE-326 share/tests.rs": "59f0d73835cbcf0520d748f6008527f319308d4bfc9dbc8a457d147b3b17d229"
+  },
+  "shared_hunk_sha256": {
+    "THE-247 agent configured admission section": "df6a18bf117e56194e22fe51ec0b33bb2474339254b296997166d637c1c44761",
+    "THE-247 agent final effect section": "5bc8de33c07f899eb40f9b643779a7dccca4f0be6777b38fe808ab6a7123e17b",
+    "THE-326 FRP config section in combined config": "b79b9ccc8475cf6a32cb9e86a1ad93156b7c6ea0c7980d76bef273945d4183fe"
+  },
+  "integration_findings": [
+    "THE-222 Windows source is approved implementation plus additive open_capability_identity; diff against tested33c has additions only.",
+    "THE-633 bounded probe/cache/hydration/platform/Unix source inventory remains byte identical to tested33c; devcontainer_startup.rs remains present.",
+    "THE-247 sandbox source is exact; agent retains THE-639 startup/floor additions and exact THE-247 admission/effect sections.",
+    "THE-247 nested VPN result and direct terminal refusal propagation remain present.",
+    "THE-326 share implementation/tests exact; config retains FRP and named-volume contracts together."
+  ],
+  "supplied_receipts": {
+    "format": "/tmp/thegn-maintenance07-source-format-20260915.log",
+    "ratchets": "/tmp/thegn-maintenance07-source-ratchets-20260915.log",
+    "strict_spec": "/tmp/thegn-maintenance07-source-spec-20260915.log"
+  },
+  "root_next_step": "single consolidated build/native admission",
+  "reviewer_mutated_source": false,
+  "report_sha256": "27a30f57e1264ff0467c09aca6a51c4e3ad44da66e023aba8d03a24531693f27"
+}

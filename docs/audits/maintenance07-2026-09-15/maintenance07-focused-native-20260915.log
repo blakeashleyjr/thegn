@@ -1,0 +1,1195 @@
+
+=== core sandbox::tests::agent_container_name_roundtrips_and_is_not_orphan ===
+
+running 1 test
+test sandbox::tests::agent_container_name_roundtrips_and_is_not_orphan ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::apple_cpu_limit_is_rounded_to_whole_cores ===
+
+running 1 test
+test sandbox::tests::apple_cpu_limit_is_rounded_to_whole_cores ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::apple_create_opts_omit_flags_its_run_rejects ===
+
+running 1 test
+test sandbox::tests::apple_create_opts_omit_flags_its_run_rejects ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.01s
+
+
+=== core sandbox::tests::apple_inspect_json_is_parsed_where_go_templates_do_not_exist ===
+
+running 1 test
+test sandbox::tests::apple_inspect_json_is_parsed_where_go_templates_do_not_exist ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::build_vpn_spec_carries_knobs_and_optional_image ===
+
+running 1 test
+test sandbox::tests::build_vpn_spec_carries_knobs_and_optional_image ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::build_vpn_spec_hostname_defaults_to_name_then_overrides ===
+
+running 1 test
+test sandbox::tests::build_vpn_spec_hostname_defaults_to_name_then_overrides ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::build_vpn_spec_maps_each_provider_to_its_params ===
+
+running 1 test
+test sandbox::tests::build_vpn_spec_maps_each_provider_to_its_params ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::build_vpn_spec_none_provider_is_none ===
+
+running 1 test
+test sandbox::tests::build_vpn_spec_none_provider_is_none ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches ===
+
+running 1 test
+test sandbox::tests::build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches ... thegn: sandbox: profile 'sealed' forbids a VPN tunnel (network=none, all capabilities dropped); ignoring [sandbox.vpn]. Use 'sealed-tunnel' for a tunnel-only worktree, or 'hardened'.
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::bwrap_binds_worktree_and_gitdir ===
+
+running 1 test
+test sandbox::tests::bwrap_binds_worktree_and_gitdir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::bwrap_die_with_parent_is_gated_by_daemon_persistent ===
+
+running 1 test
+test sandbox::tests::bwrap_die_with_parent_is_gated_by_daemon_persistent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::bwrap_local_keeps_host_matching_env_off_argv ===
+
+running 1 test
+test sandbox::tests::bwrap_local_keeps_host_matching_env_off_argv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::bwrap_local_omits_ambient_matching_marker ===
+
+running 1 test
+test sandbox::tests::bwrap_local_omits_ambient_matching_marker ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::cfg_mounts_covered_by_parent_are_skipped ===
+
+running 1 test
+test sandbox::tests::cfg_mounts_covered_by_parent_are_skipped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.01s
+
+
+=== core sandbox::tests::container_list_parsing_is_fail_closed_per_backend ===
+
+running 1 test
+test sandbox::tests::container_list_parsing_is_fail_closed_per_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::container_name_with_profile_adds_slug ===
+
+running 1 test
+test sandbox::tests::container_name_with_profile_adds_slug ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::container_status_required_mounts_are_a_subset_of_created_mounts ===
+
+running 1 test
+test sandbox::tests::container_status_required_mounts_are_a_subset_of_created_mounts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::devenv_wraps_inner ===
+
+running 1 test
+test sandbox::tests::devenv_wraps_inner ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::dropped_hardening_is_reported_not_swallowed ===
+
+running 1 test
+test sandbox::tests::dropped_hardening_is_reported_not_swallowed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::empty_oci_image_uses_default_image ===
+
+running 1 test
+test sandbox::tests::empty_oci_image_uses_default_image ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::ensure_stale_and_keepid_rm_go_through_oci_prefix ===
+
+running 1 test
+test sandbox::tests::ensure_stale_and_keepid_rm_go_through_oci_prefix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::file_access_none_removes_workdir ===
+
+running 1 test
+test sandbox::tests::file_access_none_removes_workdir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::gc_sweeps_every_oci_backend_that_can_hold_a_container ===
+
+running 1 test
+test sandbox::tests::gc_sweeps_every_oci_backend_that_can_hold_a_container ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::guest_shares_host_abi_is_true_for_everything_but_a_foreign_oci_guest ===
+
+running 1 test
+test sandbox::tests::guest_shares_host_abi_is_true_for_everything_but_a_foreign_oci_guest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::host_toolchain_mounts_are_all_ro_and_exist ===
+
+running 1 test
+test sandbox::tests::host_toolchain_mounts_are_all_ro_and_exist ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::host_toolchain_mounts_are_withheld_when_the_guest_abi_differs ===
+
+running 1 test
+test sandbox::tests::host_toolchain_mounts_are_withheld_when_the_guest_abi_differs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::host_toolchain_mounts_injected_for_oci_not_bwrap ===
+
+running 1 test
+test sandbox::tests::host_toolchain_mounts_injected_for_oci_not_bwrap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 1.11s
+
+
+=== core sandbox::tests::identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees ===
+
+running 1 test
+test sandbox::tests::identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::mosh_wraps_backend_over_ssh ===
+
+running 1 test
+test sandbox::tests::mosh_wraps_backend_over_ssh ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::mount_parsing ===
+
+running 1 test
+test sandbox::tests::mount_parsing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::named_volume_admission_accepts_existing_names_and_rejects_paths ===
+
+running 1 test
+test sandbox::tests::named_volume_admission_accepts_existing_names_and_rejects_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::named_volume_admission_precedes_oci_ensure_without_side_effects ===
+
+running 1 test
+test sandbox::tests::named_volume_admission_precedes_oci_ensure_without_side_effects ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::named_volume_admission_reports_pair_index_without_host_fallback ===
+
+running 1 test
+test sandbox::tests::named_volume_admission_reports_pair_index_without_host_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::none_backend_skips_cd_for_unretargeted_remote_worktree ===
+
+running 1 test
+test sandbox::tests::none_backend_skips_cd_for_unretargeted_remote_worktree ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_create_opts_map_userns_and_mounts ===
+
+running 1 test
+test sandbox::tests::oci_create_opts_map_userns_and_mounts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_local_secrets_go_to_env_file_not_argv ===
+
+running 1 test
+test sandbox::tests::oci_local_secrets_go_to_env_file_not_argv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_opts_emit_sealed_hardening ===
+
+running 1 test
+test sandbox::tests::oci_opts_emit_sealed_hardening ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_opts_in_container_mode_adds_net_admin_and_tun ===
+
+running 1 test
+test sandbox::tests::oci_opts_in_container_mode_adds_net_admin_and_tun ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports ===
+
+running 1 test
+test sandbox::tests::oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports ... thegn: sandbox: [sandbox] ports are ignored when a VPN sidecar owns the network namespace; publish them on the sidecar instead.
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_opts_never_bind_mount_host_dns_files ===
+
+running 1 test
+test sandbox::tests::oci_opts_never_bind_mount_host_dns_files ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_opts_open_profile_adds_no_hardening ===
+
+running 1 test
+test sandbox::tests::oci_opts_open_profile_adds_no_hardening ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_opts_without_vpn_keep_normal_network_and_ports ===
+
+running 1 test
+test sandbox::tests::oci_opts_without_vpn_keep_normal_network_and_ports ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_prefix_injects_remote_daemon_connection ===
+
+running 1 test
+test sandbox::tests::oci_prefix_injects_remote_daemon_connection ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::oci_runtime_injected_only_for_oci_backends_when_set ===
+
+running 1 test
+test sandbox::tests::oci_runtime_injected_only_for_oci_backends_when_set ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::podman_and_docker_ps_parse_and_mark_ours ===
+
+running 1 test
+test sandbox::tests::podman_and_docker_ps_parse_and_mark_ours ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::podman_exec_preserves_paths ===
+
+running 1 test
+test sandbox::tests::podman_exec_preserves_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::remote_enter_argv_wraps_with_mosh ===
+
+running 1 test
+test sandbox::tests::remote_enter_argv_wraps_with_mosh ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::remote_enter_argv_wraps_with_ssh ===
+
+running 1 test
+test sandbox::tests::remote_enter_argv_wraps_with_ssh ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::remote_none_bare_shell_cds_and_moshes ===
+
+running 1 test
+test sandbox::tests::remote_none_bare_shell_cds_and_moshes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::remote_oci_keeps_all_env_inline_as_carrier ===
+
+running 1 test
+test sandbox::tests::remote_oci_keeps_all_env_inline_as_carrier ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::sandbox_profile_baselines ===
+
+running 1 test
+test sandbox::tests::sandbox_profile_baselines ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::ssh_transport_uses_tty ===
+
+running 1 test
+test sandbox::tests::ssh_transport_uses_tty ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::systemd_local_secrets_go_to_environment_file_not_argv ===
+
+running 1 test
+test sandbox::tests::systemd_local_secrets_go_to_environment_file_not_argv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::teardown_targets_oci_host_daemon ===
+
+running 1 test
+test sandbox::tests::teardown_targets_oci_host_daemon ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::test_gc_identifies_orphans ===
+
+running 1 test
+test sandbox::tests::test_gc_identifies_orphans ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::test_identify_orphans_empty_inputs ===
+
+running 1 test
+test sandbox::tests::test_identify_orphans_empty_inputs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::test_identify_orphans_names_only_thegn_containers ===
+
+running 1 test
+test sandbox::tests::test_identify_orphans_names_only_thegn_containers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::test_parse_sandbox_stats ===
+
+running 1 test
+test sandbox::tests::test_parse_sandbox_stats ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::test_run_gc_noop_when_no_backend_available ===
+
+running 1 test
+test sandbox::tests::test_run_gc_noop_when_no_backend_available ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.48s
+
+
+=== core sandbox::tests::test_sandbox_all_oci_flags_applied ===
+
+running 1 test
+test sandbox::tests::test_sandbox_all_oci_flags_applied ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::test_win_native_sandboxes_do_not_parse_as_oci ===
+
+running 1 test
+test sandbox::tests::test_win_native_sandboxes_do_not_parse_as_oci ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::the_nix_daemon_socket_is_withheld_from_a_foreign_guest ===
+
+running 1 test
+test sandbox::tests::the_nix_daemon_socket_is_withheld_from_a_foreign_guest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::vpn_sidecar_name_roundtrips ===
+
+running 1 test
+test sandbox::tests::vpn_sidecar_name_roundtrips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox::tests::wrap_script_skips_exec_for_or_and_pipe_fallbacks ===
+
+running 1 test
+test sandbox::tests::wrap_script_skips_exec_for_or_and_pipe_fallbacks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::a_merely_capped_host_shell_is_not_a_systemd_sandbox ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::a_merely_capped_host_shell_is_not_a_systemd_sandbox ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::a_path_named_after_a_runtime_is_not_containment ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::a_path_named_after_a_runtime_is_not_containment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::a_transport_handing_off_after_dashdash_is_seen ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::a_transport_handing_off_after_dashdash_is_seen ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::every_backend_round_trips ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::every_backend_round_trips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::every_backend_round_trips_through_the_cpu_cap ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::every_backend_round_trips_through_the_cpu_cap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::falling_back_to_a_different_container_is_still_reported ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::falling_back_to_a_different_container_is_still_reported ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::host_and_auto_requests_are_not_degradations ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::host_and_auto_requests_are_not_degradations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::host_shell_is_never_read_as_contained ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::host_shell_is_never_read_as_contained ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::reconcile_is_quiet_when_the_request_was_honoured ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::reconcile_is_quiet_when_the_request_was_honoured ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::reconcile_reports_the_truth_not_the_request ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::reconcile_reports_the_truth_not_the_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::remote_placement_still_reports_the_runtime ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::remote_placement_still_reports_the_runtime ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::rootful_podman_is_distinguished_from_rootless ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::rootful_podman_is_distinguished_from_rootless ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== core sandbox_truth::sandbox_truth_tests::windows_native_is_taken_at_its_word ===
+
+running 1 test
+test sandbox_truth::sandbox_truth_tests::windows_native_is_taken_at_its_word ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4147 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_errors_without_server_addr ===
+
+running 1 test
+test share::tests::frp_errors_without_server_addr ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_escapes_utf8_token_and_redacts_plan_debug ===
+
+running 1 test
+test share::tests::frp_escapes_utf8_token_and_redacts_plan_debug ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_http_https_and_udp_keep_their_explicit_wire_shapes ===
+
+running 1 test
+test share::tests::frp_http_https_and_udp_keep_their_explicit_wire_shapes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_https_errors_without_subdomain_host ===
+
+running 1 test
+test share::tests::frp_https_errors_without_subdomain_host ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_https_materializes_toml_and_derives_subdomain_url ===
+
+running 1 test
+test share::tests::frp_https_materializes_toml_and_derives_subdomain_url ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url ===
+
+running 1 test
+test share::tests::frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_preserves_a_63_byte_label_for_tcp_proxy_name ===
+
+running 1 test
+test share::tests::frp_preserves_a_63_byte_label_for_tcp_proxy_name ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_rejects_invalid_fields_before_secret_resolution ===
+
+running 1 test
+test share::tests::frp_rejects_invalid_fields_before_secret_resolution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_rejects_invalid_or_overlong_dns_components ===
+
+running 1 test
+test share::tests::frp_rejects_invalid_or_overlong_dns_components ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_rejects_unsupported_extra_lines ===
+
+running 1 test
+test share::tests::frp_rejects_unsupported_extra_lines ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_rejects_zero_local_port_before_serialization ===
+
+running 1 test
+test share::tests::frp_rejects_zero_local_port_before_serialization ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_rejects_zero_remote_port_for_fixed_tcp_address ===
+
+running 1 test
+test share::tests::frp_rejects_zero_remote_port_for_fixed_tcp_address ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_tcp_derives_host_port_and_no_subdomain ===
+
+running 1 test
+test share::tests::frp_tcp_derives_host_port_and_no_subdomain ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_token_and_explicit_subdomain_and_vhost_port ===
+
+running 1 test
+test share::tests::frp_token_and_explicit_subdomain_and_vhost_port ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_typed_document_rejects_duplicate_keys_and_injected_tables ===
+
+running 1 test
+test share::tests::frp_typed_document_rejects_duplicate_keys_and_injected_tables ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== svc share::tests::frp_typed_document_rejects_unknown_fields ===
+
+running 1 test
+test share::tests::frp_typed_document_rejects_unknown_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 713 filtered out; finished in 0.00s
+
+
+=== host agent::tests::compose_spec_clean_shell_choice_uses_rc_free_shell ===
+
+running 1 test
+test agent::tests::compose_spec_clean_shell_choice_uses_rc_free_shell ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host agent::tests::compose_spec_host_fallback_is_login_shell ===
+
+running 1 test
+test agent::tests::compose_spec_host_fallback_is_login_shell ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host agent::tests::compose_spec_propagates_volume_refusal_without_host_fallback ===
+
+running 1 test
+test agent::tests::compose_spec_propagates_volume_refusal_without_host_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host agent::tests::configured_volume_refusal_precedes_agent_host_fallback ===
+
+running 1 test
+test agent::tests::configured_volume_refusal_precedes_agent_host_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.10s
+
+
+=== host agent::tests::explicit_host_does_not_override_fail_closed_floor ===
+
+running 1 test
+test agent::tests::explicit_host_does_not_override_fail_closed_floor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.50s
+
+
+=== host agent::tests::explicit_host_pick_overrides_nonauto_config ===
+
+running 1 test
+test agent::tests::explicit_host_pick_overrides_nonauto_config ... thegn: sandbox: no container backend available; running on the host (no kernel boundary). podman-rootful, docker installed but unavailable — check runtime health and access with `thegn doctor`
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.44s
+
+
+=== host agent::tests::final_composed_volume_gate_blocks_launch_effect_sentinel ===
+
+running 1 test
+test agent::tests::final_composed_volume_gate_blocks_launch_effect_sentinel ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host agent::tests::final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate ===
+
+running 1 test
+test agent::tests::final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.10s
+
+
+=== host agent::tests::final_host_floor_degrade_reports_the_missed_boundary ===
+
+running 1 test
+test agent::tests::final_host_floor_degrade_reports_the_missed_boundary ... thegn: isolation floor `shared-kernel` not met — this launch is `host-process` (best available here: `host-process`); start a container runtime (podman/docker/bwrap) — see `thegn doctor` for /wt/x
+thegn: sandbox: no container backend available; running on the host (no kernel boundary). podman-rootful, docker installed but unavailable — check runtime health and access with `thegn doctor`
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.46s
+
+
+=== host agent::tests::prepare_sandbox_none_backend_falls_to_host ===
+
+running 1 test
+test agent::tests::prepare_sandbox_none_backend_falls_to_host ... thegn: sandbox: no container backend available; running on the host (no kernel boundary). podman-rootful, docker installed but unavailable — check runtime health and access with `thegn doctor`
+thegn: sandbox: no container backend available; running on the host (no kernel boundary). podman-rootful, docker installed but unavailable — check runtime health and access with `thegn doctor`
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.41s
+
+
+=== host devcontainer_provider::startup::tests::unix::accepted_replacement_disposes_old_provider_on_owner_before_admission_reopens ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::accepted_replacement_disposes_old_provider_on_owner_before_admission_reopens ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.05s
+
+
+=== host devcontainer_provider::startup::tests::unix::busy_refusal_does_not_construct_or_drop_another_provider ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::busy_refusal_does_not_construct_or_drop_another_provider ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.32s
+
+
+=== host devcontainer_provider::startup::tests::unix::caller_timeout_during_preparation_prevents_late_spawn ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::caller_timeout_during_preparation_prevents_late_spawn ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.11s
+
+
+=== host devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.31s
+
+
+=== host devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody ... 
+thread 'devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody' (2738374) panicked at crates/thegn-host/src/devcontainer_startup.rs:778:9:
+owned fixture immediate post-insert unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.05s
+
+
+=== host devcontainer_provider::startup::tests::unix::fixture_assertion_unwind_releases_owned_work_without_double_panic ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::fixture_assertion_unwind_releases_owned_work_without_double_panic ... 
+thread 'devcontainer_provider::startup::tests::unix::fixture_assertion_unwind_releases_owned_work_without_double_panic' (2738397) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:1227:13:
+owned fixture assertion unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.11s
+
+
+=== host devcontainer_provider::startup::tests::unix::fixture_timeout_retains_real_directory_and_unfinished_handles_until_explicit_settlement ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::fixture_timeout_retains_real_directory_and_unfinished_handles_until_explicit_settlement ... 
+thread 'devcontainer_provider::startup::tests::unix::fixture_timeout_retains_real_directory_and_unfinished_handles_until_explicit_settlement' (2738419) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:269:13:
+owned fixture cleanup deadline expired; exact fixture custody and directory retained
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.10s
+
+
+=== host devcontainer_provider::startup::tests::unix::held_startup_does_not_occupy_git_or_capability_capture_lanes ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::held_startup_does_not_occupy_git_or_capability_capture_lanes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.33s
+
+
+=== host devcontainer_provider::startup::tests::unix::hung_leader_and_nonzero_inherited_stderr_respect_the_caller_deadline ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::hung_leader_and_nonzero_inherited_stderr_respect_the_caller_deadline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.62s
+
+
+=== host devcontainer_provider::startup::tests::unix::nonzero_exit_keeps_bounded_stderr_diagnostic_and_resource_marker ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::nonzero_exit_keeps_bounded_stderr_diagnostic_and_resource_marker ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.02s
+
+
+=== host devcontainer_provider::startup::tests::unix::producer_panic_retains_child_and_payload_without_running_its_destructor_on_caller ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::producer_panic_retains_child_and_payload_without_running_its_destructor_on_caller ... 
+thread 'devcontainer-startup' (2738698) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:1084:17:
+Box<dyn Any>
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.02s
+
+
+=== host devcontainer_provider::startup::tests::unix::reader_and_wait_failures_after_spawn_never_fall_back_or_repeat_wait ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::reader_and_wait_failures_after_spawn_never_fall_back_or_repeat_wait ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.05s
+
+
+=== host devcontainer_provider::startup::tests::unix::real_startup_stdout_null_success_and_exact_stderr_bound ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::real_startup_stdout_null_success_and_exact_stderr_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.16s
+
+
+=== host devcontainer_provider::startup::tests::unix::reservation_and_owner_launch_refuse_before_provider_construction ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::reservation_and_owner_launch_refuse_before_provider_construction ... 
+thread 'devcontainer_provider::startup::tests::unix::reservation_and_owner_launch_refuse_before_provider_construction' (2738753) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:872:17:
+fixture poison
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host devcontainer_provider::startup::tests::unix::shipping_agent_startup_decision_holds_nonzero_and_inherited_pipe_without_fallback ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::shipping_agent_startup_decision_holds_nonzero_and_inherited_pipe_without_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.43s
+
+
+=== host devcontainer_provider::startup::tests::unix::shipping_agent_success_and_unavailable_probe_preserve_existing_fallback_behavior ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::shipping_agent_success_and_unavailable_probe_preserve_existing_fallback_behavior ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.02s
+
+
+=== host devcontainer_provider::startup::tests::unix::stderr_overflow_is_held_and_does_not_admit_a_second_start ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::stderr_overflow_is_held_and_does_not_admit_a_second_start ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.06s
+
+
+=== host devcontainer_provider::startup::tests::unix::uncertain_wait_outcome_forbids_fixture_retry_even_when_public_reason_changed ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::uncertain_wait_outcome_forbids_fixture_retry_even_when_public_reason_changed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.02s
+
+
+=== host devcontainer_provider::startup::tests::unix::unwind_after_owner_spawn_installs_handle_before_abandoning_start_gate ===
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::unwind_after_owner_spawn_installs_handle_before_abandoning_start_gate ... 
+thread 'devcontainer_provider::startup::tests::unix::unwind_after_owner_spawn_installs_handle_before_abandoning_start_gate' (2739086) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:1240:17:
+owned installation unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host devcontainer_provider::startup::tests::zero_timeout_refuses_before_provider_factory ===
+
+running 1 test
+test devcontainer_provider::startup::tests::zero_timeout_refuses_before_provider_factory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::bundle_and_fetch_moves_a_tip_between_stores ===
+
+running 1 test
+test merge_remote::tests::bundle_and_fetch_moves_a_tip_between_stores ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.11s
+
+
+=== host merge_remote::tests::bundle_cleanup_preserves_an_observed_replacement ===
+
+running 1 test
+test merge_remote::tests::bundle_cleanup_preserves_an_observed_replacement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::bundle_creation_collision_preserves_preexisting_leaf ===
+
+running 1 test
+test merge_remote::tests::bundle_creation_collision_preserves_preexisting_leaf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::bundle_custody_rejects_special_replacements_and_keeps_modes ===
+
+running 1 test
+test merge_remote::tests::bundle_custody_rejects_special_replacements_and_keeps_modes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::bundle_unwind_after_injected_write_failure_cleans_owned_fixture ===
+
+running 1 test
+test merge_remote::tests::bundle_unwind_after_injected_write_failure_cleans_owned_fixture ... 
+thread 'merge_remote::tests::bundle_unwind_after_injected_write_failure_cleans_owned_fixture' (2739773) panicked at crates/thegn-host/src/merge_remote.rs:767:13:
+injected bundle unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::bundle_write_and_flush_failures_finish_without_recursive_cleanup ===
+
+running 1 test
+test merge_remote::tests::bundle_write_and_flush_failures_finish_without_recursive_cleanup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::bundle_write_revalidation_failure_preserves_replacement ===
+
+running 1 test
+test merge_remote::tests::bundle_write_revalidation_failure_preserves_replacement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::different_host_needs_ingest ===
+
+running 1 test
+test merge_remote::tests::different_host_needs_ingest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::ensure_tip_returns_heads_ref_when_same_store ===
+
+running 1 test
+test merge_remote::tests::ensure_tip_returns_heads_ref_when_same_store ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::mq_ref_is_namespaced ===
+
+running 1 test
+test merge_remote::tests::mq_ref_is_namespaced ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host merge_remote::tests::same_store_needs_no_ingest ===
+
+running 1 test
+test merge_remote::tests::same_store_needs_no_ingest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host panes::tests::terminal_invalid_configured_volume_refuses_before_no_spec_fallback ===
+
+running 1 test
+test panes::tests::terminal_invalid_configured_volume_refuses_before_no_spec_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host panes::tests::terminal_launch_spec_builds_ssh_mosh_and_local_argv ===
+
+running 1 test
+test panes::tests::terminal_launch_spec_builds_ssh_mosh_and_local_argv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::directory_rejects_alias_permissions_and_physical_replacement ===
+
+running 1 test
+test platform::gate_path::tests::directory_rejects_alias_permissions_and_physical_replacement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::exclusive_regular_creation_has_one_winner_across_two_owned_children ===
+
+running 1 test
+test platform::gate_path::tests::exclusive_regular_creation_has_one_winner_across_two_owned_children ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.03s
+
+
+=== host platform::gate_path::tests::exclusive_regular_creation_never_adopts_an_existing_leaf ===
+
+running 1 test
+test platform::gate_path::tests::exclusive_regular_creation_never_adopts_an_existing_leaf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::failed_identity_cleanup_preserves_a_replacement ===
+
+running 1 test
+test platform::gate_path::tests::failed_identity_cleanup_preserves_a_replacement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::foreign_owner_and_privilege_sharing_never_admit_regular_files ===
+
+running 1 test
+test platform::gate_path::tests::foreign_owner_and_privilege_sharing_never_admit_regular_files ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::lock_is_nonblocking_and_releases_with_its_owner ===
+
+running 1 test
+test platform::gate_path::tests::lock_is_nonblocking_and_releases_with_its_owner ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::lock_open_failure_is_not_unlocked_success ===
+
+running 1 test
+test platform::gate_path::tests::lock_open_failure_is_not_unlocked_success ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::lock_rejects_symlinks_hardlinks_and_replaced_identity ===
+
+running 1 test
+test platform::gate_path::tests::lock_rejects_symlinks_hardlinks_and_replaced_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+
+
+=== host platform::gate_path::tests::special_files_and_oversized_identity_fail_without_waiting ===
+
+running 1 test
+test platform::gate_path::tests::special_files_and_oversized_identity_fail_without_waiting ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3398 filtered out; finished in 0.00s
+

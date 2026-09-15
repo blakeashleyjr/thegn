@@ -1,0 +1,36 @@
+{
+  "review": "THE-222 hostile native final independent review",
+  "date": "2026-09-15",
+  "verdict": "APPROVED_LINUX_HOSTILE_ENTRY_ACCEPTANCE",
+  "amends": "/tmp/thegn-maintenance07-native-evidence-adversarial-luna-20260915.{md,json}",
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "receipt": {
+    "path": "/tmp/thegn-THE222-hostile-native-receipt-20260915.json",
+    "sha256": "9047d9369c489c72f0146699f3c9599f202953fb5c86d9eb0799f5b20ff0cd21",
+    "passed": 5,
+    "failed": 0,
+    "cpu_max": "100000 100000",
+    "binary_sha256": "6dc4956cfcb759924b552aa71b027800c701caa646118b4a81c48cbf699e1b8d",
+    "harness_sha256": "7e5c8e42419b00c0951dc8756bc8b85dab2b554c22a8bc5e93478a613b8eb7b1"
+  },
+  "cases": {
+    "symlink": {"exit_codes": [0, 0], "outcomes": ["loser", "loser"], "entry_identity_unchanged": true, "canary_unchanged": true, "all_children_settled": true, "private_root_removed": true},
+    "regular": {"exit_codes": [0, 0], "outcomes": ["loser", "loser"], "entry_identity_unchanged": true, "canary_unchanged": true, "all_children_settled": true, "private_root_removed": true},
+    "hardlink": {"exit_codes": [0, 0], "outcomes": ["loser", "loser"], "entry_identity_unchanged": true, "canary_unchanged": true, "all_children_settled": true, "private_root_removed": true},
+    "fifo": {"exit_codes": [0, 0], "outcomes": ["loser", "loser"], "entry_identity_unchanged": true, "canary_unchanged": true, "all_children_settled": true, "private_root_removed": true},
+    "directory": {"exit_codes": [0, 0], "outcomes": ["loser", "loser"], "entry_identity_unchanged": true, "canary_unchanged": true, "all_children_settled": true, "private_root_removed": true}
+  },
+  "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+  "scope": [
+    "Linux pinned Rust exclusive-create helper",
+    "hostile preexisting-entry refusal with two synchronized children",
+    "identity/type/link-count and canary preservation",
+    "bounded settlement and explicit nonrecursive fixture cleanup"
+  ],
+  "limits": [
+    "No Windows runtime proof",
+    "No atomic same-UID replacement lease claim",
+    "No build or re-execution by this independent reviewer"
+  ],
+  "reviewer_mutated_source": false
+}

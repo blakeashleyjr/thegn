@@ -1,0 +1,61 @@
+python3 scripts/delivery_state.py validate
+delivery state: change/issue schemas, bidirectional ownership, lifecycle, docs, and contract ratchets valid
+env -u LINEAR_API_KEY -u LINEAR_TOKEN python3 scripts/delivery_state.py fixtures
+delivery fixtures: 10 passed
+# Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
+# is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
+# may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
+# Comment lines are ignored (doc-comments legitimately name the pattern they forbid).
+# `build.rs` is exempt: a build script cannot depend on thegn-core, so it
+# scrubs GIT_ENV_VARS inline instead (see the comment at that call site).
+! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -v '/build.rs:' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+# Guardrail: pre-rename brand tokens must not come back — this is thegn.
+# Token list + allowlist live in the script. See test/brand-guard.sh.
+bash test/brand-guard.sh
+brand-guard: clean
+# Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
+# removed per-file size limit, "e2e runs every push") must not come back.
+bash test/stale-docs-guard.sh
+stale-docs-guard: clean
+# Guardrail: the hand-run Muse recipe must keep the same config and D-Bus
+# isolation as the hermetic e2e environment.
+bash test/muse-docs-guard.sh
+muse-docs-guard: clean
+# Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
+# explain each rule). The Rust-side ones run in `just test`.
+bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+ratchet(forge-leak): clean (4 pinned)
+bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+ratchet(runtime-leak): clean (7 pinned)
+bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
+ratchet(async-trait): clean (0 pinned)
+# `let _ =[[:space:]]*$` catches the rustfmt-wrapped form (`let _ =` alone on
+# its line, expression on the next) — how a swallowed budget-enforcement write
+# sat unpinned in thegn-proxy for a whole release.
+bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
+ratchet(ignored-result): clean (337 pinned)
+bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+ratchet(json-emit): clean (16 pinned)
+bash test/ratchet.sh i18n-literal 'jump|type to filter|matches|dismiss|offline|VIM NORMAL|VIM INSERT|NORMAL|EMACS|LOC|New terminal|New folder|Move to folder' crates/thegn-host/src/chrome.rs crates/thegn-host/src/statusbar_left.rs crates/thegn-host/src/statusbar_badges.rs crates/thegn-host/src/run.rs crates/thegn-host/src/handlers/status_line.rs crates/thegn-host/src/palette.rs crates/thegn-host/src/keymap_specs.rs
+ratchet(i18n-literal): clean (5 pinned)
+# Element contract: no NEW interactive chrome painted with raw `draw_text` +
+# a hand-built hit table — build it through `crate::element` instead (see
+# test/element-ratchet.txt for the rule + burn-down).
+bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
+ratchet(element): clean (3 pinned)
+# NOTE: the host-key policy-chokepoint ratchet (THE-66) is enforced as a Rust
+# test in each crate's `platform_ratchet_tests.rs`
+# (`host_key_literals_stay_in_the_chokepoint`, allowlists
+# test/hostkey-{core,svc,host}-ratchet.txt), so it runs in `just test` — the
+# pre-push gate — not here. `just ratchet-update` regenerates it via the
+# `cargo test -p <crate> platform_ratchet` lines above.
+# Guardrail: the git read engine is config-selected — host code takes it from
+# `git_handle::get()`, never constructs `GixGit` itself (writes use `CliGit`
+# explicitly, by design).
+! grep -rIn 'GixGit::new()' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: GixGit constructed in the host — use crate::git_handle::get()' && exit 1)
+# Guardrail: the idle loop never polls. Every `poll_input(` in the host is
+# either a zero-timeout drain, the attach client's blocking `None`, or THE
+# one timed site that consumes `idle_poll::poll_timeout` (tested pure).
+bash test/idle-poll-guard.sh --self-test
+idle-poll guard: 9 regression cases passed
+bash test/idle-poll-guard.sh

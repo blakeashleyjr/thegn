@@ -1,0 +1,49 @@
+{
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "runner": "/tmp/thegn-private-test-runner-20260914.py",
+  "isolation": "one exact selector per fresh process, private XDG roots, no inherited credentials/HOME except existing reviewed read-only whitelist, 30s outer timeout, one test thread",
+  "core": {
+    "prefixes": [
+      "sandbox::tests::",
+      "sandbox_truth::sandbox_truth_tests::"
+    ],
+    "exclusions": [
+      "integration_test_sandbox_net_and_file",
+      "test_sandbox_compose_executes",
+      "integration_test_sandbox_lifecycle"
+    ],
+    "qualification": "sandbox planning/parser/argv behavior; no OCI end-to-end or cross-platform claim; review listed selectors before execution"
+  },
+  "svc": {
+    "prefixes": [
+      "share::tests::frp_"
+    ],
+    "qualification": "all FRP typed-document, validation, pre-secret resolver, escaping/redaction, and existing wire-shape tests; no frpc server/client execution"
+  },
+  "host": {
+    "prefixes": [
+      "merge_remote::tests::",
+      "platform::gate_path::tests::",
+      "devcontainer_provider::startup::tests::"
+    ],
+    "exclusions": [
+      "exclusive_regular_creation_child"
+    ],
+    "exact_suffixes": [
+      "compose_spec_propagates_volume_refusal_without_host_fallback",
+      "final_composed_volume_gate_blocks_launch_effect_sentinel",
+      "configured_volume_refusal_precedes_agent_host_fallback",
+      "compose_spec_host_fallback_is_login_shell",
+      "compose_spec_clean_shell_choice_uses_rc_free_shell",
+      "prepare_sandbox_none_backend_falls_to_host",
+      "final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate",
+      "explicit_host_does_not_override_fail_closed_floor",
+      "final_host_floor_degrade_reports_the_missed_boundary",
+      "explicit_host_pick_overrides_nonauto_config",
+      "terminal_launch_spec_builds_ssh_mosh_and_local_argv",
+      "terminal_invalid_configured_volume_refuses_before_no_spec_fallback"
+    ],
+    "qualification": "private real Git bundle transport and filesystem refusal fixtures, new volume pre-effect gates, existing host floor/fallback and startup-custody regressions; no live provider/container calls"
+  },
+  "status": "planned; no native tests run yet"
+}

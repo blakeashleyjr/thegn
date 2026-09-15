@@ -1,0 +1,55 @@
+{
+  "issue": "THE-247",
+  "date": "2026-09-15",
+  "reviewer": "Luna high",
+  "candidate_path": "/tmp/thegn-THE247-private-luna-20260915-b",
+  "candidate_commit": "b6f479701ea1d7489c9d19f82e0e384721c2dc59",
+  "comparison_base": "59a9c944",
+  "verdict": "source-approved-native-admission-pending",
+  "prior_blocked_commit": "c59fe077c1d7f96bb2e0796c0a1b773df188fee5",
+  "resolved_prior_blockers": [
+    "sandbox_tests backend_enter_argv Vec unwrap compile issue resolved; direct enter_argv callers updated for Result",
+    "run.rs FnMut map clones LaunchSpec per missing id",
+    "configured invalid sources refused before agent/terminal resolver or host fallback",
+    "final composed gate uses production effect callback sentinel rather than source scanning",
+    "redaction tests avoid raw empty-source diagnostic assertion"
+  ],
+  "verified_boundaries": {
+    "grammar": "sandbox.rs:568-653; sandbox_tests.rs:668-734",
+    "ensure_and_argv": "sandbox.rs:1687-1703,1939-1960,2317-2321,2540-2547",
+    "agent_pre_resolution": "agent.rs:365-369",
+    "agent_final_pre_effect": "agent.rs:641-719",
+    "terminal_pre_resolution": "panes.rs:157-171,245-281",
+    "behavioral_sentinel": "agent_tests.rs:433-462",
+    "caller_propagation": "agent_run.rs:135-148; build_cache.rs:455-470; wizard.rs:1460-1480; run.rs:8436-8443"
+  },
+  "source_hashes": {
+    "crates/thegn-core/src/config.rs": "999fd0353ba5380d0a096aeedf95d667d0894fe55888864aed5362f087a52191",
+    "crates/thegn-core/src/sandbox.rs": "eaca583f2e93518f57960626dfdbcaececae2612cdf18d11d7fc2c35ee8c3c04",
+    "crates/thegn-core/src/sandbox_tests.rs": "09c3475434cfee758327d0c9ec8552acfe406a91d5597663047b3f5b2076b17b",
+    "crates/thegn-core/src/sandbox_truth_tests.rs": "60de38a57392fc21420b38337c94b67d0d94914396902e84536193be3c2843a2",
+    "crates/thegn-core/tests/devcontainer_e2e.rs": "212408d1959f4c8bb5367de936d5ea1d619bcdb7900dce0f7140f8b58821c009",
+    "crates/thegn-core/tests/sandbox_credentials.rs": "e638e18d0c41d951a3cbb572ade6c313e46e0f00f2e145664f11b2e7a264cc5e",
+    "crates/thegn-core/tests/sandbox_network_policy.rs": "e02b69efd9fd3ea18d7b0d7f150b70edaa3058a1c73cfda81c4fc8f9a3d691a5",
+    "crates/thegn-core/tests/sandbox_readonly_home.rs": "e8c7fc1ef4093b271632326ee578fb07c019ae56c65318cf77e20528af5d9e4b",
+    "crates/thegn-host/src/agent.rs": "53fe300c74af313a783535ab8f0ae55269a6aafc046b50a7f571470bba9ecdaa",
+    "crates/thegn-host/src/agent_run.rs": "62c4c292ebae8c707a697fe6ef31b0cb140f2f72f94bd07731ad2bb5a4257373",
+    "crates/thegn-host/src/agent_tests.rs": "0be070300beff133525b38c5fb41fe0717b730add226004823261c800e4ad4c0",
+    "crates/thegn-host/src/build_cache.rs": "5f989e39f58e52bc3be96d111791d6e502d173e22136046932f565dd8bfc09b2",
+    "crates/thegn-host/src/handlers/materialize.rs": "0e92b521dee1c1c9d733236a799a2192478a468479dc4720b04b9e369d4cd863",
+    "crates/thegn-host/src/panes.rs": "00ab87dc2aec35729d26266bb4286d868f7530a30d6a45811f70e8cc172e5857",
+    "crates/thegn-host/src/run.rs": "e1abf64305b9f11d852a5d9b45cdbfe14b7afc56f1355e5ff2922080ed45f0ed",
+    "crates/thegn-host/src/wizard.rs": "74f7be860010242dc2b9943a02f370410ef342ada3628ba114698beedff8139a"
+  },
+  "evidence": {
+    "source_ratchets": "/tmp/thegn-THE247-source-ratchets-20260915.log (supplied receipt; not rerun)",
+    "strict_spec": "/tmp/thegn-THE247-source-spec-20260915.log (supplied receipt; not rerun)",
+    "format": "/tmp/thegn-THE247-root-source-format-20260915.log (supplied receipt; not rerun)"
+  },
+  "execution": "source-only; no Cargo/build/test/native/provider/canonical/Linear operation",
+  "remaining_scope": [
+    "Root combined native/build admission",
+    "engine/runtime and cross-platform behavior",
+    "THE-153 bind/control-boundary and Compose YAML scope remain separate"
+  ]
+}

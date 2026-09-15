@@ -1,0 +1,42 @@
+{
+  "review": "THE-222 hostile native harness independent source review",
+  "date": "2026-09-15",
+  "harness": "/tmp/thegn-THE222-hostile-native-harness-20260915.py",
+  "harness_sha256": "7e5c8e42419b00c0951dc8756bc8b85dab2b554c22a8bc5e93478a613b8eb7b1",
+  "pinned_source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "verdict": "APPROVED_FOR_ROOT_NATIVE_EXECUTION",
+  "source_only_review": true,
+  "syntax_check": "python3 -m py_compile passed",
+  "operations": {
+    "cargo": false,
+    "compiler": false,
+    "test_binary": false,
+    "native_execution": false,
+    "provider": false,
+    "canonical_mutation": false,
+    "linear_write": false
+  },
+  "cases": ["symlink", "regular", "hardlink", "fifo", "directory"],
+  "assertions": [
+    "pinned host binary hash matches corrected build admission",
+    "own cgroup cpu.max is checked as exactly 100000 100000 before child spawn",
+    "corrected admission source and exit are checked",
+    "two children per hostile-entry case",
+    "finite readiness and release barrier",
+    "both children exit 0 with loser outcome",
+    "device/inode/mode/link-count/type unchanged",
+    "entry and canary bytes unchanged",
+    "all children settle before cleanup",
+    "cleanup is explicit and nonrecursive"
+  ],
+  "bounds": {
+    "readiness_seconds": 1.5,
+    "completion_seconds": 2.5,
+    "settlement_seconds": 1.0,
+    "child_stdio": "null",
+    "child_descendants": "none launched by helper",
+    "fixture": "private 0700 temporary root"
+  },
+  "qualification": "Observed preexisting-entry refusal only; no atomic same-UID lease claim.",
+  "root_execution_required": true
+}

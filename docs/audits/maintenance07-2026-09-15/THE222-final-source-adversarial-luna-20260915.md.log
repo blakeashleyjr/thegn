@@ -1,0 +1,31 @@
+# THE-222 final independent source adversarial review — Luna
+
+Date: 2026-09-15
+Candidate: `/tmp/thegn-THE222-impl-luna-20260915`
+Candidate commit: `7ad19e619ab7491c9cd665508a0c8294a8a7acab`
+Production implementation commit: `56ab0d3f83061bb5ffd848a208d6fff60f6dc1d0`
+Immutable base: `b025ec5d877f191d65cc831c95035c493c49c7f6`
+Review scope: source and staged metadata inspection only; no Cargo, build, test, native, provider, or Linear operation.
+
+## Verdict
+
+APPROVED for source review and root-owned minimal native admission. The earlier source blockers are resolved in the current candidate. Windows native behavior remains an explicit execution gate for root; its absence from this review is not a claim of Windows runtime proof.
+
+## Findings resolved
+
+- `BundleTemp::new` and both production `fetch_bundle_with_root` paths pass the two-argument `new_in(root, false)` contract. The test-only `new_for_test` helper is Unix/test cfg-gated, so the prior production/test arity mismatch is gone.
+- Unix `Regular::create_exclusive_at` verifies and clones the retained parent before `openat`, uses `O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` with mode `0600`, and converts the returned fd to `File` immediately. A post-create verification failure invokes identity-checked, nonrecursive cleanup; a clone/open/verification error cannot silently leave an adopted fd or invoke recursive cleanup.
+- Unix `BundleTemp` creates a random `0700` parent with tempfile cleanup disabled, retains `Directory` and `Regular` custody through write, flush, verification, Git fetch, and cleanup, and removes only the verified leaf through the pinned parent followed by nonrecursive `remove_dir`. The replacement tests cover symlink, FIFO, directory, and hardlink entries and preserve foreign entries/canaries.
+- The Unix tests import `OsStrExt`, and the hardlink case removes both the active link and retained inode before removing the parent. The former missing-trait and nonempty-parent test failures are resolved.
+- The bounded child test target is genuinely selected through the libtest binary and uses `OwnedChild` custody with finite two-second readiness/release/settlement loops. The test asserts exactly one exclusive-create winner and one `AlreadyExists` loser, while the shared child helper retains an unsettled child/root after observation loss instead of issuing uncontrolled cleanup.
+- Windows `Cargo.toml` enables `Win32_Security_Authorization` and `Win32_System_SystemServices`. `SE_FILE_OBJECT`, `SetEntriesInAclW`, `NO_MULTIPLE_TRUSTEE`, `TRUSTEE_IS_SID`, and `ACCESS_ALLOWED_ACE_TYPE` are imported from the modules where windows-sys 0.59 defines them. `PSECURITY_DESCRIPTOR` arguments are explicitly cast to the Win32 pointer ABI, and `TRUSTEE_W.ptstrName` receives the SID pointer with the expected `PWSTR` representation.
+- Windows `create_private_directory` obtains the current process token's `TOKEN_USER` into `usize`-aligned storage retained through ACL construction and `CreateDirectoryW`; it no longer casts a byte vector to an unaligned `TOKEN_USER`. The DACL is supplied through `SECURITY_ATTRIBUTES` at creation and has `SE_DACL_PROTECTED` set. `secure_private_directory` reads back the owner and exact one-ACE protected DACL and compares the ACE SID to that owner, so the old `OW`/actual-owner mismatch is removed.
+- Windows no-follow opens use share-read/write/delete and reject final reparse points. File/directory identity uses stable `GetFileInformationByHandle` volume serial and file-index fields rather than unstable standard-library `MetadataExt` methods. The retained handle remains open through create/write/verify/fetch and cleanup.
+
+## Scope and residual limits
+
+The Windows cleanup identity tuple does not use link count, so a same-UID actor can still create a hardlink to the owned inode; this cannot delete unrelated data and is within the documented same-UID observational race boundary. The source does not claim an atomic lease between identity observation and pathname removal. Windows native ACL, reparse, sharing, and cleanup execution is still pending root's platform gate. Bundle bytes remain materialized in memory; streaming/budgeting belongs to THE-223. These are explicit scope limits rather than source blockers for THE-222's bounded seam.
+
+The final candidate commit adds only metadata/specification and delivery records after the production implementation commit (`delivery/index.json`, `delivery/issues.json`, and `openspec/changes/secure-merge-bundle-custody/*`); the production source reviewed is unchanged between those commits. The candidate preserves existing Git bundle/fetch behavior while replacing the predictable pathname write and best-effort removal with retained custody.
+
+No source mutation, build, test execution, native execution, provider action, canonical edit, or Linear write was performed by this review.

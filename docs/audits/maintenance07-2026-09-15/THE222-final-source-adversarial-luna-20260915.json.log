@@ -1,0 +1,50 @@
+{
+  "issue": "THE-222",
+  "date": "2026-09-15",
+  "candidate_path": "/tmp/thegn-THE222-impl-luna-20260915",
+  "candidate_commit": "7ad19e619ab7491c9cd665508a0c8294a8a7acab",
+  "production_implementation_commit": "56ab0d3f83061bb5ffd848a208d6fff60f6dc1d0",
+  "base_commit": "b025ec5d877f191d65cc831c95035c493c49c7f6",
+  "verdict": "approved_source_review_root_minimal_native_admission_pending",
+  "review_scope": "Source and final metadata inspection only; no Cargo, build, test, native, provider, or Linear operation.",
+  "resolved_blockers": [
+    "BundleTemp new_in arity is cfg-correct at all callers; test-only helper is Unix/test gated.",
+    "Unix parent is verified and cloned before openat; the created fd is adopted immediately and post-create cleanup is identity checked and nonrecursive.",
+    "Unix OsStrExt import and hardlink fixture cleanup are present.",
+    "Bounded two-child exclusive-create test uses the actual libtest child target and OwnedChild custody.",
+    "Windows security imports and Cargo features match windows-sys 0.59 module definitions.",
+    "Windows DACL uses current TOKEN_USER SID in aligned storage, is protected at CreateDirectoryW, and validates the actual owner SID.",
+    "Windows stable handle identity uses GetFileInformationByHandle instead of unstable MetadataExt methods."
+  ],
+  "source_sha256": {
+    "crates/thegn-host/src/merge_remote.rs": "5f61b3316aace3b7fad9ca1becda491c352d264d0901bd4035c010b85f2c10d5",
+    "crates/thegn-host/src/platform/gate_path.rs": "885097bfa74cd134c3c77c233eae00659299d1e706deeb698eabe0737b6c9887",
+    "crates/thegn-host/src/platform/windows.rs": "cf16df9a1574f63f2f2d7f5452660b83813f050776dfebdcf1dd648384c7c1ee",
+    "crates/thegn-host/src/platform/mod.rs": "b9c615031a0b6f984c2efd5ff54a8402883ba4f25247aa8ca42543fccf93ddcc",
+    "Cargo.toml": "221149b28257da6e57e6f690c307791493ee803da177cb23ea0bbd8c865bd1ca"
+  },
+  "metadata_sha256": {
+    "delivery/index.json": "84cc26fb2ca16a799833f782f9397f2a89d711f988f15754228d418a158b7190",
+    "delivery/issues.json": "125ae1d4da4133fe149ceaf2a8c9d84f5264638611b5dce2c3ca12fb559d5f02",
+    "openspec/changes/secure-merge-bundle-custody/design.md": "5ac080a46d411d944637eb7a73e69a4627a5c6c6056fb5b2499c015c48e7a93b",
+    "openspec/changes/secure-merge-bundle-custody/proposal.md": "20fb56916aa19bfa05225e7023dfe2432f289ee7ebef54058a0d0ba9f64f62c6",
+    "openspec/changes/secure-merge-bundle-custody/specs/merge-queue/spec.md": "b4c752689b51c2f0fb626f7aefebdd6769fd9a574aa8f46ffb32e1439a3af729",
+    "openspec/changes/secure-merge-bundle-custody/tasks.md": "51c8575f8adb29ee06296c099640323adcd0d57e2b2f4109bcec66dab11d8272",
+    "openspec/changes/secure-merge-bundle-custody/validation.md": "c7f68738b5e1d49b8eef0b6a5bed739886b1b6aa7818f5e401aa2b23837590ec"
+  },
+  "checks": {
+    "unix_identity_safe_cleanup": "approved by source inspection",
+    "unix_exclusive_creation": "approved by source inspection",
+    "windows_protected_creation_dacl": "approved by source inspection; native execution pending",
+    "windows_stable_identity_and_reparse_checks": "approved by source inspection; native execution pending",
+    "bounded_child_regression": "approved by source inspection; native execution pending"
+  },
+  "residual_limits": [
+    "No atomic lease against an arbitrary same-UID replacement between identity check and unlink.",
+    "Windows cleanup identity tuple does not use link count; same-UID hardlink manipulation remains within the documented observational boundary.",
+    "Windows native ACL/reparse/share/cleanup execution is not established by this review.",
+    "Bundle bytes remain materialized; streaming and budget changes belong to THE-223."
+  ],
+  "source_mutation_by_reviewer": false,
+  "build_or_test_by_reviewer": false
+}

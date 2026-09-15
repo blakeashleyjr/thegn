@@ -1,0 +1,15 @@
+# THE-326 source-review amendment — Luna
+
+Date: 2026-09-15
+Implementation source: /tmp/thegn-THE326-private-luna-20260915-a
+Production commit reviewed: 58f1f3f749d61c10a375fabe73bf7d759aad2972 (parent a20714ba, based on 5305f09).
+Current private metadata head: ce0cffe2 (metadata-only delivery ordering/spec additions; Rust tree remains the reviewed production commit).
+
+Verdict: APPROVED for the previously identified validation-order blocker.
+
+The prior blocker was that the FRP subdomain_host validation occurred after typed-document construction/token resolution. In 58f1f3f, plan_frp delegates to plan_frp_resolving_token. That helper validates extra, server_addr, local_port, the worktree label/generated proxy name, proxy type/remote_port, the derived subdomain, and (for web modes) subdomain_host before invoking the injected token resolver or constructing FrpDocument. The production closure still delegates to expand_env_ref only after these checks. The existing provider shapes remain unchanged, and the resolver is not moved globally.
+
+The added tests are meaningful source evidence: frp_rejects_invalid_fields_before_secret_resolution covers newline server input, newline subdomain, malformed subdomain_host, and invalid worktree label with a counting resolver asserting zero calls; frp_rejects_zero_local_port_before_serialization does the same for local port zero. The HTTP/HTTPS/UDP test preserves explicit wire types and URL rules; the existing typed deny_unknown_fields round-trip and token redaction tests remain in scope. Metadata-only additions under openspec/.../specs/public-share/spec.md and the sorted delivery entry are not production Rust changes.
+
+No build, test, provider call, or canonical edit was performed for this amendment. No remaining THE-326 source blocker is visible in the reviewed delta. Native admission remains the root-owned step.
+

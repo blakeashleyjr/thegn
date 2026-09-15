@@ -1,0 +1,39 @@
+# Maintenance07 consolidated integration source review
+
+Date: 2026-09-15
+Reviewer: Luna high
+Candidate: `/tmp/thegn-maintenance-07-combined-20260915`
+Candidate HEAD: `fbd133823509fcdf1eb7912792dfec1a4c7760da`
+Local base: `f293594d` (`thegn` main before the consolidated THE-222/THE-247/THE-326 source commits)
+Scope: read-only source and provenance integration review. No Cargo, build, test, native, provider, canonical, or Linear operation.
+
+## Verdict
+
+**Approved for Root's single consolidated build admission.** The consolidated tree retains the approved source contracts for THE-222, THE-247, and THE-326, including the overlapping THE-633/THE-639 and configuration hunks. No source integration blocker was found.
+
+## Cross-issue preservation checks
+
+### THE-222 and the existing platform/source work
+
+- `crates/thegn-host/src/merge_remote.rs` is byte identical to the approved THE-222 final (`5f61b331…`), and `platform/gate_path.rs` is byte identical (`885097bf…`). The exclusive bundle custody and identity gate code therefore did not get rewritten during consolidation.
+- The consolidated `platform/windows.rs` is the approved THE-222 Windows implementation plus one additive `open_capability_identity` helper already present in the maintenance source. A diff against the tested 33c source shows additions only; no pre-existing Windows code was deleted or altered by the THE-222 merge. The protected CreateDirectoryW DACL, aligned TOKEN_USER SID, stable handle identity, reparse checks, and share flags remain present.
+- The THE-633 source inventory was checked against the tested 33c tree. Its bounded git probe, probe-cache, hydration, platform test, and Unix files remain byte identical. The Windows diff is additive THE-222 platform code, so no landed THE-633 probe behavior was lost. `devcontainer_startup.rs` remains present and the provider module retains its startup binding.
+
+### THE-247 with THE-639 startup/floor behavior
+
+- `crates/thegn-core/src/sandbox.rs` is byte identical to the approved THE-247 final (`eaca583f…`). The typed bounded/redacted volume grammar, direct entry/ensure/OCI guards, and keep-id guard remain intact.
+- `crates/thegn-host/src/agent.rs` necessarily differs from the THE-247 private final because the consolidated tree retains THE-639's startup custody changes. The THE-247 configured-admission section and final effect-boundary section were extracted and compared byte-for-byte: configured admission hash `df6a18bf…`; final admission/effect hash `5bc8de33…`. They remain exact. The THE-639 `prepare_devcontainer`/provider path is retained, and the final order is still Ready overlay → remote finalization → volume admission → floor decision → VPN/ensure/preflight, with the nested VPN result preserved.
+- The direct terminal path remains fallible and refuses invalid configured volume sources before backend/HOME/resolver fallback. No THE-247 fallback or error-propagation hunk was lost.
+
+### THE-326 and THE-247 shared configuration
+
+- `crates/thegn-svc/src/share/mod.rs` and `share/tests.rs` are byte identical to the approved THE-326 final (`1502b5f7…`, `59f0d738…`). Typed FRP serialization, deny-unknown-fields round-trip, pre-resolution validation, token resolver ordering, and redacted plan debug remain unchanged.
+- `crates/thegn-core/src/config.rs` contains both contracts: the THE-326 FRP changes (`remote_port` nonzero policy and reserved `extra`) and THE-247 named-volume documentation/field. The FRP struct slice is byte identical to the approved THE-326 slice (`b79b9ccc…`); the volume field and grammar documentation are retained alongside it. No cross-issue overwrite is present.
+
+## Source gates and tree state
+
+The consolidated worktree was clean at review time. Supplied receipts report maintenance07 source formatting with zero changes, source ratchets clean, and strict OpenSpec validation with 167 passed and 0 failed. These receipts were inspected as evidence and not rerun in this source-only review. Root owns the single consolidated build/native admission and any later landing metadata.
+
+## Exact provenance
+
+Approved private-final comparisons and consolidated hashes are recorded in the companion JSON. The consolidated commit is `fbd133823509fcdf1eb7912792dfec1a4c7760da`; no source or metadata edits were made by this review.

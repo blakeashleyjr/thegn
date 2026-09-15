@@ -1,0 +1,120 @@
+# Maintenance07 focused native evidence — independent adversarial review
+
+Date: 2026-09-15  
+Reviewer: Luna high  
+Candidate: `/tmp/thegn-maintenance-07-combined-20260915`  
+Tested source: `72d161b2e1868561fd2f5bce9facde8b0345512a`  
+Tested tree: `010fdb95a4a02a4f8d18423fcd7dc21b65ca9502`  
+Local base: `f293594d4a8516f940540b4eda60a9a98ac1d7a1`
+
+## Verdict
+
+**Evidence accepted with a THE-222 acceptance qualification.** The final
+focused Linux receipt is genuine and source-bound: 145 of 145 exact selectors
+passed in fresh isolated processes, split 77 core, 16 service, and 52 host.
+The corrected one-job test compilation and final all-target workspace Clippy
+both identify source `72d161b…` and exit successfully. This is sufficient
+focused native evidence for THE-247 and THE-326 within the documented Linux
+scope.
+
+THE-222's source and its selected Linux custody tests are healthy, but the
+literal acceptance text asks for a two-process race against hostile entries
+(symlink/FIFO/hardlink/etc.) with unchanged canary proof. The selected
+`platform::gate_path::tests::exclusive_regular_creation_has_one_winner_across_two_owned_children`
+test is a two-process race over a shared absent regular leaf: both children
+are benign exclusive creators, one wins, and the winner writes `winner`.
+The hostile-entry checks are separate single-process fixtures:
+`merge_remote::tests::bundle_custody_rejects_special_replacements_and_keeps_modes`,
+`platform::gate_path::tests::lock_rejects_symlinks_hardlinks_and_replaced_identity`,
+and related replacement tests. They prove refusal/preservation in their
+observed replacement cases, but do not prove the requested hostile two-child
+protocol or a canary unchanged across that race. Therefore recommend THE-222
+remain In Progress for that narrow adversarial regression and its native run;
+do not describe the 145-pass receipt as closing that exact requirement.
+
+## Receipt and provenance checks
+
+The focused receipt `/tmp/thegn-maintenance07-focused-native-receipt-20260915.json`
+contains 145 test records, each with `exit_code: 0` and
+`exact_one_pass: true`; its aggregate is `passed: 145`, `failed: 0`. The
+records use only the three pinned harnesses `core-tests`, `svc-tests`, and
+`host-tests`, with one selector per fresh process, one test thread, private
+XDG roots, and the documented 30-second outer bound. The receipt source hash,
+runner hash, log hash, and selected-manifest hash were independently recomputed
+and match:
+
+| Evidence | Path | SHA-256 |
+| --- | --- | --- |
+| Focused receipt | `/tmp/thegn-maintenance07-focused-native-receipt-20260915.json` | `6d1527f199a44cc6618cd1f4a437a7e189a4fff0829938c20b72e3becf5748ec` |
+| Focused log | `/tmp/thegn-maintenance07-focused-native-20260915.log` | `84b7613b1305b23f9b63a869c0b94c1a2ffe1eb49290029df4eae65c4788fb39` |
+| Selection | `/tmp/thegn-maintenance07-native-selected-20260915.json` | `13723b44db103d34cba275a5939f468cdcd4a7179399cc83d52906a0a9062af6` |
+| Selection plan | `/tmp/thegn-maintenance07-native-selection-plan-20260915.json` | `a1f52cdb7f228622c3996957d5ea8b010fbd168ccf0c0a7b5b70c76cb572d575` |
+| Private runner | `/tmp/thegn-private-test-runner-20260914.py` | `6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07` |
+| Corrected build admission | `/tmp/thegn-maintenance07-native-build-corrected-admission-20260915.json` | `f4f98187f341e0930e213fd4f7390ad6a87f4bf4d522b83529c6f5686b8afc42` |
+| Final Clippy admission | `/tmp/thegn-maintenance07-final-clippy-admission-20260915.json` | `a82269b73f3b3d76c09e861a741a14a5bab4017d28f20b2ccc718e09c7afa5bc` |
+
+The corrected compilation ran one Cargo job under a verified `cpu.max` of
+`100000 100000`, with niceness 10, and exited 0. Its pinned binaries and
+depfiles are recorded for all three affected harnesses. Final workspace
+Clippy used `cargo clippy --workspace --all-targets --keep-going -- -D warnings`
+under the same CPU quota and exited 0; its log hash is
+`c95c5e51ccaf2b91c6b723a8573eac1ae44b116f4ba06ed51276761a2cd36afa`.
+
+The source hash list in the corrected build admission matches the current
+Rust/Cargo/test source for all source entries. The worktree subsequently has
+only three uncommitted OpenSpec `validation.md` edits plus the uncommitted
+durable audit package; those metadata files are not compiled source. Their
+post-build hash differences must be reflected when root freezes the package,
+but they do not invalidate the source-bound native result.
+
+## Issue-scoped coverage
+
+- **THE-247:** The 10 selected `agent::tests` cover configured and final
+  composed volume refusal before host fallback, launch effects, VPN/ensure,
+  and secrets; the two selected `panes::tests` cover terminal launch and
+  configured-volume refusal. The 64 core sandbox selectors include named
+  volume grammar/argv and backend planning regressions. This supports the
+  intended fail-closed Linux behavior. It does not claim live Docker/Podman,
+  OCI, provider, or Windows runtime coverage.
+- **THE-326:** All 16 selected service tests are the FRP typed-document
+  family. They cover strict typed reparse/equality, invalid fields before
+  secret resolution, zero ports, DNS/proxy bounds, duplicate/unknown fields,
+  UTF-8 token escaping, IPv6, wire shapes, and redacted debug output. No FRP
+  server/client or credentialed provider was run.
+- **THE-222:** 11 `merge_remote` and 9 `platform::gate_path` selectors cover
+  real local Git bundle movement, collision refusal, special-file and
+  replacement preservation, write/flush/unwind cleanup, descriptor identity,
+  bounded child custody, and nonrecursive cleanup. The missing hostile
+  two-process race is the qualification above. The selected 20 startup
+  selectors are shared existing THE-617/THE-639 coverage, not additional
+  THE-222 acceptance.
+
+## Historical failures retained
+
+The durable package preserves the earlier strict-lint failure log and the
+rejected `cargo test --keep-going --no-run` admission, rather than rewriting
+them as passes. The earlier lint failure reported the unreachable return,
+needless return, and collapsible-if diagnostics; the corrected final Clippy
+receipt is the separate exit-0 result at the exact final source. The rejected
+test-build admission is historical and is not counted among the final 145
+passes; the corrected one-job build admission is the provenance for the pinned
+harnesses used by the focused receipt.
+
+## Explicit limits and separate ownership
+
+This is Linux focused evidence. It makes no Windows runtime, live FRP/OCI,
+release-performance, coverage-percentage, or full-workspace native claim.
+THE-222 Windows protected owner-SID DACL, stable file identity, reparse and
+sharing behavior remain source-reviewed only. Same-UID replacement between
+identity observation and unlink remains an observational race; cleanup
+preserves uncertain replacements rather than claiming an atomic lease.
+
+The sibling temporary-path audit remains separate: THE-394 owns driver/fold
+worktree paths, THE-224 owns sandbox secret files, THE-223 owns remote bundle
+streaming/budgeting, THE-328 owns share-file materialization, and THE-325 owns
+share-client credential transport. No sibling issue is silently closed by this
+receipt.
+
+No build, test, provider, native, canonical, or Linear operation was performed
+by this independent review.
+

@@ -1,0 +1,85 @@
+{
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--unit=thegn-maintenance07-final-clippy-20260915",
+    "--property=CPUQuota=100%",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--keep-going",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "queued_at_utc": "2026-09-15T21:22:25.596638+00:00",
+  "jobs": 1,
+  "cache": "/tmp/thegn-batch03-native-cache-f_3lx_t_",
+  "status": "complete",
+  "scope": "required consolidated strict lint before one affected-target test compilation",
+  "competing_builds": [
+    {
+      "pid": 2057371,
+      "comm": "cargo",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    },
+    {
+      "pid": 2127027,
+      "comm": "cargo",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-mighty-comet"
+    },
+    {
+      "pid": 2127488,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-mighty-comet"
+    },
+    {
+      "pid": 2147950,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    },
+    {
+      "pid": 2149448,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    },
+    {
+      "pid": 2149591,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    },
+    {
+      "pid": 2149808,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    },
+    {
+      "pid": 2150112,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    },
+    {
+      "pid": 2150123,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-plush-harbor"
+    }
+  ],
+  "started_at_utc": "2026-09-15T21:28:37.957656+00:00",
+  "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-maintenance07-final-clippy-20260915.scope",
+  "cpu_max": "100000 100000",
+  "systemd_properties": {
+    "ControlGroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-maintenance07-final-clippy-20260915.scope",
+    "CPUQuotaPerSecUSec": "1s"
+  },
+  "exit_code": 0,
+  "finished_at_utc": "2026-09-15T21:34:02.921780+00:00",
+  "log": "/tmp/thegn-maintenance07-final-clippy-20260915.log",
+  "log_sha256": "c95c5e51ccaf2b91c6b723a8573eac1ae44b116f4ba06ed51276761a2cd36afa"
+}

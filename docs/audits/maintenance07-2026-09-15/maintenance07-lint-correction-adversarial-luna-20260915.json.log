@@ -1,0 +1,58 @@
+{
+  "review": "THE maintenance07 lint correction adversarial source review",
+  "date": "2026-09-15",
+  "reviewer": "Luna high",
+  "base_commit": "fbd133823509fcdf1eb7912792dfec1a4c7760da",
+  "correction_commit": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "correction_tree": "010fdb95a4a02a4f8d18423fcd7dc21b65ca9502",
+  "worktree": "/tmp/thegn-maintenance-07-combined-20260915",
+  "changed_files": [
+    "crates/thegn-host/src/merge_remote.rs",
+    "crates/thegn-host/src/agent_tests.rs",
+    "crates/thegn-host/src/platform/gate_path.rs"
+  ],
+  "source_sha256": {
+    "crates/thegn-host/src/merge_remote.rs": "b954093216b2ba4e6ebdeb7a93c15fb7b56426b7dfa7b5901b6fae7ef4299f05",
+    "crates/thegn-host/src/agent_tests.rs": "f8093159dc94eee09b5ee6093a5ebe205a41b2baacd786851b06cfd3b17e1d70",
+    "crates/thegn-host/src/platform/gate_path.rs": "0c00b12e4c861cca89b8a7bdb586dfb3f97eb2bd639e6b038407047c390c7383"
+  },
+  "initial_strict_log": "/tmp/thegn-maintenance07-clippy-20260915.log",
+  "initial_strict_log_sha256": "a999f6ad383efd3e48379114fc8434e3ebef633f2b802046fef5f49c1a32f807",
+  "original_diagnostics": [
+    "unreachable expression at fetch_bundle_with_root:136",
+    "needless return at BundleTemp::new_in Unix arm:242",
+    "collapsible if at Unix cleanup:406"
+  ],
+  "semantic_review": {
+    "fetch_failure": "preserved: both cleanup match arms still diverge via anyhow::bail with unchanged messages and one custody-consuming finish",
+    "constructor_cfg": "preserved: Unix and Windows selected blocks now tail with Ok(custody); unsupported cfg remains Err",
+    "cleanup_divergence": "preserved: Unix remove_verified identity check, failure recording, parent verification/removal, and replacement preservation unchanged",
+    "test_fixture_condition": "preserved: precreate_leaf let-chain is equivalent to nested condition on Unix and Windows"
+  },
+  "source_checks": [
+    "git diff --check clean",
+    "full fbd-to-72d diff is exactly three Rust files (27 insertions, 28 deletions)",
+    "merge_remote delta is 25 insertions/25 deletions; agent_tests has two substitutions; gate_path has one deletion",
+    "worktree clean",
+    "manual cfg syntax/edition 2024 and Rust 1.89 review"
+  ],
+  "commands_not_run": [
+    "Cargo",
+    "compiler",
+    "lint",
+    "tests",
+    "native",
+    "provider"
+  ],
+  "overall_verdict": "source_approved_rerun_required",
+  "followup_findings_outside_912b": [],
+  "scope_limit": "No compiler, Cargo, lint, tests, native, or provider command was run for this review; Root owns rerun and landing.",
+  "intermediate_correction_commit": "912b1016ff8068f168685a84581620a6b80d4d7d",
+  "delta_review": {
+    "intermediate_912b_to_final_72d": "agent_tests.rs changes two sandbox enum paths to public config module; gate_path.rs removes one redundant outer OsStrExt import; merge_remote.rs unchanged",
+    "full_diff": "three files; merge_remote 25 insertions/25 deletions, agent_tests two substitutions, gate_path one deletion",
+    "fixture_types": "SandboxSpec fields are config::Network and config::FileAccess; corrected paths match declarations",
+    "import_scope": "local OsStrExt import remains in the FIFO test where as_bytes is used"
+  },
+  "required_next_gate": "Rerun strict all-target lint at final commit 72d161 before native compilation; retained initial log is historical only."
+}

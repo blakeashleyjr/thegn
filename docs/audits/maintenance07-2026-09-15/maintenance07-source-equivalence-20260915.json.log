@@ -1,0 +1,174 @@
+{
+  "source": "fbd133823509fcdf1eb7912792dfec1a4c7760da",
+  "base": "f293594d4a8516f940540b4eda60a9a98ac1d7a1",
+  "components": [
+    {
+      "issue": "THE-222",
+      "private_source": "7ad19e619ab7491c9cd665508a0c8294a8a7acab",
+      "files": [
+        {
+          "path": "Cargo.toml",
+          "candidate_sha256": "221149b28257da6e57e6f690c307791493ee803da177cb23ea0bbd8c865bd1ca",
+          "combined_sha256": "221149b28257da6e57e6f690c307791493ee803da177cb23ea0bbd8c865bd1ca",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/merge_remote.rs",
+          "candidate_sha256": "5f61b3316aace3b7fad9ca1becda491c352d264d0901bd4035c010b85f2c10d5",
+          "combined_sha256": "5f61b3316aace3b7fad9ca1becda491c352d264d0901bd4035c010b85f2c10d5",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/platform/gate_path.rs",
+          "candidate_sha256": "885097bfa74cd134c3c77c233eae00659299d1e706deeb698eabe0737b6c9887",
+          "combined_sha256": "885097bfa74cd134c3c77c233eae00659299d1e706deeb698eabe0737b6c9887",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/platform/mod.rs",
+          "candidate_sha256": "b9c615031a0b6f984c2efd5ff54a8402883ba4f25247aa8ca42543fccf93ddcc",
+          "combined_sha256": "4dee24fecb18fe2f8050805c56cbd9778358165df3dde17521fd963e3526e2e9",
+          "byte_identical": false
+        },
+        {
+          "path": "crates/thegn-host/src/platform/windows.rs",
+          "candidate_sha256": "cf16df9a1574f63f2f2d7f5452660b83813f050776dfebdcf1dd648384c7c1ee",
+          "combined_sha256": "ac743210f86df1745d95f2b083f80dd371768467f5b2a0697b37c006fb7ac4d8",
+          "byte_identical": false
+        },
+        {
+          "path": "test/support/owned_test_child.rs",
+          "candidate_sha256": "dde0018e0c9f4f4e942b15cf1c3c77bdebf7cd4e6030058aa73bcddef1deaf8c",
+          "combined_sha256": "dde0018e0c9f4f4e942b15cf1c3c77bdebf7cd4e6030058aa73bcddef1deaf8c",
+          "byte_identical": true
+        }
+      ]
+    },
+    {
+      "issue": "THE-247",
+      "private_source": "b6f479701ea1d7489c9d19f82e0e384721c2dc59",
+      "files": [
+        {
+          "path": "crates/thegn-core/src/config.rs",
+          "candidate_sha256": "999fd0353ba5380d0a096aeedf95d667d0894fe55888864aed5362f087a52191",
+          "combined_sha256": "16ada0b7c1db2449b6fd6320f2a71231e427740c3ffd53ccfbcadff1bd48cad4",
+          "byte_identical": false
+        },
+        {
+          "path": "crates/thegn-core/src/sandbox.rs",
+          "candidate_sha256": "eaca583f2e93518f57960626dfdbcaececae2612cdf18d11d7fc2c35ee8c3c04",
+          "combined_sha256": "eaca583f2e93518f57960626dfdbcaececae2612cdf18d11d7fc2c35ee8c3c04",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-core/src/sandbox_tests.rs",
+          "candidate_sha256": "09c3475434cfee758327d0c9ec8552acfe406a91d5597663047b3f5b2076b17b",
+          "combined_sha256": "09c3475434cfee758327d0c9ec8552acfe406a91d5597663047b3f5b2076b17b",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-core/src/sandbox_truth_tests.rs",
+          "candidate_sha256": "60de38a57392fc21420b38337c94b67d0d94914396902e84536193be3c2843a2",
+          "combined_sha256": "60de38a57392fc21420b38337c94b67d0d94914396902e84536193be3c2843a2",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-core/tests/devcontainer_e2e.rs",
+          "candidate_sha256": "212408d1959f4c8bb5367de936d5ea1d619bcdb7900dce0f7140f8b58821c009",
+          "combined_sha256": "212408d1959f4c8bb5367de936d5ea1d619bcdb7900dce0f7140f8b58821c009",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-core/tests/sandbox_credentials.rs",
+          "candidate_sha256": "e638e18d0c41d951a3cbb572ade6c313e46e0f00f2e145664f11b2e7a264cc5e",
+          "combined_sha256": "e638e18d0c41d951a3cbb572ade6c313e46e0f00f2e145664f11b2e7a264cc5e",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-core/tests/sandbox_network_policy.rs",
+          "candidate_sha256": "e02b69efd9fd3ea18d7b0d7f150b70edaa3058a1c73cfda81c4fc8f9a3d691a5",
+          "combined_sha256": "e02b69efd9fd3ea18d7b0d7f150b70edaa3058a1c73cfda81c4fc8f9a3d691a5",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-core/tests/sandbox_readonly_home.rs",
+          "candidate_sha256": "e8c7fc1ef4093b271632326ee578fb07c019ae56c65318cf77e20528af5d9e4b",
+          "combined_sha256": "e8c7fc1ef4093b271632326ee578fb07c019ae56c65318cf77e20528af5d9e4b",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/agent.rs",
+          "candidate_sha256": "53fe300c74af313a783535ab8f0ae55269a6aafc046b50a7f571470bba9ecdaa",
+          "combined_sha256": "137ca95623db636d8aa2aa03f45c21088c174d3fb74a1aa3284d8b6789f89c55",
+          "byte_identical": false
+        },
+        {
+          "path": "crates/thegn-host/src/agent_run.rs",
+          "candidate_sha256": "62c4c292ebae8c707a697fe6ef31b0cb140f2f72f94bd07731ad2bb5a4257373",
+          "combined_sha256": "62c4c292ebae8c707a697fe6ef31b0cb140f2f72f94bd07731ad2bb5a4257373",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/agent_tests.rs",
+          "candidate_sha256": "0be070300beff133525b38c5fb41fe0717b730add226004823261c800e4ad4c0",
+          "combined_sha256": "0be070300beff133525b38c5fb41fe0717b730add226004823261c800e4ad4c0",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/build_cache.rs",
+          "candidate_sha256": "5f989e39f58e52bc3be96d111791d6e502d173e22136046932f565dd8bfc09b2",
+          "combined_sha256": "5f989e39f58e52bc3be96d111791d6e502d173e22136046932f565dd8bfc09b2",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/handlers/materialize.rs",
+          "candidate_sha256": "0e92b521dee1c1c9d733236a799a2192478a468479dc4720b04b9e369d4cd863",
+          "combined_sha256": "0e92b521dee1c1c9d733236a799a2192478a468479dc4720b04b9e369d4cd863",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/panes.rs",
+          "candidate_sha256": "00ab87dc2aec35729d26266bb4286d868f7530a30d6a45811f70e8cc172e5857",
+          "combined_sha256": "00ab87dc2aec35729d26266bb4286d868f7530a30d6a45811f70e8cc172e5857",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/run.rs",
+          "candidate_sha256": "e1abf64305b9f11d852a5d9b45cdbfe14b7afc56f1355e5ff2922080ed45f0ed",
+          "combined_sha256": "e1abf64305b9f11d852a5d9b45cdbfe14b7afc56f1355e5ff2922080ed45f0ed",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-host/src/wizard.rs",
+          "candidate_sha256": "74f7be860010242dc2b9943a02f370410ef342ada3628ba114698beedff8139a",
+          "combined_sha256": "74f7be860010242dc2b9943a02f370410ef342ada3628ba114698beedff8139a",
+          "byte_identical": true
+        }
+      ]
+    },
+    {
+      "issue": "THE-326",
+      "private_source": "a5a3bfe7989a43bc285057f8597dd7eafcd0df4b",
+      "files": [
+        {
+          "path": "crates/thegn-core/src/config.rs",
+          "candidate_sha256": "78e29d793e66280da05b8e7dadd388eafe4ff68dc0061f9cef1f7b8bb1559c74",
+          "combined_sha256": "16ada0b7c1db2449b6fd6320f2a71231e427740c3ffd53ccfbcadff1bd48cad4",
+          "byte_identical": false
+        },
+        {
+          "path": "crates/thegn-svc/src/share/mod.rs",
+          "candidate_sha256": "1502b5f75076f26542095b80ebada72c4a00961527357c300ac02c49656c5ecf",
+          "combined_sha256": "1502b5f75076f26542095b80ebada72c4a00961527357c300ac02c49656c5ecf",
+          "byte_identical": true
+        },
+        {
+          "path": "crates/thegn-svc/src/share/tests.rs",
+          "candidate_sha256": "59f0d73835cbcf0520d748f6008527f319308d4bfc9dbc8a457d147b3b17d229",
+          "combined_sha256": "59f0d73835cbcf0520d748f6008527f319308d4bfc9dbc8a457d147b3b17d229",
+          "byte_identical": true
+        }
+      ]
+    }
+  ]
+}

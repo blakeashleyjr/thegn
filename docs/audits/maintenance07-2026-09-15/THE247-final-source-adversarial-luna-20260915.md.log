@@ -1,0 +1,32 @@
+# THE-247 final independent source adversarial review
+
+Date: 2026-09-15
+Reviewer: Luna high
+Candidate: `/tmp/thegn-THE247-private-luna-20260915-b`
+Candidate HEAD: `b6f479701ea1d7489c9d19f82e0e384721c2dc59`
+Comparison base: `59a9c944` (current main at extraction)
+Scope: source-only review; no Cargo build, test execution, native runtime, provider, canonical, or Linear operation.
+
+## Verdict
+
+**Source approval.** The final candidate resolves the prior `c59fe077` blockers and satisfies the THE-247 source contract. Root still owns the combined native/build admission and landing decision; this review makes no runtime claim.
+
+## Findings verified
+
+- `VolumeNameReason` and `VolumeAdmissionError` in `crates/thegn-core/src/sandbox.rs:568-600` are typed, bounded, and redacted. Diagnostics expose only pair index, byte length, and a stable reason; the source and destination are never formatted. `validate_volume_name` at `:602-632` enforces the documented ASCII alphanumeric first byte, minimum-two-byte, ASCII alphanumeric/underscore/hyphen/dot grammar. The table-driven tests cover managed aliases, ordinary names, Unix/relative/Windows/UNC/path and option forms, control/NUL, and non-ASCII inputs (`sandbox_tests.rs:668-707`).
+- `admit_volumes`/`admit_volume_sources` provide both final-spec and pre-resolution seams (`sandbox.rs:634-653`). `ensure` admits before compose execution, image prefetch/build, status/removal, secret handling, or OCI create (`sandbox.rs:1687-1703`); normal and Podman keep-id option builders also defend themselves (`:2317-2321`, `:2540-2547`). Direct `enter_argv` admits before script/argv construction (`:1939-1960`).
+- `prepare_sandbox_env` admits effective configured sources before provider probing and backend resolution (`agent.rs:365-369`). After Ready-host and remote finalization, the composed spec is admitted at `:641-657`; only then can isolation handling and the effectful VPN/ensure/preflight closure run at `:700-719`. A refusal is returned directly from the selected launch, so it cannot become an ordinary candidate miss or eventual host fallback.
+- `admit_final_sandbox_spec_then` is the actual production effect boundary, and `final_composed_volume_gate_blocks_launch_effect_sentinel` proves its callback is not invoked for an invalid source (`agent.rs:899-918`, `agent_tests.rs:433-446`). This replaces the prior source-text-only ordering assertion with a behavioral sentinel.
+- Configured invalid sources are refused before an unavailable backend or missing resolver result can produce a host shell. The real `prepare_sandbox_env` regression exercises that path with `Auto` plus a missing runtime (`agent_tests.rs:448-462`). Explicit `SandboxBackend::None` remains the documented disabled/host policy and is covered by the preservation fixture (`agent_tests.rs` around `1028`).
+- Terminal wrapping now checks configured source keys before backend parsing, HOME lookup, SQLite/git resolution, or `None` host fallback (`panes.rs:245-281`). `terminal_launch_spec` propagates the typed refusal at `:157-171`. The final `b6f47970` change preserves the prior nested VPN/ensure result, so VPN errors retain their existing terminal/degrade handling while volume admission remains a direct refusal.
+- Every repository `enter_argv`, `compose_spec`, and `terminal_launch_spec` caller found by source search propagates the new result: queued agents refuse (`agent_run.rs:135-148`), build-cache admission deactivates cleanly (`build_cache.rs:455-470`), wizard composition reports launch refusal (`wizard.rs:1460-1480`), materialization maps errors through `SpecError`, and the run-loop terminal prewarm clones each successful spec and maps errors (`run.rs:8436-8443`). Core integration/read-only-home/credential/network/truth tests were updated to unwrap only their known-valid fixtures.
+- Docker/Podman shared option generation retains valid `name:destination` pairs, while invalid pairs return before option construction. The normal and keep-id paths share the same admission guard; the direct-entry, ensure, pair-index, and redaction tests cover the refusal and no-fallback behavior (`sandbox_tests.rs:711-734`). Compose YAML remains a separate boundary: this gate validates `SandboxSpec.volumes` and does not claim to validate arbitrary effective Compose-file volume syntax.
+- The final source tree is clean. Existing source receipts report delivery-state/contract ratchets valid, strict OpenSpec validation valid, and formatting unchanged; they are recorded as supplied evidence and were not rerun in this source-only review.
+
+## Prior blockers and disposition
+
+The stale `c59fe077` review listed five blockers. The current source resolves each: the `backend_enter_argv` tests no longer unwrap a `Vec` return; `run.rs` clones `LaunchSpec` inside the `FnMut` map; configured invalid keys are checked before resolver fallback in agent and terminal paths; the final gate uses an effect callback rather than source scanning; and redaction tests no longer assert that a raw empty source appears in a diagnostic. The current source hashes below supersede the stale review hashes.
+
+## Residual scope
+
+Native/runtime behavior, engine-specific acceptance, and cross-platform execution remain for Root's separate admission. This source review does not claim THE-153 bind-source/control-boundary coverage, effective Compose YAML validation, or any new backend/provider behavior.

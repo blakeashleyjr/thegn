@@ -1,0 +1,22 @@
+{
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "reviewer": "root",
+  "at_utc": "2026-09-15T21:49:44.173828+00:00",
+  "verdict": "focused native pass; independent evidence review and delivery gates pending",
+  "selected": 145,
+  "passed": 145,
+  "failed": 0,
+  "counts": {
+    "core": 77,
+    "svc": 16,
+    "host": 52
+  },
+  "cpu_max_verified": "100000 100000",
+  "qualification": "Linux only. No live provider/OCI E2E, release performance, Windows runtime or full-workspace native claim. Excluded ignored integration and helper selectors per selection plan. One exact selector per isolated process; strict workspace all-target Clippy separately passed at same source.",
+  "inputs": {
+    "/tmp/thegn-maintenance07-focused-native-receipt-20260915.json": "6d1527f199a44cc6618cd1f4a437a7e189a4fff0829938c20b72e3becf5748ec",
+    "/tmp/thegn-maintenance07-focused-native-20260915.log": "84b7613b1305b23f9b63a869c0b94c1a2ffe1eb49290029df4eae65c4788fb39",
+    "/tmp/thegn-maintenance07-native-build-corrected-admission-20260915.json": "f4f98187f341e0930e213fd4f7390ad6a87f4bf4d522b83529c6f5686b8afc42",
+    "/tmp/thegn-maintenance07-native-selected-20260915.json": "13723b44db103d34cba275a5939f468cdcd4a7179399cc83d52906a0a9062af6"
+  }
+}

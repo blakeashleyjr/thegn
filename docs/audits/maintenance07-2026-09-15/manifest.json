@@ -1,0 +1,363 @@
+{
+  "issues": [
+    "THE-222",
+    "THE-247",
+    "THE-326"
+  ],
+  "tested_source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "base": "f293594d4a8516f940540b4eda60a9a98ac1d7a1",
+  "scope": "Shared Linux focused verification; durable artifacts preserve raw bytes. Historical failure and source-only reports are superseded by final source/native receipts, never erased.",
+  "status": "Accepted for reviewed local-main delivery after final source/metadata gates; Linear completion recorded separately after actual landing.",
+  "source_hashes": {
+    "Cargo.toml": "221149b28257da6e57e6f690c307791493ee803da177cb23ea0bbd8c865bd1ca",
+    "crates/thegn-core/src/config.rs": "16ada0b7c1db2449b6fd6320f2a71231e427740c3ffd53ccfbcadff1bd48cad4",
+    "crates/thegn-core/src/sandbox.rs": "eaca583f2e93518f57960626dfdbcaececae2612cdf18d11d7fc2c35ee8c3c04",
+    "crates/thegn-core/src/sandbox_tests.rs": "09c3475434cfee758327d0c9ec8552acfe406a91d5597663047b3f5b2076b17b",
+    "crates/thegn-core/src/sandbox_truth_tests.rs": "60de38a57392fc21420b38337c94b67d0d94914396902e84536193be3c2843a2",
+    "crates/thegn-core/tests/devcontainer_e2e.rs": "212408d1959f4c8bb5367de936d5ea1d619bcdb7900dce0f7140f8b58821c009",
+    "crates/thegn-core/tests/sandbox_credentials.rs": "e638e18d0c41d951a3cbb572ade6c313e46e0f00f2e145664f11b2e7a264cc5e",
+    "crates/thegn-core/tests/sandbox_network_policy.rs": "e02b69efd9fd3ea18d7b0d7f150b70edaa3058a1c73cfda81c4fc8f9a3d691a5",
+    "crates/thegn-core/tests/sandbox_readonly_home.rs": "e8c7fc1ef4093b271632326ee578fb07c019ae56c65318cf77e20528af5d9e4b",
+    "crates/thegn-host/src/agent.rs": "137ca95623db636d8aa2aa03f45c21088c174d3fb74a1aa3284d8b6789f89c55",
+    "crates/thegn-host/src/agent_run.rs": "62c4c292ebae8c707a697fe6ef31b0cb140f2f72f94bd07731ad2bb5a4257373",
+    "crates/thegn-host/src/agent_tests.rs": "f8093159dc94eee09b5ee6093a5ebe205a41b2baacd786851b06cfd3b17e1d70",
+    "crates/thegn-host/src/build_cache.rs": "5f989e39f58e52bc3be96d111791d6e502d173e22136046932f565dd8bfc09b2",
+    "crates/thegn-host/src/handlers/materialize.rs": "0e92b521dee1c1c9d733236a799a2192478a468479dc4720b04b9e369d4cd863",
+    "crates/thegn-host/src/merge_remote.rs": "b954093216b2ba4e6ebdeb7a93c15fb7b56426b7dfa7b5901b6fae7ef4299f05",
+    "crates/thegn-host/src/panes.rs": "00ab87dc2aec35729d26266bb4286d868f7530a30d6a45811f70e8cc172e5857",
+    "crates/thegn-host/src/platform/gate_path.rs": "0c00b12e4c861cca89b8a7bdb586dfb3f97eb2bd639e6b038407047c390c7383",
+    "crates/thegn-host/src/platform/mod.rs": "4dee24fecb18fe2f8050805c56cbd9778358165df3dde17521fd963e3526e2e9",
+    "crates/thegn-host/src/platform/windows.rs": "ac743210f86df1745d95f2b083f80dd371768467f5b2a0697b37c006fb7ac4d8",
+    "crates/thegn-host/src/run.rs": "e1abf64305b9f11d852a5d9b45cdbfe14b7afc56f1355e5ff2922080ed45f0ed",
+    "crates/thegn-host/src/wizard.rs": "74f7be860010242dc2b9943a02f370410ef342ada3628ba114698beedff8139a",
+    "crates/thegn-svc/src/share/mod.rs": "1502b5f75076f26542095b80ebada72c4a00961527357c300ac02c49656c5ecf",
+    "crates/thegn-svc/src/share/tests.rs": "59f0d73835cbcf0520d748f6008527f319308d4bfc9dbc8a457d147b3b17d229",
+    "delivery/index.json": "31a70205d1fd92241e8e042eddbfc65320c52de850b52bf0984c5b950243be77",
+    "delivery/issues.json": "72b4cba1a444e660284a8e0df2d7082ac7acbd140b09e70be4d3e6dbbedd3f97",
+    "docs/audits/THE-247-named-volume-admission-2026-09-15.md": "cbc4f42d9bf15d593346fa44e289cceb6ec9b3f9f26d3c25d4c86897ccf66789",
+    "openspec/changes/secure-merge-bundle-custody/design.md": "5ac080a46d411d944637eb7a73e69a4627a5c6c6056fb5b2499c015c48e7a93b",
+    "openspec/changes/secure-merge-bundle-custody/proposal.md": "20fb56916aa19bfa05225e7023dfe2432f289ee7ebef54058a0d0ba9f64f62c6",
+    "openspec/changes/secure-merge-bundle-custody/specs/merge-queue/spec.md": "b4c752689b51c2f0fb626f7aefebdd6769fd9a574aa8f46ffb32e1439a3af729",
+    "openspec/changes/secure-merge-bundle-custody/tasks.md": "51c8575f8adb29ee06296c099640323adcd0d57e2b2f4109bcec66dab11d8272",
+    "openspec/changes/secure-merge-bundle-custody/validation.md": "c7f68738b5e1d49b8eef0b6a5bed739886b1b6aa7818f5e401aa2b23837590ec",
+    "openspec/changes/serialize-validate-frp-configuration/design.md": "012b6a3e9a30801fc5ad50525897eee85ed364098b9b027dc85029cb10661817",
+    "openspec/changes/serialize-validate-frp-configuration/proposal.md": "cf7dc14a1e1f9017bf478f8c447cceda93e2b3b5f1ea7778fd5f976aa8cf7a39",
+    "openspec/changes/serialize-validate-frp-configuration/specs/public-share/spec.md": "0696b69b3bb4a306324fdb2c57ba89e990268c90e4238356d67b85f6fe2b21e8",
+    "openspec/changes/serialize-validate-frp-configuration/tasks.md": "169a04307b197f568bf88e704f9a5da629288b584bcee302ae713c4ad04e541e",
+    "openspec/changes/serialize-validate-frp-configuration/validation.md": "3aeb05b5a4887c36d7e9c6b3afa91d6946ff4f5ac6f46ca32f58c60d9ae6b815",
+    "openspec/changes/validate-sandbox-volume-sources/design.md": "1e6729df3eddb7e44ffcb535bd068857fadc5648b81deeee6a964493af967961",
+    "openspec/changes/validate-sandbox-volume-sources/proposal.md": "75a052ca6301ec8aa31f95c0ae2843ed304a78d1361d2f9e68bb2b31eaa5db43",
+    "openspec/changes/validate-sandbox-volume-sources/specs/sandbox/spec.md": "51fb1c3e8dcc7c798a88e6178bf1bf8845fb026a267ddf22badfab068dc89969",
+    "openspec/changes/validate-sandbox-volume-sources/tasks.md": "270e019ded3bce7eeee3bf3437b9b7c4ddce4d1ca3e1c9fdccf3f7bebe76cc73",
+    "openspec/changes/validate-sandbox-volume-sources/validation.md": "c53768dc8f57873d670b3ff456bdbc117661e53ad1e25aefd8044380c66946fe",
+    "test/support/owned_test_child.rs": "dde0018e0c9f4f4e942b15cf1c3c77bdebf7cd4e6030058aa73bcddef1deaf8c"
+  },
+  "artifacts": {
+    "host": {
+      "path": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "binary_sha256": "6dc4956cfcb759924b552aa71b027800c701caa646118b4a81c48cbf699e1b8d",
+      "depfile_sha256": "173bc6b2bcae7fb14ac194d39177843b9c0aae49d6d6c2e3d0b0aaf2a59dc161",
+      "compiler_artifact_fresh": false,
+      "manifest_dir": "/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-host",
+      "package_id": "path+file:///tmp/thegn-maintenance-07-combined-20260915/crates/thegn-host#0.1.0-alpha.2"
+    },
+    "svc": {
+      "path": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "binary_sha256": "40eb733347403013f0ee3ac31823b451148a0ed01f765e30cd32ab0987df93a7",
+      "depfile_sha256": "4a68ecc5dc6417949fec85b70dde5d778dfdec920bcc3f4057cdead7e735a14f",
+      "compiler_artifact_fresh": false,
+      "manifest_dir": "/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc",
+      "package_id": "path+file:///tmp/thegn-maintenance-07-combined-20260915/crates/thegn-svc#0.1.0-alpha.2"
+    },
+    "core": {
+      "path": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "binary_sha256": "d76387f2574fc30619ada97c24eed2d7e89084b4e3e8bbfc5b5c37829b4dbf5c",
+      "depfile_sha256": "d5207bc04e2bc6fee54a4074dc3ce5437ec8e4a718283bddfcd9f430c2689ab1",
+      "compiler_artifact_fresh": false,
+      "manifest_dir": "/tmp/thegn-maintenance-07-combined-20260915/crates/thegn-core",
+      "package_id": "path+file:///tmp/thegn-maintenance-07-combined-20260915/crates/thegn-core#0.1.0-alpha.2"
+    }
+  },
+  "files": {
+    "THE222-final-source-adversarial-luna-20260915.json.log": {
+      "sha256": "f2137fff771eb3fa860acc1a0086a1a5e00850dcd7c41fd280bc6813ed779cb1",
+      "bytes": 3771,
+      "source": "/tmp/thegn-THE222-final-source-adversarial-luna-20260915.json"
+    },
+    "THE222-final-source-adversarial-luna-20260915.md.log": {
+      "sha256": "2994828b6310e0b220254c6be36965adae3d51dcd4a3aac7858fe5f1bf6a20ec",
+      "bytes": 4871,
+      "source": "/tmp/thegn-THE222-final-source-adversarial-luna-20260915.md"
+    },
+    "THE222-investigation-plan-luna-20260915.md.log": {
+      "sha256": "755978e39e8ba1da09df83e67750ff6dbf7b6723eaf5e344cd4631f0d3b4c40e",
+      "bytes": 12904,
+      "source": "/tmp/thegn-THE222-investigation-plan-luna-20260915.md"
+    },
+    "THE247-final-source-adversarial-luna-20260915.json.log": {
+      "sha256": "73c8b40dd34493eb82b5f0d966ffb5554e5c04baabd0dc2be6646d8bf6918724",
+      "bytes": 3774,
+      "source": "/tmp/thegn-THE247-final-source-adversarial-luna-20260915.json"
+    },
+    "THE247-final-source-adversarial-luna-20260915.md.log": {
+      "sha256": "da2cf863f55a691f903ecbb2f45ee09c99af8d1f0887b99b95beab1f50a2e803",
+      "bytes": 5413,
+      "source": "/tmp/thegn-THE247-final-source-adversarial-luna-20260915.md"
+    },
+    "THE326-source-review-amendment-luna-20260915.json.log": {
+      "sha256": "9c8e455059b054043cf80a82ad8fa04c3f19286dc6731ac30e654047df874659",
+      "bytes": 855,
+      "source": "/tmp/thegn-THE326-source-review-amendment-luna-20260915.json"
+    },
+    "THE326-source-review-amendment-luna-20260915.md.log": {
+      "sha256": "c5413f1dd686241d8b3b81de7788bcb999ff730093859d707259daf5037cc4fd",
+      "bytes": 1878,
+      "source": "/tmp/thegn-THE326-source-review-amendment-luna-20260915.md"
+    },
+    "maintenance07-clippy-20260915.log": {
+      "sha256": "a999f6ad383efd3e48379114fc8434e3ebef633f2b802046fef5f49c1a32f807",
+      "bytes": 11371,
+      "source": "/tmp/thegn-maintenance07-clippy-20260915.log"
+    },
+    "maintenance07-clippy-admission-20260915.json.log": {
+      "sha256": "468c11d6055eedbf5419ef29dcf90096666115e7fbe56b887e1cbfde6277fb28",
+      "bytes": 1499,
+      "source": "/tmp/thegn-maintenance07-clippy-admission-20260915.json"
+    },
+    "maintenance07-corrected-clippy-20260915.log": {
+      "sha256": "486a501861d33e356afad88c49814e0658c0bed6ed4b550f07600a6e366a8672",
+      "bytes": 10913,
+      "source": "/tmp/thegn-maintenance07-corrected-clippy-20260915.log"
+    },
+    "maintenance07-corrected-clippy-admission-20260915.json.log": {
+      "sha256": "72c0973c4f41c57157c454206c8f5296153a2869a06a6f9dc9b7be99b27e5f6a",
+      "bytes": 1303,
+      "source": "/tmp/thegn-maintenance07-corrected-clippy-admission-20260915.json"
+    },
+    "maintenance07-final-clippy-20260915.log": {
+      "sha256": "c95c5e51ccaf2b91c6b723a8573eac1ae44b116f4ba06ed51276761a2cd36afa",
+      "bytes": 8148,
+      "source": "/tmp/thegn-maintenance07-final-clippy-20260915.log"
+    },
+    "maintenance07-final-clippy-admission-20260915.json.log": {
+      "sha256": "a82269b73f3b3d76c09e861a741a14a5bab4017d28f20b2ccc718e09c7afa5bc",
+      "bytes": 2410,
+      "source": "/tmp/thegn-maintenance07-final-clippy-admission-20260915.json"
+    },
+    "maintenance07-focused-native-20260915.log": {
+      "sha256": "84b7613b1305b23f9b63a869c0b94c1a2ffe1eb49290029df4eae65c4788fb39",
+      "bytes": 44710,
+      "source": "/tmp/thegn-maintenance07-focused-native-20260915.log"
+    },
+    "maintenance07-focused-native-receipt-20260915.json.log": {
+      "sha256": "6d1527f199a44cc6618cd1f4a437a7e189a4fff0829938c20b72e3becf5748ec",
+      "bytes": 54838,
+      "source": "/tmp/thegn-maintenance07-focused-native-receipt-20260915.json"
+    },
+    "maintenance07-integration-adversarial-luna-20260915.json.log": {
+      "sha256": "9eb641609e98064e9cc586150f3320fe97ea0c5f2fdc79c7110389da288bbf9b",
+      "bytes": 4588,
+      "source": "/tmp/thegn-maintenance07-integration-adversarial-luna-20260915.json"
+    },
+    "maintenance07-integration-adversarial-luna-20260915.md.log": {
+      "sha256": "27a30f57e1264ff0467c09aca6a51c4e3ad44da66e023aba8d03a24531693f27",
+      "bytes": 4329,
+      "source": "/tmp/thegn-maintenance07-integration-adversarial-luna-20260915.md"
+    },
+    "maintenance07-lint-correction-adversarial-luna-20260915.json.log": {
+      "sha256": "decf5303f080637eff1c38cb7deedcff6f3859a55fc6a203a7c2786b0efdd95d",
+      "bytes": 3339,
+      "source": "/tmp/thegn-maintenance07-lint-correction-adversarial-luna-20260915.json"
+    },
+    "maintenance07-lint-correction-adversarial-luna-20260915.md.log": {
+      "sha256": "6091eae3012da7265fe27796a5274ef6d57672ceade5afcdd230bb59398e548d",
+      "bytes": 3623,
+      "source": "/tmp/thegn-maintenance07-lint-correction-adversarial-luna-20260915.md"
+    },
+    "maintenance07-native-build-20260915.log": {
+      "sha256": "8c39be0ece75bd48de52799fdefe3aef3bbef4fabb8913fc4ffa16fe8d202927",
+      "bytes": 224,
+      "source": "/tmp/thegn-maintenance07-native-build-20260915.log"
+    },
+    "maintenance07-native-build-admission-20260915.json.log": {
+      "sha256": "4ab8631d2919f4323ccee30765139e4f3de3b8d5e83ac9f85b03705a5a9a0f46",
+      "bytes": 6399,
+      "source": "/tmp/thegn-maintenance07-native-build-admission-20260915.json"
+    },
+    "maintenance07-native-build-corrected-20260915.jsonl": {
+      "sha256": "0cd82b956c9674af1e4ff3c9b087b9ab144e8b608078e19025e2f2f9e68ad1c0",
+      "bytes": 749587,
+      "source": "/tmp/thegn-maintenance07-native-build-corrected-20260915.jsonl"
+    },
+    "maintenance07-native-build-corrected-20260915.log": {
+      "sha256": "dab90284eb71f0ef258fcc84db2109214c32cd8d4bf3d296f3146abe10a895d8",
+      "bytes": 9128,
+      "source": "/tmp/thegn-maintenance07-native-build-corrected-20260915.log"
+    },
+    "maintenance07-native-build-corrected-admission-20260915.json.log": {
+      "sha256": "f4f98187f341e0930e213fd4f7390ad6a87f4bf4d522b83529c6f5686b8afc42",
+      "bytes": 8358,
+      "source": "/tmp/thegn-maintenance07-native-build-corrected-admission-20260915.json"
+    },
+    "maintenance07-native-matrix-driver-20260915.py.log": {
+      "sha256": "414297cfe07a8950bb03865c929f828e853dbfa631176ad2f61050cf0634911f",
+      "bytes": 3603,
+      "source": "/tmp/thegn-maintenance07-native-matrix-driver-20260915.py"
+    },
+    "maintenance07-native-selected-20260915.json.log": {
+      "sha256": "13723b44db103d34cba275a5939f468cdcd4a7179399cc83d52906a0a9062af6",
+      "bytes": 30203,
+      "source": "/tmp/thegn-maintenance07-native-selected-20260915.json"
+    },
+    "maintenance07-native-selection-plan-20260915.json.log": {
+      "sha256": "a1f52cdb7f228622c3996957d5ea8b010fbd168ccf0c0a7b5b70c76cb572d575",
+      "bytes": 2225,
+      "source": "/tmp/thegn-maintenance07-native-selection-plan-20260915.json"
+    },
+    "maintenance07-primary-final-correction-review-20260915.json.log": {
+      "sha256": "98c87e737183b589c12414006e8d67e6ce0acf2e74f6b59a71b4aec6d021c2d7",
+      "bytes": 6717,
+      "source": "/tmp/thegn-maintenance07-primary-final-correction-review-20260915.json"
+    },
+    "maintenance07-primary-lint-correction-review-20260915.json.log": {
+      "sha256": "59733aadbd148a3f90343c4741e06eb394395eba4dcc13cba0fc27f5a155dc80",
+      "bytes": 6602,
+      "source": "/tmp/thegn-maintenance07-primary-lint-correction-review-20260915.json"
+    },
+    "maintenance07-primary-native-review-20260915.json.log": {
+      "sha256": "9816c01788e13cc5458bddcf611b861b0c18ae830a1c4096bddf4a07daed6cad",
+      "bytes": 1245,
+      "source": "/tmp/thegn-maintenance07-primary-native-review-20260915.json"
+    },
+    "maintenance07-primary-source-review-20260915.json.log": {
+      "sha256": "ca46cb63627e71363e1341c467b8d060982c3d193448ea79322f7552a947e312",
+      "bytes": 6357,
+      "source": "/tmp/thegn-maintenance07-primary-source-review-20260915.json"
+    },
+    "maintenance07-source-equivalence-20260915.json.log": {
+      "sha256": "e739b407831a586f1fddcc699768aabe4a8ee191d44388f1341f3c1b437fd603",
+      "bytes": 8208,
+      "source": "/tmp/thegn-maintenance07-source-equivalence-20260915.json"
+    },
+    "maintenance07-source-format-20260915.log": {
+      "sha256": "e0cb98ce81afcf66744d68bafa3648e3a6a9a9b76588b53685b7e55a850ccd04",
+      "bytes": 91,
+      "source": "/tmp/thegn-maintenance07-source-format-20260915.log"
+    },
+    "maintenance07-source-ratchets-20260915.log": {
+      "sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935",
+      "bytes": 4797,
+      "source": "/tmp/thegn-maintenance07-source-ratchets-20260915.log"
+    },
+    "maintenance07-source-spec-20260915.log": {
+      "sha256": "1f400d3bfa02e6a173de823f90e0f04c236943c5b354066839c10a52c8b3881a",
+      "bytes": 5299,
+      "source": "/tmp/thegn-maintenance07-source-spec-20260915.log"
+    },
+    "private-test-runner-20260914.py.log": {
+      "sha256": "6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07",
+      "bytes": 2101,
+      "source": "/tmp/thegn-private-test-runner-20260914.py"
+    },
+    "maintenance07-native-evidence-adversarial-luna-20260915.md.log": {
+      "sha256": "7b619bf47b214801bf8d503d5e199b2f7d13ac2fca17b8f4f28ef9d775753674",
+      "bytes": 7300,
+      "source": "/tmp/thegn-maintenance07-native-evidence-adversarial-luna-20260915.md"
+    },
+    "maintenance07-native-evidence-adversarial-luna-20260915.json.log": {
+      "sha256": "81dbfbc1887d51ed25d2f77714e3431d332e18579faa235302184c8ab8aab68c",
+      "bytes": 4770,
+      "source": "/tmp/thegn-maintenance07-native-evidence-adversarial-luna-20260915.json"
+    },
+    "THE222-hostile-native-harness-20260915.py.log": {
+      "sha256": "7e5c8e42419b00c0951dc8756bc8b85dab2b554c22a8bc5e93478a613b8eb7b1",
+      "bytes": 7384,
+      "source": "/tmp/thegn-THE222-hostile-native-harness-20260915.py"
+    },
+    "THE222-hostile-native-harness-independent-review-luna-20260915.md.log": {
+      "sha256": "f1de82b3e041227b13643011cca2f30ca8396e06ef610ac5d066e83fc5792712",
+      "bytes": 2469,
+      "source": "/tmp/thegn-THE222-hostile-native-harness-independent-review-luna-20260915.md"
+    },
+    "THE222-hostile-native-harness-independent-review-luna-20260915.json.log": {
+      "sha256": "9b321631c3073a1814e7bbabbc67011a647a6f11b1c0854aa14b291fda745152",
+      "bytes": 1622,
+      "source": "/tmp/thegn-THE222-hostile-native-harness-independent-review-luna-20260915.json"
+    },
+    "THE222-hostile-native-receipt-20260915.json.log": {
+      "sha256": "9047d9369c489c72f0146699f3c9599f202953fb5c86d9eb0799f5b20ff0cd21",
+      "bytes": 2922,
+      "source": "/tmp/thegn-THE222-hostile-native-receipt-20260915.json"
+    },
+    "maintenance07-delivery-format-initial-20260915.log": {
+      "sha256": "2c1c56411d3c28176099cae038b01e029126626046a77f9793fa6334682c99c5",
+      "bytes": 161,
+      "source": "/tmp/thegn-maintenance07-delivery-format-initial-20260915.log"
+    },
+    "maintenance07-native-build-20260915.jsonl": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "source": "/tmp/thegn-maintenance07-native-build-20260915.jsonl"
+    },
+    "THE222-hostile-native-final-review-luna-20260915.json.log": {
+      "sha256": "b01e4efef47152e540e8f4cbe0dec9a97ae405b84bca72728485712ebc377a36",
+      "bytes": 2228,
+      "source": "/tmp/thegn-THE222-hostile-native-final-review-luna-20260915.json"
+    },
+    "THE222-hostile-native-final-review-luna-20260915.md.log": {
+      "sha256": "ec8709af6294eaf97277c9920560bf3054dab7f212d86b44c21e4f9e59133de9",
+      "bytes": 2870,
+      "source": "/tmp/thegn-THE222-hostile-native-final-review-luna-20260915.md"
+    },
+    "maintenance07-delivery-format-final-20260915.log": {
+      "sha256": "07705a61bd8faf74a33261118806898365309a041e8a30cb4575296a3bdaa1fe",
+      "bytes": 161,
+      "source": "/tmp/thegn-maintenance07-delivery-format-final-20260915.log"
+    },
+    "maintenance07-delivery-ratchets-final-20260915.log": {
+      "sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935",
+      "bytes": 4797,
+      "source": "/tmp/thegn-maintenance07-delivery-ratchets-final-20260915.log"
+    },
+    "maintenance07-delivery-spec-final-20260915.log": {
+      "sha256": "86b21e44764de6079e534103ce19a16be26c8e6facc5a958e438c7b06acec54a",
+      "bytes": 5230,
+      "source": "/tmp/thegn-maintenance07-delivery-spec-final-20260915.log"
+    }
+  },
+  "qualification": [
+    "Cargo compiler-artifact fresh=false means newly compiled, not a stale cache result.",
+    "No Windows native execution, live provider/OCI E2E, release/performance or full workspace native execution is claimed.",
+    "First native invocation --keep-going was rejected before compilation; corrected invocation compiled all three pinned harnesses once.",
+    "Two strict-lint failures were corrected before final strict workspace all-target lint passed at tested_source.",
+    "Raw JSON receipts are copied as .json.log to preserve byte hashes through formatting."
+  ],
+  "additional_native": {
+    "THE-222": {
+      "cases": 5,
+      "passed": 5,
+      "native_child_invocations": 10,
+      "all_child_exit_codes": 0,
+      "all_existing_entries_refused": true,
+      "canary_sha256": "e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93",
+      "builds": 0,
+      "qualification": "Two simultaneous exclusive-create attempts at each preinstalled hostile entry. No arbitrary same-UID atomic lease claim."
+    }
+  },
+  "acceptance": {
+    "THE-247": "independent Linux acceptance",
+    "THE-326": "independent typed document/planner acceptance",
+    "THE-222": "initial gap superseded by reviewed five-case hostile-entry native supplement; Windows runtime unverified"
+  },
+  "shipping_rust_unchanged_from_tested_source": true,
+  "final_source_gates": {
+    "scoped_format": 0,
+    "ratchets_including_delivery_and_idle_guard": 0,
+    "openspec_strict": {
+      "passed": 167,
+      "failed": 0
+    },
+    "git_diff_check": 0,
+    "compiler_rerun": "none; only documentation/receipts changed after tested source"
+  }
+}

@@ -1,0 +1,44 @@
+# THE-222 hostile native harness independent review
+
+Date: 2026-09-15  
+Reviewer: Luna high  
+Harness: `/tmp/thegn-THE222-hostile-native-harness-20260915.py`  
+Harness SHA-256: `7e5c8e42419b00c0951dc8756bc8b85dab2b554c22a8bc5e93478a613b8eb7b1`  
+Pinned source: `72d161b2e1868561fd2f5bce9facde8b0345512a`
+
+## Verdict
+
+**Approved for one root-owned native execution.** The harness is bounded and
+targets the already compiled `platform::gate_path::tests::exclusive_regular_creation_child`
+   helper from the corrected build admission. Before spawning children it also
+   reads its own cgroup `cpu.max` and requires exactly `100000 100000`. It does
+   not alter Rust source or compile anything.
+
+For each of five private fixture roots it installs a symlink, regular file,
+hardlink, FIFO, or nonempty directory at `shared.bundle`, then starts two
+children with private environment/cwd and null standard streams. Both children
+must reach the finite readiness barrier; the parent releases them once; both
+must exit successfully with `loser`, and the preinstalled entry's device,
+inode, mode, link count, type, and content must remain unchanged. The canary
+bytes are checked after both children settle, including the symlink target and
+directory canary. This directly fills the THE-222 hostile-entry/two-child gap
+identified in the maintenance07 evidence review.
+
+The readiness, release, completion, and final child-settlement waits are
+bounded. On failure, `settle` kills and reaps within a one-second cleanup
+window where possible and retains the private fixture if a child remains
+unsettled. Cleanup runs only after settlement and names the two child fixture
+directories, release marker, target, canary, and directory canary explicitly;
+it is nonrecursive. The script checks the pinned host binary SHA-256 against
+the corrected build admission and checks that admission's source hash and
+successful exit before launching children.
+
+The harness is intentionally an observed preexisting-entry refusal test. It
+makes no claim of an atomic lease against an arbitrary same-UID replacement
+between identity observation and pathname removal. Root should record the
+native receipt separately and preserve any retained fixture for investigation
+if settlement or cleanup fails.
+
+Source inspection and `python3 -m py_compile` were the only checks performed by
+this review. No Cargo, Rust compiler, test binary, provider, native execution,
+canonical, or Linear operation was performed.

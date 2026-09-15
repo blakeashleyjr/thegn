@@ -1,0 +1,53 @@
+# THE-222 hostile-entry native receipt — final independent review
+
+Date: 2026-09-15  
+Reviewer: Luna high  
+Pinned source: `72d161b2e1868561fd2f5bce9facde8b0345512a`  
+Host harness binary: `/tmp/thegn-maintenance07-native-binaries-20260915/host-tests`  
+Binary SHA-256: `6dc4956cfcb759924b552aa71b027800c701caa646118b4a81c48cbf699e1b8d`  
+Harness: `/tmp/thegn-THE222-hostile-native-harness-20260915.py`  
+Harness SHA-256: `7e5c8e42419b00c0951dc8756bc8b85dab2b554c22a8bc5e93478a613b8eb7b1`
+
+## Verdict and amendment
+
+**THE-222 Linux hostile-entry acceptance is approved.** This receipt amends
+the THE07 evidence review's prior narrow gap: the supplied run now covers the
+required hostile-entry two-process race and unchanged canaries. It does not
+change the documented limits around Windows runtime proof or an atomic lease
+against arbitrary same-UID replacement.
+
+The root-owned run used the already pinned host harness binary and the
+previously approved Python harness; no compilation or Rust source change was
+made. The harness verified its cgroup quota as exactly `100000 100000` before
+spawning children. Five independent private roots covered `symlink`,
+`regular`, `hardlink`, `fifo`, and `directory` entries preinstalled at the
+shared leaf. In every case both synchronized Rust helpers exited 0 with the
+expected `loser` outcome, the entry identity tuple stayed unchanged, the
+canary SHA-256 stayed `e7620b84bcf2086c91bb468c18e433a269022ff83eb4995d7e973b34859e2c93`,
+all children settled, and explicit nonrecursive fixture cleanup removed the
+private root.
+
+## Receipt provenance
+
+Receipt: `/tmp/thegn-THE222-hostile-native-receipt-20260915.json`  
+Receipt SHA-256: `9047d9369c489c72f0146699f3c9599f202953fb5c86d9eb0799f5b20ff0cd21`
+
+The receipt source matches the pinned build source and its binary hash matches
+the corrected build admission. Its aggregate is `passed: 5`, `failed: 0`;
+each case records `exit_codes: [0, 0]`, `outcomes: ["loser", "loser"]`,
+`entry_identity_unchanged: true`, and `all_children_settled: true`. The five
+recorded private roots no longer exist after cleanup. The harness hash in the
+receipt matches the independently reviewed harness hash above.
+
+This directly completes the prior THE07 qualification that the selected
+two-child test had only raced two benign creators while hostile fixtures were
+single-process. The combined THE07 result can now describe THE-222's Linux
+hostile-entry race as covered, while retaining the separate scope statement:
+Windows protected ACL/reparse/sharing behavior remains source-reviewed only,
+and same-UID replacement between identity observation and unlink is not an
+atomic lease guarantee.
+
+No build, test execution, provider, canonical, or Linear operation was
+performed by this independent review; the native execution described here was
+root-owned and is reviewed from its immutable receipt.
+

@@ -1,0 +1,49 @@
+{
+  "source": "fbd133823509fcdf1eb7912792dfec1a4c7760da",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--unit=thegn-maintenance07-clippy-20260915",
+    "--property=CPUQuota=100%",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "queued_at_utc": "2026-09-15T21:10:29.669684+00:00",
+  "jobs": 1,
+  "cache": "/tmp/thegn-batch03-native-cache-f_3lx_t_",
+  "status": "failed; root review required",
+  "scope": "required consolidated strict lint before one affected-target test compilation",
+  "competing_builds": [
+    {
+      "pid": 1867444,
+      "comm": "cargo",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-mighty-comet"
+    },
+    {
+      "pid": 1905460,
+      "comm": "rustc",
+      "cwd": "/home/blake/.superzej/worktrees/thegn/tg-mighty-comet"
+    }
+  ],
+  "started_at_utc": "2026-09-15T21:10:49.788948+00:00",
+  "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-maintenance07-clippy-20260915.scope",
+  "cpu_max": "100000 100000",
+  "systemd_properties": {
+    "ControlGroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-maintenance07-clippy-20260915.scope",
+    "CPUQuotaPerSecUSec": "1s"
+  },
+  "exit_code": 101,
+  "finished_at_utc": "2026-09-15T21:13:32.607606+00:00",
+  "log": "/tmp/thegn-maintenance07-clippy-20260915.log",
+  "log_sha256": "a999f6ad383efd3e48379114fc8434e3ebef633f2b802046fef5f49c1a32f807"
+}

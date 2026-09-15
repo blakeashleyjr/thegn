@@ -1,0 +1,65 @@
+# THE-222 bounded investigation and repair plan
+
+## Current acceptance and source boundary
+
+Fresh Linear state: THE-222 is Urgent, **In Progress**, under THE-150, with related THE-223 (stream and bound bundle ingestion), THE-224 (sandbox secret environment files), THE-394 (unguessable owned merge throwaway worktrees), THE-328, THE-366, and THE-442. The required behavior is a secure cross-host merge bundle tempfile; byte streaming belongs to THE-223.
+
+The shipping write seam is `crates/thegn-host/src/merge_remote.rs:92-106`. `fetch_bundle` rejects a remote target, derives an ambient `/tmp/thegn-mq-<pid>-<seconds>-<sequence>.bundle` path, calls `std::fs::write`, passes that pathname to `git fetch`, and best-effort removes the pathname. `tmp_bundle_path` at lines 112-123 is predictable and seconds-based. The write follows a pre-existing symlink and can truncate a regular target; a FIFO can block. Pathname cleanup cannot prove that the entry removed is the file this call created.
+
+The existing positive `bundle_and_fetch_moves_a_tip_between_stores` test uses PID-named ambient directories and only demonstrates a successful round trip. It does not exercise the creation seam against hostile entries, two processes, failure cleanup, or replacement after creation.
+
+## Minimal production repair
+
+Keep `ensure_tip_in_target`, bundle bytes, refspecs, target-remote rejection, Git commands, and error wording behavior intact. Change only the tempfile creation/ownership portion of `fetch_bundle` and its narrow helpers in `merge_remote.rs`.
+
+1. Create an unpredictable owner-only temporary parent directory beneath the canonical system temporary directory, verify mode `0700`, and retain the parent custody for the whole fetch. The supported other-UID/shared-temp boundary is the sticky system-temp parent plus the retained private `0700` child; another UID cannot create or rename entries inside the child after creation.
+2. Create a named bundle entry inside that directory with an exclusive-create operation (`create_new`/`O_CREAT|O_EXCL`) and mode `0600`. Do not use `std::fs::write` on a pathname, `create`/truncate, or an automatic recursive/pathname drop that could remove an attacker replacement.
+3. Reuse `crate::platform::gate_path::{Directory, Regular}` on Unix rather than introducing a second custody abstraction: `Directory::open/verify` pins and rechecks directory descriptors, while `Regular` supplies owner/type/link-count/mode checks and pinned-parent removal. Extend that Unix seam narrowly for exclusive regular-file creation if needed. `gate_path` is intentionally unsupported on non-Unix and must not be routed through for Windows.
+4. On Windows, keep the implementation local to the merge-remote platform seam and use the already available `platform::open_directory_nofollow` / `open_read_nofollow` helpers for parent/file reparse-point refusal. Create the private parent with the secure tempfile primitive and verify the inherited user-temp ACL/private ownership assumption; do not call the current no-op `restrict_dir_owner_only_checked` as proof of an owner-only ACL. Create the bundle entry with `OpenOptions::create_new(true)` (the Windows `CREATE_NEW` exclusive collision contract), and ensure the retained handle has `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE` semantics so Git can read it and cleanup can settle after close. If the standard handle cannot provide those shares, use a narrow local `CreateFileW` wrapper over the existing target-gated `windows-sys` file-system surface. Reject any final reparse-point metadata before fetch or cleanup. Do not add a global `gate_path` Windows implementation or broaden platform APIs for this issue.
+5. Retain the opened file handle while writing the already-materialized bundle bytes, flush before invoking `git fetch`, and pass the owned entry's path to the existing fetch argv. This fixes pre-existing-entry handling and records observed ownership; it does not claim bounded bundle memory or streaming transport.
+6. Cleanup must be descriptor-relative, non-recursive, and fail closed: revalidate the pinned parent and file identity without following symlinks, remove only an entry observed to be the owned regular file, then use `remove_dir`/the platform equivalent so a non-empty or changed parent is retained. Preserve the existing `gate_path` caveat that verification followed by unlink is **not an atomic lease** against an arbitrary same-UID actor.
+
+The supported guarantee is therefore precise: exclusive creation atomically refuses a pre-existing collision, and the sticky-parent/private-directory boundary excludes other UIDs. A same-UID process that learns the private path can replace it between any two pathname operations; the implementation can detect a deterministic replacement before cleanup and refuse/preserve it, but cannot promise prevention or atomic identity-safe unlink under that arbitrary race. Tests must distinguish this observed replacement refusal from the unpreventable same-UID limitation. Uncontested success, Git failure, write failure, and panic paths should remove the owned file and empty private parent; uncertain identity must never trigger recursive removal of foreign entries.
+
+Use one common creation helper for production and tests, backed by the existing platform custody seam. Production supplies the secure private parent and unpredictable basename; a test-only injection of parent/name and synchronization hooks may make the candidate path deterministic while exercising that same helper and the `fetch_bundle` ownership path. Keep all test hooks behind `cfg(test)` and avoid a new runtime feature or transport protocol.
+
+## Required tests after implementation
+
+Tests should use private, disposable repositories and canary files only. They must call the shipping creation/fetch seam, not just unit-test a tempfile crate.
+
+### Creation and cleanup matrix
+
+- Verify the private parent is owner-only (`0700`) and the bundle entry is owner-only (`0600`) before Git reads it.
+- Pre-create each candidate entry in the test-controlled private parent as a symlink to a canary, regular file containing sentinel bytes, FIFO, directory, and hardlink to a canary. Exclusive creation must fail without opening, truncating, blocking on, or removing the entry; the canary and foreign entry remain byte/type identical.
+- Run two same-UID processes against one deterministic candidate with a barrier before exclusive creation. Exactly one may create it; the loser returns a collision/error without writing or deleting the winner's file. Both processes must retain distinct private-custody state.
+- In a second barrier race, let the worker create and write its file, then have the hostile process replace the pathname with a symlink, regular file, directory, FIFO, or hardlink before the worker's revalidation. The deterministic replacement-before-revalidation case must be refused without unlinking the replacement, avoid FIFO blocking, preserve the canary, and surface the original fetch/cleanup status without masking it. Record that this is observed refusal; it is not proof against a replacement in the gap after revalidation and before unlink.
+- Exercise successful fetch, failed fetch, write/flush failure, and panic/unwind after creation. Uncontested cases must leave no owned file or private parent; replacement cases must leave the foreign entry and must not claim strict directory removal.
+- Verify the old `fs::write` counterfactual in an isolated fixture: a pre-existing symlink changes the canary, demonstrating why the new exclusive-create assertion is meaningful. Do not run this against a live repository or ambient `/tmp` path.
+
+### Real bundle behavior and platform gates
+
+- Preserve the existing two-store real-Git round trip: the branch tip starts only in store B, `git fetch` reads the securely created bundle, and store A resolves `refs/thegn/mq/<branch>` to the expected tip.
+- Add a real-Git fetch-failure case and assert the error remains diagnostic while owned cleanup completes when uncontested.
+- Unix native coverage must include symlink and FIFO candidates and the two-process replacement race, with bounded waits proving no FIFO or child hangs. Assert canary bytes before and after every case. Use `gate_path`'s pinned descriptors and existing non-recursive cleanup semantics as the reference implementation.
+- Preserve the issue's Windows requirement for secure exclusive creation, sharing, permissions, replacement observation, and cleanup. First inspect the available Windows platform seam and run whatever Windows-native or existing platform checks are available; do not invent a universal prelanding Windows execution gate when that environment is unavailable. Report Windows native semantics as unverified if no Windows runner exists. Linux results and cross-compilation alone cannot establish them.
+
+The test process must explicitly reap every helper. A failed identity check must retain the private custody object for the test's bounded watchdog; no background reaper, recursive foreign cleanup, provider call, credential lookup, or real remote host is allowed. Do not count the hostile helper as a second product acceptance run.
+
+The two-process protocol must be concrete and bounded: reserve two exact-child custody slots before either spawn; launch both helpers with null stdin, private cwd/config paths, bounded output files, and only the fixed role/candidate arguments; close unused synchronization descriptors in every process; use a one-byte readiness/release barrier with a finite monotonic deadline rather than an unbounded pipe read; and on timeout kill and reap each still-owned child within a fixed cleanup budget. A failed reap retains the exact child and private fixture for the outer watchdog. After both children settle, assert canaries and foreign entries before cleanup. Cleanup may remove only a verified harness-owned entry and an empty owned parent; it must never delete a foreign fixture entry, recursively sweep a private directory, or treat a preserved replacement as a test-cleanup failure.
+
+## Sibling audit and scope decisions
+
+Inventory the merge/fold temporary paths and record each disposition with THE-222 evidence, while checking the existing issue inventory before proposing any duplicate:
+
+- `crates/thegn-host/src/integrate.rs:44,255,317` uses `tmp_path` for `tg-drivermerge` and `tg-foldregen`, then `git worktree add --detach --force` and `worktree remove --force`. This is a worktree collision/ownership and foreign-worktree cleanup problem covered by THE-394. Audit it and preserve foreign worktrees, but do not replace the fold gate under THE-222.
+- `crates/thegn-host/src/integrate_gate.rs:481` already creates a private tempfile parent, keeps it instead of relying on recursive `TempDir::drop`, and verifies directory/worktree identity. Reuse its custody principles as a reference; do not broaden its API.
+- `crates/thegn-host/src/remote_sync.rs:190-258` uses a remote deterministic `$HOME/thegn-worktrees/<slug>.bundle`, `cat >`, and `rm -f` during remote worktree synchronization. Classify this separate remote-sync surface against existing THE-223/THE-394 and any current delivery issue before proposing a new issue; do not claim THE-222's local `fetch_bundle` repair hardens it. Root owns any tracker write.
+- `crates/thegn-core/src/sandbox.rs:2202` creates stable secret environment files and is THE-224; `thegn-foldgate` is not present as a current string, and the checked `integrate_gate` path must not be misreported as unchanged unsafe foldgate behavior.
+
+Do not import THE-223's streaming/budget implementation, redesign remote transport, harden every sandbox secret path, or solve THE-394 worktree custody in this change. Any unsafe sibling found in the inventory gets a linked issue or an explicit residual entry.
+
+## Review and landing gates
+
+Before source changes, root should approve this bounded seam and the same-UID cleanup rule. After implementation, use a private candidate and record exact source hashes, the secure-temp helper diff, test selectors, platform, and artifact identity. Run source-only formatting/specification checks as appropriate, then root-owned native Unix and Windows controls using private fixtures. Keep provider/network credentials out of all tests.
+
+Acceptance requires literal evidence for symlink, regular-file, FIFO, directory, hardlink, two-process collision, permissions, success/error/panic cleanup, real bundle fetch, and available platform-specific semantics. A positive bundle round trip alone is insufficient. THE-222 can land independently with THE-223, THE-224, THE-394, and THE-328 accurately linked as residual or follow-up work; no closure claim follows from existing positive tests. If Windows native execution is unavailable, the landing record must say so explicitly rather than treating Linux or cross-compilation as Windows acceptance.

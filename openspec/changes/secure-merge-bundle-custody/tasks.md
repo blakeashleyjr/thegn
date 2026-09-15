@@ -11,8 +11,8 @@
       and two-child exclusive-creation coverage.
 - [x] Record the supported Unix and Windows custody boundaries and the
       same-UID observation limitation.
-- [ ] Run root-owned Unix native tests and source/spec/delivery gates.
-- [ ] Run available Windows native checks; report Windows native proof as
-      unverified when no Windows runner is available.
-- [ ] Complete adversarial review, minimum scoped native execution and reviewed
+- [x] Run root-owned Unix native tests and source/spec/delivery gates.
+- [x] Review the Windows exclusive-create/DACL source and explicitly record
+      unavailable Windows native proof in the delivery audit.
+- [x] Complete adversarial review, minimum scoped native execution and reviewed
       local-main landing. Remote-sync/THE-223 work remains separately owned.

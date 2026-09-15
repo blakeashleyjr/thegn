@@ -1,0 +1,151 @@
+"""Exercise the pinned Rust exclusive-create helper against hostile entries.
+No Cargo, provider, or live-state access. Two children per case; private roots.
+"""
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import time
+
+SOURCE = '72d161b2e1868561fd2f5bce9facde8b0345512a'
+BUILD = Path('/tmp/thegn-maintenance07-native-build-corrected-admission-20260915.json')
+OUT = Path('/tmp/thegn-THE222-hostile-native-receipt-20260915.json')
+HELPER = 'platform::gate_path::tests::exclusive_regular_creation_child'
+CANARY = b'HOSTILE-CANARY-222\x00\xff\n'
+
+
+def wait_until(predicate, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def settle(children):
+    # Every child has finite helper barriers, null stdio, no descendant launch.
+    for child in children:
+        if child.poll() is None:
+            child.kill()
+    end = time.monotonic() + 1.0
+    for child in children:
+        if child.poll() is None:
+            try:
+                child.wait(timeout=max(0.001, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+    return all(child.poll() is not None for child in children)
+
+
+def main():
+    cgroup = next(line.split(':', 2)[2] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+    cpu_max = (Path('/sys/fs/cgroup') / cgroup.lstrip('/') / 'cpu.max').read_text().strip()
+    assert cpu_max == '100000 100000', 'run in the reviewed one-CPU systemd scope'
+    build = json.loads(BUILD.read_text())
+    assert build['source'] == SOURCE and build['exit_code'] == 0
+    artifact = build['artifacts']['host']
+    binary = Path(artifact['path'])
+    assert hashlib.sha256(binary.read_bytes()).hexdigest() == artifact['binary_sha256']
+    receipt = {'source': SOURCE, 'cpu_max': cpu_max, 'binary_sha256': artifact['binary_sha256'],
+               'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+               'started_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               'cases': [], 'qualification': 'Linux pinned Rust create_exclusive helper. Hostile entries are installed before two synchronized create attempts; no claim of arbitrary same-UID atomic custody.'}
+    for kind in ['symlink', 'regular', 'hardlink', 'fifo', 'directory']:
+        root = Path(tempfile.mkdtemp(prefix='thegn-222-hostile-native-'))
+        os.chmod(root, 0o700)
+        children = []
+        safe_cleanup = False
+        case = {'kind': kind, 'private_root': str(root), 'passed': False}
+        target = root / 'shared.bundle'
+        canary = root / 'canary'
+        canary.write_bytes(CANARY)
+        os.chmod(canary, 0o600)
+        try:
+            if kind == 'symlink':
+                target.symlink_to(canary)
+            elif kind == 'regular':
+                target.write_bytes(CANARY)
+            elif kind == 'hardlink':
+                os.link(canary, target)
+            elif kind == 'fifo':
+                os.mkfifo(target, 0o600)
+            else:
+                target.mkdir(mode=0o700)
+                (target / 'directory-canary').write_bytes(CANARY)
+            initial = target.lstat()
+            for name in ['a', 'b']:
+                directory = root / ('child-' + name)
+                directory.mkdir(mode=0o700)
+                env = {'THEGN_GATE_CHILD_ROOT': str(root),
+                       'THEGN_GATE_CHILD_READY': str(directory / 'ready'),
+                       'THEGN_GATE_CHILD_RESULT': str(directory / 'result')}
+                children.append(subprocess.Popen(
+                    [str(binary), '--ignored', '--exact', HELPER, '--test-threads=1'],
+                    cwd=root, env=env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            ready = wait_until(lambda: all((root / ('child-' + n) / 'ready').exists() for n in ['a', 'b']), 1.5)
+            if not ready:
+                raise AssertionError('owned children did not reach release barrier')
+            with (root / 'release').open('xb'):
+                pass
+            completed = wait_until(lambda: all(child.poll() is not None for child in children), 2.5)
+            if not completed:
+                raise AssertionError('owned children did not settle after release')
+            case['exit_codes'] = [child.returncode for child in children]
+            assert case['exit_codes'] == [0, 0]
+            results = [(root / ('child-' + n) / 'result').read_text() for n in ['a', 'b']]
+            assert results == ['loser', 'loser'], results
+            after = target.lstat()
+            assert (initial.st_dev, initial.st_ino, initial.st_mode, initial.st_nlink) == (after.st_dev, after.st_ino, after.st_mode, after.st_nlink)
+            assert canary.read_bytes() == CANARY
+            if kind in ['regular', 'hardlink']:
+                assert target.read_bytes() == CANARY
+            if kind == 'symlink':
+                assert target.is_symlink() and target.readlink() == canary
+            if kind == 'fifo':
+                assert stat.S_ISFIFO(after.st_mode)
+            if kind == 'directory':
+                assert (target / 'directory-canary').read_bytes() == CANARY
+            case.update(passed=True, outcomes=results, canary_sha256=hashlib.sha256(canary.read_bytes()).hexdigest(), entry_identity_unchanged=True)
+        except Exception as error:
+            case['error'] = type(error).__name__ + ': ' + str(error)
+        finally:
+            safe_cleanup = settle(children)
+            case['all_children_settled'] = safe_cleanup
+            if safe_cleanup:
+                # Only exact fixture-owned names, after all writers have exited.
+                for name in ['a', 'b']:
+                    directory = root / ('child-' + name)
+                    if directory.exists():
+                        for leaf in ['ready', 'result']:
+                            (directory / leaf).unlink(missing_ok=True)
+                        directory.rmdir()
+                (root / 'release').unlink(missing_ok=True)
+                if kind == 'directory' and target.exists():
+                    (target / 'directory-canary').unlink(missing_ok=True)
+                    target.rmdir()
+                else:
+                    target.unlink(missing_ok=True)
+                canary.unlink()
+                root.rmdir()
+                case['cleanup'] = 'owned entries removed after settlement'
+            else:
+                case['passed'] = False
+                case['cleanup'] = 'private fixture retained with unsettled child; root investigation required'
+        receipt['cases'].append(case)
+        OUT.write_text(json.dumps(receipt, indent=2) + '\n')
+    receipt.update(finished_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   passed=sum(case['passed'] for case in receipt['cases']),
+                   failed=sum(not case['passed'] for case in receipt['cases']))
+    OUT.write_text(json.dumps(receipt, indent=2) + '\n')
+    print(json.dumps({'passed': receipt['passed'], 'failed': receipt['failed'], 'receipt': str(OUT)}))
+    return 0 if receipt['failed'] == 0 else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

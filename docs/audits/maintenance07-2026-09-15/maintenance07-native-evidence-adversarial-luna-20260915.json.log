@@ -1,0 +1,84 @@
+{
+  "review": "maintenance07-native-evidence-adversarial-luna",
+  "date": "2026-09-15",
+  "candidate_path": "/tmp/thegn-maintenance-07-combined-20260915",
+  "tested_source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "tested_tree": "010fdb95a4a02a4f8d18423fcd7dc21b65ca9502",
+  "local_base": "f293594d4a8516f940540b4eda60a9a98ac1d7a1",
+  "verdict": "ACCEPT_WITH_THE222_LITERAL_ACCEPTANCE_QUALIFICATION",
+  "source_only_review": true,
+  "review_operations": {
+    "cargo": false,
+    "build": false,
+    "test": false,
+    "native": false,
+    "provider": false,
+    "canonical_mutation": false,
+    "linear_write": false
+  },
+  "receipt_summary": {
+    "selected": 145,
+    "passed": 145,
+    "failed": 0,
+    "exact_one_pass_all": true,
+    "counts": {"core": 77, "svc": 16, "host": 52},
+    "isolation": "one exact selector per fresh process, one test thread, private XDG roots, 30s outer timeout",
+    "cpu_max": "100000 100000",
+    "linux_only": true
+  },
+  "acceptance_by_issue": {
+    "THE-247": {
+      "verdict": "accepted_with_documented_linux_scope",
+      "coverage": "core sandbox planning/parser/argv plus agent and terminal fail-closed volume gates",
+      "native_live_provider": false
+    },
+    "THE-326": {
+      "verdict": "accepted_with_documented_linux_scope",
+      "coverage": "16 FRP typed-document validation, strict reparse, pre-secret refusal, escaping/redaction and wire-shape selectors",
+      "native_live_provider": false
+    },
+    "THE-222": {
+      "verdict": "retain_in_progress_for_narrow_adversarial_regression",
+      "covered": [
+        "11 merge_remote selectors",
+        "9 platform gate_path selectors",
+        "benign two-child exclusive creation race",
+        "single-process special-file/replacement refusal and canary fixtures",
+        "real local Git bundle movement and cleanup"
+      ],
+      "gap": "The required hostile symlink/FIFO/hardlink two-process race with unchanged canary proof is not selected or present; the two-child test races two benign creators over an absent regular leaf."
+    }
+  },
+  "provenance": {
+    "focused_receipt": {"path": "/tmp/thegn-maintenance07-focused-native-receipt-20260915.json", "sha256": "6d1527f199a44cc6618cd1f4a437a7e189a4fff0829938c20b72e3becf5748ec"},
+    "focused_log": {"path": "/tmp/thegn-maintenance07-focused-native-20260915.log", "sha256": "84b7613b1305b23f9b63a869c0b94c1a2ffe1eb49290029df4eae65c4788fb39"},
+    "selection": {"path": "/tmp/thegn-maintenance07-native-selected-20260915.json", "sha256": "13723b44db103d34cba275a5939f468cdcd4a7179399cc83d52906a0a9062af6"},
+    "selection_plan": {"path": "/tmp/thegn-maintenance07-native-selection-plan-20260915.json", "sha256": "a1f52cdb7f228622c3996957d5ea8b010fbd168ccf0c0a7b5b70c76cb572d575"},
+    "runner": {"path": "/tmp/thegn-private-test-runner-20260914.py", "sha256": "6809313d9ce8fea04dcc7ad81d88e7b3ab09a41ec130155eff8514078ed3ea07"},
+    "corrected_build_admission": {"path": "/tmp/thegn-maintenance07-native-build-corrected-admission-20260915.json", "sha256": "f4f98187f341e0930e213fd4f7390ad6a87f4bf4d522b83529c6f5686b8afc42", "exit_code": 0},
+    "final_clippy_admission": {"path": "/tmp/thegn-maintenance07-final-clippy-admission-20260915.json", "sha256": "a82269b73f3b3d76c09e861a741a14a5bab4017d28f20b2ccc718e09c7afa5bc", "exit_code": 0, "log_sha256": "c95c5e51ccaf2b91c6b723a8573eac1ae44b116f4ba06ed51276761a2cd36afa"},
+    "source_hashes_verified": true,
+    "post_build_uncommitted_metadata": [
+      "openspec/changes/secure-merge-bundle-custody/validation.md",
+      "openspec/changes/serialize-validate-frp-configuration/validation.md",
+      "openspec/changes/validate-sandbox-volume-sources/validation.md",
+      "docs/audits/maintenance07-2026-09-15.md and durable package"
+    ]
+  },
+  "historical_failures_preserved": {
+    "initial_strict_lint": {"path": "/tmp/thegn-maintenance07-clippy-20260915.log", "sha256": "a999f6ad383efd3e48379114fc8434e3ebef633f2b802046fef5f49c1a32f807"},
+    "rejected_keep_going_no_run": {"path": "/tmp/thegn-maintenance07-native-build-admission-20260915.json", "sha256": "4ab8631d2919f4323ccee30765139e4f3de3b8d5e83ac9f85b03705a5a9a0f46", "counted_as_final_pass": false},
+    "corrected_final_replacements": "separate corrected build and final Clippy receipts"
+  },
+  "limits": [
+    "Linux only",
+    "No Windows runtime proof",
+    "No live FRP/OCI/provider execution",
+    "No release performance or coverage percentage claim",
+    "No full-workspace native claim",
+    "THE-222 hostile two-process special-entry race remains a narrow acceptance gap",
+    "THE-222 same-UID replacement is observational, not an atomic lease"
+  ],
+  "separate_ownership": ["THE-394", "THE-224", "THE-223", "THE-328", "THE-325"],
+  "reviewer_mutated_candidate": false
+}

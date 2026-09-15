@@ -1,0 +1,730 @@
+{
+  "source": "72d161b2e1868561fd2f5bce9facde8b0345512a",
+  "selection": [
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::agent_container_name_roundtrips_and_is_not_orphan"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::apple_cpu_limit_is_rounded_to_whole_cores"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::apple_create_opts_omit_flags_its_run_rejects"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::apple_inspect_json_is_parsed_where_go_templates_do_not_exist"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_carries_knobs_and_optional_image"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_hostname_defaults_to_name_then_overrides"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_maps_each_provider_to_its_params"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_none_provider_is_none"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_binds_worktree_and_gitdir"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_die_with_parent_is_gated_by_daemon_persistent"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_local_keeps_host_matching_env_off_argv"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::bwrap_local_omits_ambient_matching_marker"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::cfg_mounts_covered_by_parent_are_skipped"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::container_list_parsing_is_fail_closed_per_backend"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::container_name_with_profile_adds_slug"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::container_status_required_mounts_are_a_subset_of_created_mounts"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::devenv_wraps_inner"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::dropped_hardening_is_reported_not_swallowed"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::empty_oci_image_uses_default_image"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::ensure_stale_and_keepid_rm_go_through_oci_prefix"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::file_access_none_removes_workdir"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::gc_sweeps_every_oci_backend_that_can_hold_a_container"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::guest_shares_host_abi_is_true_for_everything_but_a_foreign_oci_guest"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::host_toolchain_mounts_are_all_ro_and_exist"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::host_toolchain_mounts_are_withheld_when_the_guest_abi_differs"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::host_toolchain_mounts_injected_for_oci_not_bwrap"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::mosh_wraps_backend_over_ssh"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::mount_parsing"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::named_volume_admission_accepts_existing_names_and_rejects_paths"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::named_volume_admission_precedes_oci_ensure_without_side_effects"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::named_volume_admission_reports_pair_index_without_host_fallback"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::none_backend_skips_cd_for_unretargeted_remote_worktree"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_create_opts_map_userns_and_mounts"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_local_secrets_go_to_env_file_not_argv"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_emit_sealed_hardening"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_in_container_mode_adds_net_admin_and_tun"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_never_bind_mount_host_dns_files"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_open_profile_adds_no_hardening"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_opts_without_vpn_keep_normal_network_and_ports"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_prefix_injects_remote_daemon_connection"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::oci_runtime_injected_only_for_oci_backends_when_set"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::podman_and_docker_ps_parse_and_mark_ours"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::podman_exec_preserves_paths"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_enter_argv_wraps_with_mosh"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_enter_argv_wraps_with_ssh"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_none_bare_shell_cds_and_moshes"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::remote_oci_keeps_all_env_inline_as_carrier"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::sandbox_profile_baselines"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::ssh_transport_uses_tty"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::systemd_local_secrets_go_to_environment_file_not_argv"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::teardown_targets_oci_host_daemon"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_gc_identifies_orphans"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_identify_orphans_empty_inputs"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_identify_orphans_names_only_thegn_containers"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_parse_sandbox_stats"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_run_gc_noop_when_no_backend_available"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_sandbox_all_oci_flags_applied"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::test_win_native_sandboxes_do_not_parse_as_oci"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::the_nix_daemon_socket_is_withheld_from_a_foreign_guest"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::vpn_sidecar_name_roundtrips"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox::tests::wrap_script_skips_exec_for_or_and_pipe_fallbacks"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::a_merely_capped_host_shell_is_not_a_systemd_sandbox"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::a_path_named_after_a_runtime_is_not_containment"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::a_transport_handing_off_after_dashdash_is_seen"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::every_backend_round_trips"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::every_backend_round_trips_through_the_cpu_cap"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::falling_back_to_a_different_container_is_still_reported"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::host_and_auto_requests_are_not_degradations"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::host_shell_is_never_read_as_contained"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::reconcile_is_quiet_when_the_request_was_honoured"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::reconcile_reports_the_truth_not_the_request"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::remote_placement_still_reports_the_runtime"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::rootful_podman_is_distinguished_from_rootless"
+    },
+    {
+      "crate": "core",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/core-tests",
+      "selector": "sandbox_truth::sandbox_truth_tests::windows_native_is_taken_at_its_word"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_errors_without_server_addr"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_escapes_utf8_token_and_redacts_plan_debug"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_http_https_and_udp_keep_their_explicit_wire_shapes"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_https_errors_without_subdomain_host"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_https_materializes_toml_and_derives_subdomain_url"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_preserves_a_63_byte_label_for_tcp_proxy_name"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_invalid_fields_before_secret_resolution"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_invalid_or_overlong_dns_components"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_unsupported_extra_lines"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_zero_local_port_before_serialization"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_rejects_zero_remote_port_for_fixed_tcp_address"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_tcp_derives_host_port_and_no_subdomain"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_token_and_explicit_subdomain_and_vhost_port"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_typed_document_rejects_duplicate_keys_and_injected_tables"
+    },
+    {
+      "crate": "svc",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/svc-tests",
+      "selector": "share::tests::frp_typed_document_rejects_unknown_fields"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::compose_spec_clean_shell_choice_uses_rc_free_shell"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::compose_spec_host_fallback_is_login_shell"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::compose_spec_propagates_volume_refusal_without_host_fallback"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::configured_volume_refusal_precedes_agent_host_fallback"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::explicit_host_does_not_override_fail_closed_floor"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::explicit_host_pick_overrides_nonauto_config"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::final_composed_volume_gate_blocks_launch_effect_sentinel"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::final_host_fallback_honors_fail_closed_floor_without_a_resolved_candidate"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::final_host_floor_degrade_reports_the_missed_boundary"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "agent::tests::prepare_sandbox_none_backend_falls_to_host"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::accepted_replacement_disposes_old_provider_on_owner_before_admission_reopens"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::busy_refusal_does_not_construct_or_drop_another_provider"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::caller_timeout_during_preparation_prevents_late_spawn"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::fixture_assertion_unwind_releases_owned_work_without_double_panic"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::fixture_timeout_retains_real_directory_and_unfinished_handles_until_explicit_settlement"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::held_startup_does_not_occupy_git_or_capability_capture_lanes"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::hung_leader_and_nonzero_inherited_stderr_respect_the_caller_deadline"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::nonzero_exit_keeps_bounded_stderr_diagnostic_and_resource_marker"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::producer_panic_retains_child_and_payload_without_running_its_destructor_on_caller"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::reader_and_wait_failures_after_spawn_never_fall_back_or_repeat_wait"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::real_startup_stdout_null_success_and_exact_stderr_bound"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::reservation_and_owner_launch_refuse_before_provider_construction"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::shipping_agent_startup_decision_holds_nonzero_and_inherited_pipe_without_fallback"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::shipping_agent_success_and_unavailable_probe_preserve_existing_fallback_behavior"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::stderr_overflow_is_held_and_does_not_admit_a_second_start"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::uncertain_wait_outcome_forbids_fixture_retry_even_when_public_reason_changed"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::unix::unwind_after_owner_spawn_installs_handle_before_abandoning_start_gate"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "devcontainer_provider::startup::tests::zero_timeout_refuses_before_provider_factory"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_and_fetch_moves_a_tip_between_stores"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_cleanup_preserves_an_observed_replacement"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_creation_collision_preserves_preexisting_leaf"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_custody_rejects_special_replacements_and_keeps_modes"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_unwind_after_injected_write_failure_cleans_owned_fixture"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_write_and_flush_failures_finish_without_recursive_cleanup"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::bundle_write_revalidation_failure_preserves_replacement"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::different_host_needs_ingest"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::ensure_tip_returns_heads_ref_when_same_store"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::mq_ref_is_namespaced"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "merge_remote::tests::same_store_needs_no_ingest"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "panes::tests::terminal_invalid_configured_volume_refuses_before_no_spec_fallback"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "panes::tests::terminal_launch_spec_builds_ssh_mosh_and_local_argv"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::directory_rejects_alias_permissions_and_physical_replacement"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::exclusive_regular_creation_has_one_winner_across_two_owned_children"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::exclusive_regular_creation_never_adopts_an_existing_leaf"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::failed_identity_cleanup_preserves_a_replacement"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::foreign_owner_and_privilege_sharing_never_admit_regular_files"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::lock_is_nonblocking_and_releases_with_its_owner"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::lock_open_failure_is_not_unlocked_success"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::lock_rejects_symlinks_hardlinks_and_replaced_identity"
+    },
+    {
+      "crate": "host",
+      "binary": "/tmp/thegn-maintenance07-native-binaries-20260915/host-tests",
+      "selector": "platform::gate_path::tests::special_files_and_oversized_identity_fail_without_waiting"
+    }
+  ]
+}
