@@ -9,13 +9,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sha2::{Digest as Sha2Digest, Sha256};
 
 const CLI_NAME: &str = "devcontainer";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[path = "devcontainer_startup.rs"]
+pub(crate) mod startup;
+
+#[derive(Debug)]
+pub(crate) struct PreparedStartup {
+    command: Command,
+    handle: DevcontainerHandle,
+}
 
 /// The provider's bounded capability result, suitable for doctor and status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,14 +169,14 @@ impl std::fmt::Debug for DevcontainerHandle {
 /// implementation can replace the CLI without changing launch call sites.
 pub(crate) trait DevcontainerProvider: Send + Sync {
     fn probe(&self) -> ProbeReport;
-    fn start(
+    fn prepare_start(
         &self,
         workspace_folder: &Path,
         config_path: &Path,
         config_digest: &[u8; 32],
         config_content: &[u8],
         env: &[(String, String)],
-    ) -> anyhow::Result<DevcontainerHandle>;
+    ) -> anyhow::Result<PreparedStartup>;
     fn exec_argv(&self, handle: &DevcontainerHandle, command: &str) -> anyhow::Result<Vec<String>>;
 }
 
@@ -189,21 +198,9 @@ impl std::fmt::Debug for DevcontainerSession {
 
 impl DevcontainerSession {
     pub(crate) fn start(
-        provider: Arc<dyn DevcontainerProvider>,
-        workspace_folder: &Path,
-        config_path: &Path,
-        config_digest: &[u8; 32],
-        config_content: &[u8],
-        env: &[(String, String)],
-    ) -> anyhow::Result<Self> {
-        let handle = provider.start(
-            workspace_folder,
-            config_path,
-            config_digest,
-            config_content,
-            env,
-        )?;
-        Ok(Self { provider, handle })
+        inputs: startup::StartInputs<'_>,
+    ) -> Result<startup::PendingSession, startup::StartFailure> {
+        startup::start(inputs)
     }
 
     pub(crate) fn exec_argv(&self, command: &str) -> anyhow::Result<Vec<String>> {
@@ -243,13 +240,6 @@ fn sessions() -> &'static std::sync::Mutex<std::collections::HashMap<String, Dev
         std::sync::Mutex<std::collections::HashMap<String, DevcontainerSession>>,
     > = std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-pub(crate) fn publish_session(worktree: &str, session: DevcontainerSession) {
-    sessions()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(worktree.to_string(), session);
 }
 
 pub(crate) fn session_for(worktree: &str) -> Option<DevcontainerSession> {
@@ -485,14 +475,14 @@ impl DevcontainerProvider for CliProvider {
         probe_command(executable, command, PROBE_TIMEOUT)
     }
 
-    fn start(
+    fn prepare_start(
         &self,
         workspace_folder: &Path,
         config_path: &Path,
         config_digest: &[u8; 32],
         config_content: &[u8],
         env: &[(String, String)],
-    ) -> anyhow::Result<DevcontainerHandle> {
+    ) -> anyhow::Result<PreparedStartup> {
         let executable = self.executable()?.to_path_buf();
         let snapshot = snapshot_config(config_path, config_digest, config_content)?;
         let provider_config_path = snapshot.path().to_path_buf();
@@ -523,20 +513,16 @@ impl DevcontainerProvider for CliProvider {
         // after this check cannot change what the provider parses. Keep the
         // check for the expected stale-session behavior.
         verify_config_digest(config_path, config_digest)?;
-        let output = run_bounded(&mut command, START_TIMEOUT)?;
-        anyhow::ensure!(
-            output.status.success(),
-            "`{CLI_NAME} up` failed with {}{}",
-            output.status,
-            stderr_suffix(&output.stderr)
-        );
-        Ok(DevcontainerHandle {
-            executable,
-            workspace_folder: workspace_folder.to_path_buf(),
-            config_path: config_path.to_path_buf(),
-            config_digest: *config_digest,
-            config_snapshot: snapshot,
-            env: allowlisted_env,
+        Ok(PreparedStartup {
+            command,
+            handle: DevcontainerHandle {
+                executable,
+                workspace_folder: workspace_folder.to_path_buf(),
+                config_path: config_path.to_path_buf(),
+                config_digest: *config_digest,
+                config_snapshot: snapshot,
+                env: allowlisted_env,
+            },
         })
     }
 
@@ -644,12 +630,6 @@ fn first_line(bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-fn stderr_suffix(bytes: &[u8]) -> String {
-    first_line(bytes)
-        .map(|line| format!(": {line}"))
-        .unwrap_or_default()
-}
-
 /// Build the provider process environment from the same safe runtime base as
 /// pane processes, then append the effective local-env allowlist. The latter
 /// wins if a caller explicitly admits an infrastructure key with a different
@@ -661,35 +641,6 @@ fn provider_env(allowlisted: &[(String, String)]) -> Vec<(String, String)> {
     let mut env = thegn_core::util::filter_host_env(std::env::vars(), &[]);
     env.extend(allowlisted.iter().cloned());
     env
-}
-
-#[expect(clippy::disallowed_methods)]
-fn run_bounded(command: &mut Command, timeout: Duration) -> anyhow::Result<std::process::Output> {
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                std::io::Read::read_to_end(&mut pipe, &mut stdout)?;
-            }
-            if let Some(mut pipe) = child.stderr.take() {
-                std::io::Read::read_to_end(&mut pipe, &mut stderr)?;
-            }
-            return Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("process exceeded {:?} timeout", timeout);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[cfg(test)]
@@ -740,7 +691,7 @@ mod tests {
 
         let provider = CliProvider::with_executable("/bin/devcontainer");
         let error = provider
-            .start(dir.path(), &config_path, &digest, content, &[])
+            .prepare_start(dir.path(), &config_path, &digest, content, &[])
             .expect_err("changed config must not reach the provider");
         assert!(error.to_string().contains("changed after trust approval"));
     }
@@ -774,7 +725,7 @@ mod tests {
     fn provider_up_reads_the_approved_snapshot_after_original_changes() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tempfile::tempdir().unwrap());
         let report = dir.path().join("provider-config");
         let script = dir.path().join("devcontainer");
         let config_path = dir.path().join("devcontainer.json");
@@ -792,9 +743,15 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let digest = config_digest(&config_path).unwrap();
 
-        let handle = CliProvider::with_executable(script)
-            .start(dir.path(), &config_path, &digest, approved, &[])
-            .unwrap();
+        let fixture = startup::tests::OwnedFixture::up(
+            dir.clone(),
+            script,
+            &config_path,
+            digest,
+            approved,
+            &[],
+        );
+        let handle = fixture.start().unwrap().handle;
         assert_eq!(
             std::fs::read_to_string(report).unwrap(),
             String::from_utf8_lossy(approved)
@@ -843,7 +800,7 @@ mod tests {
     fn provider_up_cannot_observe_a_non_allowlisted_host_variable() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tempfile::tempdir().unwrap());
         let report = dir.path().join("environment");
         let script = dir.path().join("devcontainer");
         std::fs::write(
@@ -864,16 +821,15 @@ mod tests {
         // SAFETY: the test serializes its process-environment mutation and
         // restores the prior value before releasing the lock.
         unsafe { std::env::set_var(blocked, "must-not-cross") };
-        let provider = CliProvider::with_executable(&script);
-        let handle = provider
-            .start(
-                dir.path(),
-                &config_path,
-                &config_digest,
-                content,
-                &[("DC_PROVIDER_ALLOWED".into(), "yes".into())],
-            )
-            .unwrap();
+        let fixture = startup::tests::OwnedFixture::up(
+            dir.clone(),
+            script.clone(),
+            &config_path,
+            config_digest,
+            content,
+            &[("DC_PROVIDER_ALLOWED".into(), "yes".into())],
+        );
+        let handle = fixture.start().unwrap().handle;
         // SAFETY: paired with the serialized setup above.
         match previous {
             Some(value) => unsafe { std::env::set_var(blocked, value) },
@@ -898,7 +854,7 @@ mod tests {
     fn provider_up_failure_preserves_stderr_for_diagnostics() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tempfile::tempdir().unwrap());
         let script = dir.path().join("devcontainer");
         std::fs::write(
             &script,
@@ -911,8 +867,16 @@ mod tests {
         std::fs::write(&config_path, content).unwrap();
         let config_digest = config_digest(&config_path).unwrap();
 
-        let error = CliProvider::with_executable(script)
-            .start(dir.path(), &config_path, &config_digest, content, &[])
+        let fixture = startup::tests::OwnedFixture::up(
+            dir.clone(),
+            script,
+            &config_path,
+            config_digest,
+            content,
+            &[],
+        );
+        let error = fixture
+            .start()
             .expect_err("failed provider start must be reported");
         let message = error.to_string();
         assert!(message.contains("failed with"), "{message}");
