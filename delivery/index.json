@@ -1080,6 +1080,18 @@
       "summary": "Compile repository data into bounded inert argv or explicitly admitted shell templates."
     },
     {
+      "change": "secure-merge-bundle-custody",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-222",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Secure cross-host merge bundle temporary-file custody with retained identity, exclusive creation and platform-specific native verification."
+    },
+    {
       "change": "select-before-snapshot",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

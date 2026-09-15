@@ -50,14 +50,14 @@ impl ProcessObservation {
     }
 }
 
-pub(super) struct OwnedChild {
+pub(crate) struct OwnedChild {
     child: Option<Child>,
     root: Arc<tempfile::TempDir>,
     slot: usize,
     observation: ProcessObservation,
 }
 impl OwnedChild {
-    pub(super) fn spawn(command: &mut Command, root: Arc<tempfile::TempDir>) -> Self {
+    pub(crate) fn spawn(command: &mut Command, root: Arc<tempfile::TempDir>) -> Self {
         let slot = {
             let mut slots = lock_slots();
             let index = slots
@@ -76,7 +76,7 @@ impl OwnedChild {
         owned.child = Some(command.spawn().expect("spawn owned thegn binary"));
         owned
     }
-    pub(super) fn poll(&mut self) -> Option<ExitStatus> {
+    pub(crate) fn poll(&mut self) -> Option<ExitStatus> {
         let status = self
             .observation
             .observe(|| self.child.as_mut().unwrap().try_wait())
@@ -86,7 +86,7 @@ impl OwnedChild {
         }
         status
     }
-    pub(super) fn terminate(&mut self, budget: Duration) -> bool {
+    pub(crate) fn terminate(&mut self, budget: Duration) -> bool {
         let Some(child) = self.child.as_mut() else {
             return true;
         };
