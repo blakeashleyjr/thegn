@@ -571,6 +571,10 @@ mod tests {
         );
         assert_eq!(
             repo_from_url_with_host("https://github.com:443/o/r/issues/1", Some("github.com")),
+            Some("o/r".into())
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://github.com:8443/o/r/issues/1", Some("github.com")),
             None
         );
         assert_eq!(
