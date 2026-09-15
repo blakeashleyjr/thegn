@@ -1158,7 +1158,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let budget = Arc::new(TrackerHttpBudget::with_permits(1));
-        budget.fail_after_prepared_requests_for_test(1);
+        budget.expire_after_responses_for_test(1);
         let backend = KaneoBackend::new_with_budget(
             format!("http://{address}"),
             "kaneo-secret".into(),
