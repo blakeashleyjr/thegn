@@ -57,6 +57,37 @@ use thegn_core::completion::{
 };
 use thegn_core::config::Config;
 
+/// Print registration for the invoked executable alias, without loading configuration.
+pub(crate) fn print_registration(shell: clap_complete::Shell, static_: bool) -> anyhow::Result<()> {
+    let bin = std::env::args()
+        .next()
+        .and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "thegn".into());
+    // Buffer first, both paths: the generators panic on write errors,
+    // and a consumer like `… | head` closing the pipe early is normal
+    // CLI life.
+    let mut buf = Vec::new();
+    if static_ {
+        // The stable `aot` generator: a self-contained script over the
+        // same grouped tree the parser uses, named for the invoked alias
+        // (thegn / tg). Structure only — it cannot know your worktrees.
+        // Kept as the documented degradation path if the unstable
+        // dynamic API ever breaks, so it must stay working and tested.
+        let mut tree = crate::cli_help::attach(<crate::Cli as clap::CommandFactory>::command());
+        clap_complete::generate(shell, &mut tree, bin, &mut buf);
+    } else {
+        write_registration(shell, &bin, &mut buf);
+    }
+    use std::io::Write;
+    // best-effort: a closed pipe just means the reader got enough.
+    let _ = std::io::stdout().write_all(&buf);
+    Ok(())
+}
+
 /// The environment variable `CompleteEnv` activates on. This is its default
 /// (verified against the vendored `clap_complete/src/env/mod.rs`); named here so
 /// the cheap "am I completing?" check does not have to construct anything.

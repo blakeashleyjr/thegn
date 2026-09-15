@@ -678,6 +678,18 @@
       "summary": "Complete runtime TUI localization and define plugin-visible string participation."
     },
     {
+      "change": "fix-static-cli-startup",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-611",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Dispatch existing static CLI output before effective configuration loading, migration and profile side effects; native acceptance and local landing remain pending."
+    },
+    {
       "change": "harden-live-diagnostics-and-forge",
       "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
