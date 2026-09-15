@@ -392,7 +392,6 @@ crates/thegn-host/src/skill_seed.rs
 #
 # Provider/select caches — a miss re-resolves next launch.
 crates/thegn-core/src/devcontainer_select.rs
-crates/thegn-host/src/devcontainer_provider.rs
 crates/thegn-host/src/mise_provider.rs
 #
 # NOT ignored Results at all: `let _ = path;` / `let _ = status;` binding
