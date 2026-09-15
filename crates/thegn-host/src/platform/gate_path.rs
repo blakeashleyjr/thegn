@@ -468,7 +468,6 @@ impl Lock {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
