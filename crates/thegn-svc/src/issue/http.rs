@@ -182,7 +182,7 @@ impl TrackerHttpOperation<'_> {
         if self.permit.is_some() {
             return Ok(());
         }
-        let _ = self.remaining()?;
+        self.remaining()?;
         let acquire = self.client.budget.semaphore.clone().acquire_owned();
         self.permit = Some(
             timeout_at(self.deadline, acquire)
@@ -204,7 +204,7 @@ impl TrackerHttpOperation<'_> {
 
     async fn send(&mut self, request: RequestBuilder) -> Result<Response, IssueError> {
         self.acquire().await?;
-        let _ = self.remaining()?;
+        self.remaining()?;
         timeout_at(self.deadline, request.send())
             .await
             .map_err(|_| IssueError::Timeout("tracker HTTP operation deadline exceeded"))?
@@ -273,7 +273,7 @@ impl TrackerHttpOperation<'_> {
             .body(bytes);
         let response = self.send(request).await?;
         self.check_response(&response, false)?;
-        let _ = read_bounded(self.deadline, response).await?;
+        read_bounded(self.deadline, response).await?;
         self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
@@ -291,7 +291,7 @@ impl TrackerHttpOperation<'_> {
             .header("Accept", "application/json");
         let response = self.send(request).await?;
         self.check_response(&response, false)?;
-        let _ = read_bounded(self.deadline, response).await?;
+        read_bounded(self.deadline, response).await?;
         self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
@@ -304,10 +304,10 @@ impl TrackerHttpOperation<'_> {
     ) -> Result<R, IssueError> {
         self.check_response(&response, true)?;
         let bytes = read_bounded(self.deadline, response).await?;
-        let _ = self.remaining()?;
+        self.remaining()?;
         let value = serde_json::from_slice(&bytes)
             .map_err(|_| IssueError::Parse("tracker JSON decode failed".into()))?;
-        let _ = self.remaining()?;
+        self.remaining()?;
         #[cfg(test)]
         self.response_consumed_for_test();
         Ok(value)
@@ -626,7 +626,7 @@ mod tests {
             Err(IssueError::BodyLimit("tracker response exceeds limit"))
         ));
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -668,7 +668,7 @@ mod tests {
         ));
         assert_eq!(target_hits.load(Ordering::SeqCst), 0);
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     struct CountingBody {
@@ -709,7 +709,7 @@ mod tests {
         let queued_client = Arc::clone(&client);
         let queued = tokio::spawn(async move {
             let mut operation = queued_client.operation_with_timeout(Duration::from_secs(10));
-            let _ = started.send(());
+            started.send(()).expect("fixture waits for queue admission");
             operation
                 .json::<_, serde_json::Value>(reqwest::Method::POST, "/queued", &body)
                 .await
@@ -747,7 +747,7 @@ mod tests {
         let queued_client = Arc::clone(&client);
         let queued = tokio::spawn(async move {
             let mut operation = queued_client.operation_with_timeout(Duration::from_secs(10));
-            let _ = started.send(());
+            started.send(()).expect("fixture waits for queue admission");
             operation.prepare().await
         });
         started_rx.await.unwrap();
@@ -767,7 +767,9 @@ mod tests {
     ) -> Response {
         let first = futures_util::stream::once(async move {
             if let Some(sender) = signal.lock().unwrap().take() {
-                let _ = sender.send(());
+                sender
+                    .send(())
+                    .expect("fixture waits for the first body chunk");
             }
             Ok::<_, std::io::Error>(b"{\"ok\":true".to_vec())
         });
@@ -827,7 +829,7 @@ mod tests {
             .await
             .expect("dropped stream released permit");
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -875,6 +877,6 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }
