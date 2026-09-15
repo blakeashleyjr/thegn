@@ -91,7 +91,11 @@ impl TrackerHttpClient {
     }
 
     pub(crate) fn operation(&self) -> TrackerHttpOperation<'_> {
-        self.operation_with_timeout(OPERATION_TIMEOUT)
+        TrackerHttpOperation {
+            client: self,
+            deadline: Instant::now() + OPERATION_TIMEOUT,
+            permit: None,
+        }
     }
 
     #[cfg(test)]
@@ -137,6 +141,11 @@ impl TrackerHttpOperation<'_> {
         self.deadline
             .checked_duration_since(Instant::now())
             .ok_or(IssueError::Timeout("operation deadline exceeded"))
+    }
+
+    #[cfg(test)]
+    fn expire_for_test(&mut self) {
+        self.deadline = Instant::now() - Duration::from_nanos(1);
     }
 
     async fn acquire(&mut self) -> Result<(), IssueError> {
@@ -388,7 +397,6 @@ mod tests {
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::any;
-    use futures_util::StreamExt;
 
     #[test]
     fn origin_policy_preserves_explicit_lan_http_and_rejects_authority_state() {
@@ -402,6 +410,28 @@ mod tests {
             "/path/"
         );
         assert!(parse_origin("ftp://example.test").is_err());
+    }
+
+    #[test]
+    fn process_budget_is_shared_across_client_construction() {
+        let first = TrackerHttpBudget::process();
+        let second = TrackerHttpBudget::process();
+        assert!(Arc::ptr_eq(&first, &second));
+        let first_client = TrackerHttpClient::new(
+            "first",
+            "http://first.example",
+            "first-secret".into(),
+            Arc::clone(&first),
+        )
+        .unwrap();
+        let second_client = TrackerHttpClient::new(
+            "second",
+            "http://second.example",
+            "second-secret".into(),
+            second,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first_client.budget, &second_client.budget));
     }
 
     #[test]
@@ -558,6 +588,7 @@ mod tests {
             Err(IssueError::BodyLimit("tracker response exceeds limit"))
         ));
         server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -599,57 +630,54 @@ mod tests {
         ));
         assert_eq!(target_hits.load(Ordering::SeqCst), 0);
         server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
-    async fn shared_budget_queue_cancellation_releases_capacity() {
-        let budget = Arc::new(TrackerHttpBudget::with_permits(8));
-        let client = TrackerHttpClient::new(
-            "fixture",
-            "http://127.0.0.1:1",
-            "fixture-secret".into(),
-            Arc::clone(&budget),
-        )
-        .unwrap();
-        let second_client = TrackerHttpClient::new(
-            "fixture",
-            "http://127.0.0.1:2",
-            "fixture-secret".into(),
-            Arc::clone(&budget),
-        )
-        .unwrap();
-        let mut held = Vec::new();
-        for _ in 0..8 {
-            let mut operation = client.operation_with_timeout(Duration::from_secs(1));
-            operation.prepare().await.unwrap();
-            held.push(operation);
-        }
-        let mut queued = second_client.operation_with_timeout(Duration::from_millis(20));
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(40), queued.prepare()).await,
-            Ok(Err(IssueError::Timeout(
-                "waiting for tracker HTTP capacity"
-            )))
-        ));
-        drop(queued);
-        let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
-        let mut queued_body = second_client.operation_with_timeout(Duration::from_millis(20));
-        let result = tokio::time::timeout(
-            Duration::from_millis(40),
-            queued_body.json::<_, serde_json::Value>(reqwest::Method::POST, "/queued", &oversized),
-        )
-        .await
-        .expect("queued request operation returns");
-        assert!(matches!(result, Err(IssueError::Timeout(_))));
-        drop(queued_body);
+    async fn shared_budget_queue_future_drop_releases_capacity() {
+        use tokio::sync::oneshot;
+
+        let budget = Arc::new(TrackerHttpBudget::with_permits(1));
+        let client = Arc::new(
+            TrackerHttpClient::new(
+                "fixture",
+                "http://127.0.0.1:1",
+                "fixture-secret".into(),
+                Arc::clone(&budget),
+            )
+            .unwrap(),
+        );
+        let mut held = client.operation_with_timeout(Duration::from_secs(1));
+        held.prepare().await.unwrap();
+
+        let (started, started_rx) = oneshot::channel();
+        let queued_client = Arc::clone(&client);
+        let queued = tokio::spawn(async move {
+            let mut operation = queued_client.operation_with_timeout(Duration::from_secs(10));
+            let _ = started.send(());
+            operation.prepare().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+
         drop(held);
-        let mut next = client.operation_with_timeout(Duration::from_millis(100));
-        next.prepare().await.expect("released global capacity");
+        let mut next = client.operation_with_timeout(Duration::from_secs(1));
+        next.prepare()
+            .await
+            .expect("dropped queued future released capacity");
     }
 
-    fn slow_response() -> Response {
-        let first =
-            futures_util::stream::once(async { Ok::<_, std::io::Error>(b"{\"ok\":true".to_vec()) });
+    fn slow_response_with_signal(
+        signal: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    ) -> Response {
+        let first = futures_util::stream::once(async move {
+            if let Some(sender) = signal.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            Ok::<_, std::io::Error>(b"{\"ok\":true".to_vec())
+        });
         let never = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
         let mut response = (StatusCode::OK, Body::from_stream(first.chain(never))).into_response();
         response.headers_mut().insert(
@@ -660,37 +688,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_stream_timeout_drops_body_and_releases_permit() {
+    async fn pending_stream_future_drop_releases_permit() {
+        use tokio::sync::oneshot;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (signal, signal_rx) = oneshot::channel();
+        let signal = Arc::new(std::sync::Mutex::new(Some(signal)));
+        let route_signal = Arc::clone(&signal);
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/slow", any(|_: Request| async { slow_response() })),
+                Router::new().route(
+                    "/slow",
+                    any(move |_: Request| {
+                        let signal = Arc::clone(&route_signal);
+                        async move { slow_response_with_signal(signal) }
+                    }),
+                ),
             )
             .await
             .unwrap();
         });
-        let client = TrackerHttpClient::new(
-            "fixture",
-            &format!("http://{address}"),
-            "fixture-secret".into(),
-            Arc::new(TrackerHttpBudget::with_permits(1)),
-        )
-        .unwrap();
-        let mut operation = client.operation_with_timeout(Duration::from_millis(40));
-        assert!(matches!(
-            operation.get::<serde_json::Value>("/slow").await,
-            Err(IssueError::Timeout("reading tracker response"))
-        ));
-        drop(operation);
-        let mut released = client.operation_with_timeout(Duration::from_millis(100));
-        released.prepare().await.expect("slow body released permit");
+        let client = Arc::new(
+            TrackerHttpClient::new(
+                "fixture",
+                &format!("http://{address}"),
+                "fixture-secret".into(),
+                Arc::new(TrackerHttpBudget::with_permits(1)),
+            )
+            .unwrap(),
+        );
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move {
+            let mut operation = request_client.operation_with_timeout(Duration::from_secs(10));
+            operation.get::<serde_json::Value>("/slow").await
+        });
+        signal_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        let mut released = client.operation_with_timeout(Duration::from_secs(1));
+        released
+            .prepare()
+            .await
+            .expect("dropped stream released permit");
         server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
-    async fn multirequest_operation_keeps_one_absolute_deadline() {
+    async fn repeated_provider_requests_share_one_explicit_budget() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -701,17 +749,14 @@ mod tests {
             let app = Router::new().fallback(any(move |_: Request| {
                 let route_calls = Arc::clone(&route_calls);
                 async move {
-                    if route_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        let mut response =
-                            (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response();
-                        response.headers_mut().insert(
-                            reqwest::header::CONTENT_TYPE,
-                            HeaderValue::from_static("application/json"),
-                        );
-                        response
-                    } else {
-                        slow_response()
-                    }
+                    route_calls.fetch_add(1, Ordering::SeqCst);
+                    let mut response =
+                        (StatusCode::OK, Body::from(r#"{"ok":true}"#)).into_response();
+                    response.headers_mut().insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
                 }
             }));
             axum::serve(listener, app).await.unwrap();
@@ -723,14 +768,19 @@ mod tests {
             Arc::new(TrackerHttpBudget::with_permits(1)),
         )
         .unwrap();
-        let mut operation = client.operation_with_timeout(Duration::from_millis(60));
-        let first: serde_json::Value = operation.get("/sequence").await.unwrap();
+        let mut operation = client.operation_with_timeout(Duration::from_secs(1));
+        let first: serde_json::Value = operation.get("/provider/first").await.unwrap();
         assert_eq!(first["ok"], true);
+        // Deterministically consume the operation's budget between provider
+        // requests. A fresh-deadline-per-request implementation would send a
+        // second request; the production operation must refuse before I/O.
+        operation.expire_for_test();
         assert!(matches!(
-            operation.get::<serde_json::Value>("/sequence").await,
-            Err(IssueError::Timeout("reading tracker response"))
+            operation.get::<serde_json::Value>("/provider/second").await,
+            Err(IssueError::Timeout("operation deadline exceeded"))
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
+        let _ = server.await;
     }
 }

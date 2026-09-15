@@ -24,7 +24,11 @@ pub struct LinearBackend {
 }
 
 impl LinearBackend {
-    pub(crate) fn new(
+    pub fn new(api_key: String, team_id: Option<String>) -> Self {
+        Self::new_with_budget(api_key, team_id, TrackerHttpBudget::process())
+    }
+
+    pub(crate) fn new_with_budget(
         api_key: String,
         team_id: Option<String>,
         budget: std::sync::Arc<TrackerHttpBudget>,
