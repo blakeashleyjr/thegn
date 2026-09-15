@@ -1187,6 +1187,9 @@ pub(super) async fn issue_get(
     if let Err(r) = authed(&state, &headers, Verb::IssuesGet) {
         return r;
     }
+    if let Err(error) = crate::issue::validate_control_issue_id(&id) {
+        return ControlError::InvalidArgument(error.to_string()).into_response();
+    }
     match state.api.issues_get(&id).await {
         Ok(detail) => axum::Json(detail).into_response(),
         Err(e) => e.into_response(),
@@ -1201,6 +1204,9 @@ pub(super) async fn issue_update(
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesUpdate) {
         return r;
+    }
+    if let Err(error) = crate::issue::validate_control_issue_id(&id) {
+        return ControlError::InvalidArgument(error.to_string()).into_response();
     }
     match state.api.issues_update(&id, &body.0).await {
         Ok(issue) => axum::Json(issue).into_response(),
@@ -1221,6 +1227,9 @@ pub(super) async fn issue_comment(
 ) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::IssuesComment) {
         return r;
+    }
+    if let Err(error) = crate::issue::validate_control_issue_id(&id) {
+        return ControlError::InvalidArgument(error.to_string()).into_response();
     }
     match state.api.issues_comment(&id, &body.0.body).await {
         Ok(()) => axum::Json(json!({ "commented": id })).into_response(),

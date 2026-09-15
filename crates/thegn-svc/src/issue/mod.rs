@@ -9,6 +9,7 @@
 pub mod capabilities;
 pub mod github;
 pub(crate) mod http;
+pub(crate) mod identity;
 pub mod jira;
 pub mod kaneo;
 pub mod kaneo_auth;
@@ -141,6 +142,134 @@ pub(crate) fn parse_due_date_ms(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp_millis())
+}
+
+/// Validate one provider-scoped issue id at an input or response boundary.
+/// This is syntax-only; account ownership remains THE-324.
+pub fn validate_issue_id(id: &str) -> Result<(), IssueError> {
+    identity::complete_identity(id).map_err(IssueError::Parse)?;
+    if let Some(rest) = id.strip_prefix("plugin:") {
+        let (plugin_id, key) = rest.split_once(':').ok_or_else(|| {
+            IssueError::Parse("plugin issue id must use plugin:<namespace>:<key>".into())
+        })?;
+        identity::builtin_segment(plugin_id, "plugin namespace").map_err(IssueError::Parse)?;
+        identity::plugin_key(key).map_err(IssueError::Parse)?;
+        return Ok(());
+    }
+    let (provider, key) = id
+        .split_once(':')
+        .ok_or_else(|| IssueError::Parse("issue id must use provider:key syntax".into()))?;
+    if provider.is_empty() || key.is_empty() {
+        return Err(IssueError::Parse(
+            "issue id has an empty provider or key".into(),
+        ));
+    }
+    match provider {
+        "github" => {
+            if let Some((repo, number)) = key.rsplit_once('#') {
+                identity::github_repo(repo).map_err(IssueError::Parse)?;
+                identity::github_number(number).map_err(IssueError::Parse)?;
+            } else {
+                identity::github_number(key).map_err(IssueError::Parse)?;
+            }
+        }
+        "jira" => {
+            identity::jira_key(key).map_err(IssueError::Parse)?;
+        }
+        "kaneo" => {
+            identity::kaneo_id(key, "Kaneo task id").map_err(IssueError::Parse)?;
+        }
+        "linear" => {
+            identity::builtin_identity(key).map_err(IssueError::Parse)?;
+        }
+        _ => return Err(IssueError::Parse("unknown issue provider namespace".into())),
+    }
+    Ok(())
+}
+
+fn validate_public_url(url: &str) -> Result<(), IssueError> {
+    if url.is_empty() {
+        return Ok(()); // legacy/fake providers may omit a browse URL
+    }
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| IssueError::Parse(format!("invalid issue URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(IssueError::Parse(
+            "issue URL has an invalid public authority".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an issue row before it enters a router, cache, or panel.
+pub fn validate_control_issue_id(id: &str) -> Result<(), IssueError> {
+    if id.contains(':') {
+        validate_issue_id(id)
+    } else {
+        identity::builtin_identity(id)
+            .map_err(IssueError::Parse)
+            .map(|_| ())
+    }
+}
+
+pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
+    if let Some(plugin_namespace) = issue.provider.strip_prefix("plugin:") {
+        identity::builtin_segment(plugin_namespace, "plugin namespace")
+            .map_err(IssueError::Parse)?;
+    }
+    let expected = format!("{}:", issue.provider);
+    if !issue.id.starts_with(&expected) {
+        return Err(IssueError::Parse(
+            "issue id/provider namespace mismatch".into(),
+        ));
+    }
+    validate_issue_id(&issue.id)?;
+    let (_, key) = issue.id.split_once(':').expect("validate_issue_id checked");
+    match issue.provider.as_str() {
+        "github" => {
+            let number = key.rsplit_once('#').map(|(_, n)| n).unwrap_or(key);
+            identity::github_number(number).map_err(IssueError::Parse)?;
+            identity::github_number(&issue.number).map_err(IssueError::Parse)?;
+        }
+        "jira" => {
+            identity::jira_key(key).map_err(IssueError::Parse)?;
+            identity::jira_key(&issue.number).map_err(IssueError::Parse)?;
+        }
+        "kaneo" => {
+            identity::kaneo_id(key, "Kaneo task id").map_err(IssueError::Parse)?;
+            identity::kaneo_id(&issue.number, "Kaneo issue number").map_err(IssueError::Parse)?;
+        }
+        _ if issue.provider.starts_with("plugin:") => {
+            let prefix = format!("{}:", issue.provider);
+            let native = issue
+                .id
+                .strip_prefix(&prefix)
+                .ok_or_else(|| IssueError::Parse("issue id/provider namespace mismatch".into()))?;
+            identity::plugin_key(native).map_err(IssueError::Parse)?;
+            identity::plugin_key(&issue.number).map_err(IssueError::Parse)?;
+        }
+        "linear" => {
+            identity::builtin_identity(&issue.number).map_err(IssueError::Parse)?;
+        }
+        _ => return Err(IssueError::Parse("unknown issue provider namespace".into())),
+    }
+    for project in &issue.project_ids {
+        if issue.provider.starts_with("plugin:") {
+            identity::plugin_key(project).map_err(IssueError::Parse)?;
+        } else {
+            identity::builtin_identity(project).map_err(IssueError::Parse)?;
+        }
+    }
+    for blocked in &issue.blocked_by {
+        validate_issue_id(blocked)?;
+    }
+    validate_public_url(&issue.url)
 }
 
 /// Provider-agnostic issue tracker seam.
@@ -365,24 +494,38 @@ impl IssueRouter {
         !self.inner.is_empty()
     }
 
-    /// Locate the backend owning an id of the form `"<provider>:<key>"`. When
-    /// multiple accounts share the provider this picks the first — get/update by
-    /// bare id can't disambiguate accounts (a known multi-account limitation).
-    ///
-    /// A **bare** id (no known provider prefix — `THE-72` from
-    /// `wt new --from-issue`) falls back to the sole configured backend when
-    /// there is exactly one. Two or more stay strict: guessing which tracker a
-    /// bare key belongs to would fetch the wrong issue, which is worse than the
-    /// error `id_miss` then produces.
+    /// Locate the backend owning an id. Provider namespaces are matched by
+    /// longest registered prefix so `plugin:demo:key` reaches `plugin:demo`.
+    /// A bare legacy id is accepted only when there is exactly one backend;
+    /// namespaced ids never fall through to another provider.
     fn backend_for_id(&self, id: &str) -> Option<&dyn IssueBackend> {
-        let prefix = id.split_once(':').map(|(p, _)| p).unwrap_or(id);
-        if let Some(b) = self.inner.iter().find(|b| b.inner.provider_id() == prefix) {
-            return Some(b.inner.as_ref());
+        let matches = |b: &&AccountBackend| {
+            id == b.inner.provider_id()
+                || id
+                    .strip_prefix(b.inner.provider_id())
+                    .is_some_and(|rest| rest.starts_with(':'))
+        };
+        let longest = self
+            .inner
+            .iter()
+            .filter(matches)
+            .map(|b| b.inner.provider_id().len())
+            .max();
+        if let Some(longest) = longest {
+            // `find` deliberately preserves the established first-account
+            // behavior when equal-length provider namespaces are duplicated.
+            return self
+                .inner
+                .iter()
+                .find(|b| matches(b) && b.inner.provider_id().len() == longest)
+                .map(|b| b.inner.as_ref());
         }
-        match self.inner.as_slice() {
-            [only] => Some(only.inner.as_ref()),
-            _ => None,
+        // Preserve the audited legacy bare-id compatibility only at the
+        // unambiguous sole-backend boundary. A namespaced id never falls back.
+        if !id.contains(':') && self.inner.len() == 1 {
+            return self.inner.first().map(|b| b.inner.as_ref());
         }
+        None
     }
 
     /// The error for an id that routed nowhere. An empty router is genuinely
@@ -401,8 +544,9 @@ impl IssueRouter {
                 ids.push(p);
             }
         }
+        let shown: String = id.chars().take(256).collect();
         IssueError::Api(format!(
-            "`{id}` does not name a configured tracker — use \"<provider>:<key>\" \
+            "`{shown}` does not name a configured tracker — use \"<provider>:<key>\" \
              (configured: {})",
             ids.join(", ")
         ))
@@ -422,7 +566,19 @@ impl IssueRouter {
         let mut all = Vec::new();
         for b in &self.inner {
             match b.inner.list_issues(filter).await {
-                Ok(mut issues) => all.append(&mut issues),
+                Ok(issues) => match issues
+                    .into_iter()
+                    .map(|issue| {
+                        validate_issue_identity(&issue)?;
+                        Ok(issue)
+                    })
+                    .collect::<Result<Vec<_>, IssueError>>()
+                {
+                    Ok(mut valid) => all.append(&mut valid),
+                    Err(e) => {
+                        tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue list failed")
                 }
@@ -439,18 +595,27 @@ impl IssueRouter {
     ) -> Vec<(String, &'static str, Result<Vec<Issue>, IssueError>)> {
         let mut out = Vec::with_capacity(self.inner.len());
         for b in &self.inner {
-            out.push((
-                b.account.clone(),
-                b.inner.provider_id(),
-                b.inner.list_issues(filter).await,
-            ));
+            let result = b.inner.list_issues(filter).await.and_then(|issues| {
+                issues
+                    .into_iter()
+                    .map(|issue| {
+                        validate_issue_identity(&issue)?;
+                        Ok(issue)
+                    })
+                    .collect()
+            });
+            out.push((b.account.clone(), b.inner.provider_id(), result));
         }
         out
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
+        validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.get_issue(id).await,
+            Some(b) => b.get_issue(id).await.and_then(|detail| {
+                validate_issue_identity(&detail.issue)?;
+                Ok(detail)
+            }),
             None => Err(self.id_miss(id)),
         }
     }
@@ -458,20 +623,28 @@ impl IssueRouter {
     /// Create an issue on the first configured provider.
     pub async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
         match self.inner.first() {
-            Some(b) => b.inner.create_issue(draft).await,
+            Some(b) => b.inner.create_issue(draft).await.and_then(|issue| {
+                validate_issue_identity(&issue)?;
+                Ok(issue)
+            }),
             None => Err(IssueError::NotConfigured),
         }
     }
 
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
+        validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
-            Some(b) => b.update_issue(id, patch).await,
+            Some(b) => b.update_issue(id, patch).await.and_then(|issue| {
+                validate_issue_identity(&issue)?;
+                Ok(issue)
+            }),
             None => Err(self.id_miss(id)),
         }
     }
 
     /// Post a comment on the issue identified by a `"<provider>:<key>"` id.
     pub async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
+        validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
             Some(b) => b.add_comment(id, body).await,
             None => Err(IssueError::NotConfigured),
@@ -480,6 +653,7 @@ impl IssueRouter {
 
     /// Attach a label (by name) to the issue identified by its id.
     pub async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
+        validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
             Some(b) => b.attach_label(id, label).await,
             None => Err(IssueError::NotConfigured),
@@ -488,6 +662,7 @@ impl IssueRouter {
 
     /// Remove a label (by name) from the issue identified by its id.
     pub async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
+        validate_control_issue_id(id)?;
         match self.backend_for_id(id) {
             Some(b) => b.detach_label(id, label).await,
             None => Err(IssueError::NotConfigured),
@@ -504,7 +679,19 @@ impl IssueRouter {
         let mut all = Vec::new();
         for b in &self.inner {
             match b.inner.search(query, limit).await {
-                Ok(mut issues) => all.append(&mut issues),
+                Ok(issues) => match issues
+                    .into_iter()
+                    .map(|issue| {
+                        validate_issue_identity(&issue)?;
+                        Ok(issue)
+                    })
+                    .collect::<Result<Vec<_>, IssueError>>()
+                {
+                    Ok(mut valid) => all.append(&mut valid),
+                    Err(e) => {
+                        tracing::warn!(provider = b.inner.provider_id(), error = %e, "issue identity rejected")
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(account = %b.account, provider = b.inner.provider_id(), error = %e, "issue search failed")
                 }
@@ -644,18 +831,224 @@ mod spec {
     }
 
     #[test]
-    fn single_backend_fallback_also_catches_a_foreign_prefix() {
-        // Documenting the fallback's full reach: with exactly one tracker the
-        // router has nothing to disambiguate, so even `jira:PROJ-1` lands on
-        // the lone Linear backend and fails with *that provider's* error rather
-        // than a routing error. The alternative — refusing ids whose prefix is a
-        // known-but-unconfigured provider — buys a nicer message on a typo at
-        // the cost of a second rule; the id in practice is a bare key.
+    fn single_backend_does_not_fallback_foreign_namespace() {
         let r = IssueRouter::from_config(&cfg_with(vec![IssueProviderKind::Linear]));
-        assert_eq!(
-            r.backend_for_id("jira:PROJ-1").map(|b| b.provider_id()),
-            Some("linear")
+        assert!(r.backend_for_id("jira:PROJ-1").is_none());
+    }
+
+    struct CountingBackend {
+        updates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl IssueBackend for CountingBackend {
+        fn provider_id(&self) -> &'static str {
+            "linear"
+        }
+
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+
+        fn list_issues<'a>(
+            &'a self,
+            _filter: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("fake get".into())) })
+        }
+
+        fn create_issue<'a>(
+            &'a self,
+            _draft: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("fake create".into())) })
+        }
+
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _patch: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            let updates = self.updates.clone();
+            Box::pin(async move {
+                updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(IssueError::Api("fake update".into()))
+            })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct PluginMarker {
+        id: &'static str,
+    }
+
+    impl IssueBackend for PluginMarker {
+        fn provider_id(&self) -> &'static str {
+            self.id
+        }
+        fn caps(&self) -> IssueCaps {
+            IssueCaps::default()
+        }
+        fn list_issues<'a>(
+            &'a self,
+            _f: &'a IssueFilter,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn get_issue<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("marker".into())) })
+        }
+        fn create_issue<'a>(
+            &'a self,
+            _d: &'a IssueDraft,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("marker".into())) })
+        }
+        fn update_issue<'a>(
+            &'a self,
+            _id: &'a str,
+            _p: &'a IssuePatch,
+        ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+            Box::pin(async { Err(IssueError::Api("marker".into())) })
+        }
+        fn search<'a>(
+            &'a self,
+            _q: &'a str,
+            _l: usize,
+        ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn plugin_namespace_routes_by_complete_registered_prefix() {
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router.push_backend("demo".into(), Box::new(PluginMarker { id: "plugin:demo" }));
+        router.push_backend(
+            "nested".into(),
+            Box::new(PluginMarker {
+                id: "plugin:demo:extra",
+            }),
         );
+        assert_eq!(
+            router
+                .backend_for_id("plugin:demo:opaque/key#7")
+                .map(|b| b.provider_id()),
+            Some("plugin:demo")
+        );
+        assert_eq!(
+            router
+                .backend_for_id("plugin:demo:extra:key")
+                .map(|b| b.provider_id()),
+            Some("plugin:demo:extra")
+        );
+        assert!(router.backend_for_id("plugin:other:opaque").is_none());
+        assert!(validate_control_issue_id("plugin:demo:opaque/key#7").is_ok());
+    }
+
+    #[test]
+    fn malformed_control_id_reaches_no_fake_provider_effect() {
+        let updates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router.push_backend(
+            "fake".into(),
+            Box::new(CountingBackend {
+                updates: updates.clone(),
+            }),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let patch = IssuePatch::default();
+        assert!(
+            runtime
+                .block_on(router.update_issue("linear:bad key", &patch))
+                .is_err()
+        );
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .block_on(router.update_issue("linear:ABC-9", &patch))
+                .is_err()
+        );
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn duplicate_provider_ids_keep_the_first_account_for_mutations() {
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router.push_backend(
+            "first".into(),
+            Box::new(CountingBackend {
+                updates: first.clone(),
+            }),
+        );
+        router.push_backend(
+            "second".into(),
+            Box::new(CountingBackend {
+                updates: second.clone(),
+            }),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(router.update_issue("linear:ABC-9", &IssuePatch::default()));
+        assert!(result.is_err());
+        assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn plugin_identity_envelope_is_bounded_before_routing() {
+        let oversized = format!("plugin:demo:{}", "x".repeat(500));
+        assert!(validate_control_issue_id(&oversized).is_err());
+        let opaque = format!("plugin:demo:{}", "客户/任务#7");
+        assert!(validate_control_issue_id(&opaque).is_ok());
+    }
+
+    #[test]
+    fn cache_boundary_rejects_cross_provider_and_malformed_ids() {
+        let mut issue: Issue = serde_json::from_value(serde_json::json!({
+            "id": "github:owner/repo#42",
+            "number": "42",
+            "provider": "github",
+            "title": "ok",
+            "status": "todo",
+            "priority": "low",
+            "url": ""
+        }))
+        .unwrap();
+        assert!(validate_issue_identity(&issue).is_ok());
+        issue.number = "0".into();
+        assert!(validate_issue_identity(&issue).is_err());
+        issue.number = "42".into();
+        issue.project_ids = vec!["../project".into()];
+        assert!(validate_issue_identity(&issue).is_err());
+        issue.project_ids.clear();
+        issue.blocked_by = vec!["github:owner/repo#0".into()];
+        assert!(validate_issue_identity(&issue).is_err());
+        issue.blocked_by.clear();
+        issue.url = "https://user:password@example.com/issue/42".into();
+        assert!(validate_issue_identity(&issue).is_err());
+        issue.url.clear();
+        issue.id = "github:owner/repo#0".into();
+        assert!(validate_issue_identity(&issue).is_err());
+        issue.provider = "jira".into();
+        assert!(validate_issue_identity(&issue).is_err());
     }
 
     #[test]

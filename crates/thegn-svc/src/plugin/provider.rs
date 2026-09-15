@@ -198,13 +198,19 @@ pub struct PluginIssueBackend {
 impl PluginIssueBackend {
     /// `provider_id` is leaked once per plugin (a handful per process): the
     /// seam wants `&'static str` ids and plugins load once per config life.
-    pub fn new(bridge: Arc<ProviderBridge>, plugin_id: &str, caps: IssueCaps) -> Self {
+    pub fn new(
+        bridge: Arc<ProviderBridge>,
+        plugin_id: &str,
+        caps: IssueCaps,
+    ) -> Result<Self, IssueError> {
+        crate::issue::identity::builtin_segment(plugin_id, "plugin namespace")
+            .map_err(IssueError::Parse)?;
         let provider_id: &'static str = Box::leak(format!("plugin:{plugin_id}").into_boxed_str());
-        Self {
+        Ok(Self {
             bridge,
             caps,
             provider_id,
-        }
+        })
     }
 
     fn op<T: serde::de::DeserializeOwned>(
@@ -220,6 +226,31 @@ impl PluginIssueBackend {
             }
         })?;
         serde_json::from_value(out).map_err(|e| IssueError::Api(format!("bad {op} reply: {e}")))
+    }
+
+    fn checked_input<'a>(&self, id: &'a str) -> Result<&'a str, IssueError> {
+        let prefix = format!("{}:", self.provider_id);
+        let key = id.strip_prefix(&prefix).ok_or_else(|| {
+            IssueError::Parse("plugin issue id does not match the exact plugin namespace".into())
+        })?;
+        crate::issue::identity::plugin_key(key).map_err(IssueError::Parse)
+    }
+
+    fn validate_issue(&self, issue: Issue) -> Result<Issue, IssueError> {
+        let key = self.checked_input(&issue.id)?;
+        crate::issue::identity::plugin_key(key).map_err(IssueError::Parse)?;
+        if issue.provider != self.provider_id {
+            return Err(IssueError::Parse(
+                "plugin issue provider does not match its bridge".into(),
+            ));
+        }
+        crate::issue::validate_issue_identity(&issue)?;
+        Ok(issue)
+    }
+
+    fn validate_detail(&self, mut detail: IssueDetail) -> Result<IssueDetail, IssueError> {
+        detail.issue = self.validate_issue(detail.issue)?;
+        Ok(detail)
     }
 }
 
@@ -238,12 +269,16 @@ impl IssueBackend for PluginIssueBackend {
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
             let args = serde_json::to_value(filter).unwrap_or_default();
-            self.op("list_issues", args)
+            let rows: Vec<Issue> = self.op("list_issues", args)?;
+            rows.into_iter().map(|i| self.validate_issue(i)).collect()
         })
     }
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
-        Box::pin(async move { self.op("get_issue", serde_json::json!({ "id": id })) })
+        Box::pin(async move {
+            self.checked_input(id)?;
+            self.validate_detail(self.op("get_issue", serde_json::json!({ "id": id }))?)
+        })
     }
 
     fn create_issue<'a>(
@@ -252,7 +287,7 @@ impl IssueBackend for PluginIssueBackend {
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
             let args = serde_json::to_value(draft).unwrap_or_default();
-            self.op("create_issue", args)
+            self.validate_issue(self.op("create_issue", args)?)
         })
     }
 
@@ -266,7 +301,8 @@ impl IssueBackend for PluginIssueBackend {
                 "id": id,
                 "patch": serde_json::to_value(patch).unwrap_or_default(),
             });
-            self.op("update_issue", args)
+            self.checked_input(id)?;
+            self.validate_issue(self.op("update_issue", args)?)
         })
     }
 
@@ -276,10 +312,11 @@ impl IssueBackend for PluginIssueBackend {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
-            self.op(
+            let rows: Vec<Issue> = self.op(
                 "search",
                 serde_json::json!({ "query": query, "limit": limit }),
-            )
+            )?;
+            rows.into_iter().map(|i| self.validate_issue(i)).collect()
         })
     }
 
@@ -292,6 +329,7 @@ impl IssueBackend for PluginIssueBackend {
             return Box::pin(async { Err(IssueError::unsupported("add_comment")) });
         }
         Box::pin(async move {
+            self.checked_input(id)?;
             self.op::<serde_json::Value>(
                 "add_comment",
                 serde_json::json!({ "id": id, "body": body }),
@@ -309,6 +347,7 @@ impl IssueBackend for PluginIssueBackend {
             return Box::pin(async { Err(IssueError::unsupported("attach_label")) });
         }
         Box::pin(async move {
+            self.checked_input(id)?;
             self.op::<serde_json::Value>(
                 "attach_label",
                 serde_json::json!({ "id": id, "label": label }),
@@ -326,6 +365,7 @@ impl IssueBackend for PluginIssueBackend {
             return Box::pin(async { Err(IssueError::unsupported("detach_label")) });
         }
         Box::pin(async move {
+            self.checked_input(id)?;
             self.op::<serde_json::Value>(
                 "detach_label",
                 serde_json::json!({ "id": id, "label": label }),
@@ -391,7 +431,8 @@ done
                 comments: true,
                 labels: false,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(backend.provider_id(), "plugin:demo");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -422,7 +463,8 @@ done
     #[test]
     fn omitted_caps_refuse_optional_ops_without_a_bridge_round_trip() {
         let (_fixture, _session, bridge) = live_bridge();
-        let backend = PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default());
+        let backend =
+            PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default()).unwrap();
         let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -437,6 +479,41 @@ done
             bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
             before
         );
+    }
+
+    #[test]
+    fn plugin_response_identity_must_match_namespace_and_opaque_fields() {
+        let (_fixture, _session, bridge) = live_bridge();
+        assert!(PluginIssueBackend::new(bridge.clone(), "bad/id", IssueCaps::default()).is_err());
+        let backend = PluginIssueBackend::new(bridge, "demo", IssueCaps::default()).unwrap();
+        let valid = thegn_core::issue::Issue {
+            id: "plugin:demo:opaque/key#7".into(),
+            number: "opaque/key#7".into(),
+            provider: "plugin:demo".into(),
+            project_ids: vec!["project / one".into()],
+            ..Default::default()
+        };
+        assert!(backend.validate_issue(valid).is_ok());
+
+        let mut wrong_provider = thegn_core::issue::Issue {
+            id: "plugin:other:7".into(),
+            number: "7".into(),
+            provider: "plugin:other".into(),
+            ..Default::default()
+        };
+        assert!(backend.validate_issue(wrong_provider.clone()).is_err());
+        wrong_provider.id = "plugin:demo:7".into();
+        wrong_provider.provider = "plugin:demo".into();
+        wrong_provider.project_ids = vec!["bad\nproject".into()];
+        assert!(backend.validate_issue(wrong_provider).is_err());
+
+        let malformed_namespace = thegn_core::issue::Issue {
+            id: "plugin:demo:extra:key".into(),
+            number: "key".into(),
+            provider: "plugin:demo:extra".into(),
+            ..Default::default()
+        };
+        assert!(crate::issue::validate_issue_identity(&malformed_namespace).is_err());
     }
 
     #[test]
