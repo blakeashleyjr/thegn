@@ -1,0 +1,32 @@
+
+running 1 test
+test forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback ... 
+thread 'forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback' (1911559) panicked at crates/thegn-svc/src/forge/native_global_connectivity_tests.rs:133:5:
+SDK fixture failed: exit status: 101; stdout=
+running 1 test
+test forge::native::global_connectivity_tests::isolated_sdk_connectivity_child ... FAILED
+
+failures:
+
+failures:
+    forge::native::global_connectivity_tests::isolated_sdk_connectivity_child
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 695 filtered out; finished in 0.04s
+
+; stderr=
+thread 'forge::native::global_connectivity_tests::isolated_sdk_connectivity_child' (1911563) panicked at crates/thegn-svc/src/forge/native_global_connectivity_tests.rs:288:13:
+assertion `left == right` failed: reachable errors-only must publish global success
+  left: Offline
+ right: Online
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 695 filtered out; finished in 0.09s
+

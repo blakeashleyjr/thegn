@@ -1,0 +1,32 @@
+{
+  "kind": "THE622 counterfactual source only",
+  "checkout": "/tmp/thegn-THE622-counterfactual-20260915",
+  "parent": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "mutation": "remove only GhCircuit::record_success global report_success statement",
+  "file": "crates/thegn-svc/src/forge/native.rs",
+  "before_sha256": "b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944",
+  "after_sha256": "dce13599ccf296b4f9bd1d8bc4a0152b163042ace3cd5dc1665fe4198e70da69",
+  "patch": "/tmp/thegn-THE622-counterfactual-20260915.patch",
+  "patch_sha256": "65f8e3d70af720a58f205e6c88b3e92aa405066661db7d2787b92e572bf629f1",
+  "protected_identical": {
+    "crates/thegn-core/src/connectivity.rs": "0c7f8a7c594dfd443e3033450a0b42e4dda89f8d995fdd5dcea2bdbd1af7afd3",
+    "crates/thegn-svc/src/forge/native_global_connectivity_tests.rs": "b0f5e8e4374dd7075b6e64533fd01b10762a8953fea53b46f8dea4f3207a925c",
+    "crates/thegn-svc/src/forge/native_regression_tests.rs": "ff7bc3e96bd1e0d0b1febe4d78323e2ca72f77341ba1d23ca29ef0cb41da4b82",
+    "test/support/owned_test_child.rs": "c82ae54690938b7f65fb794335e0580e30b06426c3c92fdad77a47abba719864",
+    "crates/thegn-host/tests/static_cli_support/mod.rs": "8853e91c5531dc9b074acfe7660dba2be0511abbbf2c7510671e02a8b34c2d33",
+    "Cargo.toml": "5f090efbbff6886c2f4c294888d934ddb30aff05953c8c9bef64160c1612a84e",
+    "Cargo.lock": "9d6aec3f25e6bef65ad59937627fa27550f7ecfdf7f10b1834d29e540668a324"
+  },
+  "parent_selector": "forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback",
+  "helper_selector": "forge::native::global_connectivity_tests::isolated_sdk_connectivity_child",
+  "native_executed": false,
+  "expected_child_assertion": "reachable errors-only must publish global success: left Offline, right Online",
+  "expected_parent_failure": "SDK fixture failed: child nonzero status and captured semantic assertion",
+  "not_proven_by_failure": [
+    "later reachable cases",
+    "fallback call counts",
+    "transport controls",
+    "complete success receipt",
+    "explicit normal success TempDir::close"
+  ]
+}

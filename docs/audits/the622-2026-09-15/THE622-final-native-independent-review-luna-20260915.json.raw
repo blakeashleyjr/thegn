@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "artifact": "THE622 final independent native counterfactual review",
+  "reviewed_at_utc": "2026-09-15T16:00:00Z",
+  "source_review": {
+    "base_commit": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+    "private_clone": "/tmp/thegn-THE622-counterfactual-20260915",
+    "clone_head": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+    "patch": "/tmp/thegn-THE622-counterfactual-20260915.patch",
+    "patch_sha256": "65f8e3d70af720a58f205e6c88b3e92aa405066661db7d2787b92e572bf629f1",
+    "changed_files": ["crates/thegn-svc/src/forge/native.rs"],
+    "diff_stat": "one deletion",
+    "base_native_rs_sha256": "b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944",
+    "counterfactual_native_rs_sha256": "dce13599ccf296b4f9bd1d8bc4a0152b163042ace3cd5dc1665fe4198e70da69",
+    "exact_change": "Delete thegn_core::connectivity::report_success() from GhCircuit::record_success after a successful GitHub round trip.",
+    "unchanged_contract": "The patch does not alter the child matrix, seed/global helper, local circuit state, ladder, custody, or cleanup code."
+  },
+  "counterfactual_native": {
+    "receipt": "/tmp/thegn-THE622-counterfactual-native-evidence-20260915/receipt.json",
+    "binary": "/tmp/thegn-THE622-counterfactual-native-evidence-20260915/svc-tests",
+    "binary_sha256": "8e7e00aadf41bfade055717aa6f7b0be100fdc0db758885997c8eab149ef09a0",
+    "depfile": "/tmp/thegn-THE622-counterfactual-native-evidence-20260915/svc-tests.d",
+    "depfile_sha256": "2f5994a3362dc1dae6b76e54edf01d8e08f7ff49781229d6205d461ca0487f1b",
+    "source_manifest_dir_in_depfile": "/tmp/thegn-THE622-counterfactual-20260915/crates/thegn-svc",
+    "affected_source_in_depfile": "crates/thegn-svc/src/forge/native.rs",
+    "target_binary_path": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn_svc-022a7c7d9a097013",
+    "build_log": "/tmp/thegn-THE622-counterfactual-build-20260915.log",
+    "build_jsonl": "/tmp/thegn-THE622-counterfactual-build-20260915.jsonl",
+    "build_exit_code": 0,
+    "build_seconds": 159,
+    "cargo_local_package_artifacts": {
+      "thegn_core": "fresh:false",
+      "thegn_media": "fresh:false",
+      "thegn_svc": "fresh:false",
+      "build_finished_success": true
+    },
+    "execution_log": "/tmp/thegn-THE622-counterfactual-native-20260915.log",
+    "execution_log_sha256": "11e5b378b65879db8a8fa15d788905a288cef118b2b9aa6d707e8a4b7ae69ebb",
+    "selector": "forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback",
+    "exit_code": 101,
+    "expected_semantic_failure": true,
+    "observed_sequence": [
+      "Parent launched the exact owned child with marker matrix-v1 and isolated private directories.",
+      "Child entered the first reachable errors-only case.",
+      "Child assertion at native_global_connectivity_tests.rs:288 expected Connectivity::Online but observed Offline.",
+      "Child was reaped before the parent fixture assertion.",
+      "Parent assertion at native_global_connectivity_tests.rs:133 reported SDK fixture exit status 101.",
+      "The child matrix receipt and parent strict success/Arc close assertions were unreachable."
+    ],
+    "first_failure": "reachable errors-only must publish global success; left Offline, right Online",
+    "limits": "Only the first reachable errors-only case ran. The later matrix, expected receipt, strict Arc-owned TempDir close, and cleanup assertions were not reached; ordinary TempDir drop is all that occurred after child failure."
+  },
+  "positive_evidence": {
+    "current06_focused_native_log": "/tmp/thegn-maintenance06-focused-native-20260915.log",
+    "current06_result": "121/121 PASS, 8220 skipped, 13.963s",
+    "positive_parallel_log": "/tmp/thegn-THE622-positive-parallel-libtest-20260915.log",
+    "positive_parallel_result": "20 passed, 1 ignored, 0 failed, 0.49s, --test-threads=4",
+    "positive_receipt": "/tmp/thegn-THE622-positive-native-evidence-20260915/receipt.json",
+    "positive_binary_sha256": "b473720166b2eefcefe3e9d99250ee943a060c55349c990064f69d628da1b9a3",
+    "positive_source": "27c0ccad5399c84612fa35aea7841b0d4209458c",
+    "positive_later_source_equivalence": "dd5e4d07 changes only crates/thegn-host/src/platform/state_db_capture_linux.rs; the forge source is unchanged between the positive source and corrected current06 source."
+  },
+  "corrected_current06_acceptance_scope": {
+    "receipt": "/tmp/thegn-maintenance06-corrected-gates-receipt-20260915.json",
+    "source": "dd5e4d07ff16428f250388b142c5f9b4c25561c3",
+    "native": "16 passed, 3365 skipped, exit 0",
+    "strict_clippy": "exit 0",
+    "source_ratchets": "exit 0",
+    "openspec": "164 passed, 0 failed"
+  },
+  "provenance_assessment": {
+    "source_patch_identity": "confirmed",
+    "compiler_artifact_observed": true,
+    "stale_cache_risk": "Residual: the executable and depfile use the reused /tmp/thegn-batch03-native-cache-f_3lx_t_ target directory. Cargo JSONL marks local package artifacts fresh:false and the depfile manifest directory/private source is correct, but this review does not claim an independently reproducible clean target build.",
+    "binary_source_claim": "The pinned binary is consistent with the private-clone source and exact failure, subject to the shared-target provenance limitation."
+  },
+  "assessment": {
+    "counterfactual": "semantic failure confirmed",
+    "positive_regression": "positive native evidence preserved",
+    "acceptance": "Scoped source review plus counterfactual native evidence and corrected current06 Clippy/native gates; no landing approval.",
+    "landing_owner": "root"
+  },
+  "operations": {
+    "new_native_or_build": false,
+    "mutable_target_operation": false,
+    "source_or_main_mutation": false
+  }
+}

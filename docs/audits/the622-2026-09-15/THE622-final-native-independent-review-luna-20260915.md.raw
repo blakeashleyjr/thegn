@@ -1,0 +1,26 @@
+# THE622 final independent native counterfactual review — 2026-09-15
+
+The THE622 counterfactual has the intended semantic failure. The private clone is at base `62289bb730b1b1a188761ef4b0a3c4b8723f914d` with exactly one deletion from `GhCircuit::record_success`: `thegn_core::connectivity::report_success()`. The base file hash is `b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944`; the patched source hash is `dce13599ccf296b4f9bd1d8bc4a0152b163042ace3cd5dc1665fe4198e70da69`. The patch hash is `65f8e3d70af720a58f205e6c88b3e92aa405066661db7d2787b92e572bf629f1`.
+
+The source diff leaves the child matrix, seeded global/helper state, local circuit state, ladder, ownership, and cleanup logic unchanged. The pinned native artifact is [receipt.json](/tmp/thegn-THE622-counterfactual-native-evidence-20260915/receipt.json), binary hash `8e7e00aadf41bfade055717aa6f7b0be100fdc0db758885997c8eab149ef09a0`. Its depfile hash is `2f5994a3362dc1dae6b76e54edf01d8e08f7ff49781229d6205d461ca0487f1b`; the depfile names the private clone as `CARGO_MANIFEST_DIR` and includes `crates/thegn-svc/src/forge/native.rs`.
+
+The build exited 0 after 159 seconds. Cargo JSONL marks the local `thegn-core`, `thegn-media`, and `thegn-svc` artifacts `fresh:false`, with a successful `build-finished` record. The artifact path is under the reused `/tmp/thegn-batch03-native-cache-f_3lx_t_` target, so stale-cache provenance remains a stated limitation even though the local package compilation records and depfile point to the private source.
+
+The exact selector was:
+
+```
+forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback
+```
+
+It exited 101 as expected. The parent launched the exact owned child with isolated private directories. The child reached the first reachable errors-only case and failed at `native_global_connectivity_tests.rs:288`: expected `Connectivity::Online`, observed `Offline`, with message `reachable errors-only must publish global success`. The child was reaped before the parent assertion. The parent then failed at line 133 with `SDK fixture failed: exit status: 101`.
+
+This counterfactual stops at the first intended failure. The later child matrix, expected receipt, parent strict-success assertion, and `Arc`-owned `TempDir::close` assertion are unreachable; only ordinary `TempDir` drop follows the child failure. The counterfactual therefore demonstrates the negative contract and preserves the honest cleanup limitation. It does not prove the later matrix or strict cleanup path.
+
+Positive evidence remains intact:
+
+- Current06 focused native receipt: 121/121 passed, 8220 skipped, 13.963 seconds.
+- THE622 positive parallel native run: 20 passed, 1 ignored, 0 failed, 0.49 seconds with four test threads.
+- The positive artifact source was `27c0ccad5399c84612fa35aea7841b0d4209458c`. The later corrected current06 source `dd5e4d07ff16428f250388b142c5f9b4c25561c3` changes only `crates/thegn-host/src/platform/state_db_capture_linux.rs`; the forge source is unchanged.
+
+The corrected current06 acceptance evidence reports source `dd5e4d07`, native 16 passed/3365 skipped with exit 0, strict Clippy exit 0, source ratchets exit 0, and OpenSpec 164 passed/0 failed. This review scopes acceptance to source identity, the counterfactual native result, and the corrected current06 native/Clippy gates. It grants no landing approval; root owns the final review.
+

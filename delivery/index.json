@@ -1099,7 +1099,7 @@
           "project": "Alpha Reliability & State Compatibility"
         }
       ],
-      "summary": "Test-only completion of actual SDK global connectivity and fallback acceptance; native, counterfactual and reviewed landing gates pending."
+      "summary": "Test-only SDK global connectivity and fallback evidence, counterfactual, source review and corrected native/strict-lint gates complete; reviewed local-main landing remains pending."
     },
     {
       "change": "verify-sandbox-mounts",

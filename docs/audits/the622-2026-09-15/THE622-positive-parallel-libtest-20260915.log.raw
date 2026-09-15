@@ -1,0 +1,26 @@
+
+running 21 tests
+test forge::native::global_connectivity_tests::isolated_sdk_connectivity_child ... ignored, helper only: exact owned reexec; global connectivity matrix
+test forge::native::regression_tests::helper_capacity_stays_reserved_until_ownership_is_released ... ok
+test forge::native::regression_tests::reaper_spawn_failure_retains_child_and_capacity ... ok
+test forge::native::regression_tests::public_host_validation_precedes_credentials ... ok
+test forge::native::regression_tests::sdk_error_classification_drives_the_real_ladder ... ok
+test forge::native::regression_tests::sdk_graphql_envelopes_fall_through_without_offline_evidence ... ok
+test forge::native::regression_tests::timeout_and_transport_failure_feed_native_circuit ... ok
+test forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback ... ok
+test forge::native::regression_tests::token_helper_success_failure_and_output_bound ... ok
+test forge::native::regression_tests::typed_http_answers_are_not_global_network_failures ... ok
+test forge::native::regression_tests::strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_tokens ... ok
+test forge::native::tests::graphql_no_pr_node_maps_to_no_pr ... ok
+test forge::native::tests::graphql_pr_list_parses_headers ... ok
+test forge::native::tests::graphql_pr_maps_fields_and_rolls_up_checks ... ok
+test forge::native::tests::native_branch_resolution_is_local_rev_parse ... ok
+test forge::native::tests::owner_repo_parses_ssh_and_https_forms ... ok
+test forge::native::tests::token_is_trimmed ... ok
+test forge::native::tests::token_precedence_prefers_gh_token_then_github_token_then_cli ... ok
+test forge::native::regression_tests::unknown_wait_ownership_is_reaped_without_group_signal ... ok
+test forge::native::regression_tests::cancelling_token_future_terminates_owned_group ... ok
+test forge::native::regression_tests::token_timeout_kills_descendants_even_after_parent_exit ... ok
+
+test result: ok. 20 passed; 0 failed; 1 ignored; 0 measured; 682 filtered out; finished in 0.49s
+

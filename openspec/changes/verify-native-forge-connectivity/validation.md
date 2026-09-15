@@ -20,4 +20,3 @@ Source review and native/counterfactual/strict-lint gates remain pending. Root
 owns execution and reviewed landing; no Done claim follows from this checkpoint.
 The separate active change is owned only by THE-622; the earlier delivered
 diagnostics/forge change and its historical validation remain unchanged.
-

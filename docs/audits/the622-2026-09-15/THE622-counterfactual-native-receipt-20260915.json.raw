@@ -1,0 +1,19 @@
+{
+  "base": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "patch": "/tmp/thegn-THE622-counterfactual-20260915.patch",
+  "source_sha256": "dce13599ccf296b4f9bd1d8bc4a0152b163042ace3cd5dc1665fe4198e70da69",
+  "binary": "/tmp/thegn-THE622-counterfactual-native-evidence-20260915/svc-tests",
+  "binary_sha256": "8e7e00aadf41bfade055717aa6f7b0be100fdc0db758885997c8eab149ef09a0",
+  "depfile_sha256": "2f5994a3362dc1dae6b76e54edf01d8e08f7ff49781229d6205d461ca0487f1b",
+  "compiler_artifact_fresh": false,
+  "source_manifest_dir": "/tmp/thegn-THE622-counterfactual-20260915/crates/thegn-svc",
+  "build_exit_code": 0,
+  "build_seconds": 159,
+  "selector": "forge::native::global_connectivity_tests::sdk_results_preserve_global_connectivity_and_fallback",
+  "exit_code": 101,
+  "expected_semantic_failure": true,
+  "log": "/tmp/thegn-THE622-counterfactual-native-20260915.log",
+  "log_sha256": "11e5b378b65879db8a8fa15d788905a288cef118b2b9aa6d707e8a4b7ae69ebb",
+  "limits": "Onlyfirstreachableerrors-onlycase; parentstrictsuccessclose/matrixreceiptunreached; childreapedbeforeparentassert, ordinaryTempDirDrop only",
+  "timestamp_utc": "2026-09-15T15:51:30.447797+00:00"
+}

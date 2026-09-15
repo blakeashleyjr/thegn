@@ -1,0 +1,13 @@
+{
+  "source": "27c0ccad5399c84612fa35aea7841b0d4209458c",
+  "exit_code": 0,
+  "passed": 121,
+  "skipped_or_filtered": 8220,
+  "test_seconds": 13.963,
+  "binaries": 39,
+  "scope": "focused603capture/602compatibility/622globalconnectivity and existingSDK/Ladder/coreconnectivity/staticCLI",
+  "log": "/tmp/thegn-maintenance06-focused-native-20260915.log",
+  "log_sha256": "94e6693c851cc1d62de35c092483b5d6fc26110b91f728826b7b89e9b5cf88c3",
+  "independent_review": "pending",
+  "timestamp_utc": "2026-09-15T15:35:41.801072+00:00"
+}
