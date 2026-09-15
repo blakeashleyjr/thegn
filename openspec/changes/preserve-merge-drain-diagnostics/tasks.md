@@ -57,6 +57,6 @@ THE-219 current Part B execution is retained without reduction in [the shared ev
 - [x] Reconcile the fixed normal CLI Part B receipts for stale-field clearing and same-row recovery, preserving the distinction from injected deferred-conflict mapping and authenticated gate-error proof.
 - [x] Retain narrowly scoped original review/issue/evidence payloads and exact hashes in the dated audit manifest.
 - [x] Verify current33c0 full native:8,465/8,465 passed,26 skipped; nine exact diagnostic selectors and seven current-source hashes match. Retain original failures and exact receipt/log hashes.
-- [ ] Complete final metadata review, source checks and local landing, then reconcile THE-608 tracker state.
+- [x] Complete final metadata review, source checks and local landing at bd738963; read back THE-608 Done at 2026-09-15T02:40:29.889Z.
 
 [The dated diagnostic acceptance audit](../../../docs/audits/THE-608-diagnostic-acceptance-2026-09-15.md) records this layered evidence. The old shared fixed-CLI/private-native/live-queue checkbox remains historical and unchecked: these scoped THE-608 receipts do not claim live user queue integration or complete THE-610. No provider, merge, cleanup or push action is authorized by this metadata update.
