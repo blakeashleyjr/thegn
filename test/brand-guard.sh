@@ -37,6 +37,9 @@ allow_files=(
   ':!test/brand-guard.sh'
   ':!crates/thegn-core/src/migrate_brand.rs'
   ':!test/smoke.sh'
+  # CLI migration canaries deliberately seed and check the legacy directory.
+  ':!crates/thegn-host/tests/static_cli_support/mod.rs'
+  ':!crates/thegn-host/tests/static_commands_process.rs'
   ':!install.sh'
   ':!crates/thegn-host/src/main.rs'
   ':!flake.lock'

@@ -84,7 +84,7 @@ pub(crate) fn print_registration(shell: clap_complete::Shell, static_: bool) -> 
     }
     use std::io::Write;
     // best-effort: a closed pipe just means the reader got enough.
-    let _ = std::io::stdout().write_all(&buf);
+    std::io::stdout().write_all(&buf).unwrap_or(());
     Ok(())
 }
 
