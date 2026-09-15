@@ -11,3 +11,7 @@
 - [x] Run combined host monitor and model equality tests in coordinated build graph.
 - [x] Complete primary code review and independent adversarial review/revisions.
 - [ ] Complete combined source/spec/format gates and reviewed local-main landing.
+- [ ] THE-640: Run the focused native host monitor/view checks and record no live process actions.
+- [ ] THE-640: Run and retain the old-comparator counterfactual in its separate private clone.
+- [ ] THE-640: Complete independent adversarial review of the direction, tree, filter, and confirmation evidence.
+- [ ] THE-640: Complete reviewed local-main landing and reconcile the issue/delivery records.
