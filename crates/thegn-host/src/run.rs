@@ -8436,8 +8436,9 @@ async fn event_loop<T: Terminal>(
                         // failed best-effort persist must not change the spawn).
                         let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
                             .unwrap_or_else(|| terminal_launch_for(&name));
-                        let spec = crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox);
-                        Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)
+                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                            .map_err(spec_err)
                     } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
                         // Non-local env, failover off, known-down (token unset /
                         // exec cooldown): halt rather than degrade to host.

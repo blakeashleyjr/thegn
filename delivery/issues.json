@@ -378,6 +378,13 @@
       ]
     },
     {
+      "issue": "THE-247",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "validate-sandbox-volume-sources"
+      ]
+    },
+    {
       "issue": "THE-286",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [

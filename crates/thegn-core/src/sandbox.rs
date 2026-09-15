@@ -557,6 +557,101 @@ pub struct SandboxSpec {
     pub daemon_persistent: bool,
 }
 
+/// Why a programmatic/configured named volume was refused. The error carries
+/// only bounded metadata: it never retains or prints the source string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeNameReason {
+    Empty,
+    TooShort,
+    InvalidFirstByte,
+    InvalidByte,
+}
+
+impl std::fmt::Display for VolumeNameReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::Empty => "empty",
+            Self::TooShort => "minimum-two",
+            Self::InvalidFirstByte => "first-byte",
+            Self::InvalidByte => "character",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// A bounded, redacted refusal for one `SandboxSpec.volumes` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeAdmissionError {
+    pub pair_index: usize,
+    pub name_len: usize,
+    pub reason: VolumeNameReason,
+}
+
+impl std::fmt::Display for VolumeAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sandbox volume refused (pair {}; {} bytes; reason {})",
+            self.pair_index, self.name_len, self.reason
+        )
+    }
+}
+
+impl std::error::Error for VolumeAdmissionError {}
+
+/// The portable Thegn named-volume lexical policy. A source must begin with
+/// ASCII alphanumeric, be at least two bytes, and contain only ASCII letters,
+/// digits, `_`, `-`, or `.`. This rejects bind/path and option syntax without
+/// filesystem access or path normalization.
+pub fn validate_volume_name(name: &str) -> Result<(), VolumeAdmissionError> {
+    validate_volume_name_at(0, name)
+}
+
+fn validate_volume_name_at(pair_index: usize, name: &str) -> Result<(), VolumeAdmissionError> {
+    let error = |reason| VolumeAdmissionError {
+        pair_index,
+        name_len: name.len(),
+        reason,
+    };
+    if name.is_empty() {
+        return Err(error(VolumeNameReason::Empty));
+    }
+    if name.len() < 2 {
+        return Err(error(VolumeNameReason::TooShort));
+    }
+    if !name.as_bytes()[0].is_ascii_alphanumeric() {
+        return Err(error(VolumeNameReason::InvalidFirstByte));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(error(VolumeNameReason::InvalidByte));
+    }
+    Ok(())
+}
+
+/// Admit the fully composed spec before any backend argv, secret-file, VPN, or
+/// container side effect. `None` remains the separate disabled/host sentinel.
+pub fn admit_volumes(spec: &SandboxSpec) -> Result<(), VolumeAdmissionError> {
+    admit_volume_sources(spec.volumes.iter().map(|(name, _dest)| name.as_str()))
+}
+
+/// Admit configured volume sources before backend resolution. This is kept
+/// separate from [`admit_volumes`] because a resolver may return `None`, in
+/// which case there is no [`SandboxSpec`] to validate before the caller's host
+/// fallback. The caller decides whether the configured sandbox is enabled;
+/// an explicit `none`/disabled configuration remains its own host policy.
+pub fn admit_volume_sources<'a, I>(sources: I) -> Result<(), VolumeAdmissionError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for (pair_index, name) in sources.into_iter().enumerate() {
+        validate_volume_name_at(pair_index, name)?;
+    }
+    Ok(())
+}
+
 impl SandboxSpec {
     /// The aggregated [`Capabilities`](crate::capabilities::Capabilities) of this
     /// resolved spec — what it can project/enforce/observe/snapshot — so callers
@@ -1592,6 +1687,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
+    admit_volumes(spec)?;
     if !spec.backend.is_oci() {
         return Ok(());
     }
@@ -1643,7 +1739,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         "--name".into(),
         spec.name.clone(),
     ]);
-    argv.extend(oci_create_opts(spec));
+    argv.extend(oci_create_opts(spec)?);
     argv.push(effective_image(spec));
     argv.extend(["sleep".into(), "infinity".into()]);
     // Keep the create's stderr: it is the only place the runtime says WHY, and
@@ -1694,7 +1790,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             "--name".into(),
             spec.name.clone(),
         ]);
-        retry.extend(oci_create_opts_with_keep_id(spec, false));
+        retry.extend(oci_create_opts_with_keep_id(spec, false)?);
         retry.push(effective_image(spec));
         retry.extend(["sleep".into(), "infinity".into()]);
         run_control_owned(spec, &retry, RUN_TIMEOUT);
@@ -1840,10 +1936,12 @@ pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
     });
 }
 
-/// The full argv to exec for an interactive pane running `inner` (a shell command
-/// string, e.g. `${SHELL:-/bin/sh} -l` or `claude`). Wraps the backend invocation
-/// in the transport (mosh/ssh) when remote.
-pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
+/// Build the full argv for an interactive pane running `inner` (a shell command
+/// string, e.g. `${SHELL:-/bin/sh} -l` or `claude`). Callers must propagate a
+/// volume refusal; it must never become host fallback or a shell shim. The
+/// backend invocation is wrapped in mosh/ssh when the placement is remote.
+pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Result<Vec<String>, VolumeAdmissionError> {
+    admit_volumes(spec)?;
     let script = wrap_script(spec, inner);
     // A compose-backed spec with a named service attaches through
     // `docker compose exec <service>` — no container-name guessing.
@@ -1859,7 +1957,7 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
     // Cap the pane's CPU on host-toolchain backends (no-op unless configured; see
     // [`crate::sandbox_cpucap`]). OCI/Systemd cap inline in their backend argv.
     let backend_argv = crate::sandbox_cpucap::wrap_pane_argv(spec, backend_argv);
-    spec.placement.interactive_argv(&backend_argv)
+    Ok(spec.placement.interactive_argv(&backend_argv))
 }
 
 /// Compose init-script + safe.directory + devenv into the `sh -lc` body that the
@@ -2218,7 +2316,8 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
 
 /// OCI `run` options shared by the keep-alive container: mounts, network, env,
 /// and uid mapping so bind-mounted files stay host-owned.
-fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
+fn oci_create_opts(spec: &SandboxSpec) -> Result<Vec<String>, VolumeAdmissionError> {
+    admit_volumes(spec)?;
     let mut v = Vec::new();
     // Ownership marker: every container thegn creates carries `thegn.managed`,
     // so container-management (the Containers tab, `sandbox prune`) has one label
@@ -2425,7 +2524,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
              network namespace; publish them on the sidecar instead.",
         );
     }
-    v
+    Ok(v)
 }
 
 /// When a VPN sidecar owns this worktree's network namespace (`sidecar`/`proxy`
@@ -2440,7 +2539,11 @@ fn vpn_sidecar_join(spec: &SandboxSpec) -> Option<String> {
 
 /// Like [`oci_create_opts`] but lets the caller suppress Podman's
 /// `--userns keep-id` flag for the rootless-fallback retry path.
-fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String> {
+fn oci_create_opts_with_keep_id(
+    spec: &SandboxSpec,
+    keep_id: bool,
+) -> Result<Vec<String>, VolumeAdmissionError> {
+    admit_volumes(spec)?;
     let mut v = Vec::new();
     match spec.backend {
         Backend::Podman if keep_id => {
@@ -2466,7 +2569,7 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
     // All other opts (network, mounts, env, volumes, gpu, limits, ports) are
     // identical to oci_create_opts — delegate by temporarily re-routing:
     // build via oci_create_opts and strip the userns flag if present.
-    let mut full = oci_create_opts(spec);
+    let mut full = oci_create_opts(spec)?;
     if spec.backend == Backend::Podman && !keep_id {
         // Drop "--userns" and "keep-id" (two consecutive entries).
         let mut out = Vec::with_capacity(full.len());
@@ -2483,9 +2586,9 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
             skip = false;
             out.push(item);
         }
-        out
+        Ok(out)
     } else {
-        full
+        Ok(full)
     }
 }
 

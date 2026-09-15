@@ -143,7 +143,7 @@ pub(crate) fn terminal_launch_spec(
     cfg: &thegn_core::config::Config,
     connection: &str,
     sandbox_backend: &str,
-) -> crate::agent::LaunchSpec {
+) -> anyhow::Result<crate::agent::LaunchSpec> {
     let (cmd, args) = pane_shell_argv(cfg, connection);
     let mut argv = vec![cmd];
     argv.extend(args);
@@ -155,12 +155,21 @@ pub(crate) fn terminal_launch_spec(
     // opens SQLite, runs a git subprocess, and probes backends, which is why
     // every caller of this builder runs off-thread.
     let backend = sandbox_backend.trim();
-    if connection.is_empty()
-        && !backend.is_empty()
-        && backend != "host"
-        && backend != "none"
-        && let Some(wrapped) = sandbox_wrap_shell(cfg, backend, &argv)
-    {
+    if connection.is_empty() && !backend.is_empty() && backend != "host" && backend != "none" {
+        let wrapped = match sandbox_wrap_shell(cfg, backend, &argv) {
+            Err(error) => return Err(anyhow::Error::new(error).context("sandbox entry refused")),
+            Ok(Some(wrapped)) => wrapped,
+            Ok(None) => {
+                return Ok(crate::agent::LaunchSpec {
+                    argv: cap_local_shell(connection, argv),
+                    cwd: None,
+                    env: vec![],
+                    backend: "host".to_string(),
+                    warnings: vec![],
+                    degraded: false,
+                });
+            }
+        };
         // The label comes from the argv we are about to exec, NEVER from the
         // request. `sandbox_wrap_shell` resolves through the backend chain, so a
         // requested runtime that isn't running (no podman machine, dockerd down)
@@ -168,21 +177,21 @@ pub(crate) fn terminal_launch_spec(
         // what made a bare `sh -lc` claim to be rootless podman.
         let truth = thegn_core::sandbox_truth::reconcile(backend, &wrapped);
         if !truth.degraded {
-            return crate::agent::LaunchSpec {
+            return Ok(crate::agent::LaunchSpec {
                 argv: wrapped,
                 cwd: None,
                 env: vec![],
                 backend: truth.label,
                 warnings: vec![],
                 degraded: false,
-            };
+            });
         }
         // Containment was asked for and not delivered: fall through to the plain
         // host shell, labelled `host`, carrying the reason so the pane can say so.
         if let Some(w) = truth.warning.as_deref() {
             thegn_core::msg::warn(w);
         }
-        return crate::agent::LaunchSpec {
+        return Ok(crate::agent::LaunchSpec {
             // Uncontained, but still capped — see `cap_local_shell`.
             argv: cap_local_shell(connection, argv),
             cwd: None,
@@ -190,16 +199,16 @@ pub(crate) fn terminal_launch_spec(
             backend: truth.label,
             warnings: truth.warning.into_iter().collect(),
             degraded: true,
-        };
+        });
     }
-    crate::agent::LaunchSpec {
+    Ok(crate::agent::LaunchSpec {
         argv: cap_local_shell(connection, argv),
         cwd: None,
         env: vec![],
         backend: "host".to_string(),
         warnings: vec![],
         degraded: false,
-    }
+    })
 }
 
 /// Apply the resource ceiling to a terminal pane that is running **uncontained**
@@ -224,9 +233,10 @@ fn cap_local_shell(connection: &str, argv: Vec<String>) -> Vec<String> {
 /// Build the sandbox-wrapping argv for a local terminal shell: force the chosen
 /// `backend` into a [`thegn_core::sandbox::SandboxSpec`] anchored at `$HOME`
 /// and `exec` the shell inside it (via
-/// [`thegn_core::sandbox::enter_argv`]). Returns `None` — so the caller falls
-/// back to a plain host shell — when the backend name is unknown or the spec
-/// can't be built (e.g. sandboxing disabled). No provisioning happens here, but
+/// [`thegn_core::sandbox::enter_argv`]). Returns `Ok(None)` — so the caller
+/// falls back to a plain host shell — when the backend name is unknown or the
+/// spec can't be built (e.g. sandboxing disabled); invalid volume input is an
+/// error and becomes a visible refusal at the caller. No provisioning happens here, but
 /// this is NOT loop-safe: `GitLoc::for_worktree` opens + reads SQLite (up to
 /// the 5s busy-timeout under a writer), `resolve_placed` shells out to
 /// `git rev-parse`, and backend availability probing can run
@@ -236,21 +246,31 @@ fn sandbox_wrap_shell(
     cfg: &thegn_core::config::Config,
     backend: &str,
     shell_argv: &[String],
-) -> Option<Vec<String>> {
-    let be = thegn_core::config::SandboxBackend::from_str_validated(backend).ok()?;
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+) -> Result<Option<Vec<String>>, thegn_core::sandbox::VolumeAdmissionError> {
+    // Invalid configured sources remain a refusal even when HOME or the
+    // requested backend is unavailable; neither may produce a host fallback.
+    thegn_core::sandbox::admit_volume_sources(cfg.sandbox.volumes.keys().map(String::as_str))?;
+    let Ok(be) = thegn_core::config::SandboxBackend::from_str_validated(backend) else {
+        return Ok(None);
+    };
+    let home = match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+        Some(home) => home,
+        None => return Ok(None),
+    };
     let mut sb = cfg.sandbox.clone();
     sb.enabled = true;
     sb.backend = be;
     let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&home));
     let name = thegn_core::sandbox::container_name(&home);
-    let mut spec = thegn_core::sandbox::resolve_placed(
+    let Some(mut spec) = thegn_core::sandbox::resolve_placed(
         &sb,
         &loc,
         &name,
         sb.profile,
         thegn_core::placement::Placement::Local,
-    )?;
+    ) else {
+        return Ok(None);
+    };
     // Terminal-connection tabs are center panes routed through the pane daemon,
     // so a local bwrap terminal must drop `--die-with-parent` to survive UI
     // detach (see the daemon-persistent gate in `sandbox::enter_argv`).
@@ -258,7 +278,7 @@ fn sandbox_wrap_shell(
     // `enter_argv` execs `inner` as the pane's foreground program; the shell
     // argv (path + login flags) is the interactive shell that owns the pane.
     let inner = shell_words_join(shell_argv);
-    Some(thegn_core::sandbox::enter_argv(&spec, &inner))
+    Ok(Some(thegn_core::sandbox::enter_argv(&spec, &inner)?))
 }
 
 /// Join a shell argv into a single command string for `sh -lc` execution,
@@ -1242,21 +1262,22 @@ mod tests {
     fn terminal_launch_spec_builds_ssh_mosh_and_local_argv() {
         let cfg = thegn_core::config::Config::default();
 
-        let ssh = terminal_launch_spec(&cfg, "ssh user@host", "");
+        let ssh = terminal_launch_spec(&cfg, "ssh user@host", "").expect("valid volume names");
         assert_eq!(ssh.argv, vec!["ssh".to_string(), "user@host".to_string()]);
         assert_eq!(ssh.backend, "host");
         assert!(ssh.cwd.is_none());
 
         // A bare target (no "ssh " prefix) is still treated as an ssh target.
-        let bare = terminal_launch_spec(&cfg, "user@host", "");
+        let bare = terminal_launch_spec(&cfg, "user@host", "").expect("valid volume names");
         assert_eq!(bare.argv, vec!["ssh".to_string(), "user@host".to_string()]);
 
-        let mosh = terminal_launch_spec(&cfg, "mosh user@host", "");
+        let mosh = terminal_launch_spec(&cfg, "mosh user@host", "").expect("valid volume names");
         assert_eq!(mosh.argv, vec!["mosh".to_string(), "user@host".to_string()]);
 
         // A target carrying flags (registered host on a non-default port) splits
         // into distinct argv entries, not one mangled hostname.
-        let ported = terminal_launch_spec(&cfg, "ssh -p 2222 user@host", "");
+        let ported =
+            terminal_launch_spec(&cfg, "ssh -p 2222 user@host", "").expect("valid volume names");
         assert_eq!(
             ported.argv,
             vec![
@@ -1268,16 +1289,17 @@ mod tests {
         );
 
         // Empty connection → a local interactive shell (argv[0] is env-dependent).
-        let local = terminal_launch_spec(&cfg, "", "");
+        let local = terminal_launch_spec(&cfg, "", "").expect("valid volume names");
         assert!(!local.argv.is_empty());
         assert_eq!(local.backend, "host");
 
         // `host`/`none` are no-op backends: still a plain host shell.
-        let host = terminal_launch_spec(&cfg, "", "host");
+        let host = terminal_launch_spec(&cfg, "", "host").expect("valid volume names");
         assert_eq!(host.backend, "host");
 
         // A remote terminal is never wrapped locally even with a backend set.
-        let remote_wrapped = terminal_launch_spec(&cfg, "ssh user@host", "bwrap");
+        let remote_wrapped =
+            terminal_launch_spec(&cfg, "ssh user@host", "bwrap").expect("valid volume names");
         assert_eq!(remote_wrapped.argv[0], "ssh");
         assert_eq!(remote_wrapped.backend, "host");
     }
@@ -1295,7 +1317,7 @@ mod tests {
         // sandbox backends happen to be installed on the host.
         let mut cfg = thegn_core::config::Config::default();
         cfg.sandbox.enabled = true;
-        let spec = terminal_launch_spec(&cfg, "", "bwrap");
+        let spec = terminal_launch_spec(&cfg, "", "bwrap").expect("valid volume names");
         assert!(!spec.argv.is_empty());
         // When bwrap is the runtime that actually resolved, it must front the
         // wrapping argv (the shell is exec'd inside) — modulo the optional
@@ -1329,6 +1351,18 @@ mod tests {
                 spec.argv
             );
         }
+    }
+
+    #[test]
+    fn terminal_invalid_configured_volume_refuses_before_no_spec_fallback() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.sandbox
+            .volumes
+            .insert("/tmp/state".into(), "/mnt/state".into());
+        let error = sandbox_wrap_shell(&cfg, "bwrap", &["/bin/sh".into()])
+            .expect_err("invalid configured volume must refuse before resolution");
+        assert_eq!(error.name_len, "/tmp/state".len());
+        assert!(!error.to_string().contains("/tmp/state"));
     }
 
     #[test]

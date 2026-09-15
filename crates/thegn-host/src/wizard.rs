@@ -1460,7 +1460,7 @@ pub fn run_worker(
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     let loc = GitLoc::from_db(&path_s, None);
-    let spec = crate::agent::compose_spec(
+    let spec = match crate::agent::compose_spec(
         cfg,
         &path_s,
         Some(&branch),
@@ -1468,7 +1468,16 @@ pub fn run_worker(
         &loc,
         &sandbox,
         crate::agent::LaunchExtras::default(),
-    );
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            fail(
+                CreateStep::Register,
+                format!("sandbox launch refused: {error}"),
+            );
+            return;
+        }
+    };
     tracing::info!(
         target: "thegn::worktree_create",
         since_ms = started.elapsed().as_millis() as u64,

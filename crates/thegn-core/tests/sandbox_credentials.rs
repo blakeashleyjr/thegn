@@ -81,7 +81,7 @@ fn e1_env_overrides_inject_scoped_key() {
     ensure(&spec).expect("ensure failed");
 
     // Run a command inside the container via enter_argv to pick up env_overrides.
-    let argv = enter_argv(&spec, "echo $ANTHROPIC_API_KEY");
+    let argv = enter_argv(&spec, "echo $ANTHROPIC_API_KEY").expect("valid volume names");
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
@@ -108,7 +108,7 @@ fn e2_env_block_strips_passthrough_key() {
     spec.env_block.push("ANTHROPIC_API_KEY".into());
     ensure(&spec).expect("ensure failed");
 
-    let argv = enter_argv(&spec, "echo ${ANTHROPIC_API_KEY:-ABSENT}");
+    let argv = enter_argv(&spec, "echo ${ANTHROPIC_API_KEY:-ABSENT}").expect("valid volume names");
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()
@@ -136,7 +136,7 @@ fn e3_env_override_beats_passthrough() {
         .insert("MY_KEY".into(), "override-value".into());
     ensure(&spec).expect("ensure failed");
 
-    let argv = enter_argv(&spec, "echo $MY_KEY");
+    let argv = enter_argv(&spec, "echo $MY_KEY").expect("valid volume names");
     let out = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()

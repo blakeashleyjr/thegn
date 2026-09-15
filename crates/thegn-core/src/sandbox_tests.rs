@@ -141,7 +141,7 @@ fn oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports() {
         &s.name,
         SandboxProfile::Hardened,
     );
-    let opts = oci_create_opts(&s);
+    let opts = oci_create_opts(&s).expect("valid volume names");
     let joined = opts.join(" ");
     // Joins the sidecar netns...
     assert!(
@@ -159,7 +159,7 @@ fn oci_opts_in_container_mode_adds_net_admin_and_tun() {
     let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
     cfg.mode = VpnMode::InContainer;
     s.vpn = build_vpn_spec(&cfg, &s.name, SandboxProfile::Hardened);
-    let opts = oci_create_opts(&s);
+    let opts = oci_create_opts(&s).expect("valid volume names");
     let joined = opts.join(" ");
     // in_container does NOT join a sidecar netns; it keeps normal networking
     // and adds the tunnel caps to the worktree container itself.
@@ -174,7 +174,7 @@ fn oci_opts_without_vpn_keep_normal_network_and_ports() {
     s.network = Network::Nat;
     s.ports = vec!["8080:8080".into()];
     assert!(s.vpn.is_none());
-    let opts = oci_create_opts(&s);
+    let opts = oci_create_opts(&s).expect("valid volume names");
     // No container: join; ports published as usual.
     assert!(!opts.join(" ").contains("container:"));
     assert!(opts.windows(2).any(|w| w == ["-p", "8080:8080"]));
@@ -283,7 +283,8 @@ fn oci_prefix_injects_remote_daemon_connection() {
 
 #[test]
 fn podman_exec_preserves_paths() {
-    let argv = enter_argv(&spec(Backend::Podman), "${SHELL:-/bin/sh} -l");
+    let argv =
+        enter_argv(&spec(Backend::Podman), "${SHELL:-/bin/sh} -l").expect("valid volume names");
     assert_eq!(argv[0], "podman");
     assert!(argv.contains(&"exec".to_string()));
     assert!(argv.contains(&"thegn-repo-feat".to_string()));
@@ -301,7 +302,7 @@ fn bwrap_binds_worktree_and_gitdir() {
     let mut s = spec(Backend::Bwrap);
     s.image = None;
     s.file_access = FileAccess::Worktree;
-    let argv = enter_argv(&s, "claude");
+    let argv = enter_argv(&s, "claude").expect("valid volume names");
     assert_eq!(argv[0], "bwrap");
     let joined = argv.join(" ");
     assert!(!joined.contains("--ro-bind / /"));
@@ -316,7 +317,9 @@ fn bwrap_die_with_parent_is_gated_by_daemon_persistent() {
     // Default (in-process / chrome pane): the sandbox dies with the compositor.
     let mut ephemeral = spec(Backend::Bwrap);
     ephemeral.image = None;
-    let joined = enter_argv(&ephemeral, "claude").join(" ");
+    let joined = enter_argv(&ephemeral, "claude")
+        .expect("valid volume names")
+        .join(" ");
     assert!(joined.contains("--unshare-pid"), "pid ns is unconditional");
     assert!(
         joined.contains("--die-with-parent"),
@@ -329,7 +332,9 @@ fn bwrap_die_with_parent_is_gated_by_daemon_persistent() {
     let mut persistent = spec(Backend::Bwrap);
     persistent.image = None;
     persistent.daemon_persistent = true;
-    let joined = enter_argv(&persistent, "claude").join(" ");
+    let joined = enter_argv(&persistent, "claude")
+        .expect("valid volume names")
+        .join(" ");
     assert!(
         joined.contains("--unshare-pid"),
         "pid ns stays even for daemon panes: {joined}"
@@ -344,7 +349,7 @@ fn bwrap_die_with_parent_is_gated_by_daemon_persistent() {
 fn file_access_none_removes_workdir() {
     let mut s = spec(Backend::Podman);
     s.file_access = FileAccess::None;
-    let argv = enter_argv(&s, "claude");
+    let argv = enter_argv(&s, "claude").expect("valid volume names");
     let joined = argv.join(" ");
     assert!(!joined.contains("--workdir"));
 }
@@ -354,7 +359,7 @@ fn oci_create_opts_map_userns_and_mounts() {
     // GH_TOKEN=abc is synthetic here (its value doesn't match the ambient
     // env) so it stays inline `-e`; unset it to keep that deterministic.
     let _env = crate::testenv::EnvGuard::unset(&["GH_TOKEN"]);
-    let opts = oci_create_opts(&spec(Backend::Podman));
+    let opts = oci_create_opts(&spec(Backend::Podman)).expect("valid volume names");
     let j = opts.join(" ");
     assert!(j.contains("--userns keep-id"));
     assert!(j.contains("-v /wt/feat:/wt/feat"));
@@ -371,7 +376,7 @@ fn apple_create_opts_omit_flags_its_run_rejects() {
     let mut a = spec(Backend::Apple);
     a.no_new_privileges = true;
     a.pids_limit = Some(512);
-    let j = oci_create_opts(&a).join(" ");
+    let j = oci_create_opts(&a).expect("valid volume names").join(" ");
     assert!(!j.contains("--security-opt"), "{j}");
     assert!(!j.contains("--pids-limit"), "{j}");
     // The flags Apple DOES accept must survive — this is a narrowing of two
@@ -379,7 +384,7 @@ fn apple_create_opts_omit_flags_its_run_rejects() {
     let mut a2 = spec(Backend::Apple);
     a2.read_only_root = true;
     a2.drop_capabilities = vec!["ALL".into()];
-    let j2 = oci_create_opts(&a2).join(" ");
+    let j2 = oci_create_opts(&a2).expect("valid volume names").join(" ");
     assert!(j2.contains("--read-only"), "{j2}");
     assert!(j2.contains("--cap-drop ALL"), "{j2}");
 
@@ -388,7 +393,7 @@ fn apple_create_opts_omit_flags_its_run_rejects() {
         let mut s = spec(b);
         s.no_new_privileges = true;
         s.pids_limit = Some(512);
-        let j = oci_create_opts(&s).join(" ");
+        let j = oci_create_opts(&s).expect("valid volume names").join(" ");
         assert!(j.contains("--security-opt no-new-privileges"), "{b:?}: {j}");
         assert!(j.contains("--pids-limit 512"), "{b:?}: {j}");
     }
@@ -436,6 +441,7 @@ fn oci_runtime_injected_only_for_oci_backends_when_set() {
     // Unset ⇒ no --runtime (daemon default).
     assert!(
         !oci_create_opts(&spec(Backend::Podman))
+            .expect("valid volume names")
             .join(" ")
             .contains("--runtime")
     );
@@ -443,16 +449,31 @@ fn oci_runtime_injected_only_for_oci_backends_when_set() {
     // Set on an OCI backend ⇒ `--runtime <value>` at create.
     let mut s = spec(Backend::Podman);
     s.oci_runtime = Some("runsc".into());
-    assert!(oci_create_opts(&s).join(" ").contains("--runtime runsc"));
+    assert!(
+        oci_create_opts(&s)
+            .expect("valid volume names")
+            .join(" ")
+            .contains("--runtime runsc")
+    );
 
     let mut k = spec(Backend::Docker);
     k.oci_runtime = Some("krun".into());
-    assert!(oci_create_opts(&k).join(" ").contains("--runtime krun"));
+    assert!(
+        oci_create_opts(&k)
+            .expect("valid volume names")
+            .join(" ")
+            .contains("--runtime krun")
+    );
 
     // A blank/whitespace value is treated as unset.
     let mut blank = spec(Backend::Podman);
     blank.oci_runtime = Some("  ".into());
-    assert!(!oci_create_opts(&blank).join(" ").contains("--runtime"));
+    assert!(
+        !oci_create_opts(&blank)
+            .expect("valid volume names")
+            .join(" ")
+            .contains("--runtime")
+    );
 }
 
 #[test]
@@ -473,7 +494,7 @@ fn oci_opts_never_bind_mount_host_dns_files() {
         ro: true,
         cache: false,
     });
-    let j = oci_create_opts(&s).join(" ");
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
     assert!(!j.contains("/etc/resolv.conf"), "resolv.conf mounted: {j}");
     assert!(!j.contains(":/etc/hosts"), "/etc/hosts mounted: {j}");
     // Real worktree mounts are untouched.
@@ -500,7 +521,7 @@ fn container_status_required_mounts_are_a_subset_of_created_mounts() {
         ro: true,
         cache: false,
     });
-    let emitted = oci_create_opts(&s).join(" ");
+    let emitted = oci_create_opts(&s).expect("valid volume names").join(" ");
     for m in s.mounts.iter().filter(|m| oci_emits_mount(m)) {
         // Every required host path must appear as a created -v source.
         assert!(
@@ -536,7 +557,7 @@ fn mosh_wraps_backend_over_ssh() {
         true,
         TransportKind::Mosh,
     ));
-    let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l");
+    let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l").expect("valid volume names");
     assert_eq!(argv[0], "mosh");
     assert!(argv.iter().any(|a| a.starts_with("--ssh=")));
     assert!(argv.iter().any(|a| a.contains("-p 2222")));
@@ -555,7 +576,7 @@ fn ssh_transport_uses_tty() {
         false,
         TransportKind::Ssh,
     ));
-    let argv = enter_argv(&s, "claude");
+    let argv = enter_argv(&s, "claude").expect("valid volume names");
     assert_eq!(argv[0], "ssh");
     assert!(argv.contains(&"-t".to_string()));
     assert!(argv.last().unwrap().contains("bwrap"));
@@ -576,7 +597,7 @@ fn bwrap_local_keeps_host_matching_env_off_argv() {
         ("PATH".into(), std::env::var("PATH").unwrap()),
         ("THEGN_SANDBOX".into(), "1".into()),
     ];
-    let argv = enter_argv(&s, "true");
+    let argv = enter_argv(&s, "true").expect("valid volume names");
     assert!(!argv.contains(&"PATH".to_string()));
     let i = argv.iter().position(|a| a == "--setenv").unwrap();
     assert_eq!(argv[i + 1], "THEGN_SANDBOX");
@@ -589,7 +610,9 @@ fn bwrap_local_keeps_host_matching_env_off_argv() {
         false,
         TransportKind::Ssh,
     ));
-    let remote = enter_argv(&s, "true").join(" ");
+    let remote = enter_argv(&s, "true")
+        .expect("valid volume names")
+        .join(" ");
     assert!(remote.contains("--setenv PATH"));
 }
 
@@ -606,7 +629,7 @@ fn bwrap_local_omits_ambient_matching_marker() {
         ("THEGN_SANDBOX".into(), "1".into()),
         ("THEGN_SYNTH_MARKER".into(), "x".into()),
     ];
-    let argv = enter_argv(&s, "true");
+    let argv = enter_argv(&s, "true").expect("valid volume names");
     // Host-matching marker inherited, not on argv.
     assert!(!argv.contains(&"THEGN_SANDBOX".to_string()));
     // Synthetic pair (absent from host env) rides --setenv.
@@ -634,12 +657,80 @@ fn test_sandbox_all_oci_flags_applied() {
     };
     s.volumes = vec![("data-vol".into(), "/mnt/data".into())];
 
-    let opts = oci_create_opts(&s);
+    let opts = oci_create_opts(&s).expect("valid volume names");
     let j_opts = opts.join(" ");
     assert!(j_opts.contains("--device nvidia.com/gpu=all"));
     assert!(j_opts.contains("--cpus 2"));
     assert!(j_opts.contains("--memory 4GB"));
     assert!(j_opts.contains("-v data-vol:/mnt/data"));
+}
+
+#[test]
+fn named_volume_admission_accepts_existing_names_and_rejects_paths() {
+    for valid in [
+        "thegn-nix-store",
+        "thegn-cargo",
+        "nix-store",
+        "cargo",
+        "data.vol",
+    ] {
+        assert!(validate_volume_name(valid).is_ok(), "valid name: {valid}");
+    }
+    for invalid in [
+        "",
+        "a",
+        ".",
+        "..",
+        ".cache",
+        "-cache",
+        "/tmp/state",
+        "./state",
+        "../state",
+        "state/sub",
+        r"state\sub",
+        "C:/state",
+        r"C:\state",
+        r"\\server\share",
+        "~/state",
+        "name:ro",
+        "name,ro",
+        "name\tvalue",
+        "name\0value",
+        "é-cache",
+    ] {
+        let error = validate_volume_name(invalid).expect_err(invalid);
+        let rendered = error.to_string();
+        assert!(!rendered.contains("/tmp/state"));
+        assert!(!rendered.contains("state\\sub"));
+        assert!(!rendered.contains("name:ro"));
+        assert!(!rendered.contains("name\\tvalue"));
+        assert!(!rendered.contains("é-cache"));
+    }
+}
+
+#[test]
+fn named_volume_admission_reports_pair_index_without_host_fallback() {
+    let mut s = spec(Backend::Podman);
+    s.volumes = vec![
+        ("ok-volume".into(), "/mnt/ok".into()),
+        ("/tmp/state".into(), "/mnt/bad".into()),
+    ];
+    let error = admit_volumes(&s).expect_err("path-like source must refuse");
+    assert_eq!(error.pair_index, 1);
+    assert_eq!(error.name_len, "/tmp/state".len());
+    let fallible = enter_argv(&s, "true").expect_err("direct entry must refuse");
+    assert_eq!(fallible, error);
+    assert!(!fallible.to_string().contains("/tmp/state"));
+    assert!(oci_create_opts_with_keep_id(&s, false).is_err());
+}
+
+#[test]
+fn named_volume_admission_precedes_oci_ensure_without_side_effects() {
+    let mut s = spec(Backend::Podman);
+    s.volumes = vec![("/tmp/state".into(), "/mnt/state".into())];
+    let error = ensure(&s).expect_err("invalid volume must stop before OCI ensure");
+    assert!(error.downcast_ref::<VolumeAdmissionError>().is_some());
+    assert!(!error.to_string().contains("/tmp/state"));
 }
 
 #[test]
@@ -686,7 +777,7 @@ fn integration_test_sandbox_net_and_file() {
     let res = ensure(&s);
     assert!(res.is_ok(), "Failed to start container: {:?}", res);
 
-    let argv = enter_argv(&s, "python3 -m http.server 8081");
+    let argv = enter_argv(&s, "python3 -m http.server 8081").expect("valid volume names");
 
     let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -804,7 +895,7 @@ fn remote_none_bare_shell_cds_and_moshes() {
         false,
         TransportKind::Mosh,
     ));
-    let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l");
+    let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l").expect("valid volume names");
     assert_eq!(argv[0], "mosh");
     let body = argv.last().unwrap();
     assert!(body.contains("cd /wt/feat"));
@@ -816,7 +907,7 @@ fn devenv_wraps_inner() {
     let mut s = spec(Backend::Bwrap);
     s.image = None;
     s.devenv = true;
-    let argv = enter_argv(&s, "claude");
+    let argv = enter_argv(&s, "claude").expect("valid volume names");
     assert_eq!(argv.last().unwrap(), "exec devenv shell -- claude");
 }
 
@@ -1087,7 +1178,7 @@ fn remote_enter_argv_wraps_with_mosh() {
     ));
     // With a real image + OCI backend on a remote, enter_argv should
     // produce a mosh wrapper.
-    let argv = enter_argv(&s, "bash -l");
+    let argv = enter_argv(&s, "bash -l").expect("valid volume names");
     assert_eq!(argv[0], "mosh", "outer command must be mosh: {argv:?}");
     // The remote host must appear in the argv.
     assert!(argv.iter().any(|a| a == "devbox"), "host missing: {argv:?}");
@@ -1102,7 +1193,7 @@ fn remote_enter_argv_wraps_with_ssh() {
         true,
         TransportKind::Ssh,
     ));
-    let argv = enter_argv(&s, "bash -l");
+    let argv = enter_argv(&s, "bash -l").expect("valid volume names");
     // SSH transport: first arg is ssh, not mosh.
     assert_eq!(argv[0], "ssh", "outer command must be ssh: {argv:?}");
     assert!(argv.iter().any(|a| a == "devbox"), "host missing: {argv:?}");
@@ -1158,7 +1249,7 @@ fn oci_opts_emit_sealed_hardening() {
     s.no_new_privileges = true;
     s.pids_limit = Some(256);
     s.drop_capabilities = vec!["ALL".into()];
-    let j = oci_create_opts(&s).join(" ");
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
     assert!(j.contains("--read-only"), "{j}");
     assert!(j.contains("--tmpfs /tmp"), "{j}");
     assert!(j.contains("--cap-drop ALL"), "{j}");
@@ -1172,7 +1263,7 @@ fn oci_opts_open_profile_adds_no_hardening() {
     // `open` (all knobs off, as the spec() helper builds) must reproduce
     // today's argv — none of the hardening flags may appear.
     let s = spec(Backend::Podman);
-    let j = oci_create_opts(&s).join(" ");
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
     assert!(!j.contains("--read-only"), "{j}");
     assert!(!j.contains("--cap-drop"), "{j}");
     assert!(!j.contains("--security-opt"), "{j}");
@@ -1358,7 +1449,7 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
         ("GH_TOKEN".into(), "ghp_secret".into()), // matches host ⇒ secret
         ("THEGN_SANDBOX".into(), "1".into()),     // synthetic ⇒ inline
     ];
-    let opts = oci_create_opts(&s);
+    let opts = oci_create_opts(&s).expect("valid volume names");
     let j = opts.join(" ");
     // The token value never appears on the argv.
     assert!(
@@ -1449,7 +1540,7 @@ fn remote_oci_keeps_all_env_inline_as_carrier() {
         false,
         TransportKind::Ssh,
     ));
-    let j = oci_create_opts(&s).join(" ");
+    let j = oci_create_opts(&s).expect("valid volume names").join(" ");
     assert!(
         j.contains("-e GH_TOKEN=ghp_secret"),
         "remote keeps env inline: {j}"
@@ -1506,7 +1597,7 @@ fn host_toolchain_mounts_are_withheld_when_the_guest_abi_differs() {
     // Apple `container`: `-v /usr:/usr:ro` gives "failed to find target
     // executable sleep" and `-v /bin:/bin:ro` gives "Exec format error".
     let s = spec(Backend::Apple);
-    let joined = oci_create_opts(&s).join(" ");
+    let joined = oci_create_opts(&s).expect("valid volume names").join(" ");
     if crate::sandbox_backend::host_os() == crate::sandbox_backend::HostOs::Linux {
         // Same-ABI host: the injection is the whole point, so it must stay.
         return;
@@ -1583,7 +1674,7 @@ fn the_nix_daemon_socket_is_withheld_from_a_foreign_guest() {
     });
     s.devenv = true;
     s.devenv_path = Some("/nix/store/abc-devenv/bin/devenv".into());
-    let joined = oci_create_opts(&s).join(" ");
+    let joined = oci_create_opts(&s).expect("valid volume names").join(" ");
     // The devenv `/nix` bind is gated at emit time, so it must be absent here
     // even though the spec asks for it.
     assert!(

@@ -455,7 +455,17 @@ where
         thegn_core::util::sh_quote(&binary),
         thegn_core::util::sh_quote(&rustc),
     );
-    let argv = thegn_core::sandbox::enter_argv(&probe_spec, &check);
+    let argv = match thegn_core::sandbox::enter_argv(&probe_spec, &check) {
+        Ok(argv) => argv,
+        Err(error) => {
+            strip_sccache(spec, agent_env);
+            spec.mounts.truncate(mount_count_before_cache_policy);
+            return SandboxCacheDecision {
+                active: false,
+                reason: format!("sandbox volume admission refused for compiler cache: {error}"),
+            };
+        }
+    };
     if !probe(&argv) {
         strip_sccache(spec, agent_env);
         spec.mounts.truncate(mount_count_before_cache_policy);
@@ -958,7 +968,8 @@ mod tests {
             .expect("real cache smoke requires a resolvable bwrap sandbox");
         assert!(
             status_with_timeout(
-                &thegn_core::sandbox::enter_argv(&spec, "rustc --version >/dev/null"),
+                &thegn_core::sandbox::enter_argv(&spec, "rustc --version >/dev/null")
+                    .expect("valid volume names"),
                 Duration::from_secs(10),
             ),
             "real cache smoke requires the fully resolved repository sandbox to run"
@@ -990,7 +1001,8 @@ mod tests {
         );
         assert!(
             status_with_timeout(
-                &thegn_core::sandbox::enter_argv(&spec, &compile_twice),
+                &thegn_core::sandbox::enter_argv(&spec, &compile_twice)
+                    .expect("valid volume names"),
                 Duration::from_secs(20),
             ),
             "contained repeated compile did not produce a real sccache hit"
@@ -1007,7 +1019,8 @@ mod tests {
         );
         assert!(
             status_with_timeout(
-                &thegn_core::sandbox::enter_argv(&spec, &compiler_error),
+                &thegn_core::sandbox::enter_argv(&spec, &compiler_error)
+                    .expect("valid volume names"),
                 Duration::from_secs(10),
             ),
             "a genuine compiler error must remain a failure"
@@ -1028,7 +1041,7 @@ mod tests {
         );
         assert!(
             status_with_timeout(
-                &thegn_core::sandbox::enter_argv(&spec, &unreachable),
+                &thegn_core::sandbox::enter_argv(&spec, &unreachable).expect("valid volume names"),
                 Duration::from_secs(10),
             ),
             "the fail-soft wrapper must run rustc when sccache transport fails"
@@ -1065,7 +1078,8 @@ mod tests {
                  rustc --crate-name thegn_cache_off --crate-type rlib --emit=link \
                    --out-dir /tmp/thegn-cache-off-out /tmp/thegn-cache-off.rs && \
                  test -f /tmp/thegn-cache-off-out/libthegn_cache_off.rlib",
-            ),
+            )
+            .expect("valid volume names"),
             Duration::from_secs(10),
         ));
     }

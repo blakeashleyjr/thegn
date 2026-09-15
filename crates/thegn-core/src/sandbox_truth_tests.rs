@@ -100,7 +100,7 @@ fn argv_visible(b: Backend) -> bool {
 #[test]
 fn every_backend_round_trips() {
     for b in all_backends().into_iter().filter(|b| argv_visible(*b)) {
-        let argv = enter_argv(&spec(b), "zsh");
+        let argv = enter_argv(&spec(b), "zsh").expect("valid volume names");
         assert_eq!(
             observed(&argv),
             b,
@@ -123,7 +123,7 @@ fn every_backend_round_trips_through_the_cpu_cap() {
     // Applying the cap explicitly with a fixed mechanism keeps this
     // host-independent, so the case can be pinned rather than skipped.
     for b in all_backends().into_iter().filter(|b| argv_visible(*b)) {
-        let argv = enter_argv(&spec(b), "zsh");
+        let argv = enter_argv(&spec(b), "zsh").expect("valid volume names");
         let limits = SandboxLimits {
             cpu: Some("8".into()),
             memory: Some("24G".into()),
@@ -210,8 +210,8 @@ fn a_path_named_after_a_runtime_is_not_containment() {
 
 #[test]
 fn rootful_podman_is_distinguished_from_rootless() {
-    let rootless = enter_argv(&spec(Backend::Podman), "zsh");
-    let rootful = enter_argv(&spec(Backend::PodmanRootful), "zsh");
+    let rootless = enter_argv(&spec(Backend::Podman), "zsh").expect("valid volume names");
+    let rootful = enter_argv(&spec(Backend::PodmanRootful), "zsh").expect("valid volume names");
     assert_eq!(observed(&rootless), Backend::Podman);
     assert_eq!(observed(&rootful), Backend::PodmanRootful);
     assert_ne!(observed(&rootless), observed(&rootful));
@@ -276,7 +276,10 @@ fn reconcile_is_quiet_when_the_request_was_honoured() {
             .ok()
             .and_then(Backend::from_config)
             .unwrap();
-        let t = reconcile(name, &enter_argv(&spec(b), "zsh"));
+        let t = reconcile(
+            name,
+            &enter_argv(&spec(b), "zsh").expect("valid volume names"),
+        );
         assert_eq!(t.label, b.label(), "{name}");
         assert!(!t.degraded, "{name}");
         assert_eq!(t.warning, None, "{name}");
@@ -296,7 +299,10 @@ fn host_and_auto_requests_are_not_degradations() {
 
 #[test]
 fn falling_back_to_a_different_container_is_still_reported() {
-    let t = reconcile("docker", &enter_argv(&spec(Backend::Podman), "zsh"));
+    let t = reconcile(
+        "docker",
+        &enter_argv(&spec(Backend::Podman), "zsh").expect("valid volume names"),
+    );
     assert_eq!(t.label, "podman-rootless");
     assert!(t.degraded);
     assert!(t.warning.is_some_and(|w| w.contains("podman-rootless")));
@@ -307,7 +313,7 @@ fn windows_native_is_taken_at_its_word() {
     // Documented limit: their isolation is invisible to argv inspection, so
     // reconcile trusts the request rather than reporting a false "host".
     for b in [Backend::WinAppContainer, Backend::WinJobObject] {
-        let argv = enter_argv(&spec(b), "zsh");
+        let argv = enter_argv(&spec(b), "zsh").expect("valid volume names");
         assert_eq!(observed(&argv), Backend::None, "argv cannot show it");
         let t = reconcile(b.label(), &argv);
         assert_eq!(t.label, b.label());

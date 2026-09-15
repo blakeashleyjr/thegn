@@ -211,7 +211,7 @@ fn e3_compose_up_and_exec() {
     sandbox::ensure(&spec).expect("ensure (compose up) failed");
 
     // The pane-enter argv must route through `docker compose exec app`.
-    let argv = sandbox::enter_argv(&spec, "true");
+    let argv = sandbox::enter_argv(&spec, "true").expect("valid volume names");
     let joined = argv.join(" ");
     assert!(
         joined.contains("compose") && joined.contains("exec") && joined.contains("app"),

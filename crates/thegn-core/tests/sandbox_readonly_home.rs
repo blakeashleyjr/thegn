@@ -84,7 +84,9 @@ fn bwrap_ro_home_emits_ro_bind_worktree_stays_rw() {
         vec![ro("/home/tester"), rw("/home/tester/wt")],
         true,
     );
-    let joined = enter_argv(&spec, "exec claude").join(" ");
+    let joined = enter_argv(&spec, "exec claude")
+        .expect("valid volume names")
+        .join(" ");
     assert!(
         joined.contains("--ro-bind /home/tester /home/tester"),
         "expected read-only $HOME bind, got: {joined}"
@@ -108,7 +110,9 @@ fn bwrap_open_home_emits_rw_bind() {
         vec![rw("/home/tester"), rw("/home/tester/wt")],
         false,
     );
-    let joined = enter_argv(&spec, "exec claude").join(" ");
+    let joined = enter_argv(&spec, "exec claude")
+        .expect("valid volume names")
+        .join(" ");
     assert!(
         joined.contains("--bind /home/tester /home/tester"),
         "open profile must bind $HOME read-write: {joined}"
@@ -132,7 +136,9 @@ fn systemd_readonly_home_keeps_worktree_and_caches_writable() {
         ],
         true,
     );
-    let joined = enter_argv(&spec, "exec claude").join(" ");
+    let joined = enter_argv(&spec, "exec claude")
+        .expect("valid volume names")
+        .join(" ");
     assert!(
         joined.contains("ProtectHome=read-only"),
         "must lock $HOME read-only: {joined}"
