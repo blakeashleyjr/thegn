@@ -313,6 +313,10 @@ placement.pack_strategy
 placement.preset
 placement.spillover_envs
 placement.strictest_allowed_mode
+# plugins.api — existing per-plugin compatibility declaration, newly visible
+# to scalar coverage after its schema correction. There is no entry-addressable
+# ambient version override; keep it file-defined with the other manifest fields.
+plugins.api
 plugins.capabilities
 plugins.command
 plugins.cwd
