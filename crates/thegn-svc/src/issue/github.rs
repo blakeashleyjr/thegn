@@ -76,7 +76,9 @@ impl GitHubIssuesBackend {
     /// get to choose their own host.
     fn effective_repo(&self, filter_repo: Option<&str>) -> Result<Option<String>, IssueError> {
         self.validate_extra_flags()?;
-        let mut selected = filter_repo.map(str::to_owned);
+        let mut selected = filter_repo
+            .filter(|repo| !repo.is_empty())
+            .map(str::to_owned);
         let mut flags = self.extra_flags.iter();
         while let Some(flag) = flags.next() {
             if let Some(repo) = flag
@@ -306,6 +308,7 @@ impl IssueBackend for GitHubIssuesBackend {
         filter: &'a IssueFilter,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
+            let expected_host = self.effective_host(filter.repo.as_deref())?;
             let limit_str = filter.limit.to_string();
             let mut args: Vec<&str> = vec![
                 "issue",
@@ -333,7 +336,6 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            let expected_host = self.effective_host(filter.repo.as_deref())?;
             issues
                 .into_iter()
                 .map(|issue| gh_issue_to_domain_with_host(issue, expected_host.as_deref()))
@@ -344,6 +346,7 @@ impl IssueBackend for GitHubIssuesBackend {
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
             let (repo, number) = split_id(id)?;
+            let expected_host = self.host_for_repo(repo)?;
             let mut args: Vec<&str> = vec![
                 "issue",
                 "view",
@@ -365,7 +368,6 @@ impl IssueBackend for GitHubIssuesBackend {
             }
             let detail: GhIssueDetail =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            let expected_host = self.host_for_repo(repo)?;
             let comments = detail
                 .comments
                 .into_iter()
@@ -390,6 +392,7 @@ impl IssueBackend for GitHubIssuesBackend {
         draft: &'a IssueDraft,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
+            let expected_host = self.host_for_repo(None)?;
             let mut args = vec!["issue", "create", "--title", &draft.title];
             let body_val;
             if let Some(body) = &draft.body {
@@ -402,7 +405,6 @@ impl IssueBackend for GitHubIssuesBackend {
             // authority for the follow-up view; never downgrade malformed
             // output to a bare number or the process cwd.
             let url = self.gh(&args)?.trim().to_string();
-            let expected_host = self.host_for_repo(None)?;
             let (repo, number) = validated_repo_number_from_url(&url, expected_host.as_deref())?;
             let json = self.gh(&[
                 "issue",
@@ -426,6 +428,7 @@ impl IssueBackend for GitHubIssuesBackend {
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
             let (repo, number) = split_id(id)?;
+            let expected_host = self.host_for_repo(repo)?;
             // Scope every mutation to the issue's own repo — without `--repo`, `gh`
             // resolves against the process cwd and can close/edit the wrong repo's
             // issue #N.
@@ -458,7 +461,6 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            let expected_host = self.host_for_repo(repo)?;
             Ok(gh_issue_to_domain_with_host(gi, expected_host.as_deref())?)
         })
     }
@@ -469,6 +471,7 @@ impl IssueBackend for GitHubIssuesBackend {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
+            let expected_host = self.effective_host(None)?;
             let limit_str = limit.to_string();
             let mut args: Vec<&str> = vec![
                 "issue",
@@ -488,7 +491,6 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let issues: Vec<GhIssue> =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            let expected_host = self.effective_host(None)?;
             issues
                 .into_iter()
                 .map(|issue| gh_issue_to_domain_with_host(issue, expected_host.as_deref()))
