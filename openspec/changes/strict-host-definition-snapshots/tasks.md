@@ -57,7 +57,7 @@ this change is not an authority or issue-closure claim.
 
 The strict reader returns source-validity data. The additive composition API now
 checks the existing final configuration rules after THE-598 host augmentation;
-its implementation and current native gates remain pending review. It is a
+its reviewed implementation and native gates are complete as recorded above. It is a
 prerequisite for the new authority adapter, not completed launch permission.
 Host opening/absence handling (THE-603), external store compatibility (THE-604),
 launch adapter integration (THE-592) and runtime containment remain separate
