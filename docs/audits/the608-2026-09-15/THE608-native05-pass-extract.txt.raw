@@ -1,0 +1,13 @@
+Derived selective excerpt, not the complete native log.
+Source: 33c0db71a3efd91a5637be47fd2d353fd628056a
+Original log SHA256: 303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b
+        PASS [   0.527s] (1345/8465) thegn-core db_aux::merge_status_tests::exact_replacement_clears_stale_columns_without_renominating
+        PASS [   0.145s] (1338/8465) thegn-core db_aux::merge_status_tests::conflict_retry_then_gate_error_has_only_current_error_detail
+        PASS [   0.137s] (1340/8465) thegn-core db_aux::merge_status_tests::null_clears_but_empty_string_remains_a_value_and_legacy_none_preserves
+        PASS [   0.141s] (1339/8465) thegn-core db_aux::merge_status_tests::missing_row_and_sql_failure_are_visible_without_other_row_changes
+        PASS [   0.190s] (6058/8465) thegn-host::bin/thegn merge_driver::status_tests::actual_conflict_paths_are_separate_from_submodule_context
+        PASS [   0.281s] (6062/8465) thegn-host::bin/thegn merge_driver::status_tests::gate_and_unreachable_errors_never_become_conflict_paths
+        PASS [   0.226s] (6066/8465) thegn-host::bin/thegn merge_driver::status_tests::success_projects_full_oid_and_does_not_fabricate_oid_from_progress_text
+        PASS [   0.562s] (4870/8465) thegn-host::bin/thegn daemon::service::tests::route_to_host_client_enqueues_but_holds_unverified_provider_source
+        PASS [   0.095s] (5241/8465) thegn-host::bin/thegn handlers::merge_queue::tests::gate_error_only_and_mixed_drains_are_not_successful_or_empty
+Summary [ 337.522s] 8465 tests run: 8465 passed, 26 skipped

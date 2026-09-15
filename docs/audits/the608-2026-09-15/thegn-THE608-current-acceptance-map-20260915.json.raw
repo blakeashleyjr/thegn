@@ -1,0 +1,46 @@
+{
+  "source_main": "393473624691b0aee04b2725b762e06210c51609",
+  "scoped_sources_exactly_match_native623": {
+    "crates/thegn-host/src/merge_driver.rs": "b91b385799e497a89518fd390c433fd878f0be05577aff4c4883f4f5dd77c236",
+    "crates/thegn-host/src/merge_driver_status_tests.rs": "6c70642b020b2c6a30073400739aed3ea1d57e208cfbe162f784a8f96781f3ab",
+    "crates/thegn-host/src/handlers/merge_queue.rs": "9a47e8c885a63eeacf38a79b8fe1bd635659f65579bdfdc51064f23d2c17df65",
+    "crates/thegn-host/src/daemon/service.rs": "a78844f380175c008477c4f8d262e7285176a2b2eb48a9d6ed693d847d7c2681",
+    "crates/thegn-core/src/db_aux.rs": "204446060a9eeb0e598436a07754c29eb25d3152d73459d8131a106397952944",
+    "crates/thegn-core/src/db_merge_status_tests.rs": "0dc2e174e18cd1ded50bbea3ee9950bd597233609a5897627097d77bcea89ba5",
+    "crates/thegn-core/src/store/worktree_aux.rs": "787057487738f276e4bb3f5c0f4e20c728ec6f7c260ac43e41170a718526ca09"
+  },
+  "literal_acceptance_selectors": {
+    "db_aux::merge_status_tests::exact_replacement_clears_stale_columns_without_renominating": [
+      "        PASS [   2.905s] (1343/8377) thegn-core db_aux::merge_status_tests::exact_replacement_clears_stale_columns_without_renominating"
+    ],
+    "db_aux::merge_status_tests::conflict_retry_then_gate_error_has_only_current_error_detail": [
+      "        PASS [   0.822s] (1338/8377) thegn-core db_aux::merge_status_tests::conflict_retry_then_gate_error_has_only_current_error_detail"
+    ],
+    "db_aux::merge_status_tests::null_clears_but_empty_string_remains_a_value_and_legacy_none_preserves": [
+      "        PASS [   0.778s] (1340/8377) thegn-core db_aux::merge_status_tests::null_clears_but_empty_string_remains_a_value_and_legacy_none_preserves"
+    ],
+    "db_aux::merge_status_tests::missing_row_and_sql_failure_are_visible_without_other_row_changes": [
+      "        PASS [   0.746s] (1339/8377) thegn-core db_aux::merge_status_tests::missing_row_and_sql_failure_are_visible_without_other_row_changes"
+    ],
+    "merge_driver::status_tests::actual_conflict_paths_are_separate_from_submodule_context": [
+      "        PASS [   1.287s] (5974/8377) thegn-host::bin/thegn merge_driver::status_tests::actual_conflict_paths_are_separate_from_submodule_context"
+    ],
+    "merge_driver::status_tests::gate_and_unreachable_errors_never_become_conflict_paths": [
+      "        PASS [   1.634s] (5976/8377) thegn-host::bin/thegn merge_driver::status_tests::gate_and_unreachable_errors_never_become_conflict_paths"
+    ],
+    "merge_driver::status_tests::success_projects_full_oid_and_does_not_fabricate_oid_from_progress_text": [
+      "        PASS [   1.221s] (5982/8377) thegn-host::bin/thegn merge_driver::status_tests::success_projects_full_oid_and_does_not_fabricate_oid_from_progress_text"
+    ],
+    "daemon::service::tests::route_to_host_client_enqueues_but_holds_unverified_provider_source": [
+      "        PASS [   1.721s] (4815/8377) thegn-host::bin/thegn daemon::service::tests::route_to_host_client_enqueues_but_holds_unverified_provider_source"
+    ],
+    "handlers::merge_queue::tests::gate_error_only_and_mixed_drains_are_not_successful_or_empty": [
+      "        PASS [   0.317s] (5157/8377) thegn-host::bin/thegn handlers::merge_queue::tests::gate_error_only_and_mixed_drains_are_not_successful_or_empty"
+    ]
+  },
+  "native_log": "/tmp/thegn-maintenance-04-combined-full-native-20260914.log",
+  "native_log_sha256": "c0581fc1f608277265bca0875f200c37f631431b88c6ada16be2cd0d0df6f111",
+  "native_limit": "full623 had unrelatedhostkeyfixturefailure, isolatedcorrectedgatepassed; do notlabelcleanfullrun",
+  "proposed_action": "Independentreview literalissueversuslandedproduction/privateSQLite+driver+UIprojection+authenticatedtransport and currentnative; no inventednewproductionrepair",
+  "remaining": "Independentadversarialacceptancereview, pending05fullnativecurrentgraph, precise sharedOpenSpec/Linear reconciliation, no livequeueclaim"
+}

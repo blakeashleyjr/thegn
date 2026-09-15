@@ -1,0 +1,105 @@
+{
+  "issue": "THE-608",
+  "source_main": "393473624691b0aee04b2725b762e06210c51609",
+  "scope": "Existing merge diagnostic column repair, nullable supersession and scoped native/normal-CLI evidence; no live queue acceptance",
+  "original_payloads": [
+    {
+      "file": "thegn-THE608-independent-acceptance-review-20260915.md.raw",
+      "original": "/tmp/thegn-THE608-independent-acceptance-review-20260915.md",
+      "bytes": 7978,
+      "sha256": "ffa2f36d58dcdf267c7b76183e805e43f558ffe82d0f6b9fe04a22759f174f7c"
+    },
+    {
+      "file": "thegn-THE608-current-acceptance-map-20260915.json.raw",
+      "original": "/tmp/thegn-THE608-current-acceptance-map-20260915.json",
+      "bytes": 3951,
+      "sha256": "713f0cdbc8b973769ca7796b0194b5093a3df1d10d1c6b3cd753d9f34b300646"
+    },
+    {
+      "file": "thegn-THE608-fresh-issue-20260915.json.raw",
+      "original": "/tmp/thegn-THE608-fresh-issue-20260915.json",
+      "bytes": 5731,
+      "sha256": "474c0bd3124fbd0393b2d8baed458dc0a316f1412e1fb6d30321b3ef81ca794d"
+    },
+    {
+      "file": "thegn-maintenance05-combined-full-native-receipt-20260915.json.raw",
+      "original": "/tmp/thegn-maintenance05-combined-full-native-receipt-20260915.json",
+      "bytes": 6272,
+      "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310"
+    }
+  ],
+  "existing_repository_evidence": [
+    {
+      "file": "../maintenance-04-2026-09-15/thegn-maintenance-04-combined-full-native-20260914.log",
+      "bytes": 971821,
+      "sha256": "c0581fc1f608277265bca0875f200c37f631431b88c6ada16be2cd0d0df6f111"
+    },
+    {
+      "file": "../maintenance-04-2026-09-15/thegn-maintenance-04-combined-full-native-receipt-20260914.json.raw",
+      "bytes": 613,
+      "sha256": "c92685e08af9d1b06cc74399a7d6fcee9ad2240f17ca299ee39843a2114bcd55"
+    },
+    {
+      "file": "../maintenance-04-2026-09-15/thegn-maintenance-04-combined-focused-receipt-20260914.json.raw",
+      "bytes": 7170,
+      "sha256": "b5b0066080b6813238ab25e198c733037b5dedcd35102779f95298758e588dc2"
+    },
+    {
+      "file": "../maintenance-04-2026-09-15/thegn-THE219-combined-drain-receipt-1-20260914.json.raw",
+      "bytes": 81041,
+      "sha256": "f01852479fb7a07d8f514a7b52b5715956c279dde90e92f45457cb1468bbf3c3"
+    },
+    {
+      "file": "../maintenance-04-2026-09-15/thegn-THE219-combined-drain-receipt-2-20260914.json.raw",
+      "bytes": 76970,
+      "sha256": "0b1726ec50b36f1298080cc6b4a413eca77382eb28ff0ddf6ea423d45ff8a1f4"
+    }
+  ],
+  "pending": [
+    "Final source review and metadata landing",
+    "Tracker closure/readback"
+  ],
+  "scoped_source_hashes": {
+    "crates/thegn-host/src/merge_driver.rs": "b91b385799e497a89518fd390c433fd878f0be05577aff4c4883f4f5dd77c236",
+    "crates/thegn-host/src/merge_driver_status_tests.rs": "6c70642b020b2c6a30073400739aed3ea1d57e208cfbe162f784a8f96781f3ab",
+    "crates/thegn-host/src/handlers/merge_queue.rs": "9a47e8c885a63eeacf38a79b8fe1bd635659f65579bdfdc51064f23d2c17df65",
+    "crates/thegn-host/src/daemon/service.rs": "a78844f380175c008477c4f8d262e7285176a2b2eb48a9d6ed693d847d7c2681",
+    "crates/thegn-core/src/db_aux.rs": "204446060a9eeb0e598436a07754c29eb25d3152d73459d8131a106397952944",
+    "crates/thegn-core/src/db_merge_status_tests.rs": "0dc2e174e18cd1ded50bbea3ee9950bd597233609a5897627097d77bcea89ba5",
+    "crates/thegn-core/src/store/worktree_aux.rs": "787057487738f276e4bb3f5c0f4e20c728ec6f7c260ac43e41170a718526ca09"
+  },
+  "exact_native_selectors": [
+    "db_aux::merge_status_tests::exact_replacement_clears_stale_columns_without_renominating",
+    "db_aux::merge_status_tests::conflict_retry_then_gate_error_has_only_current_error_detail",
+    "db_aux::merge_status_tests::null_clears_but_empty_string_remains_a_value_and_legacy_none_preserves",
+    "db_aux::merge_status_tests::missing_row_and_sql_failure_are_visible_without_other_row_changes",
+    "merge_driver::status_tests::actual_conflict_paths_are_separate_from_submodule_context",
+    "merge_driver::status_tests::gate_and_unreachable_errors_never_become_conflict_paths",
+    "merge_driver::status_tests::success_projects_full_oid_and_does_not_fabricate_oid_from_progress_text",
+    "daemon::service::tests::route_to_host_client_enqueues_but_holds_unverified_provider_source",
+    "handlers::merge_queue::tests::gate_error_only_and_mixed_drains_are_not_successful_or_empty"
+  ],
+  "native_scope": "Nine unique selectors passed in full33c0 native8465/8465,26skipped. The same seven diagnostic source files match canonical393 and prior623. Prior623 failure remains historical. NormalCLI PartB proves agent_blocked stale clearing/ready recovery, not terminal-deferred path placement.",
+  "current_native_gate": {
+    "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "exit_code": 0,
+    "passed": 8465,
+    "skipped": 26,
+    "test_seconds": 337.522,
+    "receipt": "thegn-maintenance05-combined-full-native-receipt-20260915.json.raw",
+    "full_log_original": "/tmp/thegn-maintenance05-combined-full-native-20260915.log",
+    "full_log_sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
+    "derived_scoped_excerpt": "THE608-native05-pass-extract.txt.raw",
+    "derived_scoped_excerpt_sha256": "6591ee038b75d63ce38a9b918fe4e7033b026199df09a4a74f90223a95851df1",
+    "nine_selectors_unique_pass": true,
+    "seven_scoped_files_equal_33c0_canonical393_and_candidate": {
+      "crates/thegn-host/src/merge_driver.rs": "b91b385799e497a89518fd390c433fd878f0be05577aff4c4883f4f5dd77c236",
+      "crates/thegn-host/src/merge_driver_status_tests.rs": "6c70642b020b2c6a30073400739aed3ea1d57e208cfbe162f784a8f96781f3ab",
+      "crates/thegn-host/src/handlers/merge_queue.rs": "9a47e8c885a63eeacf38a79b8fe1bd635659f65579bdfdc51064f23d2c17df65",
+      "crates/thegn-host/src/daemon/service.rs": "a78844f380175c008477c4f8d262e7285176a2b2eb48a9d6ed693d847d7c2681",
+      "crates/thegn-core/src/db_aux.rs": "204446060a9eeb0e598436a07754c29eb25d3152d73459d8131a106397952944",
+      "crates/thegn-core/src/db_merge_status_tests.rs": "0dc2e174e18cd1ded50bbea3ee9950bd597233609a5897627097d77bcea89ba5",
+      "crates/thegn-core/src/store/worktree_aux.rs": "787057487738f276e4bb3f5c0f4e20c728ec6f7c260ac43e41170a718526ca09"
+    }
+  }
+}
