@@ -12,6 +12,7 @@ use anyhow::Result;
 use crate::host::{HostCaps, HostId};
 use crate::host_config::HostConfig;
 use crate::host_db::HostRow;
+use crate::host_definition_snapshot::{HostDefinitionReadError, HostDefinitionsSnapshot};
 use crate::host_machine::HostState;
 use crate::inventory::{InventoryEntry, InventoryKey};
 
@@ -68,6 +69,12 @@ pub trait HostStore {
 
     /// All user-added host definitions (rows carrying a `config_json`).
     fn host_defs(&self) -> Result<Vec<(String, HostConfig)>>;
+
+    /// Strict, bounded host definitions from one schema-checked read snapshot.
+    /// Requires an already-authorized connection with no active transaction.
+    /// Unlike the display reader, malformed source is an error, never omitted.
+    /// This is captured data, not launch authority or a freshness lease.
+    fn host_defs_checked(&self) -> Result<HostDefinitionsSnapshot, HostDefinitionReadError>;
 
     /// The inventory entries recorded for a host.
     fn host_inventory(&self, id: &HostId) -> Result<Vec<InventoryEntry>>;

@@ -249,8 +249,16 @@ pub(crate) fn validate_schema_value<T: schemars::JsonSchema>(
     value: &serde_json::Value,
 ) -> Vec<String> {
     let root = schemars::schema_for!(T);
+    validate_schema_value_with_root(value, &root)
+}
+
+/// Reuse a generated schema for bounded batches without changing validation.
+pub(crate) fn validate_schema_value_with_root(
+    value: &serde_json::Value,
+    root: &RootSchema,
+) -> Vec<String> {
     let mut errs = Vec::new();
-    walk_object(&root.schema, &root, value, "", &mut errs, true);
+    walk_object(&root.schema, root, value, "", &mut errs, true);
     errs
 }
 
