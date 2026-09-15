@@ -553,6 +553,13 @@
       ]
     },
     {
+      "issue": "THE-611",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "fix-static-cli-startup"
+      ]
+    },
+    {
       "issue": "THE-613",
       "project": "Distribution & Release Readiness",
       "changes": [
