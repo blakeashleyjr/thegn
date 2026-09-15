@@ -713,6 +713,13 @@
       "changes": [
         "isolate-maintenance-regression-fixtures"
       ]
+    },
+    {
+      "issue": "THE-640",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "stabilize-process-monitor-refresh"
+      ]
     }
   ]
 }

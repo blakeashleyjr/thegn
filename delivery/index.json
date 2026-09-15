@@ -1073,9 +1073,13 @@
         {
           "issue": "THE-628",
           "project": "Workspace Product & Observability"
+        },
+        {
+          "issue": "THE-640",
+          "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Preserve process snapshots, deterministic row order and sampled selection identity across refreshes."
+      "summary": "THE-640 sort direction fix delivered to local main fdcefcb6 after 14 focused native passes, three intended old-comparator failures, independent review, scoped strict lint and source gates. Shared THE-628 process-refresh/performance acceptance remains separate."
     },
     {
       "change": "strict-host-definition-snapshots",

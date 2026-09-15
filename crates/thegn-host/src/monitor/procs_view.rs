@@ -71,16 +71,15 @@ fn matches(p: &ProcSample, filter: &str) -> bool {
     !owner.is_empty() && owner.contains(filter)
 }
 
-/// Compare two samples by the active sort key (ascending); the caller reverses
-/// for descending. Mirrors [`super::build`]'s former inline comparator so the
-/// flat and tree paths sort identically.
+/// Compare two samples by the active sort key in ascending order; the caller
+/// reverses the result for descending. All keys use their ordinary ascending
+/// comparator here so flat and tree paths share the same direction semantics.
 fn cmp(a: &ProcSample, b: &ProcSample, sort: ProcSort) -> std::cmp::Ordering {
     match sort {
         ProcSort::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
         ProcSort::Rss => a.rss_bytes.cmp(&b.rss_bytes),
-        // Name/pid invert so the *descending* default reads A→Z / high→low.
-        ProcSort::Name => b.name.cmp(&a.name),
-        ProcSort::Pid => b.pid.cmp(&a.pid),
+        ProcSort::Name => a.name.cmp(&b.name),
+        ProcSort::Pid => a.pid.cmp(&b.pid),
     }
 }
 
@@ -317,6 +316,92 @@ mod tests {
     }
 
     #[test]
+    fn flat_distinct_keys_follow_direction() {
+        let procs = vec![
+            sample(42, None, "zulu", 20.0, 200),
+            sample(3, None, "alpha", 30.0, 300),
+            sample(17, None, "middle", 10.0, 100),
+        ];
+        for sort in ProcSort::ALL {
+            for desc in [false, true] {
+                let rows = rows(
+                    &snap(procs.clone()),
+                    ProcSnapshotView {
+                        sort,
+                        desc,
+                        filter: String::new(),
+                        tree: false,
+                    },
+                );
+                let want = match (sort, desc) {
+                    (ProcSort::Cpu | ProcSort::Rss, false) => [17, 42, 3],
+                    (ProcSort::Cpu | ProcSort::Rss, true) => [3, 42, 17],
+                    (ProcSort::Name | ProcSort::Pid, false) => [3, 17, 42],
+                    (ProcSort::Name | ProcSort::Pid, true) => [42, 17, 3],
+                };
+                assert_eq!(
+                    rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+                    want,
+                    "{sort:?} desc={desc}"
+                );
+                if sort == ProcSort::Name {
+                    assert_eq!(
+                        rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+                        if desc {
+                            vec!["zulu", "middle", "alpha"]
+                        } else {
+                            vec!["alpha", "middle", "zulu"]
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tree_roots_and_siblings_follow_name_and_pid_direction() {
+        let procs = vec![
+            sample(10, None, "alpha-root", 0.0, 0),
+            sample(17, Some(42), "middle-child", 0.0, 0),
+            sample(3, Some(42), "alpha-child", 0.0, 0),
+            sample(42, None, "zulu-root", 0.0, 0),
+            sample(11, Some(10), "zulu-child", 0.0, 0),
+        ];
+        for sort in [ProcSort::Name, ProcSort::Pid] {
+            for desc in [false, true] {
+                let rows = rows(
+                    &snap(procs.clone()),
+                    ProcSnapshotView {
+                        sort,
+                        desc,
+                        filter: String::new(),
+                        tree: true,
+                    },
+                );
+                let want = if desc {
+                    [42, 17, 3, 10, 11]
+                } else {
+                    [10, 11, 42, 3, 17]
+                };
+                assert_eq!(
+                    rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+                    want,
+                    "{sort:?} desc={desc}"
+                );
+                assert_eq!(
+                    rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+                    if desc {
+                        [0, 1, 1, 0, 1]
+                    } else {
+                        [0, 1, 0, 1, 1]
+                    },
+                    "{sort:?} desc={desc} depth"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn flat_filter_matches_name_pid_and_owner() {
         let mut cargo = sample(100, None, "cargo", 90.0, 1);
         cargo.owner = ProcOwner::Pane(3);
@@ -379,9 +464,25 @@ mod tests {
             sample(50, None, "unrelated", 1.0, 1),
         ];
         let s = snap(procs);
-        let r = rows(&s, view("needle", true));
-        let pids: Vec<u32> = r.iter().map(|x| x.pid).collect();
-        assert_eq!(pids, [10, 20, 30], "ancestry retained, unrelated dropped");
+        for sort in [ProcSort::Name, ProcSort::Pid] {
+            for desc in [false, true] {
+                let r = rows(
+                    &s,
+                    ProcSnapshotView {
+                        sort,
+                        desc,
+                        filter: "needle".into(),
+                        tree: true,
+                    },
+                );
+                assert_eq!(
+                    r.iter().map(|x| x.pid).collect::<Vec<_>>(),
+                    [10, 20, 30],
+                    "{sort:?} desc={desc}: ancestry retained, unrelated dropped"
+                );
+                assert_eq!(r.iter().map(|x| x.depth).collect::<Vec<_>>(), [0, 1, 2]);
+            }
+        }
     }
 
     #[test]
@@ -395,5 +496,39 @@ mod tests {
         let r = rows(&s, view("", true));
         // Both appear exactly once; the walk terminates.
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn tree_name_pid_keep_elided_roots_and_cycles_both_directions() {
+        let procs = vec![
+            sample(10, None, "alpha-root", 0.0, 0),
+            sample(20, Some(999), "orphan", 0.0, 0),
+            sample(30, Some(40), "cycle-a", 0.0, 0),
+            sample(40, Some(30), "cycle-b", 0.0, 0),
+        ];
+        for sort in [ProcSort::Name, ProcSort::Pid] {
+            for desc in [false, true] {
+                let r = rows(
+                    &snap(procs.clone()),
+                    ProcSnapshotView {
+                        sort,
+                        desc,
+                        filter: String::new(),
+                        tree: true,
+                    },
+                );
+                assert_eq!(
+                    r.iter().map(|x| x.pid).collect::<Vec<_>>(),
+                    if desc {
+                        [20, 10, 40, 30]
+                    } else {
+                        [10, 20, 30, 40]
+                    },
+                    "{sort:?} desc={desc}"
+                );
+                assert_eq!(r.iter().map(|x| x.depth).collect::<Vec<_>>(), [0, 0, 0, 1]);
+                assert!(r.iter().find(|x| x.pid == 20).unwrap().elided_parent);
+            }
+        }
     }
 }
