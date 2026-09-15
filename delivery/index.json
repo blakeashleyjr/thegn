@@ -856,6 +856,10 @@
       "disposition": "verification-gated",
       "owners": [
         {
+          "issue": "THE-219",
+          "project": "Runtime Security & Host Architecture"
+        },
+        {
           "issue": "THE-608",
           "project": "Runtime Security & Host Architecture"
         },
@@ -864,7 +868,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
+      "summary": "Preserve exact drain diagnostics and terminate held retries; THE-219 adds retry-progress and private CLI acceptance, while THE-608 retains its separate verification gates."
     },
     {
       "change": "repair-kitty-stream-parser",
