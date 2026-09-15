@@ -1,0 +1,98 @@
+{
+  "kind": "THE622_final_landing_adversarial_review",
+  "candidate": "/tmp/thegn-maintenance-04-forge-connectivity-20260915",
+  "candidate_head": "7c05e3a47cc6a1e32dd2100fcc7dfc8fd6befd05",
+  "candidate_source_base": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "canonical_metadata_ancestry": "060afad525a14547336e8d2170803a66af877812",
+  "canonical_060_is_ancestor": true,
+  "source_equivalence": {
+    "comparison_checkout": "/tmp/thegn-maintenance-06-combined-20260915",
+    "comparison_head": "9553d36878b8e4726524997d2cd7e05e3b4b1f93",
+    "files": {
+      "crates/thegn-svc/src/forge/native.rs": {
+        "candidate_sha256": "b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944",
+        "current06_sha256": "b3557176e1981bf78170f79f2a7c69a4051007e41d99fdf89bead86c4b9b6944",
+        "equal": true
+      },
+      "crates/thegn-svc/src/forge/native_global_connectivity_tests.rs": {
+        "candidate_sha256": "b0f5e8e4374dd7075b6e64533fd01b10762a8953fea53b46f8dea4f3207a925c",
+        "current06_sha256": "b0f5e8e4374dd7075b6e64533fd01b10762a8953fea53b46f8dea4f3207a925c",
+        "equal": true
+      },
+      "crates/thegn-svc/src/forge/native_regression_tests.rs": {
+        "candidate_sha256": "ff7bc3e96bd1e0d0b1febe4d78323e2ca72f77341ba1d23ca29ef0cb41da4b82",
+        "current06_sha256": "ff7bc3e96bd1e0d0b1febe4d78323e2ca72f77341ba1d23ca29ef0cb41da4b82",
+        "equal": true
+      },
+      "crates/thegn-host/tests/static_cli_support/mod.rs": {
+        "candidate_sha256": "8853e91c5531dc9b074acfe7660dba2be0511abbbf2c7510671e02a8b34c2d33",
+        "current06_sha256": "8853e91c5531dc9b074acfe7660dba2be0511abbbf2c7510671e02a8b34c2d33",
+        "equal": true
+      },
+      "test/support/owned_test_child.rs": {
+        "candidate_sha256": "c82ae54690938b7f65fb794335e0580e30b06426c3c92fdad77a47abba719864",
+        "current06_sha256": "c82ae54690938b7f65fb794335e0580e30b06426c3c92fdad77a47abba719864",
+        "equal": true
+      }
+    },
+    "all_five_equal": true,
+    "candidate_worktree_clean": true
+  },
+  "shared_helper_review": {
+    "helper": "test/support/owned_test_child.rs",
+    "behavior": [
+      "reserves a bounded slot before exact-child spawn",
+      "clears command environment and uses private fixture paths in the host fixture",
+      "revokes later process syscalls after any observation error",
+      "retains exact Child and private TempDir on failed reap or cleanup",
+      "uses bounded termination and no background reaper or unbounded Drop wait"
+    ],
+    "scope": "test-only exact-child custody; no descendant containment or production networking change",
+    "equivalent_to_tested_current06": true
+  },
+  "durable_manifest": {
+    "path": "docs/audits/the622-2026-09-15/manifest.json",
+    "sha256": "98b11a80eb47e1a4b211b6778256da9b6987e3901f02974afe419e8f4bd1ee82",
+    "raw_file_count": 26,
+    "raw_hashes_match": true,
+    "external_binaries_retained_outside_candidate": true,
+    "no_binaries_committed": true
+  },
+  "native_claim_scope": {
+    "positive_parallel": "20 passed, 1 ignored, 0 failed; THE-622 parallel libtest evidence",
+    "focused_current06": "121 passed, 8220 skipped; combined 603/602/622 scope and existing controls",
+    "corrected_current06_gate": "16 passed, 3365 skipped; corrected THE-603 Linux capture result, not a THE-622 test count",
+    "counterfactual": "build exit 0; intended native exit 101 at first reachable errors-only global-success assertion",
+    "counterfactual_later_matrix": "unreached and not claimed",
+    "primary_acceptance": false,
+    "performance_or_provider_claim": false
+  },
+  "delivery_readiness": {
+    "delivery_entry": "verify-native-forge-connectivity",
+    "lifecycle": "active",
+    "disposition": "alpha-delivery",
+    "ownership_issue": "THE-622",
+    "openspec_validation": "164 passed, 0 failed",
+    "source_ratchets": "exit 0",
+    "strict_clippy": "corrected exit 0; original two-style-check failure retained historically",
+    "checklist_state": "all evidence/gate tasks checked; reviewed local-main landing remains unchecked",
+    "ready_for_local_main_landing": true,
+    "landing_approval_owner": "root"
+  },
+  "provenance_caveat": "The native counterfactual uses a reused shared target directory; local artifacts are fresh:false and depfile/source/binary identities are recorded, but this review does not claim an independently clean target rebuild.",
+  "assessment": {
+    "blockers": [],
+    "approval": "approved for root-reviewed local-main landing",
+    "conditions": [
+      "preserve the durable audit and external binary pins",
+      "retain the distinction between combined current06 evidence and THE-622-specific counts",
+      "land only the reviewed candidate head 7c05e3a47cc6a1e32dd2100fcc7dfc8fd6befd05"
+    ]
+  },
+  "operations": {
+    "source_modified_by_review": false,
+    "cargo_or_native_invoked": false,
+    "provider_invoked": false,
+    "mutable_target_operated": false
+  }
+}

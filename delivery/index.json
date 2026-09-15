@@ -1091,7 +1091,7 @@
     },
     {
       "change": "verify-native-forge-connectivity",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1099,7 +1099,8 @@
           "project": "Alpha Reliability & State Compatibility"
         }
       ],
-      "summary": "Test-only SDK global connectivity and fallback evidence, counterfactual, source review and corrected native/strict-lint gates complete; reviewed local-main landing remains pending."
+      "summary": "Test-only SDK global connectivity and fallback acceptance delivered to local main at 7c05e3a4 after primary and independent review, native controls, scoped counterfactual and strict lint; no provider or live restart.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "verify-sandbox-mounts",

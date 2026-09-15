@@ -111,6 +111,14 @@
     {
       "path": "docs/audits/the622-2026-09-15/maintenance06-original-clippy-20260915.log.raw",
       "sha256": "a2cea0597b9991f391f56d1d1e1cf78d4b2455f04f74373d6cb1e87245810e88"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-final-landing-adversarial-luna-20260915.md.raw",
+      "sha256": "3ee7c2e3f4bfa3b14b8115822dc358532350c0c8807ac12962e4d0c060cab631"
+    },
+    {
+      "path": "docs/audits/the622-2026-09-15/THE622-final-landing-adversarial-luna-20260915.json.raw",
+      "sha256": "bb9a6daaa21b90af8d4120e71e27648c5ed43cbe9e1852d40f61046deeb789cd"
     }
   ],
   "external_pinned_artifacts": [
@@ -129,5 +137,6 @@
   ],
   "omitted": [
     "No binaries are committed. No source/native/build operation is repeated."
-  ]
+  ],
+  "reviewed_local_main_landing": "7c05e3a47cc6a1e32dd2100fcc7dfc8fd6befd05"
 }

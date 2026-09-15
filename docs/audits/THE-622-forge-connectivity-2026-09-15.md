@@ -19,3 +19,7 @@ The exact counterfactual is preserved with its build JSONL/log, native log, rece
 The counterfactual selector exited 101 as intended. The child reached the first errors-only reachable case and failed `reachable errors-only must publish global success` with `Offline` observed instead of `Online`. The parent then reported the expected SDK fixture failure after reaping the child. The later matrix, complete receipt, and strict normal-success `TempDir::close` path were unreachable; this failure does not claim those paths.
 
 The pinned binaries remain outside this candidate by design. The manifest records their exact source paths and hashes, while the raw depfile and receipts preserve the provenance needed to review them. No provider, credential, shell, Cargo, native, UI, benchmark, or mutable-target operation was performed while preparing this candidate. Landing remains pending root review and final canonical fast-forward/update.
+
+## Reviewed local-main landing
+
+Canonical local main fast-forwarded to `7c05e3a47cc6a1e32dd2100fcc7dfc8fd6befd05` after root code/acceptance review and the final independent Luna high review. The earlier pending statements above describe the candidate checkpoint. The original 143 untracked files and the user’s `justfile` edits were preserved byte for byte. This landing reuses the exact tested source; no new build, provider dispatch, push, or live restart was needed.
