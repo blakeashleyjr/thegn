@@ -40,6 +40,8 @@ allow_files=(
   # CLI migration canaries deliberately seed and check the legacy directory.
   ':!crates/thegn-host/tests/static_cli_support/mod.rs'
   ':!crates/thegn-host/tests/static_commands_process.rs'
+  # Archived old-binary migration canary retains the exact observed diagnostic.
+  ':!docs/audits/maintenance-04-2026-09-15/thegn-THE611-old-binary-startup-canary-20260914.log'
   ':!install.sh'
   ':!crates/thegn-host/src/main.rs'
   ':!flake.lock'
