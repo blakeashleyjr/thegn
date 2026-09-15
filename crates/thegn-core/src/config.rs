@@ -3893,11 +3893,13 @@ pub struct FrpConfig {
     /// Subdomain label for `https`/`http`. Empty ⇒ a deterministic per-worktree
     /// slug (`<worktree>-<port>`), so a worktree's preview URL is stable.
     pub subdomain: String,
-    /// Remote port for `tcp`/`udp`. `0` = let the server choose.
+    /// Remote port for `tcp`/`udp`. Must be nonzero because Thegn publishes a
+    /// fixed address and does not implement server-assigned-port discovery.
     pub remote_port: u16,
     /// HTTPS vhost port on the server (for the derived URL when not 443).
     pub vhost_https_port: u16,
-    /// Extra `frpc.toml` lines appended verbatim to the `[[proxies]]` block.
+    /// Reserved for forward compatibility. Nonempty values are rejected until
+    /// each field has a typed, audited representation.
     pub extra: Vec<String>,
 }
 

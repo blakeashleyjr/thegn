@@ -178,7 +178,8 @@ fn frp_token_and_explicit_subdomain_and_vhost_port() {
     let plan = process_plan(&spec);
     assert_eq!(plan.url_rule.fixed(), Some("https://demo.ex.com:8443"));
     let toml = &plan.files[0].contents;
-    assert!(toml.contains("auth.token = \"literal-token\""));
+    assert!(toml.contains("[auth]"));
+    assert!(toml.contains("token = \"literal-token\""));
     assert!(toml.contains("subdomain = \"demo\""));
 }
 
@@ -201,6 +202,50 @@ fn frp_tcp_derives_host_port_and_no_subdomain() {
 }
 
 #[test]
+fn frp_http_https_and_udp_keep_their_explicit_wire_shapes() {
+    for (proxy_type, expected_type, expected_url) in [
+        (
+            FrpProxyType::Http,
+            "http",
+            "http://wt-3000.share.example.com",
+        ),
+        (
+            FrpProxyType::Https,
+            "https",
+            "https://wt-3000.share.example.com",
+        ),
+    ] {
+        let frp = FrpConfig {
+            server_addr: "frps.example.com".into(),
+            subdomain_host: "share.example.com".into(),
+            proxy_type,
+            vhost_https_port: 0,
+            token: String::new(),
+            ..FrpConfig::default()
+        };
+        let plan = process_plan(&frp_spec(frp, "wt", 3000));
+        assert_eq!(plan.url_rule.fixed(), Some(expected_url));
+        assert!(
+            plan.files[0]
+                .contents
+                .contains(&format!("type = \"{expected_type}\""))
+        );
+    }
+
+    let frp = FrpConfig {
+        server_addr: "frps.example.com".into(),
+        proxy_type: FrpProxyType::Udp,
+        remote_port: 6001,
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let plan = process_plan(&frp_spec(frp, "wt", 3000));
+    assert_eq!(plan.url_rule.fixed(), Some("frps.example.com:6001"));
+    assert!(plan.files[0].contents.contains("type = \"udp\""));
+    assert!(plan.files[0].contents.contains("remotePort = 6001"));
+}
+
+#[test]
 fn frp_errors_without_server_addr() {
     let spec = frp_spec(FrpConfig::default(), "wt", 3000);
     assert!(for_provider(&spec).launch().is_err());
@@ -215,6 +260,245 @@ fn frp_https_errors_without_subdomain_host() {
     };
     let spec = frp_spec(frp, "wt", 3000);
     assert!(for_provider(&spec).launch().is_err());
+}
+
+#[test]
+fn frp_rejects_invalid_fields_before_secret_resolution() {
+    let token = "unused-token".to_string();
+    let cases = [
+        (
+            "server_addr",
+            FrpConfig {
+                server_addr: "frps\nattacker".into(),
+                subdomain_host: "ex.com".into(),
+                token: token.clone(),
+                ..FrpConfig::default()
+            },
+            "wt",
+        ),
+        (
+            "subdomain",
+            FrpConfig {
+                server_addr: "frps".into(),
+                subdomain_host: "ex.com".into(),
+                subdomain: "bad\nname".into(),
+                token: token.clone(),
+                ..FrpConfig::default()
+            },
+            "wt",
+        ),
+        (
+            "subdomain_host",
+            FrpConfig {
+                server_addr: "frps".into(),
+                subdomain_host: "bad..example".into(),
+                token: token.clone(),
+                ..FrpConfig::default()
+            },
+            "wt",
+        ),
+        (
+            "worktree label",
+            FrpConfig {
+                server_addr: "frps".into(),
+                subdomain_host: "ex.com".into(),
+                token,
+                ..FrpConfig::default()
+            },
+            "bad_label",
+        ),
+    ];
+    for (field, frp, label) in cases {
+        let spec = frp_spec(frp.clone(), label, 3000);
+        let resolutions = std::cell::Cell::new(0);
+        let error = super::plan_frp_resolving_token(&spec, &frp, || {
+            resolutions.set(resolutions.get() + 1);
+            None
+        })
+        .expect_err("invalid provider input must be refused");
+        assert_eq!(resolutions.get(), 0, "invalid {field} resolved a secret");
+        assert!(
+            error.to_string().contains(field),
+            "expected {field} validation error, got {error}"
+        );
+    }
+}
+
+#[test]
+fn frp_rejects_zero_local_port_before_serialization() {
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        subdomain_host: "ex.com".into(),
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp.clone(), "wt", 0);
+    let resolutions = std::cell::Cell::new(0);
+    let error = super::plan_frp_resolving_token(&spec, &frp, || {
+        resolutions.set(resolutions.get() + 1);
+        None
+    })
+    .expect_err("zero local port must be refused");
+    assert_eq!(resolutions.get(), 0, "zero local port resolved a secret");
+    assert!(error.to_string().contains("local_port"));
+}
+
+#[test]
+fn frp_rejects_unsupported_extra_lines() {
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        subdomain_host: "ex.com".into(),
+        extra: vec!["transport.useEncryption = true".into()],
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, "wt", 3000);
+    let error = for_provider(&spec)
+        .launch()
+        .expect_err("extra must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("raw proxy-field injection is unsupported")
+    );
+}
+
+#[test]
+fn frp_rejects_zero_remote_port_for_fixed_tcp_address() {
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        proxy_type: FrpProxyType::Tcp,
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, "wt", 5432);
+    let error = for_provider(&spec)
+        .launch()
+        .expect_err("remote port is required");
+    assert!(error.to_string().contains("remote_port"));
+}
+
+#[test]
+fn frp_ipv6_is_unbracketed_in_toml_and_bracketed_in_url() {
+    let frp = FrpConfig {
+        server_addr: "[2001:db8::7]".into(),
+        proxy_type: FrpProxyType::Tcp,
+        remote_port: 6000,
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, "wt", 5432);
+    let plan = process_plan(&spec);
+    assert_eq!(plan.url_rule.fixed(), Some("[2001:db8::7]:6000"));
+    assert!(
+        plan.files[0]
+            .contents
+            .contains("serverAddr = \"2001:db8::7\"")
+    );
+    assert!(
+        !plan.files[0]
+            .contents
+            .contains("serverAddr = \"[2001:db8::7]\"")
+    );
+}
+
+#[test]
+fn frp_escapes_utf8_token_and_redacts_plan_debug() {
+    let token = "tok\"\\\n\t\u{0001}–🔐";
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        subdomain_host: "ex.com".into(),
+        token: token.into(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, "wt", 3000);
+    let plan = process_plan(&spec);
+    let document = &plan.files[0].contents;
+    assert!(document.contains("[auth]"));
+    let parsed: super::FrpDocument = toml::from_str(document).expect("generated frpc TOML");
+    assert_eq!(
+        parsed.auth.as_ref().map(|auth| auth.token.as_str()),
+        Some(token)
+    );
+    let debug = format!("{plan:?}");
+    assert!(!debug.contains(token));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn frp_typed_document_rejects_unknown_fields() {
+    let document = r#"
+serverAddr = "frps"
+serverPort = 7000
+
+[[proxies]]
+name = "tg-wt-3000"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 3000
+subdomain = "wt-3000"
+unexpected = true
+"#;
+    assert!(toml::from_str::<super::FrpDocument>(document).is_err());
+}
+
+#[test]
+fn frp_typed_document_rejects_duplicate_keys_and_injected_tables() {
+    let duplicate = r#"
+serverAddr = "frps"
+serverAddr = "attacker"
+serverPort = 7000
+proxies = []
+"#;
+    assert!(toml::from_str::<super::FrpDocument>(duplicate).is_err());
+
+    let injected_table = r#"
+serverAddr = "frps"
+serverPort = 7000
+proxies = []
+
+[security]
+auth = "disabled"
+"#;
+    assert!(toml::from_str::<super::FrpDocument>(injected_table).is_err());
+}
+
+#[test]
+fn frp_rejects_invalid_or_overlong_dns_components() {
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        subdomain_host: "ex.com".into(),
+        subdomain: "UPPER".into(),
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, "wt", 3000);
+    assert!(for_provider(&spec).launch().is_err());
+
+    let long_label = "a".repeat(63);
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        subdomain_host: "ex.com".into(),
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, &long_label, 3000);
+    assert!(for_provider(&spec).launch().is_err());
+}
+
+#[test]
+fn frp_preserves_a_63_byte_label_for_tcp_proxy_name() {
+    let label = "a".repeat(63);
+    let frp = FrpConfig {
+        server_addr: "frps".into(),
+        proxy_type: FrpProxyType::Tcp,
+        remote_port: 6000,
+        token: String::new(),
+        ..FrpConfig::default()
+    };
+    let spec = frp_spec(frp, &label, 5432);
+    let plan = process_plan(&spec);
+    let expected = format!("name = \"tg-{label}-5432\"");
+    assert!(plan.files[0].contents.contains(&expected));
 }
 
 // ── tailscale ────────────────────────────────────────────────────────────────

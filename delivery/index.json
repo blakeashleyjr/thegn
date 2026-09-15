@@ -1104,6 +1104,18 @@
       "summary": "Discover without mutation, then snapshot only selected confirmed local worktrees; prove native outcome and no-sweep behavior privately."
     },
     {
+      "change": "serialize-validate-frp-configuration",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-326",
+          "project": "Client API & Remote Access"
+        }
+      ],
+      "summary": "Typed FRP configuration serialization and strict reparsing are source-complete; native, lint, and landing gates remain pending."
+    },
+    {
       "change": "stabilize-process-monitor-refresh",
       "lifecycle": "active",
       "disposition": "alpha-delivery",
