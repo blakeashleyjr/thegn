@@ -1,6 +1,6 @@
 # THE-611 static CLI startup boundary
 
-The reviewed implementation is included in combined `62335026`; its original source base was `7014a496`. Current parser and actual CLI fixtures have passed, and two old-binary counterfactuals demonstrate the startup-order defect. Strict lint and source/documentation checks are complete; reviewed local-main delivery remains pending.
+The reviewed implementation is included in combined `62335026`; its original source base was `7014a496`. Current parser and actual CLI fixtures have passed, and two old-binary counterfactuals demonstrate the startup-order defect. Strict lint and source/documentation checks are complete; reviewed implementation landed on local main at `c0d3d860a22db0a7fddafb3d338bf40b25248ade`.
 
 `command_intent` exhaustively borrows all59 Command variants and each nested Config/API/Automations action. Only six StaticIntent forms return before migration/profile reroot. Existing helpers retain path spelling, schema source, API tables, grouped completion generation, basename and best-effort stdout. Schema derivation still constructs its declared defaults; the repaired boundary is no effective-config load/install or fabricated handler Config.
 
@@ -24,4 +24,8 @@ The startup canary fails on the first config-path call with the CLI profile sele
 
 [The evidence manifest](maintenance-04-2026-09-15/manifest.json) preserves original receipts, logs and independent reviews byte-for-byte. Combined `62335026` focused acceptance passed 68/68. Its full configured native run completed 8377 tests: 8376 passed, one host-key-literal ratchet failed, and 26 configured tests were skipped. Test-only `a4468a8e` replaces the precedence fixture's HostKeyAlias argument with distinct ConnectTimeout values; its fresh six-test gate passes all five precedence tests and the formerly failing ratchet. These are overlapping, segmented gates, not a single clean full-a446 run.
 
-Source ratchets, 159 strict OpenSpec items, treefmt and non-Rust lint passed. Final metadata ratchets/OpenSpec checks and strict offline workspace/all-target Clippy also exited zero; Clippy took 13m58s, with inherited dependency warnings retained in the raw log. [The final gate receipt](maintenance-04-2026-09-15/thegn-maintenance04-final-gates-receipt-20260915.json.raw) records exact commands, source and log hashes. Reviewed local-main landing remains pending. No issue closure or new performance acceptance is claimed.
+Source ratchets, 159 strict OpenSpec items, treefmt and non-Rust lint passed. Final metadata ratchets/OpenSpec checks and strict offline workspace/all-target Clippy also exited zero; Clippy took 13m58s, with inherited dependency warnings retained in the raw log. [The final gate receipt](maintenance-04-2026-09-15/thegn-maintenance04-final-gates-receipt-20260915.json.raw) records exact commands, source and log hashes. Reviewed implementation landed on local main at `c0d3d860a22db0a7fddafb3d338bf40b25248ade`. [The landing readback](maintenance-04-2026-09-15/thegn-three-fix-local-main-readback-20260915.json.raw) verifies all 16 reviewed Rust hashes, the 40 pre-landing evidence payloads and preserved user files. Tracker closure/readback remains pending; no new performance acceptance is claimed.
+
+## Future PR gate (not requested/executed)
+
+- [ ] Before opening any future PR, run `just ci` per CLAUDE.md; this pre-PR gate does not replace the local landing checks above.

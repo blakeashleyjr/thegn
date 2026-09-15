@@ -13,7 +13,7 @@
 - [x] Verify native platform limits explicitly; Unix FIFO/pipe success does not establish native Windows acceptance.
 - [x] Update THE-611 delivery evidence; retain THE-505/592/607/612 scope separately.
 - [x] Run required scoped native tests, strict lint, ratchets, OpenSpec validation and delivery checks for this local-only landing.
-- [ ] Review and land the complete THE-611 candidate on local main with its exact receipts.
-- [ ] Before opening any future PR, run `just ci` per CLAUDE.md; this pre-PR gate does not replace the local landing checks above.
+- [x] Review and land the complete THE-611 candidate on local main with its exact receipts.
+      Before any future PR, run `just ci` per CLAUDE.md. This unrequested, unexecuted pre-PR gate remains tracked in the [issue audit](../../../docs/audits/THE-611-static-cli-startup.md#future-pr-gate-not-requestedexecuted); it does not replace the completed local landing checks.
 
-Current evidence is retained in [the shared manifest](../../../docs/audits/maintenance-04-2026-09-15/manifest.json). Native coverage is Linux, including Unix FIFO/pipe controls; it does not establish native Windows execution. Segmented full/focused/corrected results and counterfactual reach limits are documented in the issue audit. Strict Clippy and final metadata checks passed; reviewed local-main landing remains pending.
+Current evidence is retained in [the shared manifest](../../../docs/audits/maintenance-04-2026-09-15/manifest.json). Native coverage is Linux, including Unix FIFO/pipe controls; it does not establish native Windows execution. Segmented full/focused/corrected results and counterfactual reach limits are documented in the issue audit. Strict Clippy and final metadata checks passed; reviewed implementation landed on local main at `c0d3d860a22db0a7fddafb3d338bf40b25248ade`. Tracker closure/readback remains pending.

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "THE611/219/598 segmented acceptance evidence with completed strict lint and source gates; reviewed local-main landing remains pending",
+  "scope": "THE611/219/598 segmented acceptance evidence with completed native, strict lint/source gates and verified local-main landing; tracker closure and metadata follow-up remain pending",
   "sources": {
     "full_focused": "6233502620110aee5663ee17806a60e8f4109ce3",
     "fixture_correction": "a4468a8ec6372b3905a7b545f5a5b740162ebf17"
@@ -306,6 +306,14 @@
       "bytes": 1072,
       "sha256": "232ca57132c00a9a8a0e8b5f52df49e124a15a4490cc310521d832e32404579d",
       "original_bytes_preserved": true
+    },
+    {
+      "file": "thegn-three-fix-local-main-readback-20260915.json.raw",
+      "source": "/tmp/thegn-three-fix-local-main-readback-20260915.json",
+      "original_filename": "thegn-three-fix-local-main-readback-20260915.json",
+      "bytes": 2390,
+      "sha256": "ea80098d41a4620d192c1c3f8ff7fdf7c1dab7948c52256e08ee6a4897f4d68b",
+      "original_bytes_preserved": true
     }
   ],
   "completed_source_gates": {
@@ -316,8 +324,8 @@
     "exit_status_provenance": "Root retained execution results; logs copied unchanged. Gates ran before this evidence/documentation import."
   },
   "pending": [
-    "final review/commit",
-    "reviewed local-main landing and tracker closure"
+    "review/commit/fast-forward of final metadata follow-up",
+    "tracker closure/readback"
   ],
   "payload_naming": "Original JSON/Markdown payloads use .json.raw/.md.raw to avoid configured formatter patterns; original bytes and SHA256 unchanged. Generated manifest.json and README.md are not original payloads.",
   "completed_final_gates": {
@@ -326,5 +334,7 @@
     "ratchets": 0,
     "openspec": 0,
     "final_scoped_documentation": "thegn-three-fix-final-docs-validation-20260915.json.raw"
-  }
+  },
+  "implementation_main": "c0d3d860a22db0a7fddafb3d338bf40b25248ade",
+  "landing_receipt": "thegn-three-fix-local-main-readback-20260915.json.raw"
 }
