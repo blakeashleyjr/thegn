@@ -34,13 +34,9 @@ removal of unrelated probes, carries the original timing flags and repeat
 disposition, and makes no release-speed, equivalent-performance, or
 whole-application claim. This candidate does not rerun the ignored workload.
 
-The source-hash manifest proves byte identity of all 17 selected component
-files against the final tested05 fixture source. The only metadata additions
-are the reciprocal THE633 `delivery/index.json` and `delivery/issues.json`
-records; no THE639 record is added. OpenSpec design, proposal, spec and task
-files remain scoped to the cache change. The task record intentionally retains
-native/current-graph and landing work as pending for root's final evidence
-readback.
+The source-hash manifest compares the twelve changed Rust files to actual native source `33c0db71`: eleven match exactly. `devcontainer_provider.rs` retains the pre-existing startup implementation, while tested05 also contains the separate THE-639 startup repair. The recorded source diff confirms that the probe/cache code and the nineteen selected test bodies match; migrated startup tests are excluded from this THE-633 receipt. Shared Git probe compatibility is covered by the existing full-suite result. No new full-suite execution is claimed for this extraction.
+
+The reciprocal delivery records cover only THE-633. Historical controlled hydration measurements and the strict combined05 Clippy receipt are reused with this source bridge. Current scoped source/specification/formatting checks and reviewed local landing remain separate gates.
 
 The durable evidence directory is `docs/audits/the633-2026-09-15/` and
 contains the source hashes, full receipt copy, 19-line pass excerpt, and
@@ -53,3 +49,5 @@ atomic hostile same-UID executable attestation, in-place identity restoration
 can remain undetected until a later demanded refresh, and Linux evidence does
 not establish Windows or Darwin runtime behavior. Root owns final current
 graph, native, lint, landing and closure decisions.
+
+Primary and independent source/evidence review approved this extraction after correcting the original file-count claim. The raw reviewer report retains the earlier finding and final resolution. All durable artifact hashes were verified against their actual files. Current source ratchets, strict OpenSpec validation and corrected formatting passed. The final local-main landing remains recorded separately below.

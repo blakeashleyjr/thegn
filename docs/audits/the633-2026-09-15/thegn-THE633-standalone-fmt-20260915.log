@@ -1,0 +1,9 @@
+nix fmt -- --ci
+warning: Git tree '/tmp/thegn-THE633-impl-luna-20260915' is dirty
+ERRO file has changed path=openspec/changes/cache-demanded-devcontainer-probes/specs/devcontainer/spec.md prev_size=1988 prev_mod_time="2026-09-15 13:03:18 -0700 PDT" current_size=1995 current_mod_time="2026-09-15 13:12:07 -0700 PDT"
+ERRO file has changed path=docs/audits/the633-2026-09-15/hydration-probe-count-evidence.md prev_size=1661 prev_mod_time="2026-09-15 13:11:38 -0700 PDT" current_size=2005 current_mod_time="2026-09-15 13:12:11 -0700 PDT"
+traversed 3472 files
+emitted 3095 files for processing
+formatted 3095 files (2 changed) in 36.045s
+Error: unexpected changes detected, --fail-on-change is enabled
+error: recipe `fmt-check` failed on line 726 with exit code 1

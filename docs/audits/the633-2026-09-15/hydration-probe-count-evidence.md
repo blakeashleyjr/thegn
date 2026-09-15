@@ -6,10 +6,10 @@ probes across each nine-build run; the demand-gated candidate executed zero.
 The same qualified behavior was recorded at 1, 8 and 32 private worktrees:
 
 | Worktrees | Baseline helper-present calls / 9 builds | Candidate helper-present calls / 9 builds |
-|---:|---:|---:|
-| 1 | 9 | 0 |
-| 8 | 9 | 0 |
-| 32 | 9 | 0 |
+| --------: | ---------------------------------------: | ----------------------------------------: |
+|         1 |                                        9 |                                         0 |
+|         8 |                                        9 |                                         0 |
+|        32 |                                        9 |                                         0 |
 
 The candidate also asserts `probes == 0` in the existing ignored
 `platform::unix::perf_workloads_hydration::controlled_full_hydration_workload`

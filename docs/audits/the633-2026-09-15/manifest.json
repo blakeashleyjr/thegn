@@ -2,7 +2,7 @@
   "schema_version": 1,
   "issue": "THE-633",
   "candidate_base": "59a9c944bcc94107ded859932864ffaf9be1ffb3",
-  "candidate_commit": "5264bc01eb5abda3502a9379a44acf7847a1cbb2",
+  "candidate_commit": "fad5d61736d74faa9a1b451600a91fa9ea178f5b",
   "component_commits": {
     "production_and_initial_tests": "774f3d78536387b6f103ad76311259448f12ce07",
     "final_fixture_extraction": "ae68f518f0cbe04d01fb7b33a5780235ef33d948",
@@ -11,26 +11,51 @@
   },
   "scope": "Standalone THE633 cache/probe extraction; no THE639 startup, monitor, renderer, sampler, or unrelated performance implementation",
   "source_hash_manifest": "source-hashes.json",
-  "source_files_byte_identical_to_tested05_final": 17,
-  "source_files_compared": 17,
+  "source_files_compared": 12,
   "durable_files": [
     {
-      "path": "thegn-maintenance05-combined-full-native-receipt-20260915.json",
-      "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310"
+      "path": "hydration-probe-count-evidence.md",
+      "sha256": "a1ef6b4e0bee6e80eee791be8832261817cfb6cc66d3a199803d431b3737e735"
     },
     {
       "path": "native-pass-excerpt.log",
-      "sha256": "d4ea948cdd83966b8247aa5edeabb0547adac8b5806c14d32842a2eb5947fa44",
-      "line_count": 19,
-      "note": "Exact lines extracted from the supplied full log."
+      "sha256": "d4ea948cdd83966b8247aa5edeabb0547adac8b5806c14d32842a2eb5947fa44"
+    },
+    {
+      "path": "source-bridge.diff",
+      "sha256": "d170959a7ae5df1dad9d55ddea0020c18cf48e5bde8f2ae0405c59466f47aaf0"
     },
     {
       "path": "source-hashes.json",
-      "note": "Candidate and tested05 final source SHA-256 pairs for all selected component files."
+      "sha256": "735cff3b2ae143ee0990186b77de0e76ae1bcee5d88c4f39e2d753c564819105"
     },
     {
-      "path": "hydration-probe-count-evidence.md",
-      "note": "Qualified historical actual build_model 9-to-0 helper-call evidence; no new performance claim."
+      "path": "thegn-THE633-final-adversarial-luna-20260915.json",
+      "sha256": "c7d5322d5aa155e8a6f510cdae298e6b8ea1ab612b53280bb1fb2fa3b736f457"
+    },
+    {
+      "path": "thegn-THE633-final-adversarial-luna-20260915.md",
+      "sha256": "57d2d5f4e9de699376026f16a79aae0c90350f93fe7647091c50541654b39d44"
+    },
+    {
+      "path": "thegn-THE633-standalone-fmt-20260915.log",
+      "sha256": "f6026a813fbef4e7edf3619b30d43fac6dd6ed7aea87ee2fe5ba8efab7661fa1"
+    },
+    {
+      "path": "thegn-THE633-standalone-format-corrected-20260915.log",
+      "sha256": "469b17d1542882335e91b0da773a37e04ed1b89df71f820fbf816e7118cebd78"
+    },
+    {
+      "path": "thegn-THE633-standalone-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f"
+    },
+    {
+      "path": "thegn-THE633-standalone-spec-20260915.log",
+      "sha256": "3d807e8a242a1b2bb6e48f0c6e8e6aa95304ca8ecac436bccf49436e96f24773"
+    },
+    {
+      "path": "thegn-maintenance05-combined-full-native-receipt-20260915.json",
+      "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310"
     }
   ],
   "full_native_evidence": {
@@ -45,8 +70,16 @@
     "the633_exact_selectors": 19
   },
   "hydration_measurement": {
-    "baseline_helper_present_calls": {"1": 9, "8": 9, "32": 9},
-    "candidate_helper_present_calls": {"1": 0, "8": 0, "32": 0},
+    "baseline_helper_present_calls": {
+      "1": 9,
+      "8": 9,
+      "32": 9
+    },
+    "candidate_helper_present_calls": {
+      "1": 0,
+      "8": 0,
+      "32": 0
+    },
     "fixture": "actual build_model with private Git/DB fixtures",
     "performance_run_in_this_candidate": false,
     "release_speed_claim": false,
@@ -60,5 +93,29 @@
     "canonical_checkout_edited": false,
     "provider_or_real_container_started": false,
     "status": "private_candidate_ready_for_root_review"
+  },
+  "rust_files_byte_identical_to_actual_native_source": 11,
+  "source_bridge": "source-bridge.diff; provider startup differences are excluded from the 19 probe/cache tests",
+  "scope_gates": {
+    "ratchets": 0,
+    "strict_spec": 0,
+    "initial_fmt": 1,
+    "fmt_changed": "Two Markdown files only",
+    "corrected_specific_fmt": 0
+  },
+  "strict_lint_reuse": {
+    "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "log": "/tmp/thegn-maintenance05-combined-clippy-20260915.log",
+    "sha256": "f68967339c68cd2129b4efcd28ff2ac8e8c6c4146daa2cab45a8cad48fe3456f",
+    "claim": "Existing strict workspace/all-target pass for the tested component; source bridge applies; no new workspace build"
+  },
+  "candidate_commit_scope": "Rust source checkpoint; subsequent evidence and delivery metadata only",
+  "independent_review": {
+    "verdict": "Source and corrected metadata approved for root-owned landing",
+    "files": [
+      "thegn-THE633-final-adversarial-luna-20260915.md",
+      "thegn-THE633-final-adversarial-luna-20260915.json"
+    ],
+    "historical_paragraph": "The earlier 17-file wording in the raw Markdown describes the original metadata defect; its final paragraph and JSON confirm resolution. Original reviewer bytes are preserved."
   }
 }

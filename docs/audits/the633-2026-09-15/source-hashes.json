@@ -1,92 +1,91 @@
 {
-  "candidate_base": "59a9c944bcc94107ded859932864ffaf9be1ffb3",
-  "tested05_final_fixture_source": "53d9a0c6f5fe8ca402497f7fc38cca52dcb30457",
-  "commit_774": "774f3d78536387b6f103ad76311259448f12ce07",
-  "files": {
-    "crates/thegn-host/src/bounded_git_probe.rs": {
-      "candidate_sha256": "164b4db61316ab4e0abf661bb469d113cc4a8a074c187c3655bbc5a67f5a6e1f",
-      "tested05_53d9_sha256": "164b4db61316ab4e0abf661bb469d113cc4a8a074c187c3655bbc5a67f5a6e1f",
-      "byte_identical": true
+  "candidate_rust_source": "fad5d61736d74faa9a1b451600a91fa9ea178f5b",
+  "tested_native_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+  "files": [
+    {
+      "file": "crates/thegn-host/src/bounded_git_probe.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "164b4db61316ab4e0abf661bb469d113cc4a8a074c187c3655bbc5a67f5a6e1f",
+      "tested33c_sha256": "164b4db61316ab4e0abf661bb469d113cc4a8a074c187c3655bbc5a67f5a6e1f",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/bounded_git_probe_tests.rs": {
-      "candidate_sha256": "a71abb302c1acb75ab1af0079b3e301508757c7efbd35537f9616fef29dd637c",
-      "tested05_53d9_sha256": "a71abb302c1acb75ab1af0079b3e301508757c7efbd35537f9616fef29dd637c",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/bounded_git_probe_tests.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "a71abb302c1acb75ab1af0079b3e301508757c7efbd35537f9616fef29dd637c",
+      "tested33c_sha256": "a71abb302c1acb75ab1af0079b3e301508757c7efbd35537f9616fef29dd637c",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/devcontainer_probe_cache.rs": {
-      "candidate_sha256": "4da7e442e736f82b2f7d4f6ffafae138a49ae0d5960594777061e542a5608e57",
-      "tested05_53d9_sha256": "4da7e442e736f82b2f7d4f6ffafae138a49ae0d5960594777061e542a5608e57",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/devcontainer_probe_cache.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "4da7e442e736f82b2f7d4f6ffafae138a49ae0d5960594777061e542a5608e57",
+      "tested33c_sha256": "4da7e442e736f82b2f7d4f6ffafae138a49ae0d5960594777061e542a5608e57",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/devcontainer_probe_cache_tests.rs": {
-      "candidate_sha256": "af40517c0478524df619a6cb5db3a0303e701b325ac46b2e250e06de9712fb81",
-      "tested05_53d9_sha256": "af40517c0478524df619a6cb5db3a0303e701b325ac46b2e250e06de9712fb81",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/devcontainer_probe_cache_tests.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "af40517c0478524df619a6cb5db3a0303e701b325ac46b2e250e06de9712fb81",
+      "tested33c_sha256": "af40517c0478524df619a6cb5db3a0303e701b325ac46b2e250e06de9712fb81",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/devcontainer_provider.rs": {
-      "candidate_sha256": "92367923702299cb54fa8d6c0ecc2003801c4ccd54fff575a7aeafe318149033",
-      "tested05_53d9_sha256": "92367923702299cb54fa8d6c0ecc2003801c4ccd54fff575a7aeafe318149033",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/devcontainer_provider.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "92367923702299cb54fa8d6c0ecc2003801c4ccd54fff575a7aeafe318149033",
+      "tested33c_sha256": "44e2c12a45e69bc686c4e30f22258ef5963dedd640a1bd4501683d91e8b84ea3",
+      "actual33c_byteidentical": false
     },
-    "crates/thegn-host/src/hydrate.rs": {
-      "candidate_sha256": "4455278cb82dedfe4a3588c433ddbd91e3b98cdf155fbcb2647e1315a971ad65",
-      "tested05_53d9_sha256": "4455278cb82dedfe4a3588c433ddbd91e3b98cdf155fbcb2647e1315a971ad65",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/hydrate.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "4455278cb82dedfe4a3588c433ddbd91e3b98cdf155fbcb2647e1315a971ad65",
+      "tested33c_sha256": "4455278cb82dedfe4a3588c433ddbd91e3b98cdf155fbcb2647e1315a971ad65",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/platform/bounded_capability_tests.rs": {
-      "candidate_sha256": "5289c57d3c975a2f9ebedb0f5f3d85502efe1faf5e4f646519e3a3fa3a66917b",
-      "tested05_53d9_sha256": "5289c57d3c975a2f9ebedb0f5f3d85502efe1faf5e4f646519e3a3fa3a66917b",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/platform/bounded_capability_tests.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "5289c57d3c975a2f9ebedb0f5f3d85502efe1faf5e4f646519e3a3fa3a66917b",
+      "tested33c_sha256": "5289c57d3c975a2f9ebedb0f5f3d85502efe1faf5e4f646519e3a3fa3a66917b",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/platform/capability_identity_tests.rs": {
-      "candidate_sha256": "aa6477cdf951185058242054413be7be7c940fb20e786d2fb9ff2ac9afeb3994",
-      "tested05_53d9_sha256": "aa6477cdf951185058242054413be7be7c940fb20e786d2fb9ff2ac9afeb3994",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/platform/capability_identity_tests.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "aa6477cdf951185058242054413be7be7c940fb20e786d2fb9ff2ac9afeb3994",
+      "tested33c_sha256": "aa6477cdf951185058242054413be7be7c940fb20e786d2fb9ff2ac9afeb3994",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/platform/devcontainer_probe_execution_tests.rs": {
-      "candidate_sha256": "8269a812f5330cb3086f789fffd3d674d22bb172c75f54af9c8855d979d4fc5f",
-      "tested05_53d9_sha256": "8269a812f5330cb3086f789fffd3d674d22bb172c75f54af9c8855d979d4fc5f",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/platform/devcontainer_probe_execution_tests.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "8269a812f5330cb3086f789fffd3d674d22bb172c75f54af9c8855d979d4fc5f",
+      "tested33c_sha256": "8269a812f5330cb3086f789fffd3d674d22bb172c75f54af9c8855d979d4fc5f",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/platform/perf_workloads_hydration.rs": {
-      "candidate_sha256": "dea955ed0b9749520b5ae9c59bef4a43f12206bd29e4798d5f5cab8427f1b299",
-      "tested05_53d9_sha256": "dea955ed0b9749520b5ae9c59bef4a43f12206bd29e4798d5f5cab8427f1b299",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/platform/perf_workloads_hydration.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "dea955ed0b9749520b5ae9c59bef4a43f12206bd29e4798d5f5cab8427f1b299",
+      "tested33c_sha256": "dea955ed0b9749520b5ae9c59bef4a43f12206bd29e4798d5f5cab8427f1b299",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/platform/unix.rs": {
-      "candidate_sha256": "c5ae8c7b8fa02c5b7653076e5ade81dc1d0cb7c029800fddb1d0354e98e05e64",
-      "tested05_53d9_sha256": "c5ae8c7b8fa02c5b7653076e5ade81dc1d0cb7c029800fddb1d0354e98e05e64",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/platform/unix.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "c5ae8c7b8fa02c5b7653076e5ade81dc1d0cb7c029800fddb1d0354e98e05e64",
+      "tested33c_sha256": "c5ae8c7b8fa02c5b7653076e5ade81dc1d0cb7c029800fddb1d0354e98e05e64",
+      "actual33c_byteidentical": true
     },
-    "crates/thegn-host/src/platform/windows.rs": {
-      "candidate_sha256": "1e6ffd5022e7dd983cca3282553808de3ccd55706cbaff9748252ecd4d5362f9",
-      "tested05_53d9_sha256": "1e6ffd5022e7dd983cca3282553808de3ccd55706cbaff9748252ecd4d5362f9",
-      "byte_identical": true
-    },
-    "docs/audits/the633-devcontainer-probe-cache-2026-09-14.md": {
-      "candidate_sha256": "e43a46a624b9c91a4a1a2e7fcbe7161dfc78e18cadcbc137b09580b7827c3694",
-      "tested05_53d9_sha256": "e43a46a624b9c91a4a1a2e7fcbe7161dfc78e18cadcbc137b09580b7827c3694",
-      "byte_identical": true
-    },
-    "openspec/changes/cache-demanded-devcontainer-probes/design.md": {
-      "candidate_sha256": "b48a9d29ab038eee915239db416fb154d16c208698b2591aa28d1c0a32eb12be",
-      "tested05_53d9_sha256": "b48a9d29ab038eee915239db416fb154d16c208698b2591aa28d1c0a32eb12be",
-      "byte_identical": true
-    },
-    "openspec/changes/cache-demanded-devcontainer-probes/proposal.md": {
-      "candidate_sha256": "5a5df6649782d676d6339c2a97f0019624f96e51284e9448c11dd315a75a0791",
-      "tested05_53d9_sha256": "5a5df6649782d676d6339c2a97f0019624f96e51284e9448c11dd315a75a0791",
-      "byte_identical": true
-    },
-    "openspec/changes/cache-demanded-devcontainer-probes/specs/devcontainer/spec.md": {
-      "candidate_sha256": "bd85df4fae9db3962eb895bbf1573261aa9e60aa00526352ebe00edf95689ae8",
-      "tested05_53d9_sha256": "bd85df4fae9db3962eb895bbf1573261aa9e60aa00526352ebe00edf95689ae8",
-      "byte_identical": true
-    },
-    "openspec/changes/cache-demanded-devcontainer-probes/tasks.md": {
-      "candidate_sha256": "6cadfad44be0c995dfa27942837d25c45acc48116a0055889f22bcb2582ba3f6",
-      "tested05_53d9_sha256": "6cadfad44be0c995dfa27942837d25c45acc48116a0055889f22bcb2582ba3f6",
-      "byte_identical": true
+    {
+      "file": "crates/thegn-host/src/platform/windows.rs",
+      "claimed_hash_matches": true,
+      "actual_sha256": "1e6ffd5022e7dd983cca3282553808de3ccd55706cbaff9748252ecd4d5362f9",
+      "tested33c_sha256": "1e6ffd5022e7dd983cca3282553808de3ccd55706cbaff9748252ecd4d5362f9",
+      "actual33c_byteidentical": true
     }
-  }
+  ],
+  "scope": "11 of 12 Rust files match exactly. The devcontainer_provider difference is the separate startup contract/test migration, excluded from the 19 probe/cache selectors. See source-bridge.diff."
 }

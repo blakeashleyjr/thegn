@@ -1,0 +1,79 @@
+{
+  "issue": "THE-633",
+  "candidate": "/tmp/thegn-THE633-impl-luna-20260915",
+  "candidate_head": "fad5d61736d74faa9a1b451600a91fa9ea178f5b",
+  "base": "59a9c944bcc94107ded859932864ffaf9be1ffb3",
+  "current06_source": "9553d36878b8e4726524997d2cd7e05e3b4b1f93",
+  "verdict": "standalone scope and corrected metadata are source-reviewable; local-main landing remains root-owned",
+  "changed_rust_files": 12,
+  "current06_exact_rust_files": 11,
+  "provider_bridge": {
+    "path": "crates/thegn-host/src/devcontainer_provider.rs",
+    "candidate_sha256": "92367923702299cb54fa8d6c0ecc2003801c4ccd54fff575a7aeafe318149033",
+    "current06_sha256": "44e2c12a45e69bc686c4e30f22258ef5963dedd640a1bd4501683d91e8b84ea3",
+    "reason": "current06 carries THE-639 startup module/API/fixture migration; candidate carries THE-633 pre-startup provider plus demand cache",
+    "the633_hunks_unchanged": true
+  },
+  "scope": {
+    "production_paths": [
+      "crates/thegn-host/src/bounded_git_probe.rs",
+      "crates/thegn-host/src/devcontainer_probe_cache.rs",
+      "crates/thegn-host/src/devcontainer_provider.rs",
+      "crates/thegn-host/src/hydrate.rs",
+      "crates/thegn-host/src/platform/unix.rs",
+      "crates/thegn-host/src/platform/windows.rs"
+    ],
+    "test_paths": [
+      "crates/thegn-host/src/bounded_git_probe_tests.rs",
+      "crates/thegn-host/src/devcontainer_probe_cache_tests.rs",
+      "crates/thegn-host/src/platform/bounded_capability_tests.rs",
+      "crates/thegn-host/src/platform/capability_identity_tests.rs",
+      "crates/thegn-host/src/platform/devcontainer_probe_execution_tests.rs",
+      "crates/thegn-host/src/platform/perf_workloads_hydration.rs"
+    ],
+    "the639_startup_source": false,
+    "the630_631_632_source": false,
+    "performance_implementation": false,
+    "performance_file_change": "four-line probes==0 assertion in existing ignored build_model fixture",
+    "the617_unix_registration_preserved": true
+  },
+  "native_evidence": {
+    "tested_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "exit_code": 0,
+    "tests_run": 8465,
+    "passed": 8465,
+    "skipped": 26,
+    "the633_selector_passes": 19,
+    "receipt": "/tmp/thegn-maintenance05-combined-full-native-receipt-20260915.json",
+    "receipt_sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310",
+    "log_sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
+    "excerpt_sha256": "d4ea948cdd83966b8247aa5edeabb0547adac8b5806c14d32842a2eb5947fa44",
+    "current06_focused_receipt": {
+      "source": "27c0ccad5399c84612fa35aea7841b0d4209458c",
+      "passed": 121,
+      "filtered": 8220,
+      "exit_code": 0,
+      "is_the633_count": false
+    }
+  },
+  "hydration_evidence": {
+    "baseline_helper_calls": {"1": 9, "8": 9, "32": 9},
+    "candidate_helper_calls": {"1": 0, "8": 0, "32": 0},
+    "new_workload_run": false,
+    "release_speed_claim": false
+  },
+  "metadata_correction": {
+    "source_hash_manifest_entries": 12,
+    "manifest_claimed_source_files": 12,
+    "required_wording": "11-of-12 current06 exact plus scoped THE-639 provider bridge; universal 17-file claim removed",
+    "current_status": "resolved in root working tree"
+  },
+  "operations": {
+    "source_review_only": true,
+    "build_or_cargo": false,
+    "native": false,
+    "performance": false,
+    "provider": false,
+    "linear_or_canonical_write": false
+  }
+}
