@@ -159,6 +159,7 @@ pub mod history;
 pub mod hooks;
 pub mod host;
 pub mod host_config;
+pub mod host_config_checked;
 pub mod host_db;
 mod host_db_snapshot;
 pub mod host_definition_snapshot;

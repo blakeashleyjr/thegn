@@ -38,8 +38,8 @@ duplicate-key detection at every object, depth32/node16384/key256-byte bounds,
 then the existing HostConfig schema walker, then permissive typed decode. This
 ordering refuses unknown fields and bad enum values before they can disappear.
 Valid existing enum aliases remain accepted. Errors contain no source payload
-or parser/SQLite message. Final composed semantics and host/env precedence remain
-the later checked configuration layer's responsibility.
+or parser/SQLite message. The additive checked composition layer below validates
+final configuration data; capture alone does not confer that property.
 
 The generated HostConfig schema is cached once per process, not rebuilt for
 each row. An additive root-taking validator helper shares the exact existing
@@ -67,7 +67,89 @@ passing gate. The new malformed-shadowed regression calls the actual object-safe
 HostStore capture seam with a real private SQLite row; a valid same-name persisted
 SSH definition is its positive control, then each malformed replacement must
 refuse while the declarative Local config and stored bytes remain unchanged.
-It does not manufacture a launch callback or checked final-config adapter.
-Final semantic composition after host augmentation remains missing acceptance
-for THE-602, independent of the separately owned THE-598 winner repair. The
-storage prerequisite can land partially without marking the full issue Done.
+It does not manufacture a launch callback. Current composition fixtures below
+exercise the actual new library seam, not shipping launch-route integration.
+Current native gates remain required before this prerequisite can be completed.
+
+## Additive checked composition
+
+HostComposedConfig has a private Config and a read-only accessor. Its Debug is
+fixed and redacted. It represents final existing configuration validity, not
+permission to launch, raw source provenance of the caller's Config, freshness or
+runtime containment. HostCompositionError returns only Source, Bounds or
+InvalidFinalConfig, with static diagnostics rather than parser/source values.
+
+capture_and_compose_hosts_checked accepts an already-authorized HostStore and
+captures before invoking compose_host_definitions_checked. A malformed shadowed
+row therefore refuses before a result can be constructed. The pure composition
+operation accepts only a strict HostDefinitionsSnapshot, borrows caller-owned
+layered Config, admits its size/work before cloning, invokes the existing THE-598 merge, then
+admits and validates the result before returning it. No Db opener, effective
+config loader, migration, normalization, secret expansion or provider is called.
+
+The project-specific schema walker remains unchanged, including legacy boolean
+failover, union and flattened-map semantics. A shared typed semantic helper
+preserves legacy diagnostic order; its checked mode returns after the first
+failed validator batch and does not clone subsequent automation profiles.
+Individual validator batches retain their existing behavior. Undefined host
+references retain existing fallback; disabled model-proxy semantics remain
+disabled. No stricter reach requirements or Iroh/Cloud pane support are added.
+
+First cached schema initialization may construct serde defaults, including
+environment-derived HOME/USERPROFILE/THEGN_DIR paths for metadata. They are not
+installed into the supplied Config. Thus the operation does not claim complete
+environment independence or absence of indirect default construction.
+
+## Checked composition work limits
+
+Limits apply only to the additive API, never legacy loaders or config validate.
+Before and after merge, streamed serialized JSON is capped at 4 MiB. Structural
+admission caps depth at 32, value nodes at 65,536, each map/array at 1,024 entries,
+keys at 256 UTF-8 bytes and string leaves at 64 KiB. Pipeline stages and profiles
+are each capped at 64; base and explicit profile automation rules at 256.
+
+Before any effective-profile clone, admit at most 4,096 effective rule visits
+and 16 MiB of cumulative base/overlay serialized work. Each nonempty profile
+charges the original base clone even when its rules replace that base. A
+replacing rules list determines effective visits; absent rules inherit base
+visits. Counting serialization does not allocate an effective configuration.
+
+These bounds address cubic pipeline traversal and repeated profile/diagnostic
+amplification. They are not a total allocator/RSS cap, hard wall-clock deadline,
+or bounds on schema-default allocations. Typed trees, bounded JSON, schema and
+transient per-validator error vectors coexist. No diagnostic vector is returned
+by the new API.
+
+Before recursive serialization or Config cloning, borrowed preflight covers both
+dynamic JSON families: model_proxy.providers[].defaults values and flattened
+plugins[].contributions[].caps, at actual root depth 5 with one shared budget.
+Null caps also consume preflight work. Rejected recursive input stays owned by
+the caller; the API never drops it on an error. The serde-skipped sandbox.build
+strings/map are independently checked and charged against the same combined
+4 MiB budget and node allowance. Build data and issues.accounts_restricted are
+preserved in the output. Exhaustive SandboxBuild destructuring forces new build
+fields to receive an explicit inventory review; future recursive Config fields
+also require updating the documented preflight inventory.
+
+## Current regression boundary
+
+New fixtures use actual private SQLite capture, the production checked wrapper,
+shared validation and actual resolve_environment with an explicit local GitLoc,
+an owned empty repository/worktree path and denied approvals. They cover source
+refusal, unshadowed contribution, declarative Local/SSH winners, full explicit-env
+preservation, semantic/schema refusal, redaction and captured-revision behavior.
+No provider callback stands in for an actual launch path.
+
+Inclusive boundary fixtures cover exact serialized, structural, stage, profile,
+rule and effective-work limits. Test-only scoped observation at semantic entry
+and immediately before profile clone proves over-limit input never enters those
+operations and checked failure skips later profiles. Legacy ordered diagnostics
+and current compatibility branches remain separate positive controls. Native
+compilation/execution and final independent source review are pending.
+
+One inherited schema limitation is explicitly retained: plugin ApiVersion
+serializes as a string while its generated schema describes an object. The
+plugin recursive-depth positive control proves structural admission at the
+limit, then expects that existing final-schema refusal. Provider-default JSON
+has a full successful composition control at the depth limit. This component
+does not silently relax the shared schema to fix an unrelated plugin contract.

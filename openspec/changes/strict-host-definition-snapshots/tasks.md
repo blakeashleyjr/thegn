@@ -16,6 +16,17 @@
 - [ ] Record exact current source and raw test receipts before any scoped local landing.
 - [ ] Reconcile THE-602 partial implementation and remaining acceptance; do not mark Done from the strict reader alone.
 
+## Checked composition implementation
+
+- [x] Integrate recovered capture on the current candidate while retaining THE-598's winning-host merger.
+- [x] Add actual capture-before-composition and strict-snapshot composition APIs with private immutable result data and fixed redacted diagnostics.
+- [x] Share existing typed semantic checks with legacy all-diagnostics and checked first-failed-batch modes; preserve schema and fallback compatibility.
+- [x] Admit pre/post byte and structural limits, stage/profile/rule caps and effective-profile work before validation or cloning.
+- [x] Borrow rejected input and preflight both recursive JSON families before serialization; charge and preserve skipped build/issue state.
+- [x] Add private SQLite-to-composition-to-resolver fixtures, raw-source refusal, semantic/schema failures, redaction and inclusive work/data boundary controls.
+- [ ] Complete primary and independent review of the composition implementation and address findings.
+- [ ] Compile/run the new composition fixtures, recovered snapshot fixtures, THE-598 merge fixtures and existing config validation tests on the same source.
+
 ## Retained historical evidence
 
 The original tasks recorded a 50/50 focused-core pass, including 22 snapshot
@@ -27,11 +38,10 @@ remain unchecked until separately completed.
 
 ## Remaining issue acceptance
 
-The strict reader returns captured source-validity data, not a finalized config
-or launch permission. THE-598 owns effective winning-host environment synthesis.
-Actual final semantic validation after trusted host augmentation, before usable
-checked configuration is published, remains outstanding and cannot be replaced
-by a test-only launch callback. Host opening/absence handling (THE-603), external
-store compatibility (THE-604), final checked launch composition (THE-592) and
-runtime containment remain separate obligations. No provider or launch execution
-is performed by this storage component or its tests.
+The strict reader returns source-validity data. The additive composition API now
+checks the existing final configuration rules after THE-598 host augmentation;
+its implementation and current native gates remain pending review. It is a
+prerequisite for the new authority adapter, not completed launch permission.
+Host opening/absence handling (THE-603), external store compatibility (THE-604),
+launch adapter integration (THE-592) and runtime containment remain separate
+obligations. No provider or launch execution occurs in these components/tests.
