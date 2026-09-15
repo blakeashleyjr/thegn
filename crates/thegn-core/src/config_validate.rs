@@ -24,7 +24,8 @@ use crate::config::Config;
 /// value is `{ "kind": <human kind>, "aliases": [<accepted aliases>] }`.
 pub const ENUM_MARKER: &str = "x-thegn-enum";
 
-/// The `Config` schema, generated once (it is pure and deterministic).
+/// Generated once. Schemars may construct environment-derived serde defaults
+/// for schema metadata; these are not installed as an effective Config.
 fn config_schema() -> &'static RootSchema {
     static SCHEMA: OnceLock<RootSchema> = OnceLock::new();
     SCHEMA.get_or_init(|| schemars::schema_for!(Config))
@@ -112,110 +113,7 @@ fn validate_normalized(body: &str) -> Vec<String> {
         // Templates are strings as far as the schema is concerned, so their
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
-            check_templates(&cfg, &mut errs);
-            errs.extend(crate::custom_cmd::validate_commands(&cfg.git_commands));
-            errs.extend(cfg.autopilot.validate("autopilot"));
-            for (slug, ws) in &cfg.workspace {
-                errs.extend(
-                    ws.autopilot
-                        .validate(&format!("workspace.{slug}.autopilot")),
-                );
-            }
-            // `[[presets]]` semantic checks (empty preset, template `preset`
-            // exclusivity) — strings to the schema, so only checkable post-parse.
-            errs.extend(crate::config_presets::validate_presets(&cfg));
-            // `[[pipeline.stages]]` semantic checks (names, resolvable agents,
-            // concurrency, `next` targets and cycles). Structure only — thegn
-            // validates the org chart it will never execute.
-            errs.extend(crate::config_pipeline::validate_pipeline(&cfg));
-            // The handoff contract: a stage prompt that never names `{row}` or
-            // never asks for `thegn dispatch report` produces rows the done-gate
-            // can never close, so the roster grows without bound. Checked here
-            // because it is a property of the prompt string, not the org chart.
-            errs.extend(crate::config_pipeline::validate_stage_contracts(&cfg));
-            // `model` / `env` on [[agents]]/[[tools]] and stage overrides: a
-            // model must land on a harness with a model flag, env keys must be
-            // exportable names.
-            errs.extend(crate::agent_task::validate_agent_models(&cfg));
-            // Skill names and directory-list syntax are a config-boundary
-            // concern. Directory existence/discovery stays at the host edge.
-            errs.extend(cfg.skills.validate());
-            errs.extend(crate::config_drawer::validate_drawer_config(&cfg));
-            check_serve(&cfg, &mut errs);
-            // IANA zone names can't be a `config_enum!` (~600 of them, and the
-            // list rots with each tzdb release), so `[calendar]` is checked
-            // against the bundled database here instead — with a did-you-mean.
-            errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
-            // `[weather]`'s enum spellings are strict-checked by the schema
-            // walker; what it can't see are the interval relationships (a hard
-            // expiry at or under the stale threshold hides the widget before it
-            // can ever render stale) and the SecretRef custody rule on
-            // `api_key`.
-            errs.extend(crate::config_weather::validate_weather(&cfg.weather));
-            // `[[lsp.servers]]` is a registry: a non-built-in key must declare
-            // extensions, and an extension may not be claimed by two entries.
-            errs.extend(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
-            // The push command inbox: enabling it demands a SecretRef secret,
-            // a non-empty allow list of known non-admin capabilities, and valid
-            // scopes — a subscribed-but-inert inbox is not a valid state.
-            errs.extend(cfg.notifications.push.inbox.validate_errors());
-            // The crash-forwarding sink is a reserved provider-seam kind — a
-            // non-empty value is rejected (not silently ignored).
-            if let Err(e) = cfg.diagnostics.validate_crash_sink() {
-                errs.push(e);
-            }
-            errs.extend(cfg.notifications.push.validate_errors());
-            let sink_names: std::collections::BTreeSet<String> = cfg
-                .notifications
-                .push
-                .effective_sinks()
-                .into_iter()
-                .map(|sink| sink.name.trim().to_string())
-                .collect();
-            for (index, rule) in cfg.notifications.rules.iter().enumerate() {
-                for channel in rule.route.iter().flatten() {
-                    let Some(name) = channel.trim().strip_prefix("push:") else {
-                        continue;
-                    };
-                    let name = name.trim();
-                    if name.is_empty() || !sink_names.contains(name) {
-                        errs.push(format!(
-                            "notifications.rules[{index}].route names unknown push sink {name:?}"
-                        ));
-                    }
-                }
-            }
-            // `[notifications]` live-agent signatures must be non-empty and
-            // bounded; otherwise an empty substring would match every line.
-            errs.extend(cfg.notifications.validate());
-            errs.extend(cfg.automations.validate());
-            for (name, profile) in &cfg.profiles {
-                if profile.automations.is_empty() {
-                    continue;
-                }
-                let mut effective = cfg.automations.clone();
-                profile.automations.clone().apply(&mut effective);
-                errs.extend(
-                    effective
-                        .validate()
-                        .into_iter()
-                        .map(|error| format!("profiles.{name}: {error}")),
-                );
-            }
-            // Sound references and kind selectors use a free-form map, so the
-            // schema walker cannot validate their keys or values.
-            errs.extend(cfg.notifications.validate_sound());
-            for (profile, profile_cfg) in &cfg.profiles {
-                errs.extend(
-                    profile_cfg
-                        .notifications
-                        .validate_sound(&format!("profiles.{profile}.notifications.sound")),
-                );
-            }
-            // `[model_proxy]` — SecretRef-only keys, routes referencing declared
-            // providers, aliases naming real routes. Only when enabled.
-            errs.extend(cfg.model_proxy.validate());
-            errs.extend(cfg.ci.validate());
+            errs.extend(typed_semantic_errors(&cfg, SemanticMode::AllDiagnostics));
             None
         }
     };
@@ -240,6 +138,179 @@ fn validate_normalized(body: &str) -> Vec<String> {
         }
     }
     errs
+}
+
+/// Existing typed checks in their original diagnostic order. Checked host
+/// composition stops after one failed batch; legacy document validation collects
+/// every batch. Individual validators retain their existing internal behavior.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticMode {
+    AllDiagnostics,
+    StopOnError,
+}
+
+pub(crate) fn typed_semantic_errors(cfg: &Config, mode: SemanticMode) -> Vec<String> {
+    #[cfg(test)]
+    semantic_observation::record("semantic_start");
+    let mut errs = Vec::new();
+    macro_rules! stop {
+        () => {
+            if mode == SemanticMode::StopOnError && !errs.is_empty() {
+                return errs;
+            }
+        };
+    }
+    macro_rules! batch {
+        ($errors:expr $(,)?) => {{
+            errs.extend($errors);
+            stop!();
+        }};
+    }
+    check_templates(cfg, &mut errs);
+    stop!();
+    batch!(crate::custom_cmd::validate_commands(&cfg.git_commands));
+    batch!(cfg.autopilot.validate("autopilot"));
+    for (slug, ws) in &cfg.workspace {
+        batch!(
+            ws.autopilot
+                .validate(&format!("workspace.{slug}.autopilot")),
+        );
+    }
+    // `[[presets]]` semantic checks (empty preset, template `preset`
+    // exclusivity) — strings to the schema, so only checkable post-parse.
+    batch!(crate::config_presets::validate_presets(cfg));
+    // `[[pipeline.stages]]` semantic checks (names, resolvable agents,
+    // concurrency, `next` targets and cycles). Structure only — thegn
+    // validates the org chart it will never execute.
+    batch!(crate::config_pipeline::validate_pipeline(cfg));
+    // The handoff contract: a stage prompt that never names `{row}` or
+    // never asks for `thegn dispatch report` produces rows the done-gate
+    // can never close, so the roster grows without bound. Checked here
+    // because it is a property of the prompt string, not the org chart.
+    batch!(crate::config_pipeline::validate_stage_contracts(cfg));
+    // `model` / `env` on [[agents]]/[[tools]] and stage overrides: a
+    // model must land on a harness with a model flag, env keys must be
+    // exportable names.
+    batch!(crate::agent_task::validate_agent_models(cfg));
+    // Skill names and directory-list syntax are a config-boundary
+    // concern. Directory existence/discovery stays at the host edge.
+    batch!(cfg.skills.validate());
+    batch!(crate::config_drawer::validate_drawer_config(cfg));
+    check_serve(cfg, &mut errs);
+    stop!();
+    // IANA zone names can't be a `config_enum!` (~600 of them, and the
+    // list rots with each tzdb release), so `[calendar]` is checked
+    // against the bundled database here instead — with a did-you-mean.
+    batch!(crate::config_calendar::validate_calendar(&cfg.calendar));
+    // `[weather]`'s enum spellings are strict-checked by the schema
+    // walker; what it can't see are the interval relationships (a hard
+    // expiry at or under the stale threshold hides the widget before it
+    // can ever render stale) and the SecretRef custody rule on
+    // `api_key`.
+    batch!(crate::config_weather::validate_weather(&cfg.weather));
+    // `[[lsp.servers]]` is a registry: a non-built-in key must declare
+    // extensions, and an extension may not be claimed by two entries.
+    batch!(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
+    // The push command inbox: enabling it demands a SecretRef secret,
+    // a non-empty allow list of known non-admin capabilities, and valid
+    // scopes — a subscribed-but-inert inbox is not a valid state.
+    batch!(cfg.notifications.push.inbox.validate_errors());
+    // The crash-forwarding sink is a reserved provider-seam kind — a
+    // non-empty value is rejected (not silently ignored).
+    if let Err(e) = cfg.diagnostics.validate_crash_sink() {
+        errs.push(e);
+        stop!();
+    }
+    batch!(cfg.notifications.push.validate_errors());
+    let sink_names: std::collections::BTreeSet<String> = cfg
+        .notifications
+        .push
+        .effective_sinks()
+        .into_iter()
+        .map(|sink| sink.name.trim().to_string())
+        .collect();
+    for (index, rule) in cfg.notifications.rules.iter().enumerate() {
+        for channel in rule.route.iter().flatten() {
+            let Some(name) = channel.trim().strip_prefix("push:") else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || !sink_names.contains(name) {
+                errs.push(format!(
+                    "notifications.rules[{index}].route names unknown push sink {name:?}"
+                ));
+                stop!();
+            }
+        }
+    }
+    // `[notifications]` live-agent signatures must be non-empty and
+    // bounded; otherwise an empty substring would match every line.
+    batch!(cfg.notifications.validate());
+    batch!(cfg.automations.validate());
+    for (name, profile) in &cfg.profiles {
+        if profile.automations.is_empty() {
+            continue;
+        }
+        #[cfg(test)]
+        semantic_observation::record("profile_clone");
+        let mut effective = cfg.automations.clone();
+        profile.automations.clone().apply(&mut effective);
+        batch!(
+            effective
+                .validate()
+                .into_iter()
+                .map(|error| format!("profiles.{name}: {error}")),
+        );
+    }
+    // Sound references and kind selectors use a free-form map, so the
+    // schema walker cannot validate their keys or values.
+    batch!(cfg.notifications.validate_sound());
+    for (profile, profile_cfg) in &cfg.profiles {
+        batch!(
+            profile_cfg
+                .notifications
+                .validate_sound(&format!("profiles.{profile}.notifications.sound")),
+        );
+    }
+    // `[model_proxy]` — SecretRef-only keys, routes referencing declared
+    // providers, aliases naming real routes. Only when enabled.
+    batch!(cfg.model_proxy.validate());
+    batch!(cfg.ci.validate());
+    errs
+}
+
+/// Same project-specific schema semantics as document validation, including
+/// its compatibility branches and flattened-map limitations.
+pub(crate) fn validate_config_schema_value(value: &serde_json::Value) -> Vec<String> {
+    validate_schema_value_with_root(value, config_schema())
+}
+
+#[cfg(test)]
+pub(crate) mod semantic_observation {
+    use std::cell::RefCell;
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn record(event: &'static str) {
+        EVENTS.with_borrow_mut(|events| {
+            if let Some(events) = events {
+                events.push(event);
+            }
+        });
+    }
+    pub(crate) fn capture<T>(action: impl FnOnce() -> T) -> (T, Vec<&'static str>) {
+        struct Restore(Option<Vec<&'static str>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                EVENTS.with_borrow_mut(|events| *events = self.0.take());
+            }
+        }
+        let restore = Restore(EVENTS.replace(Some(Vec::new())));
+        let result = action();
+        let events = EVENTS.replace(None).expect("active observation");
+        drop(restore);
+        (result, events)
+    }
 }
 
 /// Validate a format-neutral document against a config schema.  Repo-local

@@ -1085,7 +1085,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Recover strict bounded persisted-host capture; current native verification and final semantic composition acceptance remain outstanding."
+      "summary": "Strict persisted-host capture and bounded checked composition; current native/review gates remain pending, with launch adapter integration owned by THE-592."
     },
     {
       "change": "verify-gate-workspace",
