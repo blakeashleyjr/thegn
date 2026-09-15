@@ -75,13 +75,12 @@ verification while retaining the creation/swap fixtures, and (2) omit only orpha
 sidecar refusal while retaining all suffix/special-object fixtures. Each should
 fail its exact semantic assertion, not compilation; no mutation has been run.
 
-## Remaining gates
+## September 15 verification and standalone landing
 
-Current staged-file `just ratchets` (including delivery validation/fixtures),
-strict scoped OpenSpec validation, targeted rustfmt, and scoped narrative treefmt
-passed. Current primary/independent source review, coordinated native tests and
-THE-602 compatibility, strict affected-workspace lint, and local-main landing
-remain pending and must retain exact source and receipt provenance. Cross compilation, if later performed, remains a separate
-compile-only receipt. Full parent authority and arbitrary-platform claims are
-outside this scoped component. A future PR must run repository-required `just ci`;
-no PR or full CI result is claimed here.
+The corrected component at `38a1f84d` is extracted onto local-main base `59a9c944`. All five added implementation/fixture files and the three strict host-capture dependencies match corrected tested source `dd5e4d07` exactly. The initial combined06 focused run passed 121 tests, including five core and sixteen Linux capture fixtures. After the Linux-only lint correction, all sixteen Linux fixtures passed again; strict workspace/all-target Clippy also passed. The original lint failure and corrected receipts are preserved together.
+
+Two separate counterfactual builds each detected the intended regression. Removing final missing-ancestor verification fails the first ancestor-replacement assertion after permission restoration and the zero-SQL counter. Ignoring orphan sidecars fails the first regular WAL case with `Absent` after the zero-SQL counter. Both finish in 0.07 seconds under an outer 30-second bound. Later cases and explicit strict directory close are unreached on these failing paths; ordinary fixture destructors run. Neither counterfactual is a shipping change.
+
+Current standalone source ratchets, strict OpenSpec validation and formatting passed. The durable [evidence manifest](the603-2026-09-15/manifest.json) preserves source comparisons, positive/native/lint receipts, original failures and counterfactual provenance. Final independent standalone review approved the source, evidence and limits. Reviewed local-main landing remains pending. No new full-suite execution is claimed for this extraction.
+
+The stable-namespace, Linux-premise, permitted SQLite sidecar and unwired integration limits above remain in force. THE-592/THE-607 own launch/worker integration. A future PR must run the repository-required `just ci`; no PR or full CI result is claimed here.

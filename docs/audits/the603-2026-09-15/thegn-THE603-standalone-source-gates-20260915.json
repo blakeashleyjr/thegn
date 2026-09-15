@@ -1,0 +1,31 @@
+[
+  {
+    "name": "ratchets",
+    "command": [
+      "just",
+      "ratchets"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/thegn-THE603-standalone-ratchets-20260915.log"
+  },
+  {
+    "name": "spec",
+    "command": [
+      "openspec",
+      "validate",
+      "strict-state-host-capture",
+      "--strict"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/thegn-THE603-standalone-spec-20260915.log"
+  },
+  {
+    "name": "fmt",
+    "command": [
+      "just",
+      "fmt-check"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/thegn-THE603-standalone-fmt-20260915.log"
+  }
+]

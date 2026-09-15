@@ -1,0 +1,5 @@
+{
+  "ControlGroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-audit603-orphan-20260915.scope",
+  "CPUQuotaPerSecUSec": "1s",
+  "cpu.max": "100000 100000"
+}

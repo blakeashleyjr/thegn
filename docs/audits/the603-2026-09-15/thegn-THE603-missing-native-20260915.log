@@ -1,0 +1,15 @@
+
+running 1 test
+test platform::state_db_capture::linux::tests::missing_ancestor_replacement_and_permission_change_hold ... 
+thread 'platform::state_db_capture::linux::tests::missing_ancestor_replacement_and_permission_change_hold' (907132) panicked at crates/thegn-host/src/platform/state_db_capture_tests.rs:441:9:
+assertion failed: matches!(result, Err(Error::Changed))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    platform::state_db_capture::linux::tests::missing_ancestor_replacement_and_permission_change_hold
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3380 filtered out; finished in 0.07s
+

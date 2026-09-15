@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "issue": "THE-603",
+  "candidate_rust_source": "38a1f84d997bf68b7282114113817b01aa3ea635",
+  "tested_corrected_source": "dd5e4d07ff16428f250388b142c5f9b4c25561c3",
+  "scope": "Additive strict WAL capture, Linux inspected stable namespace, typed refusal elsewhere; not launch integration or pinned SQLite inode",
+  "positive": "5core+16Linux in actual121test06; corrected16Linux exactpass; fullstrictClippy correctedpass",
+  "counterfactuals": "Separate source mutations; each intended101 first semanticassertion, reads0; latercases/strictcloseunreached",
+  "artifacts": [
+    {
+      "path": "missing-native-receipt.json",
+      "sha256": "b62bae231a1f431698df83420a400bd0c387216680ec25da5f49e764aa68e87e"
+    },
+    {
+      "path": "orphan-native-receipt.json",
+      "sha256": "9f8c5a861196f9493a6a5eca9df21399113105c4c09615ef95b6b089a13e04de"
+    },
+    {
+      "path": "thegn-THE603-counterfactual-primary-approval-20260915.json",
+      "sha256": "03c275723d5170ab7b9a4f9f55835e6e3bcf41cfc205c3c353aabea1aacba760"
+    },
+    {
+      "path": "thegn-THE603-counterfactual-proposals-luna-20260915.json",
+      "sha256": "79ace50e52e4a85b2b86b3540fc937c22c02163ea790fba497dd1960183945dd"
+    },
+    {
+      "path": "thegn-THE603-final-adversarial-luna-20260915.json",
+      "sha256": "3dae0be2411f974b5947bf00ae26707cec1a809760c6cb8499e1b63337ff50b2"
+    },
+    {
+      "path": "thegn-THE603-final-adversarial-luna-20260915.md",
+      "sha256": "e5b799c64e63dcafbe9ccb081af56ec5da390a940a9e5d96b6009ef7497435b1"
+    },
+    {
+      "path": "thegn-THE603-final-format-20260915.log",
+      "sha256": "9a455e6e5c2e29eae7212a7d424113120e45c21dfffb54e98ee78819322bc701"
+    },
+    {
+      "path": "thegn-THE603-final-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f"
+    },
+    {
+      "path": "thegn-THE603-independent-source-review-20260915.json",
+      "sha256": "777cb2f1828208842ecefb19792df9affbce5cf1e491f7f0b08184f83d69674d"
+    },
+    {
+      "path": "thegn-THE603-independent-source-review-20260915.md",
+      "sha256": "b26f2909ba92ba3b63185cfeb088a675ee96be86a0cbd43d9025c0c95e187ea0"
+    },
+    {
+      "path": "thegn-THE603-lint-correction-native-20260915.log",
+      "sha256": "f642cc17e6217b807f1a8533e5ef1811ad5668b9e21887fa3d54caf9719d12c1"
+    },
+    {
+      "path": "thegn-THE603-missing-build-admission-20260915.json",
+      "sha256": "e50b497d4ee56ff44f794dfb330f963f2be51869fcf688973a5e079c0689a768"
+    },
+    {
+      "path": "thegn-THE603-missing-cpu-quota-readback-20260915.json",
+      "sha256": "e0a0ce299d881ef74c27b06d464703f704b325af215f8cec06e4fe87d14407b8"
+    },
+    {
+      "path": "thegn-THE603-missing-native-20260915.log",
+      "sha256": "22ee7ed9baa10dc4d0347c8ac5d3fdf70ce59224d2d3e699c7b44371da9b8aed"
+    },
+    {
+      "path": "thegn-THE603-orphan-build-admission-20260915.json",
+      "sha256": "b52df820c058ab5d05014284311fc176f89c1ed10a7d7ffb8abe27a8e1aa9c30"
+    },
+    {
+      "path": "thegn-THE603-orphan-cpu-quota-readback-20260915.json",
+      "sha256": "2bc924b385082245ae593980687411bd657fb90c59cb450357437ba204cff722"
+    },
+    {
+      "path": "thegn-THE603-orphan-native-20260915.log",
+      "sha256": "495002ca09d65d68d01e23e813c06159daa3b1b312f7a0d354dbedf3f99db8ae"
+    },
+    {
+      "path": "thegn-THE603-standalone-source-equivalence-20260915.json",
+      "sha256": "1a6cf42930d8f518c6741271ebc8206d04d2381bd880449a65eaa1679e5b9416"
+    },
+    {
+      "path": "thegn-THE603-standalone-source-gates-20260915.json",
+      "sha256": "3c3ac741f1b6bd6c3092edf7534f5cc9551a3bf5fb4ebd532409ea730de415bb"
+    },
+    {
+      "path": "thegn-maintenance06-combined-clippy-20260915.log",
+      "sha256": "a2cea0597b9991f391f56d1d1e1cf78d4b2455f04f74373d6cb1e87245810e88"
+    },
+    {
+      "path": "thegn-maintenance06-corrected-clippy-20260915.log",
+      "sha256": "bf7f8cd96cdf9f7b7c1df3405bfe00715327da9ad90c8f5cd686c7f1d9b340c4"
+    },
+    {
+      "path": "thegn-maintenance06-corrected-gates-receipt-20260915.json",
+      "sha256": "1351eb903a054ce2e04bf8ca14f4b5891762eb563f6302f7307333e360fbb241"
+    },
+    {
+      "path": "thegn-maintenance06-focused-independent-review-luna-20260915.md",
+      "sha256": "40141eddc17cd118fd5a19b8725008058eec1ad5048c2e670b746c0d0955edc6"
+    },
+    {
+      "path": "thegn-maintenance06-focused-native-20260915.log",
+      "sha256": "94e6693c851cc1d62de35c092483b5d6fc26110b91f728826b7b89e9b5cf88c3"
+    },
+    {
+      "path": "thegn-maintenance06-focused-native-receipt-20260915.json",
+      "sha256": "374ac6cf961718a9db82f022108583b4adcf04b7a6b22e755fd12c7635dfb7a2"
+    },
+    {
+      "path": "thegn-maintenance06-lint-only-independent-review-luna-20260915.md",
+      "sha256": "66169c8a9ed94bb9c361ec6a7979fde522868332ddf343ba84e74ead237a1605"
+    }
+  ],
+  "final_independent_review": "approved with explicit scope limits"
+}

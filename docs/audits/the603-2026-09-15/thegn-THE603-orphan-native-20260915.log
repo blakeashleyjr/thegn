@@ -1,0 +1,15 @@
+
+running 1 test
+test platform::state_db_capture::linux::tests::orphan_sidecars_preclude_absence_before_and_after_observation ... 
+thread 'platform::state_db_capture::linux::tests::orphan_sidecars_preclude_absence_before_and_after_observation' (982639) panicked at crates/thegn-host/src/platform/state_db_capture_tests.rs:471:32:
+called `Result::unwrap_err()` on an `Ok` value: Absent
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    platform::state_db_capture::linux::tests::orphan_sidecars_preclude_absence_before_and_after_observation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3380 filtered out; finished in 0.07s
+

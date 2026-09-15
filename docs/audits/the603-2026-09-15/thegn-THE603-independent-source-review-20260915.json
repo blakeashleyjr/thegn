@@ -1,0 +1,18 @@
+{
+  "source": "3c26e9879b5da8451afccf4abca17f9a18c5b11e",
+  "base": "bb97ec24e6d679400b4e97615e4e27d2c4a97039",
+  "verdict": "source-approved; no scoped blocker",
+  "checkpoint_manifest": "/tmp/thegn-THE603-source-checkpoint-20260915.json",
+  "inventory_files_verified": 16,
+  "protected_files_verified": 8,
+  "source_gate_hashes_verified": 4,
+  "native_executed": false,
+  "candidate_mutated": false,
+  "native_tests_pending": {
+    "core": 5,
+    "linux_host": 16,
+    "nonlinux_refusal": 1
+  },
+  "report": "/tmp/thegn-THE603-independent-source-review-20260915.md",
+  "report_sha256": "b26f2909ba92ba3b63185cfeb088a675ee96be86a0cbd43d9025c0c95e187ea0"
+}

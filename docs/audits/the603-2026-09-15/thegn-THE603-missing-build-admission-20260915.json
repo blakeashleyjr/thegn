@@ -1,0 +1,33 @@
+{
+  "source": "3d3271deb5f9c2fcc6d5b7b5ef18f36d938f6381",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--unit=thegn-audit603-missing-20260915",
+    "--property=CPUQuota=100%",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "-p",
+    "thegn-host",
+    "--bin",
+    "thegn",
+    "--no-run",
+    "--message-format=json-render-diagnostics"
+  ],
+  "source_hashes": {
+    "crates/thegn-core/src/lib.rs": "e38fe42dc851c74ef383d0ce930ef9b53055f5cf8448f606e2a109176ae1995e",
+    "crates/thegn-svc/src/lib.rs": "c2ab313ac3c29d57d53c46c72276a60920b95722fbf8ab0dea8b13c72f3a97a2",
+    "crates/thegn-host/src/main.rs": "109e926017812e028dc788d9361aa099feea972fbe95d75a05c71af7c8b08f8e",
+    "crates/thegn-host/src/platform/state_db_capture_linux.rs": "5854949eab555983998018c647c7357ef47d76c60b5c0fb675da256513732b0a"
+  },
+  "started_at_utc": "2026-09-15T19:57:42.890866+00:00",
+  "jobs": 1,
+  "scope": "single required THE603 missing-ancestor mutant host test build",
+  "exit_code": 0,
+  "finished_at_utc": "2026-09-15T20:02:23.705002+00:00"
+}

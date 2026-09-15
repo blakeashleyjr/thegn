@@ -1,0 +1,33 @@
+{
+  "source": "7133a556d8897c14ec9b278a53bcf770cc01c707",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--unit=thegn-audit603-orphan-20260915",
+    "--property=CPUQuota=100%",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "-p",
+    "thegn-host",
+    "--bin",
+    "thegn",
+    "--no-run",
+    "--message-format=json-render-diagnostics"
+  ],
+  "source_hashes": {
+    "crates/thegn-core/src/lib.rs": "e38fe42dc851c74ef383d0ce930ef9b53055f5cf8448f606e2a109176ae1995e",
+    "crates/thegn-svc/src/lib.rs": "c2ab313ac3c29d57d53c46c72276a60920b95722fbf8ab0dea8b13c72f3a97a2",
+    "crates/thegn-host/src/main.rs": "109e926017812e028dc788d9361aa099feea972fbe95d75a05c71af7c8b08f8e",
+    "crates/thegn-host/src/platform/state_db_capture_linux.rs": "0568fe6f44434bd77c286a924c8be19f603074c599bb0655fa6c52104a1fa77f"
+  },
+  "started_at_utc": "2026-09-15T20:04:29.067698+00:00",
+  "jobs": 1,
+  "scope": "single required THE603 orphan-sidecar mutant host test build",
+  "exit_code": 0,
+  "finished_at_utc": "2026-09-15T20:09:10.833914+00:00"
+}

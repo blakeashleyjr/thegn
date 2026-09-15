@@ -1,0 +1,22 @@
+{
+  "source": "7133a556d8897c14ec9b278a53bcf770cc01c707",
+  "source_sha256": {
+    "crates/thegn-core/src/lib.rs": "e38fe42dc851c74ef383d0ce930ef9b53055f5cf8448f606e2a109176ae1995e",
+    "crates/thegn-svc/src/lib.rs": "c2ab313ac3c29d57d53c46c72276a60920b95722fbf8ab0dea8b13c72f3a97a2",
+    "crates/thegn-host/src/main.rs": "109e926017812e028dc788d9361aa099feea972fbe95d75a05c71af7c8b08f8e",
+    "crates/thegn-host/src/platform/state_db_capture_linux.rs": "0568fe6f44434bd77c286a924c8be19f603074c599bb0655fa6c52104a1fa77f"
+  },
+  "binary": "/tmp/thegn-THE603-orphan-native-evidence-20260915/host-tests",
+  "binary_sha256": "c1ba01d402273417003a755b0d74cee475d93903733b5af061f754c0e5bd3adb",
+  "depfile_sha256": "d45994787bafd0d37e878fd6685b5664c885663afe85b7d4525a33c7d35bc86d",
+  "manifest_dir": "/tmp/thegn-THE603-counterfactual-orphan-20260915/crates/thegn-host",
+  "compiler_artifact_fresh": false,
+  "build_exit_code": 0,
+  "selector": "platform::state_db_capture::linux::tests::orphan_sidecars_preclude_absence_before_and_after_observation",
+  "exit_code": 101,
+  "log": "/tmp/thegn-THE603-orphan-native-20260915.log",
+  "log_sha256": "495002ca09d65d68d01e23e813c06159daa3b1b312f7a0d354dbedf3f99db8ae",
+  "timestamp_utc": "2026-09-15T20:09:40.047682+00:00",
+  "semantic_review": "Root verified firstregularWALlate=false resultOkAbsent atunwrap_err471 afterreached/reads0 assertions; noSQLite call. Latercases, inventorypreservation andstrictTempDircloseunreached; ordinaryfixtureDrop only.",
+  "expected_semantic_failure": true
+}
