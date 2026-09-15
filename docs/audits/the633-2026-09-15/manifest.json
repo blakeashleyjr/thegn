@@ -2,7 +2,7 @@
   "schema_version": 1,
   "issue": "THE-633",
   "candidate_base": "59a9c944bcc94107ded859932864ffaf9be1ffb3",
-  "candidate_commit_pending": true,
+  "candidate_commit": "5264bc01eb5abda3502a9379a44acf7847a1cbb2",
   "component_commits": {
     "production_and_initial_tests": "774f3d78536387b6f103ad76311259448f12ce07",
     "final_fixture_extraction": "ae68f518f0cbe04d01fb7b33a5780235ef33d948",
