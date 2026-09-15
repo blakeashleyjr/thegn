@@ -33,7 +33,22 @@ pub struct KaneoBackend {
 }
 
 impl KaneoBackend {
-    pub(crate) fn new(
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        workspace_id: Option<String>,
+        project_id: Option<String>,
+    ) -> Self {
+        Self::new_with_budget(
+            base_url,
+            api_key,
+            workspace_id,
+            project_id,
+            TrackerHttpBudget::process(),
+        )
+    }
+
+    pub(crate) fn new_with_budget(
         base_url: String,
         api_key: String,
         workspace_id: Option<String>,

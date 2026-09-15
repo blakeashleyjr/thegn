@@ -353,7 +353,7 @@ pub(crate) fn backend_from_account(
         IssueProviderKind::Linear => {
             let api_key = secret::resolve_account_token(&a.token, "linear").unwrap_or_default();
             let team_id = (!a.team_id.is_empty()).then(|| a.team_id.clone());
-            Some(Box::new(linear::LinearBackend::new(
+            Some(Box::new(linear::LinearBackend::new_with_budget(
                 api_key,
                 team_id,
                 http_budget,
@@ -366,7 +366,7 @@ pub(crate) fn backend_from_account(
         }
         IssueProviderKind::Jira => {
             let api_token = secret::resolve_account_token(&a.token, "jira").unwrap_or_default();
-            Some(Box::new(jira::JiraBackend::new(
+            Some(Box::new(jira::JiraBackend::new_with_budget(
                 a.base_url.clone(),
                 a.email.clone(),
                 api_token,
@@ -381,7 +381,7 @@ pub(crate) fn backend_from_account(
             if api_key.is_empty() {
                 api_key = kaneo_stored_token(&a.base_url).unwrap_or_default();
             }
-            Some(Box::new(kaneo::KaneoBackend::new(
+            Some(Box::new(kaneo::KaneoBackend::new_with_budget(
                 a.base_url.clone(),
                 api_key,
                 (!a.workspace_id.is_empty()).then(|| a.workspace_id.clone()),
