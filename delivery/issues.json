@@ -364,6 +364,13 @@
       ]
     },
     {
+      "issue": "THE-219",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "preserve-merge-drain-diagnostics"
+      ]
+    },
+    {
       "issue": "THE-286",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [

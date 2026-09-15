@@ -28,3 +28,17 @@ NULL versus empty values, conflict-to-error transitions, explicit retry clearing
 identity/attempt preservation, full OID panel equality, truthful summary severity,
 and a bounded held-admission path with one attempt and zero agent execution.
 Existing authenticated provider-source refusal assertions remain intact.
+
+
+## THE-219 retry-progress acceptance follow-up
+
+The neighboring-edge audit is `docs/audits/THE-219-retry-progress.md`. There is
+one immediate production retry: after Run/RunDegraded admission, local budget
+increment and the synchronous runner call. Every hold/error/settled outcome
+breaks the inner loop. A no-op/false agent still spends a local attempt; database
+write success is not required for that invocation's finite progress argument.
+The audit distinguishes returning-call termination from agent/gate process
+lifetime and failed-persistence/concurrent-drain guarantees, which remain outside
+this repair. Actual scripted floor recovery and actual CLI branch repair are
+separate evidence, not interchangeable claims. THE-608 remains independently
+verification-gated.
