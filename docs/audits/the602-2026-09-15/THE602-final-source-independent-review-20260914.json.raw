@@ -1,0 +1,168 @@
+{
+  "issue": "THE-602",
+  "scope": "additive strict SQLite capture and bounded checked host composition; no runtime/launch integration",
+  "worktree": "/tmp/thegn-maintenance-04-host-compose-20260914",
+  "base": "6233502620110aee5663ee17806a60e8f4109ce3",
+  "recovered_component_parent": "5f5a1b40",
+  "head": "d96463eea8a653666d66ec6a3e11431e14409849",
+  "clean": true,
+  "files": [
+    {
+      "path": "crates/thegn-core/src/config_validate.rs",
+      "sha256": "3ddad0e6c2049cf527c5b5cc368fefc0111f5808ffafc80644ab8bcf77159b9c"
+    },
+    {
+      "path": "crates/thegn-core/src/host_config_checked.rs",
+      "sha256": "5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996"
+    },
+    {
+      "path": "crates/thegn-core/src/host_config_checked_bounds_tests.rs",
+      "sha256": "df60368675aaaf9a197ac8ff3e125c1e3db1fc0d3345ac3829b3fbe500d3c694"
+    },
+    {
+      "path": "crates/thegn-core/src/host_config_checked_recursive_tests.rs",
+      "sha256": "ff152994014d4543eddfa0f0cdd1d5bf5257957aec941422a779caf23a353204"
+    },
+    {
+      "path": "crates/thegn-core/src/host_config_checked_tests.rs",
+      "sha256": "0a904f58e22b05328f615f869dc7deacc674f3a945d2d42a357b1c8a24c038cb"
+    },
+    {
+      "path": "crates/thegn-core/src/host_db.rs",
+      "sha256": "651625b8a17aaed8b820fd4219cff0a059905dc1a04cf5224dd40c7264dc704b"
+    },
+    {
+      "path": "crates/thegn-core/src/host_db_snapshot.rs",
+      "sha256": "c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0"
+    },
+    {
+      "path": "crates/thegn-core/src/host_db_snapshot_tests.rs",
+      "sha256": "ae5947d92b59b2555b6117e3b00485de1284a37d203d3b675885e9089c8b6d53"
+    },
+    {
+      "path": "crates/thegn-core/src/host_definition_snapshot.rs",
+      "sha256": "d814d0c3c9cac8f76577cca8e819db571daa00955bf887215d5da46fe8574c05"
+    },
+    {
+      "path": "crates/thegn-core/src/lib.rs",
+      "sha256": "24f546cbfc39962deabe37ff893d830e46bdb14e7da5a20398ae2cf7b3834536"
+    },
+    {
+      "path": "crates/thegn-core/src/store/host.rs",
+      "sha256": "22f1a21c990d66893c304e3841f953508b44173c54eaea467a62a02fc35932c2"
+    },
+    {
+      "path": "crates/thegn-core/src/store/mod.rs",
+      "sha256": "6b69bc820fae80fc92d4590b948e9e3feba2d272295dce870eddb1dcd90baa25"
+    },
+    {
+      "path": "delivery/index.json",
+      "sha256": "8e8088afa5e7a01e1b889b06e6626d25563cc6e53cb028f7f9a9892914de5fa0"
+    },
+    {
+      "path": "delivery/issues.json",
+      "sha256": "d124c65024dc93f263ce1c2e83af0c9b9fc5881ac5891091ccddfdb29b39a69c"
+    },
+    {
+      "path": "openspec/changes/strict-host-definition-snapshots/design.md",
+      "sha256": "e30ec40c42c04f11d322a4c7c73f324c87c0733df2edc4eeb016bf8f9b4df133"
+    },
+    {
+      "path": "openspec/changes/strict-host-definition-snapshots/proposal.md",
+      "sha256": "aea3f8db7423424caebe9e70497000f7c18d8899c825858319e7653f9921b96a"
+    },
+    {
+      "path": "openspec/changes/strict-host-definition-snapshots/specs/config/spec.md",
+      "sha256": "774226a0e89575fadbc4dc356cd9c35a872b12523d98d9939c2be0d3afd2c257"
+    },
+    {
+      "path": "openspec/changes/strict-host-definition-snapshots/tasks.md",
+      "sha256": "80829a2bdc8ff4b0744afc47d3314d92d5423bed5b9802490bad68d559273d7b"
+    }
+  ],
+  "new_test_count": 22,
+  "new_test_selectors": [
+    "host_config_checked::tests::actual_capture_contributes_unshadowed_host_and_preserves_declarative_winner",
+    "host_config_checked::tests::explicit_environment_and_undefined_host_fallback_keep_existing_semantics",
+    "host_config_checked::tests::malformed_shadowed_source_refuses_before_composition_or_semantic_entry",
+    "host_config_checked::tests::captured_revision_is_immutable_and_new_capture_refuses_new_corruption",
+    "host_config_checked::tests::final_semantics_schema_and_debug_are_checked_without_echoing_inputs",
+    "host_config_checked::tests::disabled_sections_and_non_pane_hosts_are_not_new_global_restrictions",
+    "host_config_checked::tests::pipeline_limit_admits_actual_chain_and_refuses_cycle_or_oversized_graph",
+    "host_config_checked::tests::profile_rule_and_effective_visit_limits_are_inclusive_before_any_clone",
+    "host_config_checked::tests::replacement_counts_effective_rules_but_still_charges_original_clone_bytes",
+    "host_config_checked::tests::first_error_stops_before_later_profile_clone_and_legacy_order_is_retained",
+    "host_config_checked::tests::bounds::structure_depth_node_container_key_and_utf8_limits_are_inclusive",
+    "host_config_checked::tests::bounds::streaming_byte_counter_refuses_one_over_without_retaining_payload",
+    "host_config_checked::tests::bounds::complete_configs_at_byte_limit_pass_and_post_merge_growth_is_refused",
+    "host_config_checked::tests::bounds::complete_config_string_and_key_limits_precede_semantic_work",
+    "host_config_checked::tests::bounds::existing_project_schema_branches_remain_shared",
+    "host_config_checked::tests::bounds::semantic_observation_restores_nested_and_unwound_fixture_custody",
+    "host_config_checked::tests::recursive::both_recursive_families_use_actual_flattened_depth_before_serialization",
+    "host_config_checked::tests::recursive::deep_rejected_input_stays_borrowed_and_is_disposed_by_owned_fixture",
+    "host_config_checked::tests::recursive::recursive_node_budget_is_shared_across_both_config_families",
+    "host_config_checked::tests::recursive::null_plugin_caps_also_consume_preflight_work",
+    "host_config_checked::tests::recursive::skipped_build_and_issue_restriction_survive_and_share_the_byte_budget",
+    "host_config_checked::tests::recursive::skipped_build_structural_refusal_does_not_clone_or_discard_input"
+  ],
+  "test_execution": "Not compiled or executed. Root owns all native gates.",
+  "required_existing_test_filters": [
+    "host_definition_snapshot::",
+    "host_db_snapshot::",
+    "host_config::merge_tests::",
+    "config_validate::"
+  ],
+  "source_gates": [
+    {
+      "gate": "ratchets",
+      "path": "/tmp/thegn-THE602-composition-ratchets-20260914.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "exit_code": 0
+    },
+    {
+      "gate": "openspec",
+      "path": "/tmp/thegn-THE602-composition-openspec-20260914.log",
+      "sha256": "b7299aeb93b7ae206b758763690cdd633a915671a6afa6084acd6083482168fe",
+      "exit_code": 0
+    },
+    {
+      "gate": "format",
+      "path": "/tmp/thegn-THE602-composition-format-20260914.log",
+      "sha256": "2b3163ded053a3a9007b41a562f910ad54c014c6e888657bd0aaf64c57415d99",
+      "exit_code": 0
+    }
+  ],
+  "limits": {
+    "config_bytes": 4194304,
+    "depth": 32,
+    "nodes": 65536,
+    "container_entries": 1024,
+    "key_bytes": 256,
+    "string_bytes": 65536,
+    "pipeline_stages": 64,
+    "profiles": 64,
+    "automation_rules": 256,
+    "effective_rule_visits": 4096,
+    "automation_work_bytes": 16777216
+  },
+  "qualifications": [
+    "First schema generation can construct environment-derived defaults; no effective loader/install/normalization.",
+    "Borrowed Config; dynamic provider defaults and flattened plugin caps preflight at depth5 before serialization/clone.",
+    "Skipped SandboxBuild bounded/charged/preserved; accounts_restricted bool preserved.",
+    "Existing Plugin ApiVersion schema/string mismatch retained; plugin depth positive proves structural admission, provider depth positive full composition.",
+    "Root owns later THE598 fixture-only HostKeyAlias replacement from a4468a8; this component does not modify that fixture.",
+    "Source reviews of this final checkpoint remain required; no native or parent THE592/THE603 acceptance inferred."
+  ],
+  "independent_review": {
+    "scope": "source-only; no native execution",
+    "verified_manifest_files": 18,
+    "new_test_source_counts": {
+      "host_config_checked_tests.rs": 10,
+      "host_config_checked_bounds_tests.rs": 6,
+      "host_config_checked_recursive_tests.rs": 6
+    },
+    "mechanism_verdict": "approved borrowed capture/admission/composition and shared legacy extraction",
+    "remaining_acceptance_defect": "ApiVersion derived object schema rejects its valid serialized string, including inert plugins; repair prerequisite and full plugin composition positive needed",
+    "native": "pending"
+  }
+}

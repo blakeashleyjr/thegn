@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "issue": "THE-602",
+  "reviewer": "Luna",
+  "review_date": "2026-09-15",
+  "candidate_checkout": "/tmp/thegn-maintenance-04-host-compose-landing-20260915",
+  "candidate_head": "090fba7fb680cda8494a45b7b432dca26e98a62e",
+  "comparison_base": "b025ec5d877f191d65cc831c95035c493c49c7f6",
+  "verdict": "approve_bounded_final_source_and_evidence",
+  "blockers": [
+    "Freeze and commit the already prepared metadata/evidence correction before landing; current HEAD is the pre-freeze 090fba7fb680cda8494a45b7b432dca26e98a62e and the correction is staged in the working tree."
+  ],
+  "historical_observation": "The stale Remaining issue acceptance paragraph is absent from the current working tree audit. Root has also staged the all-15-source manifest/raw-receipt expansion; the metadata correction is not yet committed.",
+  "scope": "THE-602 strict persisted capture and bounded checked composition only; THE-592 launch adapter/provider authority and other dependent obligations remain separate.",
+  "source_equivalence": {
+    "tested_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "affected_file_count": 15,
+    "all_match_tested_source": true,
+    "all_match_report": true,
+    "files": [
+      {
+        "path": "crates/thegn-core/src/config_validate.rs",
+        "candidate_sha256": "3ddad0e6c2049cf527c5b5cc368fefc0111f5808ffafc80644ab8bcf77159b9c",
+        "tested_source_sha256": "3ddad0e6c2049cf527c5b5cc368fefc0111f5808ffafc80644ab8bcf77159b9c",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_config_checked.rs",
+        "candidate_sha256": "5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996",
+        "tested_source_sha256": "5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_config_checked_bounds_tests.rs",
+        "candidate_sha256": "df60368675aaaf9a197ac8ff3e125c1e3db1fc0d3345ac3829b3fbe500d3c694",
+        "tested_source_sha256": "df60368675aaaf9a197ac8ff3e125c1e3db1fc0d3345ac3829b3fbe500d3c694",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_config_checked_recursive_tests.rs",
+        "candidate_sha256": "9b22c7d6a736a276166dcecf16b457764370160e883da3731db8ffada7af7ad0",
+        "tested_source_sha256": "9b22c7d6a736a276166dcecf16b457764370160e883da3731db8ffada7af7ad0",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_config_checked_tests.rs",
+        "candidate_sha256": "0a904f58e22b05328f615f869dc7deacc674f3a945d2d42a357b1c8a24c038cb",
+        "tested_source_sha256": "0a904f58e22b05328f615f869dc7deacc674f3a945d2d42a357b1c8a24c038cb",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_db.rs",
+        "candidate_sha256": "651625b8a17aaed8b820fd4219cff0a059905dc1a04cf5224dd40c7264dc704b",
+        "tested_source_sha256": "651625b8a17aaed8b820fd4219cff0a059905dc1a04cf5224dd40c7264dc704b",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_db_snapshot.rs",
+        "candidate_sha256": "c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0",
+        "tested_source_sha256": "c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_db_snapshot_tests.rs",
+        "candidate_sha256": "ae5947d92b59b2555b6117e3b00485de1284a37d203d3b675885e9089c8b6d53",
+        "tested_source_sha256": "ae5947d92b59b2555b6117e3b00485de1284a37d203d3b675885e9089c8b6d53",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/host_definition_snapshot.rs",
+        "candidate_sha256": "d814d0c3c9cac8f76577cca8e819db571daa00955bf887215d5da46fe8574c05",
+        "tested_source_sha256": "d814d0c3c9cac8f76577cca8e819db571daa00955bf887215d5da46fe8574c05",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/lib.rs",
+        "candidate_sha256": "24f546cbfc39962deabe37ff893d830e46bdb14e7da5a20398ae2cf7b3834536",
+        "tested_source_sha256": "24f546cbfc39962deabe37ff893d830e46bdb14e7da5a20398ae2cf7b3834536",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/plugin_api.rs",
+        "candidate_sha256": "ab18e52bfffa1258e6a6e3694f275019299ca428da26e65f80ce015f0ad7137c",
+        "tested_source_sha256": "ab18e52bfffa1258e6a6e3694f275019299ca428da26e65f80ce015f0ad7137c",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/store/host.rs",
+        "candidate_sha256": "22f1a21c990d66893c304e3841f953508b44173c54eaea467a62a02fc35932c2",
+        "tested_source_sha256": "22f1a21c990d66893c304e3841f953508b44173c54eaea467a62a02fc35932c2",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "crates/thegn-core/src/store/mod.rs",
+        "candidate_sha256": "6b69bc820fae80fc92d4590b948e9e3feba2d272295dce870eddb1dcd90baa25",
+        "tested_source_sha256": "6b69bc820fae80fc92d4590b948e9e3feba2d272295dce870eddb1dcd90baa25",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "docs/api/plugin-api-0.3.json",
+        "candidate_sha256": "dd472746494661fa8975c0fae4f80e5f919a4e955555fec66a7eced4d55ce543",
+        "tested_source_sha256": "dd472746494661fa8975c0fae4f80e5f919a4e955555fec66a7eced4d55ce543",
+        "matches_equivalence_report": true
+      },
+      {
+        "path": "test/env-overlay-ratchet.txt",
+        "candidate_sha256": "52dbd42ca6eddf08635f1834f80932e915083d05fd554f4ce7764598cf826ad3",
+        "tested_source_sha256": "52dbd42ca6eddf08635f1834f80932e915083d05fd554f4ce7764598cf826ad3",
+        "matches_equivalence_report": true
+      }
+    ]
+  },
+  "schema_metadata": {
+    "generated_schema_path": "docs/api/plugin-api-0.3.json",
+    "api_version_definition": {
+      "type": "string"
+    },
+    "api_version_ref_count": 2,
+    "rust_schema_impl": "ApiVersion JsonSchema delegates to String",
+    "wire_tests": [
+      "api_version_schema_matches_unchanged_string_wire_format",
+      "valid_plugin_api_passes_actual_config_validation",
+      "malformed_plugin_api_remains_rejected_by_wire_and_config_validation"
+    ],
+    "wire_test_facts": [
+      "schema instance type is String and object is absent",
+      "ApiVersion 1.2.3 serializes as string and round-trips",
+      "valid alternate numeric spellings normalize through actual Config validation",
+      "malformed and wrong-shape values are rejected by wire/config validation"
+    ],
+    "env_ratchet_plugins_api_occurrences": 1,
+    "metadata_plan": "/tmp/thegn-THE602-schema-metadata-plan-independent-review-20260915.md",
+    "metadata_plan_sha256": "ededf9f7646e43e5398cc4ec56982b690611a733fe5f1cff97f95157d35e4f96"
+  },
+  "native_evidence": {
+    "receipt": "/tmp/thegn-maintenance05-combined-full-native-receipt-20260915.json",
+    "receipt_sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310",
+    "log": "/tmp/thegn-maintenance05-combined-full-native-20260915.log",
+    "log_sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
+    "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "exit_code": 0,
+    "tests_run": 8465,
+    "passed": 8465,
+    "skipped": 26,
+    "interpretation": "Existing full05 receipt is reused because every affected source/schema/env hash matches tested source exactly; no new full native run is claimed."
+  },
+  "historical_outcomes": {
+    "pre_correction_source": "16996e29049e2ab9ef1e097f20841478ec035760",
+    "passed": 4203,
+    "failed": 2,
+    "skipped": 2,
+    "failure_meaning": [
+      "stale ApiVersion object schema snapshot",
+      "missing plugins.api pin"
+    ],
+    "corrected_metadata_source": "560a7beefb497f32d8498e7277d23d1a07310899",
+    "corrected_metadata_passed": 4,
+    "corrected_metadata_failed": 0,
+    "corrected_metadata_log_sha256": "0f77a9cdc8143da3faff4d531d515a390690236fb6e6e3d5a6712dd82e32934d"
+  },
+  "acceptance_mapping": [
+    {
+      "requirement": "bounded immutable persisted capture and strict checked composition",
+      "status": "supported by approved source equivalence and full05 source-bound evidence"
+    },
+    {
+      "requirement": "unchanged string ApiVersion wire contract documented by schema",
+      "status": "supported by current JSON schema and source tests"
+    },
+    {
+      "requirement": "single plugins.api compatibility pin with shrink-only env policy",
+      "status": "supported by current ratchet and metadata plan"
+    },
+    {
+      "requirement": "THE-602 own scope",
+      "status": "complete for strict capture/composition; no launch/provider authority"
+    },
+    {
+      "requirement": "THE-592 dependency",
+      "status": "separate launch adapter integration and authority obligation; not claimed complete here"
+    }
+  ],
+  "status": {
+    "source_equivalence": "approved",
+    "schema_metadata": "approved",
+    "existing_full_native": "accepted_with_exact_source_binding",
+    "THE602_scoped_acceptance": "approve_after_stale_audit_correction",
+    "landing": "pending root correction/review",
+    "closure": "not claimed"
+  },
+  "review_actions": [
+    "read-only source/hash/schema/audit inspection",
+    "no Cargo/build/test/native execution",
+    "no canonical, code, or Linear writes"
+  ]
+}

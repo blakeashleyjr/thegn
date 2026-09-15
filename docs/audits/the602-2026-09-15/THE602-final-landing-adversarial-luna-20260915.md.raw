@@ -1,0 +1,52 @@
+# THE-602 final candidate landing adversarial review — Luna
+
+**Bounded disposition: APPROVE the current THE-602 source/evidence candidate, subject to freezing the already prepared metadata correction.** No implementation or evidence blocker was found. The stale audit paragraph identified in the task is absent from the current working tree; the all-15-source manifest/raw-receipt expansion is staged but not yet committed beyond HEAD `090fba7fb680cda8494a45b7b432dca26e98a62e` (compared with canonical merge `b025ec5d877f191d65cc831c95035c493c49c7f6`). This review performed no Cargo, build, test, native, canonical, or Linear operation.
+
+## Source identity and scope
+
+All 15 affected Rust/schema/env paths in
+`/tmp/thegn-THE602-final-all-source-equivalence-20260915.json` independently
+match both the candidate and combined05 tested source
+`33c0db71a3efd91a5637be47fd2d353fd628056a`. This binds the existing full05
+receipt to the candidate without claiming a new full run. The affected set
+includes the capture/composition implementation and tests, `plugin_api.rs`,
+the generated plugin schema, and the env-overlay ratchet.
+
+THE-602’s accepted scope is strict persisted host capture and bounded checked
+composition. It is a prerequisite for THE-592. Launch adapter integration,
+provider/launch authority, THE-603 opening/absence handling, THE-604 external
+store compatibility, and runtime containment remain separate obligations.
+
+## Schema metadata and acceptance checks
+
+The current generated `definitions.ApiVersion` is exactly `{"type":"string"}`,
+with two references. `ApiVersion::JsonSchema` delegates to `String`, preserving
+the unchanged string wire representation. Current source tests explicitly check
+that the schema instance type is String with no object, serialize and round-trip
+`"1.2.3"`, accept valid alternate numeric spellings through actual Config
+validation, and reject malformed or wrong-shaped values through wire and config
+validation. The env-overlay ratchet contains one `plugins.api` entry with its
+narrow compatibility reason. These facts agree with the independently reviewed
+metadata plan `ededf9f7646e43e5398cc4ec56982b690611a733fe5f1cff97f95157d35e4f96`.
+
+The existing combined05 receipt is source-bound to `33c0db71`, exit 0, with
+8465/8465 passed and 26 skipped. Receipt SHA-256 is
+`c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310` and full-log SHA-256 is
+`303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b`. The historical
+4203/4205 result with two metadata failures remains preserved; corrected
+metadata source `560a7bee` has its retained 4/4 result. No redundant full-core
+rerun is required for this final source-equivalence review.
+
+## Audit and disposition
+
+The stale `## Remaining issue acceptance` paragraph described in the task is
+absent from the current working tree audit. The current audit records scoped
+gates complete, reviewed landing pending, and the valid boundary that THE-602
+does not grant launch permission; THE-592/THE-603/THE-604/runtime obligations
+remain separate. Root has staged the all-15-source manifest/raw-receipt
+expansion and canonical THE-640 ancestry note, but the metadata correction is
+not yet committed beyond HEAD `090fba7fb680cda8494a45b7b432dca26e98a62e`. Freeze that prepared correction before
+landing. Landing and issue closure are not claimed by this review.
+
+Machine-readable companion:
+`/tmp/thegn-THE602-final-landing-adversarial-luna-20260915.json`.

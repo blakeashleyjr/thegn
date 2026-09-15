@@ -1,0 +1,23 @@
+{
+  "head": "560a7beefb497f32d8498e7277d23d1a07310899",
+  "clean": true,
+  "files": {
+    "docs/api/plugin-api-0.3.json": "dd472746494661fa8975c0fae4f80e5f919a4e955555fec66a7eced4d55ce543",
+    "test/env-overlay-ratchet.txt": "52dbd42ca6eddf08635f1834f80932e915083d05fd554f4ce7764598cf826ad3"
+  },
+  "source_gates": {
+    "format": {
+      "path": "/tmp/thegn-THE602-metadata-format-20260915.log",
+      "sha256": "a5ff6ec24fd0ab3ad4ee8540108bd9f9cff1d5a6f031f498587f6b04454dcf01",
+      "exit_code": 0
+    },
+    "ratchets": {
+      "path": "/tmp/thegn-THE602-metadata-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "exit_code": 0
+    }
+  },
+  "semantic_delta": "Only definitions.ApiVersion object to string; API0.3.0/rest of JSON preserved. One plugins.api pin with local per-entry rationale.",
+  "format_note": "treefmt accepted explicit paths; neither file matched a configured formatter (0 emitted, 0 changed). Snapshot is native generator pretty JSON; git diff --check passes.",
+  "native": "Snapshot regeneration performed by root; final no-update comparison/coverage gates root-owned. Prior full-core4203/4205 and25new passed retained."
+}

@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 6815430e-39ee-4f6b-a022-458f20004694 with nextest profile: default
+    Starting 4 tests across 2 binaries
+        PASS [   0.073s] (1/4) thegn-core::env_overlay_coverage every_env_knob_is_exercised_by_the_coverage_test
+        PASS [   0.109s] (2/4) thegn-core::env_overlay_coverage every_shallow_key_has_an_env_knob_or_is_pinned
+        PASS [   0.069s] (3/4) thegn-core::plugin_api_wire snapshot_file_is_named_for_the_current_version
+        PASS [   0.073s] (4/4) thegn-core::plugin_api_wire wire_schema_matches_the_committed_snapshot
+────────────
+     Summary [   0.183s] 4 tests run: 4 passed, 0 skipped

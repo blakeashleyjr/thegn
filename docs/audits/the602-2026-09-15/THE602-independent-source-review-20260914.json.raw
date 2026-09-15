@@ -1,0 +1,23 @@
+{
+  "verdict": "source-approved-partial-delivery-native-pending",
+  "inventory_sha256": "174aa302d6d83c2db1fd1d983bb826a14f543fee9ae85d3a61d93336a5b27960",
+  "base": "773647fab4d328024bd3e5844546cdebaf143eb2",
+  "recovered_source": "9d744a1206f4a32c67295cf69de546e473f91215",
+  "files": {
+    "crates/thegn-core/src/config_validate.rs": "16c44a40a9733f715307bc4237884576a0602dc847d2d65abb4ebe19834cf32b",
+    "crates/thegn-core/src/host_db.rs": "651625b8a17aaed8b820fd4219cff0a059905dc1a04cf5224dd40c7264dc704b",
+    "crates/thegn-core/src/host_db_snapshot.rs": "c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0",
+    "crates/thegn-core/src/host_db_snapshot_tests.rs": "ae5947d92b59b2555b6117e3b00485de1284a37d203d3b675885e9089c8b6d53",
+    "crates/thegn-core/src/host_definition_snapshot.rs": "d814d0c3c9cac8f76577cca8e819db571daa00955bf887215d5da46fe8574c05",
+    "crates/thegn-core/src/lib.rs": "b9aa495e549881aced66773bb59bbc7295135f0b0e40124a55207b71465bab6e",
+    "crates/thegn-core/src/store/host.rs": "22f1a21c990d66893c304e3841f953508b44173c54eaea467a62a02fc35932c2",
+    "crates/thegn-core/src/store/mod.rs": "6b69bc820fae80fc92d4590b948e9e3feba2d272295dce870eddb1dcd90baa25",
+    "delivery/index.json": "5fa10c68192b39bb8c93a5dfe2ce4fde73f9b146019bdcae3e9f45587016e74b",
+    "delivery/issues.json": "8b538fc11d4ff9dd1188b77b4289e33bd093d59e2a125b519c8221899587b6f5",
+    "openspec/changes/strict-host-definition-snapshots/design.md": "1e6b7f85751ec04c2ba776a539a3144a54ea994ee7b33bbae33228e72643aec6",
+    "openspec/changes/strict-host-definition-snapshots/proposal.md": "ebc10c00d15b41edd8a35cdc591da89179be5db45e00aaef761f856fe7259a3c",
+    "openspec/changes/strict-host-definition-snapshots/specs/config/spec.md": "146fafec881b12a55f231b061b2bd1378890830f2c02eceda7741d218666be31",
+    "openspec/changes/strict-host-definition-snapshots/tasks.md": "3074c24c701d15ae8a2e966ec2e8838e5083d401f4c7f552c44f9df45fc046ba"
+  },
+  "executed": false
+}

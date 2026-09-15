@@ -9,14 +9,14 @@ The private candidate starts at `bb97ec24e6d679400b4e97615e4e27d2c4a97039` and m
 
 The THE-602 implementation and compatibility pins are byte-identical to the tested combined05 source `33c0db71a3efd91a5637be47fd2d353fd628056a`:
 
-| Path | SHA-256 |
-| --- | --- |
-| `crates/thegn-core/src/host_config_checked.rs` | `5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996` |
-| `crates/thegn-core/src/host_db_snapshot.rs` | `c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0` |
+| Path                                                | SHA-256                                                            |
+| --------------------------------------------------- | ------------------------------------------------------------------ |
+| `crates/thegn-core/src/host_config_checked.rs`      | `5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996` |
+| `crates/thegn-core/src/host_db_snapshot.rs`         | `c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0` |
 | `crates/thegn-core/src/host_definition_snapshot.rs` | `d814d0c3c9cac8f76577cca8e819db571daa00955bf887215d5da46fe8574c05` |
-| `crates/thegn-core/src/plugin_api.rs` | `ab18e52bfffa1258e6a6e3694f275019299ca428da26e65f80ce015f0ad7137c` |
-| `docs/api/plugin-api-0.3.json` | `dd472746494661fa8975c0fae4f80e5f919a4e955555fec66a7eced4d55ce543` |
-| `test/env-overlay-ratchet.txt` | `52dbd42ca6eddf08635f1834f80932e915083d05fd554f4ce7764598cf826ad3` |
+| `crates/thegn-core/src/plugin_api.rs`               | `ab18e52bfffa1258e6a6e3694f275019299ca428da26e65f80ce015f0ad7137c` |
+| `docs/api/plugin-api-0.3.json`                      | `dd472746494661fa8975c0fae4f80e5f919a4e955555fec66a7eced4d55ce543` |
+| `test/env-overlay-ratchet.txt`                      | `52dbd42ca6eddf08635f1834f80932e915083d05fd554f4ce7764598cf826ad3` |
 
 ## Evidence and review
 
@@ -28,3 +28,5 @@ The THE-602 implementation and compatibility pins are byte-identical to the test
 ## Acceptance boundary
 
 The candidate records THE-602’s strict persisted capture and bounded checked composition as complete for this scoped delivery. The result is a prerequisite for parent THE-592 and does not itself grant launch/provider authority. THE-592 adapter wiring, THE-603 opener/absence handling, THE-604 external-store compatibility, and runtime containment remain separate obligations. OpenSpec and delivery status therefore record gates complete with reviewed local landing pending; no issue closure or Linear mutation is asserted.
+
+Root additionally compared all 15 changed Rust/schema/env files against frozen source `33c0db71`; all are byte-identical. The final manifest expands the six-file checkpoint above to that complete changed-source set. Current canonical THE-640 delivery ancestry `475bccb1` was merged without changing any THE-602 Rust source. The ApiVersion string-schema prerequisite and compatibility pins resolve the earlier review’s plugin schema finding; the corrected full native receipt includes the previously failing schema and environment-pin controls. Compact raw receipts/reviews are retained beside the manifest; the full 8465-test log remains an external hash-pinned artifact.
