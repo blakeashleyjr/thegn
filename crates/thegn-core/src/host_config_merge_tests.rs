@@ -31,7 +31,10 @@ fn host(reach: HostReach, declared: bool) -> HostConfig {
             ssh_config: format!("/fixture/{source}/ssh-config"),
             jump_host: format!("{source}-jump.invalid"),
             identity: format!("/fixture/{source}/identity"),
-            extra_args: vec!["-o".into(), format!("HostKeyAlias={source}-fixture")],
+            extra_args: vec![
+                "-o".into(),
+                format!("ConnectTimeout={}", if declared { 11 } else { 22 }),
+            ],
         },
         iroh: HostIrohConfig {
             ticket: format!("{source}-ticket"),
