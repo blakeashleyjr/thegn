@@ -15,7 +15,10 @@
 //! [`ShareProvider`] seam keeps room for rathole/zrok/ngrok/iroh later.
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::io::{BufRead, BufReader};
+use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -85,10 +88,19 @@ impl UrlRule {
 /// A file the provider needs materialized on disk (0600) before spawn and
 /// referenced by `args`/`cwd` — e.g. a generated `frpc.toml`. Mirrors
 /// `crate::vpn::SidecarFile`. `dest` is relative to the per-share state dir.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SharePlanFile {
     pub dest: String,
     pub contents: String,
+}
+
+impl fmt::Debug for SharePlanFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharePlanFile")
+            .field("dest", &self.dest)
+            .field("contents", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A pure, fully-resolved plan for the tunnel-client child. Built from a
@@ -231,53 +243,100 @@ fn bore_args(local_port: u16, b: &BoreConfig, secret: Option<&str>) -> Vec<Strin
 /// never prints it). `https`/`http` → `scheme://<subdomain>.<host>`; `tcp`/`udp`
 /// → `<server_addr>:<remote_port>`.
 fn plan_frp(spec: &ShareSpec, f: &FrpConfig) -> Result<SharePlan> {
-    let server = f.server_addr.trim();
-    if server.is_empty() {
-        bail!("frp: set [share.frp] server_addr to your frps host");
+    plan_frp_resolving_token(spec, f, || expand_env_ref(&f.token))
+}
+
+fn plan_frp_resolving_token(
+    spec: &ShareSpec,
+    f: &FrpConfig,
+    resolve_token: impl FnOnce() -> Option<String>,
+) -> Result<SharePlan> {
+    if !f.extra.is_empty() {
+        bail!(
+            "frp: invalid extra (raw proxy-field injection is unsupported; remove {} entr{})",
+            f.extra.len(),
+            if f.extra.len() == 1 { "y" } else { "ies" }
+        );
+    }
+    if spec.local_port == 0 {
+        bail!("frp: invalid local_port (must be nonzero)");
+    }
+    let server = validate_server_addr(&f.server_addr)?;
+    let label = validate_dns_label(&spec.label, "worktree label")?;
+    let proxy_name = format!("tg-{label}-{}", spec.local_port);
+    // The generated name is composed from a 63-byte component, a fixed
+    // prefix/separator, and a u16 decimal port (at most five bytes).
+    const MAX_GENERATED_PROXY_NAME: usize = 3 + 63 + 1 + 5;
+    if proxy_name.len() > MAX_GENERATED_PROXY_NAME {
+        bail!(
+            "frp: invalid generated proxy name ({} bytes exceeds derived limit {})",
+            proxy_name.len(),
+            MAX_GENERATED_PROXY_NAME
+        );
     }
     let is_web = matches!(f.proxy_type, FrpProxyType::Https | FrpProxyType::Http);
+    if !is_web && f.remote_port == 0 {
+        bail!("frp: invalid remote_port (zero cannot produce a fixed tcp/udp address)");
+    }
     let subdomain = {
         let s = f.subdomain.trim();
         if s.is_empty() {
-            format!("{}-{}", spec.label, spec.local_port)
+            format!("{label}-{}", spec.local_port)
         } else {
             s.to_string()
         }
     };
-    let proxy_type = f.proxy_type.as_str();
-
-    // Build frpc.toml.
-    let mut toml = String::new();
-    toml.push_str(&format!("serverAddr = \"{server}\"\n"));
-    toml.push_str(&format!("serverPort = {}\n", f.server_port));
-    if let Some(tok) = expand_env_ref(&f.token) {
-        toml.push_str("auth.method = \"token\"\n");
-        toml.push_str(&format!("auth.token = \"{tok}\"\n"));
-    }
-    toml.push_str("\n[[proxies]]\n");
-    toml.push_str(&format!(
-        "name = \"tg-{}-{}\"\n",
-        spec.label, spec.local_port
-    ));
-    toml.push_str(&format!("type = \"{proxy_type}\"\n"));
-    toml.push_str("localIP = \"127.0.0.1\"\n");
-    toml.push_str(&format!("localPort = {}\n", spec.local_port));
     if is_web {
-        toml.push_str(&format!("subdomain = \"{subdomain}\"\n"));
-    } else if f.remote_port != 0 {
-        toml.push_str(&format!("remotePort = {}\n", f.remote_port));
+        // The default is `<label>-<port>`; validate the complete derived DNS
+        // label so a 63-byte worktree label is still usable with an explicit
+        // subdomain, while an overlong default fails before spawn.
+        validate_dns_label(&subdomain, "subdomain")?;
     }
-    for line in &f.extra {
-        toml.push_str(line);
-        toml.push('\n');
-    }
-
-    // Derive the public URL.
-    let url = if is_web {
+    // Resolve and validate every provider-derived web value before constructing
+    // the typed document. This keeps invalid host input ahead of token-bearing
+    // serialization, even though the plan remains in memory until returned.
+    let web_host = if is_web {
         let host = f.subdomain_host.trim();
         if host.is_empty() {
             bail!("frp: set [share.frp] subdomain_host to derive the https URL");
         }
+        validate_dns_name(host, "subdomain_host")?;
+        Some(host.to_string())
+    } else {
+        None
+    };
+    let proxy_type = f.proxy_type.as_str();
+
+    // Build and immediately reparse a typed frpc.toml document. The same
+    // deny-unknown-fields structs own both serializer and parser, so generated
+    // text cannot silently acquire an unreviewed table/key.
+    let token = resolve_token();
+    let document = FrpDocument {
+        server_addr: server.clone(),
+        server_port: f.server_port,
+        auth: token.clone().map(|token| FrpAuth {
+            method: "token".into(),
+            token,
+        }),
+        proxies: vec![FrpProxy {
+            name: proxy_name,
+            proxy_type: proxy_type.into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: spec.local_port,
+            subdomain: is_web.then_some(subdomain.clone()),
+            remote_port: (!is_web).then_some(f.remote_port),
+        }],
+    };
+    let toml = toml::to_string(&document)
+        .map_err(|_| anyhow::anyhow!("frp: generated config failed serialization"))?;
+    let parsed: FrpDocument = toml::from_str(&toml)
+        .map_err(|_| anyhow::anyhow!("frp: generated config failed validation"))?;
+    if parsed != document {
+        bail!("frp: generated config failed validation (fields changed)");
+    }
+    // Derive the public URL.
+    let url = if is_web {
+        let host = web_host.expect("web host validated above");
         let scheme = if matches!(f.proxy_type, FrpProxyType::Https) {
             "https"
         } else {
@@ -289,7 +348,7 @@ fn plan_frp(spec: &ShareSpec, f: &FrpConfig) -> Result<SharePlan> {
         };
         format!("{scheme}://{subdomain}.{host}{port_suffix}")
     } else {
-        format!("{server}:{}", f.remote_port)
+        format!("{}:{}", url_authority(&server), f.remote_port)
     };
 
     Ok(SharePlan {
@@ -302,6 +361,134 @@ fn plan_frp(spec: &ShareSpec, f: &FrpConfig) -> Result<SharePlan> {
         }],
         url_rule: UrlRule::Fixed(url),
     })
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FrpDocument {
+    #[serde(rename = "serverAddr")]
+    server_addr: String,
+    #[serde(rename = "serverPort")]
+    server_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<FrpAuth>,
+    proxies: Vec<FrpProxy>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FrpAuth {
+    method: String,
+    token: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FrpProxy {
+    name: String,
+    #[serde(rename = "type")]
+    proxy_type: String,
+    #[serde(rename = "localIP")]
+    local_ip: String,
+    #[serde(rename = "localPort")]
+    local_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subdomain: Option<String>,
+    #[serde(rename = "remotePort", skip_serializing_if = "Option::is_none")]
+    remote_port: Option<u16>,
+}
+
+/// Validate a Thegn DNS label. This is deliberately an application policy:
+/// backend parsers accept a wider set, but generated share names need a
+/// portable, bounded representation.
+fn validate_dns_label(value: &str, field: &str) -> Result<String> {
+    let len = value.len();
+    if value.is_empty() {
+        bail!("frp: invalid {field} (empty; 0 bytes)");
+    }
+    if len > 63 {
+        bail!("frp: invalid {field} ({} bytes exceeds 63)", len);
+    }
+    let bytes = value.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        bail!("frp: invalid {field} (must start with lowercase ASCII alphanumeric)");
+    }
+    if !bytes[len - 1].is_ascii_lowercase() && !bytes[len - 1].is_ascii_digit() {
+        bail!("frp: invalid {field} (must end with lowercase ASCII alphanumeric)");
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        bail!("frp: invalid {field} (use lowercase ASCII alphanumeric or '-')");
+    }
+    Ok(value.to_string())
+}
+
+fn validate_dns_name(value: &str, field: &str) -> Result<String> {
+    if value.len() > 253 {
+        bail!("frp: invalid {field} ({} bytes exceeds 253)", value.len());
+    }
+    if value.is_empty() || value.ends_with('.') {
+        bail!("frp: invalid {field} (empty or trailing dot)");
+    }
+    for label in value.split('.') {
+        if label.is_empty() {
+            bail!("frp: invalid {field} (empty DNS component)");
+        }
+        if label.len() > 63 {
+            bail!("frp: invalid {field} (DNS component exceeds 63 bytes)");
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[label.len() - 1].is_ascii_alphanumeric() {
+            bail!("frp: invalid {field} (DNS components cannot start/end with '-')");
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            bail!("frp: invalid {field} (use ASCII DNS components)");
+        }
+    }
+    Ok(value.to_string())
+}
+
+/// Return the frpc spelling of a server address. `IpAddr` parsing keeps IPv6
+/// handling typed; frpc receives the unbracketed address, while URL authority
+/// formatting below adds brackets only where RFC 3986 requires them.
+fn validate_server_addr(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        bail!("frp: set [share.frp] server_addr to your frps host");
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("frp: invalid server_addr (whitespace/control characters)");
+    }
+    if value.starts_with('[') || value.ends_with(']') {
+        let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+            bail!("frp: invalid server_addr (malformed bracketed IPv6 address)");
+        };
+        let ip = inner
+            .parse::<IpAddr>()
+            .ok()
+            .filter(|ip| ip.is_ipv6())
+            .ok_or_else(|| anyhow::anyhow!("frp: invalid server_addr (expected bracketed IPv6)"))?;
+        return Ok(ip.to_string());
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    if value.contains(':') {
+        bail!("frp: invalid server_addr (unbracketed value is not an IPv6 address)");
+    }
+    validate_dns_name(value, "server_addr")
+}
+
+fn url_authority(server: &str) -> String {
+    match server.parse::<IpAddr>() {
+        Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
+        _ => server.to_string(),
+    }
 }
 
 /// tailscale: `serve`/`funnel` the worktree port over its existing VPN tunnel.
