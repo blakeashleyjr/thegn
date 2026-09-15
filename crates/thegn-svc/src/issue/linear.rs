@@ -850,7 +850,7 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
-        let _ = server.await;
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }
 
