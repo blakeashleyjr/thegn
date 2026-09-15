@@ -203,8 +203,7 @@ impl PluginIssueBackend {
         plugin_id: &str,
         caps: IssueCaps,
     ) -> Result<Self, IssueError> {
-        crate::issue::identity::builtin_segment(plugin_id, "plugin namespace")
-            .map_err(IssueError::Parse)?;
+        crate::issue::identity::plugin_namespace(plugin_id).map_err(IssueError::Parse)?;
         let provider_id: &'static str = Box::leak(format!("plugin:{plugin_id}").into_boxed_str());
         Ok(Self {
             bridge,
