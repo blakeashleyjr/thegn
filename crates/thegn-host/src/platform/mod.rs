@@ -43,6 +43,10 @@ pub(crate) mod qos;
 
 pub(crate) mod sound;
 
+// Standalone THE-603 helper; no production launch/startup callers yet.
+#[allow(dead_code)]
+pub(crate) mod state_db_capture;
+
 /// Physical identity and nonblocking ownership checks for local gate state.
 pub(crate) mod gate_path;
 
