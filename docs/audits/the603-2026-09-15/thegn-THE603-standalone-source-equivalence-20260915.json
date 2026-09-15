@@ -1,0 +1,16 @@
+{
+  "candidate": "38a1f84d997bf68b7282114113817b01aa3ea635",
+  "base": "59a9c944bcc94107ded859932864ffaf9be1ffb3",
+  "tested_source": "dd5e4d07ff16428f250388b142c5f9b4c25561c3",
+  "source_files_match": {
+    "crates/thegn-core/src/host_db_capture.rs": "3d22b5d70a5ed60678f76ecca488f9d98acffce5561d97d71325a8ddfb84ce9e",
+    "crates/thegn-host/src/platform/state_db_capture.rs": "9493b4e01cb7c3fe3c544355dee90b10589e0dc0c8e63ee5a78e9133585c9281",
+    "crates/thegn-host/src/platform/state_db_capture_linux.rs": "c6088046efcf8e935c53c7aea4dcd11623d34855a7f0a8cf99385c798a8752cf",
+    "crates/thegn-host/src/platform/state_db_capture_tests.rs": "d3d53eb363f86f93cdc6ef703ecb1453c13739e2f896273fa5665561f3f73625",
+    "crates/thegn-host/src/state_host_capture.rs": "ef45ab0b5033814cc73422c864a056cd66700dbf4f4730261dd80dde66e2d363",
+    "crates/thegn-core/src/host_db.rs": "651625b8a17aaed8b820fd4219cff0a059905dc1a04cf5224dd40c7264dc704b",
+    "crates/thegn-core/src/host_db_snapshot.rs": "c8ef1d84a6560506aff462527c6f909490a7440acce3a80a65e1226dd521eab0",
+    "crates/thegn-core/src/host_config_checked.rs": "5000805c4f94ce76d7dc7b21f618a6636c9b74988e8729ddd54d32630e2d9996"
+  },
+  "native_reuse": "current06focused121 at27c includes5core16Linux; corrected16Linux passatdd5; exactcounterfactuals pending"
+}

@@ -1107,6 +1107,19 @@
       "delivered_at": "2026-09-15"
     },
     {
+      "change": "strict-state-host-capture",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-603",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "THE-603 additive strict WAL capture and Linux stable-namespace admission delivered on local main c6191b2a after root and independent review, source-bound positive/strict-lint evidence and two isolated counterfactual failures. THE-592/THE-607 integration remains separate.",
+      "delivered_at": "2026-09-15"
+    },
+    {
       "change": "verify-gate-workspace",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

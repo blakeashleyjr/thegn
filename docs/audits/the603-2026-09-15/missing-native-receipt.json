@@ -1,0 +1,22 @@
+{
+  "source": "3d3271deb5f9c2fcc6d5b7b5ef18f36d938f6381",
+  "source_sha256": {
+    "crates/thegn-core/src/lib.rs": "e38fe42dc851c74ef383d0ce930ef9b53055f5cf8448f606e2a109176ae1995e",
+    "crates/thegn-svc/src/lib.rs": "c2ab313ac3c29d57d53c46c72276a60920b95722fbf8ab0dea8b13c72f3a97a2",
+    "crates/thegn-host/src/main.rs": "109e926017812e028dc788d9361aa099feea972fbe95d75a05c71af7c8b08f8e",
+    "crates/thegn-host/src/platform/state_db_capture_linux.rs": "5854949eab555983998018c647c7357ef47d76c60b5c0fb675da256513732b0a"
+  },
+  "binary": "/tmp/thegn-THE603-missing-native-evidence-20260915/host-tests",
+  "binary_sha256": "b4edf4dd1fbe101ac2d44969c7efe01ca80bedf5d3eaf844d6465a7a56bbe058",
+  "depfile_sha256": "d8e76a3ae0e42c39d316843524a28588bd0b6cfdb83bfca1bdd0c5544352a236",
+  "manifest_dir": "/tmp/thegn-THE603-counterfactual-missing-20260915/crates/thegn-host",
+  "compiler_artifact_fresh": false,
+  "build_exit_code": 0,
+  "selector": "platform::state_db_capture::linux::tests::missing_ancestor_replacement_and_permission_change_hold",
+  "exit_code": 101,
+  "log": "/tmp/thegn-THE603-missing-native-20260915.log",
+  "log_sha256": "22ee7ed9baa10dc4d0347c8ac5d3fdf70ce59224d2d3e699c7b44371da9b8aed",
+  "timestamp_utc": "2026-09-15T20:03:29.795702+00:00",
+  "semantic_review": "Root verifies first change_mode=false replacement case reaches permissionrestore andreads0 assertions then requiredErrChanged assertion441 fails; noSQLite calls. Later permissioncase, recapture and strictTempDirclose unreached; ordinaryfixtureDrop only.",
+  "expected_semantic_failure": true
+}

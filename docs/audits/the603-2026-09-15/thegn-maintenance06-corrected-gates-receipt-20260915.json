@@ -1,0 +1,25 @@
+{
+  "source": "dd5e4d07ff16428f250388b142c5f9b4c25561c3",
+  "native": {
+    "passed": 16,
+    "skipped": 3365,
+    "seconds": 0.747,
+    "exit_code": 0,
+    "log": "/tmp/thegn-THE603-lint-correction-native-20260915.log",
+    "sha256": "f642cc17e6217b807f1a8533e5ef1811ad5668b9e21887fa3d54caf9719d12c1"
+  },
+  "strict_clippy": {
+    "exit_code": 0,
+    "seconds": 207,
+    "log": "/tmp/thegn-maintenance06-corrected-clippy-20260915.log",
+    "sha256": "bf7f8cd96cdf9f7b7c1df3405bfe00715327da9ad90c8f5cd686c7f1d9b340c4"
+  },
+  "source_ratchets_exit_code": 0,
+  "openspec": {
+    "passed": 164,
+    "failed": 0
+  },
+  "original_lint_failure_preserved": "/tmp/thegn-maintenance06-combined-clippy-20260915.log",
+  "independent_source_review": "/tmp/thegn-maintenance06-lint-only-independent-review-luna-20260915.md",
+  "timestamp_utc": "2026-09-15T15:47:08.123067+00:00"
+}

@@ -1,0 +1,64 @@
+{
+  "review": "THE603 bounded counterfactual proposals",
+  "reviewer": "luna",
+  "date": "2026-09-15",
+  "base": {
+    "checkout": "/tmp/thegn-maintenance-06-combined-20260915",
+    "commit": "dd5e4d07ff16428f250388b142c5f9b4c25561c3",
+    "linux_source": "crates/thegn-host/src/platform/state_db_capture_linux.rs",
+    "linux_source_sha256": "c6088046efcf8e935c53c7aea4dcd11623d34855a7f0a8cf99385c798a8752cf",
+    "positive_checkout_mutated": false,
+    "native_or_cargo_executed": false,
+    "positive_receipt_preserved": true
+  },
+  "proposals": [
+    {
+      "id": "missing-final-ancestor-verification-bypass",
+      "clone": "/tmp/thegn-THE603-counterfactual-missing-20260915",
+      "patch": "/tmp/thegn-THE603-counterfactual-missing-20260915.patch",
+      "patch_sha256": "20f64d04be1b47a9d64cfa7b72e3b4b7d5926c546c1eb2992228d7b58bb5a9f9",
+      "mutant_source_sha256": "5854949eab555983998018c647c7357ef47d76c60b5c0fb675da256513732b0a",
+      "diff": "delete self.chain.verify(true)?; from MissingObservation::verify",
+      "selector": "thegn-host::bin/thegn platform::state_db_capture::linux::tests::missing_ancestor_replacement_and_permission_change_hold",
+      "first_iteration": "change_mode=false observed parent is renamed and replacement parent is created",
+      "expected_mutant_result": "Ok(Capture::Absent)",
+      "expected_first_assertion": "source assertion requiring Err(Error::Changed)",
+      "expected_semantic_failure": "ancestor replacement is accepted as absence",
+      "read_counter_expected": 0,
+      "sqlite_or_data_io_expected": false,
+      "trusted_root_and_private_fixtures_preserved": true,
+      "strict_close_reached_on_mutant_failure": false,
+      "later_mode_iteration_reached": false,
+      "worktree_delta_files": 1
+    },
+    {
+      "id": "orphan-sidecar-refusal-bypass",
+      "clone": "/tmp/thegn-THE603-counterfactual-orphan-20260915",
+      "patch": "/tmp/thegn-THE603-counterfactual-orphan-20260915.patch",
+      "patch_sha256": "49126ab1742b3f6fc50d3e53cca64fce0269ae6d9d0f980915ff992d1f6e52b2",
+      "mutant_source_sha256": "0568fe6f44434bd77c286a924c8be19f603074c599bb0655fa6c52104a1fa77f",
+      "diff": "replace Ok(_) => return Err(Error::OrphanedSidecar), with Ok(_) => {}",
+      "selector": "thegn-host::bin/thegn platform::state_db_capture::linux::tests::orphan_sidecars_preclude_absence_before_and_after_observation",
+      "first_iteration": "regular private-state.db-wal orphan exists before rendezvous (late=false)",
+      "expected_mutant_result": "Ok(Capture::Absent)",
+      "expected_first_assertion": "let error = result.unwrap_err() expecting Error::OrphanedSidecar",
+      "expected_semantic_failure": "regular orphan sidecar is ignored and absence is published",
+      "read_counter_expected": 0,
+      "sqlite_or_data_io_expected": false,
+      "trusted_root_and_private_fixtures_preserved": true,
+      "strict_close_reached_on_mutant_failure": false,
+      "later_suffix_late_symlink_fifo_cases_reached": false,
+      "worktree_delta_files": 1
+    }
+  ],
+  "preserved_boundaries": [
+    "real trusted-root production route",
+    "private rooted fixtures and supported filesystem premise",
+    "without_sql read counter",
+    "exact ownership and restoration guards",
+    "strict TempDir close on positive paths",
+    "no hostile SQLite FIFO or live DB action",
+    "positive 21-test native receipt"
+  ],
+  "verdict": "two exact source counterfactuals prepared for root bounded execution; no landing approval"
+}
