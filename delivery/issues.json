@@ -553,6 +553,13 @@
       ]
     },
     {
+      "issue": "THE-603",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "strict-state-host-capture"
+      ]
+    },
+    {
       "issue": "THE-606",
       "project": "Runtime Security & Host Architecture",
       "changes": [
