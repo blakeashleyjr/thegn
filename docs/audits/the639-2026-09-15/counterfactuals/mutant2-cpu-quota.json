@@ -1,0 +1,6 @@
+{
+  "unit": "thegn-audit639-mutant2-20260915.scope",
+  "readback": "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-audit639-mutant2-20260915.scope\nCPUQuotaPerSecUSec=1s\n",
+  "cpu_max": "100000 100000",
+  "timestamp_utc": "2026-09-15T19:38:44.110135+00:00"
+}

@@ -1,0 +1,130 @@
+{
+  "issue": "THE-639",
+  "date": "2026-09-15",
+  "candidate": "8a83b1ec37366ba329a5752a5b20e7715fc24695",
+  "base": "3f365bfe56a7577dd8e051c56f5f0a4e81ade02e",
+  "tested_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+  "scope": "durable source/evidence packaging only; no build or execution",
+  "files": {
+    "counterfactuals/01-claim-before-preparation.patch": {
+      "sha256": "36efc21bd089d6146b5294b394d8ea3b10960b8e9fa5a246007500446ce6a343",
+      "bytes": 1114
+    },
+    "counterfactuals/02-local-displaced-session-on-unwind.patch": {
+      "sha256": "cc7ec3773cd250887ea01f7d15c0c5340962892c5020b5d8577f8886a93becc8",
+      "bytes": 1779
+    },
+    "counterfactuals/03-reader-after-owned-child-exit.patch": {
+      "sha256": "a9ece6cf05da163147a119d0cfb59d3f930800458615e60aab98cc7ca81f357d",
+      "bytes": 2119
+    },
+    "counterfactuals/mutant1-build.jsonl": {
+      "sha256": "4b4bb527d1a1f69a3fbc6d43ed6448d69ce52950606d773ba9d242c45d7ff34e",
+      "bytes": 769527
+    },
+    "counterfactuals/mutant1-build.log": {
+      "sha256": "c77dabad2795ea2713ba811990d721e0fdced65985240f11b85d7ea34b9aa1f7",
+      "bytes": 1499
+    },
+    "counterfactuals/mutant1-native.log": {
+      "sha256": "88a5095abca5082cf1b723942af34823d8bc84cb4102d9a1205729d499753cf0",
+      "bytes": 763
+    },
+    "counterfactuals/mutant1-receipt.json": {
+      "sha256": "3c2f5d9dc8b1214506626b3422cd92ca2cb514356650bd67edc360a023c3481f",
+      "bytes": 1433
+    },
+    "counterfactuals/mutant1-review.json": {
+      "sha256": "784a0c14a487df7daa6e88de6267eb1b4ed1d65db1b28364b90d9a5908639cf1",
+      "bytes": 3270
+    },
+    "counterfactuals/mutant1-review.md": {
+      "sha256": "997166bac0ef14c239ddefc5b3ca090d007e838ae30f078481af538cf507128f",
+      "bytes": 1539
+    },
+    "counterfactuals/mutant2-build-admission.json": {
+      "sha256": "fd77254d8e91c01664c532d7057487a7cb7ed54f76cff0e4ced311445a56abd5",
+      "bytes": 1219
+    },
+    "counterfactuals/mutant2-build.jsonl": {
+      "sha256": "17d2825958efe7e4347a15ec8763b6994cb4487eb50d19e23ff4d6712789947d",
+      "bytes": 733653
+    },
+    "counterfactuals/mutant2-build.log": {
+      "sha256": "6a8c1a7aa8a608ca4f1485103e536c79bec5e7973ccc90ffd47e809fbe078155",
+      "bytes": 8436
+    },
+    "counterfactuals/mutant2-cpu-quota.json": {
+      "sha256": "10f6572e70fdd1481f9a0bb49abb0d19a744ce4dc8f6872bd90cbbcd9dfc264b",
+      "bytes": 308
+    },
+    "counterfactuals/mutant2-native.log": {
+      "sha256": "f87e22903489687b9f42fd71d50718a71fc49700efe5e27abcfa7ba29d32f12a",
+      "bytes": 972
+    },
+    "counterfactuals/mutant2-receipt.json": {
+      "sha256": "811259b0acd28893c8cd3f56d94d6a3fda9a8ee18d10b470bbd2ab1cd7c348b7",
+      "bytes": 1693
+    },
+    "counterfactuals/mutant2-review.json": {
+      "sha256": "bed2fbfe6df27c3f2dd0d00fc7a67682cba2188286ebdd701a736f1b233b6284",
+      "bytes": 2634
+    },
+    "counterfactuals/mutant2-review.md": {
+      "sha256": "6bfbca34e9dbc78703e9212096d9a614c3210fc5d5e923db6758d29b5a924235",
+      "bytes": 2408
+    },
+    "counterfactuals/mutant3-build-admission.json": {
+      "sha256": "72a5945338c7fee7c7d8ac5e77cac170c1498f96d19d340d61b408bfb5733b4d",
+      "bytes": 1229
+    },
+    "counterfactuals/mutant3-build.jsonl": {
+      "sha256": "7f50b3f693af1a3e58e269c061cbd96621cd75ca5a6ea847649631c25f4d33b1",
+      "bytes": 733477
+    },
+    "counterfactuals/mutant3-build.log": {
+      "sha256": "4b4af0c66036cc5dff3e4b8e86a1db8ac3a0e03c1a6c17ac73c24ab71201e97a",
+      "bytes": 8420
+    },
+    "counterfactuals/mutant3-cpu-quota.json": {
+      "sha256": "95f917fd3abfe1c51ead62307024f90f913422965dbe6f44974e5ca357af59ee",
+      "bytes": 178
+    },
+    "counterfactuals/mutant3-native.log": {
+      "sha256": "24a8ec2b18e4bc0bef02a00e45c8f27af1cfb67fe7b55e0b0114e0b60e3687d2",
+      "bytes": 2294
+    },
+    "counterfactuals/mutant3-receipt.json": {
+      "sha256": "d0e5f6bc3c4d2cc6a116eec9df097c37cd40705f2b195736e86de2c8d39c8bad",
+      "bytes": 1725
+    },
+    "counterfactuals/mutant3-review.json": {
+      "sha256": "1d86ed665c2805761b644502db1cf022ee6fbd7fcc0439b82e49d3d3b9fc6ce4",
+      "bytes": 4833
+    },
+    "counterfactuals/mutant3-review.md": {
+      "sha256": "4ced7a6f04d46fb6c1ac2fd5eeb9ead49fd657ef8104094c9b50a3812320abb5",
+      "bytes": 4590
+    },
+    "full05-native-receipt.json": {
+      "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310",
+      "bytes": 6272
+    },
+    "full05-native.log": {
+      "sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
+      "bytes": 984898
+    },
+    "review.md": {
+      "sha256": "b021663b4b942e46df0e1c883a79fc5163ca643ff2755c061cef6e41216774d0",
+      "bytes": 2587
+    },
+    "selectors.txt": {
+      "sha256": "47da35d38bb2e3464c664ec3ee001415ccf44ab58df41feec7bb8c7277467e19",
+      "bytes": 2520
+    },
+    "source-equivalence.json": {
+      "sha256": "71268db60713379c57e4f6ec4516280b0aafb9b7d34a6fb05a351ba07ffa6af2",
+      "bytes": 1270
+    }
+  }
+}

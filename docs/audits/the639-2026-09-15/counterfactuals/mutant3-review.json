@@ -1,0 +1,85 @@
+{
+  "reviewer": "luna",
+  "review_date": "2026-09-15",
+  "review_kind": "THE639_mutant3_independent_source_and_evidence_review",
+  "verdict": "approve_expected_semantic_failure",
+  "source": "8e2d8ef68558842baab8d5dc0dfdf5ee9a4b08fc",
+  "base": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+  "source_checkout": "/tmp/thegn-THE639-native-03-reader-after-owned-child-exit-20260915",
+  "source_delta": {
+    "production_file": "crates/thegn-host/src/devcontainer_startup.rs",
+    "production_delta": "cfg(test) ChildExited hook immediately after successful consuming wait_child",
+    "test_file": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs",
+    "test_delta": "ChildExited Point plus ReaderStarted gate release and explicit finish before result.unwrap on Err",
+    "production_ownership_changed": false,
+    "production_deadline_or_cleanup_changed": false
+  },
+  "source_sha256": {
+    "crates/thegn-core/src/lib.rs": "24f546cbfc39962deabe37ff893d830e46bdb14e7da5a20398ae2cf7b3834536",
+    "crates/thegn-svc/src/lib.rs": "c2ab313ac3c29d57d53c46c72276a60920b95722fbf8ab0dea8b13c72f3a97a2",
+    "crates/thegn-host/src/main.rs": "b7bf263c580683bed257aad5d5ae3b22ae1615c35caa9fb9919e92cf694c5321",
+    "crates/thegn-host/src/devcontainer_startup.rs": "113b85a37277ce43d39544b2cf32603dc4a2b2655ef59e31de13f12631bc33ba",
+    "crates/thegn-host/src/platform/devcontainer_startup_tests.rs": "026aa43dc50a9c7a5ee34660e126f8ca4d16b3a66a28f39fe6d63d5f372741c2"
+  },
+  "patch": {
+    "path": "/tmp/thegn-THE639-counterfactuals-20260915-y422shnj/03-reader-after-owned-child-exit.patch",
+    "sha256": "a9ece6cf05da163147a119d0cfb59d3f930800458615e60aab98cc7ca81f357d"
+  },
+  "build": {
+    "admission": "/tmp/thegn-THE639-mutant3-build-admission-20260915.json",
+    "admission_sha256": "72a5945338c7fee7c7d8ac5e77cac170c1498f96d19d340d61b408bfb5733b4d",
+    "jsonl": "/tmp/thegn-THE639-mutant3-build-20260915.jsonl",
+    "jsonl_sha256": "7f50b3f693af1a3e58e269c061cbd96621cd75ca5a6ea847649631c25f4d33b1",
+    "exit_code": 0,
+    "compiler_artifact_fresh": false,
+    "binary": "/tmp/thegn-THE639-mutant3-native-evidence-20260915/host-tests",
+    "binary_sha256": "f5f998d750b0fe67a7fade2b276984d8f5ec8a88aef01d718eae406a584d8958",
+    "depfile": "/tmp/thegn-THE639-mutant3-native-evidence-20260915/host-tests.d",
+    "depfile_sha256": "ea03e6765bd21b957fd7f6cb693062b23d7080ed24c17eeb301f3f6540c411b5"
+  },
+  "execution": {
+    "selector": "devcontainer_provider::startup::tests::unix::real_startup_stdout_null_success_and_exact_stderr_bound",
+    "log": "/tmp/thegn-THE639-mutant3-native-20260915.log",
+    "log_sha256": "24a8ec2b18e4bc0bef02a00e45c8f27af1cfb67fe7b55e0b0114e0b60e3687d2",
+    "exit_code": 101,
+    "test_summary": "0 passed; 1 failed; 3364 filtered out; finished in 3.19s",
+    "failure_line": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs:646",
+    "failure": "result.unwrap() on HeldUnknown(Deadline, Diagnostic{len:0, exit_code:null})",
+    "expected_semantic_failure": true,
+    "zero_stderr_positive_prerequisite": "source-enforced before line-646 failure; result.is_ok plus session/argv/snapshot/starts/clean assertions",
+    "two_mib_case": "reader gate holds before child exit; caller deadline returns HeldUnknown(Deadline); fixture.finish executes before unwrap",
+    "later_not_reached": [
+      "2 MiB session exec_argv assertion",
+      "2 MiB config snapshot assertion",
+      "2 MiB starts-file assertion",
+      "second fixture.finish",
+      "clean assertion"
+    ]
+  },
+  "cleanup_review": {
+    "explicit_finish_before_intended_failure": true,
+    "finish_releases_reader_gate": true,
+    "finish_drains_reader_and_reaps_exact_child": true,
+    "owner_joined_before_fixture_disposal": true,
+    "gate_wait_backstop_seconds": 5,
+    "caller_deadline_seconds": 3,
+    "outer_test_bound_seconds": 30,
+    "gate_timeout_or_backstop_accepted_as_failure": false,
+    "cleanup_failure_or_double_panic_observed": false,
+    "unbounded_wait_observed": false
+  },
+  "verification": {
+    "receipt_source_hashes_match_checkout": true,
+    "receipt_binary_hash_matches": true,
+    "receipt_depfile_hash_matches": true,
+    "receipt_log_hash_matches": true,
+    "no_new_build_or_native_execution": true,
+    "no_shipping_source_mutation": true,
+    "cpu_quota_readback": "/tmp/thegn-THE639-mutant3-cpu-quota-readback-20260915.json",
+    "cpu_quota_readback_sha256": "95f917fd3abfe1c51ead62307024f90f913422965dbe6f44974e5ca357af59ee"
+  },
+  "limitations": [
+    "The one-test log does not print per-loop iteration markers; zero-stderr completion is source-confirmed by the later line-646 location and source guard.",
+    "This receipt proves the intended counterfactual kill and bounded fixture settlement; it does not claim a shipping implementation change or a new full-suite result."
+  ]
+}

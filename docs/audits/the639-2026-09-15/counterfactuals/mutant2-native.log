@@ -1,0 +1,18 @@
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody ... 
+thread 'devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody' (668007) panicked at crates/thegn-host/src/devcontainer_startup.rs:778:9:
+owned fixture immediate post-insert unwind
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody' (668007) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:761:9:
+assertion failed: operation.retired.lock().unwrap_err().into_inner().is_some()
+FAILED
+
+failures:
+
+failures:
+    devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3364 filtered out; finished in 0.16s
+

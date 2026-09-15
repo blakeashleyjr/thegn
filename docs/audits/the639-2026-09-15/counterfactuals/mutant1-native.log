@@ -1,0 +1,17 @@
+
+running 1 test
+test devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown ... 
+thread 'devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown' (4003404) panicked at crates/thegn-host/src/platform/devcontainer_startup_tests.rs:1144:13:
+assertion `left == right` failed
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3364 filtered out; finished in 0.24s
+

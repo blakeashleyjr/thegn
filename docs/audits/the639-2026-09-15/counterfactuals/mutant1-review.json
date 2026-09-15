@@ -1,0 +1,67 @@
+{
+  "kind": "THE639_mutant1_independent_source_log_review",
+  "source": "ccb10143a60e5ec80f52b7698f6c2d1b656d4a9f",
+  "patch_sha256": "36efc21bd089d6146b5294b394d8ea3b10960b8e9fa5a246007500446ce6a343",
+  "manifest_dir": "/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-host",
+  "source_sha256": {
+    "crates/thegn-host/src/devcontainer_startup.rs": "2bdc59e436a2d525cade6a17a1441f4b3eab310fc2739b4b719836f491dd329c",
+    "crates/thegn-host/src/platform/devcontainer_startup_tests.rs": "dc53176910600e0dc068b18d76a35279fb9a7272846bfa2b548c38adee408844"
+  },
+  "build": {
+    "jsonl": "/tmp/thegn-THE639-mutant1-build-20260915.jsonl",
+    "jsonl_sha256": "4b4bb527d1a1f69a3fbc6d43ed6448d69ce52950606d773ba9d242c45d7ff34e",
+    "log": "/tmp/thegn-THE639-mutant1-build-20260915.log",
+    "log_sha256": "c77dabad2795ea2713ba811990d721e0fdced65985240f11b85d7ea34b9aa1f7",
+    "exit_code": 0,
+    "seconds": 535,
+    "profile": "test [unoptimized + debuginfo]",
+    "compiler_artifact_fresh": false,
+    "execution_reused_completed_build": true,
+    "target_executable": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/deps/thegn-c095a2964b0e9b93"
+  },
+  "artifact": {
+    "binary": "/tmp/thegn-THE639-mutant1-native-evidence-20260915/host-tests",
+    "binary_sha256": "3bce4e8d6dab1df0a3021426f0b5b61a4dba853b44542776932a965684c14b2e",
+    "depfile": "/tmp/thegn-THE639-mutant1-native-evidence-20260915/host-tests.d",
+    "depfile_sha256": "fee304e44a51f0672b2015295b063d0c2ac01df0ae28a131da5a9b7dded96e34",
+    "depfile_names_present": true,
+    "depfile_worktree_provenance_present": true
+  },
+  "execution": {
+    "selector": "devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown",
+    "log": "/tmp/thegn-THE639-mutant1-native-20260915.log",
+    "log_sha256": "88a5095abca5082cf1b723942af34823d8bc84cb4102d9a1205729d499753cf0",
+    "exit_code": 101,
+    "expected_semantic_failure": true,
+    "spawn_actual": 1,
+    "spawn_expected": 0,
+    "test_result": "0 passed; 1 failed; 3364 filtered out; finished in 0.24s"
+  },
+  "first_semantic_failure": {
+    "file": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs",
+    "line": 1144,
+    "assertion": "h.fixture.controller.hooks.spawn_calls.load(Ordering::Acquire) == expected_spawns",
+    "first_case": "Point::BeforeSpawnClaim",
+    "expected": 0,
+    "observed": 1,
+    "fixture_finish_line": 1143,
+    "fixture_finish_precedes_assertion": true
+  },
+  "reachability": {
+    "explicit_fixture_finish_reached": true,
+    "first_case_cleanup_before_failure": true,
+    "second_spawn_claimed_case_reached": false,
+    "second_case_after_claim_assertions_claimed": false,
+    "later_test_assertions_claimed": false
+  },
+  "verification": {
+    "source_hashes_match_receipt": true,
+    "binary_hash_matches_receipt": true,
+    "depfile_hash_matches_receipt": true,
+    "execution_log_hash_matches_receipt": true,
+    "build_freshness_provenance_verified": true,
+    "no_new_build_or_native_execution": true,
+    "no_performance_result_claimed": true
+  },
+  "scope_note": "This review records the first failing mutant-1 preclaim case and cleanup ordering. It does not claim the later after-claim case was exercised."
+}

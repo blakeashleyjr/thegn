@@ -1,0 +1,23 @@
+{
+  "source": "ccb10143a60e5ec80f52b7698f6c2d1b656d4a9f",
+  "patch_sha256": "36efc21bd089d6146b5294b394d8ea3b10960b8e9fa5a246007500446ce6a343",
+  "source_sha256": {
+    "crates/thegn-host/src/devcontainer_startup.rs": "2bdc59e436a2d525cade6a17a1441f4b3eab310fc2739b4b719836f491dd329c",
+    "crates/thegn-host/src/platform/devcontainer_startup_tests.rs": "dc53176910600e0dc068b18d76a35279fb9a7272846bfa2b548c38adee408844"
+  },
+  "binary": "/tmp/thegn-THE639-mutant1-native-evidence-20260915/host-tests",
+  "binary_sha256": "3bce4e8d6dab1df0a3021426f0b5b61a4dba853b44542776932a965684c14b2e",
+  "depfile_sha256": "fee304e44a51f0672b2015295b063d0c2ac01df0ae28a131da5a9b7dded96e34",
+  "manifest_dir": "/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-host",
+  "compiler_artifact_fresh": false,
+  "build_exit_code": 0,
+  "build_seconds": 535,
+  "selector": "devcontainer_provider::startup::tests::unix::cancellation_before_spawn_claim_refuses_child_but_after_claim_remains_unknown",
+  "exit_code": 101,
+  "expected_semantic_failure": true,
+  "log": "/tmp/thegn-THE639-mutant1-native-20260915.log",
+  "log_sha256": "88a5095abca5082cf1b723942af34823d8bc84cb4102d9a1205729d499753cf0",
+  "execution_reused_completed_build": true,
+  "limits": "First preclaim case only; explicitfixture.finish precedes failedspawncount; afterclaimcase/laterassertionsunreached",
+  "timestamp_utc": "2026-09-15T18:47:58.932655+00:00"
+}

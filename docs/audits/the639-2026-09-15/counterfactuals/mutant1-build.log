@@ -1,0 +1,13 @@
+   Compiling gtui-core v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/gtui-core)
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-media)
+   Compiling thegn-metrics v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-metrics)
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-svc)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-core)
+   Compiling gtui-query v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/gtui-query)
+   Compiling gtui-render v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/gtui-render)
+   Compiling gtui-app v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/gtui-app)
+   Compiling tg-kit v0.1.0 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/tg-kit)
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/thegn-host)
+   Compiling termwiz v0.23.3 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/vendor/termwiz)
+   Compiling gtui-embed v0.1.0-alpha.2 (/tmp/thegn-THE639-native-01-claim-before-preparation-20260915/crates/gtui-embed)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 55s

@@ -1,0 +1,49 @@
+--- a/crates/thegn-host/src/devcontainer_startup.rs
++++ b/crates/thegn-host/src/devcontainer_startup.rs
+@@ -563,6 +563,8 @@
+             return;
+         }
+     };
++    #[cfg(test)]
++    operation.hooks.at(tests::Point::ChildExited);
+     if !status.success() {
+         // Disposition is already held before any inherited-pipe join. Only
+         // notification waits for EOF/diagnostics; the caller deadline still
+--- a/crates/thegn-host/src/platform/devcontainer_startup_tests.rs
++++ b/crates/thegn-host/src/platform/devcontainer_startup_tests.rs
+@@ -13,6 +13,7 @@
+     SpawnClaimed,
+     Spawned,
+     ReaderStarted,
++    ChildExited,
+     BeforeReady,
+ }
+ 
+@@ -623,7 +624,26 @@
+                 "i=0; while [ $i -lt 4096 ]; do printf '%0512d' 0; i=$((i+1)); done\ni=0; while [ $i -lt {} ]; do printf '%0512d' 0 >&2; i=$((i+1)); done",
+                 stderr / 512
+             ));
+-            let session = h.fixture.start().unwrap();
++            let gate = Arc::new(Gate::default());
++            h.fixture.controller.hooks.gates.lock().unwrap().push(gate.clone());
++            let ordered = gate.clone();
++            *h.fixture.controller.hooks.callback.lock().unwrap() =
++                Some(Arc::new(move |point| match point {
++                    Point::ReaderStarted => ordered.wait(),
++                    Point::ChildExited => ordered.release(),
++                    _ => (),
++                }));
++            let result = h.fixture.start();
++            if result.is_err() {
++                // Release the registered reader gate and prove exact settlement
++                // before reporting the intended positive-expectation failure.
++                h.fixture.finish();
++            }
++            assert!(
++                stderr != 0 || result.is_ok(),
++                "counterfactual zero-stderr positive control did not complete"
++            );
++            let session = result.unwrap();
+             let argv = session.exec_argv("printf fixture").unwrap();
+             assert!(argv.contains(&"exec".to_string()));
+             assert!(session.handle.config_snapshot.path().exists());

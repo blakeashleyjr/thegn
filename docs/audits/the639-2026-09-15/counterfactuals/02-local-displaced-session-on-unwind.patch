@@ -1,0 +1,39 @@
+--- a/crates/thegn-host/src/devcontainer_startup.rs
++++ b/crates/thegn-host/src/devcontainer_startup.rs
+@@ -773,12 +773,13 @@
+         };
+         // The pre-admitted empty cell receives displaced custody directly.
+         // No local old session, fallible transfer or lock acquisition follows.
+-        *retired = map.insert(key, session);
++        let displaced = map.insert(key, session);
+         #[cfg(test)]
+         assert!(
+             !operation.hooks.panic_after_insert.load(Ordering::Acquire),
+             "owned fixture immediate post-insert unwind"
+         );
++        *retired = displaced;
+         drop(map);
+         drop(retired);
+         operation.state.store(ACCEPTED, Ordering::Release);
+--- a/crates/thegn-host/src/platform/devcontainer_startup_tests.rs
++++ b/crates/thegn-host/src/platform/devcontainer_startup_tests.rs
+@@ -718,6 +718,9 @@
+ 
+         let mut previous = harness("exit 0");
+         let evidence = count_provider(&mut previous);
++        // Counterfactual only: a wrongly invoked publisher destructor must
++        // return normally so the existing custody assertions can reject it.
++        evidence.gate.release();
+         let old = previous.fixture.start().unwrap();
+         previous.fixture.finish();
+         // Stop retaining the old session in its original registry. The value
+@@ -750,6 +753,9 @@
+             ))
+             .is_err()
+         );
++        // Counterfactual receipt: prove exact owner/reader settlement before
++        // the semantic retained-custody assertion is allowed to fail.
++        h.fixture.finish();
+         assert_eq!(operation.state.load(Ordering::Acquire), HELD);
+         assert!(operation.retired.is_poisoned());
+         assert!(operation.retired.lock().unwrap_err().into_inner().is_some());

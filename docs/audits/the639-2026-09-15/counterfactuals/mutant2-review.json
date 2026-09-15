@@ -1,0 +1,44 @@
+{
+  "issue": "THE-639",
+  "mutant": "mutant2",
+  "verdict": "accepted_for_intended_counterfactual_failure",
+  "blockers": [],
+  "source": {
+    "path": "/tmp/thegn-THE639-native-02-local-displaced-session-on-unwind-20260915",
+    "commit": "4bf53c348e36b0cb6b8a88d32698ab4c0c0e26b5",
+    "clean_at_review": true,
+    "receipt_source_hashes_match": true,
+    "test_only_diff": false,
+    "production_mutation_under_test": true,
+    "isolated_nonshipping_counterfactual": true,
+    "production_behavior_claimed": false
+  },
+  "artifact": {
+    "binary": "/tmp/thegn-THE639-mutant2-native-evidence-20260915/host-tests",
+    "binary_sha256": "c48d10add226ed3cd580196a1bc502ee6aa1cecb899b095db5201eeac158b339",
+    "depfile": "/tmp/thegn-THE639-mutant2-native-evidence-20260915/host-tests.d",
+    "depfile_sha256": "1d22a1654fd03b9331bc6a123d8fa3ab5b62b7423fcda5df07da01cf05a6072d",
+    "compiler_artifact_fresh": false,
+    "build_exit_code": 0,
+    "build_jsonl": "/tmp/thegn-THE639-mutant2-build-20260915.jsonl",
+    "build_jsonl_sha256": "17d2825958efe7e4347a15ec8763b6994cb4487eb50d19e23ff4d6712789947d",
+    "build_log": "/tmp/thegn-THE639-mutant2-build-20260915.log",
+    "build_log_sha256": "6a8c1a7aa8a608ca4f1485103e536c79bec5e7973ccc90ffd47e809fbe078155"
+  },
+  "native": {
+    "selector": "devcontainer_provider::startup::tests::unix::dropped_success_and_immediate_post_insert_unwind_keep_custody",
+    "exit_code": 101,
+    "expected_semantic_failure": true,
+    "log": "/tmp/thegn-THE639-mutant2-native-20260915.log",
+    "log_sha256": "f87e22903489687b9f42fd71d50718a71fc49700efe5e27abcfa7ba29d32f12a",
+    "hook_line": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs:748",
+    "panic_line": "crates/thegn-host/src/devcontainer_startup.rs:778",
+    "fixture_finish_line": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs:758",
+    "first_failing_assertion": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs:761 retired ownership is_some",
+    "prior_assertions_passed": ["state HELD", "retired mutex poisoned"],
+    "later_assertions_unreached": ["registry contains fixture", "old snapshot exists", "provider destructor count", "Busy retry"]
+  },
+  "reviewer_executed_build_or_test": false,
+  "rerun_performed": false,
+  "scope_claim": "Pinned isolated nonshipping mutant2 first semantic failure and source/artifact provenance only; the production publish path is intentionally mutated under test, so no shipping behavior is claimed. This review did not compile or execute; the receipt's reused root build is marked compiler_artifact_fresh=false. Later assertions are not claimed."
+}

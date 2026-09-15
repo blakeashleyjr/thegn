@@ -1,0 +1,30 @@
+--- a/crates/thegn-host/src/devcontainer_startup.rs
++++ b/crates/thegn-host/src/devcontainer_startup.rs
+@@ -501,13 +501,6 @@
+         handle: prepared.handle.clone(),
+     };
+     *operation.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+-    let bytes = vec![0; STDERR_LIMIT + 1].into_boxed_slice();
+-    #[cfg(test)]
+-    operation.hooks.at(tests::Point::BeforeSpawnClaim);
+-    if super::verify_config_digest(&request.config_path, &request.digest).is_err() {
+-        operation.not_started(StartReason::Preparation);
+-        return;
+-    }
+     if Instant::now() >= operation.deadline
+         || operation
+             .state
+@@ -515,6 +508,13 @@
+             .is_err()
+     {
+         operation.not_started(StartReason::Deadline);
++        return;
++    }
++    let bytes = vec![0; STDERR_LIMIT + 1].into_boxed_slice();
++    #[cfg(test)]
++    operation.hooks.at(tests::Point::BeforeSpawnClaim);
++    if super::verify_config_digest(&request.config_path, &request.digest).is_err() {
++        operation.not_started(StartReason::Preparation);
+         return;
+     }
+     #[cfg(test)]

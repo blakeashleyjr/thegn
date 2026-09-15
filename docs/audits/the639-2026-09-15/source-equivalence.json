@@ -1,0 +1,30 @@
+{
+  "candidate": "8a83b1ec37366ba329a5752a5b20e7715fc24695",
+  "base": "3f365bfe56a7577dd8e051c56f5f0a4e81ade02e",
+  "files": [
+    {
+      "path": "crates/thegn-host/src/agent.rs",
+      "candidate_sha256": "0789aee60728050f74cc580db1b4bbaaa21a77c8f4c11db03bdb791ba9192909",
+      "tested33c_sha256": "0789aee60728050f74cc580db1b4bbaaa21a77c8f4c11db03bdb791ba9192909",
+      "exact": true
+    },
+    {
+      "path": "crates/thegn-host/src/devcontainer_provider.rs",
+      "candidate_sha256": "44e2c12a45e69bc686c4e30f22258ef5963dedd640a1bd4501683d91e8b84ea3",
+      "tested33c_sha256": "44e2c12a45e69bc686c4e30f22258ef5963dedd640a1bd4501683d91e8b84ea3",
+      "exact": true
+    },
+    {
+      "path": "crates/thegn-host/src/devcontainer_startup.rs",
+      "candidate_sha256": "368223778a2695d3794288adacabcb115ad9fb0a82a078dfd3eb16d4f294ceed",
+      "tested33c_sha256": "368223778a2695d3794288adacabcb115ad9fb0a82a078dfd3eb16d4f294ceed",
+      "exact": true
+    },
+    {
+      "path": "crates/thegn-host/src/platform/devcontainer_startup_tests.rs",
+      "candidate_sha256": "dc53176910600e0dc068b18d76a35279fb9a7272846bfa2b548c38adee408844",
+      "tested33c_sha256": "dc53176910600e0dc068b18d76a35279fb9a7272846bfa2b548c38adee408844",
+      "exact": true
+    }
+  ]
+}
