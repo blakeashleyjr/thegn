@@ -362,6 +362,17 @@ pub fn owner_repo_from_url(url: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
+/// Whether a PR/issue URL belongs to the repository `nwo` (`owner/repo`,
+/// case-insensitive — GitHub names are). Guards cached forge rows against the
+/// worktree's `origin` having changed since they were fetched: a row that
+/// can't be parsed carries no evidence either way and is kept. Pure.
+pub fn pr_url_in_repo(url: &str, nwo: &str) -> bool {
+    match owner_repo_from_url(url) {
+        Some((owner, repo)) => format!("{owner}/{repo}").eq_ignore_ascii_case(nwo),
+        None => true,
+    }
+}
+
 /// Parse the REST notifications payload down to this repo's @mention threads:
 /// `(source_ref, message)` rows, where `source_ref` is
 /// `ghn:<thread id>:<updated_at>` — stable per mention event, so the
@@ -820,6 +831,19 @@ mod tests {
     use crate::github::{GhError, classify, spawn_err, submit_review};
     use crate::remote::GitLoc;
     use crate::seam::SeamError;
+
+    #[test]
+    fn pr_url_in_repo_matches_owner_repo_case_insensitively() {
+        let url = "https://github.com/Acme/MySage/pull/12";
+        assert!(pr_url_in_repo(url, "acme/mysage"));
+        assert!(pr_url_in_repo(url, "Acme/MySage"));
+        // A row fetched before `origin` moved to another repo is rejected.
+        assert!(!pr_url_in_repo(url, "acme/old-sage"));
+        assert!(!pr_url_in_repo(url, "fork/mysage"));
+        // Unparseable URLs carry no evidence and are kept.
+        assert!(pr_url_in_repo("", "acme/mysage"));
+        assert!(pr_url_in_repo("not a url", "acme/mysage"));
+    }
 
     #[test]
     fn parse_pr_search_reads_repo_with_owner() {

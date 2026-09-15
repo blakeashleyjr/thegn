@@ -121,11 +121,23 @@ fn pr_status_of(loc: &GitLoc, number: Option<u64>) -> PrPanel {
 
 /// `gh pr view [<n>] --json …` as a `Result` — the forge-trait shape.
 pub fn pr_status_raw(loc: &GitLoc, number: Option<u64>) -> Result<PrStatus, GhError> {
-    let num = number.map(|n| n.to_string());
-    let mut args: Vec<&str> = vec!["pr", "view"];
-    if let Some(n) = num.as_deref() {
-        args.push(n);
-    }
+    // Name the PR explicitly. A bare `gh pr view` resolves it through the
+    // branch's push/upstream config, which can land on ANOTHER branch's PR
+    // (e.g. a worktree branch auto-tracking `origin/main`).
+    let selector = match number {
+        Some(n) => n.to_string(),
+        None => {
+            let branch = loc
+                .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap_or_default();
+            // Detached HEAD has no branch, so no PR.
+            if branch.is_empty() || branch == "HEAD" {
+                return Err(GhError::NoPr);
+            }
+            branch
+        }
+    };
+    let mut args: Vec<&str> = vec!["pr", "view", &selector];
     args.extend_from_slice(&["--json", PR_FIELDS]);
     let json = gh_out(loc, &args)?;
     serde_json::from_str::<PrStatus>(&json).map_err(|e| GhError::Other(format!("parse error: {e}")))

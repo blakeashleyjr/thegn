@@ -2015,6 +2015,33 @@ fn pr_state_is_definitive(state: &thegn_core::forge::model::PanelState) -> bool 
     )
 }
 
+/// Whether a cached `PrPanel` still describes this worktree's checkout. The
+/// row is keyed by worktree only, so it is checked against:
+/// - the worktree it was fetched for (drops rows written under the old
+///   colliding sandbox-path key);
+/// - the branch — a checkout leaves the old branch's PR in the row until the
+///   next successful fetch;
+/// - the repo `origin` names now — a changed remote leaves the old repo's PR.
+///
+/// An empty stamp on either side is "no evidence" and passes. Pure.
+fn cached_pr_applies(
+    cached: &thegn_core::forge::model::PrPanel,
+    cache_key: &str,
+    loc_path: &str,
+    branch: &str,
+    origin_nwo: Option<&str>,
+) -> bool {
+    use thegn_core::forge::model::{PanelState, pr_url_in_repo};
+    let same_worktree =
+        cached.worktree.is_empty() || cached.worktree == cache_key || cached.worktree == loc_path;
+    let same_branch = cached.branch.is_empty() || branch.is_empty() || cached.branch == branch;
+    let same_repo = match (&cached.state, origin_nwo) {
+        (PanelState::Pr(pr), Some(nwo)) => pr_url_in_repo(&pr.url, nwo),
+        _ => true,
+    };
+    same_worktree && same_branch && same_repo
+}
+
 /// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
 fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: thegn_core::forge::model::PrPanel) {
     use thegn_core::forge::model::{Bucket, PanelState, check_bucket};
@@ -2614,20 +2641,26 @@ pub(crate) fn build_panel(
         ..Default::default()
     };
 
+    // The repo `origin` names NOW. Every forge cache below was fetched against
+    // whatever origin was at the time; a changed remote must not keep showing
+    // the old repo's PRs (those rows never expire and survive failed refreshes).
+    let origin_nwo = thegn_core::forge::model::nwo_from_remote_url(
+        &loc.git_out(&["remote", "get-url", "origin"])
+            .unwrap_or_default(),
+    );
+
     // The typed PR cache: summary + checks + review threads + issues.
     if let Ok(Some((json, _))) = db.get_pr_cache(&cache_key)
         && let Ok(cached) = serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json)
+        && cached_pr_applies(
+            &cached,
+            &cache_key,
+            &loc.path(),
+            &panel.branch,
+            origin_nwo.as_deref(),
+        )
     {
-        // Defense-in-depth: the payload stamps the worktree it was fetched for
-        // (`pr_status` stamps `loc.path()`); drop a row that belongs to a
-        // different worktree (e.g. one written under the old colliding
-        // sandbox-path key) instead of rendering the wrong repo's PR.
-        if cached.worktree.is_empty()
-            || cached.worktree == cache_key
-            || cached.worktree == loc.path()
-        {
-            apply_pr_cache(&mut panel, cached);
-        }
+        apply_pr_cache(&mut panel, cached);
     }
 
     // The deep review cache is identity-checked before it reaches either
@@ -2792,6 +2825,12 @@ pub(crate) fn build_panel(
         .unwrap_or_else(|| loc.path());
     if let Ok(Some((json, fetched_at))) = db.get_pr_branch_cache(&pr_cache_repo_root) {
         panel.open_prs = thegn_core::forge::model::parse_pr_headers(&json);
+        // A row fetched before `origin` changed lists the old repo's PRs.
+        if let Some(nwo) = origin_nwo.as_deref() {
+            panel
+                .open_prs
+                .retain(|p| thegn_core::forge::model::pr_url_in_repo(&p.url, nwo));
+        }
         // Keep the age: an unaged row rendered a PR merged days ago (offline,
         // gh broken) as a live green badge, indistinguishable from fresh data.
         panel.open_prs_fetched_at = Some(fetched_at);
@@ -2883,6 +2922,16 @@ pub(crate) fn build_panel(
     {
         panel.my_work = feed.rows;
         panel.my_work_note = feed.note;
+        // The repo-scoped row is keyed by repo root, not repo identity: after
+        // `origin` changes it still holds the old repo's PRs until a refresh.
+        if !crate::panel::scope::mine_all()
+            && let Some(nwo) = origin_nwo.as_deref()
+        {
+            panel.my_work.retain(|r| {
+                r.kind != thegn_core::work::WorkKind::Pr
+                    || thegn_core::forge::model::pr_url_in_repo(&r.url, nwo)
+            });
+        }
     }
     crate::hydrate_feed::populate_notifications(db, &repo_root, app_cfg, &mut panel);
     populate_review_tasks(db, &mut panel);
@@ -3574,7 +3623,9 @@ pub(crate) fn spawn_pr_cache_refresh(
         let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
         let forges = crate::forge_handle::get();
         let forge = forges.for_loc(&loc);
-        let prs = forge.pr_list(&loc, 100);
+        // Newest-first, paged: a repo with more open PRs than one page (100)
+        // used to be silently truncated to an arbitrary 100.
+        let prs = forge.pr_list(&loc, 300);
         if let Ok(prs) = prs
             && let Ok(json) = serde_json::to_string(&prs)
             && let Ok(db) = thegn_core::db::Db::open()
@@ -4032,24 +4083,29 @@ pub(crate) fn spawn_my_work_refresh(
         // other workspaces' items. Surface why via the feed note instead.
         let mut note = String::new();
         if all || nwo.is_some() {
-            if let Ok(prs) = forge.search_prs(
+            let mut search_errors: Vec<String> = Vec::new();
+            match forge.search_prs(
                 &loc,
                 thegn_core::forge::PrRole::ReviewRequested,
                 nwo.as_deref(),
                 30,
             ) {
-                rows.extend(
+                Ok(prs) => rows.extend(
                     prs.into_iter()
                         .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
-                );
+                ),
+                Err(e) => search_errors.push(e.describe()),
             }
-            if let Ok(prs) =
-                forge.search_prs(&loc, thegn_core::forge::PrRole::Author, nwo.as_deref(), 30)
-            {
-                rows.extend(
+            match forge.search_prs(&loc, thegn_core::forge::PrRole::Author, nwo.as_deref(), 30) {
+                Ok(prs) => rows.extend(
                     prs.into_iter()
                         .map(|p| pr_search_row(p, WorkGroup::NeedsAttention)),
-                );
+                ),
+                Err(e) => search_errors.push(e.describe()),
+            }
+            // A failed search must not read as "nothing waiting on you".
+            if let Some(first) = search_errors.first() {
+                note = format!("PR search failed: {first}");
             }
         } else {
             note = "no `origin` remote — PR search needs it for repo scope (a = all repos)"
@@ -4382,6 +4438,15 @@ pub(crate) fn retarget_diff_watcher(
                     .any(|p| crate::git_watch::is_ref_move_path(p))
                 {
                     let _ = tx.send(RefreshKind::MainRefMoved); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                }
+                // A checkout changed the branch: the PR cache row is the OLD
+                // branch's, so look the new one up now.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| crate::git_watch::is_head_move_path(p))
+                {
+                    let _ = tx.send(RefreshKind::Pr); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
                 // A remote-tracking ref moved — the local signature of a push
                 // (or fetch): kick the PR + CI caches now so the just-pushed
