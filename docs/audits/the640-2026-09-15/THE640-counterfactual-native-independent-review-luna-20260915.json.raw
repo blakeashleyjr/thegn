@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "review": "THE-640 counterfactual native evidence independent review",
+  "reviewer": "Luna",
+  "review_date": "2026-09-15",
+  "verdict": "approve_counterfactual_native_failure",
+  "scope": "Independent provenance and semantic-failure review; no rerun, build, source mutation, or live process action by reviewer.",
+  "source": {
+    "mutant_source": "c7be344ced2fd5d655fc70e29c005afccf7f36a5",
+    "positive_source": "9a1f50b05d5bd62e53837c4ff75ed5f7d0e2b9ef",
+    "mutant_checkout": "/tmp/thegn-THE640-counterfactual-source-luna-20260915-rev",
+    "mutant_procs_view_sha256": "195abb49151e67caff618be61218cc0466c739d7ec6dcaac236eb63fd977abd3",
+    "mutant_monitor_tests_sha256": "222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237",
+    "source_change": "only the Name and PID comparator expressions are inverted; monitor tests and corrected RSS expectations are retained."
+  },
+  "build": {
+    "admission": "/tmp/thegn-THE640-counterfactual-build-admission-20260915.json",
+    "admission_sha256": "45548a58f831ff5064e6c6397ca257de92f0c3c716f202f5d151c0f50bdc0242",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "nice",
+      "-n",
+      "10",
+      "cargo",
+      "test",
+      "-p",
+      "thegn-host",
+      "--bin",
+      "thegn",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "jobs": 1,
+    "nice": 10,
+    "requested_cpu": 3,
+    "actual_cpu_enforcement": "not claimed; execution environment broadened affinity to CPUs 0-21",
+    "exit_code": 0,
+    "compiler_artifact_fresh": false,
+    "build_log": "/tmp/thegn-THE640-counterfactual-build-20260915.log",
+    "build_log_sha256": "482cd147f74fe9af8190d871e6dc96d208b3f24742b8d3852281f461b7446f07",
+    "build_jsonl": "/tmp/thegn-THE640-counterfactual-build-20260915.jsonl",
+    "build_jsonl_sha256": "900e8bcd8d5816351c10eec07c7b7a28dcf13dbc68f8a252ef6eceab3ed523b5"
+  },
+  "binary": {
+    "path": "/tmp/thegn-THE640-counterfactual-native-evidence-20260915/host-tests",
+    "sha256": "e8b28bb172669d59825b8e217202e90116eff71e7d73a6f92e9bb6e56fe1d791",
+    "depfile": "/tmp/thegn-THE640-counterfactual-native-evidence-20260915/host-tests.d",
+    "depfile_sha256": "cdc1feb62bbd200ccea56e6014af1554d1d45c683dbb43f1b23f5780afd195cd",
+    "source_manifest_in_depfile": "/tmp/thegn-THE640-counterfactual-source-luna-20260915-rev"
+  },
+  "native": {
+    "receipt": "/tmp/thegn-THE640-counterfactual-native-evidence-20260915/receipt.json",
+    "receipt_sha256": "a6d132944b445abf284f0889be00ba0f5004687e9f4531823cb9347e014c08f5",
+    "log": "/tmp/thegn-THE640-counterfactual-native-20260915.log",
+    "log_sha256": "bebaf37f94c0cdf10ed0f561670772c086c033bca8cc32455f796cc90421a55d",
+    "passed": 0,
+    "failed": 3,
+    "total": 3,
+    "selector_sections": 3,
+    "all_exit_codes_101": true,
+    "all_first_failures_intended": true,
+    "outer_timeout_seconds": 30,
+    "test_threads": 1
+  },
+  "coverage": [
+    {
+      "selector": "monitor::procs_view::tests::flat_distinct_keys_follow_direction",
+      "result": "failed as intended",
+      "first_failure": "Name desc=false at procs_view.rs:342; observed [42,17,3], expected [3,17,42].",
+      "what_ran_later": "The test panicked at this first Name assertion; later Name/PID loop cases did not execute in this test process."
+    },
+    {
+      "selector": "monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction",
+      "result": "failed as intended",
+      "first_failure": "Name desc=false at procs_view.rs:386; observed [42,17,3,10,11], expected [10,11,42,3,17].",
+      "what_ran_later": "The test panicked at this first Name assertion; later PID loop cases did not execute in this test process."
+    },
+    {
+      "selector": "monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity",
+      "result": "failed as intended",
+      "first_failure": "Name desc=true at monitor_tests.rs:501; observed [3,17,42], expected [42,17,3].",
+      "what_ran_later": "The c/m CPU/RSS direction cases ran before this failure; the later Name-ascending/PID cases and post-loop confirmation block did not execute in this test process."
+    }
+  ],
+  "interpretation": {
+    "flat": "CPU/RSS assertions precede Name and pass before first Name failure.",
+    "tree": "The selector starts with Name, so no CPU/RSS prelude is claimed for that selector.",
+    "monitor": "c/m CPU/RSS direction cases precede n/Name and pass; Name desc=true is the first failing direction.",
+    "later_pid": "Later PID assertions are absent from each failing test process after the observed first Name panic; this is a statement about this captured run, not a generic source-only reachability claim.",
+    "live_action": "No live process sampling, signal dispatch, or process workload is used by these fixture tests."
+  },
+  "status": {
+    "counterfactual": "complete; intended semantic failure observed",
+    "source_review": "approved",
+    "final_adversarial_review": "complete via this independent review",
+    "landing": "pending",
+    "closure": "pending"
+  },
+  "limits": [
+    "compiler_artifact_fresh is false; build provenance is recorded without claiming a clean fresh dependency rebuild.",
+    "The requested taskset command records CPU 3, but execution affinity was broadened to CPUs 0-21; CPU 3 enforcement is not claimed.",
+    "The raw receipt expected_first_failures field retains its pre-run root-semantic-inspection wording; observed log and current review supersede that pending phrase.",
+    "No full workspace/release/performance or live-process acceptance is inferred."
+  ]
+}

@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "artifact": "THE-640 durable positive native evidence checkpoint",
+  "issue": "THE-640",
+  "created_date": "2026-09-15",
+  "private_checkpoint": "cc3a61142d9a26c2c949e50f8fc7398b1e991125",
+  "canonical_source_merge": "b025ec5d877f191d65cc831c95035c493c49c7f6",
+  "reviewed_test_source": "9553d36878b8e4726524997d2cd7e05e3b4b1f93",
+  "scope": "Reviewed THE640 code/evidence delivered to local main; Linear closure follows final metadata receipt.",
+  "source_hashes": {
+    "crates/thegn-host/src/monitor/procs_view.rs": "3ceb2630d5f36f1d16fda8828c55140c1f5c5b2c160be10eeff95dcb931701f6",
+    "crates/thegn-host/src/monitor_tests.rs": "222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237"
+  },
+  "durable_files": [
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-positive-native-20260915.log.raw",
+      "original": "/tmp/thegn-THE640-positive-native-20260915.log",
+      "bytes": 3982,
+      "sha256": "0257d86269228718a90ee63a9223deb7dbff4b52babe246aa9792239e736c37b"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-positive-native-receipt-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-positive-native-evidence-20260915/receipt.json",
+      "bytes": 2656,
+      "sha256": "209bfaf01c9f1cf425fe1ea6b88c5461a097b903fff0a3765b93d8874537046e"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-positive-native-independent-review-luna-20260915.md.raw",
+      "original": "/tmp/thegn-THE640-positive-native-independent-review-luna-20260915.md",
+      "bytes": 6527,
+      "sha256": "9d831e9bf201d2f8a6a6c1d9087bce5f2e8ff2dee3a2737eb38e8cad360e724f"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-positive-native-independent-review-luna-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-positive-native-independent-review-luna-20260915.json",
+      "bytes": 9267,
+      "sha256": "3dbf5d6f96768c484eb27a3a197519a70c11c2fec2e400a38f55c0f77994a48a"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-independent-source-review-luna-20260915.md.raw",
+      "original": "/tmp/thegn-THE640-independent-source-review-luna-20260915.md",
+      "bytes": 2436,
+      "sha256": "e4222d6fcfb0439eda426e24cf67ee2cf167f81d442c219b360bca0d2370ebe2"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-independent-source-review-luna-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-independent-source-review-luna-20260915.json",
+      "bytes": 3056,
+      "sha256": "b5dc9286cfe49601e36f29d5142fb267e0faa6f6dc68fe9177dfa8e785ef015b"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-native-20260915.log.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-native-20260915.log",
+      "bytes": 2195,
+      "sha256": "bebaf37f94c0cdf10ed0f561670772c086c033bca8cc32455f796cc90421a55d"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-native-receipt-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-native-evidence-20260915/receipt.json",
+      "bytes": 1186,
+      "sha256": "a6d132944b445abf284f0889be00ba0f5004687e9f4531823cb9347e014c08f5"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-build-admission-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-build-admission-20260915.json",
+      "bytes": 997,
+      "sha256": "45548a58f831ff5064e6c6397ca257de92f0c3c716f202f5d151c0f50bdc0242"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-native-independent-review-luna-20260915.md.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-native-independent-review-luna-20260915.md",
+      "bytes": 3423,
+      "sha256": "5d65e5af1bc83c0c44a3dd90720be0370aa0b9d3fbabdec30eb4bd51ce74c3eb"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-native-independent-review-luna-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-native-independent-review-luna-20260915.json",
+      "bytes": 5620,
+      "sha256": "3bf5b2ad1460b2b2f6875918b32751f6e24be7ac30b358b8e2ee43e28663890f"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-source-luna-20260915.md.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-source-luna-20260915.md",
+      "bytes": 3195,
+      "sha256": "c3324b24d6cdf289d243372ecc260b77a06d4595b71f0bffd3e3665d633b84ad"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-counterfactual-source-luna-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-counterfactual-source-luna-20260915.json",
+      "bytes": 1963,
+      "sha256": "27eca83860acf76ea0318beb6b81f360e80ef4eec90dd14a28e3c63e7f7ad609"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-scoped-clippy-final-20260915.log.raw",
+      "original": "/tmp/thegn-THE640-scoped-clippy-final-20260915.log",
+      "bytes": 9066,
+      "sha256": "8ef9e1b5657c53451397cb735b773ed9410676cfe40481856c517e5cea8513ff"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-scoped-clippy-final-admission-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-scoped-clippy-final-admission-20260915.json",
+      "bytes": 661,
+      "sha256": "3e9d57161506f5da6a38dbdeb73a23ae314b22a286a8b0df4687c959ca505d03"
+    },
+    {
+      "path": "docs/audits/the640-2026-09-15/THE640-scoped-clippy-cpu-quota-readback-20260915.json.raw",
+      "original": "/tmp/thegn-THE640-scoped-clippy-cpu-quota-readback-20260915.json",
+      "bytes": 375,
+      "sha256": "5b93774756d65f0d878f97773ca993aae4dcb9e4ed6395946f95b23add8916d9"
+    }
+  ],
+  "positive_gate": {
+    "status": "complete",
+    "passed": 14,
+    "total": 14,
+    "exact_selectors": true,
+    "native_log_sha256": "0257d86269228718a90ee63a9223deb7dbff4b52babe246aa9792239e736c37b",
+    "receipt_sha256": "209bfaf01c9f1cf425fe1ea6b88c5461a097b903fff0a3765b93d8874537046e",
+    "binary_durability": "excluded by design; original binary remains at /tmp/thegn-THE640-positive-native-evidence-20260915/host-tests"
+  },
+  "status": {
+    "source_review": "approved",
+    "positive_native": "complete",
+    "counterfactual": "complete; build 27339 and intended native failures independently reviewed",
+    "final_adversarial_review": "complete via independent source/native review",
+    "landing": "complete at fdcefcb687b901d2362bcce6f1d6b3d7be4a57fb",
+    "closure": "pending",
+    "strict_scoped_clippy": "complete; root admission/log exit 0"
+  },
+  "counterfactual_wording_correction": {
+    "audit": "docs/audits/process-sort-THE-640.md",
+    "audit_sha256": "65ec10cd3a541fb72113a7839346c2e123edbc31c03330f2d51f678c39ad8c2d",
+    "meaning": "The historical pre-run wording was superseded by the captured build 27339 native log: each first Name-direction assertion failed before later PID assertions in that test process.",
+    "native_status": "complete: build 27339 exited 0; three intended Name-direction failures observed with exit 101; later PID assertions did not execute after the first panic."
+  },
+  "preserved_constraints": [
+    "THE628 shared tasks and pending performance work are unchanged.",
+    "No binary is committed.",
+    "This checkpoint does not authorize landing or issue closure."
+  ],
+  "counterfactual_evidence": {
+    "build": "THE640-counterfactual-build-admission-20260915.json.raw",
+    "native_log": "THE640-counterfactual-native-20260915.log.raw",
+    "receipt": "THE640-counterfactual-native-receipt-20260915.json.raw",
+    "independent_review": "THE640-counterfactual-native-independent-review-luna-20260915.json.raw",
+    "passed": 0,
+    "failed": 3,
+    "exit_codes": [
+      101,
+      101,
+      101
+    ],
+    "first_failures": [
+      "flat Name desc=false",
+      "tree Name desc=false",
+      "actual monitor Name desc=true"
+    ],
+    "later_pid_assertions": "did not execute after the observed first Name panic in each failing test process",
+    "cpu_enforcement": "requested taskset CPU3 but build environment broadened affinity to CPUs 0-21; no CPU3 enforcement claim"
+  },
+  "strict_scoped_clippy": {
+    "status": "complete",
+    "source_at_admission": "cc3a61142d9a26c2c949e50f8fc7398b1e991125",
+    "exit_code": 0,
+    "admission": "THE640-scoped-clippy-final-admission-20260915.json.raw",
+    "log": "THE640-scoped-clippy-final-20260915.log.raw",
+    "quota_readback": "THE640-scoped-clippy-cpu-quota-readback-20260915.json.raw",
+    "log_sha256": "8ef9e1b5657c53451397cb735b773ed9410676cfe40481856c517e5cea8513ff",
+    "admission_sha256": "3e9d57161506f5da6a38dbdeb73a23ae314b22a286a8b0df4687c959ca505d03",
+    "quota_sha256": "5b93774756d65f0d878f97773ca993aae4dcb9e4ed6395946f95b23add8916d9",
+    "scope": "one scoped production-bin clippy run, one job, CPU quota 100%; no affinity claim"
+  },
+  "final_source_gates": {
+    "ratchets": {
+      "path": "/tmp/thegn-THE640-final-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "exit_code": 0
+    },
+    "openspec": {
+      "path": "/tmp/thegn-THE640-final-openspec-20260915.log",
+      "sha256": "bf97cb282336636ef851efb84ab5ef0f3af44fd1a386e522329ed3af05ae6c5e",
+      "exit_code": 0
+    },
+    "format": {
+      "path": "/tmp/thegn-THE640-final-format-20260915.log",
+      "sha256": "09faf55d578ace4148ba7a8412a68a996f12a473545e857dfd15424996150a52",
+      "exit_code": 0
+    }
+  }
+}

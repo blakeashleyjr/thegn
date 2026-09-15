@@ -1,0 +1,32 @@
+{
+  "source": "c7be344ced2fd5d655fc70e29c005afccf7f36a5",
+  "command": [
+    "taskset",
+    "-c",
+    "3",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "test",
+    "-p",
+    "thegn-host",
+    "--bin",
+    "thegn",
+    "--no-run",
+    "--message-format=json-render-diagnostics"
+  ],
+  "source_hashes": {
+    "crates/thegn-core/src/lib.rs": "2d0dfa1300fd78f97204b72a2138a5e2f7caaecb6dc5c5cc0731b4dc1c93ee8d",
+    "crates/thegn-svc/src/lib.rs": "c2ab313ac3c29d57d53c46c72276a60920b95722fbf8ab0dea8b13c72f3a97a2",
+    "crates/thegn-host/src/main.rs": "b7bf263c580683bed257aad5d5ae3b22ae1615c35caa9fb9919e92cf694c5321",
+    "crates/thegn-host/src/monitor/procs_view.rs": "195abb49151e67caff618be61218cc0466c739d7ec6dcaac236eb63fd977abd3"
+  },
+  "started_at_utc": "2026-09-15T19:06:18.511182+00:00",
+  "purpose": "Single old-comparator counterfactual, no fullworkspace/releasebuild",
+  "jobs": 1,
+  "cpu": 3,
+  "nice": 10,
+  "exit_code": 0,
+  "finished_at_utc": "2026-09-15T19:11:11.382554+00:00"
+}

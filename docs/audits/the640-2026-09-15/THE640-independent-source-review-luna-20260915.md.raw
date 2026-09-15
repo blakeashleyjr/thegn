@@ -1,0 +1,44 @@
+# THE-640 independent source review
+
+Review date: 2026-09-15  
+Candidate: `9a1f50b05d5bd62e53837c4ff75ed5f7d0e2b9ef`  
+Baseline: `060afad525a14547336e8d2170803a66af877812`
+
+**Disposition: APPROVE source scope. No blocker remains in the revised
+candidate.** This is a source-only review; no Cargo/native process or mutation
+was performed by this reviewer.
+
+The production change is exactly the two comparator directions in
+`crates/thegn-host/src/monitor/procs_view.rs` plus their comment. CPU and RSS
+already use ordinary ascending comparisons; Name and PID now do the same, and
+the existing shared `desc` reversal therefore makes the down arrow descending
+and the up arrow ascending for all four keys. The existing PID tie-break remains
+ascending after the primary comparison for CPU, RSS, and Name. Name still uses
+the existing lexical `String` comparator.
+
+The ordering is shared by flat rows and tree roots/siblings/cycle leftovers,
+so the rendered table body follows the same `ProcRow` order that the signal
+handler indexes. The host monitor test drives the actual `c/m/n/p/r` keys,
+checks the corresponding headings and arrows, and checks the rows before and
+after each direction transition. Its passive refresh fixture changes the
+selected process's RSS from 100 to 400 while ascending; the resulting body is
+explicitly `[42, 3, 17]`, and the pending confirmation remains bound to
+`(pid 17, start_time 100, "pid 17 middle")`.
+
+The pure view tests cover distinct CPU/RSS/Name/PID ordering in both directions,
+stable PID ties, tree roots and siblings, filtered ancestry, orphan roots, and
+cycle leftovers. The confirmation test opens `x` only and inspects the pending
+record; it does not press `y`, call signal dispatch, or introduce a `y` path.
+The production diff adds no performance branch, imports, new process feature, or
+owner attribution behavior. The only non-production changes are the associated
+tests, delivery metadata, audit, and OpenSpec text.
+
+The exact source-only changed production file has SHA-256
+`3ceb2630d5f36f1d16fda8828c55140c1f5c5b2c160be10eeff95dcb931701f6`; the
+regression test file has SHA-256
+`222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237`; and the
+audit has SHA-256
+`b71f1b26a11aa99eeadfee20f3d58bd12bb580434c1081b445c0ecdc9cb80d26`.
+
+The final candidate is source-approved for root integration. Full Cargo/native,
+counterfactual, and local-main landing evidence remain root-owned.

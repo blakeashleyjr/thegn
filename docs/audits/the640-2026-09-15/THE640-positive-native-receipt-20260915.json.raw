@@ -1,0 +1,74 @@
+{
+  "source": "9553d36878b8e4726524997d2cd7e05e3b4b1f93",
+  "binary": "/tmp/thegn-THE640-positive-native-evidence-20260915/host-tests",
+  "binary_sha256": "2c9aa8f2ee7f58a1b40f8b08356ec8411b9b9855102a3ee89cc521235448f9a0",
+  "depfile_sha256": "d3009d9ee5e9d914ffe5071220674785c19e48849b3f3f5f2bd33f2408b48430",
+  "compiler_artifact_fresh": false,
+  "source_hashes": {
+    "crates/thegn-host/src/monitor/procs_view.rs": "3ceb2630d5f36f1d16fda8828c55140c1f5c5b2c160be10eeff95dcb931701f6",
+    "crates/thegn-host/src/monitor_tests.rs": "222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237"
+  },
+  "results": [
+    {
+      "selector": "monitor::procs_view::tests::a_cyclic_parent_chain_terminates",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::flat_distinct_keys_follow_direction",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::flat_filter_matches_name_pid_and_owner",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::tied_flat_and_tree_rows_have_stable_pid_order",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::tree_filter_keeps_ancestry_of_a_match",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::tree_name_pid_keep_elided_roots_and_cycles_both_directions",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::tree_nests_children_and_flags_elided_roots",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::tests::processes_sort_keys_work_and_only_there",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::tests::passive_process_refresh_follows_identity_after_rank_changes",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::tests::process_confirmation_keeps_its_identity_while_ranks_change",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::tests::process_confirmation_refuses_a_reused_or_disappeared_sampled_identity",
+      "exit_code": 0
+    },
+    {
+      "selector": "monitor::tests::reused_process_does_not_inherit_selection_or_signal_escalation",
+      "exit_code": 0
+    }
+  ],
+  "passed": 14,
+  "total": 14,
+  "log": "/tmp/thegn-THE640-positive-native-20260915.log",
+  "log_sha256": "0257d86269228718a90ee63a9223deb7dbff4b52babe246aa9792239e736c37b",
+  "timestamp_utc": "2026-09-15T19:04:24.344207+00:00"
+}

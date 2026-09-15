@@ -476,6 +476,90 @@ fn processes_sort_keys_work_and_only_there() {
     assert_eq!(ov.prefs.proc_sort, ProcSort::Cpu);
 }
 
+#[test]
+fn process_sort_keys_render_both_directions_and_keep_confirmation_identity() {
+    let screen = Rect::full(120, 40);
+    let model = model_with_procs(vec![
+        proc(42, None, "zulu", 20.0, 200),
+        proc(3, None, "alpha", 30.0, 300),
+        proc(17, None, "middle", 10.0, 100),
+    ]);
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, screen);
+
+    for (key, sort, label, descending, ascending) in [
+        ('c', ProcSort::Cpu, "cpu", [3, 42, 17], [17, 42, 3]),
+        ('m', ProcSort::Rss, "mem", [3, 42, 17], [17, 42, 3]),
+        ('n', ProcSort::Name, "name", [42, 17, 3], [3, 17, 42]),
+        ('p', ProcSort::Pid, "pid", [42, 17, 3], [3, 17, 42]),
+    ] {
+        let starts_desc = ov.prefs.proc_desc;
+        assert_eq!(ch(&mut ov, key), MonitorOutcome::PrefsChanged);
+        ov.sync(&model, &hist, screen);
+        assert_eq!(ov.prefs.proc_sort, sort);
+        assert_eq!(ov.prefs.proc_desc, starts_desc);
+        assert_eq!(
+            ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            if starts_desc { descending } else { ascending }
+        );
+        assert!(headings(&ov)[0].1.contains(&format!(
+            "{label}{}",
+            if ov.prefs.proc_desc { "↓" } else { "↑" }
+        )));
+
+        assert_eq!(ch(&mut ov, 'r'), MonitorOutcome::PrefsChanged);
+        ov.sync(&model, &hist, screen);
+        assert_eq!(ov.prefs.proc_desc, !starts_desc);
+        assert_eq!(
+            ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            if !starts_desc { descending } else { ascending }
+        );
+        assert!(headings(&ov)[0].1.contains(&format!(
+            "{label}{}",
+            if ov.prefs.proc_desc { "↓" } else { "↑" }
+        )));
+    }
+
+    // Sorting is complete before opening confirmation. A passive rank change
+    // must leave the pending prompt bound to the sampled identity.
+    ch(&mut ov, 'm');
+    ch(&mut ov, 'r');
+    ov.sync(&model, &hist, screen);
+    assert!(!ov.prefs.proc_desc);
+    assert_eq!(ov.proc_rows[ov.sel].pid, 17);
+    ch(&mut ov, 'x');
+    let (pid, start_time, label) = match &ov.confirm {
+        Some(super::Confirm::Signal {
+            pid,
+            start_time,
+            label,
+            ..
+        }) => (*pid, *start_time, label.clone()),
+        other => panic!("expected signal confirmation, got {other:?}"),
+    };
+    assert_eq!(
+        (pid, start_time, label.as_str()),
+        (17, 100, "pid 17 middle")
+    );
+    let mut changed = model.clone();
+    changed.procs.procs[2].rss_bytes = 400;
+    ov.refresh(&changed, &ctx_at(&hist, screen));
+    assert!(!ov.prefs.proc_desc);
+    assert_eq!(
+        ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+        [42, 3, 17]
+    );
+    assert!(matches!(
+        &ov.confirm,
+        Some(super::Confirm::Signal {
+            pid: current_pid,
+            start_time: current_start,
+            label: current_label,
+            ..
+        }) if (*current_pid, *current_start, current_label) == (pid, start_time, &label)
+    ));
+}
+
 // --- Geometry and scrolling ---------------------------------------------
 
 #[test]

@@ -1,6 +1,7 @@
 # Tasks
 
 - [x] Investigate hydration publication, process sampling, bounded admission, and monitor selection.
+- [x] THE-640: correct Name/PID comparator direction and add focused flat/tree, builder, key, and confirmation regressions.
 - [x] Obtain primary reviewer approval of the bounded fix and regression plan.
 - [x] Preserve sampler-owned process state at authoritative hydration swap.
 - [x] Stabilize top-N admission and flat/tree tie ordering.
@@ -10,3 +11,7 @@
 - [x] Run combined host monitor and model equality tests in coordinated build graph.
 - [x] Complete primary code review and independent adversarial review/revisions.
 - [ ] Complete combined source/spec/format gates and reviewed local-main landing.
+- [x] THE-640: Run the focused native host monitor/view checks and record no live process actions.
+- [x] THE-640: Run and retain the old-comparator counterfactual in its separate private clone.
+- [x] THE-640: Complete independent adversarial review of the direction, tree, filter, and confirmation evidence.
+- [x] THE-640: Complete reviewed local-main landing and reconcile the issue/delivery records.

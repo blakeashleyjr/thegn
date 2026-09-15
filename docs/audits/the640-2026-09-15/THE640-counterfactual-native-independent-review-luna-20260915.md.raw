@@ -1,0 +1,51 @@
+# THE-640 counterfactual native evidence — independent review — Luna
+
+**Verdict: APPROVE the counterfactual semantic failure evidence.** The pinned
+old-comparator mutant at `c7be344ced2fd5d655fc70e29c005afccf7f36a5` built successfully and all three
+selected tests failed with the intended Name-direction assertion. This review
+performed no build, rerun, source mutation, or live process action.
+
+## Provenance
+
+The mutant source is `/tmp/thegn-THE640-counterfactual-source-luna-20260915-rev`.
+The production mutant hash is
+`195abb49151e67caff618be61218cc0466c739d7ec6dcaac236eb63fd977abd3` and the unchanged
+monitor test hash is `222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237`.
+The source report describes exactly two inverted comparator expressions (Name
+and PID). The depfile names the mutant checkout and both reviewed source files.
+
+The admission records a serialized `thegn-host --bin thegn --no-run` build with
+one Cargo job and nice 10; it exited 0. The command requested CPU 3, but the
+execution environment broadened affinity to CPUs 0–21, so CPU 3 enforcement is
+not claimed. Build JSONL SHA-256: `900e8bcd8d5816351c10eec07c7b7a28dcf13dbc68f8a252ef6eceab3ed523b5`. Build log SHA-256:
+`482cd147f74fe9af8190d871e6dc96d208b3f24742b8d3852281f461b7446f07`. The receipt reports `compiler_artifact_fresh: false`.
+
+The pinned mutant binary SHA-256 is `e8b28bb172669d59825b8e217202e90116eff71e7d73a6f92e9bb6e56fe1d791` and its depfile
+SHA-256 is `cdc1feb62bbd200ccea56e6014af1554d1d45c683dbb43f1b23f5780afd195cd`. Neither binary nor depfile is copied
+into the durable candidate.
+
+## Observed failure
+
+The native log has exactly three selector sections. Each ran one test and
+returned exit 101 with the expected assertion failure:
+
+| Selector | First observed failure | Later execution in that test process |
+|---|---|---|
+| `monitor::procs_view::tests::flat_distinct_keys_follow_direction` | `Name desc=false`: observed `[42,17,3]`, expected `[3,17,42]` at `procs_view.rs:342` | First Name panic stopped later loop cases. |
+| `monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction` | `Name desc=false`: observed `[42,17,3,10,11]`, expected `[10,11,42,3,17]` at `procs_view.rs:386` | First Name panic stopped later PID loop cases. |
+| `monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity` | `Name desc=true`: observed `[3,17,42]`, expected `[42,17,3]` at `monitor_tests.rs:501` | c/m CPU/RSS cases ran; later Name/PID and confirmation block did not run. |
+
+The flat selector's CPU/RSS cases pass before Name. The tree selector starts
+with Name, so no CPU/RSS prelude is claimed there. The actual monitor selector
+runs c/m before the failing n/Name case. These are fixture tests: no live
+process sampling or signal dispatch occurs.
+
+The raw receipt's `expected_first_failures` field retains wording from before
+root's semantic inspection. This review relies on the captured native log and
+records the actual result above. The later PID assertions did not execute in
+these failing test processes after the first Name panic; that is a fact about
+this run, separate from a generic source-only reachability claim.
+
+Counterfactual native and final adversarial evidence are complete. Landing and
+closure remain pending root review. Machine-readable companion:
+`/tmp/thegn-THE640-counterfactual-native-independent-review-luna-20260915.json`.

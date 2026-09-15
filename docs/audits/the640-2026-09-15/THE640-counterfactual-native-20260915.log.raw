@@ -1,0 +1,57 @@
+
+SELECTOR monitor::procs_view::tests::flat_distinct_keys_follow_direction
+
+running 1 test
+test monitor::procs_view::tests::flat_distinct_keys_follow_direction ... 
+thread 'monitor::procs_view::tests::flat_distinct_keys_follow_direction' (210827) panicked at crates/thegn-host/src/monitor/procs_view.rs:342:17:
+assertion `left == right` failed: Name desc=false
+  left: [42, 17, 3]
+ right: [3, 17, 42]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    monitor::procs_view::tests::flat_distinct_keys_follow_direction
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3328 filtered out; finished in 0.07s
+
+
+SELECTOR monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction
+
+running 1 test
+test monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction ... 
+thread 'monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction' (210836) panicked at crates/thegn-host/src/monitor/procs_view.rs:386:17:
+assertion `left == right` failed: Name desc=false
+  left: [42, 17, 3, 10, 11]
+ right: [10, 11, 42, 3, 17]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3328 filtered out; finished in 0.01s
+
+
+SELECTOR monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity
+
+running 1 test
+test monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity ... 
+thread 'monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity' (210840) panicked at crates/thegn-host/src/monitor_tests.rs:501:9:
+assertion `left == right` failed
+  left: [3, 17, 42]
+ right: [42, 17, 3]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3328 filtered out; finished in 0.05s
+
