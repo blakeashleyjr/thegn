@@ -583,7 +583,7 @@
     },
     {
       "change": "cache-demanded-devcontainer-probes",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "verification-gated",
       "owners": [
         {
@@ -591,7 +591,8 @@
           "project": "Workspace Product & Observability"
         }
       ],
-      "summary": "Demand-gated bounded capability capture and coherent single-flight cache implemented; native regression and release hydration evidence remain pending."
+      "summary": "Reviewed demand-gated capability probes and bounded coherent cache landed locally at ea6c2635. Nineteen exact native selectors, qualified 1/8/32-worktree probe-count evidence, strict lint and source gates passed; platform and timing limits are recorded in the audit.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "complete-devcontainer-support",

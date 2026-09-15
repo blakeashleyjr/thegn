@@ -9,4 +9,4 @@
 - [x] Record controlled before/after release hydration workload at 1/8/32 worktrees with identical fixture semantics; retain original timing flags and qualified probe-count-only conclusion.
 - [x] Run source-bound strict lint and current standalone source/specification/formatting gates; record platform coverage limits.
 
-- [ ] Complete reviewed local-main landing and final delivery readback.
+- [x] Complete reviewed local-main landing and final delivery readback at `ea6c2635` on September 15.
