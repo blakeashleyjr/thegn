@@ -30,3 +30,21 @@ Workspace run: `3c0c9464-54f4-4773-ba05-2a6d01f713de`; build 4m51s, tests
 `318aed8cf9ca3916fe2428c4a864686687a22c59fdcb3a66ff7536527aadd764`).
 This evidence-only task update follows testing; no Rust source changed. The
 fixed CLI/native rehearsal and live queue outcome remain unverified.
+
+
+## THE-219 current acceptance follow-up (cce73f40)
+
+- [x] Reuse the existing THE-610 terminal InfraHold repair; preserve all production retry behavior.
+- [x] Add reviewed actual driver/SQLite scripted conflict and red-gate hold/recovery, no-op budget and GateError continuation tests.
+- [x] Run current Part A status module:8/8 passed, nextest816c3109-e2ee-4d3f-87dd-1b14cce6a09b, retained `/tmp/thegn-the219-part-a-native-retry-20260914.log`.
+- [x] Execute bounded old InfraHold break-to-continue counterfactual:2/2 intended second-fold assertion failures, retained `/tmp/thegn-THE219-counterfactual-native-receipt-20260914.json`.
+- [x] Audit all branch-local retry/continue arms and direct CLI/UI dispatch; record the progress argument and its limits in `docs/audits/THE-219-retry-progress.md`.
+- [x] Author and independently review Part B owned actual CLI conflict/red-gate hold, next-item and independent plain-drain recovery fixtures.
+- [ ] Compile and execute both actual Part B CLI tests with exact binary/config/SQL/cleanup receipts.
+- [ ] Complete current candidate strict lint, scoped specs/reciprocal delivery checks and required native gates.
+- [ ] Review and land the complete THE-219 acceptance candidate on local main with its exact receipts.
+
+These follow-up boxes concern THE-219 only. They do not complete THE-608,
+THE-232 process lifetime, other launch/containment obligations or live queue
+acceptance. Earlier shared-change receipts above remain historical evidence for
+their stated sources, not substitutes for current Part B/native gates.
