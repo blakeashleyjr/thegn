@@ -8,14 +8,9 @@
 
 ## Verification and delivery
 
-- [ ] Complete current primary and independent source review and address findings.
-- [ ] Run current focused core and Linux host fixtures plus THE-602 compatibility coverage through the coordinated native runner; report exact selectors and actual results.
-- [ ] Run required strict lint, source/OpenSpec/delivery gates and component checks on the final source.
+- [x] Complete current primary and independent source/evidence review and address findings.
+- [x] Run focused core and Linux host fixtures plus THE-602 compatibility; retain the exact positive and corrected-source receipts and both separate counterfactual failures.
+- [x] Run strict lint on the corrected component and pass standalone source/OpenSpec/delivery/formatting gates; retain exact source equivalence.
 - [ ] Land the scoped implementation on local main and reconcile THE-603 evidence without closing THE-592 or claiming startup integration.
 
-Historical tests of the retained candidate are not acceptance evidence for this
-revised source. Native execution, current compile proof, and local landing are
-pending. No live DB, startup, receiver, worker or launch path is activated.
-A future PR must run `just ci` as required by the repository workflow; no PR or
-full CI execution is claimed here. See the dated THE-603 audit for the exact
-fixture boundary and remaining native/platform gates.
+Current source-bound combined06 evidence supersedes the earlier pending native gate. Final standalone review and local landing remain pending. No live DB, startup, receiver, worker or launch path is activated. A future PR must run `just ci`; no PR or full CI execution is claimed here. See the dated THE-603 audit and durable evidence manifest for exact fixture and platform limits.
