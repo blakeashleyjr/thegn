@@ -100,7 +100,7 @@ pub(crate) fn spawn_issue_cache_refresh(
                 .get_issue_cache(&repo_key, provider, &account)
                 .ok()
                 .flatten()
-                .and_then(|(j, _)| serde_json::from_str(&j).ok())
+                .and_then(|(j, _)| serde_json::from_str::<Vec<thegn_core::issue::Issue>>(&j).ok())
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|issue| thegn_svc::issue::validate_issue_identity(issue).is_ok())

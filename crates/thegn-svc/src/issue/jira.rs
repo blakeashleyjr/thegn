@@ -360,6 +360,7 @@ impl IssueBackend for JiraBackend {
             }
 
             if let Some(proj) = &self.project_key {
+                checked_jira_key(proj)?;
                 jql_parts.push(format!("project = \"{proj}\""));
             }
 
@@ -386,14 +387,14 @@ impl IssueBackend for JiraBackend {
                 urlencoding_simple(&jql)
             );
             let result: SearchResult = self.get(&path).await?;
-            Ok(result
+            result
                 .issues
                 .into_iter()
                 .map(|issue| {
                     checked_jira_key(&issue.key)?;
                     Ok(jira_issue_to_domain(issue))
                 })
-                .collect())
+                .collect()
         })
     }
 
@@ -421,6 +422,7 @@ impl IssueBackend for JiraBackend {
                     created_at_ms: parse_ms(c.created.as_deref()),
                 })
                 .collect();
+            checked_jira_key(&ji.key)?;
             Ok(IssueDetail {
                 issue: jira_issue_to_domain(ji),
                 comments,
@@ -509,6 +511,7 @@ impl IssueBackend for JiraBackend {
                     jira_path(&created.key, "")?
                 ))
                 .await?;
+            checked_jira_key(&ji.key)?;
             Ok(jira_issue_to_domain(ji))
         })
     }
@@ -615,14 +618,14 @@ impl IssueBackend for JiraBackend {
                 urlencoding_simple(&jql)
             );
             let result: SearchResult = self.get(&path).await?;
-            Ok(result
+            result
                 .issues
                 .into_iter()
                 .map(|issue| {
                     checked_jira_key(&issue.key)?;
                     Ok(jira_issue_to_domain(issue))
                 })
-                .collect())
+                .collect()
         })
     }
 }

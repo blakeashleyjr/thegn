@@ -6,7 +6,7 @@ Issue provider adapters SHALL validate configured, caller-supplied, cached, and
 provider-returned identities before using them as URL path segments, query
 values, CLI options, or plugin control values. Built-in identities SHALL use
 bounded provider syntax; plugin native keys SHALL use a separate bounded opaque
-UTF-8 envelope. A malformed scoped identity MUST fail with a parse error and
+UTF-8 budget within a bounded complete control envelope. A malformed scoped identity MUST fail with a parse error and
 MUST NOT silently fall back to a bare identifier.
 
 #### Scenario: malformed scoped GitHub identity is refused
@@ -30,6 +30,8 @@ MUST NOT silently fall back to a bare identifier.
 The control client SHALL encode a complete issue identity once as one path
 segment, and the control server SHALL decode it once before provider routing.
 The implementation MUST NOT split or repeatedly decode the encoded identity.
+The server handler SHALL validate the once-decoded value before invoking its
+`ControlApi`, and malformed input SHALL produce no provider effect.
 
 #### Scenario: scoped identity remains one control segment
 
