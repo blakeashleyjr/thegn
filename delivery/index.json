@@ -1094,6 +1094,19 @@
       "summary": "Fail closed on gate lock or linked-checkout identity failure; never purge unknown reused gate paths."
     },
     {
+      "change": "verify-native-forge-connectivity",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-622",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Test-only SDK global connectivity and fallback acceptance delivered to local main at 7c05e3a4 after primary and independent review, native controls, scoped counterfactual and strict lint; no provider or live restart.",
+      "delivered_at": "2026-09-15"
+    },
+    {
       "change": "verify-sandbox-mounts",
       "lifecycle": "active",
       "disposition": "residual-split",

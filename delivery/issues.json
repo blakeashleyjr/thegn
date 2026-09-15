@@ -633,7 +633,8 @@
       "issue": "THE-622",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [
-        "harden-live-diagnostics-and-forge"
+        "harden-live-diagnostics-and-forge",
+        "verify-native-forge-connectivity"
       ]
     },
     {
