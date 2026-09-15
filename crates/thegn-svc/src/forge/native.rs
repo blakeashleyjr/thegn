@@ -42,15 +42,32 @@ fn token_from(
         .map(|t| t.trim().to_string())
 }
 
-/// All open PRs' headers in one round trip — the per-branch badge feed.
+/// One page (≤100, GitHub's cap) of open PRs' headers, newest first — the
+/// per-branch badge feed. `pr_list` follows `pageInfo` up to its limit.
 pub const PR_LIST_QUERY: &str = r#"
-query($owner:String!,$repo:String!){
+query($owner:String!,$repo:String!,$after:String){
   repository(owner:$owner,name:$repo){
-    pullRequests(first:100, states:[OPEN]){
+    pullRequests(first:100, after:$after, states:[OPEN],
+                 orderBy:{field:UPDATED_AT, direction:DESC}){
       nodes{ number headRefName state url isDraft }
+      pageInfo{ hasNextPage endCursor }
     }
   }
 }"#;
+
+/// The cursor for the next `PR_LIST_QUERY` page, or `None` on the last page
+/// (or a malformed reply). Pure, fixture-tested.
+pub fn parse_graphql_pr_list_next(resp: &Value) -> Option<String> {
+    let data = resp.get("data").unwrap_or(resp);
+    let info = data.pointer("/repository/pullRequests/pageInfo")?;
+    if info.get("hasNextPage").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    info.get("endCursor")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
 
 /// Parse a `PR_LIST_QUERY` response into headers. Pure, fixture-tested.
 pub fn parse_graphql_pr_list(resp: &Value) -> Vec<PrHeader> {
@@ -71,9 +88,11 @@ pub fn parse_graphql_pr_list(resp: &Value) -> Vec<PrHeader> {
 pub const PR_QUERY: &str = r#"
 query($owner:String!,$repo:String!,$head:String!){
   repository(owner:$owner,name:$repo){
-    pullRequests(headRefName:$head, first:1, states:[OPEN,MERGED,CLOSED]){
+    pullRequests(headRefName:$head, first:20, states:[OPEN,MERGED,CLOSED],
+                 orderBy:{field:UPDATED_AT, direction:DESC}){
       nodes{
         number title state url author{login ... on User{id}} isDraft headRefName headRefOid baseRefName
+        headRepositoryOwner{login}
         mergeable mergeStateStatus reviewDecision
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           contexts(first:100){ nodes{
@@ -127,6 +146,36 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
     panel
 }
 
+/// Pick THIS branch's PR from every PR whose head ref shares its name.
+///
+/// `headRefName` is only a name: a fork's `main`/`patch-1`, or an old PR from a
+/// reused branch name, match too. Prefer a head in the base repo's own owner
+/// (the base owner is the PR URL's), then OPEN over MERGED/CLOSED; within a
+/// class the reply is already newest-first (`orderBy UPDATED_AT DESC`). A
+/// fork-only match is still returned — a PR opened from a fork is legitimately
+/// "this branch's" when the worktree tracks that fork.
+fn pick_pr_node(nodes: &[Value]) -> Option<&Value> {
+    let rank = |n: &Value| {
+        let base_owner = n
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(owner_repo_from_url)
+            .map(|(owner, _)| owner);
+        let head_owner = n
+            .pointer("/headRepositoryOwner/login")
+            .and_then(Value::as_str);
+        let same_repo = match (base_owner, head_owner) {
+            (Some(base), Some(head)) => base.eq_ignore_ascii_case(head),
+            // Old fixtures / a deleted head repo: no evidence of a fork.
+            _ => true,
+        };
+        let open = n.get("state").and_then(Value::as_str) == Some("OPEN");
+        (!same_repo, !open)
+    };
+    // `min_by_key` keeps the FIRST of equal keys, preserving recency order.
+    nodes.iter().min_by_key(|n| rank(n))
+}
+
 /// The GraphQL `pullRequests(headRefName:)` reply as a `Result` — the forge
 /// trait's shape. No node ⇒ `NoPr`.
 pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
@@ -135,7 +184,7 @@ pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
         .pointer("/repository/pullRequests/nodes")
         .and_then(Value::as_array);
 
-    match nodes.and_then(|n| n.first()) {
+    match nodes.and_then(|n| pick_pr_node(n)) {
         None => Err(ForgeError::NoPr),
         Some(node) => {
             let s = |k: &str| {
@@ -435,6 +484,11 @@ impl Forge for GithubNative {
         let branch = loc
             .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
             .unwrap_or_default();
+        // Detached HEAD (mid-rebase, a checked-out tag/SHA) has no branch, so
+        // no PR — querying `headRefName:"HEAD"` would only invite a false match.
+        if branch.is_empty() || branch == "HEAD" {
+            return Err(ForgeError::NoPr);
+        }
         let body = serde_json::json!({
             "query": PR_QUERY,
             "variables": { "owner": owner, "repo": repo, "head": branch },
@@ -442,14 +496,28 @@ impl Forge for GithubNative {
         let resp = self.graphql(token, body, "pr_status")?;
         parse_graphql_pr_status(&resp)
     }
-    fn pr_list(&self, loc: &GitLoc, _limit: usize) -> Result<Vec<PrHeader>, ForgeError> {
+    fn pr_list(&self, loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, ForgeError> {
         let (token, owner, repo) = self.gate(loc)?;
-        let body = serde_json::json!({
-            "query": PR_LIST_QUERY,
-            "variables": { "owner": owner, "repo": repo },
-        });
-        let resp = self.graphql(token, body, "pr_list")?;
-        Ok(parse_graphql_pr_list(&resp))
+        let limit = limit.max(1);
+        let mut prs = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let body = serde_json::json!({
+                "query": PR_LIST_QUERY,
+                "variables": { "owner": owner, "repo": repo, "after": after },
+            });
+            // A failed later page fails the whole list: a partial open set
+            // would read as PRs having left it (merge notifications, the
+            // on-merge auto-clean) and overwrite the good cached row.
+            let resp = self.graphql(token.clone(), body, "pr_list")?;
+            prs.extend(parse_graphql_pr_list(&resp));
+            after = parse_graphql_pr_list_next(&resp);
+            if after.is_none() || prs.len() >= limit {
+                break;
+            }
+        }
+        prs.truncate(limit);
+        Ok(prs)
     }
 }
 
@@ -832,6 +900,84 @@ mod tests {
             other => panic!("expected Pr, got {other:?}"),
         }
         assert_eq!(panel.fetched_at, 7);
+    }
+
+    #[test]
+    fn graphql_pr_list_follows_page_info() {
+        let page = |has_next: bool, cursor: &str| {
+            serde_json::json!({
+              "data": { "repository": { "pullRequests": {
+                "nodes": [],
+                "pageInfo": { "hasNextPage": has_next, "endCursor": cursor }
+              }}}
+            })
+        };
+        assert_eq!(
+            parse_graphql_pr_list_next(&page(true, "Y3Vyc29y")).as_deref(),
+            Some("Y3Vyc29y")
+        );
+        assert_eq!(parse_graphql_pr_list_next(&page(false, "Y3Vyc29y")), None);
+        assert_eq!(parse_graphql_pr_list_next(&page(true, "")), None);
+        assert_eq!(parse_graphql_pr_list_next(&serde_json::json!({})), None);
+    }
+
+    fn pr_node(number: u64, state: &str, head_owner: Option<&str>) -> Value {
+        let mut node = serde_json::json!({
+            "number": number, "title": "t", "state": state,
+            "url": format!("https://github.com/acme/sage/pull/{number}"),
+            "headRefName": "main",
+        });
+        if let Some(owner) = head_owner {
+            node["headRepositoryOwner"] = serde_json::json!({ "login": owner });
+        }
+        node
+    }
+
+    fn picked(nodes: Vec<Value>) -> u64 {
+        let resp = serde_json::json!({
+            "data": { "repository": { "pullRequests": { "nodes": nodes } } }
+        });
+        parse_graphql_pr_status(&resp).expect("a PR").number
+    }
+
+    /// Regression: `headRefName` is only a name, so a branch called `main`
+    /// matched a fork contributor's `main` PR or an old merged PR — and the
+    /// statusbar showed a PR that wasn't this branch's.
+    #[test]
+    fn graphql_pr_prefers_same_repo_open_head_over_name_collisions() {
+        // A fork's same-named OPEN PR loses to the repo's own head.
+        assert_eq!(
+            picked(vec![
+                pr_node(1, "OPEN", Some("contributor")),
+                pr_node(2, "OPEN", Some("acme")),
+            ]),
+            2
+        );
+        // An OPEN PR beats a more recently updated MERGED one.
+        assert_eq!(
+            picked(vec![
+                pr_node(3, "MERGED", Some("Acme")),
+                pr_node(4, "OPEN", Some("acme")),
+            ]),
+            4
+        );
+        // Within one class the reply's newest-first order is kept.
+        assert_eq!(
+            picked(vec![
+                pr_node(5, "MERGED", Some("acme")),
+                pr_node(6, "CLOSED", Some("acme")),
+            ]),
+            5
+        );
+        // A fork-only match is still this branch's PR; no owner = no evidence.
+        assert_eq!(picked(vec![pr_node(7, "OPEN", Some("contributor"))]), 7);
+        assert_eq!(
+            picked(vec![
+                pr_node(8, "OPEN", None),
+                pr_node(9, "OPEN", Some("x"))
+            ]),
+            8
+        );
     }
 }
 

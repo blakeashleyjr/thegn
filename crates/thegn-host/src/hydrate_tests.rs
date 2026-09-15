@@ -661,6 +661,48 @@ fn pr_state_definitive_gates_cache_writes() {
 }
 
 #[test]
+fn cached_pr_applies_only_to_the_same_worktree_branch_and_repo() {
+    use thegn_core::forge::model::{PrPanel, PrStatus};
+    let row = |worktree: &str, branch: &str, url: &str| {
+        PrPanel::from_result(
+            Ok(PrStatus {
+                number: 12,
+                url: url.into(),
+                ..Default::default()
+            }),
+            worktree.into(),
+            branch.into(),
+        )
+    };
+    let url = "https://github.com/acme/sage/pull/12";
+    let ok = |p: &PrPanel, branch: &str, nwo: Option<&str>| {
+        cached_pr_applies(p, "/wt/a", "/wt/a", branch, nwo)
+    };
+
+    assert!(ok(&row("/wt/a", "feat", url), "feat", Some("acme/sage")));
+    // Another worktree's row (the old colliding sandbox key).
+    assert!(!ok(&row("/wt/b", "feat", url), "feat", Some("acme/sage")));
+    // Checked out a different branch since the fetch.
+    assert!(!ok(&row("/wt/a", "feat", url), "main", Some("acme/sage")));
+    // `origin` now names another repo.
+    assert!(!ok(
+        &row("/wt/a", "feat", url),
+        "feat",
+        Some("acme/new-sage")
+    ));
+    // No evidence (unstamped row, unreadable branch/origin) keeps the row.
+    assert!(ok(&row("", "", url), "feat", Some("acme/sage")));
+    assert!(ok(&row("/wt/a", "feat", url), "", None));
+    // Non-PR states have no URL to check.
+    let no_pr = PrPanel::from_result(
+        Err(thegn_core::forge::ForgeError::NoPr),
+        "/wt/a".into(),
+        "feat".into(),
+    );
+    assert!(ok(&no_pr, "feat", Some("other/repo")));
+}
+
+#[test]
 fn plan_log_scan_covers_rotation_append_and_idle() {
     // First scan of the process (prev_len == 0): read everything.
     assert_eq!(plan_log_scan(0, 500), LogScanPlan::FromStart);
