@@ -82,6 +82,19 @@ impl JiraBackend {
         .await
         .map(|_| ())
     }
+
+    async fn post_empty<B: Serialize>(
+        op: &mut TrackerHttpOperation<'_>,
+        path: &str,
+        body: &B,
+    ) -> Result<(), IssueError> {
+        op.json_empty(
+            reqwest::Method::POST,
+            &format!("/rest/api/3/{}", path.trim_start_matches('/')),
+            body,
+        )
+        .await
+    }
 }
 
 // ---- Jira JSON response shapes ----------------------------------------------
@@ -504,7 +517,7 @@ impl IssueBackend for JiraBackend {
                 struct TransitionId {
                     id: String,
                 }
-                let _: serde_json::Value = Self::post(
+                Self::post_empty(
                     &mut op,
                     &format!("issue/{key}/transitions"),
                     &TransitionBody {
