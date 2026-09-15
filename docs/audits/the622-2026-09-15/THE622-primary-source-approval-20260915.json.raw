@@ -1,0 +1,8 @@
+{
+  "source": "62289bb730b1b1a188761ef4b0a3c4b8723f914d",
+  "approved_for": "coordinated native and lint gates, not landing or closure",
+  "primary_review": "approved; no scoped code blocker after code and independent review",
+  "independent_report": "/tmp/thegn-THE622-independent-source-review-20260915.md",
+  "independent_sha256": "b463916a2ae267c1b90f0c0c59b0322ba3c358f7a9e180ac3f4fd0ef42a3c3bc",
+  "time_utc": "2026-09-15T02:35:58.413659+00:00"
+}

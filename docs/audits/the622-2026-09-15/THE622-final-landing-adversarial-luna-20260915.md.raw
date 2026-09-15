@@ -1,0 +1,13 @@
+# THE-622 final landing adversarial review
+
+I found no source or evidence blocker to root-reviewed local-main landing of candidate `7c05e3a47cc6a1e32dd2100fcc7dfc8fd6befd05`. Its source base `62289bb730b1b1a188761ef4b0a3c4b8723f914d` descends from canonical metadata `060afad525a14547336e8d2170803a66af877812`, and the final amendment changes only the OpenSpec validation checkpoint.
+
+The five scoped files are byte identical to the tested maintenance-06 checkout: `forge/native.rs`, `native_global_connectivity_tests.rs`, `native_regression_tests.rs`, host `static_cli_support/mod.rs`, and `test/support/owned_test_child.rs`. The shared helper reserves custody before spawn, uses exact owned children and private fixture paths, revokes process calls after observation identity loss, and retains child plus fixture on failed settlement with bounded cleanup. The behavior remains test-only and does not add production networking or descendant-containment claims.
+
+The durable THE-622 manifest contains 26 raw evidence files whose hashes all match the committed files. External positive and counterfactual binaries remain outside the candidate. Native claims are correctly scoped: the 20-pass parallel result is THE-622 evidence; the 121-pass focused result covers combined maintenance-603/602/622 scope; the corrected 16-pass result is a THE-603 Linux capture result; and the counterfactual stops at its first reachable errors-only global-success assertion. No later counterfactual matrix or primary acceptance is claimed.
+
+The delivery entry is owned by THE-622 and remains `active`/`alpha-delivery`. The checklist and final validation checkpoint mark source review, native evidence, counterfactual, strict lint, specification, and delivery gates complete, with reviewed local-main landing as the sole unchecked item. The historical pending paragraph is preserved and explicitly superseded by the dated final checkpoint.
+
+One provenance limitation remains recorded rather than hidden: the counterfactual reused a shared target directory. Its local artifacts are `fresh:false`, and source, depfile, binary, and receipt identities are retained, but this review does not upgrade that into a clean-target rebuild claim. This is not a landing blocker under the existing evidence scope.
+
+Approval is for root to land the reviewed candidate head while preserving the durable audit and the distinction between combined current-06 evidence and THE-622-specific counts. No Cargo, native, provider, benchmark, or mutable-target operation was performed for this review.
