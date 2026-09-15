@@ -1087,7 +1087,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Strict persisted-host capture and bounded checked composition; current native/review gates remain pending, with launch adapter integration owned by THE-592."
+      "summary": "Strict persisted-host capture and bounded checked composition; source/review/native/specification/delivery gates complete for the exact tested source, reviewed local landing pending, with launch adapter integration owned by THE-592."
     },
     {
       "change": "verify-gate-workspace",
