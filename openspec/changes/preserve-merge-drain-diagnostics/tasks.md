@@ -31,7 +31,6 @@ Workspace run: `3c0c9464-54f4-4773-ba05-2a6d01f713de`; build 4m51s, tests
 This evidence-only task update follows testing; no Rust source changed. The
 fixed CLI/native rehearsal and live queue outcome remain unverified.
 
-
 ## THE-219 current acceptance follow-up (cce73f40)
 
 - [x] Reuse the existing THE-610 terminal InfraHold repair; preserve all production retry behavior.

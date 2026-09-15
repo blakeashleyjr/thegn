@@ -11,14 +11,14 @@ provider, CLI, Git workload or Cargo execution was performed for this audit.
 branch-local `loop` (263), and exactly one production `continue` (430).
 `folding` is published before the inner loop, once per selected item.
 
-| Path | Next edge | Progress or termination reason |
-|---|---|---|
-| Attempt returns Err | break | One needs_human outcome; no same-item retry. |
-| Landed / UpToDate / Ready | break | Settled outcome; any lifecycle work occurs once on this path. |
-| Unreachable / GateError | break | One deferred/gate_error result; no agent admission and no immediate retry. |
-| Conflict / GateFailed, InfraHold | break | One agent_blocked transition and one deferred result; attempt count unchanged; outer loop reaches the next selected item. |
-| Conflict / GateFailed, Run or RunDegraded | continue after runner returns | Admission is followed by a strict local attempt increment, agent_running transition and one synchronous runner call. RunDegraded's warning alone does not retry: it shares the same budgeted path. |
-| Conflict / GateFailed with no agent or exhausted budget | break | Terminal deferred/gate_failed/needs_human result; no retry. |
+| Path                                                    | Next edge                     | Progress or termination reason                                                                                                                                                                     |
+| ------------------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Attempt returns Err                                     | break                         | One needs_human outcome; no same-item retry.                                                                                                                                                       |
+| Landed / UpToDate / Ready                               | break                         | Settled outcome; any lifecycle work occurs once on this path.                                                                                                                                      |
+| Unreachable / GateError                                 | break                         | One deferred/gate_error result; no agent admission and no immediate retry.                                                                                                                         |
+| Conflict / GateFailed, InfraHold                        | break                         | One agent_blocked transition and one deferred result; attempt count unchanged; outer loop reaches the next selected item.                                                                          |
+| Conflict / GateFailed, Run or RunDegraded               | continue after runner returns | Admission is followed by a strict local attempt increment, agent_running transition and one synchronous runner call. RunDegraded's warning alone does not retry: it shares the same budgeted path. |
+| Conflict / GateFailed with no agent or exhausted budget | break                         | Terminal deferred/gate_failed/needs_human result; no retry.                                                                                                                                        |
 
 The sole immediate retry is guarded by `use_agent && agent_runs <
 agent_max_attempts` (374). `agent_runs += 1` (407) therefore cannot overflow its
