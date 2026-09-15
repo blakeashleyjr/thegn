@@ -66,8 +66,7 @@ impl KaneoBackend {
         op: &mut TrackerHttpOperation<'_>,
         path: &str,
     ) -> Result<R, IssueError> {
-        op.get(&format!("/api/{}", path.trim_start_matches('/')))
-            .await
+        op.get(&api_path(path)?).await
     }
 
     async fn send_body<B: Serialize, R: for<'de> Deserialize<'de>>(
@@ -76,20 +75,11 @@ impl KaneoBackend {
         path: &str,
         body: &B,
     ) -> Result<R, IssueError> {
-        op.json(
-            method,
-            &format!("/api/{}", path.trim_start_matches('/')),
-            body,
-        )
-        .await
+        op.json(method, &api_path(path)?, body).await
     }
 
     async fn delete_req(op: &mut TrackerHttpOperation<'_>, path: &str) -> Result<(), IssueError> {
-        op.empty(
-            reqwest::Method::DELETE,
-            &format!("/api/{}", path.trim_start_matches('/')),
-        )
-        .await
+        op.empty(reqwest::Method::DELETE, &api_path(path)?).await
     }
 
     /// Best-effort resolve of the authenticated user's id, so `assignee_me` can
@@ -108,6 +98,7 @@ impl KaneoBackend {
         op: &mut TrackerHttpOperation<'_>,
     ) -> Result<Vec<String>, IssueError> {
         if let Some(pid) = &self.project_id {
+            checked_id(pid, "Kaneo project id")?;
             return Ok(vec![pid.clone()]);
         }
         let Some(ws) = &self.workspace_id else {
@@ -116,9 +107,13 @@ impl KaneoBackend {
             // error (the panel then shows this account as empty).
             return Ok(Vec::new());
         };
+        checked_id(ws, "Kaneo workspace id")?;
         let projects: Vec<KaneoProject> =
             Self::get(op, &format!("project?workspaceId={ws}")).await?;
-        Ok(projects.into_iter().map(|p| p.id).collect())
+        projects
+            .into_iter()
+            .map(|p| checked_id(&p.id, "Kaneo project id").map(str::to_owned))
+            .collect()
     }
 
     /// Fetch the board for one project and flatten it to domain issues, tagging
@@ -130,6 +125,10 @@ impl KaneoBackend {
         assignee_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Issue>, IssueError> {
+        checked_id(project_id, "Kaneo project id")?;
+        if let Some(uid) = assignee_id {
+            checked_id(uid, "Kaneo assignee id")?;
+        }
         let mut path = format!("task/tasks/{project_id}?limit={}", limit.clamp(1, 100));
         if let Some(uid) = assignee_id {
             path.push_str(&format!("&assigneeId={uid}"));
@@ -144,7 +143,7 @@ impl KaneoBackend {
                     status,
                     &self.base_url,
                     board.data.workspace_id.as_deref(),
-                ));
+                )?);
             }
         }
         Ok(out)
@@ -313,12 +312,34 @@ fn parse_ms(s: Option<&str>) -> i64 {
 /// `base_url/api`; when the web client lives elsewhere this link may not
 /// resolve, but the id/number still identify the task.
 fn task_url(base_url: &str, workspace_id: Option<&str>, project_id: &str, task_id: &str) -> String {
-    match workspace_id {
-        Some(ws) if !ws.is_empty() => {
-            format!("{base_url}/dashboard/{ws}/project/{project_id}/board?task={task_id}")
-        }
-        _ => format!("{base_url}/dashboard/project/{project_id}/board?task={task_id}"),
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return String::new();
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return String::new();
     }
+    {
+        let Ok(mut segments) = url.path_segments_mut() else {
+            return String::new();
+        };
+        segments.clear();
+        segments.push("dashboard");
+        if let Some(ws) = workspace_id.filter(|ws| !ws.is_empty()) {
+            segments.push(ws);
+        }
+        segments.push("project");
+        segments.push(project_id);
+        segments.push("board");
+    }
+    url.set_query(None);
+    url.query_pairs_mut().append_pair("task", task_id);
+    url.to_string()
 }
 
 fn task_to_domain(
@@ -326,13 +347,20 @@ fn task_to_domain(
     status: IssueStatus,
     base_url: &str,
     workspace_id: Option<&str>,
-) -> Issue {
+) -> Result<Issue, IssueError> {
+    checked_id(&t.id, "Kaneo task id")?;
+    if !t.project_id.is_empty() {
+        checked_id(&t.project_id, "Kaneo project id")?;
+    }
+    if let Some(ws) = workspace_id.filter(|ws| !ws.is_empty()) {
+        checked_id(ws, "Kaneo workspace id")?;
+    }
     let number = t
         .number
         .map(|n| n.to_string())
         .unwrap_or_else(|| t.id.clone());
     let url = task_url(base_url, workspace_id, &t.project_id, &t.id);
-    Issue {
+    Ok(Issue {
         id: format!("kaneo:{}", t.id),
         number,
         provider: "kaneo".into(),
@@ -352,7 +380,48 @@ fn task_to_domain(
             vec![t.project_id]
         },
         ..Default::default()
+    })
+}
+
+/// Encode the bounded provider route without selecting an account authority.
+/// The shared HTTP operation joins this relative path to its admitted base URL.
+fn api_path(path: &str) -> Result<String, IssueError> {
+    super::http::ensure_dynamic_input(path)?;
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    let route = route.trim_start_matches('/');
+    for segment in route.split('/') {
+        super::identity::builtin_segment(segment, "Kaneo route segment")
+            .map_err(IssueError::Parse)?;
     }
+    // This URL is only an encoder; its authority is never sent to a client.
+    let mut encoded = reqwest::Url::parse("http://path.invalid/").expect("static encoder URL");
+    encoded.set_path(&format!("/api/{route}"));
+    if !query.is_empty() {
+        let mut pairs = encoded.query_pairs_mut();
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                IssueError::Parse("Kaneo query must contain key=value pairs".into())
+            })?;
+            super::identity::builtin_segment(key, "Kaneo query key").map_err(IssueError::Parse)?;
+            super::identity::builtin_segment(value, "Kaneo query value")
+                .map_err(IssueError::Parse)?;
+            pairs.append_pair(key, value);
+        }
+    }
+    let mut result = encoded.path().to_owned();
+    if let Some(query) = encoded.query() {
+        result.push('?');
+        result.push_str(query);
+    }
+    Ok(result)
+}
+
+fn checked_id<'a>(raw: &'a str, label: &str) -> Result<&'a str, IssueError> {
+    super::identity::kaneo_id(raw, label).map_err(IssueError::Parse)
+}
+
+fn checked_task_id(raw: &str) -> Result<&str, IssueError> {
+    checked_id(raw.strip_prefix("kaneo:").unwrap_or(raw), "Kaneo task id")
 }
 
 /// Fetch a project's columns and resolve the column slug whose derived status
@@ -364,11 +433,13 @@ async fn resolve_status_slug(
     project_id: &str,
     target: IssueStatus,
 ) -> Result<Option<String>, IssueError> {
+    checked_id(project_id, "Kaneo project id")?;
     let board: BoardResp =
         KaneoBackend::get(op, &format!("task/tasks/{project_id}?limit=1")).await?;
     // Prefer an exact status match; fall back to a Done→final column.
     let mut fallback_final: Option<String> = None;
     for col in &board.data.columns {
+        checked_id(&col.slug, "Kaneo status slug")?;
         if map_column_status(&col.slug, &col.name, col.is_final) == target {
             return Ok(Some(col.slug.clone()));
         }
@@ -398,16 +469,20 @@ impl KaneoBackend {
         let mut op = http.operation();
         op.prepare().await?;
         let ws = self.require_workspace()?;
+        checked_id(ws, "Kaneo workspace id")?;
         let projects: Vec<KaneoProject> =
             Self::get(&mut op, &format!("project?workspaceId={ws}")).await?;
-        Ok(projects
+        projects
             .into_iter()
-            .map(|p| KaneoProjectInfo {
-                id: p.id,
-                name: p.name,
-                slug: p.slug,
+            .map(|p| {
+                checked_id(&p.id, "Kaneo project id")?;
+                Ok(KaneoProjectInfo {
+                    id: p.id,
+                    name: p.name,
+                    slug: p.slug,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// A project's board: columns (in order) each with their issues.
@@ -415,10 +490,11 @@ impl KaneoBackend {
         let http = self.http()?;
         let mut op = http.operation();
         op.prepare().await?;
+        checked_id(project_id, "Kaneo project id")?;
         let board: BoardResp =
             Self::get(&mut op, &format!("task/tasks/{project_id}?limit=100")).await?;
         let ws = board.data.workspace_id.clone();
-        Ok(board
+        board
             .data
             .columns
             .into_iter()
@@ -428,15 +504,15 @@ impl KaneoBackend {
                     .tasks
                     .into_iter()
                     .map(|t| task_to_domain(t, status, &self.base_url, ws.as_deref()))
-                    .collect();
-                KaneoColumnInfo {
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(KaneoColumnInfo {
                     name: c.name,
                     slug: c.slug,
                     is_final: c.is_final,
                     issues,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Move a task to another project (and optionally a target column/status).
@@ -449,7 +525,8 @@ impl KaneoBackend {
         let http = self.http()?;
         let mut op = http.operation();
         op.prepare().await?;
-        let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+        let task_id = checked_task_id(id)?;
+        checked_id(dest_project, "Kaneo destination project id")?;
         let mut body = serde_json::json!({ "destinationProjectId": dest_project });
         if let Some(s) = dest_status {
             body["destinationStatus"] = serde_json::json!(s);
@@ -539,11 +616,11 @@ impl IssueBackend for KaneoBackend {
             let http = self.http()?;
             let mut op = http.operation();
             op.prepare().await?;
-            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let task_id = checked_task_id(id)?;
             let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
             // A bare task fetch has no column `isFinal` context; map from the slug.
             let status = map_column_status(&task.status, &task.status, false);
-            let issue = task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref());
+            let issue = task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref())?;
             let comments: Vec<KaneoComment> = Self::get(&mut op, &format!("comment/{task_id}"))
                 .await
                 .unwrap_or_default();
@@ -574,6 +651,7 @@ impl IssueBackend for KaneoBackend {
                 .ok_or_else(|| {
                     IssueError::Api("Kaneo create requires a project id (config or draft)".into())
                 })?;
+            checked_id(&project_id, "Kaneo project id")?;
             // Initial column: the first column of the project's board.
             let board: BoardResp =
                 Self::get(&mut op, &format!("task/tasks/{project_id}?limit=1")).await?;
@@ -610,7 +688,7 @@ impl IssueBackend for KaneoBackend {
                 status,
                 &self.base_url,
                 self.workspace_id.as_deref(),
-            ))
+            )?)
         })
     }
 
@@ -623,7 +701,7 @@ impl IssueBackend for KaneoBackend {
             let http = self.http()?;
             let mut op = http.operation();
             op.prepare().await?;
-            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let task_id = checked_task_id(id)?;
 
             if let Some(title) = &patch.title {
                 #[derive(Serialize)]
@@ -659,6 +737,7 @@ impl IssueBackend for KaneoBackend {
                 // Resolve the target status to a project column slug first (needs
                 // the task's project id).
                 let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
+                checked_id(&task.project_id, "Kaneo project id")?;
                 if let Some(slug) = resolve_status_slug(&mut op, &task.project_id, status).await? {
                     #[derive(Serialize)]
                     struct StatusBody {
@@ -720,7 +799,7 @@ impl IssueBackend for KaneoBackend {
             let http = self.http()?;
             let mut op = http.operation();
             op.prepare().await?;
-            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let task_id = checked_task_id(id)?;
             #[derive(Serialize)]
             struct CommentBody<'a> {
                 content: &'a str,
@@ -745,14 +824,16 @@ impl IssueBackend for KaneoBackend {
             let http = self.http()?;
             let mut op = http.operation();
             op.prepare().await?;
-            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let task_id = checked_task_id(id)?;
             let ws = self.require_workspace()?;
+            checked_id(ws, "Kaneo workspace id")?;
             // Reuse an existing workspace label of the same name; otherwise create
             // it and assign in one shot (labels are workspace-scoped).
             let existing: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/workspace/{ws}"))
                 .await
                 .unwrap_or_default();
             if let Some(l) = existing.iter().find(|l| l.name.eq_ignore_ascii_case(label)) {
+                checked_id(&l.id, "Kaneo label id")?;
                 let _: serde_json::Value = Self::send_body(
                     &mut op,
                     reqwest::Method::PUT,
@@ -787,13 +868,14 @@ impl IssueBackend for KaneoBackend {
             let http = self.http()?;
             let mut op = http.operation();
             op.prepare().await?;
-            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let task_id = checked_task_id(id)?;
             let on_task: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/task/{task_id}"))
                 .await
                 .unwrap_or_default();
             let Some(l) = on_task.iter().find(|l| l.name.eq_ignore_ascii_case(label)) else {
                 return Err(IssueError::Api("Kaneo label target unavailable".into()));
             };
+            checked_id(&l.id, "Kaneo label id")?;
             Self::delete_req(&mut op, &format!("label/{}/task", l.id)).await
         })
     }
@@ -915,12 +997,15 @@ mod tests {
         for col in board.data.columns {
             let status = map_column_status(&col.slug, &col.name, col.is_final);
             for t in col.tasks {
-                issues.push(task_to_domain(
-                    t,
-                    status,
-                    "https://kaneo.example.com",
-                    board.data.workspace_id.as_deref(),
-                ));
+                issues.push(
+                    task_to_domain(
+                        t,
+                        status,
+                        "https://kaneo.example.com",
+                        board.data.workspace_id.as_deref(),
+                    )
+                    .unwrap(),
+                );
             }
         }
         assert_eq!(issues.len(), 2);
@@ -954,7 +1039,7 @@ mod tests {
             "projectId": "p9"
         }))
         .unwrap();
-        let issue = task_to_domain(t, IssueStatus::Backlog, "https://k", None);
+        let issue = task_to_domain(t, IssueStatus::Backlog, "https://k", None).unwrap();
         // No `number` ⇒ number falls back to the opaque id.
         assert_eq!(issue.number, "bare");
         assert_eq!(issue.title, "");
@@ -969,6 +1054,28 @@ mod tests {
         let u = task_url("https://k", None, "p1", "t1");
         assert!(u.contains("/project/p1/") && u.contains("task=t1"), "{u}");
         assert!(!u.contains("//project"), "no empty workspace segment: {u}");
+    }
+
+    #[test]
+    fn api_url_encodes_structured_query_and_rejects_traversal() {
+        let encoded = api_path("task/tasks/p1?workspaceId=客户").unwrap();
+        assert!(
+            encoded.contains("workspaceId=%E5%AE%A2%E6%88%B7"),
+            "{encoded}"
+        );
+        assert!(api_path("task/../secret").is_err());
+        assert!(api_path("task/t?workspaceId=a%26evil%3Dx").is_err());
+        assert!(api_path("task/t?workspaceId=a&evil=x").is_ok());
+    }
+
+    #[test]
+    fn task_link_uses_url_segments_and_query_encoding() {
+        let u = task_url("https://k", Some("ws/客户"), "p/1", "t#1");
+        assert!(
+            u.contains("/dashboard/ws%2F%E5%AE%A2%E6%88%B7/project/p%2F1/board"),
+            "{u}"
+        );
+        assert!(u.ends_with("?task=t%231"), "{u}");
     }
 
     #[test]

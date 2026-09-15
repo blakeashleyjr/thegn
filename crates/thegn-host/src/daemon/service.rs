@@ -1688,11 +1688,12 @@ impl ControlApi for DaemonService {
         id: &'a str,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
         Box::pin(async move {
+            let shown_id: String = id.chars().take(256).collect();
             let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
             router
                 .get_issue(id)
                 .await
-                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.get {id}: {e}")))
+                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.get {shown_id}: {e}")))
         })
     }
 
@@ -1702,11 +1703,11 @@ impl ControlApi for DaemonService {
         patch: &'a thegn_core::issue::IssuePatch,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
         Box::pin(async move {
+            let shown_id: String = id.chars().take(256).collect();
             let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
-            router
-                .update_issue(id, patch)
-                .await
-                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.update {id}: {e}")))
+            router.update_issue(id, patch).await.map_err(|e| {
+                ControlError::Internal(anyhow::anyhow!("issues.update {shown_id}: {e}"))
+            })
         })
     }
 
@@ -1716,11 +1717,11 @@ impl ControlApi for DaemonService {
         body: &'a str,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
+            let shown_id: String = id.chars().take(256).collect();
             let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
-            router
-                .add_comment(id, body)
-                .await
-                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.comment {id}: {e}")))
+            router.add_comment(id, body).await.map_err(|e| {
+                ControlError::Internal(anyhow::anyhow!("issues.comment {shown_id}: {e}"))
+            })
         })
     }
 

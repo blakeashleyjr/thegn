@@ -112,7 +112,7 @@ struct JiraIssue {
     id: String,
     key: String,
     #[serde(rename = "self")]
-    self_url: String,
+    _self_url: String,
     fields: JiraFields,
 }
 
@@ -242,25 +242,16 @@ fn extract_text(val: &serde_json::Value) -> String {
     }
 }
 
-fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
+fn jira_issue_to_domain(ji: JiraIssue, configured_base_url: &str) -> Issue {
     let body = ji
         .fields
         .description
         .as_ref()
         .map(extract_text)
         .filter(|s| !s.is_empty());
-    // Derive a browse URL from the self URL.
-    let url = {
-        // self URL: https://myorg.atlassian.net/rest/api/3/issue/10001
-        // browse URL: https://myorg.atlassian.net/browse/KEY-1
-        let base = ji
-            .self_url
-            .split("/rest/api")
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('/');
-        format!("{base}/browse/{}", ji.key)
-    };
+    // The response's `self` link is untrusted; browse links stay on the
+    // configured Jira origin and never inherit a response-controlled host.
+    let url = jira_browse_url(configured_base_url, &ji.key);
     Issue {
         id: format!("jira:{}", ji.key),
         number: ji.key.clone(),
@@ -285,6 +276,42 @@ fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
             .and_then(super::parse_due_date_ms),
         ..Default::default()
     }
+}
+
+fn jira_browse_url(configured_base_url: &str, key: &str) -> String {
+    if super::identity::jira_key(key).is_err() {
+        return String::new();
+    }
+    let Ok(mut base) = reqwest::Url::parse(configured_base_url) else {
+        return String::new();
+    };
+    if !matches!(base.scheme(), "https" | "http")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return String::new();
+    }
+    let path = format!("{}/browse/{key}", base.path().trim_end_matches('/'));
+    base.set_path(&path);
+    base.set_query(None);
+    base.to_string()
+}
+
+fn checked_jira_key(raw: &str) -> Result<&str, IssueError> {
+    super::identity::jira_key(raw).map_err(IssueError::Parse)
+}
+
+fn jira_path(key: &str, suffix: &str) -> Result<String, IssueError> {
+    checked_jira_key(key)?;
+    if !matches!(suffix, "" | "/transitions") {
+        return Err(IssueError::Parse(
+            "Jira path suffix contains an unstructured delimiter".into(),
+        ));
+    }
+    Ok(format!("issue/{key}{suffix}"))
 }
 
 const JIRA_FIELDS: &str =
@@ -320,6 +347,7 @@ impl IssueBackend for JiraBackend {
             }
 
             if let Some(proj) = &self.project_key {
+                checked_jira_key(proj)?;
                 jql_parts.push(format!("project = \"{proj}\""));
             }
 
@@ -346,11 +374,14 @@ impl IssueBackend for JiraBackend {
                 urlencoding_simple(&jql)
             );
             let result: SearchResult = Self::get(&mut op, &path).await?;
-            Ok(result
+            result
                 .issues
                 .into_iter()
-                .map(jira_issue_to_domain)
-                .collect())
+                .map(|issue| {
+                    checked_jira_key(&issue.key)?;
+                    Ok(jira_issue_to_domain(issue, &self.base_url))
+                })
+                .collect()
         })
     }
 
@@ -360,9 +391,12 @@ impl IssueBackend for JiraBackend {
             let mut op = http.operation();
             op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
-            ensure_dynamic_input(key)?;
-            let ji: JiraIssue =
-                Self::get(&mut op, &format!("issue/{key}?fields={JIRA_FIELDS}")).await?;
+            checked_jira_key(key)?;
+            let ji: JiraIssue = Self::get(
+                &mut op,
+                &format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?),
+            )
+            .await?;
             let comments = ji
                 .fields
                 .comment
@@ -380,8 +414,9 @@ impl IssueBackend for JiraBackend {
                     created_at_ms: parse_ms(c.created.as_deref()),
                 })
                 .collect();
+            checked_jira_key(&ji.key)?;
             Ok(IssueDetail {
-                issue: jira_issue_to_domain(ji),
+                issue: jira_issue_to_domain(ji, &self.base_url),
                 comments,
             })
         })
@@ -407,6 +442,7 @@ impl IssueBackend for JiraBackend {
             if let Some(body) = draft.body.as_deref() {
                 ensure_dynamic_input(body)?;
             }
+            super::identity::jira_project(project_key).map_err(IssueError::Parse)?;
 
             let priority_name = match draft.priority {
                 IssuePriority::Urgent => "Highest",
@@ -487,12 +523,14 @@ impl IssueBackend for JiraBackend {
             };
 
             let created: CreateResponse = Self::post(&mut op, "issue", &body).await?;
+            checked_jira_key(&created.key)?;
             let ji: JiraIssue = Self::get(
                 &mut op,
-                &format!("issue/{}?fields={JIRA_FIELDS}", created.key),
+                &format!("{}?fields={JIRA_FIELDS}", jira_path(&created.key, "")?),
             )
             .await?;
-            Ok(jira_issue_to_domain(ji))
+            checked_jira_key(&ji.key)?;
+            Ok(jira_issue_to_domain(ji, &self.base_url))
         })
     }
 
@@ -506,7 +544,7 @@ impl IssueBackend for JiraBackend {
             let mut op = http.operation();
             op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
-            ensure_dynamic_input(key)?;
+            checked_jira_key(key)?;
             if let Some(title) = patch.title.as_deref() {
                 ensure_dynamic_input(title)?;
             }
@@ -514,7 +552,7 @@ impl IssueBackend for JiraBackend {
             // Status update via transitions.
             if let Some(status) = patch.status {
                 let transitions: JiraTransitions =
-                    Self::get(&mut op, &format!("issue/{key}/transitions")).await?;
+                    Self::get(&mut op, &jira_path(key, "/transitions")?).await?;
                 let target_cat = match status {
                     IssueStatus::Backlog | IssueStatus::Todo => "new",
                     IssueStatus::InProgress => "indeterminate",
@@ -541,7 +579,7 @@ impl IssueBackend for JiraBackend {
                 }
                 Self::post_empty(
                     &mut op,
-                    &format!("issue/{key}/transitions"),
+                    &jira_path(key, "/transitions")?,
                     &TransitionBody {
                         transition: TransitionId {
                             id: trans.id.clone(),
@@ -563,7 +601,7 @@ impl IssueBackend for JiraBackend {
                 }
                 Self::put(
                     &mut op,
-                    &format!("issue/{key}"),
+                    &jira_path(key, "")?,
                     &UpdateBody {
                         fields: UpdateFields {
                             summary: title.clone(),
@@ -573,9 +611,13 @@ impl IssueBackend for JiraBackend {
                 .await?;
             }
 
-            let ji: JiraIssue =
-                Self::get(&mut op, &format!("issue/{key}?fields={JIRA_FIELDS}")).await?;
-            Ok(jira_issue_to_domain(ji))
+            let ji: JiraIssue = Self::get(
+                &mut op,
+                &format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?),
+            )
+            .await?;
+            checked_jira_key(&ji.key)?;
+            Ok(jira_issue_to_domain(ji, &self.base_url))
         })
     }
 
@@ -602,11 +644,14 @@ impl IssueBackend for JiraBackend {
                 urlencoding_simple(&jql)
             );
             let result: SearchResult = Self::get(&mut op, &path).await?;
-            Ok(result
+            result
                 .issues
                 .into_iter()
-                .map(jira_issue_to_domain)
-                .collect())
+                .map(|issue| {
+                    checked_jira_key(&issue.key)?;
+                    Ok(jira_issue_to_domain(issue, &self.base_url))
+                })
+                .collect()
         })
     }
 }
@@ -763,7 +808,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let issue = jira_issue_to_domain(ji);
+        let issue = jira_issue_to_domain(ji, "https://jira.example");
         assert_eq!(issue.id, "jira:PROJ-7");
         assert_eq!(issue.number, "PROJ-7");
         assert_eq!(issue.provider, "jira");
@@ -773,7 +818,7 @@ mod tests {
         assert_eq!(issue.priority, IssuePriority::High);
         assert_eq!(issue.assignees, vec!["Dana Scully".to_string()]);
         assert_eq!(issue.labels, vec!["bug".to_string(), "p1".to_string()]);
-        assert_eq!(issue.url, "https://myorg.atlassian.net/browse/PROJ-7");
+        assert_eq!(issue.url, "https://jira.example/browse/PROJ-7");
         assert_eq!(issue.updated_at_ms, 2000);
     }
 
@@ -833,14 +878,14 @@ mod tests {
             "fields": {}
         }))
         .unwrap();
-        let issue = jira_issue_to_domain(ji);
+        let issue = jira_issue_to_domain(ji, "https://jira.example");
         assert_eq!(issue.title, "");
         assert_eq!(issue.body, None, "empty description filtered to None");
         assert_eq!(issue.status, IssueStatus::Backlog);
         assert_eq!(issue.priority, IssuePriority::None);
         assert!(issue.assignees.is_empty());
         assert_eq!(issue.updated_at_ms, 0);
-        assert_eq!(issue.url, "https://h.example/browse/X-1");
+        assert_eq!(issue.url, "https://jira.example/browse/X-1");
     }
 
     #[test]

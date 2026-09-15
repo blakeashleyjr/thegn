@@ -78,6 +78,12 @@ pub struct ControlClient {
     addr: ControlAddr,
 }
 
+fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
+    crate::issue::validate_control_issue_id(id).map_err(|e| anyhow!(e.to_string()))?;
+    let encoded = crate::issue::identity::encode_control_segment(id).map_err(|e| anyhow!(e))?;
+    Ok(format!("/v1/issues/{encoded}{suffix}"))
+}
+
 /// An HTTP response rejected by the control API.
 ///
 /// Keep the status alongside the server's message so callers that have a
@@ -611,9 +617,8 @@ impl ControlClient {
 
     /// `GET /v1/issues/{id}` — one issue with detail/comments.
     pub async fn issue_get(&self, id: &str) -> Result<thegn_core::issue::IssueDetail> {
-        let v = self
-            .request("GET", &format!("/v1/issues/{id}"), None)
-            .await?;
+        let path = encoded_issue_path(id, "")?;
+        let v = self.request("GET", &path, None).await?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -623,25 +628,19 @@ impl ControlClient {
         id: &str,
         patch: &thegn_core::issue::IssuePatch,
     ) -> Result<thegn_core::issue::Issue> {
+        let path = encoded_issue_path(id, "")?;
         let v = self
-            .request(
-                "POST",
-                &format!("/v1/issues/{id}"),
-                Some(serde_json::to_value(patch)?),
-            )
+            .request("POST", &path, Some(serde_json::to_value(patch)?))
             .await?;
         Ok(serde_json::from_value(v)?)
     }
 
     /// `POST /v1/issues/{id}/comment` — add a comment.
     pub async fn issue_comment(&self, id: &str, body: &str) -> Result<()> {
-        self.request(
-            "POST",
-            &format!("/v1/issues/{id}/comment"),
-            Some(json!({ "body": body })),
-        )
-        .await
-        .map(|_| ())
+        let path = encoded_issue_path(id, "/comment")?;
+        self.request("POST", &path, Some(json!({ "body": body })))
+            .await
+            .map(|_| ())
     }
 
     /// `GET /v1/dispatches` — the durable dispatch roster.
@@ -1447,5 +1446,36 @@ mod tests {
             msg.contains("restart the daemon"),
             "error must be actionable: {msg}"
         );
+    }
+
+    #[test]
+    fn issue_path_encodes_complete_identity_once_for_server_decode() {
+        let id = "plugin:demo:客户/任务#7";
+        let path = encoded_issue_path(id, "").unwrap();
+        assert!(path.starts_with("/v1/issues/plugin%3Ademo%3A"));
+        assert!(path.contains("%2F") && path.contains("%23"));
+        let encoded = path.strip_prefix("/v1/issues/").unwrap();
+        let mut out = Vec::new();
+        let bytes = encoded.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        let decoded = String::from_utf8(out).unwrap();
+        assert_eq!(decoded, id);
+        assert!(crate::issue::validate_control_issue_id(&decoded).is_ok());
+    }
+
+    #[test]
+    fn issue_path_rejects_malformed_identity_before_encoding() {
+        assert!(encoded_issue_path("linear:bad key", "").is_err());
+        assert!(encoded_issue_path(&format!("plugin:demo:{}", "x".repeat(500)), "").is_err());
     }
 }
