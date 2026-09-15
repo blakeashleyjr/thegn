@@ -371,6 +371,13 @@
       ]
     },
     {
+      "issue": "THE-222",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "secure-merge-bundle-custody"
+      ]
+    },
+    {
       "issue": "THE-286",
       "project": "Alpha Reliability & State Compatibility",
       "changes": [

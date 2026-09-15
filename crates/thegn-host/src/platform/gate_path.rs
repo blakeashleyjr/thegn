@@ -187,17 +187,101 @@ impl Directory {
         use std::os::fd::AsRawFd;
         self.pins.last().unwrap().1.as_raw_fd()
     }
+
+    #[cfg(unix)]
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            path: self.path.clone(),
+            pins: self
+                .pins
+                .iter()
+                .map(|(path, file, private)| Ok((path.clone(), file.try_clone()?, *private)))
+                .collect::<io::Result<_>>()?,
+        })
+    }
 }
 
 impl Regular {
+    /// Create a new owner-only regular leaf without ever opening an existing
+    /// path. The caller retains this descriptor for the whole operation and
+    /// may later remove it through [`remove_verified`].
+    #[cfg(all(test, unix))]
+    pub(crate) fn create_exclusive(path: &Path) -> io::Result<Self> {
+        Self::open(path, true, true)
+    }
+
+    /// Create a leaf beneath an already-retained directory descriptor.  The
+    /// caller uses this when the parent was admitted as a private fixture;
+    /// reopening the absolute path would reintroduce a pathname race between
+    /// parent admission and leaf creation.
+    #[cfg(unix)]
+    pub(crate) fn create_exclusive_at(parent: &Directory, path: &Path) -> io::Result<Self> {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        if path.parent() != Some(parent.path()) {
+            return Err(refused(
+                "gate file parent does not match retained directory",
+            ));
+        }
+        // Admit and clone the parent before creation. No post-create failure
+        // can then leave a leaf without an owned parent descriptor.
+        parent.verify()?;
+        let retained_parent = parent.try_clone()?;
+        let name = CString::new(
+            path.file_name()
+                .ok_or_else(|| refused("gate file has no name"))?
+                .as_bytes(),
+        )
+        .map_err(io::Error::other)?;
+        // SAFETY: parent is retained and name is one terminated component.
+        let fd = unsafe {
+            libc::openat(
+                parent.fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Adopt the descriptor immediately so every post-create error closes
+        // it. The retained parent was admitted before openat above.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let this = Self {
+            parent: retained_parent,
+            path: path.into(),
+            file,
+        };
+        if let Err(error) = this.verify() {
+            return match this.remove_if_same_identity() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "created gate leaf verification failed; leaf preserved: {error}; cleanup refused or failed: {cleanup}"
+                ))),
+            };
+        }
+        Ok(this)
+    }
+
     pub(crate) fn open_existing(path: &Path) -> io::Result<Self> {
-        Self::open(path, false)
+        Self::open(path, false, false)
     }
 
     /// Remove only this verified regular leaf via its pinned parent. There is
     /// still no atomic lease against an arbitrary same-UID leaf replacement.
     pub(crate) fn remove_verified(self) -> io::Result<()> {
         self.verify()?;
+        self.remove_leaf()
+    }
+
+    fn remove_leaf(self) -> io::Result<()> {
         #[cfg(unix)]
         {
             use std::ffi::CString;
@@ -219,8 +303,39 @@ impl Regular {
         }
     }
 
+    /// Settle a construction error only when both retained identities still
+    /// name the objects opened by this instance. A replacement or changed
+    /// parent is preserved; this is not a pathname-only cleanup fallback.
+    #[cfg(unix)]
+    fn remove_if_same_identity(self) -> io::Result<()> {
+        let current_parent = std::fs::symlink_metadata(self.parent.path())?;
+        if !same_file(
+            &self.parent.pins.last().unwrap().1.metadata()?,
+            &current_parent,
+        ) {
+            return Err(refused(
+                "gate parent identity changed; preserving created leaf",
+            ));
+        }
+        let current_leaf = std::fs::symlink_metadata(&self.path)?;
+        if !same_file(&self.file.metadata()?, &current_leaf)
+            || !safe_regular(
+                current_leaf.is_file(),
+                current_leaf.uid(),
+                unsafe { libc::geteuid() },
+                current_leaf.nlink(),
+                current_leaf.mode(),
+            )
+        {
+            return Err(refused(
+                "gate leaf identity changed; preserving replacement",
+            ));
+        }
+        self.remove_leaf()
+    }
+
     #[cfg_attr(not(unix), allow(unused_variables))]
-    fn open(path: &Path, create_lock: bool) -> io::Result<Self> {
+    fn open(path: &Path, create_lock: bool, create_exclusive: bool) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::ffi::CString;
@@ -242,12 +357,17 @@ impl Regular {
             } else {
                 libc::O_RDONLY
             };
+            let create = if create_exclusive {
+                libc::O_CREAT | libc::O_EXCL
+            } else {
+                0
+            };
             // SAFETY: parent is retained and name is a single terminated component.
             let fd = unsafe {
                 libc::openat(
                     parent.fd(),
                     name.as_ptr(),
-                    access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    access | create | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
                     0o600,
                 )
             };
@@ -299,12 +419,22 @@ impl Regular {
             ))
         }
     }
+
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        self.file.write_all(bytes)
+    }
+
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
+        use std::io::Write;
+        self.file.flush()
+    }
 }
 
 pub(crate) fn read_regular(path: &Path) -> io::Result<String> {
     use std::io::Read;
     const LIMIT: u64 = 64 * 1024;
-    let regular = Regular::open(path, false)?;
+    let regular = Regular::open(path, false, false)?;
     if regular.file.metadata()?.len() > LIMIT {
         return Err(refused("gate identity file is oversized"));
     }
@@ -319,7 +449,7 @@ pub(crate) fn read_regular(path: &Path) -> io::Result<String> {
 
 impl Lock {
     pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
-        let regular = Regular::open(path, true)?;
+        let regular = Regular::open(path, true, false)?;
         regular.file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -338,7 +468,12 @@ impl Lock {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::super::owned_test_child::OwnedChild;
 
     fn private_root() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -461,6 +596,146 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(Lock::acquire(&file).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn exclusive_regular_creation_never_adopts_an_existing_leaf() {
+        let root = private_root();
+        let path = root.path().join("bundle");
+        let mut regular = Regular::create_exclusive(&path).unwrap();
+        regular.write_all(b"bundle").unwrap();
+        regular.flush().unwrap();
+        regular.verify().unwrap();
+        assert!(Regular::create_exclusive(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"bundle");
+    }
+
+    #[test]
+    fn failed_identity_cleanup_preserves_a_replacement() {
+        let root = private_root();
+        let path = root.path().join("bundle");
+        let regular = Regular::create_exclusive(&path).unwrap();
+        let retained = root.path().join("retained");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"foreign replacement").unwrap();
+        assert!(regular.remove_if_same_identity().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(retained).unwrap();
+    }
+
+    #[test]
+    #[ignore = "root-owned exact child custody gate"]
+    fn exclusive_regular_creation_child() {
+        let root = PathBuf::from(std::env::var_os("THEGN_GATE_CHILD_ROOT").unwrap());
+        let ready = PathBuf::from(std::env::var_os("THEGN_GATE_CHILD_READY").unwrap());
+        let result = PathBuf::from(std::env::var_os("THEGN_GATE_CHILD_RESULT").unwrap());
+        let release = root.join("release");
+        let target = root.join("shared.bundle");
+        File::create_new(&ready).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !release.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(release.exists(), "child barrier release timed out");
+        let outcome = match Regular::create_exclusive(&target) {
+            Ok(mut file) => {
+                file.write_all(b"winner").unwrap();
+                file.flush().unwrap();
+                "winner"
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => "loser",
+            Err(error) => panic!("unexpected exclusive-create error: {error}"),
+        };
+        std::fs::write(result, outcome).unwrap();
+    }
+
+    #[test]
+    fn exclusive_regular_creation_has_one_winner_across_two_owned_children() {
+        use std::process::{Command, Stdio};
+        let root = Arc::new(private_root());
+        let root_path = root.path().to_path_buf();
+        let release = root_path.join("release");
+        let target = root_path.join("shared.bundle");
+        let mut children = Vec::new();
+        for name in ["a", "b"] {
+            let child_dir = root_path.join(format!("child-{name}"));
+            std::fs::create_dir(&child_dir).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "platform::gate_path::tests::exclusive_regular_creation_child",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("THEGN_GATE_CHILD_ROOT", &root_path)
+                .env("THEGN_GATE_CHILD_READY", child_dir.join("ready"))
+                .env("THEGN_GATE_CHILD_RESULT", child_dir.join("result"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            children.push(OwnedChild::spawn(&mut command, Arc::clone(&root)));
+        }
+        let mut settled = [false, false];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !(root_path.join("child-a/ready").exists()
+            && root_path.join("child-b/ready").exists())
+            && Instant::now() < deadline
+        {
+            for (child, done) in children.iter_mut().zip(&mut settled) {
+                if !*done {
+                    *done = child.poll().is_some();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            root_path.join("child-a/ready").exists() && root_path.join("child-b/ready").exists()
+        );
+        File::create_new(&release).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !(root_path.join("child-a/result").exists()
+            && root_path.join("child-b/result").exists())
+            && Instant::now() < deadline
+        {
+            for (child, done) in children.iter_mut().zip(&mut settled) {
+                if !*done {
+                    *done = child.poll().is_some();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            root_path.join("child-a/result").exists() && root_path.join("child-b/result").exists()
+        );
+        for (index, child) in children.iter_mut().enumerate() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !settled[index] && Instant::now() < deadline {
+                settled[index] = child.poll().is_some();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(settled[index], "child did not settle");
+        }
+        let outcomes = [
+            std::fs::read_to_string(root_path.join("child-a/result")).unwrap(),
+            std::fs::read_to_string(root_path.join("child-b/result")).unwrap(),
+        ];
+        assert_eq!(
+            outcomes.iter().filter(|v| v.as_str() == "winner").count(),
+            1
+        );
+        assert_eq!(outcomes.iter().filter(|v| v.as_str() == "loser").count(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), b"winner");
+        for name in ["a", "b"] {
+            let child_dir = root_path.join(format!("child-{name}"));
+            std::fs::remove_file(child_dir.join("ready")).unwrap();
+            std::fs::remove_file(child_dir.join("result")).unwrap();
+            std::fs::remove_dir(child_dir).unwrap();
+        }
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_file(release).unwrap();
     }
 }
 

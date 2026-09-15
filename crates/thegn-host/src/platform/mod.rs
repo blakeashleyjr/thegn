@@ -50,6 +50,10 @@ pub(crate) mod state_db_capture;
 /// Physical identity and nonblocking ownership checks for local gate state.
 pub(crate) mod gate_path;
 
+#[cfg(all(test, unix))]
+#[path = "../../../../test/support/owned_test_child.rs"]
+pub(crate) mod owned_test_child;
+
 /// Platform-owned details for the daemon's local administrative endpoint.
 /// The doctor owns presentation; this seam owns the OS identity primitive and
 /// endpoint-hardening check that give those labels their meaning.
