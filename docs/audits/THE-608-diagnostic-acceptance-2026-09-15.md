@@ -3,8 +3,9 @@
 The original merge-drain diagnostic-column defect is repaired on local main
 `393473624691b0aee04b2725b762e06210c51609`. Independent source and retained
 native evidence review found no further scoped production fix. The current05
-full-source native gate passed; final metadata landing and tracker closure
-remain pending. This record does not mark the shared change or Linear issue complete.
+full-source native gate passed. Reviewed evidence landed on local main at
+`bd73896359939c5893e0aaf2a136ef627e93be2c`; Linear Done was read back with
+completion time `2026-09-15T02:40:29.889Z`. The shared change remains active.
 
 The [evidence manifest](the608-2026-09-15/manifest.json) preserves the exact
 original independent review, fresh issue snapshot and source/test map. It links
@@ -86,8 +87,10 @@ live-queue exercise.
 
 ## Remaining reconciliation
 
-Review and land this metadata with the completed current full-source result,
-then reconcile the issue state. Preserve the historical
+Primary review, source checks, local landing and THE-608 closure are complete.
+Closure comment `4bee3e3d-ab3b-4f32-8b98-e1e36b85543c` records the exact scope;
+UUID/state-history readback confirmed Done after identifier reads briefly returned
+stale state. Preserve the historical
 shared fixed-CLI/private-native/live-queue checkbox and THE-610 obligations;
 THE-608's scoped proof does not complete those separate claims or authorize
 THE-586 live retry. Existing reciprocal delivery ownership remains unchanged,

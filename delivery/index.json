@@ -869,7 +869,7 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "THE-219 finite held-retry and private actual-drain acceptance delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade. THE-608 diagnostic source and scoped native/normal-CLI evidence independently reviewed at39347362; full33c0 native passed8,465/8,465 with26 skips, while metadata landing and tracker closure remain pending. Shared live-queue integration and THE-610 acceptance are not completed by this record."
+      "summary": "THE-219 finite held-retry and private actual-drain acceptance delivered on local main c0d3d860a22db0a7fddafb3d338bf40b25248ade. THE-608 diagnostic source and scoped native/normal-CLI evidence independently reviewed at39347362; full33c0 native passed8,465/8,465 with26 skips, reviewed evidence landed at bd738963 and THE-608 Done was read back at 2026-09-15T02:40:29.889Z. Shared live-queue integration and THE-610 acceptance are not completed by this record."
     },
     {
       "change": "preserve-winning-host-environment",

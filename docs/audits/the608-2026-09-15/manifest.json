@@ -55,10 +55,7 @@
       "sha256": "0b1726ec50b36f1298080cc6b4a413eca77382eb28ff0ddf6ea423d45ff8a1f4"
     }
   ],
-  "pending": [
-    "Final source review and metadata landing",
-    "Tracker closure/readback"
-  ],
+  "pending": [],
   "scoped_source_hashes": {
     "crates/thegn-host/src/merge_driver.rs": "b91b385799e497a89518fd390c433fd878f0be05577aff4c4883f4f5dd77c236",
     "crates/thegn-host/src/merge_driver_status_tests.rs": "6c70642b020b2c6a30073400739aed3ea1d57e208cfbe162f784a8f96781f3ab",
@@ -101,5 +98,13 @@
       "crates/thegn-core/src/db_merge_status_tests.rs": "0dc2e174e18cd1ded50bbea3ee9950bd597233609a5897627097d77bcea89ba5",
       "crates/thegn-core/src/store/worktree_aux.rs": "787057487738f276e4bb3f5c0f4e20c728ec6f7c260ac43e41170a718526ca09"
     }
+  },
+  "delivery": {
+    "local_main": "bd73896359939c5893e0aaf2a136ef627e93be2c",
+    "status": "Done",
+    "completed_at": "2026-09-15T02:40:29.889Z",
+    "closure_comment": "4bee3e3d-ab3b-4f32-8b98-e1e36b85543c",
+    "readback": "/tmp/thegn-THE608-final-closure-readback-20260915.json",
+    "shared_change_complete": false
   }
 }
