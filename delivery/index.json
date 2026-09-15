@@ -1081,15 +1081,16 @@
     },
     {
       "change": "secure-merge-bundle-custody",
-      "lifecycle": "active",
-      "disposition": "verification-gated",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-222",
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Secure cross-host merge bundle temporary-file custody with retained identity, exclusive creation and platform-specific native verification."
+      "summary": "Private exclusive merge-bundle custody verified by strict lint, focused Linux native tests, and five two-process hostile-entry cases. Windows source reviewed; native proof unavailable. See maintenance07 audit for observation limits and sibling residuals.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "select-before-snapshot",
@@ -1105,15 +1106,16 @@
     },
     {
       "change": "serialize-validate-frp-configuration",
-      "lifecycle": "active",
-      "disposition": "verification-gated",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-326",
           "project": "Client API & Remote Access"
         }
       ],
-      "summary": "Typed FRP configuration serialization and strict reparsing are source-complete; native, lint, and landing gates remain pending."
+      "summary": "Typed FRP serialization, validation before secret resolution, strict reparse and equality verified by 16 focused FRP tests plus strict all-target lint. Credential transport and filesystem custody remain THE-325/THE-328.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "stabilize-process-monitor-refresh",
@@ -1159,15 +1161,16 @@
     },
     {
       "change": "validate-sandbox-volume-sources",
-      "lifecycle": "active",
-      "disposition": "verification-gated",
+      "lifecycle": "delivered-awaiting-archive",
+      "disposition": "alpha-delivery",
       "owners": [
         {
           "issue": "THE-247",
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Reject path-like named-volume sources at every sandbox entry boundary and propagate bounded terminal errors before launch effects."
+      "summary": "Named-volume source grammar and typed pre-resolution/final-composed refusal gates verified by strict all-target lint and focused Linux native tests. See maintenance07 audit for exact selectors and Linux-only scope.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "verify-gate-workspace",

@@ -9,4 +9,4 @@
 - [x] Add lexical, redaction, pair-index, direct-entry, OCI, caller, and
       behavioral pre-resolution/final-boundary regression coverage.
 - [x] Record the scoped delivery and audit checkpoint.
-- [ ] Root-owned Cargo, strict lint, and runtime verification.
+- [x] Root-owned Cargo, strict lint, and runtime verification.
