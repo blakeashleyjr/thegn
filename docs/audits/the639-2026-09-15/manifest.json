@@ -38,7 +38,7 @@
       "sha256": "784a0c14a487df7daa6e88de6267eb1b4ed1d65db1b28364b90d9a5908639cf1",
       "bytes": 3270
     },
-    "counterfactuals/mutant1-review.md": {
+    "counterfactuals/mutant1-review.md.log": {
       "sha256": "997166bac0ef14c239ddefc5b3ca090d007e838ae30f078481af538cf507128f",
       "bytes": 1539
     },
@@ -70,7 +70,7 @@
       "sha256": "bed2fbfe6df27c3f2dd0d00fc7a67682cba2188286ebdd701a736f1b233b6284",
       "bytes": 2634
     },
-    "counterfactuals/mutant2-review.md": {
+    "counterfactuals/mutant2-review.md.log": {
       "sha256": "6bfbca34e9dbc78703e9212096d9a614c3210fc5d5e923db6758d29b5a924235",
       "bytes": 2408
     },
@@ -102,9 +102,21 @@
       "sha256": "1d86ed665c2805761b644502db1cf022ee6fbd7fcc0439b82e49d3d3b9fc6ce4",
       "bytes": 4833
     },
-    "counterfactuals/mutant3-review.md": {
+    "counterfactuals/mutant3-review.md.log": {
       "sha256": "4ced7a6f04d46fb6c1ac2fd5eeb9ead49fd657ef8104094c9b50a3812320abb5",
       "bytes": 4590
+    },
+    "final-adversarial.json": {
+      "sha256": "fcad21a4990f18e1615b9d2b86f6593e352e1e31ec3ddfecfae2b50bc70a7777",
+      "bytes": 2791
+    },
+    "final-adversarial.md.log": {
+      "sha256": "eb4bf4c1e88c7ee6d66d09f84d96f1e5afc627bd30f0b6f04f5da6d06f0e136b",
+      "bytes": 3951
+    },
+    "full05-clippy.log": {
+      "sha256": "f68967339c68cd2129b4efcd28ff2ac8e8c6c4146daa2cab45a8cad48fe3456f",
+      "bytes": 9255
     },
     "full05-native-receipt.json": {
       "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310",
@@ -114,7 +126,7 @@
       "sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
       "bytes": 984898
     },
-    "review.md": {
+    "review.md.log": {
       "sha256": "b021663b4b942e46df0e1c883a79fc5163ca643ff2755c061cef6e41216774d0",
       "bytes": 2587
     },
@@ -125,6 +137,52 @@
     "source-equivalence.json": {
       "sha256": "71268db60713379c57e4f6ec4516280b0aafb9b7d34a6fb05a351ba07ffa6af2",
       "bytes": 1270
+    },
+    "thegn-THE639-final-format-20260915.log": {
+      "sha256": "c8b9b1b13b802c18af5e635f25b29cb84e857c73b6a18ef1c16d684368fa28f3",
+      "bytes": 155
+    },
+    "thegn-THE639-final-ratchets-20260915.log": {
+      "sha256": "253812df3c450d865146555472674613e37ee86712982953c0b9a5f2435d586f",
+      "bytes": 192
+    },
+    "thegn-THE639-final-ratchets-clean-20260915.log": {
+      "sha256": "df39603e698d21f156e2c62fae1c5c938c09561cb01296c01abca358b9422935",
+      "bytes": 4797
+    },
+    "thegn-THE639-final-ratchets-corrected-20260915.log": {
+      "sha256": "e011e0e6c16fcb7c0f792d3754415eca63546c0cfa74370b38f86cca2edbc350",
+      "bytes": 2824
+    },
+    "thegn-THE639-final-spec-20260915.log": {
+      "sha256": "dc5cd4b024a1ac6e36af1825e5d22a63ddc6ec0cf5f6d226500786c096c52b4d",
+      "bytes": 153
     }
+  },
+  "root_evidence_correction": "Raw review.md.log describes mutant3 as injecting child exit. The actual mutation gates the stderr reader until the consuming child-exit hook. The intended failure is pipe backpressure reaching HeldUnknown(Deadline), not a fabricated exit.",
+  "strict_lint": {
+    "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "exit_code": 0,
+    "scope": "existing strict workspace/all-target Clippy; all four extracted Rust files match the tested source exactly",
+    "new_run": false
+  },
+  "final_review": {
+    "independent_report": "final-adversarial.json",
+    "root_verdict": "Approved for local-main landing after resolving metadata-only findings",
+    "resolved_findings": [
+      "Mutant3 gates reader until owned ChildExited hook; corrected in primary audit and manifest, original packaging review retained as historical raw bytes.",
+      "Final independent standalone review is complete; the earlier packaging review remaining-review statement is historical.",
+      "The raw final review immutable_base has a spurious trailing 3. Actual40-character git base is 3f365bfe56a7577dd8e051c56f5f0a4e81ade02e, verified against the candidate parent graph."
+    ],
+    "source_changed_after_review": false
+  },
+  "source_gates": {
+    "initial_ratchets": 1,
+    "initial_ratchet_failure": "Delivery issues append needed numeric ordering",
+    "second_ratchets": 1,
+    "second_ratchet_failure": "Removed stale devcontainer_provider ignored-result allowlist entry after source eliminated matching ignored results",
+    "final_ratchets": 0,
+    "strict_spec": 0,
+    "specific_fmt": 0
   }
 }

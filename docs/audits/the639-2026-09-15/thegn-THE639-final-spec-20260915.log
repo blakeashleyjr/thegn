@@ -1,0 +1,2 @@
+OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec validate retain-devcontainer-startup-custody --strict
+Change 'retain-devcontainer-startup-custody' is valid

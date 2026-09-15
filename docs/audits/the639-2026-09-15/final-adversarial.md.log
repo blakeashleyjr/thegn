@@ -1,0 +1,31 @@
+# THE-639 final standalone adversarial review — Luna
+
+Date: 2026-09-15
+Candidate: /tmp/thegn-THE639-standalone-20260915
+Candidate packaging commit: 4f8fd8f9eb39bfd99fa25f4d64898f2e077003ad
+Source-equivalence candidate hash: 8a83b1ec37366ba329a5752a5b20e7715fc24695
+Immutable base: 3f365bfe56a7577dd8e051c56f5f0a4e81ade02e3
+Tested production source: 33c0db71a3efd91a5637be47fd2d353fd628056a
+
+## Verdict
+
+APPROVED for standalone source/evidence landing review, with one metadata prose correction required before landing. No implementation or test rerun was performed.
+
+The source-equivalence receipt proves all four Rust paths in the candidate exactly match the source used by the full05 native run: agent.rs, devcontainer_provider.rs, devcontainer_startup.rs, and platform/devcontainer_startup_tests.rs. The candidate's production source hash is 8a83b1ec37366ba329a5752a5b20e7715fc24695; each file is marked exact against tested source in source-equivalence.json. The extracted change is scoped to the THE-639 startup/custody implementation and its platform tests/OpenSpec material. No THE-640, performance, provider, or unrelated production change is introduced by the extraction.
+
+The preserved full05 receipt records exit 0, 8,465/8,465 passing tests, 26 skips, and 23 positive THE-639 selectors. It is explicitly reused evidence from source 33c, with native log SHA-256 303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b. The package also includes the three isolated counterfactual patches, build/admission/quota metadata, native logs, receipts, and independent reviews.
+
+## Counterfactual readback
+
+- Mutant 1 is the early claim mutation. Its exact selector fails first at platform/devcontainer_startup_tests.rs:1144: expected zero spawn calls, observed one. The explicit fixture.finish cleanup at line 1143 precedes the assertion. The after-claim case and subsequent assertions are unreachable; the receipt does not claim otherwise.
+- Mutant 2 is the displaced-local-custody mutation. The injected post-insert unwind is caught, fixture.finish returns, and the first failing assertion is the poisoned retired-cell ownership check at line 761. Later registry/snapshot/destructor/Busy assertions are unreachable. Its pre-release of the destructor gate is an explicit fixture cleanup refinement for this mutant and is recorded in its receipt/review.
+- Mutant 3 is the reader-after-owned-child-exit ordering mutation. The zero-stderr positive case passes. The 2 MiB stderr case reaches HeldUnknown(Deadline) and fails at the unchanged unwrap at line 646 after fixture.finish at line 639. No gate-backstop timeout, outer watchdog expiry, cleanup failure, or later assertion is claimed. The actual mutation gates the stderr reader until the consuming child-exit hook; it does not inject a child exit. The standalone review.md currently uses the inaccurate “injects child exit” wording and should be corrected by the root-owned metadata edit.
+
+The three receipts are internally consistent with their logs and intended first failures, and each records expected semantic failure with build exit 0. The positive full05 receipt and the counterfactual receipts remain separate evidence classes.
+
+## Scope limits
+
+This package supports the tested startup custody and bounded diagnostic semantics only. It does not establish behavior across a controller restart, multiple independent controllers, or arbitrary process-tree descendants/inherited pipes. It does not claim automatic signals, global reaping, total syscall settlement at the caller deadline, provider/OCI containment, performance improvement, or a new production fallback. The package's review.md also says final adversarial review remains; this report supplies that review, so root should update that stale status text together with the mutant-3 wording.
+
+No provider action, build, native rerun, canonical edit, Linear write, or source mutation was performed for this review.
+
