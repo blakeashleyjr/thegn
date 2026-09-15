@@ -133,7 +133,7 @@ fn fetch_bundle_with_root(
     // `git_ok` runs `.output()` inside thegn-core (off-loop by contract there).
     let ok = target.git_ok(&["fetch", &tmp_s, &refspec]);
     if !ok {
-        return match tmp.finish() {
+        match tmp.finish() {
             Ok(()) => anyhow::bail!("git fetch from bundle failed"),
             Err(cleanup) => {
                 anyhow::bail!("git fetch from bundle failed; cleanup failed: {cleanup}")
@@ -189,15 +189,15 @@ impl BundleTemp {
             let temp = builder.tempdir_in(std::fs::canonicalize(root)?)?;
             let temp_path = temp.path().to_owned();
             #[cfg(test)]
-            if precreate_leaf {
-                if let Err(error) = std::fs::write(temp_path.join("bundle"), b"foreign fixture") {
-                    return Err(match std::fs::remove_dir(&temp_path) {
-                        Ok(()) => error,
-                        Err(cleanup) => io::Error::other(format!(
-                            "seed hostile bundle leaf failed: {error}; nonrecursive cleanup failed: {cleanup}"
-                        )),
-                    });
-                }
+            if precreate_leaf
+                && let Err(error) = std::fs::write(temp_path.join("bundle"), b"foreign fixture")
+            {
+                return Err(match std::fs::remove_dir(&temp_path) {
+                    Ok(()) => error,
+                    Err(cleanup) => io::Error::other(format!(
+                        "seed hostile bundle leaf failed: {error}; nonrecursive cleanup failed: {cleanup}"
+                    )),
+                });
             }
             let parent = match crate::platform::gate_path::Directory::open(
                 &temp_path,
@@ -239,7 +239,7 @@ impl BundleTemp {
                     });
                 }
             };
-            return Ok(custody);
+            Ok(custody)
         }
         #[cfg(windows)]
         {
@@ -253,15 +253,15 @@ impl BundleTemp {
             // retained no-follow handle still guard the seam before fetch.
             let temp_path = crate::platform::create_private_directory(root)?;
             #[cfg(test)]
-            if precreate_leaf {
-                if let Err(error) = std::fs::write(temp_path.join("bundle"), b"foreign fixture") {
-                    return Err(match std::fs::remove_dir(&temp_path) {
-                        Ok(()) => error,
-                        Err(cleanup) => io::Error::other(format!(
-                            "seed hostile bundle leaf failed: {error}; nonrecursive cleanup failed: {cleanup}"
-                        )),
-                    });
-                }
+            if precreate_leaf
+                && let Err(error) = std::fs::write(temp_path.join("bundle"), b"foreign fixture")
+            {
+                return Err(match std::fs::remove_dir(&temp_path) {
+                    Ok(()) => error,
+                    Err(cleanup) => io::Error::other(format!(
+                        "seed hostile bundle leaf failed: {error}; nonrecursive cleanup failed: {cleanup}"
+                    )),
+                });
             }
             if let Err(error) = crate::platform::secure_private_directory(&temp_path) {
                 return Err(match std::fs::remove_dir(&temp_path) {
@@ -311,7 +311,7 @@ impl BundleTemp {
                     });
                 }
             };
-            return Ok(custody);
+            Ok(custody)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -403,10 +403,10 @@ impl BundleTemp {
     #[cfg(unix)]
     fn cleanup(&mut self) -> io::Result<()> {
         let mut failure = None;
-        if let Some(file) = self.file.take() {
-            if let Err(error) = file.remove_verified() {
-                failure = Some(error);
-            }
+        if let Some(file) = self.file.take()
+            && let Err(error) = file.remove_verified()
+        {
+            failure = Some(error);
         }
         if let Some(parent) = self.parent.take() {
             if parent.verify().is_ok() {
