@@ -1051,7 +1051,8 @@ mod spec {
             "title": "ok",
             "status": "todo",
             "priority": "low",
-            "url": ""
+            "url": "",
+            "updated_at_ms": 0
         }))
         .unwrap();
         assert!(validate_issue_identity(&issue).is_ok());
