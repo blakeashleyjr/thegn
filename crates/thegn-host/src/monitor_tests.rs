@@ -547,7 +547,7 @@ fn process_sort_keys_render_both_directions_and_keep_confirmation_identity() {
     assert!(!ov.prefs.proc_desc);
     assert_eq!(
         ov.proc_rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
-        [17, 3, 42]
+        [42, 3, 17]
     );
     assert!(matches!(
         &ov.confirm,
