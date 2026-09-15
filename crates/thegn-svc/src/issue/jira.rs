@@ -23,7 +23,22 @@ pub struct JiraBackend {
 }
 
 impl JiraBackend {
-    pub(crate) fn new(
+    pub fn new(
+        base_url: String,
+        email: String,
+        api_token: String,
+        project_key: Option<String>,
+    ) -> Self {
+        Self::new_with_budget(
+            base_url,
+            email,
+            api_token,
+            project_key,
+            TrackerHttpBudget::process(),
+        )
+    }
+
+    pub(crate) fn new_with_budget(
         base_url: String,
         email: String,
         api_token: String,
