@@ -120,6 +120,9 @@ pub(crate) fn github_number(number: &str) -> Result<&str, String> {
 
 pub(crate) fn github_repo(repo: &str) -> Result<&str, String> {
     bounded(repo, BUILTIN_ID_MAX, "GitHub repository")?;
+    if repo.starts_with('-') {
+        return Err("GitHub repository must not look like a CLI option".into());
+    }
     let parts: Vec<&str> = repo.split('/').collect();
     let (host, owner, name) = match parts.as_slice() {
         [owner, name] => (None, *owner, *name),
@@ -239,6 +242,8 @@ mod tests {
         assert!(github_repo("owner/.github").is_ok());
         assert!(github_repo("owner/repo name").is_err());
         assert!(github_repo("../repo").is_err());
+        assert!(github_repo("--help/repo").is_err());
+        assert!(github_repo("owner/-repository").is_ok());
         assert!(github_host_for_url("ghe.example").is_ok());
         assert!(github_host_for_url(".ghe.example").is_err());
         assert!(jira_project("PROJ_2").is_ok());
