@@ -24,7 +24,6 @@ use thegn_core::seam::{ErrorClass, SeamError};
 pub use capabilities::IssueCaps;
 
 /// Errors from any issue backend.
-#[derive(Debug)]
 pub enum IssueError {
     NotConfigured,
     Unsupported(&'static str),
@@ -36,6 +35,29 @@ pub enum IssueError {
     Policy(&'static str),
     Timeout(&'static str),
     BodyLimit(&'static str),
+}
+
+impl std::fmt::Debug for IssueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("IssueError::NotConfigured"),
+            Self::Unsupported(op) => f.debug_tuple("IssueError::Unsupported").field(op).finish(),
+            Self::Network(_) => f.write_str("IssueError::Network(<redacted>)"),
+            Self::Auth(message) => f.debug_tuple("IssueError::Auth").field(message).finish(),
+            Self::Api(message) => f.debug_tuple("IssueError::Api").field(message).finish(),
+            Self::Subprocess(message) => f
+                .debug_tuple("IssueError::Subprocess")
+                .field(message)
+                .finish(),
+            Self::Parse(message) => f.debug_tuple("IssueError::Parse").field(message).finish(),
+            Self::Policy(message) => f.debug_tuple("IssueError::Policy").field(message).finish(),
+            Self::Timeout(message) => f.debug_tuple("IssueError::Timeout").field(message).finish(),
+            Self::BodyLimit(message) => f
+                .debug_tuple("IssueError::BodyLimit")
+                .field(message)
+                .finish(),
+        }
+    }
 }
 
 impl std::fmt::Display for IssueError {
