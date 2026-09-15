@@ -112,6 +112,7 @@ pub(crate) fn parse_due_date_ms(s: &str) -> Option<i64> {
 /// Validate one provider-scoped issue id at an input or response boundary.
 /// This is syntax-only; account ownership remains THE-324.
 pub fn validate_issue_id(id: &str) -> Result<(), IssueError> {
+    identity::complete_identity(id).map_err(IssueError::Parse)?;
     if let Some(rest) = id.strip_prefix("plugin:") {
         let (plugin_id, key) = rest.split_once(':').ok_or_else(|| {
             IssueError::Parse("plugin issue id must use plugin:<namespace>:<key>".into())
@@ -183,6 +184,10 @@ pub fn validate_control_issue_id(id: &str) -> Result<(), IssueError> {
 }
 
 pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
+    if let Some(plugin_namespace) = issue.provider.strip_prefix("plugin:") {
+        identity::builtin_segment(plugin_namespace, "plugin namespace")
+            .map_err(IssueError::Parse)?;
+    }
     let expected = format!("{}:", issue.provider);
     if !issue.id.starts_with(&expected) {
         return Err(IssueError::Parse(
@@ -220,7 +225,11 @@ pub fn validate_issue_identity(issue: &Issue) -> Result<(), IssueError> {
         _ => return Err(IssueError::Parse("unknown issue provider namespace".into())),
     }
     for project in &issue.project_ids {
-        identity::builtin_identity(project).map_err(IssueError::Parse)?;
+        if issue.provider.starts_with("plugin:") {
+            identity::plugin_key(project).map_err(IssueError::Parse)?;
+        } else {
+            identity::builtin_identity(project).map_err(IssueError::Parse)?;
+        }
     }
     for blocked in &issue.blocked_by {
         validate_issue_id(blocked)?;
@@ -431,18 +440,26 @@ impl IssueRouter {
     /// A bare legacy id is accepted only when there is exactly one backend;
     /// namespaced ids never fall through to another provider.
     fn backend_for_id(&self, id: &str) -> Option<&dyn IssueBackend> {
-        let exact = self
+        let matches = |b: &&AccountBackend| {
+            id == b.inner.provider_id()
+                || id
+                    .strip_prefix(b.inner.provider_id())
+                    .is_some_and(|rest| rest.starts_with(':'))
+        };
+        let longest = self
             .inner
             .iter()
-            .filter(|b| {
-                id == b.inner.provider_id()
-                    || id
-                        .strip_prefix(b.inner.provider_id())
-                        .is_some_and(|rest| rest.starts_with(':'))
-            })
-            .max_by_key(|b| b.inner.provider_id().len());
-        if exact.is_some() {
-            return exact.map(|b| b.inner.as_ref());
+            .filter(matches)
+            .map(|b| b.inner.provider_id().len())
+            .max();
+        if let Some(longest) = longest {
+            // `find` deliberately preserves the established first-account
+            // behavior when equal-length provider namespaces are duplicated.
+            return self
+                .inner
+                .iter()
+                .find(|b| matches(b) && b.inner.provider_id().len() == longest)
+                .map(|b| b.inner.as_ref());
         }
         // Preserve the audited legacy bare-id compatibility only at the
         // unambiguous sole-backend boundary. A namespaced id never falls back.
@@ -812,11 +829,13 @@ mod spec {
         }
     }
 
-    struct PluginMarker;
+    struct PluginMarker {
+        id: &'static str,
+    }
 
     impl IssueBackend for PluginMarker {
         fn provider_id(&self) -> &'static str {
-            "plugin:demo"
+            self.id
         }
         fn caps(&self) -> IssueCaps {
             IssueCaps::default()
@@ -855,12 +874,24 @@ mod spec {
     #[test]
     fn plugin_namespace_routes_by_complete_registered_prefix() {
         let mut router = IssueRouter::from_config(&IssuesConfig::default());
-        router.push_backend("demo".into(), Box::new(PluginMarker));
+        router.push_backend("demo".into(), Box::new(PluginMarker { id: "plugin:demo" }));
+        router.push_backend(
+            "nested".into(),
+            Box::new(PluginMarker {
+                id: "plugin:demo:extra",
+            }),
+        );
         assert_eq!(
             router
                 .backend_for_id("plugin:demo:opaque/key#7")
                 .map(|b| b.provider_id()),
             Some("plugin:demo")
+        );
+        assert_eq!(
+            router
+                .backend_for_id("plugin:demo:extra:key")
+                .map(|b| b.provider_id()),
+            Some("plugin:demo:extra")
         );
         assert!(router.backend_for_id("plugin:other:opaque").is_none());
         assert!(validate_control_issue_id("plugin:demo:opaque/key#7").is_ok());
@@ -893,6 +924,41 @@ mod spec {
                 .is_err()
         );
         assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn duplicate_provider_ids_keep_the_first_account_for_mutations() {
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut router = IssueRouter::from_config(&IssuesConfig::default());
+        router.push_backend(
+            "first".into(),
+            Box::new(CountingBackend {
+                updates: first.clone(),
+            }),
+        );
+        router.push_backend(
+            "second".into(),
+            Box::new(CountingBackend {
+                updates: second.clone(),
+            }),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(router.update_issue("linear:ABC-9", &IssuePatch::default()));
+        assert!(result.is_err());
+        assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn plugin_identity_envelope_is_bounded_before_routing() {
+        let oversized = format!("plugin:demo:{}", "x".repeat(500));
+        assert!(validate_control_issue_id(&oversized).is_err());
+        let opaque = format!("plugin:demo:{}", "客户/任务#7");
+        assert!(validate_control_issue_id(&opaque).is_ok());
     }
 
     #[test]

@@ -141,14 +141,23 @@ fn issue_repo_number_from_url(
     }
     let host = parsed.host_str()?;
     let expected = configured_host.unwrap_or("github.com").trim();
-    if expected.is_empty() || expected.contains('/') || !host.eq_ignore_ascii_case(expected) {
+    if super::identity::github_host_for_url(expected).is_err()
+        || !host.eq_ignore_ascii_case(expected)
+    {
         return None;
     }
-    let parts: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = parsed.path_segments()?.collect();
     if parts.len() != 4 || !matches!(parts[2], "issues" | "pull") {
         return None;
     }
-    let repo = format!("{}/{}", parts[0], parts[1]);
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let repo = if configured_host.is_some() && !host.eq_ignore_ascii_case("github.com") {
+        format!("{host}/{}/{}", parts[0], parts[1])
+    } else {
+        format!("{}/{}", parts[0], parts[1])
+    };
     if super::identity::github_repo(&repo).is_err()
         || super::identity::github_number(parts[3]).is_err()
     {
@@ -489,8 +498,8 @@ mod tests {
             .as_deref(),
             Some("my-org/my.repo")
         );
-        // Enterprise / non-github.com host or malformed URL is not accepted by
-        // the default GitHub authority parser.
+        // A configured enterprise host is retained in the scoped repository
+        // identity so later `gh --repo` calls preserve the authority.
         assert_eq!(
             repo_from_url_with_host("https://example.com/o/r/issues/1", Some("github.com")),
             None
@@ -517,7 +526,11 @@ mod tests {
         );
         assert_eq!(
             repo_from_url_with_host("https://ghe.example/o/r/issues/1", Some("ghe.example")),
-            Some("o/r".into())
+            Some("ghe.example/o/r".into())
+        );
+        assert_eq!(
+            repo_from_url_with_host("https://ghe.example/o//r/issues/1", Some("ghe.example")),
+            None
         );
     }
 
@@ -526,6 +539,8 @@ mod tests {
         let mut backend = GitHubIssuesBackend::new(vec!["-R".into(), "o/r".into()]);
         assert!(backend.validate_extra_flags().is_ok());
         backend.extra_flags = vec!["--repo=o/r".into()];
+        assert!(backend.validate_extra_flags().is_ok());
+        backend.extra_flags = vec!["--repo".into(), "ghe.example/o/.github".into()];
         assert!(backend.validate_extra_flags().is_ok());
         backend.extra_flags = vec!["-R=../r".into()];
         assert!(backend.validate_extra_flags().is_err());

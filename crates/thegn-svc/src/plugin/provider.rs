@@ -198,13 +198,19 @@ pub struct PluginIssueBackend {
 impl PluginIssueBackend {
     /// `provider_id` is leaked once per plugin (a handful per process): the
     /// seam wants `&'static str` ids and plugins load once per config life.
-    pub fn new(bridge: Arc<ProviderBridge>, plugin_id: &str, caps: IssueCaps) -> Self {
+    pub fn new(
+        bridge: Arc<ProviderBridge>,
+        plugin_id: &str,
+        caps: IssueCaps,
+    ) -> Result<Self, IssueError> {
+        crate::issue::identity::builtin_segment(plugin_id, "plugin namespace")
+            .map_err(IssueError::Parse)?;
         let provider_id: &'static str = Box::leak(format!("plugin:{plugin_id}").into_boxed_str());
-        Self {
+        Ok(Self {
             bridge,
             caps,
             provider_id,
-        }
+        })
     }
 
     fn op<T: serde::de::DeserializeOwned>(
@@ -238,6 +244,7 @@ impl PluginIssueBackend {
                 "plugin issue provider does not match its bridge".into(),
             ));
         }
+        crate::issue::validate_issue_identity(&issue)?;
         Ok(issue)
     }
 
@@ -424,7 +431,8 @@ done
                 comments: true,
                 labels: false,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(backend.provider_id(), "plugin:demo");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -455,7 +463,8 @@ done
     #[test]
     fn omitted_caps_refuse_optional_ops_without_a_bridge_round_trip() {
         let (_fixture, _session, bridge) = live_bridge();
-        let backend = PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default());
+        let backend =
+            PluginIssueBackend::new(bridge.clone(), "legacy", IssueCaps::default()).unwrap();
         let before = bridge.next_id.load(std::sync::atomic::Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -470,6 +479,41 @@ done
             bridge.next_id.load(std::sync::atomic::Ordering::Relaxed),
             before
         );
+    }
+
+    #[test]
+    fn plugin_response_identity_must_match_namespace_and_opaque_fields() {
+        let (_fixture, _session, bridge) = live_bridge();
+        assert!(PluginIssueBackend::new(bridge.clone(), "bad/id", IssueCaps::default()).is_err());
+        let backend = PluginIssueBackend::new(bridge, "demo", IssueCaps::default()).unwrap();
+        let valid = thegn_core::issue::Issue {
+            id: "plugin:demo:opaque/key#7".into(),
+            number: "opaque/key#7".into(),
+            provider: "plugin:demo".into(),
+            project_ids: vec!["project / one".into()],
+            ..Default::default()
+        };
+        assert!(backend.validate_issue(valid).is_ok());
+
+        let mut wrong_provider = thegn_core::issue::Issue {
+            id: "plugin:other:7".into(),
+            number: "7".into(),
+            provider: "plugin:other".into(),
+            ..Default::default()
+        };
+        assert!(backend.validate_issue(wrong_provider.clone()).is_err());
+        wrong_provider.id = "plugin:demo:7".into();
+        wrong_provider.provider = "plugin:demo".into();
+        wrong_provider.project_ids = vec!["bad\nproject".into()];
+        assert!(backend.validate_issue(wrong_provider).is_err());
+
+        let malformed_namespace = thegn_core::issue::Issue {
+            id: "plugin:demo:extra:key".into(),
+            number: "key".into(),
+            provider: "plugin:demo:extra".into(),
+            ..Default::default()
+        };
+        assert!(crate::issue::validate_issue_identity(&malformed_namespace).is_err());
     }
 
     #[test]
