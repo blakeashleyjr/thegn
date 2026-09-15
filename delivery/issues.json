@@ -734,6 +734,13 @@
       "changes": [
         "stabilize-process-monitor-refresh"
       ]
+    },
+    {
+      "issue": "THE-639",
+      "project": "Runtime Security & Host Architecture",
+      "changes": [
+        "retain-devcontainer-startup-custody"
+      ]
     }
   ]
 }

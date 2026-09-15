@@ -1003,6 +1003,18 @@
       "summary": "Proxy restoration shipped; end-to-end failover, accounting, and gate evidence remain."
     },
     {
+      "change": "retain-devcontainer-startup-custody",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-639",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Bound devcontainer startup capture and retain unresolved ownership; halt uncertain OCI fallback and require actual native/custody validation before delivery."
+    },
+    {
       "change": "rework-shell-completions",
       "lifecycle": "active",
       "disposition": "residual-split",

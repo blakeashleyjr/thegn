@@ -203,6 +203,30 @@ pub struct SandboxOutcome {
     pub route_ssh_target: Option<SshTarget>,
 }
 
+/// Actual startup/publication/fallback decision used below, after the existing
+/// selection and trust gates. `Err` propagates before the OCI continuation;
+/// private startup fixtures exercise this seam without a live trust database.
+pub(crate) fn prepare_devcontainer(
+    inputs: crate::devcontainer_provider::startup::StartInputs<'_>,
+    worktree: &str,
+    warnings: &mut Vec<String>,
+) -> Result<bool, crate::devcontainer_provider::startup::StartFailure> {
+    use crate::devcontainer_provider::startup::{StartFailure, StartReason};
+    match crate::devcontainer_provider::DevcontainerSession::start(inputs)
+        .and_then(|pending| pending.publish(worktree))
+    {
+        Ok(()) => Ok(true),
+        Err(StartFailure::NotStarted(StartReason::ProbeUnavailable)) => Ok(false),
+        Err(error @ StartFailure::NotStarted(_)) => {
+            warnings.push(format!(
+                "devcontainer CLI could not start the container ({error}); using OCI fallback"
+            ));
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
 /// launch (container inspect/image pull/start can take seconds-to-minutes), so
 /// callers must keep it off the event loop. No DB access: `backend_choice` is
@@ -371,38 +395,29 @@ pub fn prepare_sandbox_env(
         && crate::devcontainer_provider::can_honor_sandbox(&sb)
         && let Some(dc) = &devcontainer
         && dc.provider_eligible
+        && prepare_devcontainer(
+            crate::devcontainer_provider::startup::StartInputs {
+                workspace: Path::new(worktree),
+                config_path: &dc.config_path,
+                digest: &dc.config_digest,
+                content: &dc.config_content,
+                env: &sb.passthrough_env(),
+            },
+            worktree,
+            &mut warnings,
+        )?
     {
-        let provider = crate::devcontainer_provider::provider();
-        if provider.probe().ready() {
-            match crate::devcontainer_provider::DevcontainerSession::start(
-                provider,
-                Path::new(worktree),
-                &dc.config_path,
-                &dc.config_digest,
-                &dc.config_content,
-                &sb.passthrough_env(),
-            ) {
-                Ok(session) => {
-                    crate::devcontainer_provider::publish_session(worktree, session);
-                    return Ok(SandboxOutcome {
-                        spec: None,
-                        backend_label: "devcontainer".to_string(),
-                        warnings,
-                        shell: env_shell,
-                        is_remote: false,
-                        cwd_override: None,
-                        location: None,
-                        degraded_from_provider: false,
-                        route_ssh_target: None,
-                    });
-                }
-                Err(error) => {
-                    warnings.push(format!(
-                            "devcontainer CLI could not start the container ({error}); using OCI fallback"
-                        ));
-                }
-            }
-        }
+        return Ok(SandboxOutcome {
+            spec: None,
+            backend_label: "devcontainer".to_string(),
+            warnings,
+            shell: env_shell,
+            is_remote: false,
+            cwd_override: None,
+            location: None,
+            degraded_from_provider: false,
+            route_ssh_target: None,
+        });
     }
     // Selection dropped: the user asked for a non-default env that isn't defined
     // under `[env.<name>]`, so `resolve_env` fell back to Local. The Provider/ssh
