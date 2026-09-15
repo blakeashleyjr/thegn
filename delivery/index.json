@@ -855,6 +855,18 @@
       "summary": "Separate exact drain diagnostic fields, preserve their UI projection and stop isolation-held retry loops; source review and focused/full/native verification remain pending."
     },
     {
+      "change": "preserve-winning-host-environment",
+      "lifecycle": "active",
+      "disposition": "verification-gated",
+      "owners": [
+        {
+          "issue": "THE-598",
+          "project": "Runtime Security & Host Architecture"
+        }
+      ],
+      "summary": "Winning-host environment synthesis is source-reviewed; native precedence/compatibility tests, old-body counterfactual and local-main delivery remain pending. Strict capture and checked launch composition are separate."
+    },
+    {
       "change": "repair-kitty-stream-parser",
       "lifecycle": "active",
       "disposition": "alpha-delivery",

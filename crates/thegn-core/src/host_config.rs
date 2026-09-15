@@ -260,16 +260,16 @@ fn ssh_placement(ssh: &EnvSshConfig) -> Option<SshPlacement> {
 /// catalog; the DB is the user's runtime additions).
 pub fn merge_host_defs(cfg: &mut Config, defs: &[(String, HostConfig)]) {
     for (name, hc) in defs {
-        if !cfg.host.contains_key(name) {
-            cfg.host.insert(name.clone(), hc.clone());
-        }
+        let effective = cfg.host.entry(name.clone()).or_insert_with(|| hc.clone());
         if cfg.env.contains_key(name) {
             continue;
         }
         // Synthesize the selectable env. iroh hosts get no pane transport yet
         // (provisioning works; interactive panes over iroh are a follow-up),
         // so they surface in the Hosts panel/CLI but not the env list.
-        let placement = match hc.reach {
+        // The selectable environment must use the same winning definition as
+        // the host catalog, including its connection settings.
+        let placement = match effective.reach {
             HostReach::Ssh => PlacementMode::Ssh,
             HostReach::Local => PlacementMode::Local,
             HostReach::Iroh | HostReach::Cloud => continue,
@@ -279,7 +279,7 @@ pub fn merge_host_defs(cfg: &mut Config, defs: &[(String, HostConfig)]) {
             EnvConfig {
                 placement,
                 host: name.clone(),
-                ssh: hc.ssh.clone(),
+                ssh: effective.ssh.clone(),
                 ..EnvConfig::default()
             },
         );
@@ -930,3 +930,7 @@ mod tests {
         assert_eq!(b.consent, InstallConsent::Never);
     }
 }
+
+#[cfg(test)]
+#[path = "host_config_merge_tests.rs"]
+mod merge_tests;
