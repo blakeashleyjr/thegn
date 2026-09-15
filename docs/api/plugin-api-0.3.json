@@ -16,30 +16,7 @@
       "type": "object"
     },
     "ApiVersion": {
-      "description": "Semantic version of the API contract itself.",
-      "properties": {
-        "major": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "minor": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "patch": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "major",
-        "minor",
-        "patch"
-      ],
-      "type": "object"
+      "type": "string"
     },
     "CadenceHint": {
       "oneOf": [
