@@ -627,23 +627,57 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_target_receives_no_request_or_credentials() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let source_hits = Arc::new(AtomicUsize::new(0));
         let target_hits = Arc::new(AtomicUsize::new(0));
-        let observed_hits = Arc::clone(&target_hits);
+        let authenticated_hits = Arc::new(AtomicUsize::new(0));
+        let observed_targets = Arc::clone(&target_hits);
+        let target_server = tokio::spawn(async move {
+            axum::serve(
+                target_listener,
+                Router::new().fallback(any(move || {
+                    observed_targets.fetch_add(1, Ordering::SeqCst);
+                    async { (StatusCode::OK, "unexpected redirect target") }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        let observed_sources = Arc::clone(&source_hits);
+        let observed_targets = Arc::clone(&target_hits);
+        let observed_auth = Arc::clone(&authenticated_hits);
         let server = tokio::spawn(async move {
             let app = Router::new().fallback(any(move |request: Request| {
-                let observed_hits = Arc::clone(&observed_hits);
+                let observed_sources = Arc::clone(&observed_sources);
+                let observed_targets = Arc::clone(&observed_targets);
+                let observed_auth = Arc::clone(&observed_auth);
                 async move {
-                    if request.uri().path() == "/target" {
-                        observed_hits.fetch_add(1, Ordering::SeqCst);
+                    observed_sources.fetch_add(1, Ordering::SeqCst);
+                    if request.headers().get(reqwest::header::AUTHORIZATION)
+                        == Some(&HeaderValue::from_static("Bearer redirect-secret"))
+                    {
+                        observed_auth.fetch_add(1, Ordering::SeqCst);
                     }
-                    let mut response = (StatusCode::FOUND, Body::empty()).into_response();
+                    if request.uri().path() == "/target" {
+                        observed_targets.fetch_add(1, Ordering::SeqCst);
+                        return (StatusCode::OK, "unexpected redirect target").into_response();
+                    }
+                    let mut parts = request.uri().path().trim_start_matches('/').split('/');
+                    let status =
+                        StatusCode::from_u16(parts.next().unwrap().parse().unwrap()).unwrap();
+                    let location = match parts.next().unwrap() {
+                        "same" => "/target".to_owned(),
+                        "cross" => format!("http://{target_address}/target"),
+                        "loop" => request.uri().path().to_owned(),
+                        _ => panic!("unexpected fixture redirect mode"),
+                    };
+                    let mut response = (status, Body::empty()).into_response();
                     response.headers_mut().insert(
                         reqwest::header::LOCATION,
-                        HeaderValue::from_static("/target"),
+                        HeaderValue::from_str(&location).unwrap(),
                     );
                     response
                 }
@@ -657,14 +691,39 @@ mod tests {
             Arc::new(TrackerHttpBudget::with_permits(1)),
         )
         .unwrap();
-        let mut operation = client.operation();
-        assert!(matches!(
-            operation.get::<serde_json::Value>("/redirect").await,
-            Err(IssueError::Policy("tracker redirect refused"))
-        ));
-        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+        let mut cases = 0;
+        for status in [301, 302, 307, 308] {
+            for destination in ["same", "cross", "loop"] {
+                for method in [Method::GET, Method::POST] {
+                    let path = format!("/{status}/{destination}");
+                    let mut operation = client.operation();
+                    let result = if method == Method::GET {
+                        operation.get::<serde_json::Value>(&path).await
+                    } else {
+                        operation
+                            .json::<_, serde_json::Value>(
+                                method.clone(),
+                                &path,
+                                &serde_json::json!({"mutation": "replay-sentinel"}),
+                            )
+                            .await
+                    };
+                    assert!(
+                        matches!(result, Err(IssueError::Policy("tracker redirect refused"))),
+                        "{status} {destination} {method}: {result:?}"
+                    );
+                    cases += 1;
+                    assert_eq!(source_hits.load(Ordering::SeqCst), cases);
+                    assert_eq!(authenticated_hits.load(Ordering::SeqCst), cases);
+                    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+        assert_eq!(cases, 24);
         server.abort();
+        target_server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
+        assert!(target_server.await.unwrap_err().is_cancelled());
     }
 
     struct CountingBody {
