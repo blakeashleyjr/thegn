@@ -417,12 +417,9 @@ fn parse_origin(raw: &str) -> Result<Url, IssueError> {
     {
         return Err(IssueError::Policy("tracker origin refused"));
     }
-    let path = origin.path().trim_end_matches('/').to_string();
-    origin.set_path(if path.is_empty() {
-        "/"
-    } else {
-        &format!("{path}/")
-    });
+    let mut path = origin.path().trim_end_matches('/').to_owned();
+    path.push('/');
+    origin.set_path(&path);
     Ok(origin)
 }
 

@@ -219,6 +219,7 @@ fn issue_repo_number_from_url(
     Some((repo, parts[3].to_string()))
 }
 
+#[cfg(test)]
 fn repo_from_url_with_host(url: &str, configured_host: Option<&str>) -> Option<String> {
     issue_repo_number_from_url(url, configured_host).map(|(repo, _)| repo)
 }
@@ -417,7 +418,7 @@ impl IssueBackend for GitHubIssuesBackend {
             ])?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(gh_issue_to_domain_with_host(gi, expected_host.as_deref())?)
+            gh_issue_to_domain_with_host(gi, expected_host.as_deref())
         })
     }
 
@@ -461,7 +462,7 @@ impl IssueBackend for GitHubIssuesBackend {
             let json = self.gh(&args)?;
             let gi: GhIssue =
                 serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-            Ok(gh_issue_to_domain_with_host(gi, expected_host.as_deref())?)
+            gh_issue_to_domain_with_host(gi, expected_host.as_deref())
         })
     }
 
