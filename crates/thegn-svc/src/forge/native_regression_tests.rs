@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thegn_core::seam::SeamError;
 
-fn client(status: u16, body: &str) -> octocrab::Octocrab {
+pub(super) fn client(status: u16, body: &str) -> octocrab::Octocrab {
     let body = body.to_owned();
     let service = tower::service_fn(move |_: axum::http::Request<octocrab::OctoBody>| {
         let body = body.clone();
@@ -25,7 +25,7 @@ fn client(status: u16, body: &str) -> octocrab::Octocrab {
         .unwrap()
 }
 
-fn runtime() -> tokio::runtime::Runtime {
+pub(super) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -257,9 +257,9 @@ fn strict_origin_identity_rejects_foreign_path_and_authority_confusion_before_to
     dir.close().expect("private origin fixture cleanup");
 }
 
-struct Layer {
-    result: Result<Vec<PrHeader>, ForgeError>,
-    calls: Arc<AtomicUsize>,
+pub(super) struct Layer {
+    pub(super) result: Result<Vec<PrHeader>, ForgeError>,
+    pub(super) calls: Arc<AtomicUsize>,
 }
 impl Probe for Layer {
     fn probe(&self) -> ProbeReport {

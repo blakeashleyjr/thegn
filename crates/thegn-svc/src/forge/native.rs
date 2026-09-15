@@ -838,3 +838,7 @@ mod tests {
 #[cfg(test)]
 #[path = "native_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(test)]
+#[path = "native_global_connectivity_tests.rs"]
+mod global_connectivity_tests;
