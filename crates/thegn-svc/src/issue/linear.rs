@@ -3,42 +3,51 @@
 //! Auth: `Authorization: <api_key>` (no "Bearer" prefix — Linear's convention).
 //! All queries are hand-rolled strings; no graphql_client codegen.
 
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thegn_core::issue::{
     Issue, IssueComment, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssuePriority,
     IssueStatus,
 };
 
+use super::http::{TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation};
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
 const LINEAR_API: &str = "https://api.linear.app/graphql";
 
 pub struct LinearBackend {
-    client: Client,
-    api_key: String,
+    http: Option<TrackerHttpClient>,
+    http_error: Option<&'static str>,
     team_id: Option<String>,
 }
 
 impl LinearBackend {
-    pub fn new(api_key: String, team_id: Option<String>) -> Self {
+    pub(crate) fn new(
+        api_key: String,
+        team_id: Option<String>,
+        budget: std::sync::Arc<TrackerHttpBudget>,
+    ) -> Self {
+        let (http, http_error) =
+            match TrackerHttpClient::new("linear", LINEAR_API, api_key.clone(), budget) {
+                Ok(http) => (Some(http), None),
+                Err(IssueError::Policy(message)) => (None, Some(message)),
+                Err(_) => (None, Some("tracker HTTP client configuration failed")),
+            };
         LinearBackend {
-            // Bounded timeouts: a stalled tracker must not pin a background
-            // permit forever (mirrors gh.rs's OCTOCRAB_REQUEST_TIMEOUT). Falls
-            // back to the default client if the builder somehow fails.
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
-            api_key,
+            http,
+            http_error,
             team_id,
         }
     }
 
+    fn http(&self) -> Result<&TrackerHttpClient, IssueError> {
+        self.http.as_ref().ok_or_else(|| {
+            IssueError::Policy(self.http_error.unwrap_or("tracker HTTP origin refused"))
+        })
+    }
+
     async fn gql<Q: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
+        op: &mut TrackerHttpOperation<'_>,
         query: &str,
         variables: Q,
     ) -> Result<R, IssueError> {
@@ -54,34 +63,21 @@ impl LinearBackend {
         }
         #[derive(Deserialize)]
         struct GqlError {
+            #[allow(dead_code)]
             message: String,
         }
 
-        let resp = self
-            .client
-            .post(LINEAR_API)
-            .header("Authorization", &self.api_key)
-            .header("Content-Type", "application/json")
-            .json(&Body { query, variables })
-            .send()
+        let gql: GqlResponse<R> = op
+            .json(
+                reqwest::Method::POST,
+                "/graphql",
+                &Body { query, variables },
+            )
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            // Reserve Auth for actual credential failures; 429/5xx/400 are
-            // transient/API errors, not a reason to rotate a valid key.
-            let msg = format!("HTTP {status} from Linear API");
-            return Err(if status == 401 || status == 403 {
-                IssueError::Auth(msg)
-            } else {
-                IssueError::Api(msg)
-            });
-        }
-        let gql: GqlResponse<R> = resp.json().await?;
         if let Some(errs) = gql.errors
             && !errs.is_empty()
         {
-            return Err(IssueError::Api(errs[0].message.clone()));
+            return Err(IssueError::Api("Linear GraphQL operation failed".into()));
         }
         gql.data
             .ok_or_else(|| IssueError::Parse("no data in response".into()))
@@ -442,7 +438,9 @@ impl IssueBackend for LinearBackend {
             let query = build_list_query(filter, self.team_id.as_deref());
             #[derive(Serialize)]
             struct Vars {}
-            let data: IssueNodes = self.gql(&query, Vars {}).await?;
+            let http = self.http()?;
+            let mut op = http.operation();
+            let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
             Ok(data
                 .issues
                 .nodes
@@ -459,7 +457,9 @@ impl IssueBackend for LinearBackend {
             let query = build_get_query(identifier);
             #[derive(Serialize)]
             struct Vars {}
-            let data: LinearIssueWithComments = self.gql(&query, Vars {}).await?;
+            let http = self.http()?;
+            let mut op = http.operation();
+            let data: LinearIssueWithComments = Self::gql(&mut op, &query, Vars {}).await?;
             let li = data.issue;
             let comments = li
                 .comments
@@ -488,31 +488,33 @@ impl IssueBackend for LinearBackend {
             // string-splicing it into the mutation: interpolation breaks on
             // multi-line/quoted/backslash bodies (GraphQL string literals can't hold
             // raw line terminators) and would let a crafted body inject fields.
-            let team_id = match (&self.team_id, &draft.project_id) {
-                (_, Some(pid)) => Some(pid.clone()),
-                (Some(tid), None) => Some(tid.clone()),
+            let team_id = match (&self.team_id, draft.project_id.as_deref()) {
+                (_, Some(pid)) => Some(pid),
+                (Some(tid), None) => Some(tid.as_str()),
                 (None, None) => None,
             };
             #[derive(Serialize)]
-            struct Vars {
-                title: String,
+            struct Vars<'a> {
+                title: &'a str,
                 priority: i64,
                 #[serde(skip_serializing_if = "Option::is_none")]
-                description: Option<String>,
+                description: Option<&'a str>,
                 #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
-                team_id: Option<String>,
+                team_id: Option<&'a str>,
             }
             // The selection comes from ISSUE_FIELDS — the hand-duplicated copy
             // that used to live here is how `assignees` survived the shared
             // constant (THE-72).
             let query = build_create_mutation();
             let vars = Vars {
-                title: draft.title.clone(),
+                title: &draft.title,
                 priority: priority_to_int(draft.priority),
-                description: draft.body.clone(),
+                description: draft.body.as_deref(),
                 team_id,
             };
-            let data: IssueCreateData = self.gql(&query, vars).await?;
+            let http = self.http()?;
+            let mut op = http.operation();
+            let data: IssueCreateData = Self::gql(&mut op, &query, vars).await?;
             data.issue_create
                 .issue
                 .map(linear_issue_to_domain)
@@ -529,6 +531,10 @@ impl IssueBackend for LinearBackend {
             // Escaped for the same reason as `build_get_query` — `issues.update`
             // is a control-API verb, so `id` is not necessarily a local user's.
             let identifier = escape_graphql_str(id.strip_prefix("linear:").unwrap_or(id));
+            let http = self.http()?;
+            let mut op = http.operation();
+            #[derive(Serialize)]
+            struct Vars {}
             let mut fields = Vec::new();
             if let Some(p) = patch.priority {
                 fields.push(format!("priority: {}", priority_to_int(p)));
@@ -562,9 +568,7 @@ impl IssueBackend for LinearBackend {
                 struct StateNode {
                     id: String,
                 }
-                #[derive(Serialize)]
-                struct Vars {}
-                let states: StatesData = self.gql(&state_query, Vars {}).await?;
+                let states: StatesData = Self::gql(&mut op, &state_query, Vars {}).await?;
                 if let Some(state_node) = states.workflow_states.nodes.first() {
                     fields.push(format!(r#"stateId: "{}""#, state_node.id));
                 }
@@ -572,7 +576,9 @@ impl IssueBackend for LinearBackend {
 
             if fields.is_empty() {
                 // Nothing to change — fetch and return the current state.
-                return self.get_issue(id).await.map(|d| d.issue);
+                let query = build_get_query(id.strip_prefix("linear:").unwrap_or(id));
+                let data: LinearIssueWithComments = Self::gql(&mut op, &query, Vars {}).await?;
+                return Ok(linear_issue_to_domain(data.issue.issue));
             }
 
             let fields_str = fields.join(", ");
@@ -583,9 +589,7 @@ impl IssueBackend for LinearBackend {
                 }}
             }}"#
             );
-            #[derive(Serialize)]
-            struct Vars {}
-            let data: IssueUpdateData = self.gql(&query, Vars {}).await?;
+            let data: IssueUpdateData = Self::gql(&mut op, &query, Vars {}).await?;
             data.issue_update
                 .issue
                 .map(linear_issue_to_domain)
@@ -602,7 +606,9 @@ impl IssueBackend for LinearBackend {
             let query = build_search_query(query_str, limit);
             #[derive(Serialize)]
             struct Vars {}
-            let data: IssueNodes = self.gql(&query, Vars {}).await?;
+            let http = self.http()?;
+            let mut op = http.operation();
+            let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
             Ok(data
                 .issues
                 .nodes
