@@ -595,6 +595,18 @@
       "delivered_at": "2026-09-15"
     },
     {
+      "change": "centralize-tracker-http-policy",
+      "lifecycle": "active",
+      "disposition": "alpha-delivery",
+      "owners": [
+        {
+          "issue": "THE-321",
+          "project": "Alpha Reliability & State Compatibility"
+        }
+      ],
+      "summary": "Centralize authenticated Linear, Jira, and Kaneo HTTP policy with shared operation budgets, origin pinning, bounded bodies, and redirect/encoding refusal."
+    },
+    {
       "change": "complete-devcontainer-support",
       "lifecycle": "active",
       "disposition": "verification-gated",

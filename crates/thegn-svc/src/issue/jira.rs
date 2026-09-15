@@ -4,116 +4,98 @@
 //! All requests target `/rest/api/3/…` endpoints.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thegn_core::issue::{
     Issue, IssueComment, IssueDetail, IssueDraft, IssueFilter, IssuePatch, IssuePriority,
     IssueStatus,
 };
 
+use super::http::{
+    TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation, ensure_dynamic_input,
+};
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
 pub struct JiraBackend {
-    client: Client,
-    base_url: String,
-    auth: String,
+    http: Option<TrackerHttpClient>,
+    http_error: Option<&'static str>,
     project_key: Option<String>,
 }
 
 impl JiraBackend {
-    pub fn new(
+    pub(crate) fn new(
         base_url: String,
         email: String,
         api_token: String,
         project_key: Option<String>,
+        budget: std::sync::Arc<TrackerHttpBudget>,
     ) -> Self {
         let creds = format!("{email}:{api_token}");
         let auth = format!("Basic {}", B64.encode(creds.as_bytes()));
+        let (http, http_error) = match TrackerHttpClient::new("jira", &base_url, auth, budget) {
+            Ok(http) => (Some(http), None),
+            Err(IssueError::Policy(message)) => (None, Some(message)),
+            Err(_) => (None, Some("tracker HTTP client configuration failed")),
+        };
         JiraBackend {
-            // Bounded timeouts: a stalled tracker must not pin a background
-            // permit forever (mirrors gh.rs's OCTOCRAB_REQUEST_TIMEOUT). Falls
-            // back to the default client if the builder somehow fails.
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            auth,
+            http,
+            http_error,
             project_key,
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!(
-            "{}/rest/api/3/{}",
-            self.base_url,
-            path.trim_start_matches('/')
-        )
+    fn http(&self) -> Result<&TrackerHttpClient, IssueError> {
+        self.http.as_ref().ok_or_else(|| {
+            IssueError::Policy(self.http_error.unwrap_or("tracker HTTP origin refused"))
+        })
     }
 
-    async fn get<R: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<R, IssueError> {
-        let resp = self
-            .client
-            .get(self.url(path))
-            .header("Authorization", &self.auth)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-        if resp.status() == 401 || resp.status() == 403 {
-            return Err(IssueError::Auth(format!("Jira HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            return Err(IssueError::Api(format!("Jira HTTP {}", resp.status())));
-        }
-        resp.json()
+    async fn get<R: for<'de> Deserialize<'de>>(
+        op: &mut TrackerHttpOperation<'_>,
+        path: &str,
+    ) -> Result<R, IssueError> {
+        op.get(&format!("/rest/api/3/{}", path.trim_start_matches('/')))
             .await
-            .map_err(|e| IssueError::Parse(e.to_string()))
     }
 
     async fn post<B: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
+        op: &mut TrackerHttpOperation<'_>,
         path: &str,
         body: &B,
     ) -> Result<R, IssueError> {
-        let resp = self
-            .client
-            .post(self.url(path))
-            .header("Authorization", &self.auth)
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await?;
-        if resp.status() == 401 || resp.status() == 403 {
-            return Err(IssueError::Auth(format!("Jira HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(IssueError::Api(format!("Jira POST {}: {txt}", path)));
-        }
-        resp.json()
-            .await
-            .map_err(|e| IssueError::Parse(e.to_string()))
+        op.json(
+            reqwest::Method::POST,
+            &format!("/rest/api/3/{}", path.trim_start_matches('/')),
+            body,
+        )
+        .await
     }
 
-    async fn put<B: Serialize>(&self, path: &str, body: &B) -> Result<(), IssueError> {
-        let resp = self
-            .client
-            .put(self.url(path))
-            .header("Authorization", &self.auth)
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await?;
-        if resp.status() == 401 || resp.status() == 403 {
-            return Err(IssueError::Auth(format!("Jira HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(IssueError::Api(format!("Jira PUT {}: {txt}", path)));
-        }
-        Ok(())
+    async fn put<B: Serialize>(
+        op: &mut TrackerHttpOperation<'_>,
+        path: &str,
+        body: &B,
+    ) -> Result<(), IssueError> {
+        op.json_empty(
+            reqwest::Method::PUT,
+            &format!("/rest/api/3/{}", path.trim_start_matches('/')),
+            body,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn post_empty<B: Serialize>(
+        op: &mut TrackerHttpOperation<'_>,
+        path: &str,
+        body: &B,
+    ) -> Result<(), IssueError> {
+        op.json_empty(
+            reqwest::Method::POST,
+            &format!("/rest/api/3/{}", path.trim_start_matches('/')),
+            body,
+        )
+        .await
     }
 }
 
@@ -322,6 +304,15 @@ impl IssueBackend for JiraBackend {
         filter: &'a IssueFilter,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
+            if let Some(project_key) = self.project_key.as_deref() {
+                ensure_dynamic_input(project_key)?;
+            }
+            if let Some(query) = filter.query.as_deref() {
+                ensure_dynamic_input(query)?;
+            }
             let mut jql_parts = Vec::new();
 
             if filter.assignee_me {
@@ -354,7 +345,7 @@ impl IssueBackend for JiraBackend {
                 "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
                 urlencoding_simple(&jql)
             );
-            let result: SearchResult = self.get(&path).await?;
+            let result: SearchResult = Self::get(&mut op, &path).await?;
             Ok(result
                 .issues
                 .into_iter()
@@ -365,10 +356,13 @@ impl IssueBackend for JiraBackend {
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
-            let ji: JiraIssue = self
-                .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
-                .await?;
+            ensure_dynamic_input(key)?;
+            let ji: JiraIssue =
+                Self::get(&mut op, &format!("issue/{key}?fields={JIRA_FIELDS}")).await?;
             let comments = ji
                 .fields
                 .comment
@@ -398,14 +392,21 @@ impl IssueBackend for JiraBackend {
         draft: &'a IssueDraft,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let project_key = self
                 .project_key
                 .as_deref()
                 .or(draft.project_id.as_deref())
                 .ok_or_else(|| {
                     IssueError::Api("Jira create requires a project key in config".into())
-                })?
-                .to_string();
+                })?;
+            ensure_dynamic_input(project_key)?;
+            ensure_dynamic_input(&draft.title)?;
+            if let Some(body) = draft.body.as_deref() {
+                ensure_dynamic_input(body)?;
+            }
 
             let priority_name = match draft.priority {
                 IssuePriority::Urgent => "Highest",
@@ -416,20 +417,39 @@ impl IssueBackend for JiraBackend {
             };
 
             #[derive(Serialize)]
-            struct CreateBody {
-                fields: CreateFields,
+            struct CreateBody<'a> {
+                fields: CreateFields<'a>,
             }
             #[derive(Serialize)]
-            struct CreateFields {
-                project: ProjectKey,
-                summary: String,
-                description: Option<serde_json::Value>,
+            struct CreateFields<'a> {
+                project: ProjectKey<'a>,
+                summary: &'a str,
+                description: Option<Description<'a>>,
                 issuetype: IssueType,
                 priority: PriorityName,
             }
             #[derive(Serialize)]
-            struct ProjectKey {
-                key: String,
+            struct ProjectKey<'a> {
+                key: &'a str,
+            }
+            #[derive(Serialize)]
+            struct Description<'a> {
+                #[serde(rename = "type")]
+                kind: &'static str,
+                version: u8,
+                content: [DescriptionBlock<'a>; 1],
+            }
+            #[derive(Serialize)]
+            struct DescriptionBlock<'a> {
+                #[serde(rename = "type")]
+                kind: &'static str,
+                content: [DescriptionText<'a>; 1],
+            }
+            #[derive(Serialize)]
+            struct DescriptionText<'a> {
+                #[serde(rename = "type")]
+                kind: &'static str,
+                text: &'a str,
             }
             #[derive(Serialize)]
             struct IssueType {
@@ -447,16 +467,17 @@ impl IssueBackend for JiraBackend {
             let body = CreateBody {
                 fields: CreateFields {
                     project: ProjectKey { key: project_key },
-                    summary: draft.title.clone(),
-                    description: draft.body.as_ref().map(|b| {
-                        serde_json::json!({
-                            "type": "doc",
-                            "version": 1,
-                            "content": [{
-                                "type": "paragraph",
-                                "content": [{ "type": "text", "text": b }]
-                            }]
-                        })
+                    summary: &draft.title,
+                    description: draft.body.as_deref().map(|body| Description {
+                        kind: "doc",
+                        version: 1,
+                        content: [DescriptionBlock {
+                            kind: "paragraph",
+                            content: [DescriptionText {
+                                kind: "text",
+                                text: body,
+                            }],
+                        }],
                     }),
                     issuetype: IssueType { name: "Task" },
                     priority: PriorityName {
@@ -465,10 +486,12 @@ impl IssueBackend for JiraBackend {
                 },
             };
 
-            let created: CreateResponse = self.post("issue", &body).await?;
-            let ji: JiraIssue = self
-                .get(&format!("issue/{}?fields={JIRA_FIELDS}", created.key))
-                .await?;
+            let created: CreateResponse = Self::post(&mut op, "issue", &body).await?;
+            let ji: JiraIssue = Self::get(
+                &mut op,
+                &format!("issue/{}?fields={JIRA_FIELDS}", created.key),
+            )
+            .await?;
             Ok(jira_issue_to_domain(ji))
         })
     }
@@ -479,12 +502,19 @@ impl IssueBackend for JiraBackend {
         patch: &'a IssuePatch,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
+            ensure_dynamic_input(key)?;
+            if let Some(title) = patch.title.as_deref() {
+                ensure_dynamic_input(title)?;
+            }
 
             // Status update via transitions.
             if let Some(status) = patch.status {
                 let transitions: JiraTransitions =
-                    self.get(&format!("issue/{key}/transitions")).await?;
+                    Self::get(&mut op, &format!("issue/{key}/transitions")).await?;
                 let target_cat = match status {
                     IssueStatus::Backlog | IssueStatus::Todo => "new",
                     IssueStatus::InProgress => "indeterminate",
@@ -499,11 +529,7 @@ impl IssueBackend for JiraBackend {
                             .map(|c| c.key == target_cat)
                             .unwrap_or(false)
                     })
-                    .ok_or_else(|| {
-                        IssueError::Api(format!(
-                            "no transition to '{target_cat}' state available for {key}"
-                        ))
-                    })?;
+                    .ok_or_else(|| IssueError::Api("Jira transition target unavailable".into()))?;
 
                 #[derive(Serialize)]
                 struct TransitionBody {
@@ -513,17 +539,16 @@ impl IssueBackend for JiraBackend {
                 struct TransitionId {
                     id: String,
                 }
-                let _: serde_json::Value = self
-                    .post(
-                        &format!("issue/{key}/transitions"),
-                        &TransitionBody {
-                            transition: TransitionId {
-                                id: trans.id.clone(),
-                            },
+                Self::post_empty(
+                    &mut op,
+                    &format!("issue/{key}/transitions"),
+                    &TransitionBody {
+                        transition: TransitionId {
+                            id: trans.id.clone(),
                         },
-                    )
-                    .await
-                    .unwrap_or(serde_json::Value::Null);
+                    },
+                )
+                .await?;
             }
 
             // Title / summary update.
@@ -536,7 +561,8 @@ impl IssueBackend for JiraBackend {
                 struct UpdateFields {
                     summary: String,
                 }
-                self.put(
+                Self::put(
+                    &mut op,
                     &format!("issue/{key}"),
                     &UpdateBody {
                         fields: UpdateFields {
@@ -547,9 +573,8 @@ impl IssueBackend for JiraBackend {
                 .await?;
             }
 
-            let ji: JiraIssue = self
-                .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
-                .await?;
+            let ji: JiraIssue =
+                Self::get(&mut op, &format!("issue/{key}?fields={JIRA_FIELDS}")).await?;
             Ok(jira_issue_to_domain(ji))
         })
     }
@@ -560,6 +585,10 @@ impl IssueBackend for JiraBackend {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
+            ensure_dynamic_input(query_str)?;
             // Escape JQL string-literal metachars first, then percent-encode the
             // whole `text ~ "…"` clause so quotes/backslashes in the query neither
             // break the JQL nor the query string.
@@ -572,7 +601,7 @@ impl IssueBackend for JiraBackend {
                 "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
                 urlencoding_simple(&jql)
             );
-            let result: SearchResult = self.get(&path).await?;
+            let result: SearchResult = Self::get(&mut op, &path).await?;
             Ok(result
                 .issues
                 .into_iter()
@@ -812,5 +841,17 @@ mod tests {
         assert!(issue.assignees.is_empty());
         assert_eq!(issue.updated_at_ms, 0);
         assert_eq!(issue.url, "https://h.example/browse/X-1");
+    }
+
+    #[test]
+    fn constructor_admits_self_hosted_base_path() {
+        let backend = JiraBackend::new(
+            "http://jira.lan:8080/company/jira".into(),
+            "user@example.test".into(),
+            "jira-test-token".into(),
+            Some("PROJ".into()),
+            std::sync::Arc::new(TrackerHttpBudget::with_permits(1)),
+        );
+        assert!(backend.http().is_ok());
     }
 }
