@@ -1004,7 +1004,7 @@
     },
     {
       "change": "retain-devcontainer-startup-custody",
-      "lifecycle": "active",
+      "lifecycle": "delivered-awaiting-archive",
       "disposition": "alpha-delivery",
       "owners": [
         {
@@ -1012,7 +1012,8 @@
           "project": "Runtime Security & Host Architecture"
         }
       ],
-      "summary": "Bound devcontainer startup capture and retain unresolved ownership; halt uncertain OCI fallback and require actual native/custody validation before delivery."
+      "summary": "Reviewed bounded startup capture and retained child/session custody landed locally at491320b7; all23 exact positive selectors and three intended counterfactual failures verified, strict lint/source gates passed. Controller-lifetime and platform limits remain explicit in the audit.",
+      "delivered_at": "2026-09-15"
     },
     {
       "change": "rework-shell-completions",
