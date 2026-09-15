@@ -1483,6 +1483,7 @@ async fn malformed_issue_identity_reaches_no_control_api_operation() {
     for encoded in [
         "linear%3Abad%20key",
         "github%3Ao%2Fr%230",
+        "github%3A--help%2Frepo%231",
         "plugin%3Ademo%3Abad%00key",
         "%FF",
     ] {
