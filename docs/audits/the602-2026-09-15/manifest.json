@@ -113,11 +113,11 @@
     "effective_rule_visits": 4096,
     "automation_work_bytes": 16777216
   },
-  "status": "gates_complete_landing_pending",
+  "status": "reviewed_local_main_landing_complete",
   "limitations": [
     "No new native build was run for this candidate; exact source identity binds the existing 8465-test receipt.",
     "THE-592 adapter/launch authority, THE-603, THE-604, and runtime containment remain separate.",
-    "No issue closure or Linear mutation asserted."
+    "Linear closure follows final delivery metadata receipt."
   ],
   "canonical640_metadata_merge": "090fba7fb680cda8494a45b7b432dca26e98a62e",
   "canonical640_parent": "475bccb1ac39fffdd97eaea8bef4ce51eec67b69",
@@ -175,5 +175,6 @@
       "sha256": "f68967339c68cd2129b4efcd28ff2ac8e8c6c4146daa2cab45a8cad48fe3456f"
     }
   ],
-  "strict_lint_scope": "Existing corrected combined05 workspace/alltargets Clippy passed; all15affectedRust/pins identicalto tested33c; nonewcompile"
+  "strict_lint_scope": "Existing corrected combined05 workspace/alltargets Clippy passed; all15affectedRust/pins identicalto tested33c; nonewcompile",
+  "source_landing": "a0f9730892931ce56c7c22aac18c0bfd390b892a"
 }
