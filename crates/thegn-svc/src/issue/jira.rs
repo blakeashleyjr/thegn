@@ -10,7 +10,9 @@ use thegn_core::issue::{
     IssueStatus,
 };
 
-use super::http::{TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation};
+use super::http::{
+    TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation, ensure_dynamic_input,
+};
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
@@ -304,6 +306,13 @@ impl IssueBackend for JiraBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            if let Some(project_key) = self.project_key.as_deref() {
+                ensure_dynamic_input(project_key)?;
+            }
+            if let Some(query) = filter.query.as_deref() {
+                ensure_dynamic_input(query)?;
+            }
             let mut jql_parts = Vec::new();
 
             if filter.assignee_me {
@@ -349,7 +358,9 @@ impl IssueBackend for JiraBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
+            ensure_dynamic_input(key)?;
             let ji: JiraIssue =
                 Self::get(&mut op, &format!("issue/{key}?fields={JIRA_FIELDS}")).await?;
             let comments = ji
@@ -383,6 +394,7 @@ impl IssueBackend for JiraBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let project_key = self
                 .project_key
                 .as_deref()
@@ -390,6 +402,11 @@ impl IssueBackend for JiraBackend {
                 .ok_or_else(|| {
                     IssueError::Api("Jira create requires a project key in config".into())
                 })?;
+            ensure_dynamic_input(project_key)?;
+            ensure_dynamic_input(&draft.title)?;
+            if let Some(body) = draft.body.as_deref() {
+                ensure_dynamic_input(body)?;
+            }
 
             let priority_name = match draft.priority {
                 IssuePriority::Urgent => "Highest",
@@ -487,7 +504,12 @@ impl IssueBackend for JiraBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let key = id.strip_prefix("jira:").unwrap_or(id);
+            ensure_dynamic_input(key)?;
+            if let Some(title) = patch.title.as_deref() {
+                ensure_dynamic_input(title)?;
+            }
 
             // Status update via transitions.
             if let Some(status) = patch.status {
@@ -565,6 +587,8 @@ impl IssueBackend for JiraBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            ensure_dynamic_input(query_str)?;
             // Escape JQL string-literal metachars first, then percent-encode the
             // whole `text ~ "…"` clause so quotes/backslashes in the query neither
             // break the JQL nor the query string.
@@ -817,5 +841,17 @@ mod tests {
         assert!(issue.assignees.is_empty());
         assert_eq!(issue.updated_at_ms, 0);
         assert_eq!(issue.url, "https://h.example/browse/X-1");
+    }
+
+    #[test]
+    fn constructor_admits_self_hosted_base_path() {
+        let backend = JiraBackend::new(
+            "http://jira.lan:8080/company/jira".into(),
+            "user@example.test".into(),
+            "jira-test-token".into(),
+            Some("PROJ".into()),
+            std::sync::Arc::new(TrackerHttpBudget::with_permits(1)),
+        );
+        assert!(backend.http().is_ok());
     }
 }

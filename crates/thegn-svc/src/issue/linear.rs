@@ -9,11 +9,13 @@ use thegn_core::issue::{
     IssueStatus,
 };
 
-use super::http::{TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation};
+use super::http::{
+    TrackerHttpBudget, TrackerHttpClient, TrackerHttpOperation, ensure_dynamic_input,
+};
 use super::{IssueBackend, IssueError};
 use futures_util::future::BoxFuture;
 
-const LINEAR_API: &str = "https://api.linear.app/graphql";
+const LINEAR_API: &str = "https://api.linear.app";
 
 pub struct LinearBackend {
     http: Option<TrackerHttpClient>,
@@ -435,11 +437,15 @@ impl IssueBackend for LinearBackend {
         filter: &'a IssueFilter,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
-            let query = build_list_query(filter, self.team_id.as_deref());
             #[derive(Serialize)]
             struct Vars {}
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            if let Some(team_id) = self.team_id.as_deref() {
+                ensure_dynamic_input(team_id)?;
+            }
+            let query = build_list_query(filter, self.team_id.as_deref());
             let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
             Ok(data
                 .issues
@@ -454,11 +460,13 @@ impl IssueBackend for LinearBackend {
         Box::pin(async move {
             // id is in "linear:ABC-123" form; the raw Linear id is the identifier.
             let identifier = id.strip_prefix("linear:").unwrap_or(id);
-            let query = build_get_query(identifier);
             #[derive(Serialize)]
             struct Vars {}
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            ensure_dynamic_input(identifier)?;
+            let query = build_get_query(identifier);
             let data: LinearIssueWithComments = Self::gql(&mut op, &query, Vars {}).await?;
             let li = data.issue;
             let comments = li
@@ -505,7 +513,6 @@ impl IssueBackend for LinearBackend {
             // The selection comes from ISSUE_FIELDS — the hand-duplicated copy
             // that used to live here is how `assignees` survived the shared
             // constant (THE-72).
-            let query = build_create_mutation();
             let vars = Vars {
                 title: &draft.title,
                 priority: priority_to_int(draft.priority),
@@ -514,6 +521,8 @@ impl IssueBackend for LinearBackend {
             };
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            let query = build_create_mutation();
             let data: IssueCreateData = Self::gql(&mut op, &query, vars).await?;
             data.issue_create
                 .issue
@@ -530,9 +539,14 @@ impl IssueBackend for LinearBackend {
         Box::pin(async move {
             // Escaped for the same reason as `build_get_query` — `issues.update`
             // is a control-API verb, so `id` is not necessarily a local user's.
-            let identifier = escape_graphql_str(id.strip_prefix("linear:").unwrap_or(id));
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            ensure_dynamic_input(id.strip_prefix("linear:").unwrap_or(id))?;
+            if let Some(title) = patch.title.as_deref() {
+                ensure_dynamic_input(title)?;
+            }
+            let identifier = escape_graphql_str(id.strip_prefix("linear:").unwrap_or(id));
             #[derive(Serialize)]
             struct Vars {}
             let mut fields = Vec::new();
@@ -603,11 +617,13 @@ impl IssueBackend for LinearBackend {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
-            let query = build_search_query(query_str, limit);
             #[derive(Serialize)]
             struct Vars {}
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
+            ensure_dynamic_input(query_str)?;
+            let query = build_search_query(query_str, limit);
             let data: IssueNodes = Self::gql(&mut op, &query, Vars {}).await?;
             Ok(data
                 .issues
@@ -739,6 +755,16 @@ mod tests {
         assert!(issue.labels.is_empty());
         assert_eq!(issue.branch_hint, None);
         assert_eq!(issue.updated_at_ms, 0);
+    }
+
+    #[test]
+    fn constructor_admits_official_linear_endpoint() {
+        let backend = LinearBackend::new(
+            "linear-test-key".into(),
+            None,
+            std::sync::Arc::new(TrackerHttpBudget::with_permits(1)),
+        );
+        assert!(backend.http().is_ok());
     }
 }
 

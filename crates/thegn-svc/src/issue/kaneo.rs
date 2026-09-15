@@ -396,6 +396,7 @@ impl KaneoBackend {
     pub async fn list_projects(&self) -> Result<Vec<KaneoProjectInfo>, IssueError> {
         let http = self.http()?;
         let mut op = http.operation();
+        op.prepare().await?;
         let ws = self.require_workspace()?;
         let projects: Vec<KaneoProject> =
             Self::get(&mut op, &format!("project?workspaceId={ws}")).await?;
@@ -413,6 +414,7 @@ impl KaneoBackend {
     pub async fn board(&self, project_id: &str) -> Result<Vec<KaneoColumnInfo>, IssueError> {
         let http = self.http()?;
         let mut op = http.operation();
+        op.prepare().await?;
         let board: BoardResp =
             Self::get(&mut op, &format!("task/tasks/{project_id}?limit=100")).await?;
         let ws = board.data.workspace_id.clone();
@@ -446,6 +448,7 @@ impl KaneoBackend {
     ) -> Result<(), IssueError> {
         let http = self.http()?;
         let mut op = http.operation();
+        op.prepare().await?;
         let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
         let mut body = serde_json::json!({ "destinationProjectId": dest_project });
         if let Some(s) = dest_status {
@@ -487,6 +490,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             self.list_issues_with_op(&mut op, filter).await
         })
     }
@@ -534,6 +538,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             let task: KaneoTask = Self::get(&mut op, &format!("task/{task_id}")).await?;
             // A bare task fetch has no column `isFinal` context; map from the slug.
@@ -561,6 +566,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let project_id = draft
                 .project_id
                 .clone()
@@ -616,6 +622,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
 
             if let Some(title) = &patch.title {
@@ -689,6 +696,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             // Kaneo has no workspace-wide text search over REST that we rely on, so
             // list within scope and filter titles client-side.
             let filter = IssueFilter {
@@ -711,6 +719,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             #[derive(Serialize)]
             struct CommentBody<'a> {
@@ -735,6 +744,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             let ws = self.require_workspace()?;
             // Reuse an existing workspace label of the same name; otherwise create
@@ -776,6 +786,7 @@ impl IssueBackend for KaneoBackend {
         Box::pin(async move {
             let http = self.http()?;
             let mut op = http.operation();
+            op.prepare().await?;
             let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             let on_task: Vec<KaneoLabelRow> = Self::get(&mut op, &format!("label/task/{task_id}"))
                 .await
