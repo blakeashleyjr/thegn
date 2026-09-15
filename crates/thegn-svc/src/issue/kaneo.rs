@@ -557,36 +557,7 @@ impl KaneoBackend {
     }
 }
 
-impl IssueBackend for KaneoBackend {
-    fn provider_id(&self) -> &'static str {
-        "kaneo"
-    }
-
-    fn caps(&self) -> super::IssueCaps {
-        super::IssueCaps {
-            comments: true,
-            labels: true,
-        }
-    }
-
-    /// The router downcasts through this for Kaneo-shaped board/project
-    /// browsing (columns per project), which is not provider-agnostic.
-    fn as_kaneo(&self) -> Option<&KaneoBackend> {
-        Some(self)
-    }
-
-    fn list_issues<'a>(
-        &'a self,
-        filter: &'a IssueFilter,
-    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
-        Box::pin(async move {
-            let http = self.http()?;
-            let mut op = http.operation();
-            op.prepare().await?;
-            self.list_issues_with_op(&mut op, filter).await
-        })
-    }
-
+impl KaneoBackend {
     async fn list_issues_with_op(
         &self,
         op: &mut TrackerHttpOperation<'_>,
@@ -625,6 +596,37 @@ impl IssueBackend for KaneoBackend {
             all.truncate(filter.limit);
         }
         Ok(all)
+    }
+}
+
+impl IssueBackend for KaneoBackend {
+    fn provider_id(&self) -> &'static str {
+        "kaneo"
+    }
+
+    fn caps(&self) -> super::IssueCaps {
+        super::IssueCaps {
+            comments: true,
+            labels: true,
+        }
+    }
+
+    /// The router downcasts through this for Kaneo-shaped board/project
+    /// browsing (columns per project), which is not provider-agnostic.
+    fn as_kaneo(&self) -> Option<&KaneoBackend> {
+        Some(self)
+    }
+
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let http = self.http()?;
+            let mut op = http.operation();
+            op.prepare().await?;
+            self.list_issues_with_op(&mut op, filter).await
+        })
     }
 
     fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
@@ -1046,7 +1048,11 @@ mod tests {
         );
         // Exercise the actual Kaneo producer output at the router/cache
         // identity boundary; task links legitimately carry `?task=`.
-        assert!(crate::validate_issue_identity(a).is_ok(), "url: {}", a.url);
+        assert!(
+            crate::issue::validate_issue_identity(a).is_ok(),
+            "url: {}",
+            a.url
+        );
         // The final column maps to Done regardless of name.
         assert_eq!(issues[1].status, IssueStatus::Done);
     }
