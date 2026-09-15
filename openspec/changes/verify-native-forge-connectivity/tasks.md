@@ -8,4 +8,4 @@
 - [x] Run the new parent under parallel libtest, existing SDK/ladder controls and affected THE-611 static integration fixtures; verify exact source/binary provenance.
 - [x] Run the scoped global-success-publication counterfactual and inspect the intended global-state assertion failure.
 - [x] Pass affected strict lint, source/specification/delivery gates.
-- [ ] Complete reviewed local-main landing.
+- [x] Complete reviewed local-main landing.
