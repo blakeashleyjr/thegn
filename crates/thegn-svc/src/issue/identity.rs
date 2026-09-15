@@ -11,6 +11,21 @@ const PLUGIN_NATIVE_MAX: usize = 384;
 const CONTROL_ENVELOPE_MAX: usize = 512;
 const GITHUB_COMPONENT_MAX: usize = 100;
 
+pub(crate) fn complete_identity(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("control issue identity must not be empty".into());
+    }
+    if value.len() > CONTROL_ENVELOPE_MAX {
+        return Err(format!(
+            "control issue identity exceeds {CONTROL_ENVELOPE_MAX} bytes"
+        ));
+    }
+    if value.chars().any(|c| c.is_control() || c == '\0') {
+        return Err("control issue identity contains a control character".into());
+    }
+    Ok(())
+}
+
 fn bounded(value: &str, max: usize, label: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
@@ -64,7 +79,18 @@ pub(crate) fn builtin_identity<'a>(value: &'a str) -> Result<&'a str, String> {
 /// controls, while provider-specific path restrictions remain the plugin's
 /// responsibility.  The control transport encodes the complete envelope once.
 pub(crate) fn plugin_key<'a>(value: &'a str) -> Result<&'a str, String> {
-    bounded(value, PLUGIN_NATIVE_MAX, "plugin issue key").map(|_| value)
+    if value.is_empty() {
+        return Err("plugin issue key must not be empty".into());
+    }
+    if value.len() > PLUGIN_NATIVE_MAX {
+        return Err(format!(
+            "plugin issue key exceeds {PLUGIN_NATIVE_MAX} bytes"
+        ));
+    }
+    if value.chars().any(|c| c.is_control() || c == '\0') {
+        return Err("plugin issue key contains a control character".into());
+    }
+    Ok(value)
 }
 
 pub(crate) fn github_number<'a>(number: &'a str) -> Result<&'a str, String> {
@@ -83,21 +109,41 @@ pub(crate) fn github_number<'a>(number: &'a str) -> Result<&'a str, String> {
 
 pub(crate) fn github_repo<'a>(repo: &'a str) -> Result<&'a str, String> {
     bounded(repo, BUILTIN_ID_MAX, "GitHub repository")?;
-    let mut parts = repo.split('/');
-    let owner = parts.next().ok_or("GitHub repository needs owner/repo")?;
-    let name = parts.next().ok_or("GitHub repository needs owner/repo")?;
-    if parts.next().is_some() || owner.is_empty() || name.is_empty() {
-        return Err("GitHub repository must be exactly owner/repo".into());
+    let parts: Vec<&str> = repo.split('/').collect();
+    let (host, owner, name) = match parts.as_slice() {
+        [owner, name] => (None, *owner, *name),
+        [host, owner, name] => (Some(*host), *owner, *name),
+        _ => return Err("GitHub repository must be owner/repo or HOST/owner/repo".into()),
+    };
+    if let Some(host) = host {
+        github_host_for_url(host)?;
     }
     github_component(owner, "GitHub owner")?;
     github_component(name, "GitHub repository name")?;
     Ok(repo)
 }
 
+pub(crate) fn github_host_for_url<'a>(value: &'a str) -> Result<&'a str, String> {
+    bounded(value, GITHUB_COMPONENT_MAX, "GitHub host")?;
+    let bytes = value.as_bytes();
+    if !bytes.first().is_some_and(|b| b.is_ascii_alphanumeric())
+        || !bytes.last().is_some_and(|b| b.is_ascii_alphanumeric())
+        || value.contains("..")
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-'))
+    {
+        return Err("GitHub host must use bounded ASCII hostname grammar".into());
+    }
+    Ok(value)
+}
+
 fn github_component<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
     bounded(value, GITHUB_COMPONENT_MAX, label)?;
     let mut bytes = value.bytes();
-    if !bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+    if !bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
         || !bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
         || matches!(value, "." | "..")
     {
@@ -145,7 +191,7 @@ pub(crate) fn kaneo_id<'a>(id: &'a str, label: &str) -> Result<&'a str, String> 
 /// Percent encode a complete control identity as one path segment.  Callers
 /// must not split or decode this value before the server's single path decode.
 pub(crate) fn encode_control_segment(value: &str) -> Result<String, String> {
-    bounded(value, CONTROL_ENVELOPE_MAX, "control issue identity")?;
+    complete_identity(value)?;
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
@@ -178,8 +224,12 @@ mod tests {
     #[test]
     fn builtin_grammar_keeps_ascii_repository_and_jira_rules_bounded() {
         assert!(github_repo("owner/repo-name_1.2").is_ok());
+        assert!(github_repo("ghe.example/owner/repo").is_ok());
+        assert!(github_repo("owner/.github").is_ok());
         assert!(github_repo("owner/repo name").is_err());
         assert!(github_repo("../repo").is_err());
+        assert!(github_host_for_url("ghe.example").is_ok());
+        assert!(github_host_for_url(".ghe.example").is_err());
         assert!(jira_project("PROJ_2").is_ok());
         assert!(jira_project("2PROJ").is_err());
     }
@@ -187,8 +237,18 @@ mod tests {
     #[test]
     fn plugin_keys_keep_opaque_utf8_but_reject_controls() {
         assert!(plugin_key("客户/任务#7").is_ok());
+        assert!(plugin_key("opaque key\tless").is_err());
+        assert!(plugin_key("opaque key with spaces").is_ok());
         assert!(plugin_key("bad\nkey").is_err());
         assert!(encode_control_segment("plugin:demo/客户#7").is_ok());
+    }
+
+    #[test]
+    fn complete_control_identity_bounds_the_whole_envelope() {
+        assert!(complete_identity(&"x".repeat(CONTROL_ENVELOPE_MAX)).is_ok());
+        assert!(complete_identity(&"x".repeat(CONTROL_ENVELOPE_MAX + 1)).is_err());
+        assert!(complete_identity("plugin:demo:").is_ok());
+        assert!(complete_identity("plugin:demo:\0").is_err());
     }
 
     #[test]

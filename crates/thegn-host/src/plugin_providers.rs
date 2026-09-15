@@ -32,12 +32,18 @@ pub(crate) fn set_issue_providers(rows: Vec<Row>) {
 pub(crate) fn issue_backends() -> Vec<(String, Box<dyn IssueBackend>)> {
     let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     reg.iter()
-        .map(|(plugin, account, bridge, caps)| {
-            (
+        .filter_map(|(plugin, account, bridge, caps)| {
+            let backend = match PluginIssueBackend::new(bridge.clone(), plugin, *caps) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    tracing::warn!(plugin, error = %error, "rejecting invalid plugin issue namespace");
+                    return None;
+                }
+            };
+            Some((
                 account.clone(),
-                Box::new(PluginIssueBackend::new(bridge.clone(), plugin, *caps))
-                    as Box<dyn IssueBackend>,
-            )
+                Box::new(backend) as Box<dyn IssueBackend>,
+            ))
         })
         .collect()
 }

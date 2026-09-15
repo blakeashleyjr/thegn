@@ -79,6 +79,7 @@ pub struct ControlClient {
 }
 
 fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
+    crate::issue::validate_control_issue_id(id).map_err(|e| anyhow!(e.to_string()))?;
     let encoded = crate::issue::identity::encode_control_segment(id).map_err(|e| anyhow!(e))?;
     Ok(format!("/v1/issues/{encoded}{suffix}"))
 }
@@ -1470,5 +1471,11 @@ mod tests {
         let decoded = String::from_utf8(out).unwrap();
         assert_eq!(decoded, id);
         assert!(crate::issue::validate_control_issue_id(&decoded).is_ok());
+    }
+
+    #[test]
+    fn issue_path_rejects_malformed_identity_before_encoding() {
+        assert!(encoded_issue_path("linear:bad key", "").is_err());
+        assert!(encoded_issue_path(&format!("plugin:demo:{}", "x".repeat(500)), "").is_err());
     }
 }

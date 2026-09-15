@@ -147,7 +147,7 @@ struct JiraIssue {
     id: String,
     key: String,
     #[serde(rename = "self")]
-    self_url: String,
+    _self_url: String,
     fields: JiraFields,
 }
 
@@ -277,25 +277,16 @@ fn extract_text(val: &serde_json::Value) -> String {
     }
 }
 
-fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
+fn jira_issue_to_domain(ji: JiraIssue, configured_base_url: &str) -> Issue {
     let body = ji
         .fields
         .description
         .as_ref()
         .map(extract_text)
         .filter(|s| !s.is_empty());
-    // Derive a browse URL from the self URL.
-    let url = {
-        // self URL: https://myorg.atlassian.net/rest/api/3/issue/10001
-        // browse URL: https://myorg.atlassian.net/browse/KEY-1
-        let base = ji
-            .self_url
-            .split("/rest/api")
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('/');
-        format!("{base}/browse/{}", ji.key)
-    };
+    // The response's `self` link is untrusted; browse links stay on the
+    // configured Jira origin and never inherit a response-controlled host.
+    let url = jira_browse_url(configured_base_url, &ji.key);
     Issue {
         id: format!("jira:{}", ji.key),
         number: ji.key.clone(),
@@ -320,6 +311,28 @@ fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
             .and_then(super::parse_due_date_ms),
         ..Default::default()
     }
+}
+
+fn jira_browse_url(configured_base_url: &str, key: &str) -> String {
+    if super::identity::jira_key(key).is_err() {
+        return String::new();
+    }
+    let Ok(mut base) = reqwest::Url::parse(configured_base_url) else {
+        return String::new();
+    };
+    if !matches!(base.scheme(), "https" | "http")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return String::new();
+    }
+    let path = format!("{}/browse/{key}", base.path().trim_end_matches('/'));
+    base.set_path(&path);
+    base.set_query(None);
+    base.to_string()
 }
 
 fn checked_jira_key(raw: &str) -> Result<&str, IssueError> {
@@ -392,7 +405,7 @@ impl IssueBackend for JiraBackend {
                 .into_iter()
                 .map(|issue| {
                     checked_jira_key(&issue.key)?;
-                    Ok(jira_issue_to_domain(issue))
+                    Ok(jira_issue_to_domain(issue, &self.base_url))
                 })
                 .collect()
         })
@@ -424,7 +437,7 @@ impl IssueBackend for JiraBackend {
                 .collect();
             checked_jira_key(&ji.key)?;
             Ok(IssueDetail {
-                issue: jira_issue_to_domain(ji),
+                issue: jira_issue_to_domain(ji, &self.base_url),
                 comments,
             })
         })
@@ -512,7 +525,7 @@ impl IssueBackend for JiraBackend {
                 ))
                 .await?;
             checked_jira_key(&ji.key)?;
-            Ok(jira_issue_to_domain(ji))
+            Ok(jira_issue_to_domain(ji, &self.base_url))
         })
     }
 
@@ -595,7 +608,7 @@ impl IssueBackend for JiraBackend {
                 .get(&format!("{}?fields={JIRA_FIELDS}", jira_path(key, "")?))
                 .await?;
             checked_jira_key(&ji.key)?;
-            Ok(jira_issue_to_domain(ji))
+            Ok(jira_issue_to_domain(ji, &self.base_url))
         })
     }
 
@@ -623,7 +636,7 @@ impl IssueBackend for JiraBackend {
                 .into_iter()
                 .map(|issue| {
                     checked_jira_key(&issue.key)?;
-                    Ok(jira_issue_to_domain(issue))
+                    Ok(jira_issue_to_domain(issue, &self.base_url))
                 })
                 .collect()
         })
@@ -782,7 +795,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let issue = jira_issue_to_domain(ji);
+        let issue = jira_issue_to_domain(ji, "https://jira.example");
         assert_eq!(issue.id, "jira:PROJ-7");
         assert_eq!(issue.number, "PROJ-7");
         assert_eq!(issue.provider, "jira");
@@ -792,7 +805,7 @@ mod tests {
         assert_eq!(issue.priority, IssuePriority::High);
         assert_eq!(issue.assignees, vec!["Dana Scully".to_string()]);
         assert_eq!(issue.labels, vec!["bug".to_string(), "p1".to_string()]);
-        assert_eq!(issue.url, "https://myorg.atlassian.net/browse/PROJ-7");
+        assert_eq!(issue.url, "https://jira.example/browse/PROJ-7");
         assert_eq!(issue.updated_at_ms, 2000);
     }
 
@@ -852,13 +865,13 @@ mod tests {
             "fields": {}
         }))
         .unwrap();
-        let issue = jira_issue_to_domain(ji);
+        let issue = jira_issue_to_domain(ji, "https://jira.example");
         assert_eq!(issue.title, "");
         assert_eq!(issue.body, None, "empty description filtered to None");
         assert_eq!(issue.status, IssueStatus::Backlog);
         assert_eq!(issue.priority, IssuePriority::None);
         assert!(issue.assignees.is_empty());
         assert_eq!(issue.updated_at_ms, 0);
-        assert_eq!(issue.url, "https://h.example/browse/X-1");
+        assert_eq!(issue.url, "https://jira.example/browse/X-1");
     }
 }
