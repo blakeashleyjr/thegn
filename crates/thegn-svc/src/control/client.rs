@@ -78,7 +78,7 @@ pub struct ControlClient {
     addr: ControlAddr,
 }
 
-fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
+pub(super) fn encoded_issue_path(id: &str, suffix: &str) -> Result<String> {
     crate::issue::validate_control_issue_id(id).map_err(|e| anyhow!(e.to_string()))?;
     let encoded = crate::issue::identity::encode_control_segment(id).map_err(|e| anyhow!(e))?;
     Ok(format!("/v1/issues/{encoded}{suffix}"))

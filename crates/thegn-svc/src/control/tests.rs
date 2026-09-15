@@ -43,6 +43,44 @@ impl FakeApi {
 }
 
 impl ControlApi for FakeApi {
+    fn issues_get<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
+        self.record(&format!("issues_get:{id}"));
+        Box::pin(async {
+            Err(super::ControlError::Unimplemented(
+                "recording issue fixture",
+            ))
+        })
+    }
+
+    fn issues_update<'a>(
+        &'a self,
+        id: &'a str,
+        _patch: &'a thegn_core::issue::IssuePatch,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        self.record(&format!("issues_update:{id}"));
+        Box::pin(async {
+            Err(super::ControlError::Unimplemented(
+                "recording issue fixture",
+            ))
+        })
+    }
+
+    fn issues_comment<'a>(
+        &'a self,
+        id: &'a str,
+        _body: &'a str,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        self.record(&format!("issues_comment:{id}"));
+        Box::pin(async {
+            Err(super::ControlError::Unimplemented(
+                "recording issue fixture",
+            ))
+        })
+    }
+
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>> {
         self.record("list_sessions");
         Box::pin(async { Ok(vec![]) })
@@ -1402,6 +1440,69 @@ async fn mutating_calls_and_rejections_emit_audit_records() {
                 !v.starts_with("tgc1_"),
                 "audit record leaked a token: {m:?}"
             );
+        }
+    }
+}
+
+/// Use the shipping client encoder and the real Axum extractor/handlers. In
+/// particular a literal `%2F` in an opaque plugin key must survive one decode.
+#[tokio::test]
+async fn issue_identity_roundtrips_client_encoding_through_real_router() {
+    for id in [
+        "github:owner/repo#42",
+        "plugin:demo:客户/任务#7%2Fnext: key?",
+    ] {
+        for (method, suffix, operation) in [
+            ("GET", "", "issues_get"),
+            ("POST", "", "issues_update"),
+            ("POST", "/comment", "issues_comment"),
+        ] {
+            let r = rig(false);
+            let admin = token(&r, "admin");
+            let path = super::client::encoded_issue_path(id, suffix).unwrap();
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(if suffix.is_empty() {
+                    "{}"
+                } else {
+                    r#"{"body":"fixture"}"#
+                }))
+                .unwrap();
+            let response = router(r.state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(r.api.calls(), vec![format!("{operation}:{id}")]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_issue_identity_reaches_no_control_api_operation() {
+    for encoded in [
+        "linear%3Abad%20key",
+        "github%3Ao%2Fr%230",
+        "plugin%3Ademo%3Abad%00key",
+        "%FF",
+    ] {
+        for (method, suffix) in [("GET", ""), ("POST", ""), ("POST", "/comment")] {
+            let r = rig(false);
+            let admin = token(&r, "admin");
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("/v1/issues/{encoded}{suffix}"))
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(if suffix.is_empty() {
+                    "{}"
+                } else {
+                    r#"{"body":"fixture"}"#
+                }))
+                .unwrap();
+            let response = router(r.state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(r.api.calls().is_empty());
         }
     }
 }
