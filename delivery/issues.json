@@ -687,6 +687,13 @@
       ]
     },
     {
+      "issue": "THE-633",
+      "project": "Workspace Product & Observability",
+      "changes": [
+        "cache-demanded-devcontainer-probes"
+      ]
+    },
+    {
       "issue": "THE-634",
       "project": "Runtime Security & Host Architecture",
       "changes": [
