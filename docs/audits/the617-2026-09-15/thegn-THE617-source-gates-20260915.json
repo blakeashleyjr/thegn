@@ -1,0 +1,22 @@
+[
+  {
+    "gate": "ratchets",
+    "command": [
+      "just",
+      "ratchets"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/thegn-THE617-ratchets-20260915.log"
+  },
+  {
+    "gate": "spec",
+    "command": [
+      "openspec",
+      "validate",
+      "repair-session-recovery-and-terminal-teardown",
+      "--strict"
+    ],
+    "exit_code": 0,
+    "log": "/tmp/thegn-THE617-spec-20260915.log"
+  }
+]

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "issue": "THE-617",
+  "candidate": "3692d065fb1bd7283275838e50f7507b08e89214",
+  "tested_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+  "scope": "Exact fixture plus relevant executed source bridge; full agent.rs differs in unreachable devcontainer branch; no new build for extraction",
+  "full_native_log": {
+    "external_path": "/tmp/thegn-maintenance05-combined-full-native-20260915.log",
+    "sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b"
+  },
+  "artifacts": [
+    {
+      "path": "thegn-THE617-final-adversarial-luna-20260915.md",
+      "sha256": "c79c386a84e1f06fac807d1b8e67c4e8c42dc64f92a8e907ebcfd35994931fc2"
+    },
+    {
+      "path": "thegn-THE617-final-adversarial-luna-20260915.json",
+      "sha256": "8f9c9c5f95b33b4cb423cde85090b28e03a817fd075aabd175e5262f3e18573c"
+    },
+    {
+      "path": "thegn-THE617-primary-source-equivalence-20260915.json",
+      "sha256": "580eef11d0edebcc6fcde50bef6fe718c54efdd4960cfdaed564e36ecfc7bf45"
+    },
+    {
+      "path": "thegn-THE617-prepare-source-bridge-20260915.diff",
+      "sha256": "8063ffbe6802cebd32c5c0611569c16f4c41e12be41c8ad4303b54734f00865a"
+    },
+    {
+      "path": "thegn-maintenance05-combined-full-native-receipt-20260915.json",
+      "sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310"
+    },
+    {
+      "path": "thegn-THE617-source-gates-20260915.json",
+      "sha256": "9d04f00adebe04406d0207dbbec8f1f065968ea061fcf39830fb6d5eba5c748b"
+    },
+    {
+      "path": "thegn-THE617-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f"
+    },
+    {
+      "path": "thegn-THE617-spec-20260915.log",
+      "sha256": "98e92920f4c87f719c97b29bbfe6e375808cbd37790ff3bc415a36338f0df6b0"
+    },
+    {
+      "path": "thegn-THE617-fmt-20260915.log",
+      "sha256": "4b22c98956380e17189b81bacef780916b4dfd235b5a632ecd319276fbab95e4"
+    },
+    {
+      "path": "native-pass-excerpt.log",
+      "sha256": "e0eeb0875b46d01f9d22bd3a2e7629e2e0b2d772599e63da53e03aec101e8f78"
+    }
+  ],
+  "combined05_clippy_log": {
+    "external_path": "/tmp/thegn-maintenance05-combined-clippy-20260915.log",
+    "sha256": "f68967339c68cd2129b4efcd28ff2ac8e8c6c4146daa2cab45a8cad48fe3456f",
+    "scope": "Previously completed strict workspace all-target Clippy for combined05 source; reused fixture/executed-source bridge, no standalone compilation"
+  }
+}

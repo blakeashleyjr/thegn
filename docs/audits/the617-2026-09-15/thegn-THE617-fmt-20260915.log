@@ -1,0 +1,4 @@
+nix fmt -- --ci
+traversed 3445 files
+emitted 3083 files for processing
+formatted 3083 files (0 changed) in 22.609s

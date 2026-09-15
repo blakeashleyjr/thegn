@@ -1,0 +1,45 @@
+{
+  "issue": "THE-617",
+  "verdict": "approved_for_root_landing_review",
+  "blockers": [],
+  "candidate": {
+    "path": "/tmp/thegn-THE617-impl-luna-20260915",
+    "base": "088f8d5d7a29671121465a9bccdeeb1ceb15d8ad",
+    "commit": "3692d065fb1bd7283275838e50f7507b08e89214",
+    "delta_files": 5,
+    "delta_added_lines": 201,
+    "production_implementation_changes": false
+  },
+  "fixture_equivalence": {
+    "tested05_commit": "11c81a35555a59e10cfdc3f88ec601e85de4eafd",
+    "fixture_sha256": "6d341918f5677c598058a2e020aaef3acdf8a9b6759b6925005fd42af1ddaf7e",
+    "unix_registration_sha256": "f997c840d596faa37bb0c4977b1b0966582a8360b24cdbf62b85927386b67d00",
+    "core_source_hashes_match": true,
+    "agent_source_hashes_match": false,
+    "tested05_receipt_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "candidate_agent_sha256": "a0737888aea0560fe4d3db026f1a03efcae109f91f89c9deb6b14049e7e70dd6",
+    "tested_agent_sha256": "0789aee60728050f74cc580db1b4bbaaa21a77c8f4c11db03bdb791ba9192909",
+    "agent_mismatch_scope": "THE-639 devcontainer-startup branch in prepare_sandbox_env; unreachable because the THE-617 fixture uses DevcontainerMode::Off and selected_env None"
+  },
+  "relevant_source_sha256": {
+    "crates/thegn-host/src/agent.rs": "a0737888aea0560fe4d3db026f1a03efcae109f91f89c9deb6b14049e7e70dd6",
+    "crates/thegn-core/src/sandbox_floor.rs": "6c3c2b1ccc25226cf39e3bc58135c2a10249fa18764d8f2759a9d1128123bfc5",
+    "crates/thegn-core/src/sandbox.rs": "7878b6c94dead8751871e9e84922c80d51e88fde858dbb346ebc0d8d755b93c5",
+    "crates/thegn-core/src/sandbox_backend.rs": "3c480e1c15ee5b65f31fc764db77b2a1e226c887d00b6849a8a33bac44ef1e6d"
+  },
+  "reused_native_evidence": {
+    "source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+    "tests_run": 8465,
+    "passed": 8465,
+    "skipped": 26,
+    "selector": "platform::unix::sandbox_floor_preflight_tests::stronger_runtime_preflight_failure_rechecks_final_host_floor",
+    "ordinal": "6703/8465",
+    "log_sha256": "303b96ce47969ced77bf3d54598d98f70812bd861ed7e1262dbf30f68a08f25b",
+    "receipt_sha256": "c473ac0ace3701da34b0cc845ff1c99f32b6cfc9a62e7c93cbfd1664e85ad310c"
+  },
+  "scope_claim": "Preparation control flow only; no real OCI isolation or native macOS/Windows behavior claimed.",
+  "devcontainer_difference": "Full agent.rs is not byte-identical to tested05 receipt source 33c0db71. The reviewed bridge scopes the mismatch to the THE-639 prepare_sandbox_env devcontainer-startup branch, which is unreachable with DevcontainerMode::Off and no devcontainer input.",
+  "reviewer_executed_build_or_test": false,
+  "canonical_edited": false,
+  "delivery_owner": "repair-session-recovery-and-terminal-teardown / THE-617 / Runtime Security & Host Architecture"
+}

@@ -1,0 +1,32 @@
+{
+  "tested_source": "33c0db71a3efd91a5637be47fd2d353fd628056a",
+  "candidate": "3692d065fb1bd7283275838e50f7507b08e89214",
+  "files": {
+    "crates/thegn-host/src/platform/sandbox_floor_preflight_tests.rs": {
+      "candidate_sha256": "6d341918f5677c598058a2e020aaef3acdf8a9b6759b6925005fd42af1ddaf7e",
+      "tested_sha256": "6d341918f5677c598058a2e020aaef3acdf8a9b6759b6925005fd42af1ddaf7e",
+      "byteidentical": true
+    },
+    "crates/thegn-core/src/sandbox_floor.rs": {
+      "candidate_sha256": "6c3c2b1ccc25226cf39e3bc58135c2a10249fa18764d8f2759a9d1128123bfc5",
+      "tested_sha256": "6c3c2b1ccc25226cf39e3bc58135c2a10249fa18764d8f2759a9d1128123bfc5",
+      "byteidentical": true
+    },
+    "crates/thegn-core/src/sandbox.rs": {
+      "candidate_sha256": "7878b6c94dead8751871e9e84922c80d51e88fde858dbb346ebc0d8d755b93c5",
+      "tested_sha256": "7878b6c94dead8751871e9e84922c80d51e88fde858dbb346ebc0d8d755b93c5",
+      "byteidentical": true
+    },
+    "crates/thegn-core/src/sandbox_backend.rs": {
+      "candidate_sha256": "3c480e1c15ee5b65f31fc764db77b2a1e226c887d00b6849a8a33bac44ef1e6d",
+      "tested_sha256": "3c480e1c15ee5b65f31fc764db77b2a1e226c887d00b6849a8a33bac44ef1e6d",
+      "byteidentical": true
+    },
+    "crates/thegn-host/src/agent.rs": {
+      "candidate_sha256": "a0737888aea0560fe4d3db026f1a03efcae109f91f89c9deb6b14049e7e70dd6",
+      "tested_sha256": "0789aee60728050f74cc580db1b4bbaaa21a77c8f4c11db03bdb791ba9192909",
+      "byteidentical": false
+    }
+  },
+  "scope": "Fixture and three core files identical; entire agent.rs differs. Review prepare branch bridge separately."
+}
