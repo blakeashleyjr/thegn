@@ -1,0 +1,31 @@
+{
+  "source_at_admission": "cc3a61142d9a26c2c949e50f8fc7398b1e991125",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--unit=thegn-audit640-lint-20260915",
+    "--property=CPUQuota=100%",
+    "/run/current-system/sw/bin/taskset",
+    "-c",
+    "3",
+    "nice",
+    "-n",
+    "10",
+    "cargo",
+    "clippy",
+    "-p",
+    "thegn-host",
+    "--bin",
+    "thegn",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "started_at_utc": "2026-09-15T19:14:34.348381+00:00",
+  "scope": "one scopedproductionbinlint; no fullworkspace/testtargetrebuild",
+  "jobs": 1,
+  "exit_code": 0,
+  "finished_at_utc": "2026-09-15T19:16:59.434750+00:00"
+}

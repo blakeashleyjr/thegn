@@ -1,0 +1,53 @@
+{
+  "issue": "THE-640",
+  "base_commit": "f16f9f1290c56ac586db10800eb5149ddd3e95fe",
+  "mutant_clone": "/tmp/thegn-THE640-counterfactual-source-luna-20260915-rev",
+  "mutant_commit": "53380edbb2701f075eda797ef952084698de33d0",
+  "production_file": "crates/thegn-host/src/monitor/procs_view.rs",
+  "mutations": [
+    {
+      "line_role": "Name",
+      "correct": "a.name.cmp(&b.name)",
+      "mutant": "b.name.cmp(&a.name)"
+    },
+    {
+      "line_role": "Pid",
+      "correct": "a.pid.cmp(&b.pid)",
+      "mutant": "b.pid.cmp(&a.pid)"
+    }
+  ],
+  "diff": {
+    "files": 1,
+    "insertions": 2,
+    "deletions": 2,
+    "patch_sha256": "cbc241f22129d17d1de6fb7d2b069d449111102b4f8c9485cd638524570a4fab",
+    "mutant_source_sha256": "195abb49151e67caff618be61218cc0466c739d7ec6dcaac236eb63fd977abd3"
+  },
+  "selectors": [
+    {
+      "selector": "procs_view::tests::flat_distinct_keys_follow_direction",
+      "prior_positive": ["CPU ascending", "CPU descending", "RSS ascending", "RSS descending"],
+      "first_semantic_failure": "Name desc=false / up arrow: expected [3,17,42], mutant yields [42,17,3]",
+      "later_cases_reached_claimed": false
+    },
+    {
+      "selector": "procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction",
+      "prior_positive": [],
+      "first_semantic_failure": "Name desc=false / up arrow: expected [10,11,42,3,17], mutant yields [42,17,3,10,11]",
+      "later_cases_reached_claimed": false
+    },
+    {
+      "selector": "monitor_tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity",
+      "prior_positive": ["CPU both directions", "RSS both directions"],
+      "first_semantic_failure": "Name desc=true / down arrow: expected [42,17,3], mutant yields [3,17,42]",
+      "later_cases_reached_claimed": false
+    }
+  ],
+  "workload_policy": {
+    "cargo": false,
+    "native": false,
+    "live_processes": false,
+    "render_or_benchmark": false,
+    "mutant_restored": false
+  }
+}

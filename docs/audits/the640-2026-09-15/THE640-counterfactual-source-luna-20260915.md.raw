@@ -1,0 +1,66 @@
+# THE-640 source-only old-comparator counterfactual
+
+Base candidate: `f16f9f1290c56ac586db10800eb5149ddd3e95fe`
+
+Mutant clone: `/tmp/thegn-THE640-counterfactual-source-luna-20260915-rev`
+
+Mutant commit: `53380edbb2701f075eda797ef952084698de33d0`
+
+The mutant was created from the corrected candidate and changes exactly two
+expressions in `crates/thegn-host/src/monitor/procs_view.rs`:
+
+```diff
+-        ProcSort::Name => a.name.cmp(&b.name),
+-        ProcSort::Pid => a.pid.cmp(&b.pid),
++        ProcSort::Name => b.name.cmp(&a.name),
++        ProcSort::Pid => b.pid.cmp(&a.pid),
+```
+
+The current corrected comment, all tests, OpenSpec, delivery records, and every
+other byte are preserved. The working tree is intentionally left as this
+mutant for root execution; it has not been restored. Commit hooks and signing
+are disabled in this private clone.
+
+Exact provenance:
+
+- `git diff base..mutant --stat`: one file, 2 insertions and 2 deletions.
+- Working-tree mutation patch SHA-256: `cbc241f22129d17d1de6fb7d2b069d449111102b4f8c9485cd638524570a4fab`.
+- Mutant source SHA-256: `195abb49151e67caff618be61218cc0466c739d7ec6dcaac236eb63fd977abd3`.
+
+## Selectors and expected first failures
+
+These are source-level predictions from the existing loop order. No Cargo,
+native, process, render, or benchmark workload was run here.
+
+The flat selector is
+`procs_view::tests::flat_distinct_keys_follow_direction`. It visits CPU false
+and true, then RSS false and true, before Name. The CPU and RSS assertions are
+positive under this mutant. The first semantic failure is Name with
+`desc=false` (`↑`): the test expects `[3,17,42]`, while the inverted Name
+comparator yields `[42,17,3]`. Later Name-desc and PID cases are not claimed as
+reached after that first failure.
+
+The tree selector is
+`procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction`.
+It starts with Name and `desc=false` (`↑`). The first semantic failure is the
+root/sibling sequence: the test expects `[10,11,42,3,17]`, while the mutant
+orders the Name roots/siblings in the opposite direction as
+`[42,17,3,10,11]`. The PID cases are not claimed as reached after this first
+failure.
+
+The actual monitor selector is
+`monitor_tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity`.
+Its c/m cases execute first and provide positive CPU/RSS coverage in both
+directions. Because `proc_key` preserves `proc_desc`, c starts descending and
+its r starts ascending; m begins ascending and its r returns descending; n then
+begins descending. The first semantic failure is Name with `desc=true` (`↓`):
+the test expects `[42,17,3]`, while the mutant produces `[3,17,42]`. The later
+Name-ascending and PID cases, and the confirmation section after the loop, are
+not claimed as reached after that first failure. The arrow text itself remains
+the existing `name↓`, so this counterfactual demonstrates order/label
+mismatch rather than a relabeling workaround.
+
+The separate existing tie, filtered-ancestry, cycle/orphan, and confirmation
+guard tests remain available to root as independent selectors. This report
+does not claim their later assertions ran after a first failure in any combined
+selection.

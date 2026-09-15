@@ -1,0 +1,66 @@
+{
+  "issue": "THE-640",
+  "reviewer": "luna",
+  "review_date": "2026-09-15",
+  "candidate": "9a1f50b05d5bd62e53837c4ff75ed5f7d0e2b9ef",
+  "baseline": "060afad525a14547336e8d2170803a66af877812",
+  "disposition": "approve_source_scope",
+  "blockers": [],
+  "scope": "source-only; no Cargo/native execution, process launch, or candidate mutation",
+  "production_change": {
+    "file": "crates/thegn-host/src/monitor/procs_view.rs",
+    "sha256": "3ceb2630d5f36f1d16fda8828c55140c1f5c5b2c160be10eeff95dcb931701f6",
+    "allowed_changes": [
+      "ProcSort::Name comparator changed to ordinary ascending a.name.cmp(&b.name)",
+      "ProcSort::Pid comparator changed to ordinary ascending a.pid.cmp(&b.pid)",
+      "comparator comment updated to describe shared descending reversal"
+    ],
+    "other_production_changes": false
+  },
+  "semantic_checks": {
+    "direction": "shared desc reversal makes down arrow descending and up arrow ascending for CPU/RSS/Name/PID",
+    "name": "existing lexical String comparator retained",
+    "ties": "existing ascending PID tie-break retained for CPU/RSS/Name",
+    "views": ["flat", "tree roots", "tree siblings", "cycle leftovers"],
+    "body_order": "renderer iterates the same ProcRow order used by selection and signal indexing",
+    "confirmation_identity": "pending (pid, start_time, label) remains sampled identity after passive rank change",
+    "signal_dispatch": "not confirmed or dispatched; test presses x only",
+    "performance_branch_or_import": false,
+    "new_owner_claim": false
+  },
+  "regression_scope": {
+    "pure_view": [
+      "distinct CPU/RSS/Name/PID both directions",
+      "ascending PID tie order",
+      "tree root and sibling direction",
+      "filtered ancestry",
+      "orphan retention",
+      "cycle leftover retention"
+    ],
+    "host_monitor": [
+      "actual c/m/n/p/r key transitions",
+      "heading key and arrow",
+      "body row order before and after transition",
+      "passive RSS rank change from 100 to 400 gives ascending [42,3,17]",
+      "pending identity remains pid 17/start_time 100"
+    ],
+    "reviewer_execution": "not run by this source-only review",
+    "root_owned": ["Cargo/native", "old-comparator counterfactual", "local-main landing/readback"]
+  },
+  "provenance": {
+    "test_file_sha256": "222626b87dfb0edc9294a76d1df542cb7528f5f5e862146622e8d6bf3030e237",
+    "audit_file_sha256": "b71f1b26a11aa99eeadfee20f3d58bd12bb580434c1081b445c0ecdc9cb80d26",
+    "changed_paths": [
+      "crates/thegn-host/src/monitor/procs_view.rs",
+      "crates/thegn-host/src/monitor_tests.rs",
+      "delivery/index.json",
+      "delivery/issues.json",
+      "docs/audits/process-sort-THE-640.md",
+      "openspec/changes/stabilize-process-monitor-refresh/design.md",
+      "openspec/changes/stabilize-process-monitor-refresh/proposal.md",
+      "openspec/changes/stabilize-process-monitor-refresh/specs/system-monitor/spec.md",
+      "openspec/changes/stabilize-process-monitor-refresh/tasks.md"
+    ],
+    "diff_check": "git diff --check 060afad5..9a1f50b0 passed"
+  }
+}

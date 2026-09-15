@@ -1,0 +1,7 @@
+{
+  "unit": "thegn-audit640-lint-20260915.scope",
+  "readback": "ActiveState=active\nControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/thegn-audit640-lint-20260915.scope\nCPUQuotaPerSecUSec=1s\n",
+  "cpu_max": "100000 100000",
+  "timestamp_utc": "2026-09-15T19:15:42.981430+00:00",
+  "scope": "AggregateCPUcapacitycapforentirelintscope; noaffinityclaim"
+}

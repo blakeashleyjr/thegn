@@ -1,0 +1,112 @@
+
+SELECTOR monitor::procs_view::tests::a_cyclic_parent_chain_terminates
+
+running 1 test
+test monitor::procs_view::tests::a_cyclic_parent_chain_terminates ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.05s
+
+
+SELECTOR monitor::procs_view::tests::flat_distinct_keys_follow_direction
+
+running 1 test
+test monitor::procs_view::tests::flat_distinct_keys_follow_direction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.01s
+
+
+SELECTOR monitor::procs_view::tests::flat_filter_matches_name_pid_and_owner
+
+running 1 test
+test monitor::procs_view::tests::flat_filter_matches_name_pid_and_owner ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.01s
+
+
+SELECTOR monitor::procs_view::tests::tied_flat_and_tree_rows_have_stable_pid_order
+
+running 1 test
+test monitor::procs_view::tests::tied_flat_and_tree_rows_have_stable_pid_order ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.01s
+
+
+SELECTOR monitor::procs_view::tests::tree_filter_keeps_ancestry_of_a_match
+
+running 1 test
+test monitor::procs_view::tests::tree_filter_keeps_ancestry_of_a_match ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::procs_view::tests::tree_name_pid_keep_elided_roots_and_cycles_both_directions
+
+running 1 test
+test monitor::procs_view::tests::tree_name_pid_keep_elided_roots_and_cycles_both_directions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::procs_view::tests::tree_nests_children_and_flags_elided_roots
+
+running 1 test
+test monitor::procs_view::tests::tree_nests_children_and_flags_elided_roots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction
+
+running 1 test
+test monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity
+
+running 1 test
+test monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.04s
+
+
+SELECTOR monitor::tests::processes_sort_keys_work_and_only_there
+
+running 1 test
+test monitor::tests::processes_sort_keys_work_and_only_there ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::tests::passive_process_refresh_follows_identity_after_rank_changes
+
+running 1 test
+test monitor::tests::passive_process_refresh_follows_identity_after_rank_changes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::tests::process_confirmation_keeps_its_identity_while_ranks_change
+
+running 1 test
+test monitor::tests::process_confirmation_keeps_its_identity_while_ranks_change ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::tests::process_confirmation_refuses_a_reused_or_disappeared_sampled_identity
+
+running 1 test
+test monitor::tests::process_confirmation_refuses_a_reused_or_disappeared_sampled_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+
+
+SELECTOR monitor::tests::reused_process_does_not_inherit_selection_or_signal_escalation
+
+running 1 test
+test monitor::tests::reused_process_does_not_inherit_selection_or_signal_escalation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.00s
+

@@ -1,0 +1,26 @@
+{
+  "source": "c7be344ced2fd5d655fc70e29c005afccf7f36a5",
+  "positive_source": "9a1f50b05d5bd62e53837c4ff75ed5f7d0e2b9ef",
+  "binary": "/tmp/thegn-THE640-counterfactual-native-evidence-20260915/host-tests",
+  "binary_sha256": "e8b28bb172669d59825b8e217202e90116eff71e7d73a6f92e9bb6e56fe1d791",
+  "depfile_sha256": "cdc1feb62bbd200ccea56e6014af1554d1d45c683dbb43f1b23f5780afd195cd",
+  "compiler_artifact_fresh": false,
+  "results": [
+    {
+      "selector": "monitor::procs_view::tests::flat_distinct_keys_follow_direction",
+      "exit_code": 101
+    },
+    {
+      "selector": "monitor::procs_view::tests::tree_roots_and_siblings_follow_name_and_pid_direction",
+      "exit_code": 101
+    },
+    {
+      "selector": "monitor::tests::process_sort_keys_render_both_directions_and_keep_confirmation_identity",
+      "exit_code": 101
+    }
+  ],
+  "log": "/tmp/thegn-THE640-counterfactual-native-20260915.log",
+  "log_sha256": "bebaf37f94c0cdf10ed0f561670772c086c033bca8cc32455f796cc90421a55d",
+  "timestamp_utc": "2026-09-15T19:12:47.422595+00:00",
+  "expected_first_failures": "Nameascendingflat/tree; Namedescendingactualmonitor; laterPIDcasesunreached; rootsemanticinspectionpending"
+}

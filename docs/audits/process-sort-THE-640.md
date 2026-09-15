@@ -22,7 +22,11 @@ rank and verifies the pending `(pid, start_time)` identity without confirming
 or dispatching a signal.
 
 Root review requires the old-comparator counterfactual to remain in a separate
-private clone while its source-only before/after assertions execute. That
-counterfactual must fail the Name and PID direction assertions while CPU and
-RSS continue to pass; it must not run a live process action. Full Cargo/native,
-adversarial, and local-main integration evidence remains root-owned.
+private clone. Build `27339` exited 0 and its bounded native run recorded the
+three intended Name-direction failures. In each failing test process, the
+first Name assertion stopped execution before later PID assertions; this is a
+fact from the captured log, rather than a generic source-only reachability
+claim. CPU/RSS prelude assertions passed where the selector reaches them. The
+counterfactual did not run a live process action. Counterfactual and final
+adversarial evidence are complete; local-main landing remains root-owned and
+pending.
