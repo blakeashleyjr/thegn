@@ -42,6 +42,10 @@ allow_files=(
   ':!crates/thegn-host/tests/static_commands_process.rs'
   # Archived old-binary migration canary retains the exact observed diagnostic.
   ':!docs/audits/maintenance-04-2026-09-15/thegn-THE611-old-binary-startup-canary-20260914.log'
+  # Immutable compiler-admission receipts quote observed pre-rename worktree
+  # paths. Preserve their recorded bytes and hashes; these are not product names.
+  ':!docs/audits/maintenance07-2026-09-15/maintenance07-clippy-admission-20260915.json.log'
+  ':!docs/audits/maintenance07-2026-09-15/maintenance07-final-clippy-admission-20260915.json.log'
   ':!install.sh'
   ':!crates/thegn-host/src/main.rs'
   ':!flake.lock'
