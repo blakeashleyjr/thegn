@@ -1,0 +1,2246 @@
+{
+  "private_root_removed": true,
+  "receipts": {
+    "1.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "1.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "init",
+        "-q",
+        "-b",
+        "main"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 11,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 1,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "10.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "10.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "commit",
+        "-qm",
+        "base"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 11,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 10,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "11.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "11.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "worktree",
+        "add",
+        "-qb",
+        "held",
+        "/tmp/.tmp4OhA2b/held"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 26,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 11,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "12.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "12.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "add",
+        "red-gate-marker"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 12,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "13.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "13.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "commit",
+        "-qm",
+        "red gate"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 16,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 13,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "14.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "14.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "worktree",
+        "add",
+        "-qb",
+        "clean",
+        "/tmp/.tmp4OhA2b/clean"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 37,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 14,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "15.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "15.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "add",
+        "clean.txt"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 11,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 15,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "16.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "16.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "commit",
+        "-qm",
+        "clean change"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 16,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 16,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "17.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "17.json": {
+      "argv": [
+        "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+        "--config",
+        "/tmp/.tmp4OhA2b/fixture.toml",
+        "merge",
+        "add",
+        "/tmp/.tmp4OhA2b/held",
+        "/tmp/.tmp4OhA2b/clean"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 392,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 17,
+      "stderr": "",
+      "stdout": "  + queued held\n  + queued clean\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "18.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "18.json": {
+      "argv": [
+        "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+        "--config",
+        "/tmp/.tmp4OhA2b/fixture.toml",
+        "merge",
+        "list",
+        "--json"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 97,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 18,
+      "stderr": "",
+      "stdout": "[{\"worktree\":\"/tmp/.tmp4OhA2b/held\",\"branch\":\"held\",\"target_branch\":\"main\",\"status\":\"queued\",\"queued_at\":1789433169,\"updated_at\":1789433169,\"result_oid\":null,\"conflict_paths\":null,\"error_detail\":null,\"location\":\"\",\"agent_attempts\":0},{\"worktree\":\"/tmp/.tmp4OhA2b/clean\",\"branch\":\"clean\",\"target_branch\":\"main\",\"status\":\"queued\",\"queued_at\":1789433169,\"updated_at\":1789433169,\"result_oid\":null,\"conflict_paths\":null,\"error_detail\":null,\"location\":\"\",\"agent_attempts\":0}]\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "19.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "19.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "for-each-ref",
+        "--format=%(refname) %(objectname)"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 19,
+      "stderr": "",
+      "stdout": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 80269ac60f1b360451f04b6743dc4cdbb59af75d\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "2.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "2.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "user.name",
+        "private-drain"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 2,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "20.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "20.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "worktree",
+        "list",
+        "--porcelain"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 20,
+      "stderr": "",
+      "stdout": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 80269ac60f1b360451f04b6743dc4cdbb59af75d\nbranch refs/heads/held\n\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "21.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "21.json": {
+      "argv": [
+        "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+        "--config",
+        "/tmp/.tmp4OhA2b/fixture.toml",
+        "merge",
+        "drain",
+        "--json"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 2163,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 21,
+      "stderr": "thegn: sandbox could not be established for the queue task (infrastructure failure); the branch is not at fault\n",
+      "stdout": "{\"counts\":{\"deferred\":1,\"gate_error\":0,\"landed\":0,\"needs_human\":0,\"ready\":1},\"deferred\":[\"held\"],\"gate_error\":[],\"landed\":[],\"needs_human\":[],\"ready\":[\"clean\"],\"stale_checkouts\":[],\"target\":\"main\",\"warnings\":[]}\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "22.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "22.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "for-each-ref",
+        "--format=%(refname) %(objectname)"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 22,
+      "stderr": "",
+      "stdout": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 80269ac60f1b360451f04b6743dc4cdbb59af75d\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "23.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "23.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "worktree",
+        "list",
+        "--porcelain"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 23,
+      "stderr": "",
+      "stdout": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 80269ac60f1b360451f04b6743dc4cdbb59af75d\nbranch refs/heads/held\n\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "24.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "24.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "rev-parse",
+        "held"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 6,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 24,
+      "stderr": "",
+      "stdout": "80269ac60f1b360451f04b6743dc4cdbb59af75d\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "25.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "25.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "add",
+        "-A"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 25,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "26.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "26.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "commit",
+        "-qm",
+        "private intentional repair"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 10,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 26,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "27.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "27.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "rev-parse",
+        "held"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 27,
+      "stderr": "",
+      "stdout": "5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "28.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "28.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "diff",
+        "--name-only",
+        "80269ac60f1b360451f04b6743dc4cdbb59af75d",
+        "5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 6,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 28,
+      "stderr": "",
+      "stdout": "red-gate-marker\nrepaired.txt\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "29.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "29.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "for-each-ref",
+        "--format=%(refname) %(objectname)"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 29,
+      "stderr": "",
+      "stdout": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "3.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "3.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "user.email",
+        "private@example.invalid"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 3,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "30.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "30.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "worktree",
+        "list",
+        "--porcelain"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 30,
+      "stderr": "",
+      "stdout": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nbranch refs/heads/held\n\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "31.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "31.json": {
+      "argv": [
+        "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+        "--config",
+        "/tmp/.tmp4OhA2b/fixture.toml",
+        "merge",
+        "drain",
+        "--json"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 1595,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 31,
+      "stderr": "",
+      "stdout": "{\"counts\":{\"deferred\":0,\"gate_error\":0,\"landed\":0,\"needs_human\":0,\"ready\":1},\"deferred\":[],\"gate_error\":[],\"landed\":[],\"needs_human\":[],\"ready\":[\"held\"],\"stale_checkouts\":[],\"target\":\"main\",\"warnings\":[]}\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "32.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "32.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "for-each-ref",
+        "--format=%(refname) %(objectname)"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 6,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 32,
+      "stderr": "",
+      "stdout": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "33.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "33.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "worktree",
+        "list",
+        "--porcelain"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 11,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 33,
+      "stderr": "",
+      "stdout": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nbranch refs/heads/held\n\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "34.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "34.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "cat-file",
+        "-t",
+        "d02d5a927c6f8b18ae8fc79acdbbb1fea817228f"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 17,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 34,
+      "stderr": "",
+      "stdout": "commit\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "35.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "35.json": {
+      "argv": [
+        "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+        "--config",
+        "/tmp/.tmp4OhA2b/fixture.toml",
+        "merge",
+        "list",
+        "--json"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 268,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 35,
+      "stderr": "",
+      "stdout": "[{\"worktree\":\"/tmp/.tmp4OhA2b/held\",\"branch\":\"held\",\"target_branch\":\"main\",\"status\":\"ready\",\"queued_at\":1789433169,\"updated_at\":1789433173,\"result_oid\":\"d02d5a927c6f8b18ae8fc79acdbbb1fea817228f\",\"conflict_paths\":null,\"error_detail\":\"gated green \u2014 awaiting land\",\"location\":\"\",\"agent_attempts\":1},{\"worktree\":\"/tmp/.tmp4OhA2b/clean\",\"branch\":\"clean\",\"target_branch\":\"main\",\"status\":\"ready\",\"queued_at\":1789433170,\"updated_at\":1789433172,\"result_oid\":\"a27ea9841a8834ec76141cd11bffb15aeaf1b803\",\"conflict_paths\":null,\"error_detail\":\"gated green \u2014 awaiting land\",\"location\":\"\",\"agent_attempts\":0}]\n",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "4.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "4.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "commit.gpgsign",
+        "false"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 4,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "5.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "5.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "core.fsmonitor",
+        "false"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 5,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "6.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "6.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "gc.auto",
+        "0"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 6,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "7.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "7.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "maintenance.auto",
+        "false"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 7,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "8.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "8.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "config",
+        "core.hooksPath",
+        "/tmp/.tmp4OhA2b/hooks"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 8,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "9.cleanup.json": {
+      "cleanup_error": false,
+      "identity_lost": false,
+      "leader_reaped": true,
+      "retained": false,
+      "started": true,
+      "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+    },
+    "9.json": {
+      "argv": [
+        "/tmp/.tmp4OhA2b/bin/git",
+        "add",
+        "conflict.txt"
+      ],
+      "cleanup": {
+        "cleanup_error": false,
+        "identity_lost": false,
+        "leader_reaped": true,
+        "retained": false,
+        "started": true,
+        "tree_containment": "fixed fixture group only; no escaped-tree guarantee"
+      },
+      "elapsed_ms": 5,
+      "environment": {
+        "BASH_ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "ENV": "/tmp/.tmp4OhA2b/empty-rc",
+        "GIT_CONFIG_GLOBAL": "/tmp/.tmp4OhA2b/gitconfig",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/tmp/.tmp4OhA2b/bin",
+        "SHELL": "/tmp/.tmp4OhA2b/bin/sh",
+        "TEMP": "/tmp/.tmp4OhA2b/tmp",
+        "THEGN_DIR": "/tmp/.tmp4OhA2b/app",
+        "THEGN_NO_MIGRATE": "1",
+        "TMP": "/tmp/.tmp4OhA2b/tmp",
+        "TMPDIR": "/tmp/.tmp4OhA2b/tmp",
+        "XDG_CACHE_HOME": "/tmp/.tmp4OhA2b/cache",
+        "XDG_CONFIG_HOME": "/tmp/.tmp4OhA2b/config",
+        "XDG_RUNTIME_DIR": "/tmp/.tmp4OhA2b/runtime",
+        "XDG_STATE_HOME": "/tmp/.tmp4OhA2b/state"
+      },
+      "exit_code": 0,
+      "sequence": 9,
+      "stderr": "",
+      "stdout": "",
+      "thegn_binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918"
+    },
+    "manifest.json": {
+      "agent_sentinel": "#!/tmp/.tmp4OhA2b/bin/sh\n[ \"$#\" -eq 1 ] || exit 91\nprintf 'unexpected-agent\\n' > \"$1\"\nexit 92\n",
+      "binary": "/tmp/thegn-batch03-native-cache-f_3lx_t_/debug/thegn",
+      "binary_sha256": "205941c3b3b0f9b19e7743eb7beed9d117e428dd0554d92be36b5a3934b03918",
+      "config": "\n[automations]\nenabled = false\n[daemon]\nenabled = false\n[sandbox]\nenabled = false\nbackend = \"none\"\nwarm_direnv = \"off\"\ninject_devshell = false\n[sandbox.limits]\ncpu = \"\"\nmemory = \"\"\ncpu_total = \"off\"\nmemory_total = \"off\"\n[merge_queue]\nenabled = true\ntarget_branch = \"main\"\nauto_land = false\nsnapshot_dirty = false\norganize_folders = false\non_landed = \"off\"\nsign_commits = false\nregenerate_paths = []\ngate_reuse_worktree = false\ngate_target_dir = \"\"\ngate_on = true\ngate_command = \"if [ -f red-gate-marker ]; then printf 'private-red-gate\\\\n'; exit 1; fi; printf 'private-green-gate\\\\n'\"\ngate_setup_command = \"\"\nremote_mode = \"route_to_host\"\nconflict_handoff = \"agent\"\nagent_command = \"/tmp/.tmp4OhA2b/agent-sentinel /tmp/.tmp4OhA2b/agent-ran\"\nagent_max_attempts = 3\nagent_timeout_secs = 1\nagent_sandbox = true\nagent_isolation_floor = \"guest-kernel\"\nagent_on_floor_miss = \"fail\"\n",
+      "git": {
+        "path": "/tmp/.tmp4OhA2b/bin/git",
+        "sha256": "fe3ebade9e26697472e774ce169876870f6a42eebef27c7a33e746062e4a08a2"
+      },
+      "kind": "THE219-private-actual-merge-drain",
+      "native_platform": "linux",
+      "scope": "No THE608 acceptance; Part A separately proves recovered floor admission",
+      "sh": {
+        "path": "/tmp/.tmp4OhA2b/bin/sh",
+        "sha256": "55c4ac3c8f09d2a0525f97988c9be25ca2aaeb772cf91eae7b87103ba0dc7e83"
+      }
+    },
+    "phase1-after.json": {
+      "audit": [
+        [
+          "/tmp/.tmp4OhA2b/held",
+          "folding"
+        ],
+        [
+          "/tmp/.tmp4OhA2b/held",
+          "agent_blocked"
+        ],
+        [
+          "/tmp/.tmp4OhA2b/clean",
+          "folding"
+        ],
+        [
+          "/tmp/.tmp4OhA2b/clean",
+          "ready"
+        ]
+      ],
+      "rows": [
+        {
+          "agent_attempts": 1,
+          "branch": "held",
+          "conflict_paths": null,
+          "error_detail": "sandbox could not be established for the queue task (infrastructure failure); the branch is not at fault",
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": null,
+          "status": "agent_blocked",
+          "target_branch": "main",
+          "updated_at": 1789433171,
+          "worktree": "/tmp/.tmp4OhA2b/held"
+        },
+        {
+          "agent_attempts": 0,
+          "branch": "clean",
+          "conflict_paths": null,
+          "error_detail": "gated green \u2014 awaiting land",
+          "location": "",
+          "queued_at": 1789433170,
+          "result_oid": "a27ea9841a8834ec76141cd11bffb15aeaf1b803",
+          "status": "ready",
+          "target_branch": "main",
+          "updated_at": 1789433172,
+          "worktree": "/tmp/.tmp4OhA2b/clean"
+        }
+      ],
+      "snapshot": {
+        "files": {
+          "/tmp/.tmp4OhA2b/clean/clean.txt": [
+            99,
+            108,
+            101,
+            97,
+            110,
+            32,
+            112,
+            97,
+            121,
+            108,
+            111,
+            97,
+            100,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/clean/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/red-gate-marker": [
+            114,
+            101,
+            100,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/repo/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ]
+        },
+        "refs": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 80269ac60f1b360451f04b6743dc4cdbb59af75d\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80",
+        "registrations": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 80269ac60f1b360451f04b6743dc4cdbb59af75d\nbranch refs/heads/held"
+      },
+      "summary": {
+        "counts": {
+          "deferred": 1,
+          "gate_error": 0,
+          "landed": 0,
+          "needs_human": 0,
+          "ready": 1
+        },
+        "deferred": [
+          "held"
+        ],
+        "gate_error": [],
+        "landed": [],
+        "needs_human": [],
+        "ready": [
+          "clean"
+        ],
+        "stale_checkouts": [],
+        "target": "main",
+        "warnings": []
+      }
+    },
+    "phase1-before.json": {
+      "rows": [
+        {
+          "agent_attempts": 1,
+          "branch": "held",
+          "conflict_paths": "stale-path",
+          "error_detail": "stale-diagnostic",
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": "stale",
+          "status": "queued",
+          "target_branch": "main",
+          "updated_at": 1789433169,
+          "worktree": "/tmp/.tmp4OhA2b/held"
+        },
+        {
+          "agent_attempts": 0,
+          "branch": "clean",
+          "conflict_paths": null,
+          "error_detail": null,
+          "location": "",
+          "queued_at": 1789433170,
+          "result_oid": null,
+          "status": "queued",
+          "target_branch": "main",
+          "updated_at": 1789433169,
+          "worktree": "/tmp/.tmp4OhA2b/clean"
+        }
+      ],
+      "snapshot": {
+        "files": {
+          "/tmp/.tmp4OhA2b/clean/clean.txt": [
+            99,
+            108,
+            101,
+            97,
+            110,
+            32,
+            112,
+            97,
+            121,
+            108,
+            111,
+            97,
+            100,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/clean/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/red-gate-marker": [
+            114,
+            101,
+            100,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/repo/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ]
+        },
+        "refs": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 80269ac60f1b360451f04b6743dc4cdbb59af75d\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80",
+        "registrations": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 80269ac60f1b360451f04b6743dc4cdbb59af75d\nbranch refs/heads/held"
+      }
+    },
+    "phase2-after.json": {
+      "audit": [
+        [
+          "/tmp/.tmp4OhA2b/held",
+          "folding"
+        ],
+        [
+          "/tmp/.tmp4OhA2b/held",
+          "ready"
+        ]
+      ],
+      "list": [
+        {
+          "agent_attempts": 1,
+          "branch": "held",
+          "conflict_paths": null,
+          "error_detail": "gated green \u2014 awaiting land",
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": "d02d5a927c6f8b18ae8fc79acdbbb1fea817228f",
+          "status": "ready",
+          "target_branch": "main",
+          "updated_at": 1789433173,
+          "worktree": "/tmp/.tmp4OhA2b/held"
+        },
+        {
+          "agent_attempts": 0,
+          "branch": "clean",
+          "conflict_paths": null,
+          "error_detail": "gated green \u2014 awaiting land",
+          "location": "",
+          "queued_at": 1789433170,
+          "result_oid": "a27ea9841a8834ec76141cd11bffb15aeaf1b803",
+          "status": "ready",
+          "target_branch": "main",
+          "updated_at": 1789433172,
+          "worktree": "/tmp/.tmp4OhA2b/clean"
+        }
+      ],
+      "rows": [
+        {
+          "agent_attempts": 1,
+          "branch": "held",
+          "conflict_paths": null,
+          "error_detail": "gated green \u2014 awaiting land",
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": "d02d5a927c6f8b18ae8fc79acdbbb1fea817228f",
+          "status": "ready",
+          "target_branch": "main",
+          "updated_at": 1789433173,
+          "worktree": "/tmp/.tmp4OhA2b/held"
+        },
+        {
+          "agent_attempts": 0,
+          "branch": "clean",
+          "conflict_paths": null,
+          "error_detail": "gated green \u2014 awaiting land",
+          "location": "",
+          "queued_at": 1789433170,
+          "result_oid": "a27ea9841a8834ec76141cd11bffb15aeaf1b803",
+          "status": "ready",
+          "target_branch": "main",
+          "updated_at": 1789433172,
+          "worktree": "/tmp/.tmp4OhA2b/clean"
+        }
+      ],
+      "snapshot": {
+        "files": {
+          "/tmp/.tmp4OhA2b/clean/clean.txt": [
+            99,
+            108,
+            101,
+            97,
+            110,
+            32,
+            112,
+            97,
+            121,
+            108,
+            111,
+            97,
+            100,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/clean/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/repaired.txt": [
+            100,
+            101,
+            115,
+            105,
+            114,
+            101,
+            100,
+            32,
+            114,
+            101,
+            112,
+            97,
+            105,
+            114,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/repo/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ]
+        },
+        "refs": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80",
+        "registrations": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nbranch refs/heads/held"
+      },
+      "summary": {
+        "counts": {
+          "deferred": 0,
+          "gate_error": 0,
+          "landed": 0,
+          "needs_human": 0,
+          "ready": 1
+        },
+        "deferred": [],
+        "gate_error": [],
+        "landed": [],
+        "needs_human": [],
+        "ready": [
+          "held"
+        ],
+        "stale_checkouts": [],
+        "target": "main",
+        "warnings": []
+      }
+    },
+    "repair.json": {
+      "changed_paths": "red-gate-marker\nrepaired.txt",
+      "new_tip": "5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f",
+      "old_tip": "80269ac60f1b360451f04b6743dc4cdbb59af75d",
+      "snapshot": {
+        "files": {
+          "/tmp/.tmp4OhA2b/clean/clean.txt": [
+            99,
+            108,
+            101,
+            97,
+            110,
+            32,
+            112,
+            97,
+            121,
+            108,
+            111,
+            97,
+            100,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/clean/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/held/repaired.txt": [
+            100,
+            101,
+            115,
+            105,
+            114,
+            101,
+            100,
+            32,
+            114,
+            101,
+            112,
+            97,
+            105,
+            114,
+            10
+          ],
+          "/tmp/.tmp4OhA2b/repo/conflict.txt": [
+            98,
+            97,
+            115,
+            101,
+            10
+          ]
+        },
+        "refs": "refs/heads/clean 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nrefs/heads/held 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nrefs/heads/main d3adf790a56922c5b89b193f996d2e0d5644aa80",
+        "registrations": "worktree /tmp/.tmp4OhA2b/repo\nHEAD d3adf790a56922c5b89b193f996d2e0d5644aa80\nbranch refs/heads/main\n\nworktree /tmp/.tmp4OhA2b/clean\nHEAD 08c02c68737d513d4e8af5d6f6bf705b7afdb774\nbranch refs/heads/clean\n\nworktree /tmp/.tmp4OhA2b/held\nHEAD 5f35b7c276a0e5f672fb5253ae3c3ac5e80d502f\nbranch refs/heads/held"
+      }
+    },
+    "setup.json": {
+      "initial_rows": [
+        {
+          "agent_attempts": 0,
+          "branch": "held",
+          "conflict_paths": null,
+          "error_detail": null,
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": null,
+          "status": "queued",
+          "target_branch": "main",
+          "updated_at": 1789433169,
+          "worktree": "/tmp/.tmp4OhA2b/held"
+        },
+        {
+          "agent_attempts": 0,
+          "branch": "clean",
+          "conflict_paths": null,
+          "error_detail": null,
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": null,
+          "status": "queued",
+          "target_branch": "main",
+          "updated_at": 1789433169,
+          "worktree": "/tmp/.tmp4OhA2b/clean"
+        }
+      ],
+      "seeded_rows": [
+        {
+          "agent_attempts": 1,
+          "branch": "held",
+          "conflict_paths": "stale-path",
+          "error_detail": "stale-diagnostic",
+          "location": "",
+          "queued_at": 1789433169,
+          "result_oid": "stale",
+          "status": "queued",
+          "target_branch": "main",
+          "updated_at": 1789433169,
+          "worktree": "/tmp/.tmp4OhA2b/held"
+        },
+        {
+          "agent_attempts": 0,
+          "branch": "clean",
+          "conflict_paths": null,
+          "error_detail": null,
+          "location": "",
+          "queued_at": 1789433170,
+          "result_oid": null,
+          "status": "queued",
+          "target_branch": "main",
+          "updated_at": 1789433169,
+          "worktree": "/tmp/.tmp4OhA2b/clean"
+        }
+      ]
+    }
+  }
+}

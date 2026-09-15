@@ -1,0 +1,214 @@
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-maintenance-04-static-cli-20260914/crates/thegn-host)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/hyperlink.rs:247:18
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match> {
+    |                  ^^^^^            ^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                  |
+    |                  the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match<'_>> {
+    |                                                     ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/image.rs:567:17
+    |
+567 |     pub fn data(&self) -> MutexGuard<ImageDataType> {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+567 |     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
+    |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:12:12
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>>;
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>>;
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:22:9
+   |
+22 |         &self,
+   |         ^^^^^ the lifetime is elided here
+...
+27 |     ) -> Option<SearchResult>;
+   |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+27 |     ) -> Option<SearchResult<'_>>;
+   |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:88:12
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>> {
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>> {
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/lineedit/history.rs:109:9
+    |
+109 |         &self,
+    |         ^^^^^ the lifetime is elided here
+...
+114 |     ) -> Option<SearchResult> {
+    |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+114 |     ) -> Option<SearchResult<'_>> {
+    |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:511:25
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<Line>> {
+    |                         ^^^^^         ^^^^^^^^^ the same lifetime is hidden here
+    |                         |
+    |                         the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+    |                                           +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:526:24
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<[Change]>) {
+    |                        ^^^^^ the lifetime is elided here       ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+    |                                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/clusterline.rs:165:17
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter<'_> {
+    |                                              ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/line.rs:609:19
+    |
+609 |     pub fn as_str(&self) -> Cow<str> {
+    |                   ^^^^^     ^^^^^^^^ the same lifetime is hidden here
+    |                   |
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+609 |     pub fn as_str(&self) -> Cow<'_, str> {
+    |                                 +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> vendor/termwiz/src/surface/line/line.rs:1014:21
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef> {
+     |                     ^^^^^ the lifetime is elided here   ^^^^^^^ the same lifetime is hidden here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+     |                                                                ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/terminal/mod.rs:74:27
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+   |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                           |
+   |                           the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+   |                                                                 ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/terminal/unix.rs:389:27
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+    |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                           |
+    |                           the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+    |                                                                 ++++
+
+warning: `termwiz` (lib) generated 13 warnings (run `cargo fix --lib -p termwiz` to apply 13 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 55s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 935847f6-a00a-49e8-b98f-d7ca5f53de18 with nextest profile: default
+    Starting 28 tests across 2 binaries (3299 tests skipped)
+        PASS [   0.394s] ( 1/28) thegn-host::static_commands_process static_cli_support::child_observation_error_revokes_later_signals_and_waits
+        PASS [   0.803s] ( 2/28) thegn-host::static_commands_process configured_get_still_loads_file_and_runs_legacy_profile_startup
+        PASS [   1.167s] ( 3/28) thegn-host::static_commands_process unix::early_closed_stdout_keeps_schema_catalog_and_completion_exit_success
+        PASS [   2.232s] ( 4/28) thegn-host::static_commands_process paths_alias_registration_help_and_version_keep_their_output_contract
+        PASS [   0.417s] ( 5/28) thegn-host::bin/thegn cmd::api::tests::cli_ledger_includes_the_event_tail_projection
+        PASS [   0.447s] ( 6/28) thegn-host::bin/thegn cmd::api::tests::every_advertised_plugin_host_call_has_a_generic_control_route
+        PASS [   0.389s] ( 7/28) thegn-host::bin/thegn cmd::api::tests::every_routed_cap_is_callable_or_streaming
+        PASS [   3.589s] ( 8/28) thegn-host::static_commands_process static_output_ignores_missing_malformed_config_and_invalid_overrides
+        PASS [   3.553s] ( 9/28) thegn-host::static_commands_process static_output_precedes_legacy_migration_and_both_profile_selectors
+        PASS [   0.400s] (10/28) thegn-host::bin/thegn cmd::config::tests::get_known_and_unknown_keys
+        PASS [   0.673s] (11/28) thegn-host::bin/thegn cmd::config::tests::config_set_does_not_count_compatibility_warnings_as_new_errors
+        PASS [   0.397s] (12/28) thegn-host::bin/thegn cmd::config::tests::get_reaches_nested_keys_the_allowlist_never_listed
+        PASS [   0.440s] (13/28) thegn-host::bin/thegn cmd::config::tests::get_reaches_the_pipeline_structure_as_one_document
+        PASS [   0.434s] (14/28) thegn-host::bin/thegn cmd::config::tests::get_reaches_the_pr_queue_surface
+        PASS [   0.390s] (15/28) thegn-host::bin/thegn cmd::config::tests::show_outputs_toml_and_json_without_panicking
+        PASS [   0.446s] (16/28) thegn-host::bin/thegn cmd::config::tests::validate_accepts_advisories_without_rewriting_and_rejects_real_errors
+        PASS [   0.406s] (17/28) thegn-host::bin/thegn cmd::config::tests::workspace_layer_reports_both_queue_families
+        PASS [   0.647s] (18/28) thegn-host::bin/thegn command_intent::tests::all_completion_shells_modes_and_global_positions_preserve_borrowed_intent
+        PASS [   3.422s] (19/28) thegn-host::static_commands_process unix::static_commands_do_not_open_fifo_configuration_but_configured_siblings_do
+        PASS [   0.521s] (20/28) thegn-host::bin/thegn command_intent::tests::every_config_api_and_automation_action_uses_its_exact_intent
+        PASS [   0.489s] (21/28) thegn-host::bin/thegn complete::tests::an_expired_budget_completes_nothing_anywhere
+        PASS [   0.520s] (22/28) thegn-host::bin/thegn complete::tests::bin_name_is_never_empty
+        PASS [   1.308s] (23/28) thegn-host::bin/thegn command_intent::tests::every_configured_top_level_variant_parses_without_static_authority
+        PASS [   0.519s] (24/28) thegn-host::bin/thegn complete::tests::completion_slots_are_bound_or_pinned
+        PASS [   1.254s] (25/28) thegn-host::bin/thegn complete::tests::clap_complete_is_imported_once
+        PASS [   0.450s] (26/28) thegn-host::bin/thegn complete::tests::every_implemented_catalog_slot_actually_binds
+        PASS [   0.364s] (27/28) thegn-host::bin/thegn complete::tests::wire_maps_descriptions_and_survives_a_non_utf8_word
+        PASS [   0.896s] (28/28) thegn-host::bin/thegn complete::tests::decoration_does_not_change_parsing
+────────────
+     Summary [   6.830s] 28 tests run: 28 passed, 3299 skipped

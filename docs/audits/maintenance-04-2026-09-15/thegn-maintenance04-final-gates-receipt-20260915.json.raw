@@ -1,0 +1,40 @@
+{
+  "source": "a4468a8ec6372b3905a7b545f5a5b740162ebf17",
+  "recorded_at_utc": "2026-09-15T01:58:17.033060+00:00",
+  "clippy_argv": "cargo clippy --offline --locked --workspace --all-targets -- -D warnings",
+  "clippy_session": 1302,
+  "clippy_elapsed": "13m58s",
+  "clippy_source_provenance": "Log shows actual compilation/checking from current combined checkout; no source mutations during gate, only separately reviewed documentation edits.",
+  "source_wrapper_empty": true,
+  "jobs": 2,
+  "logs": {
+    "clippy": {
+      "path": "/tmp/thegn-maintenance-04-combined-clippy-20260915.log",
+      "sha256": "ccfe565d24720f9e5d7450d1b26ac4bb66cd1e8a0f4b15552190c40c272f76d7",
+      "exit_code": 0
+    },
+    "ratchets": {
+      "path": "/tmp/thegn-maintenance04-final-metadata-ratchets-20260915.log",
+      "sha256": "b256d0305834c433d17a54c3559e00584ddfde93663f1abba1d0711ce993471f",
+      "exit_code": 0
+    },
+    "openspec": {
+      "path": "/tmp/thegn-maintenance04-final-metadata-openspec-20260915.log",
+      "sha256": "7dabe8f880a38b6929bb649b21d92e289899cc7ac5399c5123a2e69bcf34647c",
+      "exit_code": 0
+    },
+    "treefmt_before_docs": {
+      "path": "/tmp/thegn-maintenance04-treefmt-20260915.log",
+      "sha256": "8817a081ce1f09865a1db95ebdbb7e6f50d904d84fd84f01a8fb89679db58eb3",
+      "exit_code": 0
+    },
+    "nonrust_lint": {
+      "path": "/tmp/thegn-maintenance04-nonrust-lint-20260915.log",
+      "sha256": "f30d71a171c57b2cfc13a83acad747f67f4b2d29f842e99dec1a8c1429c7ac20",
+      "exit_code": 0
+    }
+  },
+  "native": "Segmented623 full8376/8377 plus a446 six-test correctedgate, not fullclean-a446; focused68 and counterfactual receipts separate.",
+  "vendor_warning_limit": "Inherited termwiz dependency warnings remain in raw log; strict workspace Clippy exits0.",
+  "landing_pending": true
+}

@@ -1,0 +1,29 @@
+{
+  "implementation_main": "c0d3d860a22db0a7fddafb3d338bf40b25248ade",
+  "previous_main": "773647fab4d328024bd3e5844546cdebaf143eb2",
+  "verified_at": "2026-09-15T02:04:31.261294+00:00",
+  "reviewed_rust_hashes": {
+    "crates/thegn-core/src/host_config.rs": "2989652f4adeca94c0737f1bc279f8f18b48fb762a1801b1177abdd868883e0f",
+    "crates/thegn-core/src/host_config_merge_tests.rs": "f370bf8a5fe2687a74ba8be8e386f239adcbe64ccf0e3979ca7466020c02ece0",
+    "crates/thegn-host/src/cmd/api.rs": "0eee14df01adf9b71132a9906477eea55b77331e11cf71668ab8da57147bcc2d",
+    "crates/thegn-host/src/cmd/config.rs": "acde01a910c711b975956076476f2ed1461b226342c20924465e9e83d93b0596",
+    "crates/thegn-host/src/command_intent.rs": "8e895a35f34a2f86168c6b27a3a5217498132a44e5d202d5794234df4b09dbe5",
+    "crates/thegn-host/src/command_intent_tests.rs": "ac7f7521e141b39cfcc97b0272e1e8307c54178630668fb29013eb891aa1c53b",
+    "crates/thegn-host/src/complete.rs": "ec65c554d52307bd5b74e589d8b9783f439cf74a61f2fc4126933c75cc9c0d8f",
+    "crates/thegn-host/src/main.rs": "b7bf263c580683bed257aad5d5ae3b22ae1615c35caa9fb9919e92cf694c5321",
+    "crates/thegn-host/src/merge_driver.rs": "b91b385799e497a89518fd390c433fd878f0be05577aff4c4883f4f5dd77c236",
+    "crates/thegn-host/src/merge_driver_status_tests.rs": "6c70642b020b2c6a30073400739aed3ea1d57e208cfbe162f784a8f96781f3ab",
+    "crates/thegn-host/tests/merge_drain_process.rs": "12f707d2bd9f94c213db147a3936026d479c4f0cae09fdb15f1b398d83dba695",
+    "crates/thegn-host/tests/merge_drain_support/custody.rs": "0c9128938311f6696b8bedfc27a34bc7f576d23472639fb6f57fa178c94fe8b7",
+    "crates/thegn-host/tests/merge_drain_support/linux.rs": "7d96c0c18d2ac00921b3ea59b3a0642cf57bcfce932a2154ce9819e490a04dd9",
+    "crates/thegn-host/tests/static_cli_support/mod.rs": "da850076b922be75813233136fc38ba4d97fc1c2e013afdbed606f4e0881c87f",
+    "crates/thegn-host/tests/static_cli_support/unix.rs": "aadd5d84bdce8223cf4f5991bea2135b59993b9ef76affd1cfa95e69283b4d8a",
+    "crates/thegn-host/tests/static_commands_process.rs": "d2b9e69366ed418893353fb22466dfde98f7b84c3d76d34ed72805813d52b96a"
+  },
+  "evidence_payloads_verified": 40,
+  "original_untracked_hashes_verified": 143,
+  "user_justfile_sha256": "75a61923b8db84f1115dd291159c65a63712eab27cbe3f3230b9b87129caf9b2",
+  "normal_canonical_hooks_retained": true,
+  "ff_exit": 0,
+  "tracker_closure_pending": true
+}

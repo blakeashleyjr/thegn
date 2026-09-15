@@ -73,9 +73,17 @@ conflict/red-gate selectors on the second held fold, as intended (0.436s,
 30s outer watchdog), per `/tmp/thegn-THE219-counterfactual-native-receipt-20260914.json`
 and its retained raw log. No infinite actual-CLI counterfactual was executed.
 
-Part B source is reviewed, but actual private CLI execution/native results,
-current strict lint/spec/delivery checks and reviewed local-main landing remain
-unchecked for this candidate. Part B proves branch repair then independent
-plain-drain re-enumeration; Part A separately proves recovered floor admission.
-Neither this audit nor these fixtures claim THE-608's broader diagnostic
-acceptance, live user queue behavior or successful real sandbox establishment.
+Part B actual private CLI conflict and red-gate tests passed in the combined
+focused and full native runs. Both complete original phase/SQL/cleanup receipts
+are retained in the evidence directory; each records private-root removal.
+Part B proves branch repair then independent plain-drain re-enumeration; Part A
+separately proves recovered floor admission. Current strict Clippy and metadata validation passed; reviewed implementation landed on local main at
+`c0d3d860a22db0a7fddafb3d338bf40b25248ade`. Neither
+this audit nor these fixtures claim THE-608's broader diagnostic acceptance,
+live user queue behavior or successful real sandbox establishment.
+
+## Segmented native evidence and remaining gates
+
+[The evidence manifest](maintenance-04-2026-09-15/manifest.json) preserves original receipts, logs and independent reviews byte-for-byte. Combined `62335026` focused acceptance passed 68/68. Its full configured native run completed 8377 tests: 8376 passed, one host-key-literal ratchet failed, and 26 configured tests were skipped. Test-only `a4468a8e` replaces the precedence fixture's HostKeyAlias argument with distinct ConnectTimeout values; its fresh six-test gate passes all five precedence tests and the formerly failing ratchet. These are overlapping, segmented gates, not a single clean full-a446 run.
+
+Source ratchets, 159 strict OpenSpec items, treefmt and non-Rust lint passed. Final metadata ratchets/OpenSpec checks and strict offline workspace/all-target Clippy also exited zero; Clippy took 13m58s, with inherited dependency warnings retained in the raw log. [The final gate receipt](maintenance-04-2026-09-15/thegn-maintenance04-final-gates-receipt-20260915.json.raw) records exact commands, source and log hashes. Reviewed implementation landed on local main at `c0d3d860a22db0a7fddafb3d338bf40b25248ade`. [The landing readback](maintenance-04-2026-09-15/thegn-three-fix-local-main-readback-20260915.json.raw) verifies all 16 reviewed Rust hashes, the 40 pre-landing evidence payloads and preserved user files. Tracker closure/readback remains pending; no new performance acceptance is claimed.

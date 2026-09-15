@@ -1,0 +1,24 @@
+{
+  "source_at_build_start": "b4ae0591d78a8dd4edeed423ba7d96d4b42b0f53",
+  "docs_only_checkpoint": "d7ec79fec99e7503f90d23b327da643e188e6768",
+  "log": "/tmp/thegn-THE611-fresh-host-native-20260914.log",
+  "log_sha256": "10c240c299c97e2792a3f262cb3a67b54940d5162f0483b6b72fa0ac598d07cd",
+  "exit_code": 0,
+  "tests_passed": 28,
+  "skipped": 3299,
+  "native_seconds": 6.83,
+  "build_seconds": 415,
+  "run_id": "935847f6-a00a-49e8-b98f-d7ca5f53de18",
+  "parser_tests": [
+    "all_completion_shells_modes_and_global_positions_preserve_borrowed_intent",
+    "every_config_api_and_automation_action_uses_its_exact_intent",
+    "every_configured_top_level_variant_parses_without_static_authority"
+  ],
+  "stale_incident": "/tmp/thegn-THE611-stale-artifact-20260914.md",
+  "remaining": [
+    "old-binary counterfactual",
+    "combined native/source gates",
+    "strict lint",
+    "local-main landing"
+  ]
+}

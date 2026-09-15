@@ -1,0 +1,23 @@
+
+running 1 test
+test static_output_precedes_legacy_migration_and_both_profile_selectors ... 
+thread 'static_output_precedes_legacy_migration_and_both_profile_selectors' (3294884) panicked at crates/thegn-host/tests/the611_old_binary_cf_8wc4x24k_support/mod.rs:321:5:
+unexpected static diagnostic: thegn: migrated superzej state to its new home (2 path(s) renamed)
+thegn: config: parse error: TOML parse error at line 1, column 9
+  |
+1 | [broken TOML
+  |         ^
+invalid table header
+expected `.`, `]`
+; using defaults
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    static_output_precedes_legacy_migration_and_both_profile_selectors
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.46s
+

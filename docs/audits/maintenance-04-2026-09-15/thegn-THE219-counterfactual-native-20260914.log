@@ -1,0 +1,244 @@
+   Compiling gtui-core v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/gtui-core)
+   Compiling thegn-media v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/thegn-media)
+   Compiling thegn-metrics v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/thegn-metrics)
+   Compiling thegn-svc v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/thegn-svc)
+   Compiling thegn-core v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/thegn-core)
+   Compiling gtui-query v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/gtui-query)
+   Compiling gtui-app v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/gtui-app)
+   Compiling gtui-render v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/gtui-render)
+   Compiling tg-kit v0.1.0 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/tg-kit)
+   Compiling thegn-host v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/thegn-host)
+   Compiling termwiz v0.23.3 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/vendor/termwiz)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/hyperlink.rs:247:18
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match> {
+    |                  ^^^^^            ^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                  |
+    |                  the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+247 |     fn highlight(&self) -> Option<fancy_regex::Match<'_>> {
+    |                                                     ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/image.rs:567:17
+    |
+567 |     pub fn data(&self) -> MutexGuard<ImageDataType> {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+567 |     pub fn data(&self) -> MutexGuard<'_, ImageDataType> {
+    |                                      +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:12:12
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>>;
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+12 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>>;
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:22:9
+   |
+22 |         &self,
+   |         ^^^^^ the lifetime is elided here
+...
+27 |     ) -> Option<SearchResult>;
+   |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+27 |     ) -> Option<SearchResult<'_>>;
+   |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/lineedit/history.rs:88:12
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<str>> {
+   |            ^^^^^ the lifetime is elided here   ^^^^^^^^ the same lifetime is hidden here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+88 |     fn get(&self, idx: HistoryIndex) -> Option<Cow<'_, str>> {
+   |                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/lineedit/history.rs:109:9
+    |
+109 |         &self,
+    |         ^^^^^ the lifetime is elided here
+...
+114 |     ) -> Option<SearchResult> {
+    |                 ^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+114 |     ) -> Option<SearchResult<'_>> {
+    |                             ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:511:25
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<Line>> {
+    |                         ^^^^^         ^^^^^^^^^ the same lifetime is hidden here
+    |                         |
+    |                         the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+511 |     pub fn screen_lines(&self) -> Vec<Cow<'_, Line>> {
+    |                                           +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/mod.rs:526:24
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<[Change]>) {
+    |                        ^^^^^ the lifetime is elided here       ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+526 |     pub fn get_changes(&self, seq: SequenceNo) -> (SequenceNo, Cow<'_, [Change]>) {
+    |                                                                    +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/clusterline.rs:165:17
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter {
+    |                 ^^^^^     ^^^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+165 |     pub fn iter(&self) -> ClusterLineCellIter<'_> {
+    |                                              ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/surface/line/line.rs:609:19
+    |
+609 |     pub fn as_str(&self) -> Cow<str> {
+    |                   ^^^^^     ^^^^^^^^ the same lifetime is hidden here
+    |                   |
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+609 |     pub fn as_str(&self) -> Cow<'_, str> {
+    |                                 +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> vendor/termwiz/src/surface/line/line.rs:1014:21
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef> {
+     |                     ^^^^^ the lifetime is elided here   ^^^^^^^ the same lifetime is hidden here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1014 |     pub fn get_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+     |                                                                ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/termwiz/src/terminal/mod.rs:74:27
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+   |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                           |
+   |                           the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+   |
+74 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+   |                                                                 ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/termwiz/src/terminal/unix.rs:389:27
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities> {
+    |                           ^^^^^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                           |
+    |                           the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+389 |     fn probe_capabilities(&mut self) -> Option<ProbeCapabilities<'_>> {
+    |                                                                 ++++
+
+warning: `termwiz` (lib) generated 13 warnings (run `cargo fix --lib -p termwiz` to apply 13 suggestions)
+   Compiling gtui-embed v0.1.0-alpha.2 (/tmp/thegn-counterfactual-621-219-20260914-eya1s0wa/the219/crates/gtui-embed)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 07s
+info: using target runner `/tmp/thegn-private-test-runner-20260914.py` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`
+────────────
+ Nextest run ID 68acf5d6-7e2e-49bd-b7e2-c1826e516579 with nextest profile: counterfactual
+    Starting 2 tests across 1 binary (3319 tests skipped)
+        FAIL [   0.217s] (1/2) thegn-host::bin/thegn merge_driver::status_tests::conflict_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt
+  stdout ───
+
+    running 1 test
+    test merge_driver::status_tests::conflict_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt ... FAILED
+
+    failures:
+
+    failures:
+        merge_driver::status_tests::conflict_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3320 filtered out; finished in 0.14s
+
+  stderr ───
+    thegn: private guest-kernel floor unavailable
+
+    thread 'merge_driver::status_tests::conflict_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt' (2074686) panicked at crates/thegn-host/src/merge_driver_status_tests.rs:566:21:
+    assertion `left == right` failed: hold must not retry the fold
+      left: 2
+     right: 1
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.211s] (2/2) thegn-host::bin/thegn merge_driver::status_tests::red_gate_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt
+  stdout ───
+
+    running 1 test
+    test merge_driver::status_tests::red_gate_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt ... FAILED
+
+    failures:
+
+    failures:
+        merge_driver::status_tests::red_gate_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3320 filtered out; finished in 0.13s
+
+  stderr ───
+    thegn: private guest-kernel floor unavailable
+
+    thread 'merge_driver::status_tests::red_gate_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt' (2074692) panicked at crates/thegn-host/src/merge_driver_status_tests.rs:566:21:
+    assertion `left == right` failed: hold must not retry the fold
+      left: 2
+     right: 1
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.436s] 2 tests run: 0 passed, 2 failed, 3319 skipped
+        FAIL [   0.217s] (1/2) thegn-host::bin/thegn merge_driver::status_tests::conflict_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt
+        FAIL [   0.211s] (2/2) thegn-host::bin/thegn merge_driver::status_tests::red_gate_hold_continues_queue_and_independent_floor_recovery_spends_one_attempt
+error: test run failed
