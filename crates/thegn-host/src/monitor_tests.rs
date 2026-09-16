@@ -543,6 +543,7 @@ fn process_sort_keys_render_both_directions_and_keep_confirmation_identity() {
     );
     let mut changed = model.clone();
     changed.procs.procs[2].rss_bytes = 400;
+    changed.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&changed, &ctx_at(&hist, screen));
     assert!(!ov.prefs.proc_desc);
     assert_eq!(
