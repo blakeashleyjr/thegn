@@ -106,6 +106,8 @@ fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
 ///   matching descendant, so filtering never severs a matching child from its
 ///   visible ancestry.
 pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
+    #[cfg(test)]
+    crate::proc_workload_alloc::process_rows();
     let ProcSnapshotView {
         sort,
         desc,

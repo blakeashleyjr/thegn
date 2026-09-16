@@ -3,12 +3,62 @@
 
 use crate::chrome::FrameModel;
 
+/// Semantic revision for hydrated row caches. Exhaustion disables caching
+/// instead of wrapping into an old valid key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ContentRevision {
+    value: u64,
+    exhausted: bool,
+}
+impl ContentRevision {
+    fn advanced(self, changed: bool) -> Self {
+        if !changed || self.exhausted {
+            return self;
+        }
+        match self.value.checked_add(1) {
+            Some(value) => Self {
+                value,
+                exhausted: false,
+            },
+            None => Self {
+                value: self.value,
+                exhausted: true,
+            },
+        }
+    }
+    pub fn same_cacheable(self, other: Self) -> bool {
+        !self.exhausted && !other.exhausted && self.value == other.value
+    }
+}
+
 impl FrameModel {
+    /// The compositor's sole live process publisher. Reconcile visibility
+    /// before final take so a sample queued across pause cannot replace the
+    /// frozen model which navigation and signal confirmation read.
+    pub fn take_process_publication(
+        &mut self,
+        control: &crate::proc_worker::Control,
+        enabled: bool,
+    ) -> bool {
+        control.set_enabled(enabled);
+        let Some(publication) = control.take_latest() else {
+            return false;
+        };
+        self.process_revision = publication.revision;
+        self.procs = publication.snapshot;
+        true
+    }
+
     /// Hydration owns Git/DB state, while the process sampler owns this snapshot.
     /// Transfer it at the authoritative swap so hydration cannot blank a live
     /// process table between samples. Moving avoids copying the bounded row set.
-    pub fn carry_live_processes_from(&mut self, current: &mut Self) {
+    /// Disk row inputs receive a semantic revision without cloning either map.
+    pub fn carry_monitor_state_from(&mut self, current: &mut Self) {
+        let disk_changed = self.sidebar_status.disk_sizes != current.sidebar_status.disk_sizes
+            || self.sidebar_status.disk_stamps != current.sidebar_status.disk_stamps;
+        self.monitor_disk_revision = current.monitor_disk_revision.advanced(disk_changed);
         self.procs = std::mem::take(&mut current.procs);
+        self.process_revision = current.process_revision;
     }
 
     /// True when a freshly hydrated model carries no render-affecting change
@@ -188,5 +238,36 @@ mod tests {
             !base.hydration_eq(&term_changed),
             "terminal change must repaint"
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    #[test]
+    fn disk_revision_tracks_both_input_maps_and_never_reuses_exhausted_keys() {
+        let mut prior = FrameModel::default();
+        let initial = prior.monitor_disk_revision;
+        let mut next = prior.clone();
+        next.sidebar_status
+            .disk_sizes
+            .insert("fixture".into(), (1, 2));
+        next.carry_monitor_state_from(&mut prior);
+        assert!(!initial.same_cacheable(next.monitor_disk_revision));
+        let sizes = next.monitor_disk_revision;
+        let mut stamp = next.clone();
+        stamp
+            .sidebar_status
+            .disk_stamps
+            .insert("fixture".into(), 100);
+        stamp.carry_monitor_state_from(&mut next);
+        assert!(!sizes.same_cacheable(stamp.monitor_disk_revision));
+        let exhausted = ContentRevision {
+            value: u64::MAX,
+            exhausted: false,
+        }
+        .advanced(true);
+        assert!(!exhausted.same_cacheable(exhausted));
+        assert_eq!(exhausted.advanced(true), exhausted);
     }
 }

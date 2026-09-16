@@ -1019,7 +1019,7 @@ fn cursor_table(ov: &MonitorOverlay) -> &crate::sections::TableSection {
     ov.body
         .iter()
         .find_map(|s| match s {
-            Section::Table(t) if t.sel.is_some() => Some(t),
+            Section::Table(t) | Section::FixedTable { table: t, .. } if t.sel.is_some() => Some(t),
             _ => None,
         })
         .expect("a table with a row cursor")
@@ -1029,8 +1029,84 @@ fn cursor_table(ov: &MonitorOverlay) -> &crate::sections::TableSection {
 fn cursor_tables(ov: &MonitorOverlay) -> usize {
     ov.body
         .iter()
-        .filter(|s| matches!(s, Section::Table(t) if t.sel.is_some()))
+        .filter(|s| matches!(s, Section::Table(t) | Section::FixedTable { table: t, .. } if t.sel.is_some()))
         .count()
+}
+
+#[test]
+fn process_columns_follow_viewport_not_sample_values_and_keep_visible_identity() {
+    let hist = TelemetryHistory::default();
+    for cols in [26, 40, 80, 160, 240] {
+        let screen = Rect::full(cols, 30);
+        let mut previous_widths = None;
+        for changed in [false, true] {
+            let mut sample = proc(
+                u32::MAX,
+                None,
+                if changed {
+                    "fixture-世-e\u{301}-👩‍💻-longer-name"
+                } else {
+                    "fixture"
+                },
+                if changed { 1200.5 } else { 0.1 },
+                if changed { u64::MAX } else { 1 },
+            );
+            sample.owner = if changed {
+                thegn_metrics::ProcOwner::Pane(123456)
+            } else {
+                thegn_metrics::ProcOwner::Other
+            };
+            let model = model_with_procs(vec![sample]);
+            let mut ov = MonitorOverlay::open(
+                MonitorTab::Procs,
+                MonitorPrefs::default(),
+                &model,
+                &ctx_at(&hist, screen),
+            );
+            let (table, widths) = ov
+                .body
+                .iter()
+                .find_map(|section| match section {
+                    Section::FixedTable { table, widths } => Some((table, widths)),
+                    _ => None,
+                })
+                .expect("Processes opts into fixed columns");
+            assert_eq!(table.rows.len(), 1);
+            assert!(widths.iter().sum::<usize>() + 5 <= ov.cols);
+            if let Some(previous) = &previous_widths {
+                assert_eq!(previous, widths);
+            }
+            previous_widths = Some(widths.clone());
+            let mut surface = Surface::new(cols, 30);
+            ov.render(&mut surface, screen);
+            if cols >= 80 {
+                let text: String = surface
+                    .screen_lines()
+                    .iter()
+                    .flat_map(|line| {
+                        line.visible_cells()
+                            .map(|cell| cell.str().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                assert!(
+                    text.contains("4294967295"),
+                    "full PID fits its fixed ten-cell budget"
+                );
+                assert!(text.contains("fixture"));
+            }
+            assert_eq!(ch(&mut ov, 'x'), MonitorOutcome::Pending);
+            assert!(matches!(
+                ov.confirm,
+                Some(Confirm::Signal {
+                    pid: u32::MAX,
+                    start_time: 100,
+                    ..
+                })
+            ));
+            // Inspect confirmation only; never dispatch a process signal.
+        }
+    }
 }
 
 fn cell_tone(c: &crate::sections::Cell) -> Tok {
@@ -1538,6 +1614,7 @@ fn process_table_survives_interleaved_hydration_and_samples() {
     let h = TelemetryHistory::default();
     let screen = Rect::full(100, 24);
     let mut m = model_with_n_procs(40);
+    m.process_revision = 41;
     let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
     ov.nav(20);
     ov.sync(&m, &h, screen);
@@ -1546,15 +1623,17 @@ fn process_table_survives_interleaved_hydration_and_samples() {
     for pass in 0..4 {
         let mut hydrated = model_with(full_snap());
         assert!(hydrated.procs.procs.is_empty());
-        hydrated.carry_live_processes_from(&mut m);
+        hydrated.carry_monitor_state_from(&mut m);
         m = hydrated;
         ov.refresh(&m, &ctx_at(&h, screen));
+        assert_eq!(m.process_revision, 41 + pass);
         assert_eq!(ov.proc_rows.len(), 40);
         assert_eq!(ov.proc_rows[ov.sel].pid, selected);
         assert_eq!(ov.scroll(), scroll);
         assert!(cursor_on_screen(&ov));
         assert!(!headings(&ov).iter().any(|(title, _)| title == "sampling…"));
         m.procs.procs[0].rss_bytes += pass;
+        m.process_revision += 1;
         ov.refresh(&m, &ctx_at(&h, screen));
     }
 }
@@ -1569,6 +1648,7 @@ fn passive_process_refresh_follows_identity_after_rank_changes() {
     ov.sync(&m, &h, screen);
     let identity = (ov.proc_rows[ov.sel].pid, ov.proc_rows[ov.sel].start_time);
     m.procs.procs[20].cpu_pct = 1000.0;
+    m.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&m, &ctx_at(&h, screen));
     assert_eq!(ov.sel, 0);
     assert_eq!(
@@ -1594,6 +1674,7 @@ fn process_refresh_does_not_yank_a_manually_scrolled_viewport() {
     ov.wheel(15);
     let scroll = ov.scroll();
     m.procs.procs[0].cpu_pct = -1.0;
+    m.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&m, &ctx_at(&h, screen));
     assert_eq!(ov.sel, 39);
     assert_eq!(ov.scroll(), scroll);
@@ -1616,6 +1697,7 @@ fn process_confirmation_refuses_a_reused_or_disappeared_sampled_identity() {
         } else {
             m.procs.procs.remove(0);
         }
+        m.process_revision += 1; // emulate the sampler publication boundary
         ov.refresh(&m, &ctx_at(&h, screen));
         // This must be the identity refusal, not the platform invalid-PID error.
         ov.confirm_key(&KeyCode::Char('y'));
@@ -1639,6 +1721,7 @@ fn reused_process_does_not_inherit_selection_or_signal_escalation() {
     ov.last_termed = Some((1000, 100));
     m.procs.procs[0].start_time = 200;
     m.procs.procs[0].cpu_pct = -1.0;
+    m.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&m, &ctx_at(&h, screen));
     assert_eq!(
         ov.proc_rows[ov.sel].pid, 1001,
@@ -1665,6 +1748,7 @@ fn process_exit_clamps_and_explicit_sort_still_resets_selection() {
     ov.nav(39);
     ov.sync(&m, &h, screen);
     m.procs.procs.truncate(2);
+    m.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&m, &ctx_at(&h, screen));
     assert_eq!(ov.sel, 1);
     assert!(cursor_on_screen(&ov));
@@ -1672,6 +1756,7 @@ fn process_exit_clamps_and_explicit_sort_still_resets_selection() {
     ov.sync(&m, &h, screen);
     assert_eq!(ov.sel, 0);
     m.procs.procs.clear();
+    m.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&m, &ctx_at(&h, screen));
     assert_eq!(ov.sel, 0);
     assert_eq!(ov.scroll(), 0);
@@ -1687,6 +1772,7 @@ fn paused_process_refresh_does_not_change_the_displayed_snapshot() {
     let before = ov.proc_rows.clone();
     m.procs.procs.reverse();
     m.procs.procs[0].cpu_pct = 1000.0;
+    m.process_revision += 1;
     assert!(!ov.refresh(&m, &ctx_at(&h, screen)));
     assert_eq!(ov.proc_rows, before);
 }
@@ -1699,6 +1785,7 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
     let mut ov = open_tab(MonitorTab::Procs, &m, &h, screen);
     ov.begin_signal();
     m.procs.procs[0].cpu_pct = -1.0;
+    m.process_revision += 1; // emulate the sampler publication boundary
     ov.refresh(&m, &ctx_at(&h, screen));
     assert_eq!(ov.sel, 2);
     assert!(matches!(
@@ -1711,3 +1798,6 @@ fn process_confirmation_keeps_its_identity_while_ranks_change() {
     ));
     // Do not confirm: the fixture validates the target, never sends a signal.
 }
+
+#[path = "monitor_cache_tests.rs"]
+mod invalidation_tests;

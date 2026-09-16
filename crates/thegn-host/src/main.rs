@@ -189,6 +189,11 @@ mod preview_pane;
 mod preview_render;
 mod preview_watch;
 mod probe;
+mod proc_worker;
+#[cfg(test)]
+mod proc_workload;
+#[cfg(test)]
+mod proc_workload_alloc;
 mod profile;
 mod provider_factory;
 mod provider_workdir;

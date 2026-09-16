@@ -20,7 +20,9 @@ mod thermal;
 
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
-pub use procs::{ProcOwner, ProcSample, ProcSampler, ProcSnapshot};
+pub use procs::{
+    MIN_INTERVAL as PROC_MIN_INTERVAL, ProcOwner, ProcSample, ProcSampler, ProcSnapshot,
+};
 pub use sample::{StatsSampler, SystemInfo, TrackedSpec};
 
 /// One sampled reading; `None`/empty fields render as absent widgets, so a

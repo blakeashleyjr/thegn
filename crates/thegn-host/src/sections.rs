@@ -23,6 +23,9 @@ use crate::compositor::Rect;
 use crate::seg::{self, Line, Tok, seg};
 use thegn_core::viz;
 
+#[path = "sections_fixed_table.rs"]
+mod fixed_table;
+
 /// One block within a stack.
 pub enum Section {
     /// A one-row dim label with an optional right-aligned note (a group header).
@@ -42,6 +45,11 @@ pub enum Section {
     Graph(GraphSection),
     /// A columnar breakdown (optional dim header row + body rows).
     Table(TableSection),
+    /// Opt-in viewport-derived columns. Other tables retain content sizing.
+    FixedTable {
+        table: TableSection,
+        widths: Vec<usize>,
+    },
     /// A `key … value` block.
     KeyVal(Vec<(String, String, Tok)>),
     /// A multi-column `key value` grid: the wide-popup answer to
@@ -204,7 +212,9 @@ impl Section {
         match self {
             Section::Heading { .. } | Section::HeadingToned { .. } | Section::Sparkrow { .. } => 1,
             Section::Graph(g) => 1 + g.plot_rows() + g.footer.is_some() as usize,
-            Section::Table(t) => (!t.header.is_empty()) as usize + t.rows.len(),
+            Section::Table(t) | Section::FixedTable { table: t, .. } => {
+                (!t.header.is_empty()) as usize + t.rows.len()
+            }
             Section::KeyVal(rows) => rows.len(),
             Section::Grid { cols, cells } => cells.len().div_ceil((*cols).max(1)),
             Section::MonthGrid(g) => g.height(),
@@ -407,6 +417,9 @@ pub(crate) fn draw_section(
         }
         Section::Graph(g) => draw_graph_block(surface, clip, x, y0, w, g),
         Section::Table(t) => draw_table(surface, clip, x, y0, w, t),
+        Section::FixedTable { table, widths } => {
+            fixed_table::draw(surface, clip, x, y0, w, table, widths);
+        }
         Section::KeyVal(rows) => {
             for (i, (k, v, tone)) in rows.iter().enumerate() {
                 put_line(
