@@ -598,6 +598,150 @@ fn start_keeps_draining_so_child_survives_post_return() {
 }
 
 #[test]
+fn bounded_reader_retries_interrupted_and_emits_eof_url() {
+    struct InterruptOnce {
+        interrupted: bool,
+        inner: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl std::io::Read for InterruptOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            std::io::Read::read(&mut self.inner, buffer)
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    super::drain_reader(
+        InterruptOnce {
+            interrupted: false,
+            inner: std::io::Cursor::new(b"listening at interrupted.example:4123".to_vec()),
+        },
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    );
+    assert_eq!(
+        url_rx.recv().expect("URL after interrupted read"),
+        "http://interrupted.example:4123"
+    );
+    assert_eq!(
+        rx.recv().expect("diagnostic after interrupted read"),
+        "listening at interrupted.example:4123"
+    );
+}
+
+#[test]
+fn bounded_reader_discards_oversized_line_but_keeps_following_url() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    let mut output = vec![b'x'; super::MAX_PROVIDER_LINE + 1];
+    output.extend_from_slice(b"\nlistening at bounded.example:4123\n");
+    super::drain_reader(
+        std::io::Cursor::new(output),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    );
+    assert_eq!(
+        url_rx.recv().expect("URL after oversized line"),
+        "http://bounded.example:4123"
+    );
+    assert_eq!(
+        rx.recv().expect("bounded diagnostic line"),
+        "listening at bounded.example:4123"
+    );
+}
+
+#[test]
+fn bounded_reader_keeps_url_when_diagnostics_receiver_is_gone() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    drop(rx);
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    super::drain_reader(
+        std::io::Cursor::new(b"listening at disconnected.example:4123\n".to_vec()),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    );
+    assert_eq!(
+        url_rx
+            .recv()
+            .expect("priority URL after diagnostic disconnect"),
+        "http://disconnected.example:4123"
+    );
+}
+
+#[test]
+fn share_debug_redacts_args_and_public_url() {
+    let plan = SharePlan {
+        program: "fake-provider".into(),
+        args: vec!["--token=ARGV_SENTINEL_325".into()],
+        env: vec![("AUTH_TOKEN".into(), "ENV_SENTINEL_325".into())],
+        files: vec![],
+        url_rule: UrlRule::Fixed("https://secret.example/TICKET_SENTINEL_325".into()),
+    };
+    let debug = format!("{plan:?}");
+    assert!(!debug.contains("ARGV_SENTINEL_325"));
+    assert!(!debug.contains("ENV_SENTINEL_325"));
+    assert!(!debug.contains("TICKET_SENTINEL_325"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[cfg(unix)]
+#[test]
+fn start_returns_url_from_unterminated_provider_line() {
+    let state = tempfile::tempdir().expect("temporary state");
+    let plan = SharePlan {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "printf 'listening at eof.example:4123'".into()],
+        env: vec![],
+        files: vec![],
+        url_rule: UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    };
+    let running = start(&plan, state.path(), Duration::from_secs(1)).expect("EOF URL");
+    assert!(!format!("{running:?}").contains("eof.example"));
+    assert_eq!(running.public_url, "http://eof.example:4123");
+    running.stop();
+}
+
+#[cfg(unix)]
+#[test]
+fn start_redacts_provider_diagnostics_on_early_exit() {
+    let state = tempfile::tempdir().expect("temporary state");
+    let plan = SharePlan {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "printf 'OUTPUT_SECRET_SENTINEL_325\\n' >&2; exit 7".into(),
+        ],
+        env: vec![],
+        files: vec![],
+        url_rule: UrlRule::Fixed("http://fixed.example".into()),
+    };
+    let error = start(&plan, state.path(), Duration::from_millis(500))
+        .expect_err("provider exits before fixed URL grace");
+    assert!(error.to_string().contains("exited early"));
+    assert!(!error.to_string().contains("OUTPUT_SECRET_SENTINEL_325"));
+}
+
+#[test]
 fn tailscale_funnel_custom_port() {
     use thegn_core::config::TailscaleShareConfig;
     let s = serve_plan(
@@ -616,4 +760,38 @@ fn tailscale_funnel_custom_port() {
         vec!["tailscale", "funnel", "--https=8443", "off"]
     );
     assert_eq!(s.port, 8443);
+}
+
+#[test]
+fn bounded_reader_prioritizes_late_url_over_full_diagnostic_queue() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
+    for i in 0..64 {
+        tx.try_send(format!("noise-{i}"))
+            .expect("fill bounded queue");
+    }
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    let mut output = (0..64).map(|i| format!("noise-{i}\n")).collect::<String>();
+    output.push_str("listening at late.example:4123\n");
+    super::drain_reader(
+        std::io::Cursor::new(output.into_bytes()),
+        tx,
+        url_tx,
+        UrlRule::AfterMarker {
+            marker: "listening at ".into(),
+            scheme: "http".into(),
+        },
+    );
+    assert_eq!(
+        url_rx.recv().expect("late URL signal"),
+        "http://late.example:4123"
+    );
+    drop(rx);
+}
+
+#[test]
+fn bounded_lossy_output_stays_within_byte_limit() {
+    let bytes = vec![0xff; super::MAX_PROVIDER_LINE];
+    let text = super::bounded_lossy(&bytes);
+    assert!(text.len() <= super::MAX_PROVIDER_LINE);
+    assert_eq!(text, "�".repeat(super::MAX_PROVIDER_LINE / 3));
 }
