@@ -1779,6 +1779,15 @@ fn auto_clean_refuses_a_target_origin_change_before_and_during_state_lookup() {
             "https://github.com/acme/repo.git",
         ],
         vec!["config", "extensions.worktreeConfig", "true"],
+        // Remote URLs are multi-valued: a worktree-local URL does not replace
+        // the first shared URL. Give each checkout its own effective origin.
+        vec![
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "https://github.com/acme/repo.git",
+        ],
+        vec!["config", "--local", "--unset-all", "remote.origin.url"],
     ] {
         assert!(thegn_core::util::git_ok(root_path, &args));
     }
@@ -1786,7 +1795,15 @@ fn auto_clean_refuses_a_target_origin_change_before_and_during_state_lookup() {
         assert!(thegn_core::util::git_ok(
             target_path,
             &["config", "--worktree", "remote.origin.url", url]
-        ))
+        ));
+        assert_eq!(
+            thegn_core::util::git_out(target_path, &["remote", "get-url", "origin"]).as_deref(),
+            Some(url)
+        );
+        assert_eq!(
+            thegn_core::util::git_out(root_path, &["remote", "get-url", "origin"]).as_deref(),
+            Some("https://github.com/acme/repo.git")
+        );
     };
     let db = thegn_core::db::Db::open_memory().unwrap();
     db.put_worktree("repo/feat", &root, &target, "feat", None, None)
